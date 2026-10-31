@@ -41,6 +41,55 @@ class DartBackfillCurrentUniverseCliTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'failed')
         self.assertEqual(payload['error'], 'boom')
 
+    def test_main_passes_exact_symbol_manifest(self):
+        result = {
+            'scope': 'targeted_active_universe',
+            'requested_stock_codes': ['005930', '000660'],
+        }
+        with (
+            patch(
+                'app.dart.backfill_current_universe.dart_fundamentals_capture_service.backfill_current_universe_fundamentals',
+                new=AsyncMock(return_value=result),
+            ) as backfill,
+            patch('sys.stdout.write'),
+        ):
+            exit_code = main(
+                [
+                    '--symbols',
+                    '005930,000660',
+                    '--start-date',
+                    '2025-01-01',
+                    '--end-date',
+                    '2026-10-30',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            backfill.await_args.kwargs['stock_codes'],
+            ['005930', '000660'],
+        )
+
+    def test_main_preserves_empty_exact_manifest_token_for_validation(self):
+        with (
+            patch(
+                'app.dart.backfill_current_universe.dart_fundamentals_capture_service.backfill_current_universe_fundamentals',
+                new=AsyncMock(
+                    side_effect=ValueError(
+                        'targeted fundamentals backfill contains an invalid stock code'
+                    )
+                ),
+            ) as backfill,
+            patch('sys.stderr.write'),
+        ):
+            exit_code = main(['--symbols', '005930,,000660'])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            backfill.await_args.kwargs['stock_codes'],
+            ['005930', '', '000660'],
+        )
+
     def test_main_rejects_negative_symbol_limit(self):
         with self.assertRaises(SystemExit):
             main(['--symbol-limit', '-1'])

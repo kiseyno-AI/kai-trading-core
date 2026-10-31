@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 from sqlalchemy.exc import (
@@ -41,6 +41,45 @@ _FINANCIAL_REPORT_PREFIXES = (
 _CONSECUTIVE_PROVIDER_FAILURE_LIMIT = 3
 DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY = 1
 MAX_DART_DISCLOSURE_SYNC_CONCURRENCY = 8
+_PER_CORPORATION_SCAN_SCOPES = {
+    'current_active_universe',
+    'targeted_active_universe',
+}
+
+
+def _normalize_root_stock_code_manifest(
+    stock_codes: Sequence[str],
+) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in stock_codes:
+        stock_code = str(value or '').strip()
+        if (
+            not stock_code
+            or not stock_code.isascii()
+            or not stock_code.isdigit()
+            or len(stock_code) > 6
+        ):
+            raise ValueError(
+                'DART root stock-code manifest contains an invalid stock code'
+            )
+        stock_code = stock_code.zfill(6)
+        if stock_code not in seen:
+            seen.add(stock_code)
+            normalized.append(stock_code)
+    if not normalized:
+        raise ValueError('DART root stock-code manifest is empty')
+    return normalized
+
+
+def _root_stock_code_manifest_sha256(stock_codes: Sequence[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            list(stock_codes),
+            ensure_ascii=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
 _SYSTEMIC_DART_STATUS_CODES = {
     '010',  # unregistered API key
     '011',  # disabled API key
@@ -1507,6 +1546,8 @@ class DartDisclosureSyncService:
         start_date: date,
         end_date: date,
         trigger: str = 'manual_active_universe_backfill',
+        scope: str = 'current_active_universe',
+        root_stock_code_manifest: Sequence[str] | None = None,
         persist_negative_authority: bool = True,
         concurrency: int = DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY,
     ) -> dict[str, Any]:
@@ -1515,19 +1556,71 @@ class DartDisclosureSyncService:
                 'concurrency must be between 1 and '
                 f'{MAX_DART_DISCLOSURE_SYNC_CONCURRENCY}'
             )
+        normalized_scope = str(scope or '').strip()
+        if normalized_scope not in _PER_CORPORATION_SCAN_SCOPES:
+            raise ValueError(
+                'unsupported DART per-corporation scan scope: '
+                f'{normalized_scope or "<empty>"}'
+            )
+        normalized_root_manifest = (
+            _normalize_root_stock_code_manifest(root_stock_code_manifest)
+            if root_stock_code_manifest is not None
+            else None
+        )
+        if (
+            normalized_scope == 'targeted_active_universe'
+            and normalized_root_manifest is None
+        ):
+            raise ValueError(
+                'targeted DART per-corporation scan requires a root '
+                'stock-code manifest'
+            )
+        normalized_corporations: list[dict[str, str]] = []
+        for item in corporations:
+            corp_code = str(item.get('corp_code') or '').strip()
+            raw_stock_code = str(item.get('stock_code') or '').strip()
+            if not corp_code:
+                raise ValueError(
+                    'DART per-corporation scan contains an empty corp code'
+                )
+            if (
+                not raw_stock_code
+                or not raw_stock_code.isascii()
+                or not raw_stock_code.isdigit()
+                or len(raw_stock_code) > 6
+            ):
+                raise ValueError(
+                    'DART per-corporation scan contains an invalid stock code'
+                )
+            normalized_item = dict(item)
+            normalized_item['corp_code'] = corp_code
+            normalized_item['stock_code'] = raw_stock_code.zfill(6)
+            normalized_corporations.append(normalized_item)
+        corporations = normalized_corporations
         requested_stock_codes = sorted(
             {
-                str(item.get('stock_code') or '').strip().zfill(6)
+                str(item['stock_code'])
                 for item in corporations
-                if str(item.get('stock_code') or '').strip()
             }
         )
+        if normalized_root_manifest is not None:
+            outside_root_manifest = sorted(
+                set(requested_stock_codes) - set(normalized_root_manifest)
+            )
+            if outside_root_manifest:
+                raise ValueError(
+                    'DART execution stock codes are outside the root '
+                    'manifest: '
+                    f'{",".join(outside_root_manifest)}'
+                )
         if not persist_negative_authority:
             return await self._sync_disclosures_for_corporations_unlocked(
                 corporations=corporations,
                 start_date=start_date,
                 end_date=end_date,
                 trigger=trigger,
+                scope=normalized_scope,
+                root_stock_code_manifest=normalized_root_manifest,
                 persist_negative_authority=False,
                 concurrency=concurrency,
             )
@@ -1540,6 +1633,15 @@ class DartDisclosureSyncService:
                 return {
                     'run_id': None,
                     'status': 'blocked',
+                    'scope': normalized_scope,
+                    'root_stock_code_manifest': normalized_root_manifest,
+                    'root_stock_code_manifest_sha256': (
+                        _root_stock_code_manifest_sha256(
+                            normalized_root_manifest
+                        )
+                        if normalized_root_manifest is not None
+                        else None
+                    ),
                     'reason': 'advisory_lock_unavailable',
                     'window_start': start_date.isoformat(),
                     'window_end': end_date.isoformat(),
@@ -1560,6 +1662,8 @@ class DartDisclosureSyncService:
                 start_date=start_date,
                 end_date=end_date,
                 trigger=trigger,
+                scope=normalized_scope,
+                root_stock_code_manifest=normalized_root_manifest,
                 persist_negative_authority=True,
                 concurrency=concurrency,
             )
@@ -1571,6 +1675,8 @@ class DartDisclosureSyncService:
         start_date: date,
         end_date: date,
         trigger: str = 'manual_active_universe_backfill',
+        scope: str = 'current_active_universe',
+        root_stock_code_manifest: Sequence[str] | None = None,
         persist_negative_authority: bool = True,
         concurrency: int = DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY,
     ) -> dict[str, Any]:
@@ -1593,6 +1699,16 @@ class DartDisclosureSyncService:
                 separators=(',', ':'),
             ).encode('utf-8')
         ).hexdigest()
+        normalized_root_manifest = (
+            list(root_stock_code_manifest)
+            if root_stock_code_manifest is not None
+            else None
+        )
+        root_manifest_hash = (
+            _root_stock_code_manifest_sha256(normalized_root_manifest)
+            if normalized_root_manifest is not None
+            else None
+        )
         page_size = max(min(settings.dart_sync_page_count, 100), 1)
         run_id = self.repository.create_sync_run(
             window_start=start_date,
@@ -1600,7 +1716,14 @@ class DartDisclosureSyncService:
             trigger=trigger[:32],
             page_size=page_size,
             run_metadata={
-                'scope': 'current_active_universe',
+                'scope': scope,
+                'root_stock_code_manifest_version': (
+                    'dart_root_stock_code_manifest_v1'
+                    if normalized_root_manifest is not None
+                    else None
+                ),
+                'root_stock_code_manifest_sha256': root_manifest_hash,
+                'root_stock_code_manifest': normalized_root_manifest,
                 'requested_corporations': len(corporations),
                 'manifest_version': 'dart_per_corp_scan_manifest_v1',
                 'manifest_hash': requested_manifest_hash,
@@ -1785,7 +1908,14 @@ class DartDisclosureSyncService:
                 - set(incomplete_stock_codes)
             )
             run_metadata = {
-                'scope': 'current_active_universe',
+                'scope': scope,
+                'root_stock_code_manifest_version': (
+                    'dart_root_stock_code_manifest_v1'
+                    if normalized_root_manifest is not None
+                    else None
+                ),
+                'root_stock_code_manifest_sha256': root_manifest_hash,
+                'root_stock_code_manifest': normalized_root_manifest,
                 'requested_corporations': len(corporations),
                 'manifest_version': 'dart_per_corp_scan_manifest_v1',
                 'manifest_hash': requested_manifest_hash,
@@ -1837,6 +1967,9 @@ class DartDisclosureSyncService:
             result = {
                 'run_id': run_id,
                 'status': status,
+                'scope': scope,
+                'root_stock_code_manifest_sha256': root_manifest_hash,
+                'root_stock_code_manifest': normalized_root_manifest,
                 'window_start': start_date.isoformat(),
                 'window_end': end_date.isoformat(),
                 'page_size': page_size,
@@ -1894,7 +2027,14 @@ class DartDisclosureSyncService:
                 financial_report_events=financial_report_events,
                 error_message=str(exc),
                 run_metadata={
-                    'scope': 'current_active_universe',
+                    'scope': scope,
+                    'root_stock_code_manifest_version': (
+                        'dart_root_stock_code_manifest_v1'
+                        if normalized_root_manifest is not None
+                        else None
+                    ),
+                    'root_stock_code_manifest_sha256': root_manifest_hash,
+                    'root_stock_code_manifest': normalized_root_manifest,
                     'requested_corporations': len(corporations),
                     'manifest_version': 'dart_per_corp_scan_manifest_v1',
                     'manifest_hash': requested_manifest_hash,

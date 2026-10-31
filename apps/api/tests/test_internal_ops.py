@@ -246,6 +246,102 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertEqual(json.loads(stdout.getvalue()), payload)
 
+    def test_stale_collection_run_repair_bypasses_runtime_bootstrap(self) -> None:
+        payload = {
+            'status': 'ready',
+            'dry_run': True,
+            'manifest_sha256': 'abc123',
+        }
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.stale_eod_collection_run_repair.repair',
+                return_value=payload,
+            ) as repair,
+        ):
+            result = ops.repair_stale_eod_collection_runs(
+                dry_run=True,
+                expected_manifest_sha256=None,
+            )
+
+        self.assertEqual(result, payload)
+        bootstrap_runtime.assert_not_called()
+        repair.assert_called_once_with(
+            apply=False,
+            expected_manifest_sha256=None,
+        )
+
+    def test_stale_collection_run_repair_cli_defaults_to_dry_run(self) -> None:
+        payload = {
+            'status': 'ready',
+            'dry_run': True,
+            'manifest_sha256': 'abc123',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.repair_stale_eod_collection_runs',
+                return_value=payload,
+            ) as repair,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(['eod-stale-collection-run-repair'])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        repair.assert_called_once_with(
+            dry_run=True,
+            expected_manifest_sha256=None,
+        )
+
+    def test_stale_collection_run_repair_cli_apply_passes_reviewed_hash(self) -> None:
+        payload = {
+            'status': 'completed',
+            'dry_run': False,
+            'manifest_sha256': 'abc123',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.repair_stale_eod_collection_runs',
+                return_value=payload,
+            ) as repair,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'eod-stale-collection-run-repair',
+                    '--apply',
+                    '--expected-manifest-sha256',
+                    'abc123',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        repair.assert_called_once_with(
+            dry_run=False,
+            expected_manifest_sha256='abc123',
+        )
+
+    def test_stale_collection_run_repair_cli_returns_nonzero_when_blocked(self) -> None:
+        payload = {
+            'status': 'blocked',
+            'reason': 'stale_eod_collection_run_manifest_mismatch',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.repair_stale_eod_collection_runs',
+                return_value=payload,
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(['eod-stale-collection-run-repair'])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+
     def test_run_pykrx_daily_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,

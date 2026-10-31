@@ -71,6 +71,9 @@ from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.eod.stale_collection_run_repair import (
+    stale_eod_collection_run_repair,
+)
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
@@ -1481,6 +1484,19 @@ def repair_terminal_daily_pipeline_children(
     )
 
 
+def repair_stale_eod_collection_runs(
+    *,
+    dry_run: bool = True,
+    expected_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    # Deliberately bypass bootstrap_runtime(): this reviewed persistence-only
+    # repair must not run migrations, hydrate runtime state, or call providers.
+    return stale_eod_collection_run_repair.repair(
+        apply=not dry_run,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+
+
 def run_daily_pipeline_stages(
     *,
     market_date: str | None = None,
@@ -2109,6 +2125,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Verify the exact incident scope without writing (default).',
     )
     pipeline_terminal_child_repair_parser.set_defaults(dry_run=True)
+    stale_collection_run_repair_parser = subparsers.add_parser(
+        'eod-stale-collection-run-repair',
+        help=(
+            'Repair reviewed stale EOD collection runs; defaults to a '
+            'read-only exact-scope check'
+        ),
+    )
+    stale_collection_run_repair_mode = (
+        stale_collection_run_repair_parser.add_mutually_exclusive_group()
+    )
+    stale_collection_run_repair_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help=(
+            'Apply only after all frozen invariants and the reviewed manifest '
+            'hash match.'
+        ),
+    )
+    stale_collection_run_repair_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Verify the exact incident scope without writing (default).',
+    )
+    stale_collection_run_repair_parser.add_argument(
+        '--expected-manifest-sha256',
+        help=(
+            'Required with --apply; copy manifest_sha256 from a successful '
+            'dry-run.'
+        ),
+    )
+    stale_collection_run_repair_parser.set_defaults(dry_run=True)
     subparsers.add_parser(
         'schema-drift-preflight',
         help='Verify runtime-critical tables and constraints before write-heavy workflows are treated as healthy',
@@ -2702,6 +2751,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = repair_terminal_daily_pipeline_children(
             dry_run=args.dry_run,
         )
+    elif args.command == 'eod-stale-collection-run-repair':
+        payload = repair_stale_eod_collection_runs(
+            dry_run=args.dry_run,
+            expected_manifest_sha256=args.expected_manifest_sha256,
+        )
     elif args.command == 'schema-drift-preflight':
         payload, exit_code = collect_schema_drift_preflight()
         print(json.dumps(payload, ensure_ascii=False))
@@ -3000,6 +3054,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         in {'blocked', 'partial', 'completed_with_gaps', 'failed'}
     ) or (
         args.command == 'eod-pipeline-terminal-child-repair'
+        and payload.get('status') in {'blocked', 'failed'}
+    ) or (
+        args.command == 'eod-stale-collection-run-repair'
         and payload.get('status') in {'blocked', 'failed'}
     ):
         return 2

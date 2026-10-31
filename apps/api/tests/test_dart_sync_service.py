@@ -827,19 +827,151 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
                 start_date=date(2025, 1, 1),
                 end_date=date(2026, 4, 7),
                 trigger='active_test',
+                scope='targeted_active_universe',
+                root_stock_code_manifest=['005930', '000660'],
             )
         finally:
             settings.dart_sync_page_count = original_page_count
 
         self.assertEqual(result['corporations_requested'], 1)
+        self.assertEqual(result['scope'], 'targeted_active_universe')
         self.assertEqual(result['corporations_processed'], 1)
         self.assertEqual(result['concurrency'], 1)
         self.assertEqual(
             repository.created_runs[-1]['run_metadata']['concurrency'],
             1,
         )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata']['scope'],
+            'targeted_active_universe',
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'root_stock_code_manifest'
+            ],
+            ['005930', '000660'],
+        )
+        self.assertEqual(
+            result['root_stock_code_manifest'],
+            ['005930', '000660'],
+        )
         self.assertEqual(result['financial_report_events'], 2)
         self.assertEqual(sum(len(batch) for _, batch in repository.upserted_batches), 2)
+
+    async def test_targeted_corp_scan_rejects_blank_stock_code_before_provider_call(self):
+        client = FakeSyncClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(
+            client=client,
+            repository=repository,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'contains an invalid stock code',
+        ):
+            await service.sync_disclosures_for_corporations(
+                corporations=[
+                    {'corp_code': '00126380', 'stock_code': ''},
+                ],
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 4, 7),
+                trigger='active_test',
+                scope='targeted_active_universe',
+                root_stock_code_manifest=['005930'],
+            )
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(repository.created_runs, [])
+
+    async def test_targeted_corp_scan_rejects_empty_corp_code_before_provider_call(self):
+        client = FakeSyncClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(
+            client=client,
+            repository=repository,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'contains an empty corp code',
+        ):
+            await service.sync_disclosures_for_corporations(
+                corporations=[
+                    {'corp_code': '', 'stock_code': '005930'},
+                ],
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 4, 7),
+                trigger='active_test',
+                scope='targeted_active_universe',
+                root_stock_code_manifest=['005930'],
+            )
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(repository.created_runs, [])
+
+    async def test_targeted_corp_scan_rejects_invalid_stock_code_shapes(self):
+        invalid_stock_codes = ('ABC123', '1234567', '１２３４５６')
+        for stock_code in invalid_stock_codes:
+            with self.subTest(stock_code=stock_code):
+                client = FakeSyncClient()
+                repository = FakeSyncRepository()
+                service = DartDisclosureSyncService(
+                    client=client,
+                    repository=repository,
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    'invalid stock code',
+                ):
+                    await service.sync_disclosures_for_corporations(
+                        corporations=[
+                            {
+                                'corp_code': '00126380',
+                                'stock_code': stock_code,
+                            },
+                        ],
+                        start_date=date(2025, 1, 1),
+                        end_date=date(2026, 4, 7),
+                        trigger='active_test',
+                        scope='targeted_active_universe',
+                        root_stock_code_manifest=[stock_code],
+                    )
+
+                self.assertEqual(client.calls, [])
+                self.assertEqual(repository.created_runs, [])
+
+    async def test_targeted_corp_scan_normalizes_short_ascii_stock_code(self):
+        client = FakeSyncClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(
+            client=client,
+            repository=repository,
+        )
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': '00126380', 'stock_code': '5930'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+            scope='targeted_active_universe',
+            root_stock_code_manifest=['5930'],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            result['root_stock_code_manifest'],
+            ['005930'],
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'requested_manifest'
+            ][0]['stock_code'],
+            '005930',
+        )
 
     async def test_complete_corp_scan_persists_positive_share_issuance_event(self):
         client = SinglePageSyncClient(

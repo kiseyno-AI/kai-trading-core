@@ -4459,6 +4459,25 @@ class DailyPipelineRunStateService:
                     'daily pipeline and EOD collection contexts do not match'
                 )
 
+            eod_metadata = dict(
+                eod_run.run_metadata
+                if isinstance(
+                    getattr(eod_run, 'run_metadata', None),
+                    dict,
+                )
+                else {}
+            )
+            reverse_pipeline_run_id = _as_int(
+                eod_metadata.get('daily_pipeline_run_id')
+            )
+            if reverse_pipeline_run_id not in {0, int(pipeline_run_id)}:
+                raise ValueError(
+                    'EOD collection run is linked to a different daily '
+                    'pipeline run'
+                )
+            eod_metadata['daily_pipeline_run_id'] = int(pipeline_run_id)
+            eod_run.run_metadata = eod_metadata
+
             metadata = dict(run_row.run_metadata or {})
             metadata['eod_collection_run_id'] = int(eod_run_id)
             run_row.run_metadata = metadata
@@ -4514,13 +4533,30 @@ class DailyPipelineRunStateService:
                     > 0
                     for stage_row in stage_rows
                 )
+                entrypoint = str(
+                    run_metadata.get('entrypoint') or ''
+                ).strip()
+                resolved_stage_ids = {
+                    str(stage_id).strip()
+                    for stage_id in (
+                        run_metadata.get('resolved_stages') or []
+                    )
+                    if str(stage_id).strip()
+                }
                 is_auto_pykrx_parent = bool(
                     run_metadata.get('mode') == 'daily_auto'
-                    or run_metadata.get('entrypoint')
+                    or entrypoint
                     == 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
                     or run_row.trigger == 'auto_eod_followup_resume'
                 )
-                if has_eod_reference or is_auto_pykrx_parent:
+                is_internal_pykrx_parent = bool(
+                    entrypoint == 'daily_pipeline_stage_service.run'
+                    and 'price_collection' in resolved_stage_ids
+                )
+                is_pykrx_parent = bool(
+                    is_auto_pykrx_parent or is_internal_pykrx_parent
+                )
+                if has_eod_reference or is_pykrx_parent:
                     source_key, trade_key = eod_collection_advisory_lock_keys(
                         market='KRX',
                         trade_date=expected_market_date,
@@ -4580,9 +4616,11 @@ class DailyPipelineRunStateService:
                     ):
                         linked_eod_runs.append(eod_run)
 
-                # Older runs may have crashed after creating the provider row
-                # but before their first stage checkpoint persisted its ID.
-                if not linked_eod_ids and is_auto_pykrx_parent:
+                # A process can stop after the provider row is committed but
+                # before the parent-side link commits. Recover that narrow
+                # window only through the exact reverse metadata authority;
+                # same-date/trigger proximity is never ownership evidence.
+                if not linked_eod_ids and is_pykrx_parent:
                     fallback_eod_runs = list(
                         session.execute(
                             select(EODCollectionRun)
@@ -4607,25 +4645,6 @@ class DailyPipelineRunStateService:
                             .limit(2)
                         ).scalars()
                     )
-                    if not fallback_eod_runs:
-                        fallback_eod_runs = list(
-                            session.execute(
-                                select(EODCollectionRun)
-                                .where(
-                                    EODCollectionRun.market == 'KRX',
-                                    EODCollectionRun.source == 'pykrx',
-                                    EODCollectionRun.trade_date
-                                    == expected_market_date,
-                                    EODCollectionRun.trigger == run_row.trigger,
-                                    EODCollectionRun.status == 'running',
-                                )
-                                .order_by(
-                                    EODCollectionRun.started_at.desc(),
-                                    EODCollectionRun.id.desc(),
-                                )
-                                .limit(2)
-                            ).scalars()
-                    )
                     if len(fallback_eod_runs) > 1:
                         ambiguous_eod_link_run_ids.append(int(run_row.id))
                         linked_eod_runs = []
@@ -4646,13 +4665,6 @@ class DailyPipelineRunStateService:
                     ambiguous_eod_link_run_ids.append(int(run_row.id))
                     linked_eod_runs = []
 
-                resolved_stage_ids = {
-                    str(stage_id).strip()
-                    for stage_id in (
-                        (run_row.run_metadata or {}).get('resolved_stages') or []
-                    )
-                    if str(stage_id).strip()
-                }
                 if not resolved_stage_ids:
                     resolved_stage_ids = {
                         str(stage_row.stage_id).strip()

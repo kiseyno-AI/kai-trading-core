@@ -1928,6 +1928,63 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
 
+    def test_extract_result_counts_uses_signal_feature_result_scope(self) -> None:
+        counts = _extract_result_counts(
+            {
+                'status': 'completed',
+                'features_persisted': 2_702,
+                'features_failed': 0,
+                'items_total': 2_702,
+            },
+            default_total=2_675,
+            stage_id='signal_features',
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2_702,
+                'total': 2_702,
+                'succeeded': 2_702,
+                'failed': 0,
+            },
+        )
+        self.assertEqual(
+            counts['processed'],
+            counts['succeeded'] + counts['failed'],
+        )
+        self.assertLessEqual(counts['succeeded'], counts['processed'])
+        self.assertLessEqual(counts['processed'], counts['total'])
+
+    def test_extract_result_counts_derives_signal_feature_scope_without_total(
+        self,
+    ) -> None:
+        counts = _extract_result_counts(
+            {
+                'status': 'partial',
+                'features_persisted': 2_702,
+                'features_failed': 3,
+            },
+            default_total=2_675,
+            stage_id='signal_features',
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2_705,
+                'total': 2_705,
+                'succeeded': 2_702,
+                'failed': 3,
+            },
+        )
+        self.assertEqual(
+            counts['processed'],
+            counts['succeeded'] + counts['failed'],
+        )
+        self.assertLessEqual(counts['succeeded'], counts['processed'])
+        self.assertLessEqual(counts['processed'], counts['total'])
+
     def test_extract_followup_source_run_ids_maps_feedback_result_run_id(
         self,
     ) -> None:
@@ -13611,6 +13668,81 @@ class PykrxBackfillServiceTests(TestCase):
                     'failed',
                 )
                 run_state_service.finish_run.assert_called_once()
+
+    def test_grouped_pipeline_owner_is_persisted_and_linked_before_provider_work(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        run_state_service = MagicMock()
+        run_state_service.link_eod_run.side_effect = RuntimeError(
+            'owner link unavailable'
+        )
+
+        with (
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch.object(
+                service,
+                'load_active_universe',
+                return_value=[
+                    PykrxSymbol(
+                        symbol='005930',
+                        market='KOSPI',
+                        name_ko='Samsung Electronics',
+                    )
+                ],
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service',
+                run_state_service,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=12,
+            ) as create_run,
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run'
+            ) as complete_run,
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date'
+            ) as collect_prices,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'owner link unavailable',
+            ):
+                service._run_market_data_pipeline(
+                    start_date='20260403',
+                    end_date='20260403',
+                    markets=('KOSPI',),
+                    trigger='internal_ops_cli_stage',
+                    refresh_universe=False,
+                    mode='daily_stage_run',
+                    selected_stages=('price_collection',),
+                    chain_fundamentals_followup=False,
+                    owning_pipeline_run_id=9000,
+                )
+
+        self.assertEqual(
+            create_run.call_args.kwargs['run_metadata'][
+                'daily_pipeline_run_id'
+            ],
+            9000,
+        )
+        run_state_service.link_eod_run.assert_called_once_with(
+            pipeline_run_id=9000,
+            eod_run_id=12,
+        )
+        run_state_service.start_run.assert_not_called()
+        collect_prices.assert_not_called()
+        complete_run.assert_called_once()
+        self.assertEqual(
+            complete_run.call_args.kwargs['status'],
+            'failed',
+        )
 
     def test_run_daily_pipeline_marks_stale_running_row_failed_and_retries(self) -> None:
         service = PykrxBackfillService()

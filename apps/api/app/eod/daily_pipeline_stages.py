@@ -1714,6 +1714,7 @@ class DailyPipelineStageService:
                     ),
                     'force': force,
                     'symbols': resolved_symbols,
+                    'owning_pipeline_run_id': pipeline_run_id,
                 }
                 if point_in_time_recovery:
                     pykrx_kwargs['point_in_time_recovery'] = True
@@ -4425,6 +4426,13 @@ class DailyPipelineStageService:
             payload = dict(result)
             payload.setdefault('market_date', result.get('latest_available_trade_date'))
             return payload
+        source_run_ids = (
+            dict(result['source_run_ids'])
+            if isinstance(result.get('source_run_ids'), dict)
+            else {}
+        )
+        if stage_id == 'price_collection' and result.get('run_id') is not None:
+            source_run_ids.setdefault('eod_run_id', result['run_id'])
         if stage_id == 'price_collection':
             try:
                 total = max(int(result.get('symbols_total') or 0), 0)
@@ -4449,6 +4457,7 @@ class DailyPipelineStageService:
                 price_status = 'completed'
             return {
                 'run_id': result.get('run_id'),
+                'source_run_ids': source_run_ids,
                 'status': price_status,
                 'market_date': result.get('latest_available_trade_date'),
                 'symbols_total': result.get('symbols_total'),
@@ -4496,6 +4505,13 @@ class DailyPipelineStageService:
                 }
         payload.setdefault('run_id', result.get('run_id'))
         payload.setdefault('market_date', result.get('latest_available_trade_date'))
+        payload_source_run_ids = (
+            dict(payload['source_run_ids'])
+            if isinstance(payload.get('source_run_ids'), dict)
+            else {}
+        )
+        payload_source_run_ids.update(source_run_ids)
+        payload['source_run_ids'] = payload_source_run_ids
         return payload
 
     def _build_stage_outcome(self, stage_id: str, result: dict[str, Any]) -> dict[str, Any]:
