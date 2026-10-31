@@ -593,6 +593,97 @@ def _stage_ids(
     }
 
 
+def normalize_daily_pipeline_stage_status(
+    *,
+    stage_id: str | None,
+    status: Any,
+    outcome: Mapping[str, Any] | None = None,
+) -> str:
+    """Canonicalize terminal optional-context unavailability.
+
+    The default daily pipeline treats news and macro context as ordering-only
+    inputs. Once an attempted optional stage has terminally reported that the
+    context is unavailable, keep that degradation visible as ``partial``
+    rather than leaving a non-canonical status that poisons the parent run.
+    Required stages and any active, blocked, or retry-pending shape remain
+    unchanged and therefore fail closed.
+    """
+
+    normalized_status = str(status or '').strip().lower()
+    normalized_stage_id = str(stage_id or '').strip().lower()
+    if (
+        normalized_status != 'unavailable'
+        or normalized_stage_id
+        not in ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS
+    ):
+        return normalized_status
+
+    candidate = dict(outcome or {})
+    candidate['stage'] = normalized_stage_id
+    candidate['status'] = normalized_status
+    payloads = _semantic_result_payloads(candidate)
+    if _partial_has_blocking_evidence(payloads):
+        return normalized_status
+    if not _partial_retries_are_terminal(payloads):
+        return normalized_status
+
+    unresolved_statuses = {
+        'abandoned',
+        'blocked',
+        'in_progress',
+        'interrupted',
+        'pending',
+        'queued',
+        'retry_pending',
+        'retrying',
+        'running',
+        'waiting',
+    }
+    observed_statuses = {
+        str(payload.get(key) or '').strip().lower()
+        for payload in payloads
+        for key in ('status', 'stage_status', 'run_status', 'retry_status')
+        if str(payload.get(key) or '').strip()
+    }
+    if observed_statuses & unresolved_statuses:
+        return normalized_status
+
+    retry_pending_flags = (
+        'has_pending_retry',
+        'retry_pending',
+        'retry_required',
+        'retry_scheduled',
+    )
+    retry_pending_counts = (
+        'pending_retry_count',
+        'remaining_retry_count',
+        'retry_pending_count',
+    )
+    if any(
+        payload.get(key) is True
+        for payload in payloads
+        for key in retry_pending_flags
+    ) or any(
+        (_optional_int(payload.get(key)) or 0) > 0
+        for payload in payloads
+        for key in retry_pending_counts
+    ):
+        return normalized_status
+    if any(
+        payload.get('triggered') is False
+        and payload.get('safe_skip') is not True
+        for payload in payloads
+    ):
+        return normalized_status
+    if any(
+        payload.get('terminal') is False
+        or payload.get('completed') is False
+        for payload in payloads
+    ):
+        return normalized_status
+    return 'partial'
+
+
 def _optional_context_degradation_is_terminal(
     *,
     status: str,
@@ -774,34 +865,97 @@ def daily_pipeline_outcome_is_satisfied(
 
     if not isinstance(outcome, Mapping):
         return False
-    status = str(outcome.get('status') or '').strip().lower()
+    normalized_outcome = dict(outcome)
+    status = normalize_daily_pipeline_stage_status(
+        stage_id=str(
+            outcome.get('stage')
+            or outcome.get('stage_id')
+            or outcome.get('task')
+            or ''
+        ),
+        status=outcome.get('status'),
+        outcome=outcome,
+    )
+    normalized_outcome['status'] = status
     if status == 'completed':
-        payloads = _payloads(outcome)
+        payloads = _payloads(normalized_outcome)
         if (
-            daily_pipeline_result_has_no_ready_content(outcome)
+            daily_pipeline_result_has_no_ready_content(normalized_outcome)
             or _partial_has_blocking_evidence(payloads)
             or not _partial_retries_are_terminal(payloads)
             or _has_positive_failure_evidence(payloads)
         ):
             return False
-        nested_stages_satisfied = _nested_stages_are_satisfied(outcome)
+        nested_stages_satisfied = _nested_stages_are_satisfied(
+            normalized_outcome
+        )
         return (
             True
             if nested_stages_satisfied is None
             else nested_stages_satisfied
         )
     if status == 'partial':
-        return _partial_outcome_is_satisfied(outcome)
+        return _partial_outcome_is_satisfied(normalized_outcome)
     if status != 'skipped':
         return False
-    payloads = _payloads(outcome)
+    payloads = _payloads(normalized_outcome)
     if _optional_context_degradation_is_terminal(
         status='skipped',
         payloads=payloads,
     ):
         return True
-    reasons = _skip_reasons(outcome)
+    reasons = _skip_reasons(normalized_outcome)
     return bool(reasons) and reasons <= SATISFIED_DEPENDENCY_SKIP_REASONS
+
+
+def daily_pipeline_nonblocking_warning_stage_ids(
+    stage_outcomes: Mapping[str, Mapping[str, Any] | str],
+) -> tuple[str, ...]:
+    """Return optional terminal partials that must not fail the parent run.
+
+    The stage remains visibly ``partial`` for diagnostics. Only ordering-only
+    context stages with satisfied terminal evidence are downgraded to parent
+    run warnings; active, blocked, failed, or retryable work remains fail
+    closed.
+    """
+
+    warning_stage_ids: list[str] = []
+    for raw_stage_id, raw_outcome in stage_outcomes.items():
+        stage_id = str(raw_stage_id or '').strip().lower()
+        if stage_id not in ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS:
+            continue
+        outcome = (
+            dict(raw_outcome)
+            if isinstance(raw_outcome, Mapping)
+            else {'status': raw_outcome}
+        )
+        outcome['stage'] = stage_id
+        outcome['status'] = normalize_daily_pipeline_stage_status(
+            stage_id=stage_id,
+            status=outcome.get('status'),
+            outcome=outcome,
+        )
+        if (
+            str(outcome.get('status') or '').strip().lower() == 'partial'
+            and daily_pipeline_outcome_is_satisfied(outcome)
+        ):
+            warning_stage_ids.append(stage_id)
+    return tuple(warning_stage_ids)
+
+
+def daily_pipeline_warning_metadata(
+    stage_outcomes: Mapping[str, Mapping[str, Any] | str],
+) -> dict[str, Any]:
+    """Build stable parent/API quality metadata for optional degradation."""
+
+    warning_stage_ids = list(
+        daily_pipeline_nonblocking_warning_stage_ids(stage_outcomes)
+    )
+    return {
+        'quality_status': 'degraded' if warning_stage_ids else 'healthy',
+        'warning_stage_ids': warning_stage_ids,
+        'warning_count': len(warning_stage_ids),
+    }
 
 
 def daily_pipeline_prefix_outcome_is_satisfied(

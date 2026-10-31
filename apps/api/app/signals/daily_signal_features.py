@@ -49,6 +49,8 @@ VOLUME_POWER = 'volume-power'
 OVERTIME_VOLUME = 'overtime-volume'
 OVERTIME_FLUCTUATION = 'overtime-fluctuation'
 SUPPORTED_SIGNAL_SOURCES = (VOLUME_POWER, OVERTIME_VOLUME, OVERTIME_FLUCTUATION)
+SIGNAL_SOURCE_MAX_ATTEMPTS = 2
+SIGNAL_SOURCE_RETRY_BASE_SECONDS = 0.25
 
 FACTOR_SCORE_FIELD_SPECS: dict[str, dict[str, str | None]] = {
     'value': {
@@ -1108,6 +1110,26 @@ class DailySignalFeatureService:
     def __init__(self, *, client=None) -> None:
         self.client = client or kis_client
 
+    async def _fetch_ranking_source(self, fetch, **kwargs) -> dict[str, Any]:
+        """Run one read-only ranking call with one bounded retry.
+
+        KIS client exceptions carry an explicit ``retryable`` classification.
+        Restricting retries to that signal keeps request/configuration failures
+        fail-fast and avoids adding retries to the generic client where order
+        submissions also flow.
+        """
+
+        for attempt in range(SIGNAL_SOURCE_MAX_ATTEMPTS):
+            try:
+                return await fetch(**kwargs)
+            except Exception as exc:
+                is_final_attempt = attempt + 1 >= SIGNAL_SOURCE_MAX_ATTEMPTS
+                if is_final_attempt or getattr(exc, 'retryable', False) is not True:
+                    raise
+                await asyncio.sleep(SIGNAL_SOURCE_RETRY_BASE_SECONDS * (2**attempt))
+
+        raise AssertionError('unreachable signal source retry state')
+
     async def collect_features(
         self,
         *,
@@ -1130,20 +1152,25 @@ class DailySignalFeatureService:
 
         if VOLUME_POWER in selected_sources:
             try:
-                response = await self.client.fetch_domestic_ranking_volume_power(max_pages=max_pages)
+                response = await self._fetch_ranking_source(
+                    self.client.fetch_domestic_ranking_volume_power,
+                    max_pages=max_pages,
+                )
                 source_rows[VOLUME_POWER] = list(response.get('output') or [])
                 collection[VOLUME_POWER] = {
                     'page_count': response.get('page_count'),
                     'max_pages_reached': response.get('max_pages_reached'),
                 }
             except Exception as exc:
+                error_message = str(exc).strip() or type(exc).__name__
                 source_rows[VOLUME_POWER] = []
-                source_errors[VOLUME_POWER] = str(exc)
-                collection[VOLUME_POWER] = {'error': str(exc)}
+                source_errors[VOLUME_POWER] = error_message
+                collection[VOLUME_POWER] = {'error': error_message}
 
         if OVERTIME_VOLUME in selected_sources:
             try:
-                response = await self.client.fetch_domestic_ranking_overtime_volume(
+                response = await self._fetch_ranking_source(
+                    self.client.fetch_domestic_ranking_overtime_volume,
                     rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
                     max_pages=max_pages,
                 )
@@ -1154,13 +1181,15 @@ class DailySignalFeatureService:
                     'summary_rows': response.get('output1') or [],
                 }
             except Exception as exc:
+                error_message = str(exc).strip() or type(exc).__name__
                 source_rows[OVERTIME_VOLUME] = []
-                source_errors[OVERTIME_VOLUME] = str(exc)
-                collection[OVERTIME_VOLUME] = {'error': str(exc)}
+                source_errors[OVERTIME_VOLUME] = error_message
+                collection[OVERTIME_VOLUME] = {'error': error_message}
 
         if OVERTIME_FLUCTUATION in selected_sources:
             try:
-                response = await self.client.fetch_domestic_ranking_overtime_fluctuation(
+                response = await self._fetch_ranking_source(
+                    self.client.fetch_domestic_ranking_overtime_fluctuation,
                     div_cls_code=overtime_fluctuation_div_cls_code,
                     max_pages=max_pages,
                 )
@@ -1171,9 +1200,10 @@ class DailySignalFeatureService:
                     'summary_rows': response.get('output1') or [],
                 }
             except Exception as exc:
+                error_message = str(exc).strip() or type(exc).__name__
                 source_rows[OVERTIME_FLUCTUATION] = []
-                source_errors[OVERTIME_FLUCTUATION] = str(exc)
-                collection[OVERTIME_FLUCTUATION] = {'error': str(exc)}
+                source_errors[OVERTIME_FLUCTUATION] = error_message
+                collection[OVERTIME_FLUCTUATION] = {'error': error_message}
 
         collection['source_counts'] = {source: len(source_rows.get(source, [])) for source in selected_sources}
         direct_rows = build_daily_signal_feature_rows(

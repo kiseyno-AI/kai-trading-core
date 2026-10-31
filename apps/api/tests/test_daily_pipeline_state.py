@@ -1257,6 +1257,86 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(run.status, 'partial')
         self.assertFalse(run.run_metadata['resumable'])
 
+    def test_converge_optional_context_partial_completes_with_warning_metadata(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 14, 7, 39, 11, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            id=398,
+            status='interrupted',
+            error_message='Core restarted.',
+            completed_at=now - timedelta(minutes=1),
+            updated_at=now - timedelta(minutes=1),
+            run_metadata={
+                'resolved_stages': [
+                    'technical_snapshots',
+                    'macro_context_refresh',
+                ],
+                'resumable': True,
+            },
+        )
+        stages = [
+            SimpleNamespace(
+                stage_id='technical_snapshots',
+                status='completed',
+                processed=100,
+                total=100,
+                succeeded=100,
+                failed=0,
+                remaining=0,
+            ),
+            SimpleNamespace(
+                stage_id='macro_context_refresh',
+                status='unavailable',
+                processed=3,
+                total=3,
+                succeeded=2,
+                failed=1,
+                remaining=0,
+                details={
+                    'result_summary': {
+                        'triggered': True,
+                        'status': 'unavailable',
+                        'remaining_retryable_events': 0,
+                    },
+                },
+            ),
+        ]
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = stages
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .converge_terminal_stages_run(pipeline_run_id=398)
+            )
+
+        self.assertTrue(result['updated'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(run.status, 'completed')
+        self.assertEqual(run.run_metadata['quality_status'], 'degraded')
+        self.assertEqual(
+            run.run_metadata['warning_stage_ids'],
+            ['macro_context_refresh'],
+        )
+        self.assertEqual(run.run_metadata['warning_count'], 1)
+        self.assertEqual(
+            run.run_metadata['stage_statuses']['macro_context_refresh'],
+            'partial',
+        )
+
     def test_converge_satisfied_terminal_partial_marks_non_resumable(
         self,
     ) -> None:

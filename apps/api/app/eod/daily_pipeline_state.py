@@ -26,6 +26,8 @@ from app.db_models import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    daily_pipeline_warning_metadata,
+    normalize_daily_pipeline_stage_status,
     terminal_continuation_expired_decision_skip_evidence_is_valid,
     terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_lease_loss_resume_lineage_is_valid,
@@ -393,10 +395,18 @@ def _build_counts(
 
 def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
     stage_id = str(getattr(stage_row, 'stage_id', '') or '').strip()
-    return {
+    raw_status = str(
+        getattr(stage_row, 'status', '') or ''
+    ).strip().lower()
+    details = (
+        dict(getattr(stage_row, 'details', {}))
+        if isinstance(getattr(stage_row, 'details', {}), Mapping)
+        else {}
+    )
+    outcome = {
         'stage': stage_id,
         'stage_id': stage_id,
-        'status': str(getattr(stage_row, 'status', '') or '').strip().lower(),
+        'status': raw_status,
         'processed': _as_int(getattr(stage_row, 'processed', 0)),
         'total': _as_int(getattr(stage_row, 'total', 0)),
         'succeeded': _as_int(getattr(stage_row, 'succeeded', 0)),
@@ -404,12 +414,22 @@ def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
         'remaining': _as_int(getattr(stage_row, 'remaining', 0)),
         'completed_at': getattr(stage_row, 'completed_at', None),
         'error_message': getattr(stage_row, 'error_message', None),
-        'details': (
-            getattr(stage_row, 'details', {})
-            if isinstance(getattr(stage_row, 'details', {}), Mapping)
-            else {}
-        ),
+        'details': details,
     }
+    normalized_status = normalize_daily_pipeline_stage_status(
+        stage_id=stage_id,
+        status=raw_status,
+        outcome=outcome,
+    )
+    if normalized_status != raw_status:
+        outcome['status'] = normalized_status
+        outcome['source_status'] = raw_status
+        details.setdefault('status_canonicalized_from', raw_status)
+        details.setdefault(
+            'status_canonicalization_reason',
+            'terminal_optional_context_unavailable',
+        )
+    return outcome
 
 
 def _build_stage_duration_details(
@@ -755,7 +775,31 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
-        normalized_status = str(status or 'running')
+        raw_status = str(status or 'running').strip().lower()
+        normalized_details = dict(details or {})
+        normalized_status = normalize_daily_pipeline_stage_status(
+            stage_id=stage_id,
+            status=raw_status,
+            outcome={
+                'stage': stage_id,
+                'status': raw_status,
+                'processed': processed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+                'remaining': remaining,
+                'details': normalized_details,
+            },
+        )
+        if normalized_status != raw_status:
+            normalized_details.setdefault(
+                'status_canonicalized_from',
+                raw_status,
+            )
+            normalized_details.setdefault(
+                'status_canonicalization_reason',
+                'terminal_optional_context_unavailable',
+            )
         terminal = normalized_status in TERMINAL_DAILY_PIPELINE_STATUSES
         with session_scope(
             statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
@@ -812,8 +856,8 @@ class DailyPipelineRunStateService:
             if source_run_ids is not None:
                 row.source_run_ids = dict(source_run_ids)
             row.completed_at = completed_at or (now if terminal else None)
-            if details is not None:
-                row.details = dict(details)
+            if details is not None or normalized_status != raw_status:
+                row.details = normalized_details
             if terminal:
                 merged_details = dict(row.details or {})
                 merged_details.update(
@@ -3980,14 +4024,23 @@ class DailyPipelineRunStateService:
                     'incomplete_stages': incomplete_stages,
                 }
 
+            warning_metadata = daily_pipeline_warning_metadata(
+                persisted_stage_outcomes,
+            )
+            warning_stage_ids = set(warning_metadata['warning_stage_ids'])
+            parent_statuses = {
+                stage_id: status
+                for stage_id, status in stage_statuses.items()
+                if stage_id not in warning_stage_ids
+            }
             if any(
                 status == 'partial'
-                for status in stage_statuses.values()
+                for status in parent_statuses.values()
             ):
                 terminal_status = 'partial'
-            elif all(
+            elif parent_statuses and all(
                 status == 'skipped'
-                for status in stage_statuses.values()
+                for status in parent_statuses.values()
             ):
                 terminal_status = 'skipped'
             else:
@@ -4023,6 +4076,7 @@ class DailyPipelineRunStateService:
                             now.isoformat()
                         ),
                         'stage_statuses': merged_stage_statuses,
+                        **warning_metadata,
                     }
                 )
                 run_row.updated_at = now
@@ -4041,6 +4095,7 @@ class DailyPipelineRunStateService:
                     'converged_at': now.isoformat(),
                     'converged_from_status': current_status,
                     'stage_statuses': stage_statuses,
+                    **warning_metadata,
                 }
             )
             run_row.status = terminal_status

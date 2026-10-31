@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from app.core.audit_logging import log_fetch_event, request_with_audit
+from app.core.audit_logging import exception_message, log_fetch_event, request_read_with_retry_and_audit
 from app.core.settings import settings
 
 
@@ -17,9 +17,10 @@ class FREDAPIError(RuntimeError):
 
 
 class FREDClient:
-    def __init__(self) -> None:
+    def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.base_url = settings.fred_base_url.rstrip('/')
         self.timeout_seconds = float(settings.macro_context_request_timeout_seconds or 15.0)
+        self.transport = transport
 
     async def fetch_latest_observations(
         self,
@@ -43,8 +44,8 @@ class FREDClient:
             'limit': str(max(1, int(limit or 1))),
         }
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await request_with_audit(
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
+                response = await request_read_with_retry_and_audit(
                     client,
                     'fred',
                     'GET',
@@ -53,7 +54,7 @@ class FREDClient:
                     secret_values=[api_key],
                 )
         except httpx.HTTPError as exc:
-            raise FREDAPIError(f'FRED transport error: {exc}') from exc
+            raise FREDAPIError(f'FRED transport error: {exception_message(exc)}') from exc
         if response.status_code >= 400:
             raise FREDAPIError(f'FRED request failed [{response.status_code}]: {response.text}')
 

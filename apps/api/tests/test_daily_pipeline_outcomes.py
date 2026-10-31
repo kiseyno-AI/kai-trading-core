@@ -6,9 +6,12 @@ from unittest.mock import patch
 import pytest
 
 from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
     daily_pipeline_result_has_no_ready_content,
+    daily_pipeline_warning_metadata,
+    normalize_daily_pipeline_stage_status,
     terminal_continuation_feedback_lease_loss_run_id,
 )
 from app.eod.pykrx_backfill import PykrxBackfillService
@@ -222,6 +225,168 @@ def test_explicit_ready_partial_is_satisfied() -> None:
     }
 
     assert daily_pipeline_outcome_is_satisfied(outcome) is True
+
+
+def test_optional_context_terminal_partial_is_run_warning() -> None:
+    outcomes = {
+        'technical_snapshots': {
+            'status': 'completed',
+        },
+        'macro_context_refresh': {
+            'status': 'partial',
+            'details': {
+                'result_summary': {
+                    'status': 'partial',
+                    'remaining_retryable_events': 0,
+                },
+            },
+        },
+    }
+
+    assert daily_pipeline_nonblocking_warning_stage_ids(outcomes) == (
+        'macro_context_refresh',
+    )
+    assert daily_pipeline_warning_metadata(outcomes) == {
+        'quality_status': 'degraded',
+        'warning_stage_ids': ['macro_context_refresh'],
+        'warning_count': 1,
+    }
+
+
+@pytest.mark.parametrize(
+    'stage_id',
+    [
+        'external_news_collect',
+        'external_news_enrich',
+        'macro_context_refresh',
+    ],
+)
+def test_terminal_optional_context_unavailable_is_canonical_partial_warning(
+    stage_id: str,
+) -> None:
+    outcome = {
+        'stage': stage_id,
+        'status': 'unavailable',
+        'details': {
+            'result_summary': {
+                'triggered': True,
+                'status': 'unavailable',
+                'reason': 'provider_unavailable',
+            },
+        },
+    }
+
+    assert normalize_daily_pipeline_stage_status(
+        stage_id=stage_id,
+        status='unavailable',
+        outcome=outcome,
+    ) == 'partial'
+    assert daily_pipeline_outcome_is_satisfied(outcome) is True
+    assert daily_pipeline_nonblocking_warning_stage_ids(
+        {stage_id: outcome}
+    ) == (stage_id,)
+
+
+def test_required_unavailable_stage_remains_fail_closed() -> None:
+    outcome = {
+        'stage': 'momentum_factors',
+        'status': 'unavailable',
+    }
+
+    assert normalize_daily_pipeline_stage_status(
+        stage_id='momentum_factors',
+        status='unavailable',
+        outcome=outcome,
+    ) == 'unavailable'
+    assert daily_pipeline_outcome_is_satisfied(outcome) is False
+
+
+@pytest.mark.parametrize(
+    'unresolved_details',
+    [
+        {'result_summary': {'status': 'running'}},
+        {'result_summary': {'retry_status': 'retry_pending'}},
+        {'result_summary': {'remaining_retryable_events': 1}},
+        {'blocking_status': 'blocking'},
+    ],
+)
+def test_optional_context_unavailable_with_unresolved_work_fails_closed(
+    unresolved_details: dict,
+) -> None:
+    outcome = {
+        'stage': 'macro_context_refresh',
+        'status': 'unavailable',
+        'details': unresolved_details,
+    }
+
+    assert normalize_daily_pipeline_stage_status(
+        stage_id='macro_context_refresh',
+        status='unavailable',
+        outcome=outcome,
+    ) == 'unavailable'
+    assert daily_pipeline_outcome_is_satisfied(outcome) is False
+    assert daily_pipeline_nonblocking_warning_stage_ids(
+        {'macro_context_refresh': outcome}
+    ) == ()
+
+
+@pytest.mark.parametrize('status', ['running', 'waiting', 'blocked', 'failed'])
+def test_optional_context_nonterminal_or_failed_status_is_not_run_warning(
+    status: str,
+) -> None:
+    outcomes = {
+        'macro_context_refresh': {
+            'status': status,
+        },
+    }
+
+    assert daily_pipeline_nonblocking_warning_stage_ids(outcomes) == ()
+    assert daily_pipeline_warning_metadata(outcomes) == {
+        'quality_status': 'healthy',
+        'warning_stage_ids': [],
+        'warning_count': 0,
+    }
+
+
+def test_required_terminal_partial_is_not_run_warning() -> None:
+    outcomes = {
+        'momentum_factors': _partial_outcome(
+            succeeded=999,
+            total=1_000,
+            details={'remaining_retryable_events': 0},
+        ),
+    }
+
+    assert daily_pipeline_outcome_is_satisfied(
+        outcomes['momentum_factors'],
+    ) is True
+    assert daily_pipeline_nonblocking_warning_stage_ids(outcomes) == ()
+
+
+@pytest.mark.parametrize(
+    'details',
+    [
+        {'blocking_status': 'blocking'},
+        {'remaining_retryable_events': 1},
+    ],
+)
+def test_optional_context_partial_with_unresolved_work_is_not_run_warning(
+    details: dict,
+) -> None:
+    outcomes = {
+        'macro_context_refresh': {
+            'status': 'partial',
+            'details': details,
+        },
+    }
+
+    assert daily_pipeline_outcome_is_satisfied(
+        {
+            'stage': 'macro_context_refresh',
+            **outcomes['macro_context_refresh'],
+        },
+    ) is False
+    assert daily_pipeline_nonblocking_warning_stage_ids(outcomes) == ()
 
 
 def test_conflicting_blocked_gate_overrides_ready_partial() -> None:

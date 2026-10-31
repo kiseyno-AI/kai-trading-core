@@ -34,6 +34,7 @@ from app.eod.action_summaries import daily_action_summary_service
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_result_has_no_ready_content,
+    daily_pipeline_warning_metadata,
     daily_pipeline_zero_scope_gate_status,
     pykrx_enrichment_preflight_is_ready,
 )
@@ -2540,14 +2541,28 @@ class DailyPipelineStageService:
                 for stage_id, outcome in stage_outcomes.items()
             },
         }
+        merged_stage_outcomes = {
+            stage_id: {
+                'stage': stage_id,
+                'status': stage_status,
+            }
+            for stage_id, stage_status in merged_stage_statuses.items()
+        }
+        merged_stage_outcomes.update(stage_outcomes)
+        warning_metadata = daily_pipeline_warning_metadata(
+            merged_stage_outcomes,
+        )
+        warning_stage_ids = set(warning_metadata['warning_stage_ids'])
         overall_status = self._resolve_overall_status(
             [
-                {'status': stage_status}
-                for stage_status in merged_stage_statuses.values()
+                outcome
+                for stage_id, outcome in merged_stage_outcomes.items()
+                if stage_id not in warning_stage_ids
             ]
         )
         run_metadata = {
             'stage_statuses': merged_stage_statuses,
+            **warning_metadata,
             **self._feedback_cutoff_run_metadata(
                 feedback_knowledge_cutoff_at,
                 feedback_cutoff_resolution,

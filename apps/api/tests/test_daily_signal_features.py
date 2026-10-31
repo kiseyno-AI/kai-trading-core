@@ -5,6 +5,7 @@ from app.brokers.kis.client import KISClient
 from app.signals.daily_signal_features import (
     OVERTIME_FLUCTUATION,
     OVERTIME_VOLUME,
+    SIGNAL_SOURCE_RETRY_BASE_SECONDS,
     VOLUME_POWER,
     DailySignalFeatureCollection,
     DailySignalFeatureService,
@@ -95,6 +96,10 @@ class FailingKISRankingClient:
         return {'output1': [], 'output2': [], 'page_count': 0, 'max_pages_reached': False}
 
 
+class RetryableRankingError(RuntimeError):
+    retryable = True
+
+
 class DailySignalFeatureBuilderTests(unittest.TestCase):
     def test_build_daily_signal_feature_rows_merges_source_features_by_symbol(self):
         rows = build_daily_signal_feature_rows(
@@ -137,6 +142,107 @@ class DailySignalFeatureBuilderTests(unittest.TestCase):
 
 
 class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collect_features_retries_each_retryable_kis_ranking_read_once(self):
+        client = type(
+            'RetryingKISRankingClient',
+            (),
+            {
+                'fetch_domestic_ranking_volume_power': AsyncMock(
+                    side_effect=[
+                        RetryableRankingError('temporary volume power failure'),
+                        {'output': [], 'page_count': 1, 'max_pages_reached': False},
+                    ]
+                ),
+                'fetch_domestic_ranking_overtime_volume': AsyncMock(
+                    side_effect=[
+                        RetryableRankingError('temporary overtime volume failure'),
+                        {'output1': [], 'output2': [], 'page_count': 1, 'max_pages_reached': False},
+                    ]
+                ),
+                'fetch_domestic_ranking_overtime_fluctuation': AsyncMock(
+                    side_effect=[
+                        RetryableRankingError('temporary overtime fluctuation failure'),
+                        {'output1': [], 'output2': [], 'page_count': 1, 'max_pages_reached': False},
+                    ]
+                ),
+            },
+        )()
+        service = DailySignalFeatureService(client=client)
+
+        with (
+            patch('app.signals.daily_signal_features.asyncio.sleep', new=AsyncMock()) as sleep,
+            patch(
+                'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+                return_value=([], {}),
+            ),
+        ):
+            result = await service.collect_features(market_date='2026-05-06')
+
+        self.assertEqual(result.source_errors, {})
+        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 2)
+        self.assertEqual(client.fetch_domestic_ranking_overtime_volume.await_count, 2)
+        self.assertEqual(client.fetch_domestic_ranking_overtime_fluctuation.await_count, 2)
+        self.assertEqual(sleep.await_count, 3)
+
+    async def test_collect_features_does_not_retry_nonretryable_kis_ranking_error(self):
+        client = type(
+            'NonRetryingKISRankingClient',
+            (),
+            {
+                'fetch_domestic_ranking_volume_power': AsyncMock(
+                    side_effect=RuntimeError('invalid request')
+                ),
+            },
+        )()
+        service = DailySignalFeatureService(client=client)
+
+        with (
+            patch('app.signals.daily_signal_features.asyncio.sleep', new=AsyncMock()) as sleep,
+            patch(
+                'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+                return_value=([], {}),
+            ),
+        ):
+            result = await service.collect_features(
+                market_date='2026-05-06',
+                sources=[VOLUME_POWER],
+            )
+
+        self.assertEqual(result.source_errors, {VOLUME_POWER: 'invalid request'})
+        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 1)
+        sleep.assert_not_awaited()
+
+    async def test_collect_features_stops_after_one_retryable_read_retry(self):
+        client = type(
+            'ExhaustedKISRankingClient',
+            (),
+            {
+                'fetch_domestic_ranking_volume_power': AsyncMock(
+                    side_effect=RetryableRankingError('ranking still unavailable')
+                ),
+            },
+        )()
+        service = DailySignalFeatureService(client=client)
+
+        with (
+            patch('app.signals.daily_signal_features.asyncio.sleep', new=AsyncMock()) as sleep,
+            patch(
+                'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+                return_value=([], {}),
+            ),
+        ):
+            result = await service.collect_features(
+                market_date='2026-05-06',
+                sources=[VOLUME_POWER],
+            )
+
+        self.assertEqual(
+            result.source_errors,
+            {VOLUME_POWER: 'ranking still unavailable'},
+        )
+        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 2)
+        sleep.assert_awaited_once_with(SIGNAL_SOURCE_RETRY_BASE_SECONDS)
+
     def test_repair_rebuilds_owned_fallback_without_rewriting_direct_evidence(
         self,
     ) -> None:

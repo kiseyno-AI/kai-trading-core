@@ -1,7 +1,9 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from app.core.settings import settings
 from app.integrations.dart.client import DartAPIError, DartClient
@@ -259,7 +261,10 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch('app.integrations.dart.client.httpx.AsyncClient', FakeAsyncClient),
-            patch('app.integrations.dart.client.request_with_audit', return_value=response),
+            patch(
+                'app.integrations.dart.client.request_read_with_retry_and_audit',
+                return_value=response,
+            ),
             patch('app.integrations.dart.client.log_fetch_event') as log_fetch_event,
         ):
             with self.assertRaises(DartAPIError):
@@ -269,6 +274,98 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log_fetch_event.call_args.kwargs['status'], 'failed')
         self.assertNotIn('test-secret-key', log_fetch_event.call_args.kwargs['error_message'])
         self.assertIn('body omitted', log_fetch_event.call_args.kwargs['error_message'])
+
+    async def test_request_retries_transient_transport_failure(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ReadTimeout('', request=request)
+            return httpx.Response(200, json={'status': '000'}, request=request)
+
+        client = DartClient(transport=httpx.MockTransport(handler))
+        client.api_key = 'test-secret-key'
+        client.base_url = 'https://dart.example.test'
+
+        with patch(
+            'app.core.audit_logging.asyncio.sleep',
+            new_callable=AsyncMock,
+        ):
+            response = await client._request(
+                '/company.json',
+                {'corp_code': '00126380'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attempts, 2)
+
+    async def test_request_retries_transient_http_status(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(503, request=request)
+            return httpx.Response(200, json={'status': '000'}, request=request)
+
+        client = DartClient(transport=httpx.MockTransport(handler))
+        client.api_key = 'test-secret-key'
+        client.base_url = 'https://dart.example.test'
+
+        with patch(
+            'app.core.audit_logging.asyncio.sleep',
+            new_callable=AsyncMock,
+        ):
+            response = await client._request(
+                '/company.json',
+                {'corp_code': '00126380'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attempts, 2)
+
+    async def test_request_stops_after_one_same_call_retry(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ReadTimeout('', request=request)
+
+        client = DartClient(transport=httpx.MockTransport(handler))
+        client.api_key = 'test-secret-key'
+        client.base_url = 'https://dart.example.test'
+
+        with (
+            patch(
+                'app.core.audit_logging.asyncio.sleep',
+                new_callable=AsyncMock,
+            ),
+            self.assertRaises(httpx.ReadTimeout),
+        ):
+            await client._request('/company.json', {'corp_code': '00126380'})
+
+        self.assertEqual(attempts, 2)
+
+    async def test_request_does_not_retry_nontransient_client_error(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(400, text='bad request', request=request)
+
+        client = DartClient(transport=httpx.MockTransport(handler))
+        client.api_key = 'test-secret-key'
+        client.base_url = 'https://dart.example.test'
+
+        with self.assertRaisesRegex(DartAPIError, r'\[400\]'):
+            await client._request('/company.json', {'corp_code': '00126380'})
+
+        self.assertEqual(attempts, 1)
 
 
 if __name__ == '__main__':

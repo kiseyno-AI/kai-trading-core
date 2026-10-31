@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import io
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
+from http.client import IncompleteRead
 from typing import Iterable, Optional
+from urllib.error import HTTPError, URLError
 
 from app.core.audit_logging import download_bytes_with_audit
 from app.eod.master_state import master_refresh_state
@@ -22,6 +25,11 @@ STOCK_SECURITY_GROUP_CODES = frozenset({'ST', 'RT', 'IF', 'MF', 'DR', 'FS'})
 # truncated or format-shifted master files before they can deactivate symbols.
 MIN_MASTER_STOCK_COUNTS = {'KOSPI': 700, 'KOSDAQ': 1_200}
 ISIN_PATTERN = re.compile(r'^[A-Z]{2}[A-Z0-9]{9}[0-9]$')
+MASTER_DOWNLOAD_MAX_ATTEMPTS = 3
+MASTER_DOWNLOAD_RETRY_BASE_SECONDS = 0.25
+MASTER_DOWNLOAD_RETRYABLE_HTTP_STATUSES = frozenset(
+    {408, 425, 429, 500, 502, 503, 504}
+)
 
 
 @dataclass
@@ -37,8 +45,35 @@ class MasterSymbol:
         return {'security_group': self.security_group}
 
 
+def _is_retryable_master_download_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in MASTER_DOWNLOAD_RETRYABLE_HTTP_STATUSES
+    return isinstance(exc, (TimeoutError, ConnectionError, IncompleteRead, URLError))
+
+
 def _download_zip_bytes(url: str) -> bytes:
-    return download_bytes_with_audit(service='kis_master', url=url, timeout=30)
+    """Download one master archive with bounded transport-only retries.
+
+    Each attempt goes through ``download_bytes_with_audit`` so the upstream
+    audit trail retains the original failure and the successful retry.  ZIP
+    parsing and universe validation intentionally happen after this boundary
+    and are therefore never retried here.
+    """
+
+    for attempt in range(MASTER_DOWNLOAD_MAX_ATTEMPTS):
+        try:
+            return download_bytes_with_audit(
+                service='kis_master',
+                url=url,
+                timeout=30,
+            )
+        except Exception as exc:
+            is_final_attempt = attempt + 1 >= MASTER_DOWNLOAD_MAX_ATTEMPTS
+            if is_final_attempt or not _is_retryable_master_download_error(exc):
+                raise
+            time.sleep(MASTER_DOWNLOAD_RETRY_BASE_SECONDS * (2**attempt))
+
+    raise AssertionError('unreachable master download retry state')
 
 
 def _read_zip_member_bytes(payload: bytes, member_suffix: str) -> bytes:

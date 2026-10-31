@@ -14,7 +14,7 @@ from xml.etree import ElementTree
 
 import httpx
 
-from app.core.audit_logging import log_fetch_event, request_with_audit
+from app.core.audit_logging import log_fetch_event, request_read_with_retry_and_audit
 from app.core.settings import settings
 
 
@@ -31,9 +31,14 @@ _FILENAME_PATTERN = re.compile(r'filename\s*=\s*"?(?P<filename>[^";]+)"?')
 
 
 class DartClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.base_url = settings.dart_base_url.rstrip('/')
         self.api_key = settings.dart_api_key
+        self.transport = transport
         self._corp_codes: list[dict[str, str]] = []
         self._corp_codes_loaded_at: datetime | None = None
         self._corp_codes_lock = asyncio.Lock()
@@ -448,13 +453,14 @@ class DartClient:
             raise DartAPIError('DART_API_KEY is not configured')
 
         request_params = {'crtfc_key': self.api_key, **params}
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await request_with_audit(
+        async with httpx.AsyncClient(timeout=20.0, transport=self.transport) as client:
+            response = await request_read_with_retry_and_audit(
                 client,
                 'dart',
                 'GET',
                 f'{self.base_url}{path}',
                 params=request_params,
+                max_attempts=2,
             )
             if response.status_code >= 400:
                 log_fetch_event(

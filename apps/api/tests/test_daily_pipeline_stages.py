@@ -3658,6 +3658,43 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(self.run_state_service.finish_run.call_count, 3)
 
+    def test_optional_context_partial_completes_run_with_degraded_quality(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+
+        with patch.object(
+            service,
+            '_execute_stage',
+            return_value={
+                'triggered': True,
+                'status': 'partial',
+                'context_status': 'stale_cache',
+                'remaining_retryable_events': 0,
+            },
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['macro_context_refresh'],
+            )
+
+        self.assertEqual(
+            result['stages']['macro_context_refresh']['status'],
+            'partial',
+        )
+        self.assertEqual(result['status'], 'completed')
+        finish = self.run_state_service.runs[-1]['finish']
+        self.assertEqual(finish['status'], 'completed')
+        self.assertEqual(
+            finish['run_metadata']['quality_status'],
+            'degraded',
+        )
+        self.assertEqual(
+            finish['run_metadata']['warning_stage_ids'],
+            ['macro_context_refresh'],
+        )
+        self.assertEqual(finish['run_metadata']['warning_count'], 1)
+
     def test_stage_failure_preserves_error_when_stage_cleanup_fails(self) -> None:
         self.run_state_service.finish_stage = MagicMock(
             side_effect=RuntimeError('stage cleanup unavailable')

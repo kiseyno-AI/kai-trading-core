@@ -44,7 +44,10 @@ from app.eod.daily_pipeline_stages import (
     DailyPipelineStageService,
 )
 from app.eod.daily_pipeline_outcomes import (
+    daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_result_has_no_ready_content,
+    daily_pipeline_warning_metadata,
+    normalize_daily_pipeline_stage_status,
 )
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS
@@ -1239,6 +1242,7 @@ class EODPipelineStatusService:
                 stages[stage_id] = stored_stage
         stages = self._mark_preopen_stage_skips(stages=stages)
         stages = self._normalize_stage_contract(stages)
+        warning_metadata = daily_pipeline_warning_metadata(stages)
         overall_status = self._resolve_overall_status(stages)
         if self._is_current_date_waiting_for_official_run(
             stages=stages,
@@ -1273,6 +1277,7 @@ class EODPipelineStatusService:
             'market_session': market_session,
             'fs_div': resolved_fs_div,
             'status': overall_status,
+            **warning_metadata,
             'stage_order': list(PIPELINE_STAGE_ORDER),
             **summary,
             'gate_summary': gate_summary,
@@ -1359,6 +1364,27 @@ class EODPipelineStatusService:
                 details['progress_source'] = EODPipelineStatusService._infer_stage_progress_source(stage)
             if details.get('reason') is None:
                 details['reason'] = EODPipelineStatusService._infer_stage_reason(stage, details)
+            raw_status = str(
+                stage.get('status') or 'pending'
+            ).strip().lower()
+            normalized_status = normalize_daily_pipeline_stage_status(
+                stage_id=stage_id,
+                status=raw_status,
+                outcome={**stage, 'details': details},
+            )
+            if normalized_status != raw_status:
+                stage['status'] = normalized_status
+                stage['source_status'] = (
+                    stage.get('source_status') or raw_status
+                )
+                details.setdefault(
+                    'status_canonicalized_from',
+                    raw_status,
+                )
+                details.setdefault(
+                    'status_canonicalization_reason',
+                    'terminal_optional_context_unavailable',
+                )
 
             normalized[stage_id] = {
                 **stage,
@@ -4350,7 +4376,16 @@ class EODPipelineStatusService:
 
     @staticmethod
     def _resolve_overall_status(stages: dict[str, dict[str, Any]]) -> str:
-        statuses = [str(item.get('status') or 'pending') for item in stages.values()]
+        warning_stage_ids = set(
+            daily_pipeline_nonblocking_warning_stage_ids(stages)
+        )
+        statuses = [
+            str(item.get('status') or 'pending')
+            for stage_id, item in stages.items()
+            if stage_id not in warning_stage_ids
+        ]
+        if not statuses:
+            return 'completed' if warning_stage_ids else 'pending'
         if any(status == 'running' for status in statuses):
             return 'running'
         if any(status == 'interrupted' for status in statuses):
