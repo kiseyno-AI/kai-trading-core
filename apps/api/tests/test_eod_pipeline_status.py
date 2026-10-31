@@ -3690,6 +3690,35 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     [],
                 )
 
+    def test_completed_official_factor_supersedes_stale_dependency_failure(self):
+        self.assertTrue(
+            EODPipelineStatusService._stored_dependency_wait_is_stale(
+                stored_stage={
+                    'status': 'pending',
+                    'gate_status': 'blocked',
+                    'details': {
+                        'blocking_stages': ['fundamentals_daily_refresh'],
+                        'failed_blocking_stages': ['fundamentals_daily_refresh'],
+                        'rows_persisted': 3,
+                        'expected_rows': 3,
+                    },
+                },
+                current_stage={
+                    'status': 'completed',
+                    'details': {
+                        'mode': 'official_daily_pipeline_run_state',
+                        'result_summary': {
+                            'status': 'completed',
+                            'results_persisted': 3,
+                        },
+                    },
+                },
+                current_stages={
+                    'fundamentals_daily_refresh': {'status': 'completed'},
+                },
+            )
+        )
+
     def test_completed_eod_progress_factor_is_not_replaced_by_stale_dependency_wait(self):
         market_date = '2026-09-28'
         updated_at = '2026-09-28T20:00:00+00:00'

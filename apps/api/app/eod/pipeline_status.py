@@ -1616,7 +1616,6 @@ class EODPipelineStatusService:
             else {}
         )
         blocking_stages = stored_details.get('blocking_stages')
-        failed_blocking_stages = stored_details.get('failed_blocking_stages')
         persisted = int(
             stored_details.get('rows_persisted')
             or stored_stage.get('succeeded')
@@ -1631,10 +1630,9 @@ class EODPipelineStatusService:
         if (
             str(stored_stage.get('status') or '').strip().lower() != 'pending'
             or str(stored_stage.get('gate_status') or '').strip().lower()
-            != 'waiting'
+            not in {'waiting', 'blocked'}
             or not isinstance(blocking_stages, list)
             or not blocking_stages
-            or (isinstance(failed_blocking_stages, list) and failed_blocking_stages)
             or persisted <= 0
             or expected <= 0
             or persisted < expected
