@@ -1050,6 +1050,248 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_resolved'], 2)
         self.assertEqual(result['sync']['run_id'], 77)
 
+    async def test_backfill_current_universe_accepts_exact_active_stock_code_manifest(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+                {'symbol': '035420'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 88,
+                'status': 'completed',
+                'financial_report_events': 2,
+            },
+        ) as sync_disclosures:
+            result = await service.backfill_current_universe_fundamentals(
+                stock_codes=['035420', '000660', '035420'],
+                capture_limit=10,
+                fs_div='CFS',
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 10, 30),
+            )
+
+        self.assertEqual(result['scope'], 'targeted_active_universe')
+        self.assertEqual(result['requested_stock_codes'], ['035420', '000660'])
+        self.assertEqual(
+            result['requested_stock_code_manifest_sha256'],
+            'e1295df1fe3193c96103e255688328d197c5429ce655daf90010c01e1a0365ad',
+        )
+        self.assertEqual(result['symbol_offset'], 0)
+        self.assertEqual(result['symbol_limit'], 2)
+        self.assertEqual(result['symbols_selected'], 2)
+        self.assertEqual(result['capture']['scope'], 'targeted_active_universe')
+        self.assertEqual(
+            result['capture']['stock_code_manifest'],
+            ['035420', '000660'],
+        )
+        self.assertEqual(repository.stale_run_failures, [])
+        self.assertEqual(
+            repository.created_runs[-1]['trigger'],
+            'targeted_active_backfill',
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata']['scope'],
+            'targeted_active_universe',
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'root_stock_code_manifest'
+            ],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'stock_code_manifest'
+            ],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'stale_run_reconciliation'
+            ],
+            'skipped_exact_scope',
+        )
+        self.assertEqual(
+            [
+                item['stock_code']
+                for item in sync_disclosures.call_args.kwargs['corporations']
+            ],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            sync_disclosures.call_args.kwargs['scope'],
+            'targeted_active_universe',
+        )
+        self.assertEqual(
+            sync_disclosures.call_args.kwargs['trigger'],
+            'targeted_active_backfill',
+        )
+        self.assertEqual(
+            sync_disclosures.call_args.kwargs['root_stock_code_manifest'],
+            ['035420', '000660'],
+        )
+
+    async def test_targeted_backfill_persists_root_manifest_when_sync_reduces_capture_scope(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '035420'},
+                {'symbol': '000660'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 89,
+                'status': 'partial',
+                'financial_report_events': 1,
+                'failed_stock_codes': ['000660'],
+                'unattempted_stock_codes': [],
+            },
+        ):
+            result = await service.backfill_current_universe_fundamentals(
+                stock_codes=['035420', '000660'],
+                capture_limit=10,
+                fs_div='CFS',
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 10, 30),
+            )
+
+        run_metadata = repository.created_runs[-1]['run_metadata']
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            run_metadata['root_stock_code_manifest'],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            run_metadata['stock_code_manifest'],
+            ['035420'],
+        )
+        self.assertNotEqual(
+            run_metadata['root_stock_code_manifest_sha256'],
+            run_metadata['stock_code_manifest_sha256'],
+        )
+        self.assertEqual(
+            result['capture']['root_stock_code_manifest'],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            result['capture']['stock_code_manifest'],
+            ['035420'],
+        )
+
+    async def test_backfill_current_universe_rejects_blank_exact_manifest_token(self):
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+        ) as sync_disclosures:
+            with self.assertRaisesRegex(
+                ValueError,
+                'contains an invalid stock code',
+            ):
+                await service.backfill_current_universe_fundamentals(
+                    stock_codes=['005930', '', '000660'],
+                )
+
+        sync_disclosures.assert_not_called()
+
+    async def test_capture_rejects_root_manifest_without_exact_scope_before_stale_reconciliation(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'requires an exact capture manifest',
+        ):
+            await service.capture_recent_fundamentals(
+                stock_codes=['005930'],
+                root_stock_code_manifest=['005930'],
+            )
+
+        self.assertEqual(repository.stale_run_failures, [])
+        self.assertEqual(repository.created_runs, [])
+
+    async def test_capture_rejects_non_ascii_exact_stock_code_before_db_work(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'contains an invalid stock code',
+        ):
+            await service.capture_recent_fundamentals(
+                stock_codes=['１２３４５６'],
+                exact_stock_code_manifest=['１２３４５６'],
+            )
+
+        self.assertEqual(repository.stale_run_failures, [])
+        self.assertEqual(repository.created_runs, [])
+
+    async def test_backfill_current_universe_rejects_inactive_target_before_provider_calls(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+        ) as sync_disclosures:
+            with self.assertRaisesRegex(
+                ValueError,
+                'requires active stock codes: 000660',
+            ):
+                await service.backfill_current_universe_fundamentals(
+                    stock_codes=['005930', '000660'],
+                    capture_limit=10,
+                )
+
+        sync_disclosures.assert_not_called()
+
     async def test_backfill_current_universe_marks_capture_limit_debt_partial_until_scope_is_drained(self):
         class DrainingCaptureRepository(FakeCaptureRepository):
             def __init__(self):

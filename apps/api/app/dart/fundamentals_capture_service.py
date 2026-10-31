@@ -64,6 +64,13 @@ UPDATED_ENTRY_CATEGORY_LABELS = {
 FUNDAMENTALS_SCOPE_OUTCOME_MANIFEST_VERSION = (
     'dart_fundamentals_scope_outcomes_v1'
 )
+TARGETED_BACKFILL_SCOPE = 'targeted_active_universe'
+TARGETED_BACKFILL_MANIFEST_VERSION = (
+    'dart_targeted_active_stock_code_manifest_v1'
+)
+TARGETED_CAPTURE_MANIFEST_VERSION = (
+    'dart_targeted_capture_stock_code_manifest_v1'
+)
 
 
 class TerminalFundamentalsCaptureError(RuntimeError):
@@ -80,6 +87,43 @@ class DartFundamentalsMappingError(TerminalFundamentalsCaptureError):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_exact_stock_code_manifest(
+    stock_codes: Sequence[str],
+) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in stock_codes:
+        stock_code = str(value or '').strip()
+        if (
+            not stock_code
+            or not stock_code.isascii()
+            or not stock_code.isdigit()
+            or len(stock_code) > 6
+        ):
+            raise ValueError(
+                'targeted fundamentals backfill contains an invalid stock code'
+            )
+        stock_code = stock_code.zfill(6)
+        if stock_code not in seen:
+            seen.add(stock_code)
+            normalized.append(stock_code)
+    if not normalized:
+        raise ValueError(
+            'targeted fundamentals backfill stock-code manifest is empty'
+        )
+    return normalized
+
+
+def _stock_code_manifest_sha256(stock_codes: Sequence[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            list(stock_codes),
+            ensure_ascii=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
 
 
 def _bounded_missing_probe_codes(
@@ -913,6 +957,8 @@ class DartFundamentalsCaptureService:
         receipt_date_from: date | None = None,
         receipt_date_to: date | None = None,
         event_ids: list[int] | None = None,
+        exact_stock_code_manifest: Sequence[str] | None = None,
+        root_stock_code_manifest: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         run_metadata: dict[str, Any] = {'requested_limit': limit}
@@ -924,6 +970,68 @@ class DartFundamentalsCaptureService:
             run_metadata['receipt_date_to'] = receipt_date_to.isoformat()
         if event_ids is not None:
             run_metadata['event_id_count'] = len(event_ids)
+        normalized_exact_manifest: list[str] | None = None
+        normalized_root_manifest: list[str] | None = None
+        if (
+            root_stock_code_manifest is not None
+            and exact_stock_code_manifest is None
+        ):
+            raise ValueError(
+                'root fundamentals stock-code manifest requires an exact '
+                'capture manifest'
+            )
+        if exact_stock_code_manifest is not None:
+            normalized_exact_manifest = _normalize_exact_stock_code_manifest(
+                exact_stock_code_manifest
+            )
+            normalized_root_manifest = _normalize_exact_stock_code_manifest(
+                root_stock_code_manifest
+                if root_stock_code_manifest is not None
+                else normalized_exact_manifest
+            )
+            normalized_capture_stock_codes = (
+                _normalize_exact_stock_code_manifest(stock_codes or [])
+            )
+            if normalized_capture_stock_codes != normalized_exact_manifest:
+                raise ValueError(
+                    'exact fundamentals capture manifest does not match '
+                    'capture stock codes'
+                )
+            outside_root_manifest = [
+                stock_code
+                for stock_code in normalized_exact_manifest
+                if stock_code not in set(normalized_root_manifest)
+            ]
+            if outside_root_manifest:
+                raise ValueError(
+                    'exact fundamentals capture manifest is outside the '
+                    'root stock-code manifest: '
+                    f'{",".join(outside_root_manifest)}'
+                )
+            run_metadata.update(
+                {
+                    'scope': TARGETED_BACKFILL_SCOPE,
+                    'root_stock_code_manifest_version': (
+                        TARGETED_BACKFILL_MANIFEST_VERSION
+                    ),
+                    'root_stock_code_manifest_sha256': (
+                        _stock_code_manifest_sha256(
+                            normalized_root_manifest
+                        )
+                    ),
+                    'root_stock_code_manifest': normalized_root_manifest,
+                    'stock_code_manifest_version': (
+                        TARGETED_CAPTURE_MANIFEST_VERSION
+                    ),
+                    'stock_code_manifest_sha256': (
+                        _stock_code_manifest_sha256(
+                            normalized_exact_manifest
+                        )
+                    ),
+                    'stock_code_manifest': normalized_exact_manifest,
+                    'stale_run_reconciliation': 'skipped_exact_scope',
+                }
+            )
         log_fetch_event(
             service='dart',
             operation='capture_recent_fundamentals',
@@ -933,12 +1041,15 @@ class DartFundamentalsCaptureService:
             trigger=trigger,
             fs_div=resolved_fs_div,
         )
-        stale_run_ids = self.repository.fail_stale_capture_runs(
-            stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
-            error_message=(
-                'Marked failed after exceeding the stale running threshold before a new capture run started'
-            ),
-        )
+        stale_run_ids = []
+        if normalized_exact_manifest is None:
+            stale_run_ids = self.repository.fail_stale_capture_runs(
+                stale_before=_utcnow() - timedelta(minutes=self.stale_run_minutes),
+                error_message=(
+                    'Marked failed after exceeding the stale running '
+                    'threshold before a new capture run started'
+                ),
+            )
         if stale_run_ids:
             log_fetch_event(
                 service='dart',
@@ -1302,6 +1413,23 @@ class DartFundamentalsCaptureService:
                 'results': results,
                 'operator_buckets': operator_buckets,
             }
+            if normalized_exact_manifest is not None:
+                result.update(
+                    {
+                        'scope': TARGETED_BACKFILL_SCOPE,
+                        'root_stock_code_manifest_sha256': run_metadata[
+                            'root_stock_code_manifest_sha256'
+                        ],
+                        'root_stock_code_manifest': normalized_root_manifest,
+                        'stock_code_manifest_sha256': run_metadata[
+                            'stock_code_manifest_sha256'
+                        ],
+                        'stock_code_manifest': normalized_exact_manifest,
+                        'stale_run_reconciliation': (
+                            'skipped_exact_scope'
+                        ),
+                    }
+                )
             log_fetch_event(
                 service='dart',
                 operation='capture_recent_fundamentals',
@@ -1453,6 +1581,7 @@ class DartFundamentalsCaptureService:
         *,
         symbol_limit: int = 25,
         symbol_offset: int = 0,
+        stock_codes: Sequence[str] | None = None,
         capture_limit: int | None = 250,
         force: bool = False,
         fs_div: str | None = None,
@@ -1469,7 +1598,35 @@ class DartFundamentalsCaptureService:
                 'effective_start_date must be on or before effective_end_date '
                 f'({effective_start_date.isoformat()} > {resolved_end_date.isoformat()})'
             )
-        selected_symbols = active_symbols[symbol_offset : symbol_offset + symbol_limit]
+        requested_stock_codes: list[str] | None = None
+        if stock_codes is not None:
+            requested_stock_codes = _normalize_exact_stock_code_manifest(
+                stock_codes
+            )
+
+            active_symbols_by_stock_code = {
+                str(item.get('symbol') or '').strip().zfill(6): item
+                for item in active_symbols
+                if str(item.get('symbol') or '').strip()
+            }
+            inactive_or_unknown = [
+                stock_code
+                for stock_code in requested_stock_codes
+                if stock_code not in active_symbols_by_stock_code
+            ]
+            if inactive_or_unknown:
+                raise ValueError(
+                    'targeted fundamentals backfill requires active stock '
+                    f'codes: {",".join(inactive_or_unknown)}'
+                )
+            selected_symbols = [
+                active_symbols_by_stock_code[stock_code]
+                for stock_code in requested_stock_codes
+            ]
+        else:
+            selected_symbols = active_symbols[
+                symbol_offset : symbol_offset + symbol_limit
+            ]
         corp_records = []
         symbol_lookup_errors: list[dict[str, str]] = []
 
@@ -1484,11 +1641,23 @@ class DartFundamentalsCaptureService:
 
         from app.dart.sync_service import dart_disclosure_sync_service
 
+        backfill_scope = (
+            TARGETED_BACKFILL_SCOPE
+            if requested_stock_codes is not None
+            else 'current_active_universe'
+        )
+        backfill_trigger = (
+            'targeted_active_backfill'
+            if requested_stock_codes is not None
+            else 'manual_active_universe_backfill'
+        )
         sync_result = await dart_disclosure_sync_service.sync_disclosures_for_corporations(
             corporations=corp_records,
             start_date=effective_start_date,
             end_date=resolved_end_date,
-            trigger='manual_active_universe_backfill',
+            trigger=backfill_trigger,
+            scope=backfill_scope,
+            root_stock_code_manifest=requested_stock_codes,
             persist_negative_authority=False,
         )
         sync_incomplete_stock_codes = {
@@ -1506,11 +1675,17 @@ class DartFundamentalsCaptureService:
             capture_result = await self.capture_recent_fundamentals(
                 limit=None if force else capture_limit,
                 force=force,
-                trigger='manual_active_universe_backfill',
+                trigger=backfill_trigger,
                 fs_div=fs_div,
                 stock_codes=capture_stock_codes,
                 receipt_date_from=effective_start_date,
                 receipt_date_to=resolved_end_date,
+                exact_stock_code_manifest=(
+                    capture_stock_codes
+                    if requested_stock_codes is not None
+                    else None
+                ),
+                root_stock_code_manifest=requested_stock_codes,
             )
         else:
             capture_result = {
@@ -1598,11 +1773,23 @@ class DartFundamentalsCaptureService:
         else:
             status = 'completed'
         return {
-            'scope': 'current_active_universe',
+            'scope': backfill_scope,
             'status': status,
             'active_symbols_total': len(active_symbols),
-            'symbol_offset': symbol_offset,
-            'symbol_limit': symbol_limit,
+            'symbol_offset': (
+                0 if requested_stock_codes is not None else symbol_offset
+            ),
+            'symbol_limit': (
+                len(requested_stock_codes)
+                if requested_stock_codes is not None
+                else symbol_limit
+            ),
+            'requested_stock_codes': requested_stock_codes,
+            'requested_stock_code_manifest_sha256': (
+                _stock_code_manifest_sha256(requested_stock_codes)
+                if requested_stock_codes is not None
+                else None
+            ),
             'symbols_selected': len(selected_symbols),
             'symbols_resolved': len(corp_records),
             'symbol_lookup_error_count': len(retryable_lookup_errors),
