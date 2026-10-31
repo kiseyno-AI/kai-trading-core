@@ -1007,7 +1007,7 @@ async def _backfill_dart_share_issuance_evidence_async(
     try:
         mapping_result = (
             await dart_fundamentals_capture_service.client.lookup_corp_codes_for_stocks(
-                stock_codes=selected_stock_codes,
+                stock_codes=requested_stock_codes,
             )
         )
     except Exception as exc:
@@ -1021,7 +1021,7 @@ async def _backfill_dart_share_issuance_evidence_async(
                     'reason': 'corp_mapping_lookup_failed',
                     'error': str(exc),
                 }
-                for stock_code in selected_stock_codes
+                for stock_code in requested_stock_codes
             ],
         }
 
@@ -1034,31 +1034,52 @@ async def _backfill_dart_share_issuance_evidence_async(
             return ''
         return normalized.zfill(6)
 
-    selected_stock_code_set = set(selected_stock_codes)
+    requested_stock_code_set = set(requested_stock_codes)
     resolved_by_stock: dict[str, list[dict[str, Any]]] = {}
     for item in mapping_result.get('resolved') or []:
         if not isinstance(item, dict):
             continue
         stock_code = normalize_mapping_stock_code(item.get('stock_code'))
-        if stock_code in selected_stock_code_set:
+        if stock_code in requested_stock_code_set:
             resolved_by_stock.setdefault(stock_code, []).append(item)
     unsupported_stock_codes: set[str] = set()
     for item in mapping_result.get('unsupported_stock_codes') or []:
         stock_code = normalize_mapping_stock_code(item)
-        if stock_code in selected_stock_code_set:
+        if stock_code in requested_stock_code_set:
             unsupported_stock_codes.add(stock_code)
     conflicts_by_stock: dict[str, list[dict[str, Any]]] = {}
     for item in mapping_result.get('conflicting_mappings') or []:
         if not isinstance(item, dict):
             continue
         stock_code = normalize_mapping_stock_code(item.get('stock_code'))
-        if stock_code in selected_stock_code_set:
+        if stock_code in requested_stock_code_set:
             conflicts_by_stock.setdefault(stock_code, []).append(item)
     mapping_authority = mapping_result.get('mapping_authority')
     mapping_is_authoritative = bool(
         isinstance(mapping_authority, dict)
         and mapping_authority.get('authoritative') is True
     )
+    stock_codes_by_corp: dict[str, set[str]] = {}
+    for stock_code, candidates in resolved_by_stock.items():
+        for candidate in candidates:
+            corp_code = str(candidate.get('corp_code') or '').strip()
+            if corp_code:
+                stock_codes_by_corp.setdefault(corp_code, set()).add(
+                    stock_code
+                )
+    for stock_code, conflict_items in conflicts_by_stock.items():
+        for conflict_item in conflict_items:
+            for value in conflict_item.get('corp_codes') or []:
+                corp_code = str(value or '').strip()
+                if corp_code:
+                    stock_codes_by_corp.setdefault(corp_code, set()).add(
+                        stock_code
+                    )
+    duplicate_corp_codes = {
+        corp_code
+        for corp_code, stock_codes_for_corp in stock_codes_by_corp.items()
+        if len(stock_codes_for_corp) > 1
+    }
 
     corporations: list[dict[str, Any]] = []
     terminal_not_applicable: list[dict[str, Any]] = []
@@ -1078,6 +1099,7 @@ async def _backfill_dart_share_issuance_evidence_async(
             mapping_is_authoritative
             and len(candidates) == 1
             and len(corp_codes) == 1
+            and corp_codes[0] not in duplicate_corp_codes
             and not has_unsupported_claim
             and not conflict_items
         ):
@@ -1126,6 +1148,8 @@ async def _backfill_dart_share_issuance_evidence_async(
             reason = 'conflicting_resolved_and_unsupported_mapping'
         elif not mapping_is_authoritative:
             reason = 'corp_mapping_authority_not_authoritative'
+        elif corp_codes and corp_codes[0] in duplicate_corp_codes:
+            reason = 'duplicate_corp_code_mapping_across_stock_codes'
         elif candidates:
             reason = 'resolved_stock_mapping_missing_corp_code'
         else:
@@ -1138,43 +1162,6 @@ async def _backfill_dart_share_issuance_evidence_async(
                 'error_type': 'DartMappingContractError',
                 'error': reason,
             }
-        )
-
-    stock_codes_by_corp: dict[str, list[str]] = {}
-    for corporation in corporations:
-        stock_codes_by_corp.setdefault(
-            str(corporation['corp_code']),
-            [],
-        ).append(str(corporation['stock_code']))
-    duplicate_corp_codes = {
-        corp_code
-        for corp_code, stock_codes_for_corp in stock_codes_by_corp.items()
-        if len(stock_codes_for_corp) > 1
-    }
-    if duplicate_corp_codes:
-        retained_corporations: list[dict[str, Any]] = []
-        for corporation in corporations:
-            corp_code = str(corporation['corp_code'])
-            if corp_code not in duplicate_corp_codes:
-                retained_corporations.append(corporation)
-                continue
-            reason = 'duplicate_corp_code_mapping_across_stock_codes'
-            retryable_unmapped.append(
-                {
-                    'stock_code': str(corporation['stock_code']),
-                    'corp_codes': [corp_code],
-                    'reason': reason,
-                    'error_type': 'DartMappingContractError',
-                    'error': reason,
-                }
-            )
-        corporations = retained_corporations
-        selected_order = {
-            stock_code: index
-            for index, stock_code in enumerate(selected_stock_codes)
-        }
-        retryable_unmapped.sort(
-            key=lambda item: selected_order[str(item['stock_code'])]
         )
 
     sync_result: dict[str, Any] | None = None
