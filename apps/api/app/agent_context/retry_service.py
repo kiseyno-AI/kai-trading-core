@@ -5285,27 +5285,43 @@ class AgentFeedbackRetryService:
         should_bypass_prerequisite_gate = bool(
             force or bypass_prerequisite_gate
         )
-        prerequisites = (
-            agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
-                market_date=config.market_date,
-                fs_div=resolved_fs_div,
-            )
+        eligible_symbols = self._load_eligible_symbols(
+            market_date=config.market_date,
+            requested_symbols=requested_symbols,
         )
+        if requested_symbols is not None and not eligible_symbols:
+            prerequisites = {
+                'status': 'blocked',
+                'ready': False,
+                'blocked_stage_ids': ['market_risk_filter'],
+                'waiting_stage_ids': [],
+                'missing_prerequisites': [
+                    {
+                        'stage': 'market_risk_filter',
+                        'gate_status': 'blocked',
+                        'reason': 'requested_scope_has_no_eligible_symbols',
+                    }
+                ],
+            }
+        else:
+            prerequisites = (
+                agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                    market_date=config.market_date,
+                    fs_div=resolved_fs_div,
+                    symbols=eligible_symbols,
+                )
+            )
         if not should_bypass_prerequisite_gate and not prerequisites['ready']:
             return self._run_retry_cycles_admitted(
                 config=config,
                 force=force,
                 bypass_prerequisite_gate=bypass_prerequisite_gate,
                 prerequisites=prerequisites,
+                preloaded_eligible_symbols=eligible_symbols,
                 weekly_policy_session_guard=(
                     weekly_policy_session_guard
                 ),
             )
-
-        eligible_symbols = self._load_eligible_symbols(
-            market_date=config.market_date,
-            requested_symbols=requested_symbols,
-        )
         if effective_knowledge_cutoff_at is None:
             (
                 effective_knowledge_cutoff_at,
@@ -5736,12 +5752,37 @@ class AgentFeedbackRetryService:
             roles=roles,
             requested_symbols=requested_symbols,
         )
-        prerequisites = prerequisites or (
-            agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+        eligible_symbols = (
+            list(preloaded_eligible_symbols)
+            if preloaded_eligible_symbols is not None
+            else self._load_eligible_symbols(
                 market_date=config.market_date,
-                fs_div=resolved_fs_div,
+                requested_symbols=requested_symbols,
             )
         )
+        if prerequisites is None:
+            if requested_symbols is not None and not eligible_symbols:
+                prerequisites = {
+                    'status': 'blocked',
+                    'ready': False,
+                    'blocked_stage_ids': ['market_risk_filter'],
+                    'waiting_stage_ids': [],
+                    'missing_prerequisites': [
+                        {
+                            'stage': 'market_risk_filter',
+                            'gate_status': 'blocked',
+                            'reason': 'requested_scope_has_no_eligible_symbols',
+                        }
+                    ],
+                }
+            else:
+                prerequisites = (
+                    agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                        market_date=config.market_date,
+                        fs_div=resolved_fs_div,
+                        symbols=eligible_symbols,
+                    )
+                )
         if not should_bypass_prerequisite_gate and not prerequisites['ready']:
             progress = self._get_retry_progress(
                 market_date=config.market_date,
@@ -5763,8 +5804,12 @@ class AgentFeedbackRetryService:
                 'feedback_scope_mode': feedback_scope_mode,
                 'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
                 'role_symbol_scopes': resolved_role_symbol_scopes,
-                'eligible_symbols': None,
-                'skipped_symbols': [],
+                'eligible_symbols': eligible_symbols,
+                'skipped_symbols': [
+                    symbol
+                    for symbol in (requested_symbols or ())
+                    if symbol not in set(eligible_symbols)
+                ],
                 'run_id': None,
                 'status': prerequisites['status'],
                 'gated': True,
@@ -5774,14 +5819,6 @@ class AgentFeedbackRetryService:
                 'prerequisites': prerequisites,
                 'progress': progress,
             }
-        eligible_symbols = (
-            list(preloaded_eligible_symbols)
-            if preloaded_eligible_symbols is not None
-            else self._load_eligible_symbols(
-                market_date=config.market_date,
-                requested_symbols=requested_symbols,
-            )
-        )
         eligibility_records = load_agent_feedback_eligibility_records(
             market_date=config.market_date,
             requested_symbols=requested_symbols,

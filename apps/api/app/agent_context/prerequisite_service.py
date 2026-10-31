@@ -13,6 +13,8 @@ from app.eod.pykrx_enrichment_coverage_policy import (
 )
 
 FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
+    'technical_snapshots',
+    'action_summaries',
     'pykrx_enrichment',
     'fundamentals_daily_refresh',
     'market_risk_filter',
@@ -65,6 +67,10 @@ class AgentFeedbackPrerequisiteService:
     def _classify_stage_gate_status(stage_payload: dict[str, Any]) -> str:
         status = str(stage_payload.get('status') or 'pending').strip().lower()
         details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
+        if status in {'failed', 'blocked', 'interrupted', 'abandoned'}:
+            return 'blocked'
+        if status in {'pending', 'running', 'waiting'}:
+            return 'waiting'
         explicit_gate_status = str(
             stage_payload.get('gate_status') or details.get('gate_status') or ''
         ).strip().lower()
@@ -458,6 +464,7 @@ class AgentFeedbackPrerequisiteService:
         fs_div: str | None = None,
         feedback_run_context: dict[str, Any] | None = None,
         required_stage_ids: tuple[str, ...] | None = None,
+        symbols: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         from app.eod.pipeline_status import eod_pipeline_status_service
 
@@ -470,12 +477,28 @@ class AgentFeedbackPrerequisiteService:
                 else FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
             )
         )
+        resolved_scope_symbols = list(
+            dict.fromkeys(
+                str(symbol or '').strip().upper()
+                for symbol in (
+                    symbols
+                    if symbols is not None
+                    else (
+                        feedback_run_context.get('requested_symbols')
+                        if isinstance(feedback_run_context, dict)
+                        else []
+                    )
+                )
+                if str(symbol or '').strip()
+            )
+        )
         pipeline_status = eod_pipeline_status_service.read(
             market_date=normalized_market_date.isoformat(),
             fs_div=resolved_fs_div,
             include_feedback_context=feedback_run_context is not None,
             feedback_run_context=feedback_run_context,
             include_feedback_stage=False,
+            scope_symbols=resolved_scope_symbols,
         )
         stages = pipeline_status.get('stages') if isinstance(pipeline_status.get('stages'), dict) else {}
         price_stage = stages.get('price_collection') if isinstance(stages, dict) else None
@@ -570,6 +593,8 @@ class AgentFeedbackPrerequisiteService:
         return {
             'market_date': normalized_market_date.isoformat(),
             'fs_div': resolved_fs_div,
+            'scope_symbols': resolved_scope_symbols,
+            'scope_symbol_count': len(resolved_scope_symbols),
             'status': overall_status,
             'ready': overall_status == 'ready',
             'required_stage_ids': list(resolved_required_stage_ids),

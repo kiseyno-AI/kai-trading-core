@@ -76,6 +76,8 @@ from app.eod.pykrx_pipeline_runner import (
     HISTORICAL_BACKFILL_STAGE_ORDER,
     _OfficialDailyPipelineTracker,
     _bounded_failure_diagnostics,
+    _build_macro_provider_coverage,
+    _build_pykrx_enrichment_symbol_scope_outcome,
     _classify_pykrx_enrichment_categories,
     _completion_status_for_gap,
     _gap_policy_details,
@@ -112,6 +114,7 @@ class FeedbackRetryConfigCallsiteTests(TestCase):
                 '<default_false>',
             ],
             'app/dart/fundamentals_capture_service.py': [
+                '<default_false>',
                 '<default_false>'
             ],
             'app/eod/daily_pipeline_stages.py': [
@@ -625,6 +628,61 @@ class PykrxPipelineResultStatusTests(TestCase):
         self.assertEqual(classification['coverage_gap_categories'], ['foreign_ownership'])
         self.assertEqual(classification['unresolved_categories'], ['foreign_ownership'])
 
+    def test_enrichment_exact_scope_advances_only_complete_symbols(self) -> None:
+        categories = {
+            category: {
+                'expected_scope_keys': ['005930', '000660'],
+                'complete_scope_keys': ['005930', '000660'],
+            }
+            for category in (
+                'sector_classification',
+                'investor_flow_symbol',
+                'short_selling',
+                'valuation_snapshot',
+            )
+        }
+        categories['short_selling']['complete_scope_keys'] = ['005930']
+        outcome, reasons = _build_pykrx_enrichment_symbol_scope_outcome(
+            selected_symbols=['005930', '000660'],
+            coverage_categories=categories,
+        )
+
+        self.assertEqual(outcome['successful_stock_codes'], ['005930'])
+        self.assertEqual(outcome['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(
+            reasons['000660'],
+            ['short_selling:incomplete_required_coverage'],
+        )
+
+    def test_enrichment_exact_scope_fails_closed_without_symbol_identity(self) -> None:
+        categories = {
+            category: {
+                'expected_scope_keys': ['005930', '000660'],
+                'complete_scope_keys': ['005930', '000660'],
+            }
+            for category in (
+                'sector_classification',
+                'investor_flow_symbol',
+                'short_selling',
+                'valuation_snapshot',
+            )
+        }
+        categories['valuation_snapshot'].pop('complete_scope_keys')
+        outcome, reasons = _build_pykrx_enrichment_symbol_scope_outcome(
+            selected_symbols=['005930', '000660'],
+            coverage_categories=categories,
+        )
+
+        self.assertEqual(outcome['successful_stock_codes'], [])
+        self.assertEqual(
+            outcome['retry_debt_stock_codes'],
+            ['005930', '000660'],
+        )
+        self.assertEqual(
+            reasons['005930'],
+            ['valuation_snapshot:missing_exact_scope_identity'],
+        )
+
     def test_enrichment_gap_partition_uses_required_category_gate_threshold(self) -> None:
         blocking, tolerated = _partition_pykrx_enrichment_category_gaps(
             failed_categories=['valuation_snapshot'],
@@ -732,7 +790,12 @@ def _lock(acquired: bool = True):
     yield acquired
 
 
-def _ready_pykrx_enrichment_result(*, market_date: str = '2026-04-03') -> dict:
+def _ready_pykrx_enrichment_result(
+    *,
+    market_date: str = '2026-04-03',
+    symbols: tuple[str, ...] = ('005930',),
+    markets: tuple[str, ...] = ('KOSPI',),
+) -> dict:
     categories = {
         'sector_classification': {'rows_persisted': 1, 'errors': []},
         'investor_flow_market': {'rows_persisted': 1, 'errors': []},
@@ -742,6 +805,7 @@ def _ready_pykrx_enrichment_result(*, market_date: str = '2026-04-03') -> dict:
         'market_breadth': {'rows_persisted': 1, 'errors': []},
         'foreign_ownership': {'rows_persisted': 1, 'errors': []},
     }
+    market_scope_categories = {'market_breadth', 'investor_flow_market'}
     return {
         'market_date': market_date,
         'status': 'completed',
@@ -752,11 +816,30 @@ def _ready_pykrx_enrichment_result(*, market_date: str = '2026-04-03') -> dict:
             'requested_market_count': 1,
             'categories': {
                 category: {
-                    'scope_type': 'symbol' if category in {'investor_flow_symbol', 'short_selling'} else 'market',
+                    'scope_type': (
+                        'market'
+                        if category in market_scope_categories
+                        else 'symbol'
+                    ),
                     'expected_rows': 1,
                     'present_rows': 1,
                     'coverage_ratio': 1.0,
                     'coverage_status': 'complete',
+                    'expected_scope_keys': list(
+                        markets
+                        if category in market_scope_categories
+                        else symbols
+                    ),
+                    'decision_usable_scope_keys': list(
+                        markets
+                        if category in market_scope_categories
+                        else symbols
+                    ),
+                    'complete_scope_keys': list(
+                        markets
+                        if category in market_scope_categories
+                        else symbols
+                    ),
                 }
                 for category in categories
             },
@@ -1775,6 +1858,76 @@ class PykrxBackfillServiceTests(TestCase):
             },
         )
 
+    def test_extract_result_counts_reads_external_news_collection_summary(self) -> None:
+        counts = _extract_result_counts(
+            {
+                'status': 'completed',
+                'summary': {
+                    'requested_symbol_count': 201,
+                    'eligible_symbol_count': 201,
+                    'collected_symbol_count': 201,
+                    'matched_symbol_count': 201,
+                },
+            },
+            stage_id='external_news_collect',
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 201,
+                'total': 201,
+                'succeeded': 201,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_result_counts_reads_external_news_enrichment_components(self) -> None:
+        counts = _extract_result_counts(
+            {
+                'status': 'partial',
+                'items_inspected': 200,
+                'items_missing_classification': 7,
+                'items_remaining_at_least': 2,
+                'missing_item_ids': [101, 102, 102],
+            },
+            stage_id='external_news_enrich',
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 200,
+                'total': 202,
+                'succeeded': 195,
+                'failed': 5,
+            },
+        )
+
+    def test_extract_result_counts_reads_macro_observation_outcomes(self) -> None:
+        counts = _extract_result_counts(
+            {
+                'status': 'partial',
+                'observations_upserted': 2,
+                'observations_failed': 1,
+                'source_statuses': {
+                    'ecos': 'ready',
+                    'fred': 'disabled_missing_api_key',
+                },
+            },
+            stage_id='macro_context_refresh',
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 3,
+                'total': 3,
+                'succeeded': 2,
+                'failed': 1,
+            },
+        )
+
     def test_extract_followup_source_run_ids_maps_feedback_result_run_id(
         self,
     ) -> None:
@@ -2139,6 +2292,13 @@ class PykrxBackfillServiceTests(TestCase):
             'status': 'skipped',
             'reason': 'macro_context_refresh_not_due',
             'context': {'freshness': {'status': 'fresh'}},
+            'source_statuses': {
+                'world_bank': {'status': 'available'},
+                'fred': {
+                    'status': 'disabled_missing_api_key',
+                    'reason': 'FRED_API_KEY is not configured',
+                },
+            },
         }
         with patch(
             'app.macro_context.service.macro_context_service.refresh_context',
@@ -2151,7 +2311,65 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['market_date'], '2026-04-03')
         self.assertEqual(result['freshness_gate'], 'fresh')
+        self.assertEqual(
+            result['provider_coverage'],
+            {
+                'status': 'partial',
+                'provider_count': 2,
+                'available_provider_count': 1,
+                'configured_provider_count': 0,
+                'gap_provider_count': 1,
+                'providers': {
+                    'world_bank': 'available',
+                    'fred': 'disabled',
+                },
+            },
+        )
         refresh_context.assert_called_once_with(force=False, trigger='eod_pykrx_followup')
+
+    def test_macro_provider_coverage_prefers_fresh_context_over_configured_refresh_status(self) -> None:
+        macro_result = {
+            'status': 'skipped',
+            'reason': 'macro_context_refresh_not_due',
+            'source_statuses': {
+                'world_bank': {'status': 'configured'},
+                'fred': {'status': 'disabled_missing_api_key'},
+            },
+            'context': {
+                'freshness': {'status': 'fresh'},
+                'source_statuses': {
+                    'world_bank': {'status': 'available'},
+                    'fred': {'status': 'disabled_missing_api_key'},
+                },
+            },
+        }
+        with patch(
+            'app.macro_context.service.macro_context_service.refresh_context',
+            return_value=macro_result,
+        ):
+            result = _run_daily_macro_context_followup(
+                market_date='2026-04-03',
+                enabled=True,
+            )
+
+        self.assertEqual(result['freshness_gate'], 'fresh')
+        self.assertEqual(result['provider_coverage']['status'], 'partial')
+        self.assertEqual(
+            result['provider_coverage']['providers']['world_bank'],
+            'available',
+        )
+
+    def test_macro_provider_coverage_does_not_treat_configured_as_observed(self) -> None:
+        coverage = _build_macro_provider_coverage(
+            {
+                'world_bank': {'status': 'configured'},
+                'fred': {'status': 'disabled_missing_api_key'},
+            }
+        )
+
+        self.assertEqual(coverage['status'], 'unknown')
+        self.assertEqual(coverage['available_provider_count'], 0)
+        self.assertEqual(coverage['configured_provider_count'], 1)
 
     def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
         service = PykrxBackfillService()
@@ -2585,7 +2803,8 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.pykrx_enrichment_service.'
                 'collect_for_market_date',
                 return_value=_ready_pykrx_enrichment_result(
-                    market_date='2026-09-11'
+                    market_date='2026-09-11',
+                    symbols=('099999',),
                 ),
             ) as collect_enrichment,
             patch(
@@ -2818,6 +3037,10 @@ class PykrxBackfillServiceTests(TestCase):
     def test_run_backfill_uses_only_point_in_time_safe_stages_and_disables_followups(self) -> None:
         service = PykrxBackfillService()
         with (
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-05-04') as latest,
             patch.object(
                 service,
@@ -2836,11 +3059,17 @@ class PykrxBackfillServiceTests(TestCase):
 
     def test_run_backfill_preserves_explicit_trading_date(self) -> None:
         service = PykrxBackfillService()
-        with patch.object(
-            service,
-            '_run_market_data_pipeline',
-            return_value={'status': 'completed'},
-        ) as run_pipeline:
+        with (
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
+            patch.object(
+                service,
+                '_run_market_data_pipeline',
+                return_value={'status': 'completed'},
+            ) as run_pipeline,
+        ):
             service.run_backfill(end_date='20200430')
 
         kwargs = run_pipeline.call_args.kwargs
@@ -13894,6 +14123,10 @@ class PykrxBackfillServiceTests(TestCase):
         symbols = [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')]
 
         with (
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
             patch('app.eod.pykrx_backfill.log_fetch_event') as log_fetch_event,
             patch.object(
                 service,
@@ -15468,6 +15701,10 @@ class PykrxBackfillServiceTests(TestCase):
         symbols = [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')]
 
         with (
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
             patch.object(
                 service,
                 'fetch_recent_universe_snapshot',
@@ -15947,6 +16184,8 @@ class PykrxBackfillServiceTests(TestCase):
                 'present_rows': 0,
                 'coverage_ratio': 0.0,
                 'coverage_status': 'missing',
+                'decision_usable_scope_keys': [],
+                'complete_scope_keys': [],
             }
         )
 
@@ -16035,6 +16274,10 @@ class PykrxBackfillServiceTests(TestCase):
         symbols = [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')]
 
         with (
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
             patch.object(
                 service,
                 'fetch_recent_universe_snapshot',
@@ -16981,6 +17224,10 @@ class PykrxBackfillServiceTests(TestCase):
         symbols = [PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung Electronics')]
 
         with (
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
             patch('app.eod.pykrx_backfill.log_fetch_event') as log_fetch_event,
             patch.object(
                 service,
@@ -17416,7 +17663,10 @@ class PykrxBackfillServiceTests(TestCase):
             patch(
                 'app.eod.pykrx_backfill.pykrx_enrichment_service.'
                 'collect_for_market_date',
-                return_value=_ready_pykrx_enrichment_result(),
+                return_value=_ready_pykrx_enrichment_result(
+                    symbols=('472220',),
+                    markets=('KOSDAQ',),
+                ),
             ),
             patch(
                 'app.eod.pykrx_backfill.complete_eod_collection_run'
@@ -17539,7 +17789,10 @@ class PykrxBackfillServiceTests(TestCase):
                 patch(
                     'app.eod.pykrx_backfill.pykrx_enrichment_service.'
                     'collect_for_market_date',
-                    return_value=_ready_pykrx_enrichment_result(),
+                    return_value=_ready_pykrx_enrichment_result(
+                        symbols=('472220',),
+                        markets=('KOSDAQ',),
+                    ),
                 )
             )
             stack.enter_context(

@@ -618,6 +618,15 @@ def _build_feature_coverage_summary(
         'market_date': market_date,
         'persisted_row_count': len(persisted_rows),
         'direct_signal_source_row_count': direct_signal_source_rows,
+        'direct_signal_source_coverage_ratio': (
+            _round_float(direct_signal_source_rows / len(persisted_rows), digits=6)
+            if persisted_rows
+            else None
+        ),
+        'direct_signal_source_coverage_status': _coverage_status(
+            present_count=direct_signal_source_rows,
+            universe_size=len(persisted_rows),
+        ),
         'fallback_only_row_count': row_kind_counts.get(ROW_KIND_FALLBACK_ONLY, 0),
         'row_kind_counts': row_kind_counts,
         'active_universe': _build_feature_coverage_bucket(

@@ -6401,12 +6401,18 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
     def test_dispatch_for_symbols_returns_blocked_gate_when_prerequisites_are_not_ready(self):
         service = AgentFeedbackOrchestrator()
 
-        with patch(
-            'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
-            side_effect=lambda **_: _feedback_prerequisites(
-                status='blocked',
-                missing_stage_ids=['quality_factors', 'composite_factors'],
-            ),
+        with (
+            patch(
+                'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=lambda **_: _feedback_prerequisites(
+                    status='blocked',
+                    missing_stage_ids=[
+                        'quality_factors',
+                        'composite_factors',
+                    ],
+                ),
+            ) as inspect_prerequisites,
+            _patch_feedback_eligibility('005930'),
         ):
             result = service.dispatch_for_symbols(
                 market_date='2026-04-14',
@@ -6422,6 +6428,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             result['request']['parent_run_id'],
             'feedback-parent-prerequisite-gate',
+        )
+        self.assertEqual(
+            inspect_prerequisites.call_args.kwargs['symbols'],
+            ['005930'],
+        )
+        self.assertIn(
+            'signal_features',
+            inspect_prerequisites.call_args.kwargs['required_stage_ids'],
         )
 
     def test_buffered_symbol_dispatch_cleans_each_batch_session_once(self):

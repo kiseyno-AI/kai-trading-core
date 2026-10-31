@@ -51,7 +51,7 @@ def _statement_row(
     statement_type: str,
     account_id: str | None,
     account_name: str,
-    amount: int,
+    amount: int | None,
     row_order: int,
 ) -> dict:
     return {
@@ -340,6 +340,97 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
         context = derive_annual_financial_context(snapshot)
 
         self.assertEqual(context['depreciation_and_amortization'], 40.0)
+
+    def test_derive_annual_financial_context_matches_common_dart_ifrs_flow_ids(self) -> None:
+        snapshot = _snapshot(
+            '000660',
+            total_equity=1000,
+            total_liabilities=300,
+            operating_income=110,
+            operating_cash_flow=200,
+            cash=90,
+            capex_ppe=None,
+            depreciation=None,
+            amortization=None,
+            depreciation_and_amortization=None,
+        )
+        snapshot.statement_rows.extend(
+            [
+                _statement_row(
+                    'capex',
+                    statement_type='CF',
+                    account_id='ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+                    account_name='설비투자 현금유출',
+                    amount=-60,
+                    row_order=4,
+                ),
+                _statement_row(
+                    'dep',
+                    statement_type='CF',
+                    account_id='ifrs-full_AdjustmentsForDepreciationExpense',
+                    account_name='현금흐름 조정 A',
+                    amount=25,
+                    row_order=5,
+                ),
+                _statement_row(
+                    'amo',
+                    statement_type='CF',
+                    account_id='ifrs-full_AdjustmentsForAmortisationExpense',
+                    account_name='현금흐름 조정 B',
+                    amount=15,
+                    row_order=6,
+                ),
+            ]
+        )
+
+        context = derive_annual_financial_context(snapshot)
+
+        self.assertEqual(context['capital_expenditure'], 60.0)
+        self.assertEqual(context['depreciation_and_amortization'], 40.0)
+        self.assertEqual(
+            context['audit']['matched_inputs']['capex_ppe']['account_id'],
+            'ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+        )
+
+    def test_derive_annual_financial_context_skips_empty_duplicate_statement_row(self) -> None:
+        snapshot = _snapshot(
+            '000660',
+            total_equity=1000,
+            total_liabilities=300,
+            operating_income=110,
+            operating_cash_flow=200,
+            cash=90,
+            capex_ppe=-60,
+            depreciation_and_amortization=35,
+        )
+        snapshot.statement_rows.extend(
+            [
+                _statement_row(
+                    'assets-empty',
+                    statement_type='BS',
+                    account_id='ifrs-full_Assets',
+                    account_name='자산총계',
+                    amount=None,
+                    row_order=1,
+                ),
+                _statement_row(
+                    'assets-valid',
+                    statement_type='BS',
+                    account_id='ifrs-full_Assets',
+                    account_name='자산총계',
+                    amount=1400,
+                    row_order=2,
+                ),
+            ]
+        )
+
+        context = derive_annual_financial_context(snapshot)
+
+        self.assertEqual(context['total_assets'], 1400.0)
+        self.assertEqual(
+            context['audit']['matched_inputs']['total_assets']['row_key'],
+            'assets-valid',
+        )
 
 
 class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
@@ -933,6 +1024,7 @@ class _FakeFundamentalsLoaderSession:
         }
         self.highlight_chunks: list[list[int]] = []
         self.statement_row_chunks: list[list[int]] = []
+        self.statement_row_queries: list[str] = []
 
     def execute(self, statement, params=None):
         compiled_params = getattr(statement.compile(), 'params', {}) if hasattr(statement, 'compile') else {}
@@ -1003,6 +1095,7 @@ class _FakeFundamentalsLoaderSession:
                         )
                     ]
                 )
+            self.statement_row_queries.append(str(statement))
             self.statement_row_chunks.append(list(snapshot_ids))
             return _FakeLoaderResult(
                 [
@@ -1104,6 +1197,14 @@ class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
         self.assertEqual(
             [len(chunk) for chunk in fake_session.statement_row_chunks],
             [100, 100, 100, 100, 100, 1],
+        )
+        self.assertTrue(fake_session.statement_row_queries)
+        self.assertTrue(
+            all(
+                'dart_fundamentals_rows.account_id IN' in query
+                and 'dart_fundamentals_rows.account_name IN' in query
+                for query in fake_session.statement_row_queries
+            )
         )
         self.assertEqual(result[symbols[0]].highlights_by_key['total_equity']['current_amount'], 1001)
         self.assertEqual(result[symbols[-1]].highlights_by_key['total_equity']['current_amount'], 1501)

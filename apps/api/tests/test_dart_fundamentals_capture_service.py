@@ -1,15 +1,22 @@
 import unittest
 import asyncio
 from datetime import date
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.dart.fundamentals_capture_service import (
-    DartFundamentalsCaptureService,
+    DartFundamentalsCaptureService as _DartFundamentalsCaptureService,
     _bounded_missing_probe_codes,
+    _load_share_issuance_activation_audit,
     build_row_payloads,
     infer_fundamentals_request,
+    resolve_supported_dart_corp_record,
 )
+
+
+def DartFundamentalsCaptureService(**kwargs):
+    kwargs.setdefault('global_share_issuance_enabled', False)
+    return _DartFundamentalsCaptureService(**kwargs)
 
 
 def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
@@ -36,6 +43,38 @@ def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[st
             for stage_id in missing_stage_ids
         ],
         'stages': {},
+    }
+
+
+def _exact_fundamentals_scope_outcome(
+    selected_stock_codes: list[str],
+    *,
+    retry_debt_stock_codes: list[str] | None = None,
+) -> dict:
+    retry_debt = set(retry_debt_stock_codes or [])
+    successful = [
+        stock_code
+        for stock_code in selected_stock_codes
+        if stock_code not in retry_debt
+    ]
+    return {
+        'scope_outcome_manifest_version': (
+            'dart_fundamentals_scope_outcomes_v1'
+        ),
+        'selected_stock_codes': list(selected_stock_codes),
+        'successful_stock_codes': successful,
+        'retry_debt_stock_codes': sorted(retry_debt),
+        'scope_outcome_manifest': [
+            {
+                'stock_code': stock_code,
+                'outcome': (
+                    'retry_debt'
+                    if stock_code in retry_debt
+                    else 'success'
+                ),
+            }
+            for stock_code in selected_stock_codes
+        ],
     }
 
 
@@ -414,6 +453,146 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.mock_piotroski_filter = self.piotroski_filter_patcher.start()
         self.addCleanup(self.piotroski_filter_patcher.stop)
+
+    async def test_non_authoritative_corp_cache_cannot_terminalize_absence(self):
+        class NonAuthoritativeClient:
+            async def has_supported_stock_code(self, _stock_code):
+                return False
+
+            def corp_code_mapping_authority(self):
+                return {
+                    'source': 'persistent_fallback',
+                    'authoritative': False,
+                    'cache_age_seconds': 999999,
+                }
+
+        corp, error = await resolve_supported_dart_corp_record(
+            NonAuthoritativeClient(),
+            stock_code='005930',
+        )
+
+        self.assertIsNone(corp)
+        self.assertEqual(
+            error['error_type'],
+            'DartMappingAuthorityUnavailable',
+        )
+        self.assertFalse(error['terminal'])
+        self.assertEqual(
+            error['mapping_authority']['source'],
+            'persistent_fallback',
+        )
+
+    async def test_global_activation_failure_stops_before_current_universe_work(self):
+        activation_loader = Mock(
+            return_value={
+                'enabled': False,
+                'reasons': ['audit_manifest_hash_mismatch'],
+            }
+        )
+        service = _DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=Mock(
+                side_effect=AssertionError('must not load active universe')
+            ),
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=activation_loader,
+        )
+        service._run_daily_incremental_refresh = AsyncMock()
+
+        result = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 10, 30),
+        )
+
+        activation_loader.assert_called_once_with()
+        service._run_daily_incremental_refresh.assert_not_awaited()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(
+            result['reason'],
+            'global_share_issuance_activation_audit_required',
+        )
+
+    async def test_global_activation_loader_error_fails_closed(self):
+        activation_loader = Mock(
+            side_effect=RuntimeError('audit store unavailable')
+        )
+        service = _DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=Mock(
+                side_effect=AssertionError('must not load active universe')
+            ),
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=activation_loader,
+        )
+        service._run_daily_incremental_refresh = AsyncMock()
+
+        result = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 10, 30),
+        )
+
+        activation_loader.assert_called_once_with()
+        service._run_daily_incremental_refresh.assert_not_awaited()
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn(
+            'activation_audit_read_failed',
+            result['activation_audit']['reasons'],
+        )
+
+    def test_activation_loader_uses_dedicated_full_universe_trigger(self):
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.repository.get_latest_sync_run',
+            return_value=None,
+        ) as get_latest_sync_run:
+            result = _load_share_issuance_activation_audit()
+
+        get_latest_sync_run.assert_called_once_with(
+            trigger='ops_dart_issuance_activation',
+            include_internal_audits=True,
+        )
+        self.assertFalse(result['enabled'])
+
+    def _build_global_followup_service(
+        self,
+        stock_codes: list[str] | None = None,
+    ):
+        stock_codes = list(stock_codes or ['005930'])
+
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        repository = FakeCaptureRepository()
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': stock_code} for stock_code in stock_codes
+            ],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda **_kwargs: {
+                'enabled': True,
+            },
+        )
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 188,
+                'status': 'completed',
+                **_exact_fundamentals_scope_outcome(stock_codes),
+            }
+        )
+        return service, repository
 
     async def test_capture_annual_fundamentals_captures_audit_signal_before_marking_success(self):
         repository = FakeCaptureRepository()
@@ -1269,7 +1448,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result['piotroski_filter_error'])
         self.assertEqual(repository.successes, [4, 5])
         self.assertEqual([call['start_date'] for call in sync_calls], [date(2015, 1, 1), date(2026, 4, 2)])
-        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [4, 5])
+        self.assertIn(
+            [4, 5],
+            [
+                call['event_ids']
+                for call in repository.candidate_call_kwargs
+                if call['event_ids'] is not None
+            ],
+        )
         self.assertEqual(repository.completed_refresh_runs[-1][1]['status'], 'completed')
         self.assertEqual(
             repository.completed_refresh_runs[-1][1]['run_metadata']['updated_entries'],
@@ -1290,7 +1476,10 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         )
-        self.mock_piotroski_filter.assert_called_once_with(market_date=date(2026, 4, 14))
+        self.mock_piotroski_filter.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['000660', '005930', '123456'],
+        )
 
     async def test_daily_incremental_refresh_boundedly_probes_missing_symbols_in_recent_window(self):
         client = FakeCaptureClient()
@@ -1348,7 +1537,17 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             if item['state'] == 'missing_recent_probe_deferred'
         ]
         self.assertEqual(len(deferred), 2)
-        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['successful_stock_codes'], ['222222'])
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['111111', '333333'],
+        )
+        self.assertIn('scope_retry_debt', result['partial_reasons'])
+        self.mock_piotroski_filter.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['222222'],
+        )
 
     async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):
         client = FakeCaptureClient()
@@ -1393,7 +1592,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_missing'], 1)
         self.assertEqual(result['events_detected'], 1)
         self.assertEqual(result['events_captured'], 1)
-        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
+        self.assertIn(
+            [7],
+            [
+                call['event_ids']
+                for call in repository.candidate_call_kwargs
+                if call['event_ids'] is not None
+            ],
+        )
         self.assertEqual(repository.successes, [7])
 
     async def test_daily_incremental_refresh_propagates_company_sync_failures_as_retryable_partial(self):
@@ -1806,7 +2012,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['triggered'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['events_detected'], 2)
-        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [5, 11])
+        self.assertIn(
+            [5, 11],
+            [
+                call['event_ids']
+                for call in repository.candidate_call_kwargs
+                if call['event_ids'] is not None
+            ],
+        )
         self.assertEqual(repository.successes, [5, 11])
         self.assertNotIn(10, repository.successes)
 
@@ -2075,6 +2288,11 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             'market_date': '2026-04-14',
             'status': 'completed',
             'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_scope_outcome': (
+                    _exact_fundamentals_scope_outcome(['005930'])
+                ),
+            },
         }
         service = DartFundamentalsCaptureService(
             client=FakeCaptureClient(),
@@ -2087,6 +2305,674 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['triggered'])
         self.assertEqual(result['reason'], 'already_completed')
         self.assertEqual(repository.created_refresh_runs, [])
+
+    async def test_daily_incremental_refresh_reuses_its_own_persisted_exact_scope_on_second_call(self):
+        class PersistingRefreshRepository(FakeCaptureRepository):
+            def complete_refresh_run(self, run_id, **kwargs):
+                super().complete_refresh_run(run_id, **kwargs)
+                self.latest_refresh_run = {
+                    'id': run_id,
+                    'market_date': '2026-04-14',
+                    'status': kwargs['status'],
+                    'fs_div': 'CFS',
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != 'status'
+                    },
+                }
+
+        repository = PersistingRefreshRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-14',
+                'latest_resolved_fundamentals_receipt_date': '2026-04-14',
+                'latest_snapshot': {'id': 1},
+                'latest_terminal_fundamentals_event': None,
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        first = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            run_piotroski_followup=False,
+            run_feedback_followup=False,
+        )
+        second = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            run_piotroski_followup=False,
+            run_feedback_followup=False,
+        )
+
+        self.assertEqual(first['status'], 'completed')
+        self.assertFalse(second['triggered'])
+        self.assertEqual(second['reason'], 'already_completed')
+        self.assertEqual(len(repository.created_refresh_runs), 1)
+
+    async def test_daily_incremental_refresh_does_not_reuse_legacy_completed_run_without_exact_scope(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {'fundamentals_core_status': 'completed'},
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('new exact scope run reached')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'new exact scope run reached'):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_daily_incremental_refresh_does_not_reuse_completed_scope_with_retry_debt(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_core_status': 'completed',
+                'fundamentals_scope_outcome': (
+                    _exact_fundamentals_scope_outcome(
+                        ['005930'],
+                        retry_debt_stock_codes=['005930'],
+                    )
+                ),
+            },
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('retry debt must be reprocessed')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'retry debt must be reprocessed',
+        ):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_daily_incremental_refresh_does_not_reuse_completed_run_for_disjoint_scope(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_core_status': 'completed',
+                'fundamentals_scope_outcome': (
+                    _exact_fundamentals_scope_outcome(['005930'])
+                ),
+            },
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('new exact scope run reached')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'new exact scope run reached'):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                symbols=['000660'],
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_daily_incremental_refresh_does_not_reuse_non_exhaustive_scope_manifest(self):
+        incomplete_outcome = _exact_fundamentals_scope_outcome(
+            ['005930', '000660']
+        )
+        incomplete_outcome['scope_outcome_manifest'] = [
+            incomplete_outcome['scope_outcome_manifest'][0]
+        ]
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_core_status': 'completed',
+                'fundamentals_scope_outcome': incomplete_outcome,
+            },
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('new exact scope run reached')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'new exact scope run reached'):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_compound_refresh_persists_and_advances_baseline_repair_cursor(self):
+        stock_codes = ['000001', '000002', '000003']
+
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        class CursorRepository(FakeCaptureRepository):
+            def complete_refresh_run(self, run_id, **kwargs):
+                super().complete_refresh_run(run_id, **kwargs)
+                self.latest_refresh_run = {
+                    'id': run_id,
+                    'market_date': '2026-04-14',
+                    'status': kwargs['status'],
+                    'fs_div': 'CFS',
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != 'status'
+                    },
+                }
+
+        repository = CursorRepository()
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': stock_code} for stock_code in stock_codes
+            ],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda **_kwargs: {
+                'enabled': True,
+            },
+        )
+        core_outcome = _exact_fundamentals_scope_outcome(stock_codes)
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 188,
+                'status': 'completed',
+                **core_outcome,
+            }
+        )
+
+        async def repair(**kwargs):
+            requested = [
+                item['stock_code'] for item in kwargs['corporations']
+            ]
+            return {
+                'triggered': True,
+                'status': 'completed',
+                'successful_stock_codes': requested,
+                'incomplete_stock_codes': [],
+            }
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'partial',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': [],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': stock_codes,
+                },
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                side_effect=repair,
+            ) as repair_mock,
+            patch(
+                'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_missing_symbol_probe_limit',
+                1,
+            ),
+        ):
+            first = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+            second = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 15),
+                fs_div='CFS',
+            )
+
+        requested_batches = [
+            [
+                item['stock_code']
+                for item in call.kwargs['corporations']
+            ]
+            for call in repair_mock.await_args_list
+        ]
+        self.assertEqual(requested_batches, [['000001'], ['000002']])
+        self.assertEqual(
+            first['share_issuance_baseline_repair'][
+                'cursor_after_stock_code'
+            ],
+            '000001',
+        )
+        self.assertEqual(
+            second['share_issuance_baseline_repair'][
+                'previous_cursor_after_stock_code'
+            ],
+            '000001',
+        )
+        self.assertEqual(
+            repository.latest_refresh_run['run_metadata'][
+                'share_issuance_baseline_repair_cursor_after_stock_code'
+            ],
+            '000002',
+        )
+
+    async def test_compound_refresh_orders_issuance_before_piotroski_and_feedback(self):
+        service, repository = self._build_global_followup_service()
+        call_order = []
+        core_result = dict(
+            service._run_daily_incremental_refresh.return_value
+        )
+
+        async def run_core(**kwargs):
+            call_order.append('fundamentals')
+            self.assertFalse(kwargs['run_piotroski_followup'])
+            self.assertFalse(kwargs['run_feedback_followup'])
+            return core_result
+
+        async def run_global_scan(**_kwargs):
+            call_order.append('global_scan')
+            return {
+                'run_id': 901,
+                'status': 'partial',
+                'scan_status': 'completed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            }
+
+        async def run_baseline_repair(**_kwargs):
+            call_order.append('baseline_repair')
+            return {
+                'triggered': True,
+                'status': 'completed',
+                'successful_stock_codes': ['005930'],
+                'incomplete_stock_codes': [],
+            }
+
+        piotroski_result = {
+            'market_date': '2026-04-14',
+            'results_persisted': 1,
+            'results_failed': 0,
+        }
+
+        def run_piotroski(**_kwargs):
+            call_order.append('piotroski')
+            return piotroski_result
+
+        def inspect_prerequisites(**kwargs):
+            call_order.append('feedback_prerequisites')
+            self.assertEqual(kwargs['symbols'], ['005930'])
+            persisted_scope = repository.completed_refresh_runs[-1][1][
+                'run_metadata'
+            ]
+            self.assertEqual(
+                persisted_scope['successful_stock_codes'],
+                ['005930'],
+            )
+            self.assertEqual(
+                persisted_scope['retry_debt_stock_codes'],
+                [],
+            )
+            return _feedback_prerequisites()
+
+        feedback_result = {'completed': True, 'final_pending': 0}
+
+        def run_feedback(**kwargs):
+            call_order.append('feedback')
+            self.assertEqual(kwargs['config'].symbols, ('005930',))
+            return feedback_result
+
+        service._run_daily_incremental_refresh.side_effect = run_core
+        self.mock_piotroski_filter.side_effect = run_piotroski
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                side_effect=run_global_scan,
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                side_effect=run_baseline_repair,
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=inspect_prerequisites,
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                side_effect=run_feedback,
+            ),
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        self.assertEqual(
+            call_order,
+            [
+                'fundamentals',
+                'global_scan',
+                'baseline_repair',
+                'piotroski',
+                'feedback_prerequisites',
+                'feedback',
+            ],
+        )
+        self.mock_piotroski_filter.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['005930'],
+        )
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['piotroski_filter'], piotroski_result)
+        self.assertEqual(result['feedback_followup'], feedback_result)
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['piotroski_filter_followup'], piotroski_result)
+        self.assertEqual(metadata['feedback_followup'], feedback_result)
+        self.assertEqual(metadata['compound_status'], 'completed')
+
+    async def test_compound_refresh_runs_followups_only_for_ready_subset(self):
+        service, repository = self._build_global_followup_service(
+            ['000660', '005930']
+        )
+
+        def run_piotroski(**kwargs):
+            self.assertEqual(kwargs['symbols'], ['000660'])
+            pre_followup = repository.completed_refresh_runs[-1][1]
+            self.assertEqual(pre_followup['status'], 'partial')
+            self.assertEqual(
+                pre_followup['run_metadata']['successful_stock_codes'],
+                ['000660'],
+            )
+            self.assertEqual(
+                pre_followup['run_metadata']['retry_debt_stock_codes'],
+                ['005930'],
+            )
+            self.assertEqual(
+                pre_followup['run_metadata'][
+                    'piotroski_filter_followup_state'
+                ],
+                'pending',
+            )
+            return {'results_persisted': 1, 'results_failed': 0}
+
+        self.mock_piotroski_filter.side_effect = run_piotroski
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'partial',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': ['000660'],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': ['005930'],
+                },
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                return_value={
+                    'triggered': True,
+                    'status': 'partial',
+                    'successful_stock_codes': [],
+                    'incomplete_stock_codes': ['005930'],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ) as prerequisites,
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                return_value={'completed': True},
+            ) as feedback,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['successful_stock_codes'], ['000660'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+        prerequisites.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            symbols=['000660'],
+        )
+        self.assertEqual(feedback.call_args.kwargs['config'].symbols, ('000660',))
+
+    async def test_compound_refresh_skips_followups_when_all_symbols_are_debt(self):
+        service, repository = self._build_global_followup_service(
+            ['000660', '005930']
+        )
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'partial',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': [],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': ['000660', '005930'],
+                },
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                return_value={
+                    'triggered': True,
+                    'status': 'partial',
+                    'successful_stock_codes': [],
+                    'incomplete_stock_codes': ['000660', '005930'],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            ) as prerequisites,
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        self.mock_piotroski_filter.assert_not_called()
+        prerequisites.assert_not_called()
+        feedback.assert_not_called()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['successful_stock_codes'], [])
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(
+            result['piotroski_filter']['reason'],
+            'no_compound_ready_symbols',
+        )
+        self.assertEqual(
+            result['feedback_followup']['reason'],
+            'piotroski_filter_followup_incomplete',
+        )
+        self.assertEqual(
+            repository.completed_refresh_runs[-1][1]['status'],
+            'failed',
+        )
+
+    async def test_compound_refresh_is_partial_when_piotroski_persistence_is_incomplete(self):
+        service, repository = self._build_global_followup_service()
+        self.mock_piotroski_filter.return_value = {
+            'market_date': '2026-04-14',
+            'results_persisted': 0,
+            'results_failed': 1,
+            'failed_symbols': ['005930'],
+        }
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'completed',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': ['005930'],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': [],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback_followup,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        feedback_followup.assert_not_called()
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn(
+            'piotroski_filter_persistence_incomplete',
+            result['partial_reasons'],
+        )
+        self.assertEqual(
+            result['feedback_followup']['reason'],
+            'piotroski_filter_followup_incomplete',
+        )
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['compound_status'], 'partial')
+        self.assertIn(
+            'piotroski_filter_persistence_incomplete',
+            metadata['partial_reasons'],
+        )
+        self.assertEqual(
+            metadata['piotroski_filter_followup']['failed_symbols'],
+            ['005930'],
+        )
+
+    async def test_compound_refresh_is_partial_when_piotroski_raises(self):
+        service, repository = self._build_global_followup_service()
+        self.mock_piotroski_filter.side_effect = RuntimeError(
+            'piotroski persistence unavailable'
+        )
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'completed',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': ['005930'],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': [],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback_followup,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        feedback_followup.assert_not_called()
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn(
+            'piotroski_filter_followup_failed',
+            result['partial_reasons'],
+        )
+        self.assertIsNone(result['piotroski_filter'])
+        self.assertEqual(
+            result['piotroski_filter_error'],
+            'piotroski persistence unavailable',
+        )
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['compound_status'], 'partial')
+        self.assertEqual(
+            metadata['piotroski_filter_followup_error'],
+            'piotroski persistence unavailable',
+        )
+        self.assertEqual(
+            metadata['feedback_followup']['reason'],
+            'piotroski_filter_followup_incomplete',
+        )
 
 
 class InferFundamentalsRequestTests(unittest.TestCase):

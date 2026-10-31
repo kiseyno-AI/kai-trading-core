@@ -2515,12 +2515,16 @@ class PykrxEnrichmentService:
         category_summaries: dict[str, dict[str, Any]] = {}
         for category in categories:
             supported_markets = CATEGORY_SUPPORTED_MARKETS.get(category)
-            decision_usable_rows = [
+            raw_category_rows = [
                 item
                 for item in rows
                 if item['category'] == category
                 and (supported_markets is None or _row_market(item) in supported_markets)
-                and is_decision_usable_pykrx_enrichment_row(item)
+            ]
+            decision_usable_rows = [
+                item
+                for item in raw_category_rows
+                if is_decision_usable_pykrx_enrichment_row(item)
             ]
             complete_rows = [
                 item
@@ -2677,8 +2681,19 @@ class PykrxEnrichmentService:
                 if parsed is not None and (latest_parsed is None or parsed > latest_parsed):
                     latest_parsed = parsed
                     latest_captured_at = item.get('captured_at')
-            category_summaries[category] = {
+            category_summary = {
                 'scope_type': CATEGORY_SCOPE_TYPE[category],
+                'expected_scope_keys': (
+                    sorted(expected_scope_keys)
+                    if expected_scope_keys is not None
+                    else None
+                ),
+                'decision_usable_scope_keys': sorted(
+                    eligible_decision_usable_scope_keys
+                ),
+                'complete_scope_keys': sorted(
+                    eligible_complete_scope_keys
+                ),
                 'present_rows': present_rows,
                 'raw_present_rows': len(decision_usable_scope_keys),
                 'complete_present_rows': complete_present_rows,
@@ -2723,6 +2738,56 @@ class PykrxEnrichmentService:
                 'markets': sorted({item['market'] for item in category_rows if item.get('market')}),
                 'latest_captured_at': latest_captured_at,
             }
+            if category == 'short_selling':
+                short_component_specs = {
+                    'short_volume': ('short_volume', SHORT_VOLUME_METRIC_KEYS),
+                    'short_value': ('short_volume', SHORT_VALUE_METRIC_KEYS),
+                    'short_balance': ('short_balance', SHORT_BALANCE_METRIC_KEYS),
+                }
+                component_coverage: dict[str, dict[str, Any]] = {}
+                for component, (payload_group, metric_keys) in short_component_specs.items():
+                    component_scope_keys = {
+                        item.get('symbol') or item['scope_key']
+                        for item in raw_category_rows
+                        if (item.get('symbol') or item.get('scope_key'))
+                        and item.get('source') != 'pykrx_carry_forward'
+                        and _metric_group_complete(
+                            dict((item.get('payload') or {}).get(payload_group) or {}),
+                            metric_keys,
+                        )
+                    }
+                    eligible_component_scope_keys = (
+                        component_scope_keys
+                        if expected_scope_keys is None
+                        else component_scope_keys & expected_scope_keys
+                    )
+                    component_present_rows = len(eligible_component_scope_keys)
+                    component_status = (
+                        'unavailable'
+                        if expectation_status == 'unavailable' or expected_rows is None
+                        else 'not_applicable'
+                        if expectation_status == 'not_applicable'
+                        else _coverage_status(
+                            present_rows=component_present_rows,
+                            expected_rows=expected_rows,
+                        )
+                    )
+                    component_coverage[component] = {
+                        'present_rows': component_present_rows,
+                        'missing_rows': (
+                            max(expected_rows - component_present_rows, 0)
+                            if expected_rows is not None
+                            else None
+                        ),
+                        'coverage_ratio': (
+                            round(component_present_rows / expected_rows, 6)
+                            if expected_rows is not None and expected_rows > 0
+                            else None
+                        ),
+                        'coverage_status': component_status,
+                    }
+                category_summary['component_coverage'] = component_coverage
+            category_summaries[category] = category_summary
 
         return {
             'market_date': market_date,

@@ -8,6 +8,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
 from app.db_models import DartDisclosureEvent, DartDisclosureSyncRun
+from app.dart.share_issuance_audit import (
+    DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+    DART_SHARE_ISSUANCE_AUDIT_TRIGGER,
+)
 from app.dart.service import classify_disclosure_event
 
 
@@ -185,22 +189,58 @@ class DartSyncRepository:
             'financial_report_events': financial_count,
         }
 
-    def get_latest_sync_run(self) -> dict | None:
+    def get_latest_sync_run(
+        self,
+        *,
+        trigger: str | None = None,
+        include_internal_audits: bool = False,
+    ) -> dict | None:
         with session_scope() as session:
+            stmt = select(DartDisclosureSyncRun)
+            if trigger is not None:
+                stmt = stmt.where(DartDisclosureSyncRun.trigger == trigger)
+            elif not include_internal_audits:
+                stmt = stmt.where(
+                    DartDisclosureSyncRun.trigger.not_in(
+                        (
+                            DART_SHARE_ISSUANCE_AUDIT_TRIGGER,
+                            DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+                        )
+                    )
+                )
             row = session.execute(
-                select(DartDisclosureSyncRun)
-                .order_by(DartDisclosureSyncRun.started_at.desc(), DartDisclosureSyncRun.id.desc())
+                stmt.order_by(
+                    DartDisclosureSyncRun.started_at.desc(),
+                    DartDisclosureSyncRun.id.desc(),
+                )
                 .limit(1)
             ).scalar_one_or_none()
             if row is None:
                 return None
             return _serialize_run(row)
 
-    def list_sync_runs(self, *, limit: int = 10) -> list[dict]:
+    def list_sync_runs(
+        self,
+        *,
+        limit: int = 10,
+        include_internal_audits: bool = False,
+    ) -> list[dict]:
         with session_scope() as session:
+            stmt = select(DartDisclosureSyncRun)
+            if not include_internal_audits:
+                stmt = stmt.where(
+                    DartDisclosureSyncRun.trigger.not_in(
+                        (
+                            DART_SHARE_ISSUANCE_AUDIT_TRIGGER,
+                            DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+                        )
+                    )
+                )
             rows = session.execute(
-                select(DartDisclosureSyncRun)
-                .order_by(DartDisclosureSyncRun.started_at.desc(), DartDisclosureSyncRun.id.desc())
+                stmt.order_by(
+                    DartDisclosureSyncRun.started_at.desc(),
+                    DartDisclosureSyncRun.id.desc(),
+                )
                 .limit(limit)
             ).scalars()
             return [_serialize_run(row) for row in rows]

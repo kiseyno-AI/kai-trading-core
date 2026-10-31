@@ -28,6 +28,7 @@ class DartLookupError(LookupError):
 
 _FILENAME_STAR_PATTERN = re.compile(r"filename\*\s*=\s*([^']*)''([^;]+)")
 _FILENAME_PATTERN = re.compile(r'filename\s*=\s*"?(?P<filename>[^";]+)"?')
+NON_AUTHORITATIVE_CORP_CODE_MEMORY_TTL_SECONDS = 300
 
 
 class DartClient:
@@ -41,6 +42,10 @@ class DartClient:
         self.transport = transport
         self._corp_codes: list[dict[str, str]] = []
         self._corp_codes_loaded_at: datetime | None = None
+        self._corp_codes_source = 'uninitialized'
+        self._corp_codes_source_fetched_at: datetime | None = None
+        self._corp_codes_cache_age_seconds: float | None = None
+        self._corp_codes_authoritative = False
         self._corp_codes_lock = asyncio.Lock()
 
     async def fetch_company_overview(self, corp_code: str) -> dict[str, Any]:
@@ -252,6 +257,23 @@ class DartClient:
         corp_codes = await self._load_corp_codes()
         return any(item['stock_code'] == normalized_stock_code for item in corp_codes)
 
+    def corp_code_mapping_authority(self) -> dict[str, Any]:
+        return {
+            'source': self._corp_codes_source,
+            'source_fetched_at': (
+                self._corp_codes_source_fetched_at.isoformat()
+                if self._corp_codes_source_fetched_at is not None
+                else None
+            ),
+            'loaded_at': (
+                self._corp_codes_loaded_at.isoformat()
+                if self._corp_codes_loaded_at is not None
+                else None
+            ),
+            'cache_age_seconds': self._corp_codes_cache_age_seconds,
+            'authoritative': self._corp_codes_authoritative,
+        }
+
     async def lookup_corp_code(
         self,
         *,
@@ -281,6 +303,104 @@ class DartClient:
 
         raise DartLookupError('One of corp_code, stock_code, or corp_name is required')
 
+    async def lookup_corp_codes_for_stocks(
+        self,
+        *,
+        stock_codes: list[str],
+    ) -> dict[str, Any]:
+        normalized_stock_codes = list(
+            dict.fromkeys(
+                str(stock_code or '').strip().zfill(6)
+                for stock_code in stock_codes
+                if str(stock_code or '').strip()
+            )
+        )
+        corp_codes = await self._load_corp_codes()
+        requested = set(normalized_stock_codes)
+        candidates_by_stock: dict[str, list[dict[str, str]]] = {}
+        for item in corp_codes:
+            stock_code = str(item.get('stock_code') or '').strip().zfill(6)
+            if stock_code not in requested:
+                continue
+            candidates_by_stock.setdefault(stock_code, []).append(item)
+        resolved_by_stock: dict[str, dict[str, str]] = {}
+        conflicting_mappings: list[dict[str, Any]] = []
+        for stock_code, candidates in candidates_by_stock.items():
+            corp_codes_for_stock = sorted(
+                {
+                    str(item.get('corp_code') or '').strip()
+                    for item in candidates
+                    if str(item.get('corp_code') or '').strip()
+                }
+            )
+            if len(corp_codes_for_stock) != 1:
+                conflicting_mappings.append(
+                    {
+                        'stock_code': stock_code,
+                        'corp_codes': corp_codes_for_stock,
+                        'reason': 'ambiguous_stock_to_corp_mapping',
+                    }
+                )
+                continue
+            resolved_by_stock[stock_code] = next(
+                item
+                for item in candidates
+                if str(item.get('corp_code') or '').strip()
+                == corp_codes_for_stock[0]
+            )
+        absent_stock_codes = [
+            stock_code
+            for stock_code in normalized_stock_codes
+            if stock_code not in resolved_by_stock
+            and stock_code not in candidates_by_stock
+        ]
+        if not self._corp_codes_authoritative:
+            conflicting_mappings.extend(
+                {
+                    'stock_code': stock_code,
+                    'corp_codes': [
+                        str(
+                            resolved_by_stock[stock_code].get('corp_code')
+                            or ''
+                        ).strip()
+                    ],
+                    'reason': (
+                        'stock_mapping_resolved_from_non_authoritative_corp_list'
+                    ),
+                }
+                for stock_code in normalized_stock_codes
+                if stock_code in resolved_by_stock
+            )
+            conflicting_mappings.extend(
+                {
+                    'stock_code': stock_code,
+                    'corp_codes': [],
+                    'reason': (
+                        'stock_mapping_absent_from_non_authoritative_corp_list'
+                    ),
+                }
+                for stock_code in absent_stock_codes
+            )
+        return {
+            'resolved': [
+                {
+                    'stock_code': stock_code,
+                    'corp_code': resolved_by_stock[stock_code]['corp_code'],
+                    'corp_name': resolved_by_stock[stock_code]['corp_name'],
+                }
+                for stock_code in normalized_stock_codes
+                if stock_code in resolved_by_stock
+                and self._corp_codes_authoritative
+            ],
+            'unsupported_stock_codes': [
+                stock_code
+                for stock_code in absent_stock_codes
+                if self._corp_codes_authoritative
+            ],
+            'conflicting_mappings': conflicting_mappings,
+            'mapping_authority': self.corp_code_mapping_authority(),
+        }
+
     async def _find_corp(self, predicate) -> dict[str, str] | None:
         corp_codes = await self._load_corp_codes()
         for item in corp_codes:
@@ -291,12 +411,42 @@ class DartClient:
     async def _load_corp_codes(self) -> list[dict[str, str]]:
         now = datetime.now(timezone.utc)
         ttl = timedelta(seconds=settings.dart_corp_code_cache_ttl_seconds)
-        if self._corp_codes and self._corp_codes_loaded_at and now - self._corp_codes_loaded_at < ttl:
+        memory_ttl = (
+            ttl
+            if self._corp_codes_authoritative
+            else min(
+                ttl,
+                timedelta(
+                    seconds=NON_AUTHORITATIVE_CORP_CODE_MEMORY_TTL_SECONDS
+                ),
+            )
+        )
+        if (
+            self._corp_codes
+            and self._corp_codes_loaded_at
+            and now - self._corp_codes_loaded_at < memory_ttl
+        ):
             return self._corp_codes
 
         async with self._corp_codes_lock:
             now = datetime.now(timezone.utc)
-            if self._corp_codes and self._corp_codes_loaded_at and now - self._corp_codes_loaded_at < ttl:
+            memory_ttl = (
+                ttl
+                if self._corp_codes_authoritative
+                else min(
+                    ttl,
+                    timedelta(
+                        seconds=(
+                            NON_AUTHORITATIVE_CORP_CODE_MEMORY_TTL_SECONDS
+                        )
+                    ),
+                )
+            )
+            if (
+                self._corp_codes
+                and self._corp_codes_loaded_at
+                and now - self._corp_codes_loaded_at < memory_ttl
+            ):
                 return self._corp_codes
 
             payload = b''
@@ -312,13 +462,43 @@ class DartClient:
             except (DartAPIError, httpx.HTTPError) as exc:
                 persisted = self._load_persisted_corp_codes()
                 if persisted is not None:
+                    cache_path = self._corp_code_cache_path()
+                    source_fetched_at: datetime | None = None
+                    cache_age_seconds: float | None = None
+                    try:
+                        if cache_path is not None:
+                            source_fetched_at = datetime.fromtimestamp(
+                                cache_path.stat().st_mtime,
+                                tz=timezone.utc,
+                            )
+                            cache_age_seconds = max(
+                                (now - source_fetched_at).total_seconds(),
+                                0.0,
+                            )
+                    except OSError:
+                        source_fetched_at = None
+                        cache_age_seconds = None
                     self._corp_codes = persisted
                     self._corp_codes_loaded_at = now
+                    self._corp_codes_source = 'persistent_fallback'
+                    self._corp_codes_source_fetched_at = source_fetched_at
+                    self._corp_codes_cache_age_seconds = cache_age_seconds
+                    self._corp_codes_authoritative = bool(
+                        cache_age_seconds is not None
+                        and cache_age_seconds <= ttl.total_seconds()
+                    )
                     log_fetch_event(
                         service='dart',
                         operation='load_corp_codes',
                         status='completed',
                         source='persistent_fallback',
+                        source_fetched_at=(
+                            source_fetched_at.isoformat()
+                            if source_fetched_at is not None
+                            else None
+                        ),
+                        cache_age_seconds=cache_age_seconds,
+                        authoritative=self._corp_codes_authoritative,
                         corp_code_count=len(persisted),
                         upstream_error_type=type(exc).__name__,
                     )
@@ -336,6 +516,10 @@ class DartClient:
             self._persist_corp_code_payload(payload)
             self._corp_codes = corp_codes
             self._corp_codes_loaded_at = now
+            self._corp_codes_source = 'upstream'
+            self._corp_codes_source_fetched_at = now
+            self._corp_codes_cache_age_seconds = 0.0
+            self._corp_codes_authoritative = True
             log_fetch_event(
                 service='dart',
                 operation='load_corp_codes',

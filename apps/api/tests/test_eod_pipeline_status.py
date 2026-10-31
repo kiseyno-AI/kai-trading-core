@@ -1,6 +1,7 @@
 import unittest
 from copy import deepcopy
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
@@ -13,7 +14,9 @@ from app.eod.pipeline_status import (
     _load_latest_feedback_run_summary,
     _load_latest_pipeline_pykrx_run,
     _load_pipeline_pykrx_run_rows,
+    _signal_feature_row_is_semantically_ready,
 )
+from app.eod.market_membership import build_market_membership_snapshot
 
 
 class _FakeMarketState:
@@ -77,6 +80,24 @@ def _full_pykrx_enrichment_coverage(*, symbol_count: int, market_count: int, upd
             }
             for category in DEFAULT_PYKRX_ENRICHMENT_CATEGORIES
         },
+    }
+
+
+def _scope_gap_evidence(
+    *,
+    requested_count: int,
+    present_count: int,
+    missing_symbols_sample: list[str] | None = None,
+    **extra,
+) -> dict:
+    return {
+        'evidence_version': 'row_count_scope_gap_v1',
+        'authoritative': True,
+        'requested_count': requested_count,
+        'present_count': present_count,
+        'missing_count': requested_count - present_count,
+        'missing_symbols_sample': list(missing_symbols_sample or []),
+        **extra,
     }
 
 
@@ -510,6 +531,857 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_read_keeps_aggregate_only_price_coverage_unverified(self):
+        pykrx_run = {
+            'id': 900,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {'markets': ['KOSPI']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 2,
+            technical_snapshot_count_loader=lambda *_: 2,
+            action_summary_count_loader=lambda *_: 2,
+            row_count_stage_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date='2026-04-21')
+
+        price_stage = result['stages']['price_collection']
+        self.assertEqual(price_stage['status'], 'completed')
+        self.assertEqual(price_stage['gate_status'], 'ready')
+        self.assertEqual(price_stage['severity'], 'degraded')
+        self.assertEqual(
+            price_stage['details']['expected_rows_source'],
+            'eod_run_symbol_total_unverified',
+        )
+        self.assertEqual(
+            price_stage['details']['coverage_verification_status'],
+            'unverified',
+        )
+        self.assertFalse(price_stage['details']['exact_universe_verified'])
+
+    def test_read_uses_validated_run_membership_instead_of_self_certifying_price_count(self):
+        requested_symbols = ['000660', '005930']
+        membership = build_market_membership_snapshot(
+            symbols=[
+                SimpleNamespace(symbol='000660', market='KOSPI'),
+                SimpleNamespace(symbol='005930', market='KOSPI'),
+            ],
+            markets=['KOSPI'],
+        )
+        pykrx_run = {
+            'id': 901,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': requested_symbols,
+                'universe_snapshot': {
+                    'markets': ['KOSPI'],
+                    'market_membership': membership,
+                },
+            },
+        }
+
+        def scope_gap_loader(*, stage_id, market_date, symbols):
+            assert market_date == '2026-04-21'
+            assert symbols == requested_symbols
+            if stage_id == 'price_collection':
+                return _scope_gap_evidence(
+                    requested_count=2,
+                    present_count=1,
+                    missing_symbols_sample=['005930'],
+                )
+            return _scope_gap_evidence(
+                requested_count=2,
+                present_count=2,
+            )
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 2,
+            technical_snapshot_count_loader=lambda *_: 2,
+            action_summary_count_loader=lambda *_: 2,
+            row_count_stage_counts_loader=lambda **_: {},
+            row_count_scope_gap_loader=scope_gap_loader,
+        )
+
+        result = service.read(market_date='2026-04-21')
+
+        price_stage = result['stages']['price_collection']
+        self.assertEqual(price_stage['status'], 'partial')
+        self.assertEqual(price_stage['succeeded'], 1)
+        self.assertEqual(price_stage['failed'], 1)
+        self.assertEqual(
+            price_stage['details']['expected_rows_source'],
+            'validated_eod_run_market_membership',
+        )
+        self.assertFalse(price_stage['details']['exact_universe_verified'])
+        self.assertEqual(
+            price_stage['details']['exact_universe_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['005930'],
+        )
+
+    def test_read_blocks_complete_factor_count_when_requested_symbol_is_missing(self):
+        requested_symbols = ['000660', '005930']
+        membership = build_market_membership_snapshot(
+            symbols=[
+                SimpleNamespace(symbol='000660', market='KOSPI'),
+                SimpleNamespace(symbol='005930', market='KOSPI'),
+            ],
+            markets=['KOSPI'],
+        )
+        pykrx_run = {
+            'id': 902,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': requested_symbols,
+                'universe_snapshot': {
+                    'markets': ['KOSPI'],
+                    'market_membership': membership,
+                },
+            },
+        }
+
+        def scope_gap_loader(*, stage_id, market_date, symbols):
+            assert market_date == '2026-04-21'
+            assert symbols == requested_symbols
+            if stage_id == 'momentum_factors':
+                return _scope_gap_evidence(
+                    requested_count=2,
+                    present_count=1,
+                    missing_symbols_sample=['005930'],
+                )
+            return _scope_gap_evidence(
+                requested_count=2,
+                present_count=2,
+            )
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 2,
+            technical_snapshot_count_loader=lambda *_: 2,
+            action_summary_count_loader=lambda *_: 2,
+            row_count_stage_counts_loader=lambda **_: (
+                _full_feedback_prerequisite_stage_counts(
+                    total=2,
+                    updated_at='2026-04-21T09:45:00+00:00',
+                )
+            ),
+            row_count_scope_gap_loader=scope_gap_loader,
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2,
+                'semantic_ready_count': 2,
+            },
+        )
+
+        result = service.read(
+            market_date='2026-04-21',
+            scope_symbols=requested_symbols,
+        )
+
+        momentum_stage = result['stages']['momentum_factors']
+        self.assertEqual(momentum_stage['status'], 'completed')
+        self.assertEqual(momentum_stage['gate_status'], 'blocked')
+        self.assertEqual(
+            momentum_stage['details']['gate_reason'],
+            'missing_rows_intersect_requested_scope',
+        )
+        self.assertEqual(
+            momentum_stage['details']['feedback_scope_gap'][
+                'missing_symbols_sample'
+            ],
+            ['005930'],
+        )
+
+    def test_signal_feature_stage_requires_semantically_usable_rows_for_requested_scope(self):
+        self.assertFalse(
+            _signal_feature_row_is_semantically_ready(
+                signal_count=0,
+                feature_payload={'fallback_features': {}},
+            )
+        )
+        self.assertTrue(
+            _signal_feature_row_is_semantically_ready(
+                signal_count=0,
+                feature_payload={
+                    'fallback_features': {
+                        'price_action': {'close_return_1d_pct': 1.2},
+                    },
+                },
+            )
+        )
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=2,
+                present_count=1,
+                missing_symbols_sample=['005930'],
+                semantic_readiness_required=True,
+            ),
+        )
+
+        stage = service._build_signal_features_stage(
+            market_date='2026-04-21',
+            aggregate={
+                'persisted': 2,
+                'semantic_ready_count': 1,
+                'semantic_unready_count': 1,
+                'direct_signal_rows': 0,
+                'fallback_usable_rows': 1,
+            },
+            expected_total=2,
+            scope_symbols=['000660', '005930'],
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['details']['semantic_ready_rows'], 1)
+        self.assertEqual(stage['details']['semantic_unready_rows'], 1)
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'missing_rows_intersect_requested_scope',
+        )
+
+    def test_factor_partial_blocks_when_missing_row_intersects_requested_scope(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **kwargs: _scope_gap_evidence(
+                requested_count=len(kwargs['symbols']),
+                present_count=1,
+                missing_symbols_sample=['005930'],
+            ),
+        )
+
+        diagnostics = service._build_row_count_stage_diagnostics(
+            stage_id='quality_factors',
+            status='partial',
+            market_date='2026-04-21',
+            persisted=199,
+            expected_total=200,
+            blocking_stages=[],
+            failed_blocking_stages=[],
+            aggregate={'missing_count': 1},
+            feedback_run=None,
+            scope_symbols=['000660', '005930'],
+        )
+
+        self.assertEqual(diagnostics['gate_status'], 'blocked')
+        self.assertEqual(diagnostics['blocking_status'], 'blocking')
+        self.assertEqual(
+            diagnostics['gate_reason'],
+            'missing_rows_intersect_requested_scope',
+        )
+        self.assertEqual(
+            diagnostics['feedback_scope_gap']['missing_symbols_sample'],
+            ['005930'],
+        )
+
+    def test_requested_scope_gate_fails_closed_on_malformed_zero_gap_proof(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: {
+                'missing_count': 0,
+            },
+        )
+
+        stage = service._apply_scope_coverage_gate(
+            stage_id='quality_factors',
+            market_date='2026-04-21',
+            stage={
+                'status': 'completed',
+                'gate_status': 'ready',
+                'severity': 'ready',
+                'blocking_status': 'non_blocking',
+                'details': {},
+            },
+            scope_symbols=['005930'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'requested_scope_coverage_evidence_invalid',
+        )
+
+    def test_requested_scope_completion_does_not_bypass_dependency_or_terminal_gate(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+            ),
+        )
+
+        diagnostics = service._build_row_count_stage_diagnostics(
+            stage_id='quality_factors',
+            status='pending',
+            market_date='2026-04-21',
+            persisted=1,
+            expected_total=1,
+            blocking_stages=['fundamentals_daily_refresh'],
+            failed_blocking_stages=[],
+            aggregate={'missing_count': 0},
+            feedback_run=None,
+            scope_symbols=['005930'],
+        )
+        self.assertEqual(diagnostics['gate_status'], 'waiting')
+        self.assertEqual(
+            diagnostics['gate_reason'],
+            'waiting_on_dependency',
+        )
+
+        failed_stage = service._apply_scope_coverage_gate(
+            stage_id='technical_snapshots',
+            market_date='2026-04-21',
+            stage={
+                'status': 'failed',
+                'gate_status': 'blocked',
+                'severity': 'failed',
+                'blocking_status': 'blocking',
+                'details': {'gate_reason': 'official_stage_failed'},
+            },
+            scope_symbols=['005930'],
+        )
+        self.assertEqual(failed_stage['status'], 'failed')
+        self.assertEqual(failed_stage['gate_status'], 'blocked')
+        self.assertEqual(
+            failed_stage['details']['gate_reason'],
+            'official_stage_failed',
+        )
+
+    def test_requested_scope_completion_isolates_out_of_scope_partial_dependency(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: {
+                'evidence_version': 'row_count_scope_gap_v1',
+                'authoritative': True,
+                'requested_count': 1,
+                'present_count': 1,
+                'missing_count': 0,
+                'missing_symbols_sample': [],
+            },
+        )
+        price_stage = service._apply_scope_coverage_gate(
+            stage_id='price_collection',
+            market_date='2026-04-21',
+            stage={
+                'status': 'partial',
+                'gate_status': 'blocked',
+                'severity': 'blocked',
+                'blocking_status': 'blocking',
+                'details': {
+                    'gate_reason': 'missing_rows_intersect_exact_run_universe',
+                    'exact_universe_coverage': {
+                        'requested_count': 2,
+                        'present_count': 1,
+                        'missing_count': 1,
+                        'missing_symbols_sample': ['005930'],
+                    },
+                },
+            },
+            scope_symbols=['000660'],
+        )
+
+        self.assertEqual(price_stage['status'], 'partial')
+        self.assertEqual(price_stage['gate_status'], 'ready')
+        self.assertEqual(price_stage['severity'], 'degraded')
+        self.assertEqual(price_stage['blocking_status'], 'non_blocking')
+        self.assertEqual(
+            price_stage['details']['gate_reason'],
+            'requested_scope_rows_complete',
+        )
+        self.assertTrue(
+            service._dependency_is_ready_for_scope(
+                stage=price_stage,
+                scope_symbols=['000660'],
+            )
+        )
+
+        momentum_stage = service._build_row_count_stage(
+            stage_id='momentum_factors',
+            market_date='2026-04-21',
+            price_stage=price_stage,
+            price_rows_persisted=1,
+            prior_stages={'price_collection': price_stage},
+            aggregate={'persisted': 1, 'missing_count': 1},
+            live_symbols_total=2,
+            feedback_run=None,
+            scope_symbols=['000660'],
+        )
+        self.assertEqual(momentum_stage['status'], 'completed')
+        self.assertEqual(momentum_stage['gate_status'], 'ready')
+        self.assertEqual(momentum_stage['details']['blocking_stages'], [])
+        self.assertEqual(
+            momentum_stage['details']['gate_reason'],
+            'requested_scope_rows_complete',
+        )
+
+    def test_requested_scope_never_promotes_non_partial_dependency_states(self):
+        service = EODPipelineStatusService()
+        for status, gate_status in (
+            ('failed', 'blocked'),
+            ('running', 'waiting'),
+            ('pending', 'waiting'),
+            ('blocked', 'blocked'),
+            ('waiting', 'waiting'),
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    service._dependency_is_ready_for_scope(
+                        stage={
+                            'status': status,
+                            'gate_status': gate_status,
+                            'blocking_status': 'blocking',
+                        },
+                        scope_symbols=['000660'],
+                    )
+                )
+
+    def test_partial_dependency_requires_exact_requested_scope_evidence(self):
+        service = EODPipelineStatusService()
+        partial_ready_without_scope_evidence = {
+            'status': 'partial',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'details': {
+                'gate_reason': 'global_coverage_above_minimum',
+            },
+        }
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage=partial_ready_without_scope_evidence,
+                scope_symbols=['000660'],
+            )
+        )
+
+        partial_ready_with_incomplete_scope = {
+            **partial_ready_without_scope_evidence,
+            'details': {
+                'requested_scope_coverage': {
+                    'requested_count': 1,
+                    'present_count': 0,
+                    'missing_count': 1,
+                    'missing_symbols_sample': ['000660'],
+                },
+            },
+        }
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage=partial_ready_with_incomplete_scope,
+                scope_symbols=['000660'],
+            )
+        )
+
+        authoritative_but_incomplete_row_count_evidence = {
+            **partial_ready_without_scope_evidence,
+            'details': {
+                'requested_scope_coverage': {
+                    'authoritative': True,
+                    'evidence_version': 'row_count_scope_gap_v1',
+                    'requested_count': 2,
+                    'present_count': 1,
+                    'missing_count': 1,
+                    'missing_symbols_sample': ['000660'],
+                },
+            },
+        }
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage=(
+                    authoritative_but_incomplete_row_count_evidence
+                ),
+                scope_symbols=['005930', '000660'],
+            )
+        )
+
+    def test_waiting_partial_dependency_never_promotes_exact_scope_evidence(self):
+        service = EODPipelineStatusService()
+
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage={
+                    'status': 'partial',
+                    'gate_status': '',
+                    'blocking_status': 'waiting',
+                    'details': {
+                        'requested_scope_coverage': {
+                            'authoritative': True,
+                            'evidence_version': (
+                                'dart_fundamentals_scope_outcomes_v1'
+                            ),
+                            'requested_count': 1,
+                            'missing_count': 0,
+                        }
+                    },
+                },
+                scope_symbols=['000660'],
+            )
+        )
+
+    def test_fundamentals_partial_manifest_is_ready_only_for_successful_requested_symbols(self):
+        run = {
+            'id': 901,
+            'market_date': '2026-10-28',
+            'status': 'partial',
+            'fs_div': 'CFS',
+            'symbols_total': 3,
+            'symbols_checked': 3,
+            'symbols_fresh': 1,
+            'symbols_refreshed': 1,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': ['000660', '005930', '035420'],
+                'successful_stock_codes': ['000660', '005930'],
+                'retry_debt_stock_codes': ['035420'],
+                'scope_outcome_manifest': [
+                    {'stock_code': '000660', 'outcome': 'success'},
+                    {'stock_code': '005930', 'outcome': 'success'},
+                    {'stock_code': '035420', 'outcome': 'retry_debt'},
+                ],
+            },
+        }
+        service = EODPipelineStatusService(
+            fundamentals_refresh_loader=lambda **_: run,
+        )
+
+        successful_scope = service._build_fundamentals_stage(
+            market_date='2026-10-28',
+            fs_div='CFS',
+            scope_symbols=['000660', '005930'],
+        )
+        retry_debt_scope = service._build_fundamentals_stage(
+            market_date='2026-10-28',
+            fs_div='CFS',
+            scope_symbols=['035420'],
+        )
+
+        self.assertEqual(successful_scope['gate_status'], 'ready')
+        self.assertEqual(
+            successful_scope['details']['requested_scope_coverage'][
+                'missing_count'
+            ],
+            0,
+        )
+        self.assertTrue(
+            service._dependency_is_ready_for_scope(
+                stage=successful_scope,
+                scope_symbols=['000660', '005930'],
+            )
+        )
+        self.assertEqual(retry_debt_scope['gate_status'], 'blocked')
+        self.assertEqual(
+            retry_debt_scope['details']['requested_scope_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['035420'],
+        )
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage=retry_debt_scope,
+                scope_symbols=['035420'],
+            )
+        )
+
+    def test_completed_fundamentals_run_does_not_cover_symbol_outside_manifest(self):
+        run = {
+            'id': 902,
+            'market_date': '2026-10-28',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'symbols_total': 1,
+            'symbols_checked': 1,
+            'symbols_refreshed': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': ['005930'],
+                'successful_stock_codes': ['005930'],
+                'retry_debt_stock_codes': [],
+                'scope_outcome_manifest': [
+                    {'stock_code': '005930', 'outcome': 'success'},
+                ],
+            },
+        }
+        service = EODPipelineStatusService(
+            fundamentals_refresh_loader=lambda **_: run,
+        )
+
+        stage = service._build_fundamentals_stage(
+            market_date='2026-10-28',
+            fs_div='CFS',
+            scope_symbols=['000660'],
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(
+            stage['details']['requested_scope_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['000660'],
+        )
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage=stage,
+                scope_symbols=['000660'],
+            )
+        )
+
+    def test_fundamentals_scope_resolution_uses_latest_attempt_per_symbol(self):
+        older_full_run = {
+            'id': 903,
+            'status': 'completed',
+            'run_metadata': {
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': ['000660', '005930'],
+                'successful_stock_codes': ['000660', '005930'],
+                'retry_debt_stock_codes': [],
+                'scope_outcome_manifest': [
+                    {'stock_code': '000660', 'outcome': 'success'},
+                    {'stock_code': '005930', 'outcome': 'success'},
+                ],
+            },
+        }
+        newer_retry_run = {
+            'id': 904,
+            'market_date': '2026-10-28',
+            'status': 'partial',
+            'fs_div': 'CFS',
+            'symbols_total': 1,
+            'symbols_checked': 1,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': ['005930'],
+                'successful_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+                'scope_outcome_manifest': [
+                    {'stock_code': '005930', 'outcome': 'retry_debt'},
+                ],
+            },
+            '_scope_evidence_runs': [],
+        }
+        newer_retry_run['_scope_evidence_runs'] = [
+            newer_retry_run,
+            older_full_run,
+        ]
+        service = EODPipelineStatusService(
+            fundamentals_refresh_loader=lambda **_: newer_retry_run,
+        )
+
+        stage = service._build_fundamentals_stage(
+            market_date='2026-10-28',
+            fs_div='CFS',
+            scope_symbols=['000660', '005930'],
+        )
+        coverage = stage['details']['requested_scope_coverage']
+
+        self.assertEqual(coverage['present_count'], 1)
+        self.assertEqual(coverage['missing_symbols_sample'], ['005930'])
+        self.assertEqual(
+            coverage['source_run_ids_by_symbol'],
+            {'000660': 903, '005930': 904},
+        )
+        self.assertEqual(stage['gate_status'], 'blocked')
+
+    def test_daily_data_scope_manifest_is_ready_only_for_success_partition(
+        self,
+    ):
+        run = {
+            'id': 905,
+            'market_date': '2026-10-28',
+            'status': 'partial',
+            'fs_div': 'CFS',
+            'symbols_total': 3,
+            'symbols_checked': 3,
+            'symbols_refreshed': 1,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'scope_outcome_manifest_version': (
+                    'dart_daily_data_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': ['005930', '000660', '035420'],
+                'successful_stock_codes': ['005930'],
+                'retry_debt_stock_codes': ['000660'],
+                'terminal_not_applicable_stock_codes': ['035420'],
+                'scope_outcome_manifest': [
+                    {'stock_code': '005930', 'outcome': 'success'},
+                    {'stock_code': '000660', 'outcome': 'retry_debt'},
+                    {
+                        'stock_code': '035420',
+                        'outcome': 'terminal_not_applicable',
+                    },
+                ],
+            },
+        }
+        service = EODPipelineStatusService(
+            fundamentals_refresh_loader=lambda **_: run,
+        )
+
+        successful_scope = service._build_fundamentals_stage(
+            market_date='2026-10-28',
+            fs_div='CFS',
+            scope_symbols=['005930'],
+        )
+        excluded_scope = service._build_fundamentals_stage(
+            market_date='2026-10-28',
+            fs_div='CFS',
+            scope_symbols=['000660', '035420'],
+        )
+
+        successful_coverage = successful_scope['details'][
+            'requested_scope_coverage'
+        ]
+        self.assertEqual(
+            successful_coverage['evidence_version'],
+            'dart_daily_data_scope_outcomes_v1',
+        )
+        self.assertTrue(successful_coverage['authoritative'])
+        self.assertEqual(successful_coverage['missing_count'], 0)
+        self.assertEqual(successful_scope['gate_status'], 'ready')
+        self.assertTrue(
+            service._dependency_is_ready_for_scope(
+                stage=successful_scope,
+                scope_symbols=['005930'],
+            )
+        )
+        self.assertEqual(excluded_scope['gate_status'], 'blocked')
+        self.assertEqual(
+            excluded_scope['details']['requested_scope_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['000660', '035420'],
+        )
+
+    def test_daily_data_scope_manifest_rejects_malformed_partitions(self):
+        valid_metadata = {
+            'scope_outcome_manifest_version': (
+                'dart_daily_data_scope_outcomes_v1'
+            ),
+            'selected_stock_codes': ['005930', '000660', '035420'],
+            'successful_stock_codes': ['005930'],
+            'retry_debt_stock_codes': ['000660'],
+            'terminal_not_applicable_stock_codes': ['035420'],
+            'scope_outcome_manifest': [
+                {'stock_code': '005930', 'outcome': 'success'},
+                {'stock_code': '000660', 'outcome': 'retry_debt'},
+                {
+                    'stock_code': '035420',
+                    'outcome': 'terminal_not_applicable',
+                },
+            ],
+        }
+        malformed_metadata: dict[str, dict] = {}
+
+        overlapping_partition = deepcopy(valid_metadata)
+        overlapping_partition['successful_stock_codes'].append('000660')
+        malformed_metadata['overlapping_partition'] = overlapping_partition
+
+        duplicate_partition_symbol = deepcopy(valid_metadata)
+        duplicate_partition_symbol['selected_stock_codes'].append('005930')
+        malformed_metadata['duplicate_partition_symbol'] = (
+            duplicate_partition_symbol
+        )
+
+        duplicate_manifest_symbol = deepcopy(valid_metadata)
+        duplicate_manifest_symbol['scope_outcome_manifest'].append(
+            {'stock_code': '005930', 'outcome': 'success'}
+        )
+        malformed_metadata['duplicate_manifest_symbol'] = (
+            duplicate_manifest_symbol
+        )
+
+        mismatched_manifest = deepcopy(valid_metadata)
+        mismatched_manifest['scope_outcome_manifest'][1]['outcome'] = 'success'
+        malformed_metadata['mismatched_manifest'] = mismatched_manifest
+
+        service = EODPipelineStatusService()
+        for case_name, run_metadata in malformed_metadata.items():
+            with self.subTest(case=case_name):
+                coverage = service._build_fundamentals_requested_scope_coverage(
+                    run={
+                        'id': 906,
+                        'status': 'partial',
+                        'run_metadata': run_metadata,
+                    },
+                    scope_symbols=['005930', '000660', '035420'],
+                )
+
+                self.assertFalse(coverage['authoritative'])
+                self.assertEqual(coverage['present_count'], 0)
+                self.assertEqual(coverage['missing_count'], 3)
+                self.assertEqual(
+                    coverage['missing_symbols_sample'],
+                    ['005930', '000660', '035420'],
+                )
+                self.assertEqual(coverage['source_run_ids_by_symbol'], {})
+
+    def test_pykrx_global_completion_does_not_cover_missing_requested_symbol(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=1,
+            market_count=2,
+            updated_at='2026-10-28T16:30:00+09:00',
+        )
+        service = EODPipelineStatusService()
+
+        stage = service._build_pykrx_enrichment_stage(
+            market_date='2026-10-28',
+            coverage=coverage,
+            scope_symbols=['000660', '005930'],
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertFalse(
+            stage['details']['requested_scope_coverage']['authoritative']
+        )
+        self.assertEqual(
+            stage['details']['requested_scope_coverage']['missing_count'],
+            2,
+        )
+        self.assertFalse(
+            service._dependency_is_ready_for_scope(
+                stage=stage,
+                scope_symbols=['000660', '005930'],
+            )
+        )
+
     def test_legacy_optional_unavailable_stage_is_rendered_partial(self) -> None:
         normalized = EODPipelineStatusService._normalize_stage_contract(
             {
@@ -3199,11 +4071,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 updated_at='2026-05-27T06:25:00+00:00',
             ),
             feedback_run_loader=lambda **_: feedback_run,
-            row_count_scope_gap_loader=lambda **_: {
-                'missing_count': 0,
-                'missing_symbols_sample': [],
-                'missing_symbol_details_sample': [],
-            },
+            row_count_scope_gap_loader=lambda **kwargs: _scope_gap_evidence(
+                requested_count=len(kwargs['symbols']),
+                present_count=len(kwargs['symbols']),
+                missing_symbol_details_sample=[],
+            ),
         )
 
         result = service.read(market_date='2026-05-27')
@@ -3596,7 +4468,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['trending_ranks']['processed'], 3)
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['succeeded'], 3)
 
-    def test_read_uses_persisted_outputs_when_latest_official_run_is_single_stage_resume(self):
+    def test_read_uses_persisted_outputs_but_keeps_blocked_dependencies_pending_for_single_stage_resume(self):
         market_date = '2026-05-28'
         pykrx_run = {
             'id': 400,
@@ -3743,15 +4615,16 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date=market_date)
 
-        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['total_stages'], 26)
-        self.assertEqual(result['completed_stages'], 24)
+        self.assertEqual(result['completed_stages'], 19)
         self.assertEqual(result['skipped_stages'], 2)
-        self.assertEqual(result['display_completed_stages'], 26)
-        self.assertEqual(result['pending_stages'], 0)
+        self.assertEqual(result['display_completed_stages'], 21)
+        self.assertEqual(result['pending_stages'], 5)
         self.assertEqual(result['partial_stages'], 0)
         self.assertEqual(result['running_stages'], 0)
-        self.assertIsNone(result['current_stage'])
+        self.assertEqual(result['current_stage'], 'piotroski_filter')
+        self.assertEqual(result['current_stage_status'], 'pending')
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(
             result['stages']['master_refresh']['details']['reason'],
@@ -3773,6 +4646,23 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(pykrx_stage['status'], 'completed')
         self.assertEqual(pykrx_stage['gate_status'], 'blocked')
         self.assertEqual(pykrx_stage['details']['decider_category_gate_status'], 'blocked')
+        for stage_id in (
+            'piotroski_filter',
+            'value_factors',
+            'advanced_value_factors',
+            'unified_value_factors',
+        ):
+            with self.subTest(stage_id=stage_id):
+                self.assertEqual(result['stages'][stage_id]['status'], 'pending')
+                self.assertIn(
+                    'pykrx_enrichment',
+                    result['stages'][stage_id]['details']['blocking_stages'],
+                )
+        self.assertEqual(result['stages']['composite_factors']['status'], 'pending')
+        self.assertEqual(
+            result['stages']['composite_factors']['details']['blocking_stages'],
+            ['value_factors', 'advanced_value_factors'],
+        )
         self.assertEqual(result['gate_summary']['status'], 'blocked')
         self.assertEqual(result['gate_summary']['blocked_stage_ids'], ['pykrx_enrichment'])
         blocking_categories = pykrx_stage['details']['decider_blocking_categories']

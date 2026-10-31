@@ -292,6 +292,7 @@ class Settings(BaseSettings):
     dart_fundamentals_event_timeout_seconds: int = 60
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
+    dart_global_share_issuance_enabled: bool = False
     dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=100, ge=0, le=500)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
 

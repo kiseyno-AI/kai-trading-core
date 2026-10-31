@@ -780,6 +780,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['summary']['entries'], 1)
         self.assertEqual(result['summary']['entries_for_market_date'], 2)
+        self.assertEqual(result['summary']['coverage']['direct_signal_source_row_count'], 1)
+        self.assertEqual(result['summary']['coverage']['fallback_only_row_count'], 1)
+        self.assertEqual(result['summary']['coverage']['direct_signal_source_coverage_ratio'], 0.5)
+        self.assertEqual(result['summary']['coverage']['direct_signal_source_coverage_status'], 'partial')
         self.assertEqual(result['summary']['coverage']['active_universe']['present_rows'], 2)
         self.assertEqual(result['summary']['coverage']['active_universe']['missing_rows'], 1)
         self.assertEqual(result['summary']['coverage']['candidate_universe']['present_rows'], 1)

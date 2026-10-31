@@ -59,6 +59,7 @@ class AgentContextProgressService:
             state = runtime_feedback_state_store.get_run(normalized_market_date, logical=True)
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=normalized_market_date,
+            symbols=normalized_symbols,
             feedback_run_context=self._build_feedback_run_context_for_prerequisites(
                 state=state,
                 resolved_run=resolved_run,

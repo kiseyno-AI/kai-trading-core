@@ -142,6 +142,33 @@ def test_default_point_in_time_prerequisites_ignore_current_signal_features():
     )
 
 
+def test_prerequisites_include_technical_inputs_and_apply_requested_scope():
+    assert FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER[:2] == (
+        'technical_snapshots',
+        'action_summaries',
+    )
+    pipeline_status = _pipeline_status(
+        pykrx_stage=_pykrx_enrichment_stage(category_overrides={}),
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ) as read_status:
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-18',
+            fs_div='CFS',
+            symbols=['005930', '000660', '005930'],
+        )
+
+    assert result['ready'] is True
+    assert result['scope_symbols'] == ['005930', '000660']
+    assert result['scope_symbol_count'] == 2
+    assert 'technical_snapshots' in result['ready_stage_ids']
+    assert 'action_summaries' in result['ready_stage_ids']
+    assert read_status.call_args.kwargs['scope_symbols'] == ['005930', '000660']
+
+
 def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     payload = {
         'status': 'partial',

@@ -5,11 +5,11 @@ import io
 import re
 import zipfile
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from typing import Any
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.settings import settings
@@ -22,7 +22,11 @@ from app.db_models import (
     DartFundamentalsSnapshot,
     Symbol,
 )
-from app.dart.sync_service import _is_systemic_provider_failure
+from app.dart.sync_service import (
+    _is_corporation_local_persistence_error,
+    _is_systemic_provider_failure,
+)
+from app.eod.finality import validate_finalized_krx_write_date
 from app.integrations.dart.client import DartClient, dart_client
 
 
@@ -79,6 +83,19 @@ _DILUTION_RULES = [
     ('신주인수권부사채', 'bond_with_warrant', 'bw'),
     ('교환사채', 'exchange_bond', 'eb'),
 ]
+SHARE_ISSUANCE_POSITIVE_SIGNAL_TYPES = tuple(
+    signal_type for _token, signal_type, _security_type in _DILUTION_RULES
+)
+
+SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS = 365
+SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA = 'dart_share_issuance_coverage_v1'
+SHARE_ISSUANCE_RULE_VERSION = 'dart_share_issuance_rules_v1'
+SHARE_ISSUANCE_EVIDENCE_SOURCE = 'dart_disclosure_events'
+SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION = (
+    'krx_post_close_snapshot_overlap_v1'
+)
+SHARE_ISSUANCE_LATE_ARRIVAL_POLICY = 'next_scan_one_day_overlap_v1'
+_POSITIVE_DATE_NOT_LOADED = object()
 
 
 @dataclass
@@ -206,6 +223,118 @@ class DartSignalsRepository:
                 }
                 for row in rows
             ]
+
+    def list_recent_share_issuance_scan_evidence(
+        self,
+        *,
+        stock_code: str,
+        corp_code: str,
+        before_date: date,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        stmt = (
+            select(
+                DartDilutionSignal.id.label('id'),
+                DartDilutionSignal.receipt_date.label('receipt_date'),
+                DartDilutionSignal.payload.label('payload'),
+            )
+            .where(
+                DartDilutionSignal.stock_code == stock_code,
+                DartDilutionSignal.corp_code == corp_code,
+                DartDilutionSignal.signal_type == 'share_issuance',
+                DartDilutionSignal.has_dilution_signal.is_(False),
+                DartDilutionSignal.receipt_date.is_not(None),
+                DartDilutionSignal.receipt_date < before_date,
+            )
+            .order_by(
+                DartDilutionSignal.receipt_date.desc(),
+                DartDilutionSignal.id.desc(),
+            )
+            .limit(limit)
+        )
+        with session_scope() as session:
+            return [dict(row) for row in session.execute(stmt).mappings().all()]
+
+    def get_latest_share_issuance_positive_event_date(
+        self,
+        *,
+        stock_code: str,
+        corp_code: str,
+        on_or_before: date,
+    ) -> date | None:
+        stmt = select(func.max(DartDilutionSignal.receipt_date)).where(
+            DartDilutionSignal.stock_code == stock_code,
+            DartDilutionSignal.corp_code == corp_code,
+            DartDilutionSignal.signal_type.in_(
+                SHARE_ISSUANCE_POSITIVE_SIGNAL_TYPES
+            ),
+            DartDilutionSignal.has_dilution_signal.is_(True),
+            DartDilutionSignal.receipt_date.is_not(None),
+            DartDilutionSignal.receipt_date <= on_or_before,
+        )
+        with session_scope() as session:
+            return session.execute(stmt).scalar_one_or_none()
+
+    def list_current_share_issuance_coverage(
+        self,
+        *,
+        corp_codes: list[str],
+        on_or_before: date,
+    ) -> list[dict[str, Any]]:
+        if not corp_codes:
+            return []
+        stmt = (
+            select(
+                DartDilutionSignal.id.label('id'),
+                DartDilutionSignal.corp_code.label('corp_code'),
+                DartDilutionSignal.stock_code.label('stock_code'),
+                DartDilutionSignal.receipt_date.label('receipt_date'),
+                DartDilutionSignal.payload.label('payload'),
+            )
+            .where(
+                DartDilutionSignal.corp_code.in_(corp_codes),
+                DartDilutionSignal.rcept_no.like('DILCOV-%'),
+                DartDilutionSignal.signal_type == 'share_issuance',
+                DartDilutionSignal.has_dilution_signal.is_(False),
+                DartDilutionSignal.receipt_date.is_not(None),
+                DartDilutionSignal.receipt_date <= on_or_before,
+            )
+        )
+        with session_scope() as session:
+            return [dict(row) for row in session.execute(stmt).mappings().all()]
+
+    def list_latest_share_issuance_positive_event_dates(
+        self,
+        *,
+        corp_codes: list[str],
+        on_or_before: date,
+    ) -> dict[str, date]:
+        if not corp_codes:
+            return {}
+        stmt = (
+            select(
+                DartDilutionSignal.corp_code,
+                func.max(DartDilutionSignal.receipt_date).label(
+                    'latest_receipt_date'
+                ),
+            )
+            .where(
+                DartDilutionSignal.corp_code.in_(corp_codes),
+                DartDilutionSignal.signal_type.in_(
+                    SHARE_ISSUANCE_POSITIVE_SIGNAL_TYPES
+                ),
+                DartDilutionSignal.has_dilution_signal.is_(True),
+                DartDilutionSignal.receipt_date.is_not(None),
+                DartDilutionSignal.receipt_date <= on_or_before,
+            )
+            .group_by(DartDilutionSignal.corp_code)
+        )
+        with session_scope() as session:
+            return {
+                str(row.corp_code): row.latest_receipt_date
+                for row in session.execute(stmt).all()
+                if row.latest_receipt_date is not None
+            }
 
 
 class DartSignalsService:
@@ -597,9 +726,1010 @@ class DartSignalsService:
                     'has_dilution_signal': True,
                     'security_type': security_type,
                     'reason': report_nm,
-                    'payload': {'matched_token': token},
+                    'payload': {
+                        'matched_token': token,
+                        'evidence_semantics': 'positive_event_match',
+                    },
                 }
         return None
+
+    def persist_share_issuance_scan_evidence(
+        self,
+        *,
+        corporation: dict[str, str],
+        raw_items: list[dict[str, Any]],
+        window_start: date,
+        window_end: date,
+        pagination_completed: bool,
+        sync_run_id: int | None = None,
+        failure_reason: str | None = None,
+        positive_events_already_persisted: bool = False,
+        previous_evidence_rows: list[dict[str, Any]] | None = None,
+        latest_positive_date: date | None | object = _POSITIVE_DATE_NOT_LOADED,
+        defer_store: bool = False,
+    ) -> dict[str, Any]:
+        """Persist share-issuance evidence only from a completed corporation scan."""
+        if not pagination_completed:
+            incomplete_rows = self._persist_incomplete_share_issuance_attempt(
+                corporation=corporation,
+                window_start=window_start,
+                window_end=window_end,
+                sync_run_id=sync_run_id,
+                failure_reason=failure_reason,
+            )
+            return {
+                'pagination_completed': False,
+                'positive_event_count': 0,
+                'negative_coverage_count': 0,
+                'negative_segment_count': 0,
+                'rows_upserted': incomplete_rows,
+                'coverage_status': 'incomplete',
+            }
+
+        corp_code = str(corporation.get('corp_code') or '').strip()
+        if not corp_code:
+            raise ValueError('corp_code is required for share issuance evidence')
+        requested_stock_code = self._normalize_stock_code(
+            corporation.get('stock_code')
+        )
+        corporation_name = str(corporation.get('corp_name') or '').strip()
+        if window_end < window_start:
+            raise ValueError('share issuance scan window_end precedes window_start')
+        scan_completed_at = datetime.now(timezone.utc)
+        try:
+            validate_finalized_krx_write_date(
+                window_end,
+                now=scan_completed_at,
+                operation='DART share issuance negative coverage',
+            )
+        except ValueError as exc:
+            self._persist_incomplete_share_issuance_attempt(
+                corporation=corporation,
+                window_start=window_start,
+                window_end=window_end,
+                sync_run_id=sync_run_id,
+                failure_reason=str(exc),
+                scan_completed_at=scan_completed_at,
+            )
+            raise
+        self._validate_completed_scan_items(
+            raw_items=raw_items,
+            corp_code=corp_code,
+            window_start=window_start,
+            window_end=window_end,
+        )
+
+        evidence_rows: list[dict[str, Any]] = []
+        matched_event_count = 0
+        matched_receipt_dates: list[date] = []
+        seen_receipt_numbers: set[str] = set()
+        for raw_item in raw_items:
+            report_name = str(raw_item.get('report_nm') or '').strip()
+            dilution_signal = self._extract_dilution_signal(
+                {'report_nm': report_name}
+            )
+            if dilution_signal is None:
+                continue
+
+            receipt_number = str(raw_item.get('rcept_no') or '').strip()
+            if not receipt_number:
+                raise ValueError(
+                    'share issuance disclosure is missing rcept_no'
+                )
+            if receipt_number in seen_receipt_numbers:
+                continue
+            seen_receipt_numbers.add(receipt_number)
+
+            raw_corp_code = str(raw_item.get('corp_code') or '').strip()
+            if raw_corp_code and raw_corp_code != corp_code:
+                raise ValueError(
+                    'share issuance disclosure corp_code does not match scan scope'
+                )
+            receipt_date = self._parse_dart_receipt_date(
+                raw_item.get('rcept_dt')
+            )
+            if receipt_date is None:
+                raise ValueError(
+                    'share issuance disclosure is missing a valid receipt date'
+                )
+            if not window_start <= receipt_date <= window_end:
+                raise ValueError(
+                    'share issuance disclosure falls outside the completed scan window'
+                )
+
+            stock_code = (
+                self._normalize_stock_code(raw_item.get('stock_code'))
+                or requested_stock_code
+            )
+            dilution_signal = {
+                **dilution_signal,
+                'payload': {
+                    **dilution_signal['payload'],
+                    'source': SHARE_ISSUANCE_EVIDENCE_SOURCE,
+                    'scan_window_start': window_start.isoformat(),
+                    'scan_window_end': window_end.isoformat(),
+                    'pagination_completed': True,
+                },
+            }
+            event = {
+                'id': None,
+                'rcept_no': receipt_number,
+                'corp_code': corp_code,
+                'stock_code': stock_code,
+                'corp_name': (
+                    str(raw_item.get('corp_name') or '').strip()
+                    or corporation_name
+                    or corp_code
+                ),
+                'receipt_date': receipt_date,
+                'report_nm': report_name,
+            }
+            if not positive_events_already_persisted:
+                evidence_rows.append(
+                    {'event': event, 'dilution_signal': dilution_signal}
+                )
+            matched_event_count += 1
+            matched_receipt_dates.append(receipt_date)
+
+        negative_coverage_count = 0
+        negative_segment_count = 0
+        coverage_status = 'missing_stock_code'
+        if requested_stock_code:
+            resolved_latest_positive_date = (
+                max(matched_receipt_dates)
+                if matched_receipt_dates
+                else (
+                    self.repository.get_latest_share_issuance_positive_event_date(
+                        stock_code=requested_stock_code,
+                        corp_code=corp_code,
+                        on_or_before=window_end,
+                    )
+                    if latest_positive_date is _POSITIVE_DATE_NOT_LOADED
+                    else latest_positive_date
+                )
+            )
+            negative_window_start = max(
+                window_start,
+                resolved_latest_positive_date + timedelta(days=1)
+                if isinstance(resolved_latest_positive_date, date)
+                else window_start,
+            )
+            continued_from_evidence_id: int | None = None
+            if not matched_receipt_dates:
+                candidate_previous_rows = (
+                    previous_evidence_rows
+                    if previous_evidence_rows is not None
+                    else self.repository.list_recent_share_issuance_scan_evidence(
+                        stock_code=requested_stock_code,
+                        corp_code=corp_code,
+                        before_date=window_end + timedelta(days=1),
+                        limit=10,
+                    )
+                )
+                for previous_row in candidate_previous_rows:
+                    previous_coverage = self._validated_share_issuance_coverage(
+                        previous_row,
+                        corp_code=corp_code,
+                    )
+                    if previous_coverage is None:
+                        continue
+                    previous_end = date.fromisoformat(
+                        str(previous_coverage['window_end'])
+                    )
+                    if window_start > previous_end + timedelta(days=1):
+                        break
+                    previous_start = date.fromisoformat(
+                        str(previous_coverage['window_start'])
+                    )
+                    if (
+                        isinstance(resolved_latest_positive_date, date)
+                        and previous_start <= resolved_latest_positive_date
+                    ):
+                        break
+                    if previous_start <= previous_end:
+                        negative_window_start = min(
+                            negative_window_start,
+                            previous_start,
+                        )
+                        continued_from_evidence_id = int(previous_row['id'])
+                    break
+
+            coverage_complete = (
+                negative_window_start <= window_end
+                and negative_window_start
+                <= window_end
+                - timedelta(days=SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS)
+            )
+            if negative_window_start > window_end:
+                if evidence_rows and not defer_store:
+                    self._store_dilution_signal_rows(evidence_rows)
+                result = {
+                    'pagination_completed': True,
+                    'positive_event_count': matched_event_count,
+                    'negative_coverage_count': 0,
+                    'negative_segment_count': 0,
+                    'rows_upserted': len(evidence_rows),
+                    'coverage_status': 'positive_events',
+                }
+                if defer_store:
+                    result['_evidence_rows'] = evidence_rows
+                return result
+            coverage_state = 'complete' if coverage_complete else 'segment'
+            coverage = {
+                'schema_version': SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA,
+                'rule_version': SHARE_ISSUANCE_RULE_VERSION,
+                'status': coverage_state,
+                'source': SHARE_ISSUANCE_EVIDENCE_SOURCE,
+                'corp_code': corp_code,
+                'window_start': negative_window_start.isoformat(),
+                'window_end': window_end.isoformat(),
+                'matched_event_count': 0,
+                'scan_window_start': window_start.isoformat(),
+                'scan_window_end': window_end.isoformat(),
+                'scan_matched_event_count': matched_event_count,
+                'pagination_completed': True,
+                'scan_completed_at': scan_completed_at.isoformat(),
+                'authority_policy_version': (
+                    SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+                ),
+                'authoritative_as_of_cutoff': True,
+                'late_arrival_reconciliation': (
+                    SHARE_ISSUANCE_LATE_ARRIVAL_POLICY
+                ),
+            }
+            if sync_run_id is not None:
+                coverage['sync_run_id'] = int(sync_run_id)
+            if continued_from_evidence_id is not None:
+                coverage['continued_from_evidence_id'] = (
+                    continued_from_evidence_id
+                )
+            event = {
+                'id': None,
+                'rcept_no': (
+                    f'DILCOV-{corp_code[:16]}'
+                ),
+                'corp_code': corp_code,
+                'stock_code': requested_stock_code,
+                'corp_name': corporation_name or corp_code,
+                'receipt_date': window_end,
+                'report_nm': 'DART share issuance coverage',
+            }
+            evidence_rows.append(
+                {
+                    'event': event,
+                    'dilution_signal': {
+                        'signal_type': 'share_issuance',
+                        'has_dilution_signal': False,
+                        'security_type': None,
+                        'reason': (
+                            'completed disclosure scan established a share issuance '
+                            'negative-evidence segment'
+                        ),
+                        'payload': {
+                            'evidence_semantics': (
+                                'complete_negative_coverage'
+                                if coverage_complete
+                                else 'negative_coverage_segment'
+                            ),
+                            'evidence_coverage': coverage,
+                        },
+                    },
+                }
+            )
+            evidence_rows.append(
+                {
+                    'event': {
+                        **event,
+                        'rcept_no': f'DILATT-{corp_code[:16]}',
+                        'report_nm': 'DART share issuance latest scan attempt',
+                    },
+                    'dilution_signal': {
+                        'signal_type': 'share_issuance',
+                        'has_dilution_signal': False,
+                        'security_type': None,
+                        'reason': (
+                            'latest completed share issuance disclosure scan '
+                            'authority marker'
+                        ),
+                        'payload': {
+                            'evidence_semantics': 'completed_scan_attempt',
+                            'evidence_coverage': coverage,
+                        },
+                    },
+                }
+            )
+            if coverage_complete:
+                negative_coverage_count = 1
+                coverage_status = 'complete_negative'
+            else:
+                negative_segment_count = 1
+                coverage_status = 'negative_segment'
+
+        if evidence_rows and not defer_store:
+            self._store_dilution_signal_rows(evidence_rows)
+
+        result = {
+            'pagination_completed': True,
+            'positive_event_count': matched_event_count,
+            'negative_coverage_count': negative_coverage_count,
+            'negative_segment_count': negative_segment_count,
+            'rows_upserted': len(evidence_rows),
+            'coverage_status': coverage_status,
+        }
+        if defer_store:
+            result['_evidence_rows'] = evidence_rows
+        return result
+
+    def plan_global_share_issuance_scan(
+        self,
+        *,
+        corporations: list[dict[str, str]],
+        window_end: date,
+    ) -> dict[str, Any]:
+        corp_codes = list(
+            dict.fromkeys(
+                str(item.get('corp_code') or '').strip()
+                for item in corporations
+                if str(item.get('corp_code') or '').strip()
+            )
+        )
+        current_rows = self.repository.list_current_share_issuance_coverage(
+            corp_codes=corp_codes,
+            on_or_before=window_end,
+        )
+        rows_by_corp = {
+            str(row.get('corp_code') or ''): row for row in current_rows
+        }
+        starts: list[date] = []
+        missing_corp_codes: list[str] = []
+        for corp_code in corp_codes:
+            current_row = rows_by_corp.get(corp_code)
+            coverage = (
+                self._validated_share_issuance_coverage(
+                    current_row,
+                    corp_code=corp_code,
+                )
+                if current_row is not None
+                else None
+            )
+            if coverage is None:
+                missing_corp_codes.append(corp_code)
+                continue
+            # Re-read the prior end date on the next global scan so filings that
+            # arrive after the fixed post-close snapshot are reconciled.
+            starts.append(date.fromisoformat(str(coverage['window_end'])))
+            if coverage.get('status') != 'complete':
+                missing_corp_codes.append(corp_code)
+        return {
+            'window_start': min(starts) if starts else window_end,
+            'window_end': window_end,
+            'corporation_count': len(corp_codes),
+            'baseline_required_count': len(missing_corp_codes),
+            'baseline_required_corp_codes': missing_corp_codes,
+            'late_arrival_reconciliation': (
+                SHARE_ISSUANCE_LATE_ARRIVAL_POLICY
+            ),
+        }
+
+    def persist_global_share_issuance_scan_evidence(
+        self,
+        *,
+        corporations: list[dict[str, str]],
+        raw_items: list[dict[str, Any]],
+        window_start: date,
+        window_end: date,
+        sync_run_id: int,
+        positive_events_already_persisted: bool = True,
+    ) -> dict[str, Any]:
+        corp_codes = list(
+            dict.fromkeys(
+                str(item.get('corp_code') or '').strip()
+                for item in corporations
+                if str(item.get('corp_code') or '').strip()
+            )
+        )
+        corporation_by_corp = {
+            str(item.get('corp_code') or '').strip(): item
+            for item in corporations
+            if str(item.get('corp_code') or '').strip()
+        }
+        raw_items_by_corp: dict[str, list[dict[str, Any]]] = {
+            corp_code: [] for corp_code in corp_codes
+        }
+        for raw_item in raw_items:
+            corp_code = str(raw_item.get('corp_code') or '').strip()
+            if not corp_code:
+                raise ValueError(
+                    'global share issuance scan item is missing corp_code'
+                )
+            if corp_code in raw_items_by_corp:
+                raw_items_by_corp[corp_code].append(raw_item)
+
+        current_rows = self.repository.list_current_share_issuance_coverage(
+            corp_codes=corp_codes,
+            on_or_before=window_end,
+        )
+        current_rows_by_corp: dict[str, list[dict[str, Any]]] = {}
+        for row in current_rows:
+            current_rows_by_corp.setdefault(
+                str(row.get('corp_code') or ''), []
+            ).append(row)
+        latest_positive_dates = (
+            self.repository.list_latest_share_issuance_positive_event_dates(
+                corp_codes=corp_codes,
+                on_or_before=window_end,
+            )
+        )
+
+        pending_by_corp: dict[
+            str, tuple[dict[str, Any], list[dict[str, Any]]]
+        ] = {}
+        failed_corp_reasons: dict[str, str] = {}
+        for corp_code in corp_codes:
+            corporation = corporation_by_corp[corp_code]
+            try:
+                result = self.persist_share_issuance_scan_evidence(
+                    corporation=corporation,
+                    raw_items=raw_items_by_corp[corp_code],
+                    window_start=window_start,
+                    window_end=window_end,
+                    pagination_completed=True,
+                    sync_run_id=sync_run_id,
+                    positive_events_already_persisted=(
+                        positive_events_already_persisted
+                    ),
+                    previous_evidence_rows=current_rows_by_corp.get(
+                        corp_code, []
+                    ),
+                    latest_positive_date=latest_positive_dates.get(corp_code),
+                    defer_store=True,
+                )
+                corp_evidence_rows = result.pop('_evidence_rows', [])
+            except Exception as exc:
+                failure_reason = str(exc)[:500]
+                failed_corp_reasons[corp_code] = failure_reason
+                try:
+                    self._persist_incomplete_share_issuance_attempt(
+                        corporation=corporation,
+                        window_start=window_start,
+                        window_end=window_end,
+                        sync_run_id=sync_run_id,
+                        failure_reason=failure_reason,
+                    )
+                except Exception:
+                    # The original corporation-local failure remains the
+                    # authoritative retry reason.  A marker write failure must
+                    # not erase other corporations' completed evidence.
+                    pass
+                continue
+            pending_by_corp[corp_code] = (result, corp_evidence_rows)
+
+        persisted_corp_codes: set[str] = set()
+
+        def persist_corp_batch(batch_corp_codes: list[str]) -> None:
+            if not batch_corp_codes:
+                return
+            batch_rows = [
+                row
+                for corp_code in batch_corp_codes
+                for row in pending_by_corp[corp_code][1]
+            ]
+            try:
+                if batch_rows:
+                    self._store_dilution_signal_rows(batch_rows)
+            except Exception as exc:
+                if not _is_corporation_local_persistence_error(exc):
+                    raise
+                if len(batch_corp_codes) > 1:
+                    midpoint = len(batch_corp_codes) // 2
+                    persist_corp_batch(batch_corp_codes[:midpoint])
+                    persist_corp_batch(batch_corp_codes[midpoint:])
+                    return
+                corp_code = batch_corp_codes[0]
+                failed_corp_reasons[corp_code] = (
+                    f'evidence persistence failed: {exc}'[:500]
+                )
+                return
+            persisted_corp_codes.update(batch_corp_codes)
+
+        pending_corp_codes = list(pending_by_corp)
+        for index in range(0, len(pending_corp_codes), 250):
+            persist_corp_batch(pending_corp_codes[index:index + 250])
+
+        for corp_code in sorted(
+            set(pending_by_corp) - persisted_corp_codes
+        ):
+            try:
+                self._persist_incomplete_share_issuance_attempt(
+                    corporation=corporation_by_corp[corp_code],
+                    window_start=window_start,
+                    window_end=window_end,
+                    sync_run_id=sync_run_id,
+                    failure_reason=failed_corp_reasons[corp_code],
+                )
+            except Exception:
+                pass
+
+        evidence_rows: list[dict[str, Any]] = []
+        positive_event_count = 0
+        negative_coverage_count = 0
+        negative_segment_count = 0
+        coverage_ready_corp_codes: list[str] = []
+        baseline_debt_corp_codes: list[str] = []
+        coverage_status_by_corp: dict[str, str] = {
+            corp_code: 'failed' for corp_code in failed_corp_reasons
+        }
+        for corp_code in corp_codes:
+            if corp_code not in persisted_corp_codes:
+                continue
+            result, corp_evidence_rows = pending_by_corp[corp_code]
+            evidence_rows.extend(corp_evidence_rows)
+            positive_event_count += int(
+                result.get('positive_event_count') or 0
+            )
+            negative_coverage_count += int(
+                result.get('negative_coverage_count') or 0
+            )
+            negative_segment_count += int(
+                result.get('negative_segment_count') or 0
+            )
+            coverage_status = str(
+                result.get('coverage_status') or 'unknown'
+            )
+            coverage_status_by_corp[corp_code] = coverage_status
+            latest_positive_date = latest_positive_dates.get(corp_code)
+            has_recent_positive_evidence = (
+                isinstance(latest_positive_date, date)
+                and latest_positive_date
+                >= window_end
+                - timedelta(days=SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS)
+            )
+            if (
+                int(result.get('positive_event_count') or 0) > 0
+                or coverage_status == 'complete_negative'
+                or has_recent_positive_evidence
+            ):
+                coverage_ready_corp_codes.append(corp_code)
+                if (
+                    has_recent_positive_evidence
+                    and coverage_status != 'complete_negative'
+                ):
+                    coverage_status_by_corp[corp_code] = (
+                        'recent_positive_evidence'
+                    )
+            else:
+                baseline_debt_corp_codes.append(corp_code)
+        return {
+            'pagination_completed': True,
+            'corporation_count': len(corp_codes),
+            'positive_event_count': positive_event_count,
+            'negative_coverage_count': negative_coverage_count,
+            'negative_segment_count': negative_segment_count,
+            'rows_upserted': len(evidence_rows),
+            'coverage_ready_corp_codes': coverage_ready_corp_codes,
+            'baseline_debt_corp_codes': baseline_debt_corp_codes,
+            'coverage_status_by_corp': coverage_status_by_corp,
+            'failed_corp_codes': sorted(failed_corp_reasons),
+            'failed_corp_reasons': failed_corp_reasons,
+        }
+
+    def persist_global_share_issuance_incomplete_attempts(
+        self,
+        *,
+        corporations: list[dict[str, str]],
+        window_start: date,
+        window_end: date,
+        sync_run_id: int,
+        failure_reason: str,
+    ) -> int:
+        completed_at = datetime.now(timezone.utc)
+        rows: list[dict[str, Any]] = []
+        seen_corp_codes: set[str] = set()
+        for corporation in corporations:
+            corp_code = str(corporation.get('corp_code') or '').strip()
+            stock_code = self._normalize_stock_code(
+                corporation.get('stock_code')
+            )
+            if (
+                not corp_code
+                or not stock_code
+                or corp_code in seen_corp_codes
+            ):
+                continue
+            seen_corp_codes.add(corp_code)
+            coverage = {
+                'schema_version': SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA,
+                'rule_version': SHARE_ISSUANCE_RULE_VERSION,
+                'status': 'incomplete',
+                'source': SHARE_ISSUANCE_EVIDENCE_SOURCE,
+                'corp_code': corp_code,
+                'window_start': window_start.isoformat(),
+                'window_end': window_end.isoformat(),
+                'matched_event_count': None,
+                'scan_window_start': window_start.isoformat(),
+                'scan_window_end': window_end.isoformat(),
+                'pagination_completed': False,
+                'scan_completed_at': completed_at.isoformat(),
+                'authority_policy_version': (
+                    SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+                ),
+                'authoritative_as_of_cutoff': False,
+                'late_arrival_reconciliation': (
+                    SHARE_ISSUANCE_LATE_ARRIVAL_POLICY
+                ),
+                'sync_run_id': int(sync_run_id),
+                'failure_reason': str(failure_reason)[:500],
+            }
+            rows.append(
+                {
+                    'event': {
+                        'id': None,
+                        'rcept_no': f'DILATT-{corp_code[:16]}',
+                        'corp_code': corp_code,
+                        'stock_code': stock_code,
+                        'corp_name': (
+                            str(corporation.get('corp_name') or '').strip()
+                            or corp_code
+                        ),
+                        'receipt_date': window_end,
+                        'report_nm': 'DART share issuance coverage attempt',
+                    },
+                    'dilution_signal': {
+                        'signal_type': 'share_issuance',
+                        'has_dilution_signal': False,
+                        'security_type': None,
+                        'reason': 'share issuance disclosure scan was incomplete',
+                        'payload': {
+                            'evidence_semantics': 'incomplete_scan_attempt',
+                            'evidence_coverage': coverage,
+                        },
+                    },
+                }
+            )
+        if rows:
+            self._store_dilution_signal_rows(rows)
+        return len(rows)
+
+    def persist_share_issuance_positive_events(
+        self,
+        *,
+        corporation: dict[str, str],
+        raw_items: list[dict[str, Any]],
+        window_start: date,
+        window_end: date,
+        sync_run_id: int | None = None,
+        pagination_completed: bool = False,
+    ) -> dict[str, Any]:
+        """Persist adverse matches immediately; negative proof waits for all pages."""
+        corp_code = str(corporation.get('corp_code') or '').strip()
+        if not corp_code:
+            raise ValueError('corp_code is required for share issuance evidence')
+        requested_stock_code = self._normalize_stock_code(
+            corporation.get('stock_code')
+        )
+        corporation_name = str(corporation.get('corp_name') or '').strip()
+        rows: list[dict[str, Any]] = []
+        seen_receipt_numbers: set[str] = set()
+        for raw_item in raw_items:
+            report_name = str(raw_item.get('report_nm') or '').strip()
+            dilution_signal = self._extract_dilution_signal(
+                {'report_nm': report_name}
+            )
+            if dilution_signal is None:
+                continue
+            receipt_number = str(raw_item.get('rcept_no') or '').strip()
+            if not receipt_number or receipt_number in seen_receipt_numbers:
+                continue
+            raw_corp_code = str(raw_item.get('corp_code') or '').strip()
+            if raw_corp_code and raw_corp_code != corp_code:
+                raise ValueError(
+                    'share issuance disclosure corp_code does not match scan scope'
+                )
+            receipt_date = self._parse_dart_receipt_date(
+                raw_item.get('rcept_dt')
+            )
+            if receipt_date is None or not window_start <= receipt_date <= window_end:
+                raise ValueError(
+                    'share issuance disclosure falls outside the scan window'
+                )
+            seen_receipt_numbers.add(receipt_number)
+            payload = {
+                **dilution_signal['payload'],
+                'source': SHARE_ISSUANCE_EVIDENCE_SOURCE,
+                'scan_window_start': window_start.isoformat(),
+                'scan_window_end': window_end.isoformat(),
+                'pagination_completed': pagination_completed,
+                'evidence_semantics': 'positive_event_match',
+            }
+            if sync_run_id is not None:
+                payload['sync_run_id'] = int(sync_run_id)
+            rows.append(
+                {
+                    'event': {
+                        'id': None,
+                        'rcept_no': receipt_number,
+                        'corp_code': corp_code,
+                        'stock_code': (
+                            self._normalize_stock_code(raw_item.get('stock_code'))
+                            or requested_stock_code
+                        ),
+                        'corp_name': (
+                            str(raw_item.get('corp_name') or '').strip()
+                            or corporation_name
+                            or corp_code
+                        ),
+                        'receipt_date': receipt_date,
+                        'report_nm': report_name,
+                    },
+                    'dilution_signal': {
+                        **dilution_signal,
+                        'payload': payload,
+                    },
+                }
+            )
+        if rows:
+            self._store_dilution_signal_rows(rows)
+        return {
+            'positive_event_count': len(rows),
+            'rows_upserted': len(rows),
+        }
+
+    def _persist_incomplete_share_issuance_attempt(
+        self,
+        *,
+        corporation: dict[str, str],
+        window_start: date,
+        window_end: date,
+        sync_run_id: int | None,
+        failure_reason: str | None,
+        scan_completed_at: datetime | None = None,
+    ) -> int:
+        corp_code = str(corporation.get('corp_code') or '').strip()
+        stock_code = self._normalize_stock_code(corporation.get('stock_code'))
+        if not corp_code or not stock_code:
+            return 0
+        coverage: dict[str, Any] = {
+            'schema_version': SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA,
+            'rule_version': SHARE_ISSUANCE_RULE_VERSION,
+            'status': 'incomplete',
+            'source': SHARE_ISSUANCE_EVIDENCE_SOURCE,
+            'corp_code': corp_code,
+            'window_start': window_start.isoformat(),
+            'window_end': window_end.isoformat(),
+            'matched_event_count': None,
+            'scan_window_start': window_start.isoformat(),
+            'scan_window_end': window_end.isoformat(),
+            'pagination_completed': False,
+            'scan_completed_at': (
+                scan_completed_at or datetime.now(timezone.utc)
+            ).isoformat(),
+            'authority_policy_version': (
+                SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+            ),
+            'authoritative_as_of_cutoff': False,
+            'late_arrival_reconciliation': (
+                SHARE_ISSUANCE_LATE_ARRIVAL_POLICY
+            ),
+        }
+        if sync_run_id is not None:
+            coverage['sync_run_id'] = int(sync_run_id)
+        if failure_reason:
+            coverage['failure_reason'] = str(failure_reason)[:500]
+        self._store_dilution_signal_rows(
+            [
+                {
+                    'event': {
+                        'id': None,
+                        'rcept_no': f'DILATT-{corp_code[:16]}',
+                        'corp_code': corp_code,
+                        'stock_code': stock_code,
+                        'corp_name': (
+                            str(corporation.get('corp_name') or '').strip()
+                            or corp_code
+                        ),
+                        'receipt_date': window_end,
+                        'report_nm': 'DART share issuance coverage attempt',
+                    },
+                    'dilution_signal': {
+                        'signal_type': 'share_issuance',
+                        'has_dilution_signal': False,
+                        'security_type': None,
+                        'reason': 'share issuance disclosure scan was incomplete',
+                        'payload': {
+                            'evidence_semantics': 'incomplete_scan_attempt',
+                            'evidence_coverage': coverage,
+                        },
+                    },
+                }
+            ]
+        )
+        return 1
+
+    @staticmethod
+    def _validated_share_issuance_coverage(
+        row: dict[str, Any],
+        *,
+        corp_code: str,
+    ) -> dict[str, Any] | None:
+        payload = row.get('payload')
+        if not isinstance(payload, dict):
+            return None
+        coverage = payload.get('evidence_coverage')
+        if not isinstance(coverage, dict):
+            return None
+        if coverage.get('schema_version') != SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA:
+            return None
+        if coverage.get('rule_version') != SHARE_ISSUANCE_RULE_VERSION:
+            return None
+        if coverage.get('source') != SHARE_ISSUANCE_EVIDENCE_SOURCE:
+            return None
+        if coverage.get('corp_code') != corp_code:
+            return None
+        if coverage.get('status') not in {'complete', 'segment'}:
+            return None
+        if coverage.get('matched_event_count') != 0:
+            return None
+        if coverage.get('pagination_completed') is not True:
+            return None
+        if coverage.get('authoritative_as_of_cutoff') is not True:
+            return None
+        if (
+            coverage.get('authority_policy_version')
+            != SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+        ):
+            return None
+        if (
+            coverage.get('late_arrival_reconciliation')
+            != SHARE_ISSUANCE_LATE_ARRIVAL_POLICY
+        ):
+            return None
+        try:
+            datetime.fromisoformat(str(coverage.get('scan_completed_at') or ''))
+        except ValueError:
+            return None
+        try:
+            window_start = date.fromisoformat(str(coverage.get('window_start')))
+            window_end = date.fromisoformat(str(coverage.get('window_end')))
+        except ValueError:
+            return None
+        if window_start > window_end:
+            return None
+        return coverage
+
+    @staticmethod
+    def _normalize_stock_code(value: Any) -> str | None:
+        normalized = str(value or '').strip()
+        if not normalized:
+            return None
+        return normalized.zfill(6) if normalized.isdigit() else normalized
+
+    @staticmethod
+    def _parse_dart_receipt_date(value: Any) -> date | None:
+        normalized = str(value or '').strip()
+        if len(normalized) < 8 or not normalized[:8].isdigit():
+            return None
+        try:
+            return date(
+                int(normalized[:4]),
+                int(normalized[4:6]),
+                int(normalized[6:8]),
+            )
+        except ValueError:
+            return None
+
+    @classmethod
+    def _validate_completed_scan_items(
+        cls,
+        *,
+        raw_items: list[dict[str, Any]],
+        corp_code: str,
+        window_start: date,
+        window_end: date,
+    ) -> None:
+        for raw_item in raw_items:
+            if not str(raw_item.get('rcept_no') or '').strip():
+                raise ValueError(
+                    'completed disclosure scan contains an item without rcept_no'
+                )
+            if not str(raw_item.get('report_nm') or '').strip():
+                raise ValueError(
+                    'completed disclosure scan contains an item without report_nm'
+                )
+            raw_corp_code = str(raw_item.get('corp_code') or '').strip()
+            if raw_corp_code and raw_corp_code != corp_code:
+                raise ValueError(
+                    'completed disclosure scan contains an out-of-scope corporation'
+                )
+            receipt_date = cls._parse_dart_receipt_date(raw_item.get('rcept_dt'))
+            if receipt_date is None or not window_start <= receipt_date <= window_end:
+                raise ValueError(
+                    'completed disclosure scan contains an invalid receipt date'
+                )
+
+    def _store_dilution_signal_rows(
+        self,
+        evidence_rows: list[dict[str, Any]],
+    ) -> None:
+        with session_scope() as session:
+            for index in range(0, len(evidence_rows), 1_000):
+                values = []
+                for evidence_row in evidence_rows[index:index + 1_000]:
+                    event = evidence_row['event']
+                    dilution_signal = evidence_row['dilution_signal']
+                    values.append(
+                        {
+                            'disclosure_event_id': event.get('id'),
+                            'rcept_no': event['rcept_no'],
+                            'corp_code': event['corp_code'],
+                            'stock_code': event['stock_code'],
+                            'corp_name': event['corp_name'],
+                            'receipt_date': event['receipt_date'],
+                            'report_nm': event['report_nm'],
+                            'signal_type': dilution_signal['signal_type'],
+                            'has_dilution_signal': dilution_signal[
+                                'has_dilution_signal'
+                            ],
+                            'security_type': dilution_signal['security_type'],
+                            'reason': dilution_signal['reason'],
+                            'payload': dilution_signal['payload'],
+                        }
+                    )
+                stmt = pg_insert(DartDilutionSignal).values(values)
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        constraint='uq_dart_dilution_signals_rcept_no',
+                        set_={
+                            'disclosure_event_id': func.coalesce(
+                                stmt.excluded.disclosure_event_id,
+                                DartDilutionSignal.disclosure_event_id,
+                            ),
+                            'corp_code': stmt.excluded.corp_code,
+                            'stock_code': stmt.excluded.stock_code,
+                            'corp_name': stmt.excluded.corp_name,
+                            'receipt_date': stmt.excluded.receipt_date,
+                            'report_nm': stmt.excluded.report_nm,
+                            'signal_type': stmt.excluded.signal_type,
+                            'has_dilution_signal': (
+                                stmt.excluded.has_dilution_signal
+                            ),
+                            'security_type': stmt.excluded.security_type,
+                            'reason': stmt.excluded.reason,
+                            'payload': stmt.excluded.payload,
+                        },
+                        where=self._dilution_signal_upsert_cas_condition(stmt),
+                    )
+                )
+
+    @staticmethod
+    def _dilution_signal_upsert_cas_condition(stmt: Any) -> Any:
+        excluded_authority_strength = case(
+            (
+                stmt.excluded.payload[
+                    'evidence_semantics'
+                ].as_string()
+                == 'completed_scan_attempt',
+                1,
+            ),
+            else_=0,
+        )
+        stored_authority_strength = case(
+            (
+                DartDilutionSignal.payload[
+                    'evidence_semantics'
+                ].as_string()
+                == 'completed_scan_attempt',
+                1,
+            ),
+            else_=0,
+        )
+        return and_(
+            stmt.excluded.receipt_date >= DartDilutionSignal.receipt_date,
+            or_(
+                ~stmt.excluded.rcept_no.like('DILATT-%'),
+                stmt.excluded.receipt_date > DartDilutionSignal.receipt_date,
+                excluded_authority_strength >= stored_authority_strength,
+            ),
+        )
 
     def _store_signals(self, *, event: dict[str, Any], audit_signal: ParsedAuditSignal | None, dilution_signal: dict[str, Any] | None) -> None:
         with session_scope() as session:
@@ -639,32 +1769,54 @@ class DartSignalsService:
                     )
                 )
             if dilution_signal is not None:
-                stmt = pg_insert(DartDilutionSignal).values(
-                    disclosure_event_id=event['id'],
-                    rcept_no=event['rcept_no'],
-                    corp_code=event['corp_code'],
-                    stock_code=event['stock_code'],
-                    corp_name=event['corp_name'],
-                    receipt_date=event['receipt_date'],
-                    report_nm=event['report_nm'],
-                    signal_type=dilution_signal['signal_type'],
-                    has_dilution_signal=dilution_signal['has_dilution_signal'],
-                    security_type=dilution_signal['security_type'],
-                    reason=dilution_signal['reason'],
-                    payload=dilution_signal['payload'],
+                self._execute_dilution_upsert(
+                    session,
+                    event=event,
+                    dilution_signal=dilution_signal,
                 )
-                session.execute(
-                    stmt.on_conflict_do_update(
-                        constraint='uq_dart_dilution_signals_rcept_no',
-                        set_={
-                            'signal_type': stmt.excluded.signal_type,
-                            'has_dilution_signal': stmt.excluded.has_dilution_signal,
-                            'security_type': stmt.excluded.security_type,
-                            'reason': stmt.excluded.reason,
-                            'payload': stmt.excluded.payload,
-                        },
-                    )
-                )
+
+    @staticmethod
+    def _execute_dilution_upsert(
+        session: Any,
+        *,
+        event: dict[str, Any],
+        dilution_signal: dict[str, Any],
+    ) -> None:
+        stmt = pg_insert(DartDilutionSignal).values(
+            disclosure_event_id=event.get('id'),
+            rcept_no=event['rcept_no'],
+            corp_code=event['corp_code'],
+            stock_code=event['stock_code'],
+            corp_name=event['corp_name'],
+            receipt_date=event['receipt_date'],
+            report_nm=event['report_nm'],
+            signal_type=dilution_signal['signal_type'],
+            has_dilution_signal=dilution_signal['has_dilution_signal'],
+            security_type=dilution_signal['security_type'],
+            reason=dilution_signal['reason'],
+            payload=dilution_signal['payload'],
+        )
+        session.execute(
+            stmt.on_conflict_do_update(
+                constraint='uq_dart_dilution_signals_rcept_no',
+                set_={
+                    'disclosure_event_id': func.coalesce(
+                        stmt.excluded.disclosure_event_id,
+                        DartDilutionSignal.disclosure_event_id,
+                    ),
+                    'corp_code': stmt.excluded.corp_code,
+                    'stock_code': stmt.excluded.stock_code,
+                    'corp_name': stmt.excluded.corp_name,
+                    'receipt_date': stmt.excluded.receipt_date,
+                    'report_nm': stmt.excluded.report_nm,
+                    'signal_type': stmt.excluded.signal_type,
+                    'has_dilution_signal': stmt.excluded.has_dilution_signal,
+                    'security_type': stmt.excluded.security_type,
+                    'reason': stmt.excluded.reason,
+                    'payload': stmt.excluded.payload,
+                },
+            )
+        )
 
 
 def _clean_html_text(value: str) -> str:

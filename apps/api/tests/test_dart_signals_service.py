@@ -3,15 +3,17 @@ import unittest
 import zipfile
 from contextlib import contextmanager
 from datetime import date
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.db import engine
 from app.db_models import (
     DailyPriceBar,
     DartAuditSignal,
+    DartDilutionSignal,
     DartDisclosureEvent,
     DartFundamentalsSnapshot,
     Symbol,
@@ -37,6 +39,42 @@ def _audit_document(*opinions):
         for opinion in opinions
     )
     return f'<TABLE-GROUP ACLASS="AUD_OPN">{rows}</TABLE-GROUP>'.encode('utf-8')
+
+
+def _share_issuance_attempt_row(
+    *,
+    corp_code: str,
+    stock_code: str,
+    receipt_date: date,
+    evidence_semantics: str,
+    authority_marker: str,
+):
+    completed = evidence_semantics == 'completed_scan_attempt'
+    return {
+        'event': {
+            'id': None,
+            'rcept_no': f'DILATT-{corp_code}',
+            'corp_code': corp_code,
+            'stock_code': stock_code,
+            'corp_name': 'Authority CAS test',
+            'receipt_date': receipt_date,
+            'report_nm': 'DART share issuance coverage attempt',
+        },
+        'dilution_signal': {
+            'signal_type': 'share_issuance',
+            'has_dilution_signal': False,
+            'security_type': None,
+            'reason': f'{evidence_semantics} test row',
+            'payload': {
+                'evidence_semantics': evidence_semantics,
+                'authority_marker': authority_marker,
+                'evidence_coverage': {
+                    'pagination_completed': completed,
+                    'authoritative_as_of_cutoff': completed,
+                },
+            },
+        },
+    }
 
 
 class FakeSignalsClient:
@@ -66,6 +104,280 @@ class FakeSignalsRepository:
 
 
 class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_global_evidence_isolates_one_corporation_failure(self):
+        repository = MagicMock()
+        repository.list_current_share_issuance_coverage.return_value = []
+        repository.list_latest_share_issuance_positive_event_dates.return_value = {}
+        service = DartSignalsService(repository=repository)
+
+        def persist_one(*, corporation, **_kwargs):
+            if corporation['corp_code'] == 'CORP-B':
+                raise ValueError('malformed corporation evidence')
+            return {
+                'positive_event_count': 0,
+                'negative_coverage_count': 1,
+                'negative_segment_count': 0,
+                'coverage_status': 'complete_negative',
+                '_evidence_rows': [
+                    {
+                        'event': {'corp_code': 'CORP-A'},
+                        'dilution_signal': {},
+                    }
+                ],
+            }
+
+        with (
+            patch.object(
+                service,
+                'persist_share_issuance_scan_evidence',
+                side_effect=persist_one,
+            ),
+            patch.object(service, '_store_dilution_signal_rows') as store,
+            patch.object(
+                service,
+                '_persist_incomplete_share_issuance_attempt',
+                return_value=1,
+            ) as mark_incomplete,
+        ):
+            result = service.persist_global_share_issuance_scan_evidence(
+                corporations=[
+                    {
+                        'corp_code': 'CORP-A',
+                        'stock_code': '005930',
+                    },
+                    {
+                        'corp_code': 'CORP-B',
+                        'stock_code': '000660',
+                    },
+                ],
+                raw_items=[],
+                window_start=date(2026, 1, 1),
+                window_end=date(2026, 4, 1),
+                sync_run_id=7,
+            )
+
+        store.assert_called_once()
+        mark_incomplete.assert_called_once()
+        self.assertEqual(result['coverage_ready_corp_codes'], ['CORP-A'])
+        self.assertEqual(result['failed_corp_codes'], ['CORP-B'])
+        self.assertEqual(
+            result['failed_corp_reasons']['CORP-B'],
+            'malformed corporation evidence',
+        )
+
+    def test_global_evidence_batches_full_universe_writes(self):
+        repository = MagicMock()
+        repository.list_current_share_issuance_coverage.return_value = []
+        repository.list_latest_share_issuance_positive_event_dates.return_value = {}
+        service = DartSignalsService(repository=repository)
+        corporations = [
+            {
+                'corp_code': f'CORP-{index:04d}',
+                'stock_code': f'{index:06d}',
+            }
+            for index in range(501)
+        ]
+
+        def persist_one(*, corporation, **_kwargs):
+            return {
+                'positive_event_count': 0,
+                'negative_coverage_count': 1,
+                'negative_segment_count': 0,
+                'coverage_status': 'complete_negative',
+                '_evidence_rows': [
+                    {
+                        'event': {
+                            'corp_code': corporation['corp_code'],
+                        },
+                        'dilution_signal': {},
+                    }
+                ],
+            }
+
+        with (
+            patch.object(
+                service,
+                'persist_share_issuance_scan_evidence',
+                side_effect=persist_one,
+            ),
+            patch.object(service, '_store_dilution_signal_rows') as store,
+        ):
+            result = service.persist_global_share_issuance_scan_evidence(
+                corporations=corporations,
+                raw_items=[],
+                window_start=date(2026, 1, 1),
+                window_end=date(2026, 4, 1),
+                sync_run_id=8,
+            )
+
+        self.assertEqual(store.call_count, 3)
+        self.assertEqual(
+            [len(item.args[0]) for item in store.call_args_list],
+            [250, 250, 1],
+        )
+        self.assertEqual(result['corporation_count'], 501)
+        self.assertEqual(len(result['coverage_ready_corp_codes']), 501)
+        self.assertEqual(result['failed_corp_codes'], [])
+
+    def test_global_evidence_bisects_failed_batch_to_one_corporation(self):
+        repository = MagicMock()
+        repository.list_current_share_issuance_coverage.return_value = []
+        repository.list_latest_share_issuance_positive_event_dates.return_value = {}
+        service = DartSignalsService(repository=repository)
+        corporations = [
+            {'corp_code': 'CORP-A', 'stock_code': '005930'},
+            {'corp_code': 'CORP-B', 'stock_code': '000660'},
+            {'corp_code': 'CORP-C', 'stock_code': '035420'},
+        ]
+
+        def persist_one(*, corporation, **_kwargs):
+            return {
+                'positive_event_count': 0,
+                'negative_coverage_count': 1,
+                'negative_segment_count': 0,
+                'coverage_status': 'complete_negative',
+                '_evidence_rows': [
+                    {
+                        'event': {'corp_code': corporation['corp_code']},
+                        'dilution_signal': {},
+                    }
+                ],
+            }
+
+        def store_rows(rows):
+            if any(
+                row['event']['corp_code'] == 'CORP-B'
+                for row in rows
+            ):
+                class UniqueViolation(ValueError):
+                    pgcode = '23505'
+
+                raise IntegrityError(
+                    'insert dilution evidence',
+                    {},
+                    UniqueViolation(
+                        'one corporation violates storage contract'
+                    ),
+                )
+
+        with (
+            patch.object(
+                service,
+                'persist_share_issuance_scan_evidence',
+                side_effect=persist_one,
+            ),
+            patch.object(
+                service,
+                '_store_dilution_signal_rows',
+                side_effect=store_rows,
+            ),
+            patch.object(
+                service,
+                '_persist_incomplete_share_issuance_attempt',
+                return_value=1,
+            ) as mark_incomplete,
+        ):
+            result = service.persist_global_share_issuance_scan_evidence(
+                corporations=corporations,
+                raw_items=[],
+                window_start=date(2026, 1, 1),
+                window_end=date(2026, 4, 1),
+                sync_run_id=9,
+            )
+
+        self.assertEqual(
+            result['coverage_ready_corp_codes'],
+            ['CORP-A', 'CORP-C'],
+        )
+        self.assertEqual(result['failed_corp_codes'], ['CORP-B'])
+        self.assertIn(
+            'one corporation violates storage contract',
+            result['failed_corp_reasons']['CORP-B'],
+        )
+        self.assertEqual(result['rows_upserted'], 2)
+        mark_incomplete.assert_called_once()
+        self.assertEqual(
+            mark_incomplete.call_args.kwargs['corporation']['corp_code'],
+            'CORP-B',
+        )
+
+    def test_global_evidence_does_not_bisect_systemic_database_failure(self):
+        repository = MagicMock()
+        repository.list_current_share_issuance_coverage.return_value = []
+        repository.list_latest_share_issuance_positive_event_dates.return_value = {}
+        service = DartSignalsService(repository=repository)
+        corporations = [
+            {'corp_code': 'CORP-A', 'stock_code': '005930'},
+            {'corp_code': 'CORP-B', 'stock_code': '000660'},
+            {'corp_code': 'CORP-C', 'stock_code': '035420'},
+        ]
+
+        def persist_one(*, corporation, **_kwargs):
+            return {
+                'positive_event_count': 0,
+                'negative_coverage_count': 1,
+                'negative_segment_count': 0,
+                'coverage_status': 'complete_negative',
+                '_evidence_rows': [
+                    {
+                        'event': {'corp_code': corporation['corp_code']},
+                        'dilution_signal': {},
+                    }
+                ],
+            }
+
+        outage = OperationalError(
+            'insert dilution evidence',
+            {},
+            ConnectionError('database connection reset'),
+            connection_invalidated=True,
+        )
+        with (
+            patch.object(
+                service,
+                'persist_share_issuance_scan_evidence',
+                side_effect=persist_one,
+            ),
+            patch.object(
+                service,
+                '_store_dilution_signal_rows',
+                side_effect=outage,
+            ) as store,
+            patch.object(
+                service,
+                '_persist_incomplete_share_issuance_attempt',
+            ) as mark_incomplete,
+        ):
+            with self.assertRaises(OperationalError):
+                service.persist_global_share_issuance_scan_evidence(
+                    corporations=corporations,
+                    raw_items=[],
+                    window_start=date(2026, 1, 1),
+                    window_end=date(2026, 4, 1),
+                    sync_run_id=10,
+                )
+
+        store.assert_called_once()
+        mark_incomplete.assert_not_called()
+
+    def test_dilution_signal_records_only_positive_event_evidence(self):
+        service = DartSignalsService(client=FakeSignalsClient(members=[]))
+
+        matched = service._extract_dilution_signal(
+            {'report_nm': '유상증자 결정'}
+        )
+        unmatched = service._extract_dilution_signal(
+            {'report_nm': '정기주주총회 결과'}
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertTrue(matched['has_dilution_signal'])
+        self.assertEqual(
+            matched['payload']['evidence_semantics'],
+            'positive_event_match',
+        )
+        self.assertIsNone(unmatched)
+
     def test_candidate_query_requires_captured_successful_annual_snapshot_without_audit(self):
         statements = []
 
@@ -553,6 +865,273 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DartSignalsRepositoryPostgresTests(unittest.TestCase):
+    def test_same_date_incomplete_attempt_cannot_downgrade_completed_authority(self):
+        corp_code = uuid4().hex[:8]
+        stock_code = f'T{uuid4().hex[:8]}'
+        receipt_date = date(2025, 10, 30)
+
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            session = Session(bind=connection)
+
+            @contextmanager
+            def rollback_only_session_scope():
+                yield session
+                session.flush()
+
+            try:
+                service = DartSignalsService(client=object())
+                with patch(
+                    'app.dart.signals_service.session_scope',
+                    rollback_only_session_scope,
+                ):
+                    service._store_dilution_signal_rows(
+                        [
+                            _share_issuance_attempt_row(
+                                corp_code=corp_code,
+                                stock_code=stock_code,
+                                receipt_date=receipt_date,
+                                evidence_semantics='completed_scan_attempt',
+                                authority_marker='completed-first',
+                            )
+                        ]
+                    )
+                    service._store_dilution_signal_rows(
+                        [
+                            _share_issuance_attempt_row(
+                                corp_code=corp_code,
+                                stock_code=stock_code,
+                                receipt_date=receipt_date,
+                                evidence_semantics='incomplete_scan_attempt',
+                                authority_marker='incomplete-later',
+                            )
+                        ]
+                    )
+
+                session.expire_all()
+                row = (
+                    session.query(DartDilutionSignal)
+                    .filter(
+                        DartDilutionSignal.rcept_no == f'DILATT-{corp_code}'
+                    )
+                    .one()
+                )
+                self.assertEqual(
+                    row.payload['evidence_semantics'],
+                    'completed_scan_attempt',
+                )
+                self.assertEqual(
+                    row.payload['authority_marker'],
+                    'completed-first',
+                )
+            finally:
+                session.close()
+                transaction.rollback()
+
+    def test_completed_authority_can_promote_same_date_and_refresh_newer_date(self):
+        corp_code = uuid4().hex[:8]
+        stock_code = f'T{uuid4().hex[:8]}'
+        first_date = date(2025, 10, 30)
+        newer_date = date(2025, 10, 31)
+
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            session = Session(bind=connection)
+
+            @contextmanager
+            def rollback_only_session_scope():
+                yield session
+                session.flush()
+
+            try:
+                service = DartSignalsService(client=object())
+                with patch(
+                    'app.dart.signals_service.session_scope',
+                    rollback_only_session_scope,
+                ):
+                    for receipt_date, semantics, marker in (
+                        (
+                            first_date,
+                            'incomplete_scan_attempt',
+                            'incomplete-first',
+                        ),
+                        (
+                            first_date,
+                            'completed_scan_attempt',
+                            'same-date-completed',
+                        ),
+                        (
+                            newer_date,
+                            'completed_scan_attempt',
+                            'newer-completed',
+                        ),
+                    ):
+                        service._store_dilution_signal_rows(
+                            [
+                                _share_issuance_attempt_row(
+                                    corp_code=corp_code,
+                                    stock_code=stock_code,
+                                    receipt_date=receipt_date,
+                                    evidence_semantics=semantics,
+                                    authority_marker=marker,
+                                )
+                            ]
+                        )
+
+                session.expire_all()
+                row = (
+                    session.query(DartDilutionSignal)
+                    .filter(
+                        DartDilutionSignal.rcept_no == f'DILATT-{corp_code}'
+                    )
+                    .one()
+                )
+                self.assertEqual(row.receipt_date, newer_date)
+                self.assertEqual(
+                    row.payload['evidence_semantics'],
+                    'completed_scan_attempt',
+                )
+                self.assertEqual(
+                    row.payload['authority_marker'],
+                    'newer-completed',
+                )
+            finally:
+                session.close()
+                transaction.rollback()
+
+    def test_positive_issuance_date_queries_include_every_positive_signal_type(self):
+        receipt_date = date(2025, 10, 30)
+        positive_signal_types = (
+            'paid_increase',
+            'convertible_bond',
+            'bond_with_warrant',
+            'exchange_bond',
+        )
+
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            session = Session(bind=connection)
+
+            @contextmanager
+            def rollback_only_session_scope():
+                yield session
+                session.flush()
+
+            try:
+                corporation_rows = []
+                for signal_type in positive_signal_types:
+                    corp_code = uuid4().hex[:8]
+                    stock_code = f'T{uuid4().hex[:8]}'
+                    corporation_rows.append((corp_code, stock_code))
+                    session.add(
+                        DartDilutionSignal(
+                            disclosure_event_id=None,
+                            rcept_no=f'R{uuid4().hex[:20]}',
+                            corp_code=corp_code,
+                            stock_code=stock_code,
+                            corp_name='Positive issuance type test',
+                            receipt_date=receipt_date,
+                            report_nm='Positive issuance disclosure',
+                            signal_type=signal_type,
+                            has_dilution_signal=True,
+                            security_type='test',
+                            reason='positive issuance type test',
+                            payload={'evidence_semantics': 'positive_event_match'},
+                        )
+                    )
+                session.flush()
+
+                repository = DartSignalsRepository()
+                with patch(
+                    'app.dart.signals_service.session_scope',
+                    rollback_only_session_scope,
+                ):
+                    latest_by_corp = (
+                        repository.list_latest_share_issuance_positive_event_dates(
+                            corp_codes=[row[0] for row in corporation_rows],
+                            on_or_before=receipt_date,
+                        )
+                    )
+                    latest_by_single_corp = {
+                        corp_code: repository.get_latest_share_issuance_positive_event_date(
+                            stock_code=stock_code,
+                            corp_code=corp_code,
+                            on_or_before=receipt_date,
+                        )
+                        for corp_code, stock_code in corporation_rows
+                    }
+
+                expected = {
+                    corp_code: receipt_date
+                    for corp_code, _stock_code in corporation_rows
+                }
+                self.assertEqual(latest_by_corp, expected)
+                self.assertEqual(latest_by_single_corp, expected)
+            finally:
+                session.close()
+                transaction.rollback()
+
+    def test_complete_negative_share_issuance_coverage_is_idempotent(self):
+        corp_code = uuid4().hex[:8]
+        stock_code = f'T{uuid4().hex[:8]}'
+        window_start = date(2024, 10, 30)
+        window_end = date(2025, 10, 30)
+
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            session = Session(bind=connection)
+
+            @contextmanager
+            def rollback_only_session_scope():
+                yield session
+                session.flush()
+
+            try:
+                service = DartSignalsService(client=object())
+                with patch(
+                    'app.dart.signals_service.session_scope',
+                    rollback_only_session_scope,
+                ):
+                    for _ in range(2):
+                        result = service.persist_share_issuance_scan_evidence(
+                            corporation={
+                                'corp_code': corp_code,
+                                'stock_code': stock_code,
+                                'corp_name': 'Idempotent coverage test',
+                            },
+                            raw_items=[],
+                            window_start=window_start,
+                            window_end=window_end,
+                            pagination_completed=True,
+                        )
+                        self.assertEqual(result['negative_coverage_count'], 1)
+
+                rows = (
+                    session.query(DartDilutionSignal)
+                    .filter(
+                        DartDilutionSignal.corp_code == corp_code,
+                        DartDilutionSignal.receipt_date == window_end,
+                    )
+                    .all()
+                )
+                self.assertEqual(len(rows), 2)
+                rows_by_receipt = {row.rcept_no: row for row in rows}
+                self.assertEqual(
+                    set(rows_by_receipt),
+                    {f'DILATT-{corp_code}', f'DILCOV-{corp_code}'},
+                )
+                current_row = rows_by_receipt[f'DILCOV-{corp_code}']
+                self.assertFalse(current_row.has_dilution_signal)
+                self.assertEqual(
+                    current_row.payload['evidence_coverage'][
+                        'matched_event_count'
+                    ],
+                    0,
+                )
+            finally:
+                session.close()
+                transaction.rollback()
+
     def test_point_in_time_candidate_selection_matches_piotroski_audit_consumption(self):
         market_date = date(2099, 12, 30)
         symbol_prefix = f'T{uuid4().hex[:8]}'

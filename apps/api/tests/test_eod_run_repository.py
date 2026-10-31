@@ -4393,6 +4393,35 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         )
 
     @patch('app.repositories.eod_run_repository.engine')
+    def test_multi_date_unlock_failure_invalidates_pooled_session(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        first_lock = MagicMock()
+        first_lock.scalar.return_value = True
+        second_lock = MagicMock()
+        second_lock.scalar.return_value = True
+        connection.execute.side_effect = [
+            first_lock,
+            second_lock,
+            RuntimeError('unlock statement interrupted'),
+        ]
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2026-09-21', '2026-09-22'),
+            source='daily_price_bars',
+        ) as lock_result:
+            self.assertEqual(lock_result, (True, None))
+
+        connection.invalidate.assert_called_once_with()
+        self.assertEqual(connection.execute.call_count, 3)
+
+    @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_rejects_empty_date_set_without_connecting(
         self,
         engine,
@@ -4516,7 +4545,77 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         ) as acquired:
             self.assertTrue(acquired)
 
+        connection.invalidate.assert_called_once_with()
         engine.connect.return_value.__exit__.assert_called_once_with(None, None, None)
+
+    def test_unlock_failure_discards_real_pooled_session(self) -> None:
+        probe_engine = create_engine(
+            engine.url,
+            pool_size=2,
+            max_overflow=0,
+            future=True,
+        )
+        source_key, trade_key = eod_collection_advisory_lock_keys(
+            market='KRX',
+            trade_date='2099-12-29',
+            source='daily_price_bars',
+        )
+        parameters = {'source_key': source_key, 'trade_key': trade_key}
+
+        def fail_unlock_before_execution(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if 'pg_advisory_unlock' in statement:
+                raise RuntimeError('synthetic unlock failure')
+
+        event.listen(
+            probe_engine,
+            'before_cursor_execute',
+            fail_unlock_before_execution,
+        )
+        try:
+            # Keep a separate backend checked out so it can verify that the
+            # owner's PostgreSQL session was actually closed, not merely
+            # returned to the pool with its session-level lock intact.
+            with probe_engine.connect() as contender:
+                with patch(
+                    'app.repositories.eod_run_repository.engine',
+                    probe_engine,
+                ):
+                    with advisory_eod_collection_lock(
+                        market='KRX',
+                        trade_date='2099-12-29',
+                        source='daily_price_bars',
+                    ) as acquired:
+                        self.assertTrue(acquired)
+
+                transaction = contender.begin()
+                try:
+                    contender_acquired = bool(
+                        contender.execute(
+                            text(
+                                'SELECT pg_try_advisory_xact_lock('
+                                ':source_key, :trade_key)'
+                            ),
+                            parameters,
+                        ).scalar()
+                    )
+                finally:
+                    transaction.rollback()
+
+            self.assertTrue(contender_acquired)
+        finally:
+            event.remove(
+                probe_engine,
+                'before_cursor_execute',
+                fail_unlock_before_execution,
+            )
+            probe_engine.dispose()
 
 
 class CompleteEODCollectionRunUnitTests(unittest.TestCase):

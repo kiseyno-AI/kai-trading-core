@@ -557,12 +557,20 @@ class DartService:
 
 def build_fundamentals_dataset(statements: dict[str, Any]) -> dict[str, Any]:
     items = [_normalize_statement_item(item) for item in statements.get('list', [])]
-    highlights = _build_highlights(items)
+    highlights = build_highlights_from_normalized_items(items)
     return {
         'items': items,
         'highlights': highlights,
         'currency': next((item['currency'] for item in items if item.get('currency')), None),
     }
+
+
+def build_highlights_from_normalized_items(
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive the canonical highlight contract from already-normalized DART rows."""
+
+    return _build_highlights(items)
 
 
 def build_fundamental_context_from_highlights(
