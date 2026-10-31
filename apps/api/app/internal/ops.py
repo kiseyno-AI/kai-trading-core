@@ -58,6 +58,7 @@ from app.dart.sync_service import dart_disclosure_sync_service
 from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
+from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 from app.eod.daily_pipeline_tracking import (
     build_prior_date_current_only_stage_skip,
@@ -113,6 +114,13 @@ from app.signals.daily_signal_features import daily_signal_feature_service
 
 
 DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY = 4
+TERMINAL_CHILD_REPAIR_EXPECTED_ORPHANS = {
+    151: ('failed', 'price_collection'),
+    217: ('failed', 'signal_decider'),
+    231: ('interrupted', 'signal_decider'),
+    447: ('blocked', 'agent_feedback_summaries'),
+}
+TERMINAL_CHILD_REPAIR_EXPECTED_COUNT = 4
 
 
 def bootstrap_runtime() -> None:
@@ -1303,6 +1311,23 @@ def list_daily_pipeline_stages() -> dict[str, Any]:
     return daily_pipeline_stage_service.describe()
 
 
+def repair_terminal_daily_pipeline_children(
+    *,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    # Deliberately bypass bootstrap_runtime(): this one-time repair must not
+    # run migrations or hydrate unrelated runtime state.
+    return (
+        daily_pipeline_run_state_service
+        .reconcile_terminal_parent_running_stages(
+            expected_orphans=dict(TERMINAL_CHILD_REPAIR_EXPECTED_ORPHANS),
+            expected_orphan_count=TERMINAL_CHILD_REPAIR_EXPECTED_COUNT,
+            apply=not dry_run,
+            preserve_historical_updated_at=True,
+        )
+    )
+
+
 def run_daily_pipeline_stages(
     *,
     market_date: str | None = None,
@@ -1908,6 +1933,29 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('scanner-tracked-symbols', help='Return /scanner/tracked-symbols directly from services')
     subparsers.add_parser('eod-status', help='Return /eod/status directly from services')
     subparsers.add_parser('eod-pipeline-stages', help='List the canonical daily pipeline stage catalog')
+    pipeline_terminal_child_repair_parser = subparsers.add_parser(
+        'eod-pipeline-terminal-child-repair',
+        help=(
+            'Repair the reviewed terminal-parent/running-child incident set; '
+            'defaults to a read-only exact-scope check'
+        ),
+    )
+    pipeline_terminal_child_repair_mode = (
+        pipeline_terminal_child_repair_parser.add_mutually_exclusive_group()
+    )
+    pipeline_terminal_child_repair_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help='Apply the fixed-scope repair after all invariants match.',
+    )
+    pipeline_terminal_child_repair_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Verify the exact incident scope without writing (default).',
+    )
+    pipeline_terminal_child_repair_parser.set_defaults(dry_run=True)
     subparsers.add_parser(
         'schema-drift-preflight',
         help='Verify runtime-critical tables and constraints before write-heavy workflows are treated as healthy',
@@ -2490,6 +2538,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = get_eod_status()
     elif args.command == 'eod-pipeline-stages':
         payload = list_daily_pipeline_stages()
+    elif args.command == 'eod-pipeline-terminal-child-repair':
+        payload = repair_terminal_daily_pipeline_children(
+            dry_run=args.dry_run,
+        )
     elif args.command == 'schema-drift-preflight':
         payload, exit_code = collect_schema_drift_preflight()
         print(json.dumps(payload, ensure_ascii=False))
@@ -2785,6 +2837,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.command == 'dart-share-issuance-evidence-backfill'
         and payload.get('status')
         in {'blocked', 'partial', 'completed_with_gaps', 'failed'}
+    ) or (
+        args.command == 'eod-pipeline-terminal-child-repair'
+        and payload.get('status') in {'blocked', 'failed'}
     ):
         return 2
     return 0
