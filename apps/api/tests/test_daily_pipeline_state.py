@@ -1942,6 +1942,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             market='KRX',
             source='pykrx',
             trigger='auto_close_scheduler',
+            run_metadata={'daily_pipeline_run_id': 387},
         )
         run_result = MagicMock()
         run_result.scalar_one_or_none.return_value = run
@@ -1968,6 +1969,10 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             {'pipeline_run_id': 387, 'eod_run_id': 522},
         )
         self.assertEqual(run.run_metadata['eod_collection_run_id'], 522)
+        self.assertEqual(
+            eod_run.run_metadata['daily_pipeline_run_id'],
+            387,
+        )
         self.assertEqual(run.updated_at, now)
 
     def test_startup_interrupt_marks_linked_eod_run_retryable_immediately(
@@ -2537,7 +2542,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             {'source_key': 10_003, 'trade_key': 20_260_914},
         )
 
-    def test_startup_interrupt_links_unique_running_eod_before_first_checkpoint(
+    def test_startup_interrupt_uses_exact_reverse_eod_link_before_first_checkpoint(
         self,
     ) -> None:
         now = datetime(2026, 9, 14, 7, 34, 11, tzinfo=timezone.utc)
@@ -2550,7 +2555,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             completed_at=None,
             updated_at=now,
             run_metadata={
-                'mode': 'daily_auto',
+                'entrypoint': 'daily_pipeline_stage_service.run',
                 'resolved_stages': ['price_collection', 'technical_snapshots'],
             },
         )
@@ -2581,16 +2586,17 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             symbols_failed=0,
             error_message=None,
             completed_at=None,
-            run_metadata={'requested_symbols': ['005930']},
+            run_metadata={
+                'daily_pipeline_run_id': 387,
+                'requested_symbols': ['005930'],
+            },
         )
         runs_result = MagicMock()
         runs_result.scalars.return_value = [run]
         stages_result = MagicMock()
         stages_result.scalars.return_value = [stage]
         metadata_candidates_result = MagicMock()
-        metadata_candidates_result.scalars.return_value = []
-        legacy_candidates_result = MagicMock()
-        legacy_candidates_result.scalars.return_value = [eod_run]
+        metadata_candidates_result.scalars.return_value = [eod_run]
         lock_result = MagicMock()
         lock_result.scalar.return_value = True
         persisted_symbols_result = MagicMock()
@@ -2601,7 +2607,6 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             stages_result,
             lock_result,
             metadata_candidates_result,
-            legacy_candidates_result,
             persisted_symbols_result,
         ]
         session_context = MagicMock()
@@ -2621,6 +2626,84 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(result['run_ids'], [387])
         self.assertEqual(result['interrupted_eod_run_ids'], [522])
         self.assertEqual(eod_run.status, 'failed')
+        reverse_link_statement = session.execute.call_args_list[3].args[0]
+        self.assertIn(
+            'daily_pipeline_run_id',
+            reverse_link_statement.compile().params.values(),
+        )
+        self.assertEqual(session.execute.call_count, 5)
+
+    def test_startup_interrupt_never_infers_eod_owner_from_date_and_trigger(
+        self,
+    ) -> None:
+        now = datetime(2026, 9, 14, 7, 34, 11, tzinfo=timezone.utc)
+        run = SimpleNamespace(
+            id=388,
+            market_date=date(2026, 9, 14),
+            trigger='internal_ops_cli_stage',
+            status='running',
+            error_message=None,
+            completed_at=None,
+            updated_at=now,
+            run_metadata={
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'resolved_stages': ['price_collection'],
+            },
+        )
+        stage = SimpleNamespace(
+            stage_id='price_collection',
+            market_date=date(2026, 9, 14),
+            status='running',
+            processed=0,
+            total=1,
+            remaining=1,
+            error_message=None,
+            current_step='price_collection_started',
+            current_activity='Starting prices',
+            completed_at=None,
+            updated_at=now,
+            source_run_ids={},
+            details={},
+        )
+        runs_result = MagicMock()
+        runs_result.scalars.return_value = [run]
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = [stage]
+        lock_result = MagicMock()
+        lock_result.scalar.return_value = True
+        reverse_candidates_result = MagicMock()
+        reverse_candidates_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.side_effect = [
+            runs_result,
+            stages_result,
+            lock_result,
+            reverse_candidates_result,
+        ]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch('app.eod.daily_pipeline_state._utcnow', return_value=now),
+        ):
+            result = DailyPipelineRunStateService().mark_active_runs_interrupted(
+                reason='Core restarted.'
+            )
+
+        self.assertEqual(result['run_ids'], [388])
+        self.assertEqual(result['interrupted_eod_run_ids'], [])
+        self.assertEqual(result['augmented_eod_run_ids'], [])
+        self.assertEqual(session.execute.call_count, 4)
+        reverse_link_statement = session.execute.call_args_list[3].args[0]
+        self.assertIn(
+            'daily_pipeline_run_id',
+            reverse_link_statement.compile().params.values(),
+        )
+        session.get.assert_not_called()
 
     def test_startup_interrupt_augments_terminal_eod_from_prior_stage_link(
         self,

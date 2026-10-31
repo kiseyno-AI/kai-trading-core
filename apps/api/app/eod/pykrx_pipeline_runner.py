@@ -844,6 +844,23 @@ def _extract_result_counts(
             'failed': min(failed, inspected),
         }
 
+    if stage_id == 'signal_features':
+        succeeded = _int(result.get('features_persisted'))
+        failed = _int(result.get('features_failed'))
+        processed = succeeded + failed
+        reported_total = (
+            _int(result.get('items_total'))
+            if 'items_total' in result
+            else processed
+        )
+        total = max(reported_total, processed)
+        return {
+            'processed': processed,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+        }
+
     count_pairs = (
         ('symbols_refreshed', 'symbols_failed'),
         ('events_captured', 'events_failed'),
@@ -1962,6 +1979,7 @@ def run_market_data_pipeline(
     track_daily_pipeline: bool = False,
     point_in_time_recovery: bool = False,
     provider_admission_fence_owned: bool = False,
+    owning_pipeline_run_id: int | None = None,
 ) -> dict:
     feedback_knowledge_cutoff_at: datetime | None = None
 
@@ -1973,6 +1991,25 @@ def run_market_data_pipeline(
 
     normalized_start = dependencies.normalize_yyyymmdd(start_date)
     normalized_end = dependencies.normalize_yyyymmdd(end_date)
+    normalized_owning_pipeline_run_id: int | None = None
+    if owning_pipeline_run_id is not None:
+        try:
+            normalized_owning_pipeline_run_id = int(
+                owning_pipeline_run_id
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'owning_pipeline_run_id must be a positive integer'
+            ) from exc
+        if normalized_owning_pipeline_run_id <= 0:
+            raise ValueError(
+                'owning_pipeline_run_id must be a positive integer'
+            )
+        if track_daily_pipeline:
+            raise ValueError(
+                'owning_pipeline_run_id cannot be combined with '
+                'track_daily_pipeline'
+            )
     historical_backfill = mode == 'historical_backfill'
     # Production entry points resolve prior-date recovery before reaching this
     # low-level runner. Keeping this boundary explicit avoids making direct
@@ -2169,6 +2206,10 @@ def run_market_data_pipeline(
         'failed_symbols_count': 0,
         'unattempted_symbols': unattempted_symbols,
     }
+    if normalized_owning_pipeline_run_id is not None:
+        run_metadata['daily_pipeline_run_id'] = (
+            normalized_owning_pipeline_run_id
+        )
     if retry_context is not None:
         run_metadata['retry'] = retry_context
     if inherited_downstream_symbols:
@@ -2342,7 +2383,13 @@ def run_market_data_pipeline(
             raise
 
     try:
-        daily_pipeline_tracker.link_eod_run(run_id)
+        if normalized_owning_pipeline_run_id is not None:
+            dependencies.daily_pipeline_run_state_service.link_eod_run(
+                pipeline_run_id=normalized_owning_pipeline_run_id,
+                eod_run_id=run_id,
+            )
+        else:
+            daily_pipeline_tracker.link_eod_run(run_id)
     except Exception as exc:
         terminalize_tracking_failure(
             exc,

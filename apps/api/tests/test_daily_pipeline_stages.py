@@ -3004,6 +3004,26 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'market_risk_filter',
             ],
         )
+        self.assertEqual(
+            pykrx_runner.calls[0]['owning_pipeline_run_id'],
+            self.run_state_service.runs[0]['id'],
+        )
+        self.assertEqual(
+            result['stages']['price_collection']['result'][
+                'source_run_ids'
+            ]['eod_run_id'],
+            901,
+        )
+        price_finish = next(
+            event
+            for event in self.run_state_service.stage_events
+            if event['event'] == 'finish_stage'
+            and event['stage_id'] == 'price_collection'
+        )
+        self.assertEqual(
+            price_finish['source_run_ids']['eod_run_id'],
+            901,
+        )
         executed_stage_ids = [call.args[0] for call in execute_stage.call_args_list]
         self.assertEqual(
             executed_stage_ids[:4],
@@ -6337,6 +6357,26 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['source_run_ids']['eod_run_id'], 901)
+
+    def test_grouped_non_price_stage_does_not_mislabel_eod_run_id(self) -> None:
+        service = DailyPipelineStageService()
+
+        result = service._extract_pykrx_stage_result(
+            'technical_snapshots',
+            {
+                'run_id': 901,
+                'latest_available_trade_date': '2026-04-14',
+                'technical_snapshots': {
+                    'status': 'completed',
+                    'snapshots_persisted': 2,
+                    'snapshots_failed': 0,
+                },
+            },
+        )
+
+        self.assertEqual(result['run_id'], 901)
+        self.assertEqual(result['source_run_ids'], {})
 
     def test_grouped_technical_failure_does_not_block_enrichment_after_price_success(self) -> None:
         enrichment_service = MagicMock()

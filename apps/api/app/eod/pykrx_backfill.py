@@ -6719,6 +6719,7 @@ class PykrxBackfillService:
         force: bool = False,
         symbols: Sequence[str] | None = None,
         point_in_time_recovery: bool = False,
+        owning_pipeline_run_id: int | None = None,
     ) -> dict:
         requested_stages = [stage for stage in PYKRX_STAGE_SEQUENCE if stage in set(stages)]
         if not requested_stages:
@@ -6813,6 +6814,7 @@ class PykrxBackfillService:
                 selected_stages=requested_stages,
                 chain_fundamentals_followup=False,
                 point_in_time_recovery=point_in_time_recovery,
+                owning_pipeline_run_id=owning_pipeline_run_id,
             )
             result['triggered'] = True
             result['forced'] = force
@@ -7421,6 +7423,7 @@ class PykrxBackfillService:
         track_daily_pipeline: bool = False,
         point_in_time_recovery: bool = False,
         provider_admission_fence_owned: bool = False,
+        owning_pipeline_run_id: int | None = None,
     ) -> dict:
         self._symbol_fundamentals_disabled_for_run = False
         self._symbol_fundamentals_failure_count_for_run = 0
@@ -7464,6 +7467,7 @@ class PykrxBackfillService:
             provider_admission_fence_owned=(
                 provider_admission_fence_owned
             ),
+            owning_pipeline_run_id=owning_pipeline_run_id,
         )
 
     def _load_symbol_fundamentals(self, *, symbol: str, start_date: str, end_date: str):
