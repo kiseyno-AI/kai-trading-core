@@ -1398,6 +1398,29 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['coverage_status'], 'complete')
         self.assertEqual(coverage['complete_present_rows'], 0)
         self.assertEqual(coverage['completeness_status'], 'missing')
+        self.assertEqual(
+            coverage['component_coverage'],
+            {
+                'short_volume': {
+                    'present_rows': 1,
+                    'missing_rows': 0,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
+                'short_value': {
+                    'present_rows': 1,
+                    'missing_rows': 0,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
+                'short_balance': {
+                    'present_rows': 0,
+                    'missing_rows': 1,
+                    'coverage_ratio': 0.0,
+                    'coverage_status': 'missing',
+                },
+            },
+        )
 
     def test_valuation_coverage_exposes_incomplete_observation_without_counting_it_ready(self):
         service = PykrxEnrichmentService()

@@ -185,7 +185,11 @@ class SignalDeciderMarketContextBuilder:
         }
         indices = {key: value for key, value in indices.items() if value is not None}
 
-        fx = self._build_fx_context(payload=snapshot.get('usd_krw'), missing_fields=missing_fields)
+        fx = self._build_fx_context(
+            payload=snapshot.get('usd_krw'),
+            market_date=market_date,
+            missing_fields=missing_fields,
+        )
         flows = self._build_flow_context(snapshot_markets=snapshot_markets, missing_fields=missing_fields)
         summary = self._build_summary(
             market_date_text=market_date_text,
@@ -201,16 +205,23 @@ class SignalDeciderMarketContextBuilder:
             _append_missing_field(missing_fields, 'as_of')
         elif as_of.date().isoformat() != market_date_text:
             stale_reasons.append(f'as_of_date={as_of.date().isoformat()}')
+        snapshot_stale_reason = str(snapshot.get('stale_reason') or '').strip()
+        if snapshot_stale_reason and snapshot_stale_reason not in stale_reasons:
+            stale_reasons.append(snapshot_stale_reason)
         usd_krw = fx.get('usdkrw') if isinstance(fx.get('usdkrw'), dict) else None
         if isinstance(usd_krw, dict):
             fx_stale_reason = str(usd_krw.get('stale_reason') or '').strip()
-            if fx_stale_reason:
+            if fx_stale_reason and fx_stale_reason not in stale_reasons:
                 stale_reasons.append(fx_stale_reason)
             elif usd_krw.get('fallback_applied'):
                 stale_reasons.append('usdkrw_fallback_applied')
 
         status = 'ready'
-        if not indices and not usd_krw:
+        fx_value_available = bool(
+            isinstance(usd_krw, dict)
+            and _to_float(usd_krw.get('value')) is not None
+        )
+        if not indices and not fx_value_available:
             status = 'unavailable'
         elif stale_reasons:
             status = 'stale'
@@ -260,30 +271,70 @@ class SignalDeciderMarketContextBuilder:
             'change_rate': change_rate,
         }
 
-    def _build_fx_context(self, *, payload: Any, missing_fields: list[str]) -> dict[str, Any]:
+    def _build_fx_context(
+        self,
+        *,
+        payload: Any,
+        market_date: date,
+        missing_fields: list[str],
+    ) -> dict[str, Any]:
         if not isinstance(payload, dict):
             _append_missing_field(missing_fields, 'fx.usdkrw')
             return {}
 
         value = _to_float(payload.get('rate'))
         effective_date = payload.get('effective_date')
+        try:
+            normalized_effective_date = (
+                date.fromisoformat(str(effective_date))
+                if effective_date is not None
+                else None
+            )
+        except ValueError:
+            normalized_effective_date = None
+        fallback_applied = bool(payload.get('fallback_applied'))
+        status = str(payload.get('status') or ('ready' if value is not None else 'missing'))
+        source = str(payload.get('source') or ('live' if value is not None else 'unavailable'))
+        stale_reason = payload.get('stale_reason')
         if value is None:
             _append_missing_field(missing_fields, 'fx.usdkrw')
-            return {}
-        if effective_date is None:
+        if normalized_effective_date is None:
             _append_missing_field(missing_fields, 'fx.usdkrw.effective_date')
         captured_at = _normalize_datetime(payload.get('captured_at'))
+        if captured_at is None:
+            _append_missing_field(missing_fields, 'fx.usdkrw.captured_at')
+        provider_gap = bool(
+            stale_reason
+            or fallback_applied
+            or status.strip().lower() != 'ready'
+            or source.strip().lower() != 'live'
+            or normalized_effective_date != market_date
+            or captured_at is None
+        )
+        if value is None:
+            provider_freshness = 'missing'
+        elif provider_gap:
+            provider_freshness = 'stale'
+        else:
+            provider_freshness = 'fresh'
 
         return {
             'usdkrw': {
                 'value': value,
-                'effective_date': str(effective_date) if effective_date is not None else None,
-                'fallback_applied': bool(payload.get('fallback_applied')),
-                'status': str(payload.get('status') or 'ready'),
-                'source': str(payload.get('source') or 'live'),
-                'stale_reason': payload.get('stale_reason'),
+                'effective_date': (
+                    normalized_effective_date.isoformat()
+                    if normalized_effective_date is not None
+                    else None
+                ),
+                'fallback_applied': fallback_applied,
+                'status': status,
+                'source': source,
+                'stale_reason': stale_reason,
                 'detail': payload.get('detail'),
                 'captured_at': captured_at.isoformat() if captured_at is not None else None,
+                'provider_gap': provider_gap,
+                'provider_freshness': provider_freshness,
+                'value_available': value is not None,
             }
         }
 

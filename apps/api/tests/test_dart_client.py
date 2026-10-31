@@ -1,4 +1,6 @@
 import unittest
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -225,6 +227,92 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
                 corp = await client.lookup_corp_code(stock_code='005930')
 
             self.assertEqual(corp['corp_code'], '00126380')
+
+    async def test_fresh_persisted_corp_list_can_prove_missing_mapping(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            client = TestableDartClient(
+                {'status': '800', 'message': 'Maintenance'},
+                content=(
+                    b'<result><status>800</status>'
+                    b'<message>Maintenance</message></result>'
+                ),
+                headers={'content-type': 'application/xml'},
+            )
+
+            with patch.object(
+                settings,
+                'dart_corp_code_cache_file',
+                str(cache_file),
+            ):
+                result = await client.lookup_corp_codes_for_stocks(
+                    stock_codes=['005930', '999999'],
+                )
+
+            self.assertEqual(
+                [item['stock_code'] for item in result['resolved']],
+                ['005930'],
+            )
+            self.assertEqual(result['unsupported_stock_codes'], ['999999'])
+            self.assertEqual(result['conflicting_mappings'], [])
+            self.assertTrue(result['mapping_authority']['authoritative'])
+            self.assertEqual(
+                result['mapping_authority']['source'],
+                'persistent_fallback',
+            )
+
+    async def test_stale_persisted_corp_list_keeps_all_mappings_retryable(self):
+        with TemporaryDirectory() as directory:
+            cache_file = Path(directory) / 'corp-codes.xml'
+            cache_file.write_bytes(self._CORP_CODE_XML)
+            stale_at = datetime.now(timezone.utc) - timedelta(
+                seconds=settings.dart_corp_code_cache_ttl_seconds + 60
+            )
+            os.utime(
+                cache_file,
+                (stale_at.timestamp(), stale_at.timestamp()),
+            )
+            client = TestableDartClient(
+                {'status': '800', 'message': 'Maintenance'},
+                content=(
+                    b'<result><status>800</status>'
+                    b'<message>Maintenance</message></result>'
+                ),
+                headers={'content-type': 'application/xml'},
+            )
+
+            with patch.object(
+                settings,
+                'dart_corp_code_cache_file',
+                str(cache_file),
+            ):
+                result = await client.lookup_corp_codes_for_stocks(
+                    stock_codes=['005930', '999999'],
+                )
+
+            self.assertEqual(result['resolved'], [])
+            self.assertEqual(result['unsupported_stock_codes'], [])
+            self.assertEqual(
+                result['conflicting_mappings'],
+                [
+                    {
+                        'stock_code': '005930',
+                        'corp_codes': ['00126380'],
+                        'reason': (
+                            'stock_mapping_resolved_from_non_authoritative_corp_list'
+                        ),
+                    },
+                    {
+                        'stock_code': '999999',
+                        'corp_codes': [],
+                        'reason': (
+                            'stock_mapping_absent_from_non_authoritative_corp_list'
+                        ),
+                    }
+                ],
+            )
+            self.assertFalse(result['mapping_authority']['authoritative'])
 
     async def test_invalid_persisted_corp_code_payload_does_not_mask_upstream_error(self):
         with TemporaryDirectory() as directory:

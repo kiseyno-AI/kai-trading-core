@@ -27,7 +27,10 @@ from sqlalchemy import select
 
 from app.agent_context.decision_delta import build_previous_decision_context
 from app.agent_context.feedback_service import agent_context_feedback_service
-from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
+from app.agent_context.prerequisite_service import (
+    FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+    agent_feedback_prerequisite_service,
+)
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -6452,47 +6455,6 @@ class AgentFeedbackOrchestrator:
                         'source_context_overlays do not match durable WAIT recheck evidence'
                     )
                 normalized_source_context_overlays[symbol] = validated_context
-        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
-            market_date=normalized_market_date,
-            fs_div=fs_div,
-        )
-        if not force and not prerequisites['ready']:
-            return {
-                'request': {
-                    'market_date': normalized_market_date.isoformat(),
-                    'symbols': requested_symbols,
-                    'requested_symbols': requested_symbols,
-                    'request_run_id': None,
-                    'parent_run_id': normalized_parent_run_id,
-                    'roles': [spec.role for spec in specs],
-                    'fs_div': fs_div,
-                    'disclosures_limit': disclosures_limit,
-                    'knowledge_cutoff_at': requested_knowledge_cutoff_at,
-                    'policy_context_as_of_date': (
-                        resolved_policy_context_as_of_date.isoformat()
-                    ),
-                    'reuse_existing': reuse_existing,
-                    'force_recompute': force_recompute,
-                    'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
-                    'auto_scope': auto_scope,
-                    'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
-                    'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
-                    'skipped_symbols': [],
-                    'funnel_diagnostics': funnel_diagnostics,
-                    'mode': 'role_sequential_runtime_buffered',
-                },
-                'summary': {
-                    'status': prerequisites['status'],
-                    'completed': 0,
-                    'failed': 0,
-                    'skipped': 0,
-                    'flushed_to_db': 0,
-                    'gated': True,
-                },
-                'items': [],
-                'failures': [],
-                'prerequisites': prerequisites,
-            }
         uses_precomputed_auto_scope = bool(
             auto_scope
             and role_symbol_scopes is not None
@@ -6512,7 +6474,9 @@ class AgentFeedbackOrchestrator:
                 )
             )
             eligibility_scope_symbols_for_revalidation = requested_symbols
-            public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
+            public_eligibility_diagnostics = _public_eligibility_diagnostics(
+                eligibility_diagnostics
+            )
             eligibility_collapse = _requested_scope_eligibility_collapse(
                 requested_symbols=requested_symbols,
                 dispatch_symbols=dispatch_symbols,
@@ -6535,10 +6499,14 @@ class AgentFeedbackOrchestrator:
                         ),
                         'reuse_existing': reuse_existing,
                         'force_recompute': force_recompute,
-                        'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+                        'scope': resolve_agent_feedback_scope(
+                            requested_symbols=requested_symbols
+                        ),
                         'auto_scope': auto_scope,
                         'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
-                        'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+                        'eligibility_filters': list(
+                            AGENT_FEEDBACK_ELIGIBILITY_FILTERS
+                        ),
                         'skipped_symbols': skipped_symbols,
                         'eligibility_diagnostics': public_eligibility_diagnostics,
                         'funnel_diagnostics': funnel_diagnostics,
@@ -6570,6 +6538,54 @@ class AgentFeedbackOrchestrator:
                         'eligibility_scope_gate': eligibility_collapse,
                     },
                 }
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+            fs_div=fs_div,
+            symbols=dispatch_symbols,
+            required_stage_ids=(
+                FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+                if point_in_time_recovery
+                else (*FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER, 'signal_features')
+            ),
+        )
+        if not force and not prerequisites['ready']:
+            return {
+                'request': {
+                    'market_date': normalized_market_date.isoformat(),
+                    'symbols': dispatch_symbols,
+                    'requested_symbols': requested_symbols,
+                    'request_run_id': None,
+                    'parent_run_id': normalized_parent_run_id,
+                    'roles': [spec.role for spec in specs],
+                    'fs_div': fs_div,
+                    'disclosures_limit': disclosures_limit,
+                    'knowledge_cutoff_at': requested_knowledge_cutoff_at,
+                    'policy_context_as_of_date': (
+                        resolved_policy_context_as_of_date.isoformat()
+                    ),
+                    'reuse_existing': reuse_existing,
+                    'force_recompute': force_recompute,
+                    'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
+                    'auto_scope': auto_scope,
+                    'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                    'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+                    'skipped_symbols': skipped_symbols,
+                    'eligibility_diagnostics': public_eligibility_diagnostics,
+                    'funnel_diagnostics': funnel_diagnostics,
+                    'mode': 'role_sequential_runtime_buffered',
+                },
+                'summary': {
+                    'status': prerequisites['status'],
+                    'completed': 0,
+                    'failed': 0,
+                    'skipped': len(skipped_symbols),
+                    'flushed_to_db': 0,
+                    'gated': True,
+                },
+                'items': [],
+                'failures': [],
+                'prerequisites': prerequisites,
+            }
         soft_penalized_symbols = list(public_eligibility_diagnostics.get('soft_penalized_symbols') or [])
         if funnel_diagnostics is None:
             records_by_symbol = eligibility_diagnostics.get('records_by_symbol') if isinstance(eligibility_diagnostics, dict) else {}
@@ -8917,6 +8933,7 @@ class AgentFeedbackOrchestrator:
         fs_div: str | None = None,
         disclosures_limit: int = 5,
         per_role_parallelism: int = 5,
+        force: bool = False,
     ) -> dict[str, Any]:
         return _dispatch_for_symbols_via_subagents_helper(
             self,
@@ -8926,10 +8943,14 @@ class AgentFeedbackOrchestrator:
             fs_div=fs_div,
             disclosures_limit=disclosures_limit,
             per_role_parallelism=per_role_parallelism,
+            force=force,
             signal_decider_agent_name=SIGNAL_DECIDER_AGENT_NAME,
             normalize_requested_symbols=_normalize_requested_symbols,
             split_requested_symbols_by_agent_feedback_eligibility=_split_requested_symbols_by_agent_feedback_eligibility,
             agent_context_read_service=agent_context_read_service,
+            agent_feedback_prerequisite_service=(
+                agent_feedback_prerequisite_service
+            ),
             normalize_agent_response=normalize_agent_response,
             build_response_storage_payload=_build_response_storage_payload,
         )

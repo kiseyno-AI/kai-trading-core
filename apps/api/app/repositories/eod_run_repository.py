@@ -83,6 +83,7 @@ _EOD_COLLECTION_LOCK_SOURCE_KEYS = {
     ('KRX', 'pykrx'): 10_001,
     ('KRX', 'kis'): 10_002,
     ('KRX', 'daily_price_bars'): 10_003,
+    ('KRX', 'dart_share_issuance'): 10_004,
 }
 _AUTO_DAILY_PIPELINE_ENTRYPOINT = (
     'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
@@ -180,6 +181,19 @@ def eod_collection_advisory_lock_keys(
     return source_key, int(normalized_trade_date.strftime('%Y%m%d'))
 
 
+def _invalidate_advisory_lock_connection(connection: Any) -> None:
+    """Discard a pooled session whose advisory-lock cleanup failed."""
+
+    try:
+        connection.invalidate()
+    except Exception:
+        logger.warning(
+            'Failed to invalidate the EOD advisory-lock connection after '
+            'unlock cleanup failed.',
+            exc_info=True,
+        )
+
+
 @contextmanager
 def advisory_eod_collection_locks(
     *,
@@ -239,8 +253,17 @@ def advisory_eod_collection_locks(
                         },
                     )
                 except Exception:
-                    # Closing the dedicated connection releases every held lock.
-                    pass
+                    # SQLAlchemy close normally returns this session to the
+                    # pool, where session-level locks would remain held.
+                    # Invalidating it closes the PostgreSQL session and
+                    # releases this lock plus any remaining locks in the set.
+                    _invalidate_advisory_lock_connection(connection)
+                    logger.warning(
+                        'Failed to explicitly release EOD advisory locks; '
+                        'discarded the dedicated connection.',
+                        exc_info=True,
+                    )
+                    break
 
 
 def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
@@ -2989,12 +3012,14 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
                         },
                     )
                 except Exception:
-                    # Closing the dedicated PostgreSQL session releases any
-                    # remaining session-level advisory lock. Do not replace a
-                    # pipeline result/error with a cleanup-only failure.
+                    # Connection.close() normally returns the PostgreSQL
+                    # session to SQLAlchemy's pool, so it does not release a
+                    # session-level lock after a failed unlock. Invalidate the
+                    # connection without replacing a pipeline result/error.
+                    _invalidate_advisory_lock_connection(connection)
                     logger.warning(
                         'Failed to explicitly release EOD advisory lock; '
-                        'closing the dedicated connection will release it.',
+                        'discarded the dedicated connection.',
                         exc_info=True,
                     )
 

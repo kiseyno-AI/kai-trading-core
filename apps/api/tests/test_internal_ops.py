@@ -4,7 +4,7 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from fastapi import FastAPI
@@ -99,6 +99,63 @@ class InternalAPIClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InternalOpsTests(unittest.TestCase):
+    @staticmethod
+    def _authoritative_mapping(
+        *,
+        resolved: list[dict] | None = None,
+        unsupported_stock_codes: list[str] | None = None,
+        conflicting_mappings: list[dict] | None = None,
+    ) -> dict:
+        return {
+            'resolved': resolved or [],
+            'unsupported_stock_codes': unsupported_stock_codes or [],
+            'conflicting_mappings': conflicting_mappings or [],
+            'mapping_authority': {
+                'source': 'dart_corp_code_zip',
+                'source_fetched_at': '2026-10-30T10:00:00+00:00',
+                'authoritative': True,
+            },
+        }
+
+    @staticmethod
+    def _complete_issuance_coverage(
+        *,
+        stock_code: str,
+        corp_code: str,
+        window_start: str = '2025-10-30',
+        window_end: str = '2026-10-30',
+        status: str = 'complete',
+    ) -> dict:
+        return {
+            'corp_code': corp_code,
+            'stock_code': stock_code,
+            'payload': {
+                'evidence_coverage': {
+                    'schema_version': (
+                        ops.SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA
+                    ),
+                    'rule_version': ops.SHARE_ISSUANCE_RULE_VERSION,
+                    'source': 'dart_disclosure_events',
+                    'corp_code': corp_code,
+                    'status': status,
+                    'matched_event_count': 0,
+                    'pagination_completed': True,
+                    'authoritative_as_of_cutoff': True,
+                    'authority_policy_version': (
+                        ops.SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+                    ),
+                    'late_arrival_reconciliation': (
+                        'next_scan_one_day_overlap_v1'
+                    ),
+                    'scan_completed_at': (
+                        '2026-10-30T10:00:00+00:00'
+                    ),
+                    'window_start': window_start,
+                    'window_end': window_end,
+                }
+            },
+        }
+
     def test_main_schema_drift_preflight_emits_json_and_exit_code(self) -> None:
         payload = {
             'ready': False,
@@ -175,6 +232,706 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(backfill.call_args.kwargs['limit'], 2)
         self.assertEqual(backfill.call_args.kwargs['after_event_id'], 40)
         self.assertFalse(backfill.call_args.kwargs['dry_run'])
+
+    def test_backfill_dart_share_issuance_evidence_dry_run_freezes_sorted_manifest_and_cursor(self) -> None:
+        active_symbols = [
+            {'symbol': '005930'},
+            {'symbol': '000660'},
+            {'symbol': '035420'},
+        ]
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch.object(
+                ops.dart_fundamentals_capture_service,
+                'active_symbol_loader',
+                return_value=active_symbols,
+            ) as load_active_symbols,
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(),
+            ) as lookup_corp_codes,
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(),
+            ) as sync_disclosures,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+            ) as create_audit_run,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ) as complete_audit_run,
+        ):
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=2,
+                after_stock_code='000660',
+                dry_run=True,
+            )
+            load_active_symbols.return_value = list(reversed(active_symbols))
+            reordered = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=2,
+                after_stock_code='000660',
+                dry_run=True,
+            )
+
+        self.assertEqual(bootstrap_runtime.call_count, 2)
+        lookup_corp_codes.assert_not_awaited()
+        sync_disclosures.assert_not_awaited()
+        create_audit_run.assert_not_called()
+        complete_audit_run.assert_not_called()
+        self.assertEqual(result['status'], 'dry_run')
+        self.assertEqual(result['window_start'], '2025-10-30')
+        self.assertEqual(result['window_end'], '2026-10-30')
+        self.assertEqual(
+            result['requested_stock_codes'],
+            ['000660', '005930', '035420'],
+        )
+        self.assertEqual(result['selected_stock_codes'], ['005930', '035420'])
+        self.assertEqual(result['next_after_stock_code'], '035420')
+        self.assertFalse(result['has_more'])
+        self.assertEqual(result['manifest_hash'], reordered['manifest_hash'])
+        self.assertEqual(
+            result['manifest']['requested_stock_codes'],
+            result['requested_stock_codes'],
+        )
+        self.assertEqual(
+            result['policy_version'],
+            ops.DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
+        )
+        self.assertTrue(
+            result['invariants']['manifest_stock_codes_sorted_unique']
+        )
+
+    def test_backfill_dart_share_issuance_evidence_applies_exact_market_date_window(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(
+                    return_value=self._authoritative_mapping(
+                        resolved=[
+                            {
+                                'stock_code': stock_code,
+                                'corp_code': f'corp-{stock_code}',
+                                'corp_name': stock_code,
+                            }
+                            for stock_code in ('000660', '005930')
+                        ],
+                    )
+                ),
+            ) as lookup_corp_codes,
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(
+                    return_value={
+                        'status': 'completed',
+                        'corporations_processed': 2,
+                        'dilution_positive_events': 1,
+                        'dilution_negative_coverage_rows': 1,
+                    }
+                ),
+            ) as sync_disclosures,
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_current_share_issuance_coverage',
+                return_value=[],
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_latest_share_issuance_positive_event_dates',
+                return_value={
+                    'corp-000660': date(2026, 10, 29),
+                    'corp-005930': date(2026, 10, 30),
+                },
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=901,
+            ) as create_audit_run,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ) as complete_audit_run,
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=2,
+                stock_codes='005930,000660',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=2,
+                stock_codes='000660,005930',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        self.assertEqual(bootstrap_runtime.call_count, 2)
+        self.assertEqual(lookup_corp_codes.await_count, 2)
+        for call in lookup_corp_codes.await_args_list:
+            self.assertEqual(
+                call.kwargs['stock_codes'],
+                ['000660', '005930'],
+            )
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['resolved_corporation_count'], 2)
+        self.assertEqual(
+            result['operator_buckets']['completed']['stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertTrue(
+            result['invariants']['selected_stock_codes_partition_complete']
+        )
+        self.assertEqual(
+            sync_disclosures.await_args.kwargs['start_date'],
+            date(2025, 10, 30),
+        )
+        self.assertEqual(
+            sync_disclosures.await_args.kwargs['end_date'],
+            date(2026, 10, 30),
+        )
+        self.assertEqual(
+            sync_disclosures.await_args.kwargs['trigger'],
+            ops.DART_SHARE_ISSUANCE_BACKFILL_TRIGGER,
+        )
+        self.assertLessEqual(
+            len(sync_disclosures.await_args.kwargs['trigger']),
+            32,
+        )
+        self.assertTrue(result['full_manifest_audit'])
+        self.assertTrue(
+            result['aggregate_audit']['aggregate_evidence_complete']
+        )
+        self.assertEqual(
+            result['aggregate_audit']['classification_counts'],
+            {
+                'completed_positive': 2,
+                'completed_negative': 0,
+                'terminal_not_applicable': 0,
+                'retry_debt': 0,
+            },
+        )
+        self.assertLessEqual(
+            len(create_audit_run.call_args.kwargs['trigger']),
+            32,
+        )
+        complete_audit_run.assert_called_once()
+
+    def test_backfill_dart_share_issuance_evidence_separates_terminal_and_retryable_mapping(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(
+                    return_value=self._authoritative_mapping(
+                        resolved=[
+                            {
+                                'stock_code': '005930',
+                                'corp_code': 'corp-005930',
+                                'corp_name': '005930',
+                            }
+                        ],
+                        unsupported_stock_codes=['000660'],
+                        conflicting_mappings=[
+                            {
+                                'stock_code': '035420',
+                                'corp_codes': [],
+                                'reason': 'temporary lookup failure',
+                            }
+                        ],
+                    )
+                ),
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ) as sync_disclosures,
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_current_share_issuance_coverage',
+                return_value=[],
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_latest_share_issuance_positive_event_dates',
+                return_value={'corp-005930': date(2026, 10, 30)},
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=902,
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ),
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=3,
+                stock_codes='005930,000660,035420',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=3,
+                stock_codes='005930,000660,035420',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['resolved_corporation_count'], 1)
+        self.assertEqual(result['lookup_error_count'], 1)
+        self.assertEqual(
+            result['terminal_not_applicable_stock_codes'],
+            ['000660'],
+        )
+        self.assertFalse(result['full_manifest_audit'])
+        self.assertTrue(result['durable_full_manifest_audit_complete'])
+        self.assertFalse(
+            result['aggregate_audit']['aggregate_evidence_complete']
+        )
+        self.assertEqual(
+            result['aggregate_audit']['classification_stock_codes'][
+                'retry_debt'
+            ],
+            ['035420'],
+        )
+        self.assertEqual(result['retryable_unmapped_stock_codes'], ['035420'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['035420'])
+        self.assertEqual(
+            result['operator_buckets']['terminal_not_applicable']['count'],
+            1,
+        )
+        self.assertEqual(
+            result['operator_buckets']['retryable_unmapped']['count'],
+            1,
+        )
+        self.assertTrue(
+            result['invariants'][
+                'terminal_not_applicable_excluded_from_retry_debt'
+            ]
+        )
+        self.assertEqual(
+            [item['stock_code'] for item in sync_disclosures.await_args.kwargs['corporations']],
+            ['005930'],
+        )
+
+    def test_backfill_dart_share_issuance_evidence_treats_all_terminal_mappings_as_completed_audit(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(
+                    return_value=self._authoritative_mapping(
+                        unsupported_stock_codes=['000660'],
+                    )
+                ),
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(),
+            ) as sync_disclosures,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=903,
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ),
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                stock_codes='000660',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                stock_codes='000660',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        sync_disclosures.assert_not_awaited()
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertEqual(
+            result['terminal_not_applicable_stock_codes'],
+            ['000660'],
+        )
+        self.assertTrue(result['full_manifest_audit'])
+        self.assertTrue(
+            result['aggregate_audit']['aggregate_evidence_complete']
+        )
+
+    def test_backfill_dart_share_issuance_final_page_builds_durable_exact_aggregate_audit(self) -> None:
+        stock_codes = [f'{index:06d}' for index in range(1, 8)]
+
+        async def lookup_mapping(*, stock_codes: list[str]) -> dict:
+            resolved = [
+                {
+                    'stock_code': stock_code,
+                    'corp_code': f'corp-{stock_code}',
+                    'corp_name': stock_code,
+                }
+                for stock_code in stock_codes
+                if stock_code not in {'000003', '000007'}
+            ]
+            return self._authoritative_mapping(
+                resolved=resolved,
+                unsupported_stock_codes=(
+                    ['000003'] if '000003' in stock_codes else []
+                ),
+                conflicting_mappings=(
+                    [
+                        {
+                            'stock_code': '000007',
+                            'reason': 'conflicting_corp_codes',
+                        }
+                    ]
+                    if '000007' in stock_codes
+                    else []
+                ),
+            )
+
+        valid_negative = self._complete_issuance_coverage(
+            stock_code='000002',
+            corp_code='corp-000002',
+        )
+        stale_negative = self._complete_issuance_coverage(
+            stock_code='000004',
+            corp_code='corp-000004',
+            window_end='2026-10-29',
+        )
+        segment_negative = self._complete_issuance_coverage(
+            stock_code='000005',
+            corp_code='corp-000005',
+            status='segment',
+        )
+        malformed_negative = self._complete_issuance_coverage(
+            stock_code='000006',
+            corp_code='corp-000006',
+        )
+        malformed_negative['payload']['evidence_coverage'][
+            'authority_policy_version'
+        ] = 'obsolete-policy'
+
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(side_effect=lookup_mapping),
+            ) as lookup_corp_codes,
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_current_share_issuance_coverage',
+                return_value=[
+                    valid_negative,
+                    stale_negative,
+                    segment_negative,
+                    malformed_negative,
+                ],
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_latest_share_issuance_positive_event_dates',
+                return_value={'corp-000001': date(2026, 10, 30)},
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=904,
+            ) as create_audit_run,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ) as complete_audit_run,
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=4,
+                stock_codes=','.join(stock_codes),
+                dry_run=True,
+            )
+            first_page = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=4,
+                stock_codes=','.join(stock_codes),
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+            self.assertTrue(first_page['has_more'])
+            self.assertIsNone(first_page['aggregate_audit'])
+            create_audit_run.assert_not_called()
+
+            final_page = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                limit=4,
+                stock_codes=','.join(stock_codes),
+                after_stock_code=first_page['next_after_stock_code'],
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        self.assertEqual(lookup_corp_codes.await_count, 3)
+        self.assertEqual(
+            lookup_corp_codes.await_args_list[-1].kwargs['stock_codes'],
+            stock_codes,
+        )
+        aggregate = final_page['aggregate_audit']
+        self.assertEqual(final_page['status'], 'partial')
+        self.assertFalse(final_page['full_manifest_audit'])
+        self.assertTrue(
+            final_page['durable_full_manifest_audit_complete']
+        )
+        self.assertTrue(aggregate['durable_audit_complete'])
+        self.assertFalse(aggregate['aggregate_evidence_complete'])
+        self.assertEqual(
+            aggregate['classification_stock_codes'],
+            {
+                'completed_positive': ['000001'],
+                'completed_negative': ['000002'],
+                'terminal_not_applicable': ['000003'],
+                'retry_debt': ['000004', '000005', '000006', '000007'],
+            },
+        )
+        self.assertEqual(
+            [
+                item['stock_code']
+                for item in aggregate['outcome_manifest']['outcomes']
+            ],
+            stock_codes,
+        )
+        self.assertEqual(
+            aggregate['outcome_manifest_sha256'],
+            ops._canonical_json_sha256(aggregate['outcome_manifest']),
+        )
+        self.assertEqual(
+            create_audit_run.call_args.kwargs['trigger'],
+            ops.DART_SHARE_ISSUANCE_AUDIT_TRIGGER,
+        )
+        self.assertLessEqual(
+            len(create_audit_run.call_args.kwargs['trigger']),
+            32,
+        )
+        complete_audit_run.assert_called_once()
+        completed_metadata = complete_audit_run.call_args.kwargs[
+            'run_metadata'
+        ]['aggregate_audit']
+        self.assertEqual(
+            completed_metadata['outcome_manifest_sha256'],
+            aggregate['outcome_manifest_sha256'],
+        )
+        self.assertTrue(completed_metadata['durable_audit_complete'])
+
+    def test_backfill_dart_share_issuance_aggregate_audit_persistence_failure_is_fail_closed(self) -> None:
+        mapping = self._authoritative_mapping(
+            resolved=[
+                {
+                    'stock_code': '005930',
+                    'corp_code': 'corp-005930',
+                    'corp_name': 'Samsung',
+                }
+            ]
+        )
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service.client,
+                'lookup_corp_codes_for_stocks',
+                new=AsyncMock(return_value=mapping),
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service,
+                'sync_disclosures_for_corporations',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_current_share_issuance_coverage',
+                return_value=[],
+            ),
+            patch.object(
+                ops.dart_signals_service.repository,
+                'list_latest_share_issuance_positive_event_dates',
+                return_value={'corp-005930': date(2026, 10, 30)},
+            ),
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=905,
+            ) as create_audit_run,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+                side_effect=RuntimeError('audit database unavailable'),
+            ) as complete_audit_run,
+        ):
+            reviewed = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                stock_codes='005930',
+                dry_run=True,
+            )
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                stock_codes='005930',
+                expected_manifest_hash=reviewed['manifest_hash'],
+                dry_run=False,
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(result['full_manifest_audit'])
+        self.assertFalse(
+            result['aggregate_audit']['aggregate_evidence_complete']
+        )
+        self.assertFalse(
+            result['aggregate_audit']['durable_audit_complete']
+        )
+        self.assertEqual(
+            result['aggregate_audit']['persistence_status'],
+            'failed',
+        )
+        self.assertIn(
+            'audit database unavailable',
+            result['aggregate_audit']['persistence_error'],
+        )
+        create_audit_run.assert_called_once()
+        complete_audit_run.assert_called_once()
+        self.assertEqual(result['aggregate_audit']['audit_run_id'], 905)
+
+    def test_full_universe_audit_uses_dedicated_activation_trigger(self) -> None:
+        aggregate = {
+            'window_start': '2025-10-30',
+            'window_end': '2026-10-30',
+            'requested_count': 1,
+            'audit_scope': (
+                ops.DART_SHARE_ISSUANCE_AUDIT_SCOPE_GLOBAL_ACTIVATION
+            ),
+            'aggregate_evidence_ready': True,
+        }
+        with (
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'create_sync_run',
+                return_value=906,
+            ) as create_audit_run,
+            patch.object(
+                ops.dart_disclosure_sync_service.repository,
+                'complete_sync_run',
+            ) as complete_audit_run,
+        ):
+            result = ops._persist_dart_share_issuance_aggregate_audit(
+                aggregate
+            )
+
+        self.assertEqual(
+            create_audit_run.call_args.kwargs['trigger'],
+            ops.DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+        )
+        self.assertTrue(result['durable_audit_complete'])
+        self.assertEqual(result['audit_run_id'], 906)
+        complete_audit_run.assert_called_once()
+
+    def test_full_universe_review_manifest_binds_activation_scope(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.dart_fundamentals_capture_service,
+                'active_symbol_loader',
+                return_value=[
+                    {'symbol': '005930'},
+                    {'symbol': '000660'},
+                ],
+            ),
+        ):
+            result = ops.backfill_dart_share_issuance_evidence(
+                market_date='2026-10-30',
+                dry_run=True,
+            )
+
+        self.assertEqual(
+            result['manifest_source'],
+            ops.DART_SHARE_ISSUANCE_MANIFEST_SOURCE_ACTIVE_UNIVERSE,
+        )
+        self.assertEqual(
+            result['audit_scope'],
+            ops.DART_SHARE_ISSUANCE_AUDIT_SCOPE_GLOBAL_ACTIVATION,
+        )
+        self.assertEqual(
+            result['manifest']['manifest_source'],
+            result['manifest_source'],
+        )
+        self.assertEqual(
+            result['manifest']['audit_scope'], result['audit_scope']
+        )
+        self.assertEqual(
+            result['manifest_hash'],
+            ops._canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in result['manifest'].items()
+                    if key not in {'hash_algorithm', 'manifest_hash'}
+                }
+            ),
+        )
+
+    def test_backfill_dart_share_issuance_evidence_requires_exact_reviewed_manifest_before_provider_calls(self) -> None:
+        cases = (
+            (None, 'expected_manifest_hash_required', None),
+            ('0' * 64, 'expected_manifest_hash_mismatch', False),
+        )
+        for expected_hash, expected_reason, expected_invariant in cases:
+            with self.subTest(reason=expected_reason):
+                with (
+                    patch('app.internal.ops.bootstrap_runtime'),
+                    patch.object(
+                        ops.dart_fundamentals_capture_service.client,
+                        'lookup_corp_codes_for_stocks',
+                        new=AsyncMock(),
+                    ) as lookup_corp_codes,
+                    patch.object(
+                        ops.dart_disclosure_sync_service,
+                        'sync_disclosures_for_corporations',
+                        new=AsyncMock(),
+                    ) as sync_disclosures,
+                ):
+                    result = ops.backfill_dart_share_issuance_evidence(
+                        market_date='2026-10-30',
+                        stock_codes='000660,005930',
+                        expected_manifest_hash=expected_hash,
+                        dry_run=False,
+                    )
+
+                lookup_corp_codes.assert_not_awaited()
+                sync_disclosures.assert_not_awaited()
+                self.assertEqual(result['status'], 'blocked')
+                self.assertEqual(result['reason'], expected_reason)
+                self.assertIs(
+                    result['invariants']['manifest_hash_matches_expected'],
+                    expected_invariant,
+                )
 
     def test_cli_dart_audit_signals_backfill_outputs_resume_metadata(self) -> None:
         payload = {
@@ -274,9 +1031,74 @@ class InternalOpsTests(unittest.TestCase):
                 self.assertEqual(exit_code, 2)
                 self.assertEqual(json.loads(stdout.getvalue()), {'status': status})
 
+    def test_cli_dart_share_issuance_evidence_backfill_defaults_to_dry_run(self) -> None:
+        payload = {'status': 'dry_run', 'selected_count': 2}
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.backfill_dart_share_issuance_evidence',
+                return_value=payload,
+            ) as backfill,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'dart-share-issuance-evidence-backfill',
+                    '--market-date',
+                    '2026-10-30',
+                    '--limit',
+                    '2',
+                    '--stock-codes',
+                    '005930,000660',
+                    '--after-stock-code',
+                    '000660',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        backfill.assert_called_once_with(
+            market_date='2026-10-30',
+            limit=2,
+            stock_codes='005930,000660',
+            after_stock_code='000660',
+            expected_manifest_hash=None,
+            dry_run=True,
+        )
+
+    def test_cli_dart_share_issuance_evidence_backfill_returns_nonzero_for_retry_debt(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.backfill_dart_share_issuance_evidence',
+                return_value={'status': 'partial', 'retry_debt_stock_codes': ['000660']},
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'dart-share-issuance-evidence-backfill',
+                    '--market-date',
+                    '2026-10-30',
+                    '--apply',
+                    '--expected-manifest-hash',
+                    'a' * 64,
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+
     def test_run_next_open_execution_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_delegate_execution',
+                return_value=False,
+            ),
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_manage_delegated_authority',
+                return_value=False,
+            ),
             patch(
                 'app.internal.ops.signal_decider_next_open_execution_service.run_market_open_execution_if_due',
                 new=AsyncMock(return_value={'summary': {'triggered': True, 'selected_count': 1}}),
@@ -364,6 +1186,10 @@ class InternalOpsTests(unittest.TestCase):
     def test_run_intraday_auto_sell_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.signal_decider_exec_integration_service.should_delegate_execution',
+                return_value=False,
+            ),
             patch(
                 'app.internal.ops.signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due',
                 new=AsyncMock(return_value={'summary': {'triggered': True, 'selected_count': 1}}),
@@ -688,7 +1514,10 @@ class InternalOpsTests(unittest.TestCase):
             )
 
         bootstrap_runtime.assert_called_once_with()
-        inspect_prerequisites.assert_called_once_with(market_date='2026-04-30')
+        inspect_prerequisites.assert_called_once_with(
+            market_date='2026-04-30',
+            symbols=['005930', '000660'],
+        )
         self.assertEqual(result, {'summary': {'evaluations_upserted': 4}})
         self.assertEqual(compute_evaluations.call_args.kwargs['as_of_market_date'], '2026-04-30')
         self.assertEqual(compute_evaluations.call_args.kwargs['lookback_days'], 21)

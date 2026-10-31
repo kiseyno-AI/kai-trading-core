@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -533,6 +535,179 @@ def _consume_retry_failed_symbols(result: dict[str, Any]) -> list[str]:
     )
 
 
+def _build_exact_scope_outcome(
+    *,
+    selected_symbols: Sequence[str],
+    successful_symbols: Sequence[str],
+    retry_debt_symbols: Sequence[str],
+) -> dict[str, Any]:
+    selected = list(dict.fromkeys(str(value).strip() for value in selected_symbols if str(value).strip()))
+    successful_set = {
+        str(value).strip()
+        for value in successful_symbols
+        if str(value).strip()
+    }
+    retry_debt_set = {
+        str(value).strip()
+        for value in retry_debt_symbols
+        if str(value).strip()
+    }
+    selected_set = set(selected)
+    if successful_set & retry_debt_set:
+        raise ValueError('PyKRX exact scope outcomes overlap')
+    if selected_set != successful_set | retry_debt_set:
+        raise ValueError('PyKRX exact scope outcomes are not exhaustive')
+    return {
+        'scope_outcome_manifest_version': (
+            'pykrx_enrichment_scope_outcomes_v1'
+        ),
+        'selected_stock_codes': selected,
+        'successful_stock_codes': [
+            symbol for symbol in selected if symbol in successful_set
+        ],
+        'retry_debt_stock_codes': [
+            symbol for symbol in selected if symbol in retry_debt_set
+        ],
+        'terminal_not_applicable_stock_codes': [],
+        'scope_outcome_manifest': [
+            {
+                'stock_code': symbol,
+                'outcome': (
+                    'success' if symbol in successful_set else 'retry_debt'
+                ),
+            }
+            for symbol in selected
+        ],
+    }
+
+
+def _build_pykrx_invocation_scope_proof(
+    symbols: Sequence[str],
+) -> dict[str, Any]:
+    normalized = [
+        str(value or '').strip().zfill(6)
+        if str(value or '').strip().isdigit()
+        else str(value or '').strip()
+        for value in symbols
+    ]
+    if (
+        not normalized
+        or any(not value for value in normalized)
+        or len(normalized) != len(set(normalized))
+    ):
+        raise ValueError('PyKRX invocation scope must be nonempty and unique')
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    return {
+        'invocation_scope_manifest_version': (
+            'pykrx_daily_invocation_scope_v1'
+        ),
+        'invocation_scope_stock_codes': normalized,
+        'invocation_scope_count': len(normalized),
+        'invocation_scope_sha256': hashlib.sha256(
+            canonical.encode('utf-8')
+        ).hexdigest(),
+    }
+
+
+def _build_pykrx_enrichment_symbol_scope_outcome(
+    *,
+    selected_symbols: Sequence[str],
+    coverage_categories: dict[str, Any],
+    required_categories: Sequence[str] = (
+        REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES
+    ),
+) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    """Partition enrichment scope using exact per-symbol coverage proof."""
+
+    selected = list(
+        dict.fromkeys(
+            str(value).strip()
+            for value in selected_symbols
+            if str(value).strip()
+        )
+    )
+    selected_set = set(selected)
+    retry_reasons: dict[str, list[str]] = {symbol: [] for symbol in selected}
+
+    for raw_category in required_categories:
+        category = str(raw_category).strip()
+        payload = coverage_categories.get(category)
+        if not isinstance(payload, dict):
+            for symbol in selected:
+                retry_reasons[symbol].append(
+                    f'{category}:missing_exact_coverage_payload'
+                )
+            continue
+
+        raw_expected = payload.get('expected_scope_keys')
+        raw_complete = payload.get('complete_scope_keys')
+        if not isinstance(raw_expected, list) or not isinstance(
+            raw_complete, list
+        ):
+            for symbol in selected:
+                retry_reasons[symbol].append(
+                    f'{category}:missing_exact_scope_identity'
+                )
+            continue
+
+        expected = {
+            str(value).strip()
+            for value in raw_expected
+            if str(value).strip()
+        }
+        complete = {
+            str(value).strip()
+            for value in raw_complete
+            if str(value).strip()
+        }
+        if len(expected) != len(raw_expected) or len(complete) != len(
+            raw_complete
+        ):
+            for symbol in selected:
+                retry_reasons[symbol].append(
+                    f'{category}:malformed_exact_scope_identity'
+                )
+            continue
+        if not complete <= expected:
+            for symbol in selected:
+                retry_reasons[symbol].append(
+                    f'{category}:non_exhaustive_exact_scope_identity'
+                )
+            continue
+
+        # A category may legitimately exclude a symbol from its exact expected
+        # universe (for example, a zero-volume investor-flow scope).  Once a
+        # symbol is expected, complete coverage is mandatory.
+        for symbol in selected_set & expected:
+            if symbol not in complete:
+                retry_reasons[symbol].append(
+                    f'{category}:incomplete_required_coverage'
+                )
+
+    retry_debt_symbols = [
+        symbol for symbol in selected if retry_reasons[symbol]
+    ]
+    successful_symbols = [
+        symbol for symbol in selected if not retry_reasons[symbol]
+    ]
+    return (
+        _build_exact_scope_outcome(
+            selected_symbols=selected,
+            successful_symbols=successful_symbols,
+            retry_debt_symbols=retry_debt_symbols,
+        ),
+        {
+            symbol: reasons
+            for symbol, reasons in retry_reasons.items()
+            if reasons
+        },
+    )
+
+
 def _resolve_result_status(
     result: dict[str, Any],
     *,
@@ -604,12 +779,70 @@ def _is_satisfied_followup_result(
     return daily_pipeline_outcome_is_satisfied(outcome)
 
 
-def _extract_result_counts(result: dict[str, Any], *, default_total: int = 0) -> dict[str, int]:
+def _extract_result_counts(
+    result: dict[str, Any],
+    *,
+    default_total: int = 0,
+    stage_id: str | None = None,
+) -> dict[str, int]:
     def _int(value: Any) -> int:
         try:
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
+
+    if stage_id == 'macro_context_refresh':
+        succeeded = _int(result.get('observations_upserted'))
+        failed = _int(result.get('observations_failed'))
+        total = succeeded + failed
+        return {
+            'processed': total,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+        }
+
+    if stage_id == 'external_news_collect':
+        summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+        total_key = (
+            'eligible_symbol_count'
+            if 'eligible_symbol_count' in summary
+            else 'requested_symbol_count'
+        )
+        succeeded_key = (
+            'collected_symbol_count'
+            if 'collected_symbol_count' in summary
+            else 'matched_symbol_count'
+        )
+        total = _int(summary.get(total_key))
+        succeeded = _int(summary.get(succeeded_key))
+        failed = max(total - succeeded, 0)
+        return {
+            'processed': min(succeeded + failed, total) if total else succeeded + failed,
+            'total': total,
+            'succeeded': succeeded,
+            'failed': failed,
+        }
+
+    if stage_id == 'external_news_enrich':
+        inspected = _int(result.get('items_inspected'))
+        missing_item_ids = result.get('missing_item_ids')
+        remaining = _int(result.get('items_remaining_at_least'))
+        failed_preview_count = (
+            len(set(missing_item_ids))
+            if isinstance(missing_item_ids, list)
+            else 0
+        )
+        failed = max(
+            failed_preview_count,
+            _int(result.get('items_missing_classification')) - remaining,
+        )
+        return {
+            'processed': inspected,
+            'total': inspected + remaining,
+            'succeeded': max(inspected - failed, 0),
+            'failed': min(failed, inspected),
+        }
 
     count_pairs = (
         ('symbols_refreshed', 'symbols_failed'),
@@ -1272,6 +1505,69 @@ def _run_daily_external_news_enrichment_followup(*, market_date: str, enabled: b
     }
 
 
+def _build_macro_provider_coverage(source_statuses: Any) -> dict[str, Any]:
+    if not isinstance(source_statuses, dict) or not source_statuses:
+        return {
+            'status': 'unknown',
+            'provider_count': 0,
+            'available_provider_count': 0,
+            'configured_provider_count': 0,
+            'gap_provider_count': 0,
+            'providers': {},
+        }
+
+    provider_states: dict[str, str] = {}
+    for provider, payload in source_statuses.items():
+        raw_status = (
+            payload.get('status')
+            if isinstance(payload, dict)
+            else payload
+        )
+        status = str(raw_status or 'unknown').strip().lower()
+        if status in {'available', 'ready', 'completed', 'fresh'}:
+            provider_state = 'available'
+        elif status == 'configured':
+            provider_state = 'configured'
+        elif status.startswith('disabled'):
+            provider_state = 'disabled'
+        elif status in {'partial', 'stale', 'degraded'}:
+            provider_state = 'degraded'
+        elif status in {'unavailable', 'failed', 'error', 'missing'}:
+            provider_state = 'unavailable'
+        else:
+            provider_state = 'unknown'
+        provider_states[str(provider)] = provider_state
+
+    available_provider_count = sum(
+        state == 'available' for state in provider_states.values()
+    )
+    gap_provider_count = sum(
+        state in {'disabled', 'degraded', 'unavailable'}
+        for state in provider_states.values()
+    )
+    configured_provider_count = sum(
+        state == 'configured' for state in provider_states.values()
+    )
+    if available_provider_count == len(provider_states):
+        coverage_status = 'complete'
+    elif available_provider_count > 0:
+        coverage_status = 'partial'
+    elif configured_provider_count > 0:
+        coverage_status = 'unknown'
+    elif gap_provider_count > 0:
+        coverage_status = 'unavailable'
+    else:
+        coverage_status = 'unknown'
+    return {
+        'status': coverage_status,
+        'provider_count': len(provider_states),
+        'available_provider_count': available_provider_count,
+        'configured_provider_count': configured_provider_count,
+        'gap_provider_count': gap_provider_count,
+        'providers': provider_states,
+    }
+
+
 def _run_daily_macro_context_followup(*, market_date: str, enabled: bool) -> dict[str, Any]:
     if not enabled:
         return {
@@ -1295,6 +1591,12 @@ def _run_daily_macro_context_followup(*, market_date: str, enabled: bool) -> dic
         'market_date': market_date,
         **result,
         'freshness_gate': freshness_status,
+        'provider_coverage': _build_macro_provider_coverage(
+            context.get('source_statuses')
+            if isinstance(context.get('source_statuses'), dict)
+            and context.get('source_statuses')
+            else result.get('source_statuses')
+        ),
     }
 
 
@@ -1819,6 +2121,9 @@ def run_market_data_pipeline(
 
     latest_trade_date = service.resolve_latest_trade_date(end_date=normalized_end)
     requested_symbol_codes = [item.symbol for item in symbols]
+    invocation_scope_proof = _build_pykrx_invocation_scope_proof(
+        requested_symbol_codes
+    )
     inherited_downstream_symbols = list(
         dict.fromkeys(
             str(symbol).strip()
@@ -1859,6 +2164,7 @@ def run_market_data_pipeline(
         # If a provider outage triggers the bounded early abort, the scheduler
         # can distinguish never-attempted symbols from attempted failures.
         'requested_symbols': requested_symbol_codes,
+        **invocation_scope_proof,
         'failed_symbols': [],
         'failed_symbols_count': 0,
         'unattempted_symbols': unattempted_symbols,
@@ -2689,19 +2995,33 @@ def run_market_data_pipeline(
                 if preflight.get('allowed') and not blocking_failed_categories
                 else 'partial'
             )
+            (
+                exact_scope_outcome,
+                exact_scope_retry_reasons,
+            ) = _build_pykrx_enrichment_symbol_scope_outcome(
+                selected_symbols=requested_symbol_codes,
+                coverage_categories=coverage_categories,
+            )
+            exact_retry_symbols = list(
+                exact_scope_outcome['retry_debt_stock_codes']
+            )
+            if exact_retry_symbols:
+                stage_status = 'partial'
+            pykrx_enrichment_result.update(exact_scope_outcome)
+            pykrx_enrichment_result['exact_scope_retry_reasons'] = (
+                exact_scope_retry_reasons
+            )
+            pykrx_enrichment_result['status'] = stage_status
             enrichment_failed_count = len(blocking_failed_categories)
             if stage_status != 'completed':
                 pykrx_enrichment_error_message = (
                     'PyKRX enrichment incomplete for categories: '
                     + ','.join(blocking_failed_categories)
                     if blocking_failed_categories
-                    else 'PyKRX enrichment did not complete successfully'
+                    else 'PyKRX enrichment has symbol-level coverage debt'
                 )
-                # Category/market failures do not always identify exact symbols.
-                # Preserve a conservative bounded retry scope rather than
-                # silently completing a run that has missing decision inputs.
                 pykrx_enrichment_result['_retry_metadata'] = {
-                    'failed_symbols': list(requested_symbol_codes),
+                    'failed_symbols': exact_retry_symbols,
                 }
             persist_stage_progress(
                 stage='pykrx_enrichment',
@@ -2727,6 +3047,7 @@ def run_market_data_pipeline(
                     'minor_missing_gap_policy': {
                         'max_non_blocking_missing_ratio': MAX_NON_BLOCKING_STAGE_MISSING_RATIO,
                     },
+                    **exact_scope_outcome,
                     'downstream_preflight_status': preflight.get('status'),
                     'downstream_allowed': bool(preflight.get('allowed')),
                     'zero_coverage_categories': preflight.get('zero_coverage_categories'),
@@ -2760,6 +3081,13 @@ def run_market_data_pipeline(
             pykrx_enrichment_result['_retry_metadata'] = {
                 'failed_symbols': list(requested_symbol_codes),
             }
+            pykrx_enrichment_result.update(
+                _build_exact_scope_outcome(
+                    selected_symbols=requested_symbol_codes,
+                    successful_symbols=[],
+                    retry_debt_symbols=requested_symbol_codes,
+                )
+            )
             pykrx_enrichment_error_message = f'PyKRX enrichment collection failed: {exc}'
             persist_stage_progress(
                 stage='pykrx_enrichment',
@@ -3363,6 +3691,16 @@ def run_market_data_pipeline(
             [*price_retry_symbol_codes, *downstream_retry_symbol_codes]
         )
     )
+    price_retry_symbol_set = set(price_retry_symbol_codes)
+    price_scope_outcome = _build_exact_scope_outcome(
+        selected_symbols=requested_symbol_codes,
+        successful_symbols=[
+            stock_code
+            for stock_code in requested_symbol_codes
+            if stock_code not in price_retry_symbol_set
+        ],
+        retry_debt_symbols=price_retry_symbol_codes,
+    )
 
     run_errors: list[str] = []
     if failed_symbols:
@@ -3471,6 +3809,7 @@ def run_market_data_pipeline(
         'turnover_coverage': turnover_coverage,
         'turnover_invalid_symbols': turnover_invalid_symbols[:50],
         'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
+        **price_scope_outcome,
         'price_contexts': price_context_result,
         'pykrx_enrichment': pykrx_enrichment_result,
         'technical_snapshots': technical_snapshot_result,
@@ -3480,6 +3819,7 @@ def run_market_data_pipeline(
         'market_risk_filter': market_risk_filter_result,
         'refresh_universe': effective_refresh_universe,
         'universe_snapshot': universe_snapshot,
+        **invocation_scope_proof,
     }
 
     def record_followup_start(stage_id: str, activity: str) -> None:
@@ -3504,7 +3844,11 @@ def run_market_data_pipeline(
             stage_result,
             stage_id=stage_id,
         )
-        counts = _extract_result_counts(stage_result, default_total=default_total)
+        counts = _extract_result_counts(
+            stage_result,
+            default_total=default_total,
+            stage_id=stage_id,
+        )
         persist_stage_progress(
             stage=stage_id,
             status=stage_status,

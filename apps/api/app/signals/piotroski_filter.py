@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Sequence
 
 from sqlalchemy import and_, case, func, select
 
+from app.dart.service import (
+    build_highlights_from_normalized_items,
+)
+from app.dart.signals_service import (
+    SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION,
+    SHARE_ISSUANCE_LATE_ARRIVAL_POLICY,
+)
 from app.db import session_scope
 from app.db_models import (
     DailyPriceBar,
@@ -15,9 +22,11 @@ from app.db_models import (
     DartDilutionSignal,
     DartDisclosureEvent,
     DartFundamentalsHighlight,
+    DartFundamentalsRow,
     DartFundamentalsSnapshot,
     Symbol,
 )
+from app.eod.finality import validate_finalized_krx_write_date
 from app.market_data_store import (
     load_daily_piotroski_filter_results,
     load_latest_available_daily_piotroski_filter_result_date,
@@ -43,6 +52,24 @@ PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES = (
 )
 LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
 PIOTROSKI_INPUT_QUERY_CHUNK_SIZE = 500
+DILUTION_NEGATIVE_COVERAGE_SCHEMA = 'dart_share_issuance_coverage_v1'
+DILUTION_NEGATIVE_COVERAGE_RULE_VERSION = 'dart_share_issuance_rules_v1'
+DILUTION_EVIDENCE_SIGNAL_TYPES = (
+    'share_issuance',
+    'paid_increase',
+    'convertible_bond',
+    'bond_with_warrant',
+    'exchange_bond',
+)
+DILUTION_NEGATIVE_COVERAGE_SOURCE = 'dart_disclosure_events'
+DILUTION_NEGATIVE_COVERAGE_DAYS = 365
+PIOTROSKI_RAW_FALLBACK_FACT_KEYS = (
+    'total_assets',
+    'current_assets',
+    'current_liabilities',
+    'gross_profit',
+    'revenue',
+)
 
 INDEX_GROSS_MARGIN = 'M211300'
 INDEX_CURRENT_RATIO = 'M221200'
@@ -134,6 +161,89 @@ def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
         seen.add(symbol)
         normalized.append(symbol)
     return normalized
+
+
+def _current_highlight_value(highlight: dict[str, Any] | None) -> Any:
+    if not isinstance(highlight, dict):
+        return None
+    statement_type = str(highlight.get('statement_type') or '').strip().upper()
+    if statement_type in {'IS', 'CIS', 'CF'}:
+        cumulative_amount = highlight.get('current_cumulative_amount')
+        if cumulative_amount is not None:
+            return cumulative_amount
+    current_amount = highlight.get('current_amount')
+    if current_amount is not None:
+        return current_amount
+    return highlight.get('current_cumulative_amount')
+
+
+def _validated_negative_dilution_coverage(
+    payload: Any,
+    *,
+    market_date: date,
+    expected_corp_code: str,
+    row_corp_code: str,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    coverage = payload.get('evidence_coverage')
+    if not isinstance(coverage, dict):
+        return None
+    if coverage.get('schema_version') != DILUTION_NEGATIVE_COVERAGE_SCHEMA:
+        return None
+    if coverage.get('rule_version') != DILUTION_NEGATIVE_COVERAGE_RULE_VERSION:
+        return None
+    if coverage.get('status') != 'complete':
+        return None
+    if coverage.get('source') != DILUTION_NEGATIVE_COVERAGE_SOURCE:
+        return None
+    if coverage.get('pagination_completed') is not True:
+        return None
+    if coverage.get('authoritative_as_of_cutoff') is not True:
+        return None
+    if (
+        coverage.get('authority_policy_version')
+        != SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+    ):
+        return None
+    if (
+        coverage.get('late_arrival_reconciliation')
+        != SHARE_ISSUANCE_LATE_ARRIVAL_POLICY
+    ):
+        return None
+    if not expected_corp_code or row_corp_code != expected_corp_code:
+        return None
+    if coverage.get('corp_code') != expected_corp_code:
+        return None
+    if coverage.get('matched_event_count') != 0:
+        return None
+    try:
+        window_start = date.fromisoformat(str(coverage.get('window_start') or ''))
+        window_end = date.fromisoformat(str(coverage.get('window_end') or ''))
+        scan_completed_at = datetime.fromisoformat(
+            str(coverage.get('scan_completed_at') or '')
+        )
+    except ValueError:
+        return None
+    if scan_completed_at.tzinfo is None:
+        return None
+    try:
+        validate_finalized_krx_write_date(
+            market_date,
+            now=scan_completed_at,
+            operation='DART share issuance negative coverage',
+        )
+    except ValueError:
+        return None
+    if window_end != market_date:
+        return None
+    if window_start > market_date - timedelta(days=DILUTION_NEGATIVE_COVERAGE_DAYS):
+        return None
+    return {
+        **coverage,
+        'window_start': window_start.isoformat(),
+        'window_end': window_end.isoformat(),
+    }
 
 
 def _mapped_float(
@@ -313,6 +423,9 @@ class DailyPiotroskiFilterService:
                 == len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
                 and score >= PIOTROSKI_PASS_SCORE
             )
+            dilution_evidence_available = signals[
+                'no_new_share_issuance'
+            ].available
             is_bottom_momentum = momentum_rank is not None and momentum_rank <= BOTTOM_MOMENTUM_PERCENTILE
             passed_filter = valuation_available and all([
                 is_low_pbr,
@@ -320,6 +433,7 @@ class DailyPiotroskiFilterService:
                 not has_capital_impairment,
                 not has_audit_issue,
                 passes_piotroski_score,
+                dilution_evidence_available,
                 not is_bottom_momentum,
             ])
             payload = {
@@ -352,6 +466,16 @@ class DailyPiotroskiFilterService:
                         ),
                         'financial_signal_coverage': (
                             financial_signal_coverage_status
+                        ),
+                        'dilution': (
+                            'clean'
+                            if dilution_evidence_available
+                            and item.has_dilution_signal is False
+                            else (
+                                'issue'
+                                if item.has_dilution_signal is True
+                                else 'unavailable'
+                            )
                         ),
                     },
                     'signals': {key: {'value': result.value, 'available': result.available} for key, result in signals.items()},
@@ -446,7 +570,28 @@ class DailyPiotroskiFilterService:
                         failed_symbols.append(symbol)
                         failed_symbol_errors.append({'symbol': symbol, 'error': str(exc)})
 
+        evaluated_symbols = {
+            str(payload['symbol']) for payload in result_payloads
+        }
+        selected_scope_symbols = (
+            list(normalized_symbols)
+            if normalized_symbols is not None
+            else sorted(evaluated_symbols)
+        )
+        successful_symbols = sorted(
+            evaluated_symbols - set(failed_symbols)
+        )
+        retry_debt_symbols = sorted(
+            set(selected_scope_symbols) - set(successful_symbols)
+        )
+        scope_status = (
+            'completed'
+            if not retry_debt_symbols
+            else ('partial' if successful_symbols else 'failed')
+        )
+
         return {
+            'status': scope_status,
             'market_date': normalized_market_date.isoformat(),
             'source': FILTER_SOURCE,
             'symbols_evaluated': len(result_payloads),
@@ -462,6 +607,23 @@ class DailyPiotroskiFilterService:
             'results_failed': len(failed_symbols),
             'failed_symbols': failed_symbols,
             'failed_symbol_errors': failed_symbol_errors,
+            'scope_outcome_manifest_version': (
+                'piotroski_scope_outcomes_v1'
+            ),
+            'selected_stock_codes': selected_scope_symbols,
+            'successful_stock_codes': successful_symbols,
+            'retry_debt_stock_codes': retry_debt_symbols,
+            'scope_outcome_manifest': [
+                {
+                    'stock_code': symbol,
+                    'outcome': (
+                        'success'
+                        if symbol in successful_symbols
+                        else 'retry_debt'
+                    ),
+                }
+                for symbol in selected_scope_symbols
+            ],
         }
 
     def inspect(
@@ -651,6 +813,7 @@ class DailyPiotroskiFilterService:
                         DartFundamentalsSnapshot.fs_div.label('fs_div'),
                         DartFundamentalsSnapshot.rcept_no.label('rcept_no'),
                         DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                        DartDisclosureEvent.corp_code.label('corp_code'),
                         DartDisclosureEvent.receipt_date.label('receipt_date'),
                         latest_rank,
                     )
@@ -692,6 +855,8 @@ class DailyPiotroskiFilterService:
                 snapshot_ids = list(snapshot_metadata_by_id)
                 if not snapshot_ids:
                     continue
+                stored_highlights_by_snapshot: dict[int, dict[str, Any]] = {}
+                stored_ratios_by_snapshot: dict[int, dict[str, Any]] = {}
                 highlight_rows = session.execute(
                     select(
                         DartFundamentalsHighlight.snapshot_id.label('snapshot_id'),
@@ -708,24 +873,157 @@ class DailyPiotroskiFilterService:
                     )
                 ).mappings().all()
                 for row in highlight_rows:
-                    metadata = snapshot_metadata_by_id[int(row['snapshot_id'])]
+                    snapshot_id = int(row['snapshot_id'])
+                    metadata = snapshot_metadata_by_id[snapshot_id]
                     symbol = str(metadata['symbol'])
                     business_year = int(metadata['business_year'])
                     current_amount = row['current_amount']
                     if current_amount is None:
                         current_amount = row['current_cumulative_amount']
-                    highlights_by_symbol.setdefault(symbol, {})[(row['metric_key'], business_year)] = current_amount
-                    ratios_by_symbol.setdefault(symbol, {})[(row['metric_key'], business_year)] = row['ratio_value']
+                    stored_highlights_by_snapshot.setdefault(snapshot_id, {})[
+                        str(row['metric_key'])
+                    ] = current_amount
+                    stored_ratios_by_snapshot.setdefault(snapshot_id, {})[
+                        str(row['metric_key'])
+                    ] = row['ratio_value']
+                    highlights_by_symbol.setdefault(symbol, {})[
+                        (row['metric_key'], business_year)
+                    ] = current_amount
+                    ratios_by_symbol.setdefault(symbol, {})[
+                        (row['metric_key'], business_year)
+                    ] = row['ratio_value']
+
+                raw_fallback_snapshot_ids: list[int] = []
+                for snapshot_id in snapshot_ids:
+                    stored_highlights = stored_highlights_by_snapshot.get(snapshot_id, {})
+                    stored_ratios = stored_ratios_by_snapshot.get(snapshot_id, {})
+                    required_raw_fact_missing = any(
+                        stored_highlights.get(metric_key) is None
+                        for metric_key in PIOTROSKI_RAW_FALLBACK_FACT_KEYS
+                    )
+                    current_ratio_missing = all(
+                        stored_ratios.get(metric_key) is None
+                        for metric_key in (CANONICAL_CURRENT_RATIO, INDEX_CURRENT_RATIO)
+                    ) and any(
+                        stored_highlights.get(metric_key) is None
+                        for metric_key in ('current_assets', 'current_liabilities')
+                    )
+                    gross_margin_missing = all(
+                        stored_ratios.get(metric_key) is None
+                        for metric_key in (CANONICAL_GROSS_MARGIN, INDEX_GROSS_MARGIN)
+                    ) and any(
+                        stored_highlights.get(metric_key) is None
+                        for metric_key in ('gross_profit', 'revenue')
+                    )
+                    asset_turnover_missing = all(
+                        stored_ratios.get(metric_key) is None
+                        for metric_key in (
+                            CANONICAL_ASSET_TURNOVER,
+                            INDEX_ASSET_TURNOVER,
+                        )
+                    ) and any(
+                        stored_highlights.get(metric_key) is None
+                        for metric_key in ('revenue', 'total_assets')
+                    )
+                    if (
+                        required_raw_fact_missing
+                        or current_ratio_missing
+                        or gross_margin_missing
+                        or asset_turnover_missing
+                    ):
+                        raw_fallback_snapshot_ids.append(snapshot_id)
+
+                raw_rows_by_snapshot: dict[int, list[dict[str, Any]]] = {}
+                for start in range(
+                    0,
+                    len(raw_fallback_snapshot_ids),
+                    PIOTROSKI_INPUT_QUERY_CHUNK_SIZE,
+                ):
+                    raw_snapshot_chunk = raw_fallback_snapshot_ids[
+                        start:start + PIOTROSKI_INPUT_QUERY_CHUNK_SIZE
+                    ]
+                    raw_rows = session.execute(
+                        select(
+                            DartFundamentalsRow.snapshot_id.label('snapshot_id'),
+                            DartFundamentalsRow.statement_type.label('statement_type'),
+                            DartFundamentalsRow.statement_name.label('statement_name'),
+                            DartFundamentalsRow.account_id.label('account_id'),
+                            DartFundamentalsRow.account_name.label('account_name'),
+                            DartFundamentalsRow.account_detail.label('account_detail'),
+                            DartFundamentalsRow.current_amount.label('current_amount'),
+                            DartFundamentalsRow.current_cumulative_amount.label(
+                                'current_cumulative_amount'
+                            ),
+                            DartFundamentalsRow.prior_amount.label('prior_amount'),
+                            DartFundamentalsRow.prior_cumulative_amount.label(
+                                'prior_cumulative_amount'
+                            ),
+                            DartFundamentalsRow.pre_prior_amount.label(
+                                'pre_prior_amount'
+                            ),
+                            DartFundamentalsRow.row_order.label('order'),
+                            DartFundamentalsRow.currency.label('currency'),
+                        ).where(
+                            DartFundamentalsRow.snapshot_id.in_(raw_snapshot_chunk),
+                        )
+                    ).mappings().all()
+                    for raw_row in raw_rows:
+                        snapshot_id = int(raw_row['snapshot_id'])
+                        raw_rows_by_snapshot.setdefault(snapshot_id, []).append(
+                            dict(raw_row)
+                        )
+
+                raw_fallback_metrics_by_snapshot: dict[int, list[str]] = {}
+                raw_derived_ratios_by_snapshot: dict[int, list[str]] = {}
+                for snapshot_id, raw_rows in raw_rows_by_snapshot.items():
+                    metadata = snapshot_metadata_by_id[snapshot_id]
+                    symbol = str(metadata['symbol'])
+                    business_year = int(metadata['business_year'])
+                    derived_highlights = build_highlights_from_normalized_items(raw_rows)
+                    fallback_metric_names: list[str] = []
+                    for metric_key in PIOTROSKI_RAW_FALLBACK_FACT_KEYS:
+                        mapped_key = (metric_key, business_year)
+                        existing_value = highlights_by_symbol.setdefault(symbol, {}).get(
+                            mapped_key
+                        )
+                        derived_value = _current_highlight_value(
+                            derived_highlights.get(metric_key)
+                        )
+                        if existing_value is None and derived_value is not None:
+                            highlights_by_symbol[symbol][mapped_key] = derived_value
+                            fallback_metric_names.append(metric_key)
+                    derived_ratios = derived_highlights.get('ratios') or {}
+                    derived_ratio_names: list[str] = []
+                    for ratio_key in (CANONICAL_CURRENT_RATIO, CANONICAL_GROSS_MARGIN):
+                        mapped_key = (ratio_key, business_year)
+                        if (
+                            ratios_by_symbol.setdefault(symbol, {}).get(mapped_key)
+                            is not None
+                        ):
+                            continue
+                        derived_ratio = _as_float(derived_ratios.get(ratio_key))
+                        if derived_ratio is not None:
+                            ratios_by_symbol[symbol][mapped_key] = derived_ratio
+                            derived_ratio_names.append(ratio_key)
+                    if fallback_metric_names:
+                        raw_fallback_metrics_by_snapshot[snapshot_id] = sorted(
+                            fallback_metric_names
+                        )
+                    if derived_ratio_names:
+                        raw_derived_ratios_by_snapshot[snapshot_id] = sorted(
+                            derived_ratio_names
+                        )
                 for metadata in snapshot_metadata_by_id.values():
                     symbol = str(metadata['symbol'])
                     business_year = int(metadata['business_year'])
-                    fundamentals_provenance_by_symbol.setdefault(symbol, {})[business_year] = {
+                    provenance = {
                         'snapshot_id': int(metadata['snapshot_id']),
                         'disclosure_event_id': int(metadata['disclosure_event_id']),
                         'business_year': business_year,
                         'report_code': str(metadata['report_code']),
                         'fs_div': str(metadata['fs_div']),
                         'rcept_no': str(metadata['rcept_no']),
+                        'corp_code': str(metadata['corp_code']),
                         'receipt_date': metadata['receipt_date'].isoformat(),
                         'captured_at': (
                             metadata['captured_at'].isoformat()
@@ -733,6 +1031,19 @@ class DailyPiotroskiFilterService:
                             else None
                         ),
                     }
+                    raw_fallback_metrics = raw_fallback_metrics_by_snapshot.get(
+                        int(metadata['snapshot_id'])
+                    )
+                    if raw_fallback_metrics:
+                        provenance['raw_row_fallback_metrics'] = raw_fallback_metrics
+                    raw_derived_ratios = raw_derived_ratios_by_snapshot.get(
+                        int(metadata['snapshot_id'])
+                    )
+                    if raw_derived_ratios:
+                        provenance['raw_row_derived_ratios'] = raw_derived_ratios
+                    fundamentals_provenance_by_symbol.setdefault(symbol, {})[
+                        business_year
+                    ] = provenance
 
             selected_audit_rcept_by_symbol: dict[str, str] = {}
             for symbol, provenance in fundamentals_provenance_by_symbol.items():
@@ -780,41 +1091,116 @@ class DailyPiotroskiFilterService:
 
             latest_dilution: dict[str, Any] = {}
             dilution_provenance_by_symbol: dict[str, dict[str, Any]] = {}
+            current_corp_code_by_symbol = {
+                symbol: str(provenance[max(provenance)]['corp_code'])
+                for symbol, provenance in fundamentals_provenance_by_symbol.items()
+                if provenance
+            }
+            dilution_window_start = market_date - timedelta(
+                days=DILUTION_NEGATIVE_COVERAGE_DAYS
+            )
             for symbol_chunk in _chunks(symbols, PIOTROSKI_INPUT_QUERY_CHUNK_SIZE):
-                latest_rank = func.row_number().over(
-                    partition_by=DartDilutionSignal.stock_code,
-                    order_by=(
-                        DartDilutionSignal.receipt_date.desc(),
-                        DartDilutionSignal.id.desc(),
-                    ),
-                ).label('row_rank')
-                ranked_dilution_signals = (
+                expected_corp_codes = {
+                    current_corp_code_by_symbol[symbol]
+                    for symbol in symbol_chunk
+                    if current_corp_code_by_symbol.get(symbol)
+                }
+                dilution_rows = session.execute(
                     select(
                         DartDilutionSignal.id.label('id'),
                         DartDilutionSignal.stock_code.label('symbol'),
+                        DartDilutionSignal.corp_code.label('corp_code'),
                         DartDilutionSignal.rcept_no.label('rcept_no'),
                         DartDilutionSignal.receipt_date.label('receipt_date'),
                         DartDilutionSignal.has_dilution_signal.label('has_dilution_signal'),
-                        latest_rank,
+                        DartDilutionSignal.payload.label('payload'),
                     )
                     .where(
-                        DartDilutionSignal.stock_code.in_(symbol_chunk),
+                        DartDilutionSignal.corp_code.in_(expected_corp_codes),
+                        DartDilutionSignal.signal_type.in_(
+                            DILUTION_EVIDENCE_SIGNAL_TYPES
+                        ),
                         DartDilutionSignal.receipt_date.is_not(None),
+                        DartDilutionSignal.receipt_date >= dilution_window_start,
                         DartDilutionSignal.receipt_date <= market_date,
                     )
-                    .subquery()
-                )
-                dilution_rows = session.execute(
-                    select(ranked_dilution_signals).where(ranked_dilution_signals.c.row_rank == 1)
+                    .order_by(
+                        DartDilutionSignal.stock_code.asc(),
+                        DartDilutionSignal.receipt_date.desc(),
+                        DartDilutionSignal.id.desc(),
+                    )
                 ).mappings().all()
+                dilution_rows_by_corp: dict[str, list[Any]] = {}
                 for row in dilution_rows:
-                    symbol = str(row['symbol'])
-                    latest_dilution[symbol] = row['has_dilution_signal']
-                    dilution_provenance_by_symbol[symbol] = {
-                        'id': int(row['id']),
-                        'rcept_no': str(row['rcept_no']),
-                        'receipt_date': row['receipt_date'].isoformat(),
+                    dilution_rows_by_corp.setdefault(
+                        str(row['corp_code']), []
+                    ).append(row)
+                for symbol in symbol_chunk:
+                    selected_row: Any | None = None
+                    selected_coverage: dict[str, Any] | None = None
+                    expected_corp_code = current_corp_code_by_symbol.get(symbol, '')
+                    symbol_dilution_rows = dilution_rows_by_corp.get(
+                        expected_corp_code, []
+                    )
+                    positive_rows = [
+                        row
+                        for row in symbol_dilution_rows
+                        if bool(row['has_dilution_signal'])
+                        and str(row['corp_code']) == expected_corp_code
+                    ]
+                    if positive_rows:
+                        selected_row = positive_rows[0]
+                    else:
+                        negative_rows = [
+                            row
+                            for row in symbol_dilution_rows
+                            if not bool(row['has_dilution_signal'])
+                            and str(row['corp_code']) == expected_corp_code
+                        ]
+                        authority_attempt_rows = [
+                            row
+                            for row in negative_rows
+                            if str(row['rcept_no']).startswith('DILATT-')
+                            or (
+                                isinstance(row['payload'], dict)
+                                and row['payload'].get('evidence_semantics')
+                                in {
+                                    'completed_scan_attempt',
+                                    'incomplete_scan_attempt',
+                                }
+                            )
+                        ]
+                        latest_attempt = (
+                            authority_attempt_rows[0]
+                            if authority_attempt_rows
+                            else (negative_rows[0] if negative_rows else None)
+                        )
+                        if latest_attempt is not None:
+                            selected_coverage = _validated_negative_dilution_coverage(
+                                latest_attempt['payload'],
+                                market_date=market_date,
+                                expected_corp_code=expected_corp_code,
+                                row_corp_code=str(latest_attempt['corp_code']),
+                            )
+                            if selected_coverage is not None:
+                                selected_row = latest_attempt
+                    if selected_row is None:
+                        continue
+                    has_dilution_signal = bool(selected_row['has_dilution_signal'])
+                    latest_dilution[symbol] = has_dilution_signal
+                    dilution_provenance = {
+                        'id': int(selected_row['id']),
+                        'rcept_no': str(selected_row['rcept_no']),
+                        'receipt_date': selected_row['receipt_date'].isoformat(),
+                        'evidence_status': (
+                            'positive_event'
+                            if has_dilution_signal
+                            else 'complete_negative_coverage'
+                        ),
                     }
+                    if selected_coverage is not None:
+                        dilution_provenance['evidence_coverage'] = selected_coverage
+                    dilution_provenance_by_symbol[symbol] = dilution_provenance
 
         inputs: list[PiotroskiInputs] = []
         for row in base_rows:

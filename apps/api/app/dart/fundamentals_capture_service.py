@@ -9,7 +9,7 @@ from pathlib import Path
 from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
 from app.core.audit_logging import log_fetch_event
@@ -18,12 +18,17 @@ from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import DailyPriceBar
 from app.dart.fundamentals_store import (
+    CAPTURE_STATUS_CAPTURED,
     CAPTURE_STATUS_MAPPING_FAILED,
     CAPTURE_STATUS_NO_DATA,
     RETRYABLE_CAPTURE_STATUSES,
     TERMINAL_CAPTURE_STATUSES,
     DartFundamentalsRepository,
     dart_fundamentals_repository,
+)
+from app.dart.share_issuance_audit import (
+    DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+    inspect_share_issuance_activation_audit,
 )
 from app.dart.service import (
     FS_DIV_TO_STATEMENT_TYPE,
@@ -56,6 +61,9 @@ UPDATED_ENTRY_CATEGORY_LABELS = {
     UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE: 'Initial fundamentals capture',
     UPDATED_ENTRY_CATEGORY_FINANCIAL_STATEMENT_REFRESH: 'Financial statement refresh',
 }
+FUNDAMENTALS_SCOPE_OUTCOME_MANIFEST_VERSION = (
+    'dart_fundamentals_scope_outcomes_v1'
+)
 
 
 class TerminalFundamentalsCaptureError(RuntimeError):
@@ -86,6 +94,120 @@ def _bounded_missing_probe_codes(
     rotation_start = (market_date.toordinal() * resolved_limit) % len(candidates)
     rotated = candidates[rotation_start:] + candidates[:rotation_start]
     return rotated[:resolved_limit]
+
+
+def _bounded_baseline_repair_codes(
+    candidates: Sequence[str],
+    *,
+    repair_limit: int,
+    after_stock_code: str | None,
+) -> tuple[list[str], str | None]:
+    ordered_candidates = sorted(
+        {
+            str(stock_code or '').strip().zfill(6)
+            for stock_code in candidates
+            if str(stock_code or '').strip()
+        }
+    )
+    if not ordered_candidates or repair_limit <= 0:
+        return [], after_stock_code
+
+    raw_after = str(after_stock_code or '').strip()
+    normalized_after = raw_after.zfill(6) if raw_after else ''
+    start_index = 0
+    if normalized_after:
+        start_index = next(
+            (
+                index
+                for index, stock_code in enumerate(ordered_candidates)
+                if stock_code > normalized_after
+            ),
+            0,
+        )
+    rotated = (
+        ordered_candidates[start_index:]
+        + ordered_candidates[:start_index]
+    )
+    selected = rotated[: min(repair_limit, len(rotated))]
+    return selected, selected[-1] if selected else after_stock_code
+
+
+def _exact_reusable_fundamentals_scope_outcome(
+    run_metadata: dict[str, Any],
+    *,
+    selected_stock_codes: Sequence[str],
+) -> dict[str, Any] | None:
+    raw_outcome = run_metadata.get('fundamentals_scope_outcome')
+    if not isinstance(raw_outcome, dict):
+        return None
+    if (
+        str(raw_outcome.get('scope_outcome_manifest_version') or '')
+        != FUNDAMENTALS_SCOPE_OUTCOME_MANIFEST_VERSION
+    ):
+        return None
+
+    requested_scope = [
+        str(stock_code or '').strip().zfill(6)
+        for stock_code in selected_stock_codes
+        if str(stock_code or '').strip()
+    ]
+    stored_scope = [
+        str(stock_code or '').strip().zfill(6)
+        for stock_code in raw_outcome.get('selected_stock_codes') or []
+        if str(stock_code or '').strip()
+    ]
+    if (
+        stored_scope != requested_scope
+        or len(stored_scope) != len(set(stored_scope))
+    ):
+        return None
+
+    successful = [
+        str(stock_code or '').strip().zfill(6)
+        for stock_code in raw_outcome.get('successful_stock_codes') or []
+        if str(stock_code or '').strip()
+    ]
+    retry_debt = [
+        str(stock_code or '').strip().zfill(6)
+        for stock_code in raw_outcome.get('retry_debt_stock_codes') or []
+        if str(stock_code or '').strip()
+    ]
+    if (
+        len(successful) != len(set(successful))
+        or len(retry_debt) != len(set(retry_debt))
+        or bool(retry_debt)
+        or set(successful) & set(retry_debt)
+        or set(successful) | set(retry_debt) != set(requested_scope)
+    ):
+        return None
+
+    raw_manifest = raw_outcome.get('scope_outcome_manifest')
+    if not isinstance(raw_manifest, list) or len(raw_manifest) != len(
+        requested_scope
+    ):
+        return None
+    manifest_outcomes: dict[str, str] = {}
+    for item in raw_manifest:
+        if not isinstance(item, dict):
+            return None
+        raw_stock_code = str(item.get('stock_code') or '').strip()
+        if not raw_stock_code:
+            return None
+        stock_code = raw_stock_code.zfill(6)
+        outcome = str(item.get('outcome') or '').strip().lower()
+        if (
+            stock_code in manifest_outcomes
+            or outcome not in {'success', 'retry_debt'}
+        ):
+            return None
+        manifest_outcomes[stock_code] = outcome
+    expected_outcomes = {
+        **{stock_code: 'success' for stock_code in successful},
+        **{stock_code: 'retry_debt' for stock_code in retry_debt},
+    }
+    if manifest_outcomes != expected_outcomes:
+        return None
+    return dict(raw_outcome)
 
 
 def _debug_refresh_log(stage: str, **payload: Any) -> None:
@@ -360,6 +482,34 @@ def _parse_decimal(value: str | None) -> Decimal | None:
         return None
 
 
+def _dart_mapping_authority(client: Any) -> dict[str, Any] | None:
+    authority_loader = getattr(client, 'corp_code_mapping_authority', None)
+    if not callable(authority_loader):
+        return None
+    try:
+        authority = authority_loader()
+    except Exception:
+        return None
+    return dict(authority) if isinstance(authority, dict) else None
+
+
+def _non_authoritative_mapping_error(
+    *,
+    stock_code: str,
+    authority: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        'stock_code': stock_code,
+        'error_type': 'DartMappingAuthorityUnavailable',
+        'error': (
+            'DART corporation mapping is non-authoritative; absence cannot '
+            f'be terminalized for stock code {stock_code}'
+        ),
+        'terminal': False,
+        'mapping_authority': authority,
+    }
+
+
 async def resolve_supported_dart_corp_record(
     client: DartClient,
     *,
@@ -371,6 +521,15 @@ async def resolve_supported_dart_corp_record(
     except Exception:
         is_supported = True
     if not is_supported:
+        mapping_authority = _dart_mapping_authority(client)
+        if (
+            mapping_authority is not None
+            and mapping_authority.get('authoritative') is not True
+        ):
+            return None, _non_authoritative_mapping_error(
+                stock_code=normalized_stock_code,
+                authority=mapping_authority,
+            )
         return None, {
             'stock_code': normalized_stock_code,
             'error_type': 'DartLookupUnsupported',
@@ -385,6 +544,15 @@ async def resolve_supported_dart_corp_record(
         error_type = type(exc).__name__
         error_message = str(exc)
         if error_type == 'DartLookupError' and 'Unknown stock_code:' in error_message:
+            mapping_authority = _dart_mapping_authority(client)
+            if (
+                mapping_authority is not None
+                and mapping_authority.get('authoritative') is not True
+            ):
+                return None, _non_authoritative_mapping_error(
+                    stock_code=normalized_stock_code,
+                    authority=mapping_authority,
+                )
             return None, {
                 'stock_code': normalized_stock_code,
                 'error_type': error_type,
@@ -409,6 +577,36 @@ def _load_active_symbols() -> list[dict[str, Any]]:
     return [item for item in load_symbols(is_active=True) if (item.get('symbol') or '').strip().isdigit()]
 
 
+def _normalize_active_universe_stock_codes(
+    active_symbols: Sequence[dict[str, Any]],
+) -> list[str]:
+    normalized: set[str] = set()
+    for item in active_symbols:
+        raw_stock_code = str(item.get('symbol') or '').strip()
+        if (
+            not raw_stock_code
+            or not raw_stock_code.isdigit()
+            or len(raw_stock_code) > 6
+        ):
+            raise ValueError(
+                'active universe contains an invalid stock code'
+            )
+        normalized.add(raw_stock_code.zfill(6))
+    if not normalized:
+        raise ValueError('active universe stock-code manifest is empty')
+    return sorted(normalized)
+
+
+def _load_share_issuance_activation_audit() -> dict[str, Any]:
+    from app.dart.sync_service import dart_disclosure_sync_service
+
+    run = dart_disclosure_sync_service.repository.get_latest_sync_run(
+        trigger=DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+        include_internal_audits=True,
+    )
+    return inspect_share_issuance_activation_audit(run)
+
+
 def _load_daily_price_bar_bounds() -> tuple[date | None, date | None]:
     with session_scope() as session:
         return (
@@ -425,9 +623,11 @@ def _normalize_refresh_date(value: date | str | None, *, default: date) -> date:
     return date.fromisoformat(value)
 
 
-def _parse_optional_iso_date(value: str | None) -> date | None:
+def _parse_optional_iso_date(value: str | date | None) -> date | None:
     if not value:
         return None
+    if isinstance(value, date):
+        return value
     return date.fromisoformat(value)
 
 
@@ -682,12 +882,23 @@ class DartFundamentalsCaptureService:
         signals_service: DartSignalsService | None = None,
         active_symbol_loader: Callable[[], list[dict[str, Any]]] | None = None,
         daily_price_bar_bounds_loader: Callable[[], tuple[date | None, date | None]] | None = None,
+        global_share_issuance_enabled: bool,
+        global_share_issuance_activation_loader: (
+            Callable[[], dict[str, Any]] | None
+        ) = None,
     ) -> None:
         self.client = client or dart_client
         self.repository = repository or dart_fundamentals_repository
         self.signals_service = signals_service or dart_signals_service
         self.active_symbol_loader = active_symbol_loader or _load_active_symbols
         self.daily_price_bar_bounds_loader = daily_price_bar_bounds_loader or _load_daily_price_bar_bounds
+        self.global_share_issuance_enabled = bool(
+            global_share_issuance_enabled
+        )
+        self.global_share_issuance_activation_loader = (
+            global_share_issuance_activation_loader
+            or _load_share_issuance_activation_audit
+        )
         self.event_timeout_seconds = settings.dart_fundamentals_event_timeout_seconds
         self.stale_run_minutes = settings.dart_fundamentals_stale_run_minutes
 
@@ -1278,6 +1489,7 @@ class DartFundamentalsCaptureService:
             start_date=effective_start_date,
             end_date=resolved_end_date,
             trigger='manual_active_universe_backfill',
+            persist_negative_authority=False,
         )
         sync_incomplete_stock_codes = {
             str(stock_code or '').strip()
@@ -1421,6 +1633,769 @@ class DartFundamentalsCaptureService:
         market_date: date | str | None = None,
         symbol_limit: int | None = None,
         symbol_offset: int = 0,
+        symbols: Sequence[str] | None = None,
+        capture_limit: int | None = 500,
+        force: bool = False,
+        fs_div: str | None = None,
+        trigger: str = 'manual_daily_api',
+        retry_cycles: int | None = None,
+        run_piotroski_followup: bool = True,
+        run_feedback_followup: bool | None = None,
+        progress_callback: Callable[..., Any] | None = None,
+    ) -> dict[str, Any]:
+        if not self.global_share_issuance_enabled:
+            return await self._run_daily_incremental_refresh(
+                market_date=market_date,
+                symbol_limit=symbol_limit,
+                symbol_offset=symbol_offset,
+                symbols=symbols,
+                capture_limit=capture_limit,
+                force=force,
+                fs_div=fs_div,
+                trigger=trigger,
+                retry_cycles=retry_cycles,
+                run_piotroski_followup=run_piotroski_followup,
+                run_feedback_followup=run_feedback_followup,
+                progress_callback=progress_callback,
+            )
+
+        resolved_market_date = _normalize_refresh_date(
+            market_date,
+            default=date.today(),
+        )
+        try:
+            activation_audit = (
+                self.global_share_issuance_activation_loader()
+            )
+        except Exception as exc:
+            activation_audit = {
+                'enabled': False,
+                'reasons': ['activation_audit_read_failed'],
+                'error': str(exc),
+                'audit_run_id': None,
+            }
+        if activation_audit.get('enabled') is not True:
+            return {
+                'triggered': False,
+                'status': 'failed',
+                'reason': (
+                    'global_share_issuance_activation_audit_required'
+                ),
+                'market_date': resolved_market_date.isoformat(),
+                'activation_audit': activation_audit,
+                'partial_reasons': [
+                    'global_share_issuance_activation_not_proven'
+                ],
+                'selected_stock_codes': [],
+                'successful_stock_codes': [],
+                'retry_debt_stock_codes': [],
+                'scope_outcome_manifest': [],
+                'scope_outcome_manifest_version': (
+                    'dart_daily_data_scope_outcomes_v1'
+                ),
+            }
+
+        resolved_fs_div = (
+            fs_div or settings.dart_fundamentals_default_fs_div
+        ).strip().upper()
+        active_symbols = self.active_symbol_loader()
+        global_stock_codes = _normalize_active_universe_stock_codes(
+            active_symbols
+        )
+        upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
+        selected_stock_codes = (
+            list(
+                dict.fromkeys(
+                    str(value or '').strip().zfill(6)
+                    for value in symbols
+                    if str(value or '').strip()
+                )
+            )
+            if symbols is not None
+            else list(
+                dict.fromkeys(
+                    str(item.get('symbol') or '').strip().zfill(6)
+                    for item in active_symbols[symbol_offset:upper_bound]
+                    if str(item.get('symbol') or '').strip()
+                )
+            )
+        )
+        mapping_error: str | None = None
+        try:
+            mapping_result = await self.client.lookup_corp_codes_for_stocks(
+                stock_codes=global_stock_codes,
+            )
+        except Exception as exc:
+            mapping_error = str(exc)
+            mapping_result = {
+                'resolved': [],
+                'unsupported_stock_codes': [],
+                'conflicting_mappings': [
+                    {
+                        'stock_code': stock_code,
+                        'corp_codes': [],
+                        'reason': 'corp_mapping_lookup_failed',
+                    }
+                    for stock_code in global_stock_codes
+                ],
+                'error': mapping_error,
+            }
+        try:
+            fundamentals_result = await self._run_daily_incremental_refresh(
+                market_date=market_date,
+                symbol_limit=symbol_limit,
+                symbol_offset=symbol_offset,
+                symbols=symbols,
+                capture_limit=capture_limit,
+                force=force,
+                fs_div=fs_div,
+                trigger=trigger,
+                retry_cycles=retry_cycles,
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            fundamentals_result = {
+                'triggered': True,
+                'status': 'failed',
+                'reason': 'fundamentals_refresh_failed',
+                'error': str(exc),
+                'market_date': resolved_market_date.isoformat(),
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': selected_stock_codes,
+                'successful_stock_codes': [],
+                'retry_debt_stock_codes': selected_stock_codes,
+                'scope_outcome_manifest': [
+                    {
+                        'stock_code': stock_code,
+                        'outcome': 'retry_debt',
+                    }
+                    for stock_code in selected_stock_codes
+                ],
+            }
+        if fundamentals_result.get('reason') == 'already_running':
+            return fundamentals_result
+
+        corporations = list(mapping_result.get('resolved') or [])
+        terminal_not_applicable_stock_codes = sorted(
+            {
+                str(stock_code or '').strip().zfill(6)
+                for stock_code in mapping_result.get(
+                    'unsupported_stock_codes', []
+                )
+                if str(stock_code or '').strip()
+            }
+        )
+        mapping_retry_debt_stock_codes = sorted(
+            {
+                str(item.get('stock_code') or '').strip().zfill(6)
+                for item in mapping_result.get('conflicting_mappings', [])
+                if str(item.get('stock_code') or '').strip()
+            }
+        )
+        from app.dart.sync_service import dart_disclosure_sync_service
+
+        try:
+            issuance_result = (
+                await dart_disclosure_sync_service.sync_global_share_issuance_evidence(
+                    corporations=[
+                        *corporations,
+                        *[
+                            {'stock_code': stock_code, 'corp_code': None}
+                            for stock_code in mapping_retry_debt_stock_codes
+                        ],
+                    ],
+                    end_date=resolved_market_date,
+                    trigger='daily_fundamentals_issuance',
+                )
+            )
+        except Exception as exc:
+            issuance_result = {
+                'run_id': None,
+                'status': 'failed',
+                'scan_status': 'not_started',
+                'reason': 'global_share_issuance_scan_failed_before_run',
+                'error': str(exc),
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': sorted(
+                    set(global_stock_codes)
+                    - set(terminal_not_applicable_stock_codes)
+                ),
+            }
+
+        resolved_by_stock = {
+            str(item.get('stock_code') or '').strip().zfill(6): item
+            for item in corporations
+            if str(item.get('stock_code') or '').strip()
+        }
+        global_scan_completed = (
+            str(issuance_result.get('scan_status') or '').strip().lower()
+            == 'completed'
+        )
+        baseline_repair_candidates = (
+            [
+                stock_code
+                for stock_code in issuance_result.get(
+                    'retry_debt_stock_codes', []
+                )
+                if stock_code in resolved_by_stock
+            ]
+            if global_scan_completed
+            else []
+        )
+        baseline_repair_limit = max(
+            0,
+            int(
+                getattr(
+                    settings,
+                    'dart_fundamentals_daily_missing_symbol_probe_limit',
+                    100,
+                )
+                or 0
+            ),
+        )
+        cursor_run = self.repository.get_latest_refresh_run(
+            fs_div=(
+                fs_div or settings.dart_fundamentals_default_fs_div
+            ).strip().upper(),
+            exclude_run_id=(
+                int(
+                    fundamentals_result.get('run_id')
+                    or dict(
+                        fundamentals_result.get('existing_run') or {}
+                    ).get('id')
+                )
+                if (
+                    fundamentals_result.get('run_id') is not None
+                    or dict(
+                        fundamentals_result.get('existing_run') or {}
+                    ).get('id') is not None
+                )
+                else None
+            ),
+        )
+        cursor_metadata = dict((cursor_run or {}).get('run_metadata') or {})
+        previous_baseline_repair_cursor = str(
+            cursor_metadata.get(
+                'share_issuance_baseline_repair_cursor_after_stock_code'
+            )
+            or ''
+        ).strip() or None
+        (
+            bounded_baseline_repair_codes,
+            next_baseline_repair_cursor,
+        ) = _bounded_baseline_repair_codes(
+            baseline_repair_candidates,
+            repair_limit=baseline_repair_limit,
+            after_stock_code=previous_baseline_repair_cursor,
+        )
+        baseline_repair_result: dict[str, Any] = {
+            'triggered': False,
+            'reason': (
+                'global_scan_incomplete'
+                if not global_scan_completed
+                else 'no_baseline_debt'
+                if not baseline_repair_candidates
+                else 'daily_repair_limit_zero'
+            ),
+            'requested_stock_codes': bounded_baseline_repair_codes,
+            'remaining_debt_count': len(baseline_repair_candidates),
+            'cursor_after_stock_code': next_baseline_repair_cursor,
+            'previous_cursor_after_stock_code': (
+                previous_baseline_repair_cursor
+            ),
+        }
+        if bounded_baseline_repair_codes:
+            try:
+                baseline_repair_result = (
+                    await dart_disclosure_sync_service.sync_disclosures_for_corporations(
+                        corporations=[
+                            resolved_by_stock[stock_code]
+                            for stock_code in bounded_baseline_repair_codes
+                        ],
+                        start_date=resolved_market_date - timedelta(days=365),
+                        end_date=resolved_market_date,
+                        trigger='daily_issuance_baseline',
+                        persist_negative_authority=True,
+                    )
+                )
+            except Exception as exc:
+                baseline_repair_result = {
+                    'triggered': True,
+                    'status': 'failed',
+                    'requested_stock_codes': bounded_baseline_repair_codes,
+                    'successful_stock_codes': [],
+                    'incomplete_stock_codes': bounded_baseline_repair_codes,
+                    'cursor_after_stock_code': next_baseline_repair_cursor,
+                    'previous_cursor_after_stock_code': (
+                        previous_baseline_repair_cursor
+                    ),
+                    'error': str(exc),
+                }
+            else:
+                baseline_repair_result = {
+                    **baseline_repair_result,
+                    'cursor_after_stock_code': next_baseline_repair_cursor,
+                    'previous_cursor_after_stock_code': (
+                        previous_baseline_repair_cursor
+                    ),
+                }
+
+        fundamentals_status = str(
+            fundamentals_result.get('status') or ''
+        ).strip().lower()
+        piotroski_filter_followup = None
+        piotroski_filter_followup_error = None
+        followup_partial_reasons: list[str] = []
+
+        fundamentals_scope = fundamentals_result
+        existing_run = fundamentals_result.get('existing_run')
+        if isinstance(existing_run, dict):
+            existing_metadata = dict(existing_run.get('run_metadata') or {})
+            fundamentals_scope = {
+                **dict(
+                    existing_metadata.get('fundamentals_scope_outcome')
+                    or existing_metadata
+                ),
+                **fundamentals_result,
+            }
+        fundamentals_scope_outcome = {
+            'scope_outcome_manifest_version': str(
+                fundamentals_scope.get('scope_outcome_manifest_version')
+                or 'dart_fundamentals_scope_outcomes_v1'
+            ),
+            'selected_stock_codes': list(
+                fundamentals_scope.get('selected_stock_codes') or []
+            ),
+            'successful_stock_codes': list(
+                fundamentals_scope.get('successful_stock_codes') or []
+            ),
+            'retry_debt_stock_codes': list(
+                fundamentals_scope.get('retry_debt_stock_codes') or []
+            ),
+            'scope_outcome_manifest': list(
+                fundamentals_scope.get('scope_outcome_manifest') or []
+            ),
+        }
+        fundamentals_success = {
+            str(stock_code or '').strip().zfill(6)
+            for stock_code in fundamentals_scope.get(
+                'successful_stock_codes', []
+            )
+            if str(stock_code or '').strip()
+        }
+        issuance_ready = {
+            str(stock_code or '').strip().zfill(6)
+            for key in (
+                'coverage_ready_stock_codes',
+                'decision_ready_positive_stock_codes',
+            )
+            for stock_code in issuance_result.get(key, [])
+            if str(stock_code or '').strip()
+        }
+        issuance_ready.update(
+            str(stock_code or '').strip().zfill(6)
+            for stock_code in baseline_repair_result.get(
+                'successful_stock_codes', []
+            )
+            if str(stock_code or '').strip()
+        )
+        selected_stock_code_set = set(selected_stock_codes)
+        terminal_not_applicable = (
+            set(terminal_not_applicable_stock_codes)
+            & selected_stock_code_set
+        )
+        successful_stock_codes = sorted(
+            fundamentals_success
+            & issuance_ready
+            & set(selected_stock_codes)
+        )
+        retry_debt_stock_codes = sorted(
+            set(selected_stock_codes)
+            - set(successful_stock_codes)
+            - terminal_not_applicable
+        )
+        if mapping_retry_debt_stock_codes:
+            retry_debt_stock_codes = sorted(
+                set(retry_debt_stock_codes)
+                | (
+                    set(mapping_retry_debt_stock_codes)
+                    & selected_stock_code_set
+                )
+            )
+        outcome_by_stock = {
+            stock_code: (
+                'success'
+                if stock_code in successful_stock_codes
+                else (
+                    'terminal_not_applicable'
+                    if stock_code in terminal_not_applicable
+                    else 'retry_debt'
+                )
+            )
+            for stock_code in selected_stock_codes
+        }
+        scope_outcome_manifest = [
+            {
+                'stock_code': stock_code,
+                'outcome': outcome_by_stock[stock_code],
+            }
+            for stock_code in selected_stock_codes
+        ]
+        status = (
+            'completed'
+            if not retry_debt_stock_codes
+            else ('partial' if successful_stock_codes or terminal_not_applicable else 'failed')
+        )
+        partial_reasons = list(fundamentals_result.get('partial_reasons') or [])
+        if retry_debt_stock_codes and 'share_issuance_scope_incomplete' not in partial_reasons:
+            partial_reasons.append('share_issuance_scope_incomplete')
+        for partial_reason in followup_partial_reasons:
+            if partial_reason not in partial_reasons:
+                partial_reasons.append(partial_reason)
+        if followup_partial_reasons and status == 'completed':
+            status = 'partial'
+        combined = {
+            **fundamentals_result,
+            'triggered': bool(
+                fundamentals_result.get('triggered')
+                or issuance_result.get('run_id') is not None
+            ),
+            'status': status,
+            'partial_reasons': partial_reasons,
+            'scope_outcome_manifest_version': 'dart_daily_data_scope_outcomes_v1',
+            'selected_stock_codes': selected_stock_codes,
+            'successful_stock_codes': successful_stock_codes,
+            'retry_debt_stock_codes': retry_debt_stock_codes,
+            'terminal_not_applicable_stock_codes': sorted(
+                terminal_not_applicable
+            ),
+            'terminal_policy_version': (
+                'dart_missing_corp_mapping_not_applicable_v1'
+            ),
+            'scope_outcome_manifest': scope_outcome_manifest,
+            'fundamentals_refresh': fundamentals_result,
+            'share_issuance_global_scan': issuance_result,
+            'share_issuance_baseline_repair': baseline_repair_result,
+            'share_issuance_baseline_repair_cursor_after_stock_code': (
+                next_baseline_repair_cursor
+            ),
+            'share_issuance_mapping': mapping_result,
+            'piotroski_filter': piotroski_filter_followup,
+            'piotroski_filter_error': piotroski_filter_followup_error,
+            'feedback_followup': None,
+            'feedback_followup_error': None,
+        }
+
+        run_id = fundamentals_result.get('run_id')
+        if run_id is None and isinstance(existing_run, dict):
+            run_id = existing_run.get('id')
+        latest_run: dict[str, Any] | None = None
+        durable_metadata: dict[str, Any] | None = None
+        piotroski_followup_pending = bool(
+            fundamentals_status in {'completed', 'partial'}
+            and run_piotroski_followup
+            and successful_stock_codes
+        )
+        if run_id is not None:
+            latest_run = self.repository.get_latest_refresh_run(
+                market_date=resolved_market_date,
+                fs_div=(
+                    fs_div or settings.dart_fundamentals_default_fs_div
+                ).strip().upper(),
+            )
+            latest_run_metadata = dict(
+                (latest_run or {}).get('run_metadata') or {}
+            )
+            fundamentals_core_status = str(
+                fundamentals_result.get('status')
+                or latest_run_metadata.get('fundamentals_core_status')
+                or (
+                    dict(existing_run.get('run_metadata') or {}).get(
+                        'fundamentals_core_status'
+                    )
+                    if isinstance(existing_run, dict)
+                    else None
+                )
+                or (
+                    existing_run.get('status')
+                    if isinstance(existing_run, dict)
+                    else None
+                )
+                or ''
+            ).strip().lower()
+            durable_metadata = {
+                **latest_run_metadata,
+                'fundamentals_core_status': fundamentals_core_status,
+                'fundamentals_scope_outcome': fundamentals_scope_outcome,
+                **{
+                    key: combined[key]
+                    for key in (
+                        'scope_outcome_manifest_version',
+                        'selected_stock_codes',
+                        'successful_stock_codes',
+                        'retry_debt_stock_codes',
+                        'terminal_not_applicable_stock_codes',
+                        'terminal_policy_version',
+                        'scope_outcome_manifest',
+                        'share_issuance_global_scan',
+                        'share_issuance_baseline_repair',
+                        'share_issuance_baseline_repair_cursor_after_stock_code',
+                        'share_issuance_mapping',
+                    )
+                },
+                'compound_status': status,
+                'partial_reasons': partial_reasons,
+                'piotroski_filter_followup': piotroski_filter_followup,
+                'piotroski_filter_followup_error': (
+                    piotroski_filter_followup_error
+                ),
+                'piotroski_filter_followup_state': (
+                    'pending'
+                    if piotroski_followup_pending
+                    else 'not_requested'
+                ),
+                'last_progress_at': _utcnow().isoformat(),
+            }
+            self.repository.complete_refresh_run(
+                int(run_id),
+                status=(
+                    'partial'
+                    if piotroski_followup_pending and status == 'completed'
+                    else status
+                ),
+                symbols_checked=int((latest_run or {}).get('symbols_checked') or 0),
+                symbols_missing=int((latest_run or {}).get('symbols_missing') or 0),
+                symbols_stale=int((latest_run or {}).get('symbols_stale') or 0),
+                symbols_fresh=int((latest_run or {}).get('symbols_fresh') or 0),
+                symbols_refreshed=int((latest_run or {}).get('symbols_refreshed') or 0),
+                symbols_failed=int((latest_run or {}).get('symbols_failed') or 0),
+                events_detected=int((latest_run or {}).get('events_detected') or 0),
+                events_captured=int((latest_run or {}).get('events_captured') or 0),
+                events_failed=int((latest_run or {}).get('events_failed') or 0),
+                run_metadata=durable_metadata,
+            )
+
+        if (
+            fundamentals_status in {'completed', 'partial'}
+            and run_piotroski_followup
+            and successful_stock_codes
+        ):
+            try:
+                piotroski_filter_followup = await asyncio.to_thread(
+                    daily_piotroski_filter_service.rebuild_for_market_date,
+                    market_date=resolved_market_date,
+                    symbols=successful_stock_codes,
+                )
+                if int(
+                    piotroski_filter_followup.get('results_failed') or 0
+                ) > 0:
+                    followup_partial_reasons.append(
+                        'piotroski_filter_persistence_incomplete'
+                    )
+            except Exception as exc:
+                piotroski_filter_followup_error = str(exc)
+                followup_partial_reasons.append(
+                    'piotroski_filter_followup_failed'
+                )
+        elif not run_piotroski_followup:
+            piotroski_filter_followup = {
+                'triggered': False,
+                'reason': 'followup_disabled',
+                'market_date': resolved_market_date.isoformat(),
+            }
+        elif not successful_stock_codes:
+            piotroski_filter_followup = {
+                'triggered': False,
+                'reason': 'no_compound_ready_symbols',
+                'market_date': resolved_market_date.isoformat(),
+            }
+        else:
+            piotroski_filter_followup = {
+                'triggered': False,
+                'reason': 'fundamentals_refresh_incomplete',
+                'market_date': resolved_market_date.isoformat(),
+            }
+
+        for partial_reason in followup_partial_reasons:
+            if partial_reason not in partial_reasons:
+                partial_reasons.append(partial_reason)
+        if followup_partial_reasons and status == 'completed':
+            status = 'partial'
+        combined.update(
+            {
+                'status': status,
+                'partial_reasons': partial_reasons,
+                'piotroski_filter': piotroski_filter_followup,
+                'piotroski_filter_error': piotroski_filter_followup_error,
+            }
+        )
+        if run_id is not None and durable_metadata is not None:
+            durable_metadata = {
+                **durable_metadata,
+                'compound_status': status,
+                'partial_reasons': partial_reasons,
+                'piotroski_filter_followup': piotroski_filter_followup,
+                'piotroski_filter_followup_error': (
+                    piotroski_filter_followup_error
+                ),
+                'piotroski_filter_followup_state': (
+                    'failed'
+                    if piotroski_filter_followup_error
+                    or int(
+                        (piotroski_filter_followup or {}).get(
+                            'results_failed'
+                        )
+                        or 0
+                    )
+                    > 0
+                    else 'completed'
+                    if piotroski_followup_pending
+                    else 'not_requested'
+                ),
+                'last_progress_at': _utcnow().isoformat(),
+            }
+            self.repository.complete_refresh_run(
+                int(run_id),
+                status=status,
+                symbols_checked=int((latest_run or {}).get('symbols_checked') or 0),
+                symbols_missing=int((latest_run or {}).get('symbols_missing') or 0),
+                symbols_stale=int((latest_run or {}).get('symbols_stale') or 0),
+                symbols_fresh=int((latest_run or {}).get('symbols_fresh') or 0),
+                symbols_refreshed=int((latest_run or {}).get('symbols_refreshed') or 0),
+                symbols_failed=int((latest_run or {}).get('symbols_failed') or 0),
+                events_detected=int((latest_run or {}).get('events_detected') or 0),
+                events_captured=int((latest_run or {}).get('events_captured') or 0),
+                events_failed=int((latest_run or {}).get('events_failed') or 0),
+                run_metadata=durable_metadata,
+            )
+
+        feedback_followup = None
+        feedback_followup_error = None
+        feedback_followup_requested = (
+            settings.openclaw_feedback_trigger_after_fundamentals_refresh
+            if run_feedback_followup is None
+            else run_feedback_followup
+        )
+        feedback_symbols = tuple(successful_stock_codes)
+        piotroski_ready = (
+            run_piotroski_followup
+            and piotroski_filter_followup is not None
+            and not piotroski_filter_followup_error
+            and int(piotroski_filter_followup.get('results_failed') or 0) == 0
+            and piotroski_filter_followup.get('reason')
+            not in {
+                'followup_disabled',
+                'no_compound_ready_symbols',
+                'fundamentals_refresh_incomplete',
+            }
+        )
+        compound_scope_persisted = (
+            run_id is not None and durable_metadata is not None
+        )
+        should_trigger_feedback_followup = (
+            feedback_followup_requested
+            and piotroski_ready
+            and bool(feedback_symbols)
+            and compound_scope_persisted
+        )
+        if not feedback_followup_requested:
+            feedback_followup = {
+                'triggered': False,
+                'reason': 'followup_disabled',
+                'market_date': resolved_market_date.isoformat(),
+            }
+        elif not piotroski_ready:
+            feedback_followup = {
+                'triggered': False,
+                'reason': 'piotroski_filter_followup_incomplete',
+                'market_date': resolved_market_date.isoformat(),
+            }
+        elif not feedback_symbols:
+            feedback_followup = {
+                'triggered': False,
+                'reason': 'no_compound_ready_symbols',
+                'market_date': resolved_market_date.isoformat(),
+            }
+        elif not compound_scope_persisted:
+            feedback_followup = {
+                'triggered': False,
+                'reason': 'compound_scope_not_persisted',
+                'market_date': resolved_market_date.isoformat(),
+            }
+        if should_trigger_feedback_followup:
+            prerequisites = (
+                agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                    market_date=resolved_market_date,
+                    fs_div=resolved_fs_div,
+                    symbols=list(feedback_symbols),
+                )
+            )
+            if not prerequisites['ready']:
+                feedback_followup = {
+                    'triggered': False,
+                    'reason': 'feedback_prerequisites_not_ready',
+                    'status': prerequisites['status'],
+                    'market_date': resolved_market_date.isoformat(),
+                    'prerequisites': prerequisites,
+                }
+            else:
+                try:
+                    feedback_followup = await asyncio.to_thread(
+                        agent_feedback_retry_service.run_retry_cycles,
+                        config=FeedbackRetryCycleConfig(
+                            market_date=resolved_market_date,
+                            roles=EXPECTED_ROLES,
+                            symbols=feedback_symbols,
+                            fs_div=resolved_fs_div,
+                            max_cycles=(
+                                settings.openclaw_feedback_retry_max_cycles
+                            ),
+                            outer_batch_size=(
+                                settings.openclaw_feedback_retry_outer_batch_size
+                            ),
+                            reuse_existing=True,
+                        ),
+                    )
+                except Exception as exc:
+                    feedback_followup_error = str(exc)
+
+        combined['feedback_followup'] = feedback_followup
+        combined['feedback_followup_error'] = feedback_followup_error
+        if run_id is not None and durable_metadata is not None:
+            durable_metadata = {
+                **durable_metadata,
+                'feedback_followup': feedback_followup,
+                'feedback_followup_error': feedback_followup_error,
+                'last_progress_at': _utcnow().isoformat(),
+            }
+            self.repository.complete_refresh_run(
+                int(run_id),
+                status=status,
+                symbols_checked=int((latest_run or {}).get('symbols_checked') or 0),
+                symbols_missing=int((latest_run or {}).get('symbols_missing') or 0),
+                symbols_stale=int((latest_run or {}).get('symbols_stale') or 0),
+                symbols_fresh=int((latest_run or {}).get('symbols_fresh') or 0),
+                symbols_refreshed=int((latest_run or {}).get('symbols_refreshed') or 0),
+                symbols_failed=int((latest_run or {}).get('symbols_failed') or 0),
+                events_detected=int((latest_run or {}).get('events_detected') or 0),
+                events_captured=int((latest_run or {}).get('events_captured') or 0),
+                events_failed=int((latest_run or {}).get('events_failed') or 0),
+                run_metadata=durable_metadata,
+            )
+        return combined
+
+    async def _run_daily_incremental_refresh(
+        self,
+        *,
+        market_date: date | str | None = None,
+        symbol_limit: int | None = None,
+        symbol_offset: int = 0,
+        symbols: Sequence[str] | None = None,
         capture_limit: int | None = 500,
         force: bool = False,
         fs_div: str | None = None,
@@ -1442,6 +2417,28 @@ class DartFundamentalsCaptureService:
 
         resolved_market_date = _normalize_refresh_date(market_date, default=date.today())
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
+        active_symbols = self.active_symbol_loader()
+        upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
+        symbol_rows_by_code = {
+            str(symbol.get('symbol') or '').strip().zfill(6): symbol
+            for symbol in active_symbols
+            if (symbol.get('symbol') or '').strip()
+        }
+        selected_stock_codes = (
+            list(
+                dict.fromkeys(
+                    str(value or '').strip().zfill(6)
+                    for value in symbols
+                    if str(value or '').strip()
+                )
+            )
+            if symbols is not None
+            else [
+                (symbol.get('symbol') or '').strip().zfill(6)
+                for symbol in active_symbols[symbol_offset:upper_bound]
+                if (symbol.get('symbol') or '').strip()
+            ]
+        )
         stale_refresh_run_ids = self._fail_stale_refresh_runs(
             error_message='Marked failed after exceeding the stale running threshold before a new daily refresh started'
         )
@@ -1458,28 +2455,39 @@ class DartFundamentalsCaptureService:
                 'existing_run': latest_run,
                 'stale_refresh_run_ids_failed': stale_refresh_run_ids,
             }
-        if latest_run and latest_run['status'] == 'completed' and not force:
+        latest_metadata = (
+            dict(latest_run.get('run_metadata') or {})
+            if latest_run
+            else {}
+        )
+        reusable_scope_outcome = _exact_reusable_fundamentals_scope_outcome(
+            latest_metadata,
+            selected_stock_codes=selected_stock_codes,
+        )
+        if (
+            latest_run
+            and not force
+            and str(
+                latest_metadata.get('fundamentals_core_status')
+                or latest_run.get('status')
+                or ''
+            ).strip().lower()
+            == 'completed'
+            and reusable_scope_outcome is not None
+        ):
             return {
                 'triggered': False,
                 'reason': 'already_completed',
+                'status': 'completed',
                 'market_date': resolved_market_date.isoformat(),
                 'fs_div': resolved_fs_div,
                 'existing_run': latest_run,
+                **reusable_scope_outcome,
                 'stale_refresh_run_ids_failed': stale_refresh_run_ids,
             }
-
-        active_symbols = self.active_symbol_loader()
-        upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
-        selected_symbols = active_symbols[symbol_offset:upper_bound]
-        symbol_rows_by_code = {
-            str(symbol.get('symbol') or '').strip().zfill(6): symbol
-            for symbol in active_symbols
-            if (symbol.get('symbol') or '').strip()
-        }
-        selected_stock_codes = [
-            (symbol.get('symbol') or '').strip().zfill(6)
-            for symbol in selected_symbols
-            if (symbol.get('symbol') or '').strip()
+        selected_symbols = [
+            symbol_rows_by_code.get(stock_code, {'symbol': stock_code})
+            for stock_code in selected_stock_codes
         ]
         if not selected_stock_codes:
             return {
@@ -1582,6 +2590,10 @@ class DartFundamentalsCaptureService:
             'bounded_missing_symbol_probe_count': len(bounded_missing_probe_codes),
             'bounded_missing_symbol_probe_sample': _limited_sample(sorted(bounded_missing_probe_codes)),
             'retry_cycles_requested': resolved_retry_cycles,
+            'scope_outcome_manifest_version': (
+                'dart_fundamentals_scope_outcomes_v1'
+            ),
+            'selected_stock_codes': list(selected_stock_codes),
             'selected_symbols_sample': _limited_sample(selected_stock_codes),
             'stale_refresh_run_ids_failed': stale_refresh_run_ids,
             'last_progress_at': _utcnow().isoformat(),
@@ -1842,6 +2854,7 @@ class DartFundamentalsCaptureService:
                         start_date=check_start_date,
                         end_date=resolved_market_date,
                         trigger='daily_incremental_refresh',
+                        persist_negative_authority=False,
                     )
 
                 update_refresh_progress(
@@ -2187,6 +3200,49 @@ class DartFundamentalsCaptureService:
                         symbol_results[stock_code]['state'] = _terminal_symbol_state(status_value)
                         symbol_results[stock_code]['terminal'] = True
                         symbol_results[stock_code]['error'] = item.get('error')
+
+            remaining_exact_candidates = (
+                self.repository.list_capture_candidates(
+                    limit=None,
+                    force=False,
+                    stock_codes=sync_stock_codes,
+                    receipt_date_to=resolved_market_date,
+                )
+                if sync_stock_codes
+                else []
+            )
+            remaining_exact_candidate_symbols: set[str] = set()
+            resolved_current_event_ids = {
+                int(item['event_id'])
+                for item in capture_result.get('results', [])
+                if (
+                    item.get('event_id') is not None
+                    and item.get('status')
+                    in {
+                        CAPTURE_STATUS_CAPTURED,
+                        *TERMINAL_CAPTURE_STATUSES,
+                    }
+                )
+            }
+            for candidate in remaining_exact_candidates:
+                if (
+                    candidate.get('id') is not None
+                    and int(candidate['id'])
+                    in resolved_current_event_ids
+                ):
+                    continue
+                stock_code = str(candidate.get('stock_code') or '').strip()
+                receipt_date = _parse_optional_iso_date(
+                    candidate.get('receipt_date')
+                )
+                check_start_date = check_start_by_symbol.get(stock_code)
+                if (
+                    stock_code
+                    and check_start_date is not None
+                    and receipt_date is not None
+                    and receipt_date >= check_start_date
+                ):
+                    remaining_exact_candidate_symbols.add(stock_code)
             updated_entries = _build_daily_refresh_updated_entries(
                 capture_results=capture_result.get('results', []),
                 candidate_events_by_id=candidate_events_by_id,
@@ -2213,6 +3269,54 @@ class DartFundamentalsCaptureService:
                 remaining_retryable_events=remaining_candidate_events,
             )
 
+            successful_terminal_states = {
+                'fresh',
+                'terminal_no_newer_events',
+                'missing_no_newer_events',
+                'terminal_no_data',
+                'terminal_mapping_failed',
+                'terminal_resolved',
+            }
+            exact_retry_debt_symbols = (
+                set(failed_symbols)
+                | set(sync_failed_symbols)
+                | set(lookup_failed_symbols)
+                | remaining_exact_candidate_symbols
+            )
+            successful_stock_codes = {
+                stock_code
+                for stock_code in selected_stock_codes
+                if (
+                    stock_code in refreshed_symbols
+                    or str(
+                        (symbol_results.get(stock_code) or {}).get('state') or ''
+                    )
+                    in successful_terminal_states
+                )
+                and stock_code not in exact_retry_debt_symbols
+            }
+            unresolved_stock_codes = (
+                set(selected_stock_codes)
+                - successful_stock_codes
+                - exact_retry_debt_symbols
+            )
+            exact_retry_debt_symbols.update(unresolved_stock_codes)
+            outcome_manifest = [
+                {
+                    'stock_code': stock_code,
+                    'state': str(
+                        (symbol_results.get(stock_code) or {}).get('state')
+                        or 'unresolved'
+                    ),
+                    'outcome': (
+                        'success'
+                        if stock_code in successful_stock_codes
+                        else 'retry_debt'
+                    ),
+                }
+                for stock_code in selected_stock_codes
+            ]
+
             partial_reasons: list[str] = []
             if sync_incomplete:
                 partial_reasons.append('sync_failures')
@@ -2222,6 +3326,8 @@ class DartFundamentalsCaptureService:
                 partial_reasons.append('event_failures')
             if remaining_candidate_events:
                 partial_reasons.append('remaining_retryable_events')
+            if exact_retry_debt_symbols:
+                partial_reasons.append('scope_retry_debt')
 
             all_sync_groups_failed = bool(sync_results) and all(
                 item.get('status') == 'failed' for item in sync_results
@@ -2230,9 +3336,16 @@ class DartFundamentalsCaptureService:
                 bool(selected_stock_codes)
                 and lookup_failed_symbols == set(selected_stock_codes)
             )
+            all_selected_symbols_are_debt = bool(
+                selected_stock_codes
+            ) and not successful_stock_codes
             status = (
                 'failed'
-                if all_sync_groups_failed or all_selected_lookups_failed
+                if (
+                    all_sync_groups_failed
+                    or all_selected_lookups_failed
+                    or all_selected_symbols_are_debt
+                )
                 else ('partial' if partial_reasons else 'completed')
             )
 
@@ -2243,6 +3356,7 @@ class DartFundamentalsCaptureService:
                     piotroski_filter_followup = await asyncio.to_thread(
                         daily_piotroski_filter_service.rebuild_for_market_date,
                         market_date=resolved_market_date,
+                        symbols=sorted(successful_stock_codes),
                     )
                     if int(piotroski_filter_followup.get('results_failed') or 0) > 0:
                         partial_reasons.append('piotroski_filter_persistence_incomplete')
@@ -2296,6 +3410,26 @@ class DartFundamentalsCaptureService:
                     [symbol_results[stock_code] for stock_code in sorted(symbol_results)],
                     limit=100,
                 ),
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': list(selected_stock_codes),
+                'successful_stock_codes': sorted(successful_stock_codes),
+                'retry_debt_stock_codes': sorted(exact_retry_debt_symbols),
+                'scope_outcome_manifest': outcome_manifest,
+                'fundamentals_scope_outcome': {
+                    'scope_outcome_manifest_version': (
+                        FUNDAMENTALS_SCOPE_OUTCOME_MANIFEST_VERSION
+                    ),
+                    'selected_stock_codes': list(selected_stock_codes),
+                    'successful_stock_codes': sorted(
+                        successful_stock_codes
+                    ),
+                    'retry_debt_stock_codes': sorted(
+                        exact_retry_debt_symbols
+                    ),
+                    'scope_outcome_manifest': outcome_manifest,
+                },
                 'remaining_candidate_events': remaining_candidate_events,
                 'over_limit_event_count': len(over_limit_event_ids),
                 'over_limit_event_ids_sample': _limited_sample(over_limit_event_ids, limit=100),
@@ -2419,6 +3553,13 @@ class DartFundamentalsCaptureService:
                 'events_captured': events_captured,
                 'events_failed': events_failed,
                 'partial_reasons': partial_reasons,
+                'scope_outcome_manifest_version': (
+                    'dart_fundamentals_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': list(selected_stock_codes),
+                'successful_stock_codes': sorted(successful_stock_codes),
+                'retry_debt_stock_codes': sorted(exact_retry_debt_symbols),
+                'scope_outcome_manifest': outcome_manifest,
                 'stale_refresh_run_ids_failed': stale_refresh_run_ids,
                 'sync': {
                     'run_count': len(sync_results),
@@ -2548,4 +3689,8 @@ class DartFundamentalsCaptureService:
         }
 
 
-dart_fundamentals_capture_service = DartFundamentalsCaptureService()
+dart_fundamentals_capture_service = DartFundamentalsCaptureService(
+    global_share_issuance_enabled=(
+        settings.dart_global_share_issuance_enabled
+    ),
+)

@@ -19,6 +19,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
     resolve_agent_feedback_scope,
+    split_requested_symbols_by_agent_feedback_eligibility,
 )
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
@@ -361,12 +362,14 @@ def _inspect_feedback_prerequisites(
     market_date: date,
     fs_div: str | None = None,
     force: bool = False,
+    symbols: list[str] | None = None,
 ) -> dict[str, Any] | None:
     if force:
         return None
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
         fs_div=fs_div,
+        symbols=symbols,
     )
     return None if prerequisites['ready'] else prerequisites
 
@@ -887,14 +890,21 @@ async def dispatch_symbol_agent_feedback(
 
         requested_roles = list(payload.roles or EXPECTED_ROLES)
         requested_symbols = list(dict.fromkeys(payload.symbols))
+        dispatch_symbols, skipped_symbols = (
+            split_requested_symbols_by_agent_feedback_eligibility(
+                market_date=payload.market_date,
+                requested_symbols=requested_symbols,
+            )
+        )
         prerequisites = _inspect_feedback_prerequisites(
             market_date=payload.market_date,
             fs_div=payload.fs_div,
             force=payload.force,
+            symbols=dispatch_symbols,
         )
         request_payload = {
             'market_date': payload.market_date.isoformat(),
-            'symbols': requested_symbols,
+            'symbols': dispatch_symbols,
             'requested_symbols': requested_symbols,
             'request_run_id': None,
             'roles': requested_roles,
@@ -913,6 +923,7 @@ async def dispatch_symbol_agent_feedback(
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+            'skipped_symbols': skipped_symbols,
             'wait_for_completion': False,
         }
         if prerequisites is not None:
@@ -1209,28 +1220,37 @@ async def list_agent_feedback_session_cleanup(
 @router.post('/feedback/dispatch/subagent-experiment')
 async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExperimentRequest, background_tasks: BackgroundTasks) -> dict:
     try:
-        prerequisites = _inspect_feedback_prerequisites(
-            market_date=payload.market_date,
-            fs_div=payload.fs_div,
-            force=payload.force,
-        )
-        if prerequisites is not None:
-            return _build_feedback_gate_response(
-                request_payload={
-                    'market_date': payload.market_date.isoformat(),
-                    'symbols': payload.symbols,
-                    'requested_symbols': payload.symbols,
-                    'request_run_id': None,
-                    'roles': payload.roles or EXPECTED_ROLES,
-                    'fs_div': payload.fs_div,
-                    'disclosures_limit': payload.disclosures_limit,
-                    'per_role_parallelism': payload.per_role_parallelism,
-                    'mode': 'subagent_experiment',
-                    'wait_for_completion': payload.wait_for_completion,
-                },
-                prerequisites=prerequisites,
-            )
         if not payload.wait_for_completion:
+            requested_symbols = list(dict.fromkeys(payload.symbols))
+            dispatch_symbols, skipped_symbols = (
+                split_requested_symbols_by_agent_feedback_eligibility(
+                    market_date=payload.market_date,
+                    requested_symbols=requested_symbols,
+                )
+            )
+            prerequisites = _inspect_feedback_prerequisites(
+                market_date=payload.market_date,
+                fs_div=payload.fs_div,
+                force=payload.force,
+                symbols=dispatch_symbols,
+            )
+            if prerequisites is not None:
+                return _build_feedback_gate_response(
+                    request_payload={
+                        'market_date': payload.market_date.isoformat(),
+                        'symbols': dispatch_symbols,
+                        'requested_symbols': requested_symbols,
+                        'request_run_id': None,
+                        'roles': payload.roles or EXPECTED_ROLES,
+                        'fs_div': payload.fs_div,
+                        'disclosures_limit': payload.disclosures_limit,
+                        'per_role_parallelism': payload.per_role_parallelism,
+                        'skipped_symbols': skipped_symbols,
+                        'mode': 'subagent_experiment',
+                        'wait_for_completion': False,
+                    },
+                    prerequisites=prerequisites,
+                )
             request_run_id = f'subagent-symbol-run-{payload.market_date.isoformat()}-api-{payload.per_role_parallelism}x{len(payload.symbols)}'
 
             def _run_background_subagent_dispatch() -> None:
@@ -1242,6 +1262,7 @@ async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExp
                         fs_div=payload.fs_div,
                         disclosures_limit=payload.disclosures_limit,
                         per_role_parallelism=payload.per_role_parallelism,
+                        force=payload.force,
                     )
                     logger.info(
                         'Subagent experiment background dispatch finished',
@@ -1291,6 +1312,7 @@ async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExp
             fs_div=payload.fs_div,
             disclosures_limit=payload.disclosures_limit,
             per_role_parallelism=payload.per_role_parallelism,
+            force=payload.force,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1619,6 +1641,7 @@ async def compute_decider_post_decision_evaluations(payload: DeciderEvaluationCo
         prerequisites = _inspect_feedback_prerequisites(
             market_date=payload.market_date_to,
             force=payload.force_recompute,
+            symbols=payload.symbols,
         )
         if prerequisites is not None:
             request_payload = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()
@@ -1911,6 +1934,7 @@ async def compute_signal_decider_evaluations(payload: SignalDeciderEvaluationCom
         prerequisites = _inspect_feedback_prerequisites(
             market_date=payload.market_date_to,
             force=payload.force_recompute,
+            symbols=payload.symbols,
         )
         if prerequisites is not None:
             request_payload = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()

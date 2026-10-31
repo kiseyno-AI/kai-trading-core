@@ -79,10 +79,36 @@ TOTAL_LIABILITIES_MATCHER = {
     'account_ids': {'ifrs-full_Liabilities', 'ifrs_Liabilities'},
     'account_names': {'부채총계', 'Liabilities'},
 }
+TOTAL_ASSETS_MATCHER = {
+    'statement_types': {'BS'},
+    'account_ids': {'ifrs-full_Assets', 'ifrs_Assets'},
+    'account_names': {'자산총계', 'Assets'},
+}
 TOTAL_EQUITY_MATCHER = {
     'statement_types': {'BS'},
     'account_ids': {'ifrs-full_Equity', 'ifrs_Equity'},
     'account_names': {'자본총계', 'Equity'},
+}
+NET_INCOME_MATCHER = {
+    'statement_types': {'IS', 'CIS'},
+    'account_ids': {
+        'ifrs-full_ProfitLoss',
+        'ifrs_ProfitLoss',
+        'ifrs-full_ProfitLossAttributableToOwnersOfParent',
+    },
+    'account_names': {
+        '당기순이익',
+        '당기순손실',
+        '분기순이익',
+        '반기순이익',
+        'Profit (loss)',
+        '당기순이익(손실)',
+    },
+}
+GROSS_PROFIT_MATCHER = {
+    'statement_types': {'IS', 'CIS'},
+    'account_ids': {'ifrs-full_GrossProfit', 'ifrs_GrossProfit'},
+    'account_names': {'매출총이익', '매출총손실', 'Gross profit'},
 }
 OPERATING_INCOME_MATCHER = {
     'statement_types': {'IS', 'CIS'},
@@ -126,6 +152,7 @@ CAPEX_PPE_MATCHER = {
     'account_ids': {
         'ifrs-full_PurchaseOfPropertyPlantAndEquipment',
         'ifrs-full_AcquisitionOfPropertyPlantAndEquipment',
+        'ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
     },
     'account_names': {
         '유형자산의 취득',
@@ -149,6 +176,7 @@ CAPEX_INTANGIBLE_MATCHER = {
     'account_ids': {
         'ifrs-full_PurchaseOfIntangibleAssets',
         'ifrs-full_AcquisitionOfIntangibleAssetsOtherThanGoodwill',
+        'ifrs-full_PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities',
     },
     'account_names': {
         '무형자산의 취득',
@@ -185,7 +213,10 @@ DEPRECIATION_AND_AMORTIZATION_MATCHER = {
 }
 DEPRECIATION_MATCHER = {
     'statement_types': {'CF', 'IS', 'CIS'},
-    'account_ids': set(),
+    'account_ids': {
+        'ifrs-full_AdjustmentsForDepreciationExpense',
+        'ifrs-full_DepreciationExpense',
+    },
     'account_names': {
         '감가상각비',
         'Depreciation',
@@ -202,7 +233,12 @@ DEPRECIATION_MATCHER = {
 }
 AMORTIZATION_MATCHER = {
     'statement_types': {'CF', 'IS', 'CIS'},
-    'account_ids': set(),
+    'account_ids': {
+        'ifrs-full_AdjustmentsForAmortisationExpense',
+        'ifrs-full_AdjustmentsForAmortizationExpense',
+        'ifrs-full_AmortisationExpense',
+        'ifrs-full_AmortizationExpense',
+    },
     'account_names': {
         '상각비',
         '무형자산상각비',
@@ -223,7 +259,10 @@ AMORTIZATION_MATCHER = {
 
 FUNDAMENTALS_FALLBACK_MATCHERS = (
     TOTAL_LIABILITIES_MATCHER,
+    TOTAL_ASSETS_MATCHER,
     TOTAL_EQUITY_MATCHER,
+    NET_INCOME_MATCHER,
+    GROSS_PROFIT_MATCHER,
     OPERATING_INCOME_MATCHER,
     OPERATING_CASH_FLOW_MATCHER,
     CASH_AND_CASH_EQUIVALENTS_MATCHER,
@@ -233,7 +272,6 @@ FUNDAMENTALS_FALLBACK_MATCHERS = (
     DEPRECIATION_MATCHER,
     AMORTIZATION_MATCHER,
 )
-
 
 def _round(value: float | None, digits: int = 6) -> float | None:
     if value is None:
@@ -265,7 +303,11 @@ def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
 def _matcher_values(key: str) -> set[str]:
     values: set[str] = set()
     for matcher in FUNDAMENTALS_FALLBACK_MATCHERS:
-        values.update(str(value).strip() for value in matcher.get(key, set()) if str(value or '').strip())
+        values.update(
+            str(value).strip()
+            for value in matcher.get(key, set())
+            if str(value or '').strip()
+        )
     return values
 
 
@@ -455,10 +497,19 @@ def _match_score(
     return (score, row_bias, current_amount_present, cumulative_amount_present, 0)
 
 
-def _find_statement_row(rows: Sequence[dict[str, Any]], matcher: dict[str, Any]) -> dict[str, Any] | None:
+def _find_statement_row(
+    rows: Sequence[dict[str, Any]],
+    matcher: dict[str, Any],
+    *,
+    flow: bool,
+) -> dict[str, Any] | None:
     best_row: dict[str, Any] | None = None
     best_score: tuple[int, int, int, int, int] | None = None
     for row in rows:
+        if row.get('current_amount') is None and not (
+            flow and row.get('current_cumulative_amount') is not None
+        ):
+            continue
         score = _match_score(row, matcher=matcher)
         if score is None:
             continue
@@ -479,7 +530,7 @@ def _extract_metric_with_fallback(
     value, amount_field = _highlight_amount(highlight_row, flow=flow, absolute=absolute)
     if value is not None:
         return value, _build_source_metadata(source_type='highlight', row=highlight_row, amount_field=amount_field)
-    matched_row = _find_statement_row(rows, matcher)
+    matched_row = _find_statement_row(rows, matcher, flow=flow)
     value, amount_field = _statement_amount(matched_row, flow=flow, absolute=absolute)
     return value, _build_source_metadata(source_type='statement_row', row=matched_row, amount_field=amount_field)
 
@@ -528,6 +579,24 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         matcher=TOTAL_LIABILITIES_MATCHER,
         flow=False,
     )
+    total_assets, total_assets_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('total_assets'),
+        rows=rows,
+        matcher=TOTAL_ASSETS_MATCHER,
+        flow=False,
+    )
+    net_income, net_income_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('net_income'),
+        rows=rows,
+        matcher=NET_INCOME_MATCHER,
+        flow=True,
+    )
+    gross_profit, gross_profit_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('gross_profit'),
+        rows=rows,
+        matcher=GROSS_PROFIT_MATCHER,
+        flow=True,
+    )
     operating_income, operating_income_source = _extract_metric_with_fallback(
         highlight_row=highlights.get('operating_income'),
         rows=rows,
@@ -548,9 +617,13 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         flow=False,
     )
 
-    capex_ppe_row = _find_statement_row(rows, CAPEX_PPE_MATCHER)
+    capex_ppe_row = _find_statement_row(rows, CAPEX_PPE_MATCHER, flow=True)
     capex_ppe, capex_ppe_amount_field = _statement_amount(capex_ppe_row, flow=True, absolute=True)
-    capex_intangible_row = _find_statement_row(rows, CAPEX_INTANGIBLE_MATCHER)
+    capex_intangible_row = _find_statement_row(
+        rows,
+        CAPEX_INTANGIBLE_MATCHER,
+        flow=True,
+    )
     capex_intangible, capex_intangible_amount_field = _statement_amount(
         capex_intangible_row,
         flow=True,
@@ -561,7 +634,11 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         _round(sum(capital_expenditure_components), 4) if capital_expenditure_components else None
     )
 
-    depreciation_and_amortization_row = _find_statement_row(rows, DEPRECIATION_AND_AMORTIZATION_MATCHER)
+    depreciation_and_amortization_row = _find_statement_row(
+        rows,
+        DEPRECIATION_AND_AMORTIZATION_MATCHER,
+        flow=True,
+    )
     depreciation_row = None
     amortization_row = None
     depreciation = None
@@ -576,9 +653,17 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
             absolute=True,
         )
     else:
-        depreciation_row = _find_statement_row(rows, DEPRECIATION_MATCHER)
+        depreciation_row = _find_statement_row(
+            rows,
+            DEPRECIATION_MATCHER,
+            flow=True,
+        )
         depreciation, depreciation_amount_field = _statement_amount(depreciation_row, flow=True, absolute=True)
-        amortization_row = _find_statement_row(rows, AMORTIZATION_MATCHER)
+        amortization_row = _find_statement_row(
+            rows,
+            AMORTIZATION_MATCHER,
+            flow=True,
+        )
         amortization, amortization_amount_field = _statement_amount(amortization_row, flow=True, absolute=True)
         if depreciation is None and amortization is None:
             depreciation_and_amortization = None
@@ -588,6 +673,9 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
     return {
         'total_equity': total_equity,
         'total_liabilities': total_liabilities,
+        'total_assets': total_assets,
+        'net_income': net_income,
+        'gross_profit': gross_profit,
         'operating_income': operating_income,
         'operating_cash_flow': operating_cash_flow,
         'cash_and_cash_equivalents': cash_and_cash_equivalents,
@@ -609,6 +697,9 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
             'matched_inputs': {
                 'total_equity': total_equity_source,
                 'total_liabilities': total_liabilities_source,
+                'total_assets': total_assets_source,
+                'net_income': net_income_source,
+                'gross_profit': gross_profit_source,
                 'operating_income': operating_income_source,
                 'operating_cash_flow': operating_cash_flow_source,
                 'cash_and_cash_equivalents': cash_and_cash_equivalents_source,

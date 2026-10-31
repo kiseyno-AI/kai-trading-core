@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -173,6 +175,15 @@ DEFAULT_FEEDBACK_MAX_CYCLES = 3
 DEFAULT_FEEDBACK_OUTER_BATCH_SIZE = 20
 FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS = 60.0
 DAILY_PIPELINE_FINALIZATION_ATTEMPTS = 3
+EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS = {
+    'dart_daily_data_scope_outcomes_v1',
+    'dart_fundamentals_scope_outcomes_v1',
+    'piotroski_scope_outcomes_v1',
+    'pykrx_enrichment_scope_outcomes_v1',
+}
+PYKRX_INVOCATION_SCOPE_MANIFEST_VERSION = (
+    'pykrx_daily_invocation_scope_v1'
+)
 CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
     *FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
     'signal_features',
@@ -357,6 +368,7 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         depends_on=('fundamentals_daily_refresh', 'pykrx_enrichment'),
         inspect_routes=('/eod/piotroski-filter-results',),
         output_tables=('daily_piotroski_filter_results',),
+        supports_symbols=True,
         default_selected=True,
     ),
     'momentum_factors': DailyStageDefinition(
@@ -1032,6 +1044,7 @@ class DailyPipelineStageService:
                 agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                     market_date=resolved_market_date,
                     fs_div=resolved_fs_div,
+                    symbols=resolved_symbols,
                     required_stage_ids=(
                         persisted_feedback_prerequisite_stage_ids
                     ),
@@ -1070,6 +1083,7 @@ class DailyPipelineStageService:
                 }
 
         stage_outcomes: dict[str, dict[str, Any]] = {}
+        stage_invocation_symbols: dict[str, list[str] | None] = {}
         handled: set[str] = set()
         if (
             existing_pipeline_run_id is not None
@@ -1713,8 +1727,18 @@ class DailyPipelineStageService:
                     error_message=str(exc),
                 )
                 raise
+            pykrx_invocation_symbols = (
+                list(resolved_symbols)
+                if resolved_symbols is not None
+                else self._validated_pykrx_invocation_scope(pykrx_result)
+            )
             for stage_id in pykrx_requested:
                 stage_result = self._extract_pykrx_stage_result(stage_id, pykrx_result)
+                stage_invocation_symbols[stage_id] = (
+                    list(pykrx_invocation_symbols)
+                    if pykrx_invocation_symbols is not None
+                    else None
+                )
                 stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
                 self._finish_tracked_stage(
                     pipeline_run_id=pipeline_run_id,
@@ -1816,19 +1840,10 @@ class DailyPipelineStageService:
                 stage_symbols = list(
                     feedback_cutoff_resolution['requested_symbols']
                 )
-            try:
-                self._start_tracked_stage(
-                    pipeline_run_id=pipeline_run_id,
-                    stage_id=stage_id,
-                    market_date=resolved_market_date,
-                    symbols=stage_symbols,
-                )
-            except Exception as exc:
-                self._finish_run_after_stage_start_failure(
-                    pipeline_run_id=pipeline_run_id,
-                    error_message=str(exc),
-                )
-                raise
+            exact_partial_dependency_proofs: list[dict[str, Any]] = []
+            exact_partial_dependency_candidates: list[
+                dict[str, Any]
+            ] = []
             incomplete_dependencies = [
                 dependency
                 for dependency in STAGE_DEFINITIONS[stage_id].depends_on
@@ -1857,6 +1872,72 @@ class DailyPipelineStageService:
                 and terminal_decider_symbols
             ):
                 incomplete_dependencies.remove('signal_decider')
+            if STAGE_DEFINITIONS[stage_id].supports_symbols:
+                for dependency in STAGE_DEFINITIONS[stage_id].depends_on:
+                    if dependency not in resolved_stages:
+                        continue
+                    exact_scope = self._exact_partial_success_scope(
+                        outcome=stage_outcomes.get(dependency),
+                        invocation_symbols=stage_invocation_symbols.get(
+                            dependency
+                        ),
+                    )
+                    if exact_scope is None:
+                        continue
+                    admitted_symbols = exact_scope[
+                        'successful_stock_codes'
+                    ]
+                    if not admitted_symbols:
+                        if dependency not in incomplete_dependencies:
+                            incomplete_dependencies.append(dependency)
+                        continue
+                    if stage_symbols is None:
+                        stage_symbols = list(admitted_symbols)
+                    else:
+                        admitted_set = set(admitted_symbols)
+                        stage_symbols = [
+                            symbol
+                            for symbol in stage_symbols
+                            if symbol in admitted_set
+                        ]
+                    exact_partial_dependency_candidates.append(
+                        {
+                            'dependency': dependency,
+                            **exact_scope,
+                        }
+                    )
+            if exact_partial_dependency_candidates:
+                if stage_symbols:
+                    for proof in exact_partial_dependency_candidates:
+                        dependency = str(proof['dependency'])
+                        if dependency in incomplete_dependencies:
+                            incomplete_dependencies.remove(dependency)
+                        exact_partial_dependency_proofs.append(
+                            {
+                                **proof,
+                                'admitted_stock_codes': list(
+                                    stage_symbols
+                                ),
+                            }
+                        )
+                else:
+                    for proof in exact_partial_dependency_candidates:
+                        dependency = str(proof['dependency'])
+                        if dependency not in incomplete_dependencies:
+                            incomplete_dependencies.append(dependency)
+            try:
+                self._start_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    symbols=stage_symbols,
+                )
+            except Exception as exc:
+                self._finish_run_after_stage_start_failure(
+                    pipeline_run_id=pipeline_run_id,
+                    error_message=str(exc),
+                )
+                raise
             if incomplete_dependencies and stage_id != 'next_open_execution_plan':
                 stage_result = {
                     'triggered': False,
@@ -2255,6 +2336,11 @@ class DailyPipelineStageService:
                     }
                 else:
                     def execute_current_stage() -> dict[str, Any]:
+                        stage_invocation_symbols[stage_id] = (
+                            list(stage_symbols)
+                            if stage_symbols is not None
+                            else None
+                        )
                         return self._execute_stage(
                             stage_id,
                             market_date=resolved_market_date,
@@ -2381,6 +2467,14 @@ class DailyPipelineStageService:
                             }
                     else:
                         stage_result = execute_current_stage()
+                if exact_partial_dependency_proofs:
+                    stage_result = {
+                        **stage_result,
+                        'exact_partial_dependency_proofs': (
+                            exact_partial_dependency_proofs
+                        ),
+                        'requested_symbols': list(stage_symbols or []),
+                    }
                 stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
                 self._finish_tracked_stage(
                     pipeline_run_id=pipeline_run_id,
@@ -3930,6 +4024,7 @@ class DailyPipelineStageService:
             return asyncio.run(
                 dart_fundamentals_capture_service.run_daily_incremental_refresh(
                     market_date=market_date,
+                    symbols=symbols,
                     symbol_limit=symbol_limit,
                     symbol_offset=symbol_offset,
                     capture_limit=capture_limit,
@@ -3943,7 +4038,10 @@ class DailyPipelineStageService:
                 )
             )
         if stage_id == 'piotroski_filter':
-            return daily_piotroski_filter_service.rebuild_for_market_date(market_date=market_date)
+            return daily_piotroski_filter_service.rebuild_for_market_date(
+                market_date=market_date,
+                symbols=symbols,
+            )
         if stage_id == 'momentum_factors':
             return daily_momentum_factor_service.rebuild_for_market_date(
                 market_date=market_date,
@@ -4016,6 +4114,7 @@ class DailyPipelineStageService:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                 market_date=market_date,
                 fs_div=fs_div,
+                symbols=symbols,
                 required_stage_ids=self._feedback_prerequisite_stage_ids(
                     point_in_time_recovery=point_in_time_recovery,
                 ),
@@ -4240,6 +4339,7 @@ class DailyPipelineStageService:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                 market_date=market_date,
                 fs_div=fs_div,
+                symbols=symbols,
             )
             if not bypass_prerequisite_gate and not prerequisites['ready']:
                 return self._build_prerequisite_gate_result(
@@ -4356,6 +4456,24 @@ class DailyPipelineStageService:
                 'symbols_failed': result.get('symbols_failed'),
                 'failed_symbols': result.get('failed_symbols'),
                 'bars_upserted': result.get('bars_upserted'),
+                'scope_outcome_manifest_version': result.get(
+                    'scope_outcome_manifest_version'
+                ),
+                'selected_stock_codes': result.get(
+                    'selected_stock_codes'
+                ),
+                'successful_stock_codes': result.get(
+                    'successful_stock_codes'
+                ),
+                'retry_debt_stock_codes': result.get(
+                    'retry_debt_stock_codes'
+                ),
+                'terminal_not_applicable_stock_codes': result.get(
+                    'terminal_not_applicable_stock_codes'
+                ),
+                'scope_outcome_manifest': result.get(
+                    'scope_outcome_manifest'
+                ),
             }
         payload = dict(result.get(stage_id) or {})
         if stage_id == 'technical_snapshots':
@@ -4393,6 +4511,180 @@ class DailyPipelineStageService:
     @staticmethod
     def _dependency_outcome_is_satisfied(outcome: dict[str, Any] | None) -> bool:
         return daily_pipeline_outcome_is_satisfied(outcome)
+
+    @staticmethod
+    def _exact_partial_success_scope(
+        *,
+        outcome: dict[str, Any] | None,
+        invocation_symbols: Sequence[str] | None,
+    ) -> dict[str, Any] | None:
+        """Return a partial-success partition bound to its exact invocation.
+
+        A well-formed partition for only part of a larger requested scope is
+        not exhaustive evidence.  The orchestrator therefore binds the
+        manifest to the symbols it actually passed to that dependency.
+        """
+
+        if not (
+            isinstance(outcome, dict)
+            and str(outcome.get('status') or '').strip().lower()
+            in {'completed', 'partial'}
+        ):
+            return None
+        result = outcome.get('result')
+        if not isinstance(result, dict):
+            return None
+        version = str(
+            result.get('scope_outcome_manifest_version') or ''
+        ).strip()
+        if version not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS:
+            return None
+
+        def normalize_list(key: str) -> list[str] | None:
+            raw = result.get(key)
+            if not isinstance(raw, list):
+                return None
+            normalized = [
+                (
+                    str(value or '').strip().zfill(6)
+                    if str(value or '').strip().isdigit()
+                    else str(value or '').strip()
+                )
+                for value in raw
+            ]
+            if any(not value for value in normalized):
+                return None
+            if len(normalized) != len(set(normalized)):
+                return None
+            return normalized
+
+        selected = normalize_list('selected_stock_codes')
+        successful = normalize_list('successful_stock_codes')
+        retry_debt = normalize_list('retry_debt_stock_codes')
+        terminal_not_applicable = normalize_list(
+            'terminal_not_applicable_stock_codes'
+        )
+        if terminal_not_applicable is None:
+            terminal_not_applicable = []
+        if selected is None or successful is None or retry_debt is None:
+            return None
+        selected_set = set(selected)
+        successful_set = set(successful)
+        retry_debt_set = set(retry_debt)
+        terminal_set = set(terminal_not_applicable)
+        if (
+            successful_set & retry_debt_set
+            or successful_set & terminal_set
+            or retry_debt_set & terminal_set
+            or selected_set
+            != successful_set | retry_debt_set | terminal_set
+        ):
+            return None
+        outcome_status = str(outcome.get('status') or '').strip().lower()
+        if outcome_status == 'completed' and retry_debt_set:
+            return None
+        if invocation_symbols is None:
+            return None
+        normalized_invocation = [
+            (
+                str(value or '').strip().zfill(6)
+                if str(value or '').strip().isdigit()
+                else str(value or '').strip()
+            )
+            for value in invocation_symbols
+        ]
+        if (
+            not normalized_invocation
+            or any(not value for value in normalized_invocation)
+            or len(normalized_invocation) != len(set(normalized_invocation))
+            or selected_set != set(normalized_invocation)
+        ):
+            return None
+
+        raw_manifest = result.get('scope_outcome_manifest')
+        if not isinstance(raw_manifest, list):
+            return None
+        manifest_outcomes: dict[str, str] = {}
+        for item in raw_manifest:
+            if not isinstance(item, dict):
+                return None
+            raw_stock_code = str(item.get('stock_code') or '').strip()
+            stock_code = (
+                raw_stock_code.zfill(6)
+                if raw_stock_code.isdigit()
+                else raw_stock_code
+            )
+            outcome_value = str(item.get('outcome') or '').strip()
+            if (
+                not stock_code
+                or stock_code in manifest_outcomes
+                or outcome_value
+                not in {'success', 'retry_debt', 'terminal_not_applicable'}
+            ):
+                return None
+            manifest_outcomes[stock_code] = outcome_value
+        expected_manifest_outcomes = {
+            **{stock_code: 'success' for stock_code in successful_set},
+            **{stock_code: 'retry_debt' for stock_code in retry_debt_set},
+            **{
+                stock_code: 'terminal_not_applicable'
+                for stock_code in terminal_set
+            },
+        }
+        if manifest_outcomes != expected_manifest_outcomes:
+            return None
+        return {
+            'manifest_version': version,
+            'selected_stock_codes': selected,
+            'successful_stock_codes': successful,
+            'retry_debt_stock_codes': retry_debt,
+            'terminal_not_applicable_stock_codes': terminal_not_applicable,
+        }
+
+    @staticmethod
+    def _validated_pykrx_invocation_scope(
+        result: Mapping[str, Any],
+    ) -> list[str] | None:
+        if (
+            str(result.get('invocation_scope_manifest_version') or '')
+            != PYKRX_INVOCATION_SCOPE_MANIFEST_VERSION
+        ):
+            return None
+        raw_symbols = result.get('invocation_scope_stock_codes')
+        if not isinstance(raw_symbols, list):
+            return None
+        normalized = [
+            str(value or '').strip().zfill(6)
+            if str(value or '').strip().isdigit()
+            else str(value or '').strip()
+            for value in raw_symbols
+        ]
+        if (
+            not normalized
+            or any(not value for value in normalized)
+            or len(normalized) != len(set(normalized))
+        ):
+            return None
+        try:
+            declared_count = int(result.get('invocation_scope_count'))
+        except (TypeError, ValueError):
+            return None
+        if declared_count != len(normalized):
+            return None
+        canonical = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        expected_sha256 = hashlib.sha256(
+            canonical.encode('utf-8')
+        ).hexdigest()
+        if (
+            str(result.get('invocation_scope_sha256') or '').strip()
+            != expected_sha256
+        ):
+            return None
+        return normalized
 
     @staticmethod
     def _partial_summary_dependency_is_proven(

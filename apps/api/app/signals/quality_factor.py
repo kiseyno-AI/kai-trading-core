@@ -465,6 +465,32 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
         net_income, net_income_amount_field = _highlight_amount(net_income_row, flow=True)
         total_assets, total_assets_amount_field = _highlight_amount(total_assets_row, flow=False)
         gross_profit, gross_profit_amount_field = _highlight_amount(gross_profit_row, flow=True)
+        net_income_source = _highlight_audit_payload(
+            net_income_row,
+            amount_field=net_income_amount_field,
+        )
+        total_assets_source = _highlight_audit_payload(
+            total_assets_row,
+            amount_field=total_assets_amount_field,
+        )
+        gross_profit_source = _highlight_audit_payload(
+            gross_profit_row,
+            amount_field=gross_profit_amount_field,
+        )
+        matched_inputs = (
+            financial_context.get('audit', {}).get('matched_inputs', {})
+            if financial_context
+            else {}
+        )
+        if net_income is None and financial_context:
+            net_income = financial_context.get('net_income')
+            net_income_source = matched_inputs.get('net_income')
+        if total_assets is None and financial_context:
+            total_assets = financial_context.get('total_assets')
+            total_assets_source = matched_inputs.get('total_assets')
+        if gross_profit is None and financial_context:
+            gross_profit = financial_context.get('gross_profit')
+            gross_profit_source = matched_inputs.get('gross_profit')
         gross_margin = _highlight_ratio(gross_margin_row)
         asset_turnover = _highlight_ratio(asset_turnover_row)
         debt_ratio = _highlight_ratio(debt_ratio_row)
@@ -505,14 +531,8 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             gross_profit_to_assets_source = {
                 'source_type': 'derived_formula',
                 'formula': 'gross_profit / total_assets',
-                'gross_profit': _highlight_audit_payload(
-                    gross_profit_row,
-                    amount_field=gross_profit_amount_field,
-                ),
-                'total_assets': _highlight_audit_payload(
-                    total_assets_row,
-                    amount_field=total_assets_amount_field,
-                ),
+                'gross_profit': gross_profit_source,
+                'total_assets': total_assets_source,
             }
         else:
             gross_profit_to_assets_source = {
@@ -592,14 +612,8 @@ class DailyQualityFactorService(DailyAdvancedValueFactorService):
             '_operating_cash_flow': operating_cash_flow,
             '_gross_margin': gross_margin,
             '_asset_turnover': asset_turnover,
-            '_net_income_source': _highlight_audit_payload(
-                net_income_row,
-                amount_field=net_income_amount_field,
-            ),
-            '_total_assets_source': _highlight_audit_payload(
-                total_assets_row,
-                amount_field=total_assets_amount_field,
-            ),
+            '_net_income_source': net_income_source,
+            '_total_assets_source': total_assets_source,
             '_gross_profit_to_assets_source': gross_profit_to_assets_source,
             '_gross_margin_source': _highlight_audit_payload(gross_margin_row, ratio_source=True),
             '_asset_turnover_source': _highlight_audit_payload(asset_turnover_row, ratio_source=True),

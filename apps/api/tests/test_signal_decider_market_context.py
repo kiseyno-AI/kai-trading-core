@@ -193,6 +193,9 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertEqual(result['indices']['kospi']['level'], 2642.07)
         self.assertEqual(result['indices']['kosdaq']['change_rate'], 0.54)
         self.assertEqual(result['fx']['usdkrw']['value'], 1444.5)
+        self.assertFalse(result['fx']['usdkrw']['provider_gap'])
+        self.assertEqual(result['fx']['usdkrw']['provider_freshness'], 'fresh')
+        self.assertTrue(result['fx']['usdkrw']['value_available'])
         self.assertEqual(result['flows']['foreign']['value'], -1667138000000)
         self.assertEqual(result['flows']['foreign']['unit'], 'krw')
         self.assertEqual(result['flows']['institutional']['value'], -20710000000)
@@ -258,6 +261,52 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertEqual(result['stale_reason'], 'koreaexim_quota_exhausted')
         self.assertEqual(result['fx']['usdkrw']['source'], 'cache')
         self.assertEqual(result['fx']['usdkrw']['status'], 'stale')
+        self.assertTrue(result['fx']['usdkrw']['provider_gap'])
+        self.assertEqual(result['fx']['usdkrw']['provider_freshness'], 'stale')
+        self.assertTrue(result['fx']['usdkrw']['value_available'])
+
+    def test_build_preserves_unavailable_fx_provider_gap_metadata(self) -> None:
+        snapshot = _snapshot_payload()
+        snapshot['status'] = 'partial'
+        snapshot['stale_reason'] = 'koreaexim_rate_not_found'
+        snapshot['usd_krw'] = {
+            'rate': None,
+            'effective_date': None,
+            'fallback_applied': False,
+            'status': 'missing',
+            'source': 'unavailable',
+            'stale_reason': 'koreaexim_rate_not_found',
+            'detail': 'USD/KRW rate unavailable for requested date',
+            'captured_at': None,
+        }
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot)
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'stale')
+        self.assertEqual(result['stale_reason'], 'koreaexim_rate_not_found')
+        self.assertIn('fx.usdkrw', result['missing_fields'])
+        self.assertIsNone(result['fx']['usdkrw']['value'])
+        self.assertTrue(result['fx']['usdkrw']['provider_gap'])
+        self.assertEqual(result['fx']['usdkrw']['provider_freshness'], 'missing')
+        self.assertFalse(result['fx']['usdkrw']['value_available'])
+
+    def test_build_does_not_mark_fx_fresh_without_effective_date(self) -> None:
+        snapshot = _snapshot_payload()
+        snapshot['usd_krw']['effective_date'] = None
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot)
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn('fx.usdkrw.effective_date', result['missing_fields'])
+        self.assertTrue(result['fx']['usdkrw']['provider_gap'])
+        self.assertEqual(result['fx']['usdkrw']['provider_freshness'], 'stale')
+        self.assertTrue(result['fx']['usdkrw']['value_available'])
 
     def test_build_returns_unavailable_when_snapshot_fetch_fails(self) -> None:
         builder = SignalDeciderMarketContextBuilder(snapshot_service=ErrorSnapshotService())

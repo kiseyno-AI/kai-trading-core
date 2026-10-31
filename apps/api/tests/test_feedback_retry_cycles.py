@@ -788,6 +788,93 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(observed['stage'], 'cycle_started')
         self.assertEqual(observed['current_step'], 'cycle_started')
 
+    def test_retry_admission_prerequisite_check_receives_exact_eligible_symbols(self):
+        service = AgentFeedbackRetryService()
+        symbols = ('005930', '000660')
+        eligible_symbols = ['005930']
+        config = FeedbackRetryCycleConfig(
+            market_date=date(2026, 4, 16),
+            roles=SUMMARIZER_AGENT_NAMES,
+            symbols=symbols,
+        )
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+
+        with (
+            patch(
+                'app.agent_context.retry_service.'
+                'resolve_external_news_knowledge_cutoff_for_symbols',
+                return_value=(cutoff, 'requested'),
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=['fundamentals_daily_refresh'],
+                ),
+            ) as inspect_prerequisites,
+            patch.object(
+                service,
+                '_load_eligible_symbols',
+                return_value=eligible_symbols,
+            ),
+            patch.object(
+                service,
+                '_run_retry_cycles_admitted',
+                return_value={'status': 'waiting'},
+            ),
+        ):
+            result = service.run_retry_cycles(config=config)
+
+        self.assertEqual(result['status'], 'waiting')
+        inspect_prerequisites.assert_called_once_with(
+            market_date=date(2026, 4, 16),
+            fs_div='CFS',
+            symbols=eligible_symbols,
+        )
+
+    def test_admitted_retry_prerequisite_recheck_receives_exact_eligible_symbols(self):
+        service = AgentFeedbackRetryService()
+        symbols = ('005930', '000660')
+        eligible_symbols = ['005930']
+        config = FeedbackRetryCycleConfig(
+            market_date=date(2026, 4, 16),
+            roles=SUMMARIZER_AGENT_NAMES,
+            symbols=symbols,
+        )
+
+        with (
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=['quality_factors'],
+                ),
+            ) as inspect_prerequisites,
+            patch.object(
+                service,
+                '_load_eligible_symbols',
+                return_value=eligible_symbols,
+            ),
+            patch.object(
+                service,
+                '_get_retry_progress',
+                return_value={'summary': {'pending_symbols': 2}},
+            ),
+        ):
+            result = service._run_retry_cycles_admitted(config=config)
+
+        self.assertEqual(result['status'], 'waiting')
+        self.assertTrue(result['gated'])
+        inspect_prerequisites.assert_called_once_with(
+            market_date=date(2026, 4, 16),
+            fs_div='CFS',
+            symbols=eligible_symbols,
+        )
+
     def test_exact_rearm_can_bind_failed_parent(self):
         service = AgentFeedbackRetryService()
         market_date = date(2026, 4, 16)
@@ -3373,6 +3460,15 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.addCleanup(cleanup)
 
         with (
+            patch.object(
+                service,
+                '_load_eligible_symbols',
+                return_value=[symbol],
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
             patch.object(
                 service,
                 '_run_retry_cycles_admitted',
@@ -6950,6 +7046,15 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         run_state_service.find_latest_run = lambda **_: active_run
 
         with (
+            patch.object(
+                service,
+                '_load_eligible_symbols',
+                return_value=['005930'],
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
             patch(
                 'app.agent_context.retry_service._claim_feedback_retry_run',
                 return_value={

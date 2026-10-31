@@ -16,6 +16,7 @@ from app.db_models import (
     DartDilutionSignal,
     DartDisclosureEvent,
     DartFundamentalsHighlight,
+    DartFundamentalsRow,
     DartFundamentalsSnapshot,
     Symbol,
 )
@@ -127,7 +128,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         self.assertFalse(persisted['passes_piotroski_score'])
         self.assertFalse(persisted['passed_filter'])
 
-    def test_missing_optional_dilution_event_keeps_raw_score_conservative_without_blocking_core_coverage(self):
+    def test_missing_dilution_evidence_keeps_raw_score_but_fails_closed(self):
         service = DailyPiotroskiFilterService()
         candidate = _build_input(
             symbol='005930',
@@ -165,7 +166,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             ['no_new_share_issuance'],
         )
         self.assertTrue(persisted['passes_piotroski_score'])
-        self.assertTrue(persisted['passed_filter'])
+        self.assertFalse(persisted['passed_filter'])
 
     def test_missing_audit_evidence_is_unknown_and_fails_closed(self):
         service = DailyPiotroskiFilterService()
@@ -243,7 +244,12 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
     def test_collect_and_persist_stores_passed_and_not_passed_symbols(self):
         service = DailyPiotroskiFilterService()
         inputs = [
-            _build_input(symbol='005930', pbr=0.4, return_20d=8.0),
+            _build_input(
+                symbol='005930',
+                pbr=0.4,
+                return_20d=8.0,
+                has_dilution_signal=False,
+            ),
             _build_input(symbol='000660', pbr=2.0, return_20d=-8.0, has_audit_issue=True),
         ]
 
@@ -267,6 +273,61 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         self.assertFalse(persisted_by_symbol['000660']['passed_filter'])
         self.assertTrue(persisted_by_symbol['005930']['passes_piotroski_score'])
         self.assertTrue(persisted_by_symbol['000660']['is_bottom_momentum'])
+
+    def test_explicit_symbols_emit_exact_scope_outcome_manifest(self):
+        service = DailyPiotroskiFilterService()
+        inputs = [
+            _build_input(symbol='005930', pbr=0.4, return_20d=8.0),
+            _build_input(symbol='000660', pbr=2.0, return_20d=-8.0),
+            _build_input(symbol='051910', pbr=0.6, return_20d=4.0),
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_load_inputs',
+                return_value=inputs,
+            ) as load_inputs,
+            patch(
+                'app.signals.piotroski_filter.'
+                'upsert_daily_piotroski_filter_results'
+            ) as upsert,
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-14',
+                symbols=['5930', '000660', '035420', '005930'],
+            )
+
+        load_inputs.assert_called_once_with(
+            date(2026, 4, 14),
+            symbols=None,
+        )
+        self.assertEqual(
+            [payload['symbol'] for payload in upsert.call_args.args[0]],
+            ['005930', '000660'],
+        )
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['scope_outcome_manifest_version'],
+            'piotroski_scope_outcomes_v1',
+        )
+        self.assertEqual(
+            result['selected_stock_codes'],
+            ['005930', '000660', '035420'],
+        )
+        self.assertEqual(
+            result['successful_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], ['035420'])
+        self.assertEqual(
+            result['scope_outcome_manifest'],
+            [
+                {'stock_code': '005930', 'outcome': 'success'},
+                {'stock_code': '000660', 'outcome': 'success'},
+                {'stock_code': '035420', 'outcome': 'retry_debt'},
+            ],
+        )
 
     def test_collect_and_persist_records_point_in_time_input_provenance(self):
         service = DailyPiotroskiFilterService()
@@ -530,6 +591,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
             DailyTechnicalSnapshot.__table__,
             DartDisclosureEvent.__table__,
             DartFundamentalsSnapshot.__table__,
+            DartFundamentalsRow.__table__,
             DartFundamentalsHighlight.__table__,
             DartAuditSignal.__table__,
             DartDilutionSignal.__table__,
@@ -545,6 +607,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         with Session(self.engine) as session:
             for model in (
                 DartFundamentalsHighlight,
+                DartFundamentalsRow,
                 DartFundamentalsSnapshot,
                 DartDisclosureEvent,
                 DartAuditSignal,
@@ -641,7 +704,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
             if disclosure_event_id is None:
                 event = DartDisclosureEvent(
                     rcept_no=resolved_rcept_no,
-                    corp_code=f'C{suffix[:12]}',
+                    corp_code=f'C{symbol}',
                     corp_name=symbol,
                     stock_code=symbol,
                     report_nm=f'Annual Report {business_year}',
@@ -742,27 +805,94 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
                 )
             session.commit()
 
+    def _add_ratio_highlights(
+        self,
+        snapshot_id: int,
+        **ratios: float,
+    ) -> None:
+        with Session(self.engine) as session:
+            for metric_key, ratio_value in ratios.items():
+                session.add(
+                    DartFundamentalsHighlight(
+                        snapshot_id=snapshot_id,
+                        metric_key=metric_key,
+                        metric_type='ratio',
+                        ratio_value=ratio_value,
+                    )
+                )
+            session.commit()
+
     def _add_dilution_signal(
         self,
         *,
         symbol: str,
         receipt_date: date | None,
         has_dilution_signal: bool,
+        payload: dict | None = None,
+        row_corp_code: str | None = None,
+        coverage_corp_code: str | None = None,
+        normalize_negative_coverage: bool = True,
+        signal_type: str = 'share_issuance',
     ) -> tuple[int, str]:
         rcept_no = f'PDI{uuid4().hex[:16].upper()}'
+        corp_code = row_corp_code or f'C{symbol}'
+        resolved_payload = payload
+        if (
+            not has_dilution_signal
+            and normalize_negative_coverage
+            and isinstance(payload, dict)
+        ):
+            coverage = payload.get('evidence_coverage')
+            if isinstance(coverage, dict):
+                resolved_payload = {
+                    **payload,
+                    'evidence_coverage': {
+                        **coverage,
+                        'rule_version': 'dart_share_issuance_rules_v1',
+                        'corp_code': coverage_corp_code or corp_code,
+                        'pagination_completed': True,
+                        'scan_completed_at': '2026-04-14T12:00:00+00:00',
+                        'authority_policy_version': 'krx_post_close_snapshot_overlap_v1',
+                        'authoritative_as_of_cutoff': True,
+                        'late_arrival_reconciliation': 'next_scan_one_day_overlap_v1',
+                    },
+                }
         with Session(self.engine) as session:
             row = DartDilutionSignal(
                 rcept_no=rcept_no,
-                corp_code=f'C{uuid4().hex[:12].upper()}',
+                corp_code=corp_code,
                 stock_code=symbol,
                 corp_name=symbol,
                 receipt_date=receipt_date,
-                signal_type='share_issuance',
+                signal_type=signal_type,
                 has_dilution_signal=has_dilution_signal,
+                payload=resolved_payload,
             )
             session.add(row)
             session.commit()
             return row.id, rcept_no
+
+    def _add_statement_rows(
+        self,
+        snapshot_id: int,
+        **amounts: tuple[str, str, int],
+    ) -> None:
+        with Session(self.engine) as session:
+            for metric_key, (statement_type, account_id, amount) in amounts.items():
+                session.add(
+                    DartFundamentalsRow(
+                        snapshot_id=snapshot_id,
+                        row_key=f'{metric_key}:{uuid4().hex}',
+                        statement_type=statement_type,
+                        account_id=account_id,
+                        account_name=metric_key,
+                        current_amount=amount,
+                        row_order=1,
+                        currency='KRW',
+                        payload={},
+                    )
+                )
+            session.commit()
 
     def test_load_inputs_uses_exact_date_price_bar_universe_even_if_symbol_is_inactive(self) -> None:
         market_date = date(2026, 4, 14)
@@ -1077,6 +1207,16 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
             symbol=symbol,
             receipt_date=date(2026, 3, 21),
             has_dilution_signal=False,
+            payload={
+                'evidence_coverage': {
+                    'schema_version': 'dart_share_issuance_coverage_v1',
+                    'status': 'complete',
+                    'source': 'dart_disclosure_events',
+                    'window_start': '2025-04-14',
+                    'window_end': '2026-04-14',
+                    'matched_event_count': 0,
+                }
+            },
         )
 
         with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
@@ -1094,6 +1234,146 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         self.assertAlmostEqual(input_row.prior_asset_turnover, 0.7)
         _, _, available_signal_count = _compute_signals(input_row)
         self.assertEqual(available_signal_count, 9)
+
+    def test_load_inputs_derives_missing_ratio_inputs_from_persisted_statement_rows(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        prior_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2024,
+            receipt_date=date(2025, 3, 20),
+            net_income=10,
+        )
+        current_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_statement_rows(
+            prior_snapshot_id,
+            current_assets=('BS', 'ifrs-full_CurrentAssets', 30),
+            current_liabilities=('BS', 'ifrs-full_CurrentLiabilities', 20),
+            gross_profit=('IS', 'ifrs-full_GrossProfit', 28),
+            revenue=('IS', 'ifrs-full_Revenue', 70),
+        )
+        self._add_statement_rows(
+            current_snapshot_id,
+            current_assets=('BS', 'ifrs-full_CurrentAssets', 50),
+            current_liabilities=('BS', 'ifrs-full_CurrentLiabilities', 25),
+            gross_profit=('IS', 'ifrs-full_GrossProfit', 40),
+            revenue=('IS', 'ifrs-full_Revenue', 80),
+        )
+
+        with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        input_row = inputs[0]
+        self.assertAlmostEqual(input_row.current_ratio, 2.0)
+        self.assertAlmostEqual(input_row.prior_current_ratio, 1.5)
+        self.assertAlmostEqual(input_row.gross_margin, 0.5)
+        self.assertAlmostEqual(input_row.prior_gross_margin, 0.4)
+        self.assertEqual(
+            input_row.fundamentals_provenance[2025]['raw_row_fallback_metrics'],
+            ['current_assets', 'current_liabilities', 'gross_profit', 'revenue'],
+        )
+        self.assertEqual(
+            input_row.fundamentals_provenance[2024]['raw_row_fallback_metrics'],
+            ['current_assets', 'current_liabilities', 'gross_profit', 'revenue'],
+        )
+        self.assertEqual(
+            input_row.fundamentals_provenance[2025]['raw_row_derived_ratios'],
+            ['current_ratio', 'gross_margin'],
+        )
+        self.assertEqual(
+            input_row.fundamentals_provenance[2024]['raw_row_derived_ratios'],
+            ['current_ratio', 'gross_margin'],
+        )
+
+    def test_load_inputs_recovers_asset_turnover_when_other_ratios_are_stored(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_amount_highlights(snapshot_id, total_assets=100)
+        self._add_ratio_highlights(
+            snapshot_id,
+            current_ratio=2.0,
+            gross_margin=0.5,
+        )
+        self._add_statement_rows(
+            snapshot_id,
+            revenue=('IS', 'ifrs-full_Revenue', 80),
+        )
+
+        with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertAlmostEqual(inputs[0].asset_turnover, 0.8)
+        self.assertEqual(
+            inputs[0].fundamentals_provenance[2025]['raw_row_fallback_metrics'],
+            ['revenue'],
+        )
+
+    def test_load_inputs_recovers_total_assets_even_when_asset_turnover_ratio_is_stored(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        prior_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2024,
+            receipt_date=date(2025, 3, 20),
+            net_income=10,
+        )
+        current_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        for snapshot_id, asset_turnover in (
+            (prior_snapshot_id, 0.7),
+            (current_snapshot_id, 0.8),
+        ):
+            self._add_ratio_highlights(
+                snapshot_id,
+                current_ratio=2.0,
+                gross_margin=0.5,
+                asset_turnover=asset_turnover,
+            )
+            self._add_statement_rows(
+                snapshot_id,
+                total_assets=('BS', 'ifrs-full_Assets', 100),
+            )
+
+        with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(inputs[0].total_assets, 100.0)
+        self.assertEqual(inputs[0].prior_total_assets, 100.0)
+        self.assertAlmostEqual(inputs[0].asset_turnover, 0.8)
+        self.assertAlmostEqual(inputs[0].prior_asset_turnover, 0.7)
+        self.assertEqual(
+            inputs[0].fundamentals_provenance[2025][
+                'raw_row_fallback_metrics'
+            ],
+            ['total_assets'],
+        )
+        signals, _, _ = _compute_signals(inputs[0])
+        self.assertTrue(signals['positive_roa'].available)
+        self.assertTrue(signals['improving_roa'].available)
 
     def test_load_inputs_uses_audit_signal_for_selected_annual_filing_only(self) -> None:
         market_date = date(2026, 4, 14)
@@ -1132,13 +1412,23 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
 
         self._add_dilution_signal(
             symbol=symbol,
-            receipt_date=date(2026, 4, 10),
+            receipt_date=date(2025, 4, 13),
             has_dilution_signal=True,
         )
         expected_dilution_id, expected_dilution_rcept_no = self._add_dilution_signal(
             symbol=symbol,
             receipt_date=date(2026, 4, 10),
             has_dilution_signal=False,
+            payload={
+                'evidence_coverage': {
+                    'schema_version': 'dart_share_issuance_coverage_v1',
+                    'status': 'complete',
+                    'source': 'dart_disclosure_events',
+                    'window_start': '2025-04-14',
+                    'window_end': '2026-04-14',
+                    'matched_event_count': 0,
+                }
+            },
         )
         self._add_dilution_signal(
             symbol=symbol,
@@ -1163,6 +1453,211 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         self.assertEqual(
             inputs[0].dilution_provenance['rcept_no'],
             expected_dilution_rcept_no,
+        )
+
+    def test_load_inputs_ignores_negative_dilution_row_without_complete_coverage(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        self._add_dilution_signal(
+            symbol=symbol,
+            receipt_date=date(2026, 4, 10),
+            has_dilution_signal=False,
+            payload={'matched_event_count': 0},
+        )
+
+        with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertIsNone(inputs[0].has_dilution_signal)
+        self.assertIsNone(inputs[0].dilution_provenance)
+
+    def test_load_inputs_rejects_legacy_negative_coverage_without_authority_fields(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_dilution_signal(
+            symbol=symbol,
+            receipt_date=market_date,
+            has_dilution_signal=False,
+            normalize_negative_coverage=False,
+            payload={
+                'evidence_coverage': {
+                    'schema_version': 'dart_share_issuance_coverage_v1',
+                    'status': 'complete',
+                    'source': 'dart_disclosure_events',
+                    'window_start': '2025-04-14',
+                    'window_end': '2026-04-14',
+                    'matched_event_count': 0,
+                }
+            },
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertIsNone(inputs[0].has_dilution_signal)
+        self.assertIsNone(inputs[0].dilution_provenance)
+
+    def test_load_inputs_rejects_negative_coverage_for_different_corporation(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_dilution_signal(
+            symbol=symbol,
+            receipt_date=market_date,
+            has_dilution_signal=False,
+            coverage_corp_code='COTHER',
+            payload={
+                'evidence_coverage': {
+                    'schema_version': 'dart_share_issuance_coverage_v1',
+                    'status': 'complete',
+                    'source': 'dart_disclosure_events',
+                    'window_start': '2025-04-14',
+                    'window_end': '2026-04-14',
+                    'matched_event_count': 0,
+                }
+            },
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertIsNone(inputs[0].has_dilution_signal)
+        self.assertIsNone(inputs[0].dilution_provenance)
+
+    def test_latest_incomplete_dilution_attempt_invalidates_older_complete_coverage(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_dilution_signal(
+            symbol=symbol,
+            receipt_date=date(2026, 4, 13),
+            has_dilution_signal=False,
+            payload={
+                'evidence_coverage': {
+                    'schema_version': 'dart_share_issuance_coverage_v1',
+                    'status': 'complete',
+                    'source': 'dart_disclosure_events',
+                    'window_start': '2025-04-14',
+                    'window_end': '2026-04-14',
+                    'matched_event_count': 0,
+                }
+            },
+        )
+        self._add_dilution_signal(
+            symbol=symbol,
+            receipt_date=market_date,
+            has_dilution_signal=False,
+            payload={
+                'evidence_coverage': {
+                    'schema_version': 'dart_share_issuance_coverage_v1',
+                    'status': 'incomplete',
+                    'source': 'dart_disclosure_events',
+                    'window_start': '2026-04-14',
+                    'window_end': '2026-04-14',
+                    'matched_event_count': 0,
+                }
+            },
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertIsNone(inputs[0].has_dilution_signal)
+        self.assertIsNone(inputs[0].dilution_provenance)
+
+    def test_load_inputs_ignores_positive_dilution_event_outside_lookback_window(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        self._add_dilution_signal(
+            symbol=symbol,
+            receipt_date=date(2025, 4, 13),
+            has_dilution_signal=True,
+        )
+
+        with patch('app.signals.piotroski_filter.session_scope', self._session_scope):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertIsNone(inputs[0].has_dilution_signal)
+        self.assertIsNone(inputs[0].dilution_provenance)
+
+    def test_load_inputs_recognizes_all_positive_share_issuance_signal_types(self) -> None:
+        market_date = date(2026, 4, 14)
+        signal_types = (
+            'paid_increase',
+            'convertible_bond',
+            'bond_with_warrant',
+            'exchange_bond',
+        )
+        symbols = ['005930', '000660', '035420', '051910']
+        for symbol, signal_type in zip(symbols, signal_types, strict=True):
+            symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+            self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+            self._add_fundamentals_snapshot(
+                symbol=symbol,
+                business_year=2025,
+                receipt_date=date(2026, 4, 10),
+                net_income=20,
+            )
+            self._add_dilution_signal(
+                symbol=symbol,
+                receipt_date=date(2026, 4, 10),
+                has_dilution_signal=True,
+                signal_type=signal_type,
+            )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        inputs_by_symbol = {item.symbol: item for item in inputs}
+        self.assertEqual(set(inputs_by_symbol), set(symbols))
+        self.assertTrue(
+            all(
+                inputs_by_symbol[symbol].has_dilution_signal is True
+                for symbol in symbols
+            )
         )
 
     def test_load_inputs_does_not_reuse_prior_clean_audit_for_newer_filing(self) -> None:
