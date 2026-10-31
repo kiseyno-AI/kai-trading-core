@@ -54,6 +54,9 @@ from app.dart.signals_service import (
     SHARE_ISSUANCE_RULE_VERSION,
     dart_signals_service,
 )
+from app.dart.stale_sync_run_reconciliation import (
+    stale_dart_sync_run_reconciliation,
+)
 from app.dart.sync_service import (
     MAX_DART_DISCLOSURE_SYNC_CONCURRENCY,
     dart_disclosure_sync_service,
@@ -1497,6 +1500,20 @@ def repair_stale_eod_collection_runs(
     )
 
 
+def reconcile_stale_dart_sync_runs(
+    *,
+    dry_run: bool = True,
+    expected_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    # Deliberately bypass bootstrap_runtime(): this reviewed persistence-only
+    # reconciliation must not run migrations, hydrate runtime state, call
+    # providers, or replay disclosure collection.
+    return stale_dart_sync_run_reconciliation.reconcile(
+        apply=not dry_run,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+
+
 def run_daily_pipeline_stages(
     *,
     market_date: str | None = None,
@@ -2158,6 +2175,39 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     stale_collection_run_repair_parser.set_defaults(dry_run=True)
+    stale_dart_sync_reconciliation_parser = subparsers.add_parser(
+        'dart-stale-sync-run-reconcile',
+        help=(
+            'Reconcile six reviewed historical DART sync runs; defaults to '
+            'a read-only exact-scope check'
+        ),
+    )
+    stale_dart_sync_reconciliation_mode = (
+        stale_dart_sync_reconciliation_parser.add_mutually_exclusive_group()
+    )
+    stale_dart_sync_reconciliation_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help=(
+            'Apply only after the exact row, cutoff, event-reference, and '
+            'reviewed manifest-hash invariants match.'
+        ),
+    )
+    stale_dart_sync_reconciliation_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Verify the exact reviewed scope without writing (default).',
+    )
+    stale_dart_sync_reconciliation_parser.add_argument(
+        '--expected-manifest-sha256',
+        help=(
+            'Required with --apply; copy manifest_sha256 from a successful '
+            'dry-run.'
+        ),
+    )
+    stale_dart_sync_reconciliation_parser.set_defaults(dry_run=True)
     subparsers.add_parser(
         'schema-drift-preflight',
         help='Verify runtime-critical tables and constraints before write-heavy workflows are treated as healthy',
@@ -2756,6 +2806,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             dry_run=args.dry_run,
             expected_manifest_sha256=args.expected_manifest_sha256,
         )
+    elif args.command == 'dart-stale-sync-run-reconcile':
+        payload = reconcile_stale_dart_sync_runs(
+            dry_run=args.dry_run,
+            expected_manifest_sha256=args.expected_manifest_sha256,
+        )
     elif args.command == 'schema-drift-preflight':
         payload, exit_code = collect_schema_drift_preflight()
         print(json.dumps(payload, ensure_ascii=False))
@@ -3057,6 +3112,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         and payload.get('status') in {'blocked', 'failed'}
     ) or (
         args.command == 'eod-stale-collection-run-repair'
+        and payload.get('status') in {'blocked', 'failed'}
+    ) or (
+        args.command == 'dart-stale-sync-run-reconcile'
         and payload.get('status') in {'blocked', 'failed'}
     ):
         return 2

@@ -91,6 +91,27 @@ What it does:
 - `POST /eod/composite-factors/compute`
 - `GET /eod/composite-factors`
 
+## Reviewed stale DART sync-run reconciliation
+
+The incident-scoped reconciliation for historical sync-run IDs
+`3,327,1147,1148,1149,2038` is read-only by default. It never replays a DART
+request and never includes the later targeted run `5594`.
+
+- Dry-run: `python3.11 -m app.internal.ops dart-stale-sync-run-reconcile`
+- Apply: rerun with `--apply --expected-manifest-sha256 <manifest_sha256>`
+
+Only copy the hash from a successful dry-run immediately before the reviewed
+maintenance action. Apply fails closed if any target column, event foreign-key
+count, running-run scope, or stale timestamp cutoff has changed. Do not apply
+while DART sync, fundamentals capture, or fundamentals refresh work is active.
+Dry-run uses ordinary reads and acquires no row or maintenance locks. Apply
+first takes bounded PostgreSQL `SHARE ROW EXCLUSIVE` locks on the three DART
+run tables and disclosure events, then repeats the complete proof and CAS
+updates in the same transaction. This fences automatic writer table locks,
+including a new run inserted after the initial check; a busy writer, missing
+table-lock privilege, or any post-update global-running drift blocks and rolls
+back the whole reconciliation.
+
 ## Current runtime expectations
 - Core server should stay up 24/7.
 - The API startup path tries to prime the persisted `/market/snapshot` cache once. The background runner keeps flow and FX on the normal configured cadence (`MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS`, default 3600s). On a KRX trading day from 09:00 through 14:30 KST it refreshes only the KIS index leg every `MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS` (default 300s). Process-local single-flight coalescing is backed by a durable database bucket claim so only one process starts a bucket refresh. Transaction advisory locking makes concurrent first insert safe; attempted time, each KOSPI/KOSDAQ provider observation, receipt time, and quality form a monotonic persistence fence, so a slow failure or one regressed market leg cannot overwrite newer successful evidence merely because the other leg advanced the top-level timestamp. An initial timeout stays fail-closed while the shielded single-flight task finishes; a later success clears the runner cooldown immediately, while failure/cancellation retains it. That refresh completes before open-session plan refresh or dispatch. The configured interval cannot exceed `MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS` (default 360s).

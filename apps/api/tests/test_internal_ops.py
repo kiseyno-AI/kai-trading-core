@@ -342,6 +342,103 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertEqual(json.loads(stdout.getvalue()), payload)
 
+    def test_stale_dart_sync_reconciliation_bypasses_runtime_bootstrap(self) -> None:
+        payload = {
+            'status': 'ready',
+            'dry_run': True,
+            'manifest_sha256': 'abc123',
+        }
+        with (
+            patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
+            patch(
+                'app.internal.ops.'
+                'stale_dart_sync_run_reconciliation.reconcile',
+                return_value=payload,
+            ) as reconcile,
+        ):
+            result = ops.reconcile_stale_dart_sync_runs(
+                dry_run=True,
+                expected_manifest_sha256=None,
+            )
+
+        self.assertEqual(result, payload)
+        bootstrap_runtime.assert_not_called()
+        reconcile.assert_called_once_with(
+            apply=False,
+            expected_manifest_sha256=None,
+        )
+
+    def test_stale_dart_sync_reconciliation_cli_defaults_to_dry_run(self) -> None:
+        payload = {
+            'status': 'ready',
+            'dry_run': True,
+            'manifest_sha256': 'abc123',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.reconcile_stale_dart_sync_runs',
+                return_value=payload,
+            ) as reconcile,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(['dart-stale-sync-run-reconcile'])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        reconcile.assert_called_once_with(
+            dry_run=True,
+            expected_manifest_sha256=None,
+        )
+
+    def test_stale_dart_sync_reconciliation_apply_passes_hash(self) -> None:
+        payload = {
+            'status': 'completed',
+            'dry_run': False,
+            'manifest_sha256': 'abc123',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.reconcile_stale_dart_sync_runs',
+                return_value=payload,
+            ) as reconcile,
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(
+                [
+                    'dart-stale-sync-run-reconcile',
+                    '--apply',
+                    '--expected-manifest-sha256',
+                    'abc123',
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+        reconcile.assert_called_once_with(
+            dry_run=False,
+            expected_manifest_sha256='abc123',
+        )
+
+    def test_stale_dart_sync_reconciliation_blocked_returns_nonzero(self) -> None:
+        payload = {
+            'status': 'blocked',
+            'reason': 'stale_dart_sync_run_manifest_mismatch',
+        }
+        stdout = io.StringIO()
+        with (
+            patch(
+                'app.internal.ops.reconcile_stale_dart_sync_runs',
+                return_value=payload,
+            ),
+            redirect_stdout(stdout),
+        ):
+            exit_code = ops.main(['dart-stale-sync-run-reconcile'])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(stdout.getvalue()), payload)
+
     def test_run_pykrx_daily_if_due_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
