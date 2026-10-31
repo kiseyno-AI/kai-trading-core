@@ -4,6 +4,7 @@ import asyncio
 import io
 import os
 import re
+import stat
 import tempfile
 from urllib.parse import unquote
 import zipfile
@@ -408,9 +409,14 @@ class DartClient:
                 return item
         return None
 
-    async def _load_corp_codes(self) -> list[dict[str, str]]:
-        now = datetime.now(timezone.utc)
-        ttl = timedelta(seconds=settings.dart_corp_code_cache_ttl_seconds)
+    def _corp_code_memory_cache_is_fresh(
+        self,
+        *,
+        now: datetime,
+        ttl: timedelta,
+    ) -> bool:
+        if not self._corp_codes or self._corp_codes_loaded_at is None:
+            return False
         memory_ttl = (
             ttl
             if self._corp_codes_authoritative
@@ -421,33 +427,65 @@ class DartClient:
                 ),
             )
         )
-        if (
-            self._corp_codes
-            and self._corp_codes_loaded_at
-            and now - self._corp_codes_loaded_at < memory_ttl
-        ):
+        if now - self._corp_codes_loaded_at >= memory_ttl:
+            return False
+        if self._corp_codes_authoritative:
+            if self._corp_codes_source_fetched_at is None:
+                return False
+            source_age = max(
+                (now - self._corp_codes_source_fetched_at).total_seconds(),
+                0.0,
+            )
+            self._corp_codes_cache_age_seconds = source_age
+            return source_age <= ttl.total_seconds()
+        return True
+
+    async def _load_corp_codes(self) -> list[dict[str, str]]:
+        now = datetime.now(timezone.utc)
+        ttl = timedelta(seconds=settings.dart_corp_code_cache_ttl_seconds)
+        if self._corp_code_memory_cache_is_fresh(now=now, ttl=ttl):
             return self._corp_codes
 
         async with self._corp_codes_lock:
             now = datetime.now(timezone.utc)
-            memory_ttl = (
-                ttl
-                if self._corp_codes_authoritative
-                else min(
-                    ttl,
-                    timedelta(
-                        seconds=(
-                            NON_AUTHORITATIVE_CORP_CODE_MEMORY_TTL_SECONDS
-                        )
-                    ),
-                )
-            )
-            if (
-                self._corp_codes
-                and self._corp_codes_loaded_at
-                and now - self._corp_codes_loaded_at < memory_ttl
-            ):
+            if self._corp_code_memory_cache_is_fresh(now=now, ttl=ttl):
                 return self._corp_codes
+
+            snapshot = self._load_persisted_corp_code_snapshot(
+                fresh_as_of=now,
+                ttl=ttl,
+            )
+            if snapshot is not None:
+                persisted, source_fetched_at = snapshot
+                cache_age_seconds = max(
+                    (now - source_fetched_at).total_seconds(),
+                    0.0,
+                )
+                if cache_age_seconds <= ttl.total_seconds():
+                    self._corp_codes = persisted
+                    self._corp_codes_loaded_at = now
+                    self._corp_codes_source = 'persistent_cache'
+                    self._corp_codes_source_fetched_at = source_fetched_at
+                    self._corp_codes_cache_age_seconds = cache_age_seconds
+                    self._corp_codes_authoritative = True
+                    log_fetch_event(
+                        service='dart',
+                        operation='load_corp_codes',
+                        status='completed',
+                        source='persistent_cache',
+                        source_fetched_at=(
+                            source_fetched_at.isoformat()
+                            if source_fetched_at is not None
+                            else None
+                        ),
+                        cache_age_seconds=cache_age_seconds,
+                        authoritative=True,
+                        cache_ttl_seconds=(
+                            settings.dart_corp_code_cache_ttl_seconds
+                        ),
+                        corp_code_count=len(persisted),
+                    )
+                    return persisted
 
             payload = b''
             content_type: str | None = None
@@ -460,24 +498,13 @@ class DartClient:
                 if not corp_codes:
                     raise DartAPIError('DART corp code archive contained no valid records')
             except (DartAPIError, httpx.HTTPError) as exc:
-                persisted = self._load_persisted_corp_codes()
-                if persisted is not None:
-                    cache_path = self._corp_code_cache_path()
-                    source_fetched_at: datetime | None = None
-                    cache_age_seconds: float | None = None
-                    try:
-                        if cache_path is not None:
-                            source_fetched_at = datetime.fromtimestamp(
-                                cache_path.stat().st_mtime,
-                                tz=timezone.utc,
-                            )
-                            cache_age_seconds = max(
-                                (now - source_fetched_at).total_seconds(),
-                                0.0,
-                            )
-                    except OSError:
-                        source_fetched_at = None
-                        cache_age_seconds = None
+                snapshot = self._load_persisted_corp_code_snapshot()
+                if snapshot is not None:
+                    persisted, source_fetched_at = snapshot
+                    cache_age_seconds = max(
+                        (now - source_fetched_at).total_seconds(),
+                        0.0,
+                    )
                     self._corp_codes = persisted
                     self._corp_codes_loaded_at = now
                     self._corp_codes_source = 'persistent_fallback'
@@ -537,22 +564,65 @@ class DartClient:
             return None
         return Path(configured).expanduser()
 
-    def _load_persisted_corp_codes(self) -> list[dict[str, str]] | None:
+    def _load_persisted_corp_code_snapshot(
+        self,
+        *,
+        fresh_as_of: datetime | None = None,
+        ttl: timedelta | None = None,
+    ) -> tuple[list[dict[str, str]], datetime] | None:
         cache_path = self._corp_code_cache_path()
-        if cache_path is None or not cache_path.exists():
+        if cache_path is None:
             return None
 
+        file_descriptor: int | None = None
         try:
-            if cache_path.is_symlink() or not cache_path.is_file():
+            open_flags = (
+                os.O_RDONLY
+                | getattr(os, 'O_CLOEXEC', 0)
+                | getattr(os, 'O_NONBLOCK', 0)
+            )
+            no_follow_flag = getattr(os, 'O_NOFOLLOW', 0)
+            if not no_follow_flag and cache_path.is_symlink():
                 raise DartAPIError('DART corp code cache must be a regular file')
-            if cache_path.stat().st_size > 64 * 1024 * 1024:
-                raise DartAPIError('DART corp code cache exceeds the 64 MiB safety limit')
+            file_descriptor = os.open(
+                cache_path,
+                open_flags | no_follow_flag,
+            )
+            with os.fdopen(file_descriptor, 'rb') as cache_file:
+                file_descriptor = None
+                file_stat = os.fstat(cache_file.fileno())
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise DartAPIError(
+                        'DART corp code cache must be a regular file'
+                    )
+                max_cache_bytes = 64 * 1024 * 1024
+                if file_stat.st_size > max_cache_bytes:
+                    raise DartAPIError(
+                        'DART corp code cache exceeds the 64 MiB safety limit'
+                    )
+                source_fetched_at = datetime.fromtimestamp(
+                    file_stat.st_mtime,
+                    tz=timezone.utc,
+                )
+                if fresh_as_of is not None and ttl is not None:
+                    cache_age_seconds = max(
+                        (fresh_as_of - source_fetched_at).total_seconds(),
+                        0.0,
+                    )
+                    if cache_age_seconds > ttl.total_seconds():
+                        return None
+                payload = cache_file.read(max_cache_bytes + 1)
+                if len(payload) > max_cache_bytes:
+                    raise DartAPIError(
+                        'DART corp code cache exceeds the 64 MiB safety limit'
+                    )
 
-            payload = cache_path.read_bytes()
             corp_codes = self._parse_corp_code_payload(payload)
             if not corp_codes:
                 raise DartAPIError('DART corp code cache contained no valid records')
-            return corp_codes
+            return corp_codes, source_fetched_at
+        except FileNotFoundError:
+            return None
         except (DartAPIError, OSError) as exc:
             log_fetch_event(
                 service='dart',
@@ -562,6 +632,16 @@ class DartClient:
                 error_message=str(exc),
             )
             return None
+        finally:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+
+    def _load_persisted_corp_codes(self) -> list[dict[str, str]] | None:
+        snapshot = self._load_persisted_corp_code_snapshot()
+        return snapshot[0] if snapshot is not None else None
 
     def _persist_corp_code_payload(self, payload: bytes) -> None:
         cache_path = self._corp_code_cache_path()
