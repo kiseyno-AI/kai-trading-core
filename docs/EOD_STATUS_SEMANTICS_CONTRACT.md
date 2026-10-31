@@ -37,6 +37,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 - `market_session.intraday_data_expected` and `market_session.quote_data_expected` are false on weekends, holidays, and same-day closed sessions where live intraday or quote rows are not expected.
 - `market_session.recommendation_basis` is `live_intraday` only for the current open trading session; otherwise it is `latest_completed_eod`.
 - On weekends, holidays, and other non-trading days, consumers must use `latest_valid_trading_date` and `recommendation_basis=latest_completed_eod` when describing freshness to operators instead of implying a missing current-cycle intraday feed.
+- Realtime-price `enabled` is configuration state and `market_session_active` is verified session eligibility. Operators must use `websocket_connected` as the direct KIS price-socket signal; active sockets normally report `connected`, `subscribed`, or `limited` status. Non-open or calendar-unverified sessions remain disconnected and expose no active WAIT candidate partition.
 
 ## `GET /eod/freshness`
 

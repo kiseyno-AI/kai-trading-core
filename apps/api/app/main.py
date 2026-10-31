@@ -142,11 +142,14 @@ async def lifespan(_: FastAPI):
             startup_maintenance_task.cancel()
             with suppress(asyncio.CancelledError):
                 await startup_maintenance_task
+        # Stop new background WAIT scheduling first. Any already-scheduled
+        # worker carries the pre-stop cache epoch and is revoked when realtime
+        # price shutdown clears WAIT membership below.
+        await background_runner.stop()
         await kis_realtime_price_service.stop()
         await kis_realtime_order_notice_service.stop()
         await db_pool_watchdog.stop()
         await us_equity_pipeline_scheduler.stop()
-        await background_runner.stop()
 
 
 app = FastAPI(title=settings.app_name, debug=settings.app_debug, lifespan=lifespan)

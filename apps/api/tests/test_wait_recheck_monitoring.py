@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,7 +18,9 @@ from app.agent_context.wait_recheck_service import (
     WaitRecheckCandidate,
     WaitRecheckObservation,
     _canonical_json_sha256,
+    _event_retry_not_before,
     _material_change_reasons,
+    _unaccepted_decision_run_ids,
     build_wait_recheck_candidate,
     canonical_wait_recheck_context,
     merge_wait_recheck_monitored_source,
@@ -267,6 +270,332 @@ def test_same_symbol_wait_candidates_remain_independent_by_agent() -> None:
     } == {'signal-decider', 'short-term-decider'}
 
 
+def test_non_trading_target_clears_wait_subscription_source() -> None:
+    service = SignalDeciderWaitRecheckService()
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=date(2026, 10, 31),
+    )
+    assert candidate is not None
+    service.replace_candidate_cache([candidate])
+
+    with (
+        patch.object(
+            settings,
+            'signal_decider_wait_recheck_monitoring_enabled',
+            True,
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.is_krx_trading_day',
+            return_value=False,
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope'
+        ) as mocked_session_scope,
+    ):
+        source = service.load_subscription_source(
+            target_trade_date=date(2026, 10, 31),
+        )
+
+    assert source.symbols == ()
+    assert source.membership_complete is True
+    assert service.runtime_snapshot()['candidate_count'] == 0
+    mocked_session_scope.assert_not_called()
+
+
+def test_unknown_target_calendar_clears_wait_source_fail_closed() -> None:
+    service = SignalDeciderWaitRecheckService()
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=date(2026, 10, 30),
+    )
+    assert candidate is not None
+    service.replace_candidate_cache([candidate])
+
+    with (
+        patch.object(
+            settings,
+            'signal_decider_wait_recheck_monitoring_enabled',
+            True,
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.is_krx_trading_day',
+            side_effect=RuntimeError('calendar unavailable'),
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope'
+        ) as mocked_session_scope,
+    ):
+        source = service.load_subscription_source(
+            target_trade_date=date(2026, 10, 30),
+        )
+
+    assert source.symbols == ()
+    assert source.source_version is None
+    assert source.membership_complete is False
+    assert service.runtime_snapshot()['candidate_count'] == 0
+    mocked_session_scope.assert_not_called()
+
+
+def test_terminal_event_after_close_cannot_repopulate_wait_candidates() -> None:
+    service = SignalDeciderWaitRecheckService()
+    event = SimpleNamespace(
+        target_trade_date=date(2026, 10, 30),
+        status='running',
+        result_snapshot_id=None,
+        result_action=None,
+        last_error_payload=None,
+        completed_at=None,
+        last_attempt_at=None,
+    )
+    session = Mock()
+    session.execute.return_value.scalar_one_or_none.return_value = event
+
+    class FakeSessionScope:
+        def __enter__(self) -> Mock:
+            return session
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    finished_at = datetime(2026, 10, 30, 7, 0, tzinfo=timezone.utc)
+    with (
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope',
+            return_value=FakeSessionScope(),
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service._utcnow',
+            return_value=finished_at,
+        ),
+        patch.object(service, 'load_subscription_source') as load_source,
+        patch.object(service, 'clear_candidate_cache') as clear_cache,
+    ):
+        service._finish_event(
+            event_id=17,
+            request_run_id='wait-recheck-test',
+            status='completed',
+            expected_cache_epoch=service.candidate_cache_epoch(),
+            result_action='wait',
+        )
+
+    assert event.status == 'completed'
+    assert event.completed_at == finished_at
+    load_source.assert_not_called()
+    clear_cache.assert_called_once_with()
+
+
+def test_terminal_event_during_session_refreshes_wait_candidates() -> None:
+    service = SignalDeciderWaitRecheckService()
+    target_trade_date = date(2026, 10, 30)
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=target_trade_date,
+    )
+    assert candidate is not None
+    event = SimpleNamespace(
+        target_trade_date=target_trade_date,
+        status='running',
+        result_snapshot_id=None,
+        result_action=None,
+        last_error_payload=None,
+        completed_at=None,
+        last_attempt_at=None,
+    )
+    session = Mock()
+    session.execute.return_value.scalar_one_or_none.return_value = event
+
+    class FakeSessionScope:
+        def __enter__(self) -> Mock:
+            return session
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    def reload_source(
+        *,
+        target_trade_date: date,
+        expected_cache_epoch: int | None = None,
+    ) -> Mock:
+        assert target_trade_date == event.target_trade_date
+        assert service.replace_candidate_cache(
+            [candidate],
+            expected_cache_epoch=expected_cache_epoch,
+        )
+        return Mock()
+
+    with (
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope',
+            return_value=FakeSessionScope(),
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.'
+            '_target_regular_session_is_open_at',
+            return_value=True,
+        ),
+        patch.object(
+            service,
+            'load_subscription_source',
+            side_effect=reload_source,
+        ) as load_source,
+    ):
+        service._finish_event(
+            event_id=18,
+            request_run_id='wait-recheck-test',
+            status='completed',
+            expected_cache_epoch=service.candidate_cache_epoch(),
+            result_action='wait',
+        )
+
+    load_source.assert_called_once_with(
+        target_trade_date=target_trade_date,
+        expected_cache_epoch=0,
+    )
+    assert service.runtime_snapshot()['candidate_count'] == 1
+
+
+def test_inflight_dispatch_cannot_refresh_candidates_after_cache_clear() -> None:
+    service = SignalDeciderWaitRecheckService()
+    target_trade_date = date(2026, 10, 30)
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=target_trade_date,
+    )
+    assert candidate is not None
+    assert service.replace_candidate_cache([candidate])
+
+    event = SimpleNamespace(
+        target_trade_date=target_trade_date,
+        status='running',
+        result_snapshot_id=None,
+        result_action=None,
+        last_error_payload=None,
+        completed_at=None,
+        last_attempt_at=None,
+    )
+    session = Mock()
+    session.execute.return_value.scalar_one_or_none.return_value = event
+
+    class FakeSessionScope:
+        def __enter__(self) -> Mock:
+            return session
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    attempt = {
+        'symbol': '005930',
+        'agent_name': 'short-term-decider',
+        'source_market_date': date(2026, 10, 29),
+        'target_trade_date': target_trade_date,
+        'source_decision_run_id': 'source-run',
+        'request_run_id': 'wait-recheck-test',
+        'context': {},
+        'fs_div': 'CFS',
+        'disclosures_limit': 5,
+        'knowledge_cutoff_at': None,
+        'upstream_summary_run_id': None,
+    }
+    dispatch_started = Event()
+    release_dispatch = Event()
+    refresh_epochs: list[int | None] = []
+    dispatch_result: dict[str, object] = {}
+    dispatch_errors: list[BaseException] = []
+
+    def blocked_dispatch(**_: object) -> dict[str, object]:
+        dispatch_started.set()
+        if not release_dispatch.wait(timeout=5):
+            raise TimeoutError('test dispatch release timed out')
+        raise RuntimeError('provider failed after shutdown')
+
+    def reload_source(
+        *,
+        target_trade_date: date,
+        expected_cache_epoch: int | None = None,
+    ) -> Mock:
+        assert target_trade_date == event.target_trade_date
+        refresh_epochs.append(expected_cache_epoch)
+        service.replace_candidate_cache(
+            [candidate],
+            expected_cache_epoch=expected_cache_epoch,
+        )
+        return Mock()
+
+    def run_dispatch() -> None:
+        try:
+            dispatch_result.update(
+                service._dispatch_event(
+                    19,
+                    now=datetime(2026, 10, 30, 0, 5, tzinfo=timezone.utc),
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            dispatch_errors.append(exc)
+
+    with (
+        patch.object(service, '_begin_attempt', return_value=attempt),
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope',
+            return_value=FakeSessionScope(),
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.'
+            '_target_regular_session_is_open_at',
+            return_value=True,
+        ),
+        patch.object(
+            service,
+            'load_subscription_source',
+            side_effect=reload_source,
+        ),
+        patch(
+            'app.agent_context.orchestrator.agent_feedback_orchestrator.'
+            'dispatch_for_symbols',
+            side_effect=blocked_dispatch,
+        ),
+    ):
+        dispatch_thread = Thread(target=run_dispatch)
+        dispatch_thread.start()
+        try:
+            assert dispatch_started.wait(timeout=5)
+            assert service.clear_candidate_cache()
+            assert service.runtime_snapshot()['candidate_count'] == 0
+        finally:
+            release_dispatch.set()
+            dispatch_thread.join(timeout=5)
+
+    assert not dispatch_thread.is_alive()
+    assert dispatch_errors == []
+    assert dispatch_result == {'event_id': 19, 'status': 'failed'}
+    assert refresh_epochs == [0]
+    assert service.runtime_snapshot()['candidate_count'] == 0
+
+
+def test_candidate_refresh_crossing_close_clears_loaded_cache() -> None:
+    service = SignalDeciderWaitRecheckService()
+    before_close = datetime(2026, 10, 30, 6, 29, 59, tzinfo=timezone.utc)
+    after_close = datetime(2026, 10, 30, 6, 30, 1, tzinfo=timezone.utc)
+
+    with (
+        patch(
+            'app.agent_context.wait_recheck_service._utcnow',
+            side_effect=(before_close, after_close),
+        ),
+        patch.object(service, 'load_subscription_source') as load_source,
+        patch.object(service, 'clear_candidate_cache') as clear_cache,
+    ):
+        service._refresh_candidate_cache_during_target_session(
+            target_trade_date=date(2026, 10, 30),
+        )
+
+    load_source.assert_called_once_with(
+        target_trade_date=date(2026, 10, 30),
+        expected_cache_epoch=0,
+    )
+    clear_cache.assert_called_once_with()
+
+
 def test_realtime_tick_queues_once_only_for_fresh_subscribed_ask_inside_band() -> None:
     service = SignalDeciderWaitRecheckService()
     candidate = build_wait_recheck_candidate(
@@ -482,9 +811,12 @@ def test_rr_prefilter_blocks_short_before_claim_but_keeps_signal_lane() -> None:
         market='KRX',
         state='OPEN',
         is_trading_day=True,
+        is_open=True,
         server_time='2026-10-21T09:05:05+09:00',
         session_open_at='2026-10-21T09:00:00+09:00',
         session_close_at='2026-10-21T15:30:00+09:00',
+        calendar_source='kis_chk_holiday',
+        calendar_source_status='ok',
     )
     short_only = SignalDeciderWaitRecheckService()
     with patch.object(
@@ -509,6 +841,50 @@ def test_rr_prefilter_blocks_short_before_claim_but_keeps_signal_lane() -> None:
             result = short_only.run_open_cycle(market=market)
     assert result['status'] == 'idle'
     claim.assert_not_called()
+
+
+def test_open_cycle_rejects_fallback_calendar_and_clears_candidates() -> None:
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=date(2026, 10, 21),
+    )
+    assert candidate is not None
+    service = SignalDeciderWaitRecheckService()
+    service.replace_candidate_cache([candidate])
+    market_time = datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc)
+    market = SimpleNamespace(
+        market='KRX',
+        state='OPEN',
+        is_trading_day=True,
+        is_open=True,
+        server_time=market_time.isoformat(),
+        session_open_at='2026-10-21T09:00:00+09:00',
+        session_close_at='2026-10-21T15:30:00+09:00',
+        calendar_source='exchange_calendars',
+        calendar_source_status='fallback',
+    )
+
+    with (
+        patch.object(
+            settings,
+            'signal_decider_wait_recheck_monitoring_enabled',
+            True,
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service._utcnow',
+            return_value=market_time,
+        ),
+        patch.object(service, '_retry_event_ids', return_value=[17]),
+        patch.object(service, '_dispatch_event') as dispatch,
+    ):
+        result = service.run_open_cycle(market=market)
+
+    assert result == {
+        'status': 'not_due',
+        'direct_order_authority': False,
+    }
+    assert service.runtime_snapshot()['candidate_count'] == 0
+    dispatch.assert_not_called()
 
 
 def test_pending_observation_is_cancelled_when_latest_price_fails_reward_risk() -> None:
@@ -703,9 +1079,12 @@ def test_preopen_ticks_never_queue_and_aged_observations_are_discarded() -> None
             market='KRX',
             state='OPEN',
             is_trading_day=True,
+            is_open=True,
             server_time=server_time,
             session_open_at='2026-10-21T09:00:00+09:00',
             session_close_at='2026-10-21T15:30:00+09:00',
+            calendar_source='kis_chk_holiday',
+            calendar_source_status='ok',
         )
         with (
             patch(
@@ -761,10 +1140,13 @@ def test_pending_touch_refreshes_to_latest_tick_before_open_cycle() -> None:
         market='KRX',
         state='OPEN',
         is_trading_day=True,
+        is_open=True,
         # Simulate the runner's market snapshot predating the latest WS tick.
         server_time=(latest_observed_at - timedelta(seconds=10)).isoformat(),
         session_open_at='2026-10-21T09:00:00+09:00',
         session_close_at='2026-10-21T15:30:00+09:00',
+        calendar_source='kis_chk_holiday',
+        calendar_source_status='ok',
     )
     with (
         patch.object(
@@ -794,6 +1176,513 @@ def test_pending_touch_refreshes_to_latest_tick_before_open_cycle() -> None:
     claimed_observation = claim.call_args.kwargs['observation']
     assert claimed_observation.received_at == latest_observed_at
     assert claimed_observation.observed_price == 71_100
+
+
+def test_open_cycle_preserves_epoch_across_claim_to_dispatch_gap() -> None:
+    service = SignalDeciderWaitRecheckService()
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=date(2026, 10, 21),
+    )
+    assert candidate is not None
+    observed_at = datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc)
+    assert _enqueue_supported_window(
+        service,
+        candidate=candidate,
+        end_at=observed_at,
+    ) == (False, False, True)
+    market = SimpleNamespace(
+        market='KRX',
+        state='OPEN',
+        is_trading_day=True,
+        is_open=True,
+        server_time=observed_at.isoformat(),
+        session_open_at='2026-10-21T09:00:00+09:00',
+        session_close_at='2026-10-21T15:30:00+09:00',
+        calendar_source='kis_chk_holiday',
+        calendar_source_status='ok',
+    )
+
+    def clear_during_claim(**_: object) -> int:
+        service.clear_candidate_cache()
+        return 17
+
+    with (
+        patch.object(
+            settings,
+            'signal_decider_wait_recheck_monitoring_enabled',
+            True,
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service._utcnow',
+            return_value=observed_at,
+        ),
+        patch.object(
+            service,
+            '_claim_observation',
+            side_effect=clear_during_claim,
+        ),
+        patch.object(service, '_retry_event_ids', return_value=[]),
+        patch.object(
+            service,
+            '_dispatch_event',
+            return_value={'event_id': 17, 'status': 'completed'},
+        ) as dispatch,
+        patch.object(
+            service,
+            '_expire_queued_event_after_session_revocation',
+        ) as expire_queued_event,
+    ):
+        result = service.run_open_cycle(market=market)
+
+    assert result['events_processed'] == 0
+    assert result['status'] == 'idle'
+    assert service.candidate_cache_epoch() == 1
+    dispatch.assert_not_called()
+    expire_queued_event.assert_called_once_with(17, now=observed_at)
+
+
+def test_stale_scheduled_open_cycle_is_rejected_before_market_work() -> None:
+    service = SignalDeciderWaitRecheckService()
+    scheduled_epoch = service.candidate_cache_epoch()
+    service.clear_candidate_cache()
+
+    with patch.object(service, '_retry_event_ids') as retry_event_ids:
+        result = service.run_open_cycle(
+            market=SimpleNamespace(),
+            expected_cache_epoch=scheduled_epoch,
+        )
+
+    assert result == {
+        'status': 'not_due',
+        'direct_order_authority': False,
+    }
+    retry_event_ids.assert_not_called()
+
+
+def test_dispatch_rejects_revoked_epoch_before_begin_attempt() -> None:
+    service = SignalDeciderWaitRecheckService()
+    dispatch_epoch = service.candidate_cache_epoch()
+    service.clear_candidate_cache()
+
+    with (
+        patch.object(service, '_begin_attempt') as begin_attempt,
+        patch.object(
+            service,
+            '_expire_queued_event_after_session_revocation',
+        ) as expire_queued_event,
+    ):
+        result = service._dispatch_event(
+            17,
+            now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            expected_cache_epoch=dispatch_epoch,
+        )
+
+    assert result == {'event_id': 17, 'status': 'not_dispatched'}
+    begin_attempt.assert_not_called()
+    expire_queued_event.assert_called_once_with(
+        17,
+        now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+    )
+
+
+def test_dispatch_revoked_after_begin_expires_without_provider_call() -> None:
+    service = SignalDeciderWaitRecheckService()
+    dispatch_epoch = service.candidate_cache_epoch()
+    attempt = {
+        'request_run_id': 'wait-recheck-revoked-before-provider',
+    }
+
+    def begin_then_revoke(*_: object, **__: object) -> dict[str, object]:
+        service.clear_candidate_cache()
+        return attempt
+
+    with (
+        patch.object(
+            service,
+            '_begin_attempt',
+            side_effect=begin_then_revoke,
+        ) as begin_attempt,
+        patch.object(service, '_finish_event') as finish_event,
+        patch(
+            'app.agent_context.orchestrator.agent_feedback_orchestrator.'
+            'dispatch_for_symbols'
+        ) as dispatch_for_symbols,
+    ):
+        result = service._dispatch_event(
+            18,
+            now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            expected_cache_epoch=dispatch_epoch,
+        )
+
+    assert result == {'event_id': 18, 'status': 'not_dispatched'}
+    begin_attempt.assert_called_once_with(
+        18,
+        now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+        expected_cache_epoch=dispatch_epoch,
+    )
+    dispatch_for_symbols.assert_not_called()
+    finish_event.assert_called_once_with(
+        event_id=18,
+        request_run_id='wait-recheck-revoked-before-provider',
+        status='expired',
+        error_code='wait_recheck_market_session_revoked',
+        expected_cache_epoch=dispatch_epoch,
+    )
+
+
+def test_dispatch_revocation_wins_linearized_provider_admission() -> None:
+    service = SignalDeciderWaitRecheckService()
+    dispatch_epoch = service.candidate_cache_epoch()
+    begin_completed = Event()
+    result_holder: dict[str, object] = {}
+    attempt = {
+        'request_run_id': 'wait-recheck-revoked-at-provider-admission',
+    }
+
+    def begin_attempt(*_: object, **__: object) -> dict[str, object]:
+        begin_completed.set()
+        return attempt
+
+    def run_dispatch() -> None:
+        result_holder['result'] = service._dispatch_event(
+            19,
+            now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            expected_cache_epoch=dispatch_epoch,
+        )
+
+    with (
+        patch.object(
+            service,
+            '_begin_attempt',
+            side_effect=begin_attempt,
+        ),
+        patch.object(service, '_finish_event') as finish_event,
+        patch(
+            'app.agent_context.orchestrator.agent_feedback_orchestrator.'
+            'dispatch_for_symbols'
+        ) as dispatch_for_symbols,
+    ):
+        # Hold the shared admission boundary until _begin_attempt has durably
+        # claimed the event, then let revocation linearize before provider
+        # entry.  The worker must observe the new epoch after it acquires the
+        # same boundary and must never call the provider.
+        with service._dispatch_entry_lock:
+            worker = Thread(target=run_dispatch)
+            worker.start()
+            assert begin_completed.wait(timeout=1)
+            service.clear_candidate_cache()
+        worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert result_holder['result'] == {
+        'event_id': 19,
+        'status': 'not_dispatched',
+    }
+    dispatch_for_symbols.assert_not_called()
+    finish_event.assert_called_once_with(
+        event_id=19,
+        request_run_id='wait-recheck-revoked-at-provider-admission',
+        status='expired',
+        error_code='wait_recheck_market_session_revoked',
+        expected_cache_epoch=dispatch_epoch,
+    )
+
+
+def test_revoked_dispatch_releases_admission_before_durable_expiry() -> None:
+    service = SignalDeciderWaitRecheckService()
+    dispatch_epoch = service.candidate_cache_epoch()
+    finish_started = Event()
+    allow_finish = Event()
+    second_clear_completed = Event()
+
+    def begin_then_revoke(*_: object, **__: object) -> dict[str, object]:
+        service.clear_candidate_cache()
+        return {
+            'request_run_id': 'wait-recheck-revoked-slow-expiry',
+        }
+
+    def slow_finish(**_: object) -> None:
+        finish_started.set()
+        assert allow_finish.wait(timeout=1)
+
+    def run_dispatch() -> None:
+        service._dispatch_event(
+            20,
+            now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            expected_cache_epoch=dispatch_epoch,
+        )
+
+    def clear_again() -> None:
+        service.clear_candidate_cache()
+        second_clear_completed.set()
+
+    with (
+        patch.object(
+            service,
+            '_begin_attempt',
+            side_effect=begin_then_revoke,
+        ),
+        patch.object(
+            service,
+            '_finish_event',
+            side_effect=slow_finish,
+        ),
+        patch(
+            'app.agent_context.orchestrator.agent_feedback_orchestrator.'
+            'dispatch_for_symbols'
+        ) as dispatch_for_symbols,
+    ):
+        dispatch_worker = Thread(target=run_dispatch)
+        dispatch_worker.start()
+        assert finish_started.wait(timeout=1)
+        clear_worker = Thread(target=clear_again)
+        clear_worker.start()
+        assert second_clear_completed.wait(timeout=1)
+        allow_finish.set()
+        dispatch_worker.join(timeout=1)
+        clear_worker.join(timeout=1)
+
+    assert not dispatch_worker.is_alive()
+    assert not clear_worker.is_alive()
+    dispatch_for_symbols.assert_not_called()
+
+
+def test_session_revocation_rearms_only_through_fresh_evidence_retry() -> None:
+    revoked_at = datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc)
+    event = SimpleNamespace(
+        status='expired',
+        last_attempt_at=revoked_at,
+        updated_at=revoked_at,
+        observed_at=revoked_at - timedelta(seconds=5),
+        attempt_count=0,
+        last_error_payload={
+            'code': 'wait_recheck_market_session_revoked',
+        },
+    )
+
+    assert _event_retry_not_before(event) == revoked_at
+
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=date(2026, 10, 21),
+    )
+    assert candidate is not None
+    retry_candidate = replace(
+        candidate,
+        rearm_not_before=revoked_at,
+        retry_event_id=19,
+    )
+    fresh_observation = _supported_observation(
+        retry_candidate,
+        end_at=revoked_at + timedelta(seconds=5),
+    )
+    stale_observation = replace(
+        fresh_observation,
+        received_at=revoked_at - timedelta(seconds=1),
+        price_as_of=revoked_at - timedelta(seconds=1),
+    )
+    service = SignalDeciderWaitRecheckService()
+
+    assert not service._observation_is_dispatchable(
+        stale_observation,
+        market_now=stale_observation.received_at,
+        session_open_at=datetime(
+            2026,
+            10,
+            21,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        ),
+    )
+    assert service._observation_is_dispatchable(
+        fresh_observation,
+        market_now=fresh_observation.received_at,
+        session_open_at=datetime(
+            2026,
+            10,
+            21,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        ),
+    )
+
+
+def test_pre_provider_revocation_restores_reserved_attempt_budget() -> None:
+    service = SignalDeciderWaitRecheckService()
+    revoked_at = datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc)
+    maximum_attempts = settings.signal_decider_wait_recheck_max_attempts
+    event = SimpleNamespace(
+        target_trade_date=date(2026, 10, 21),
+        status='running',
+        attempt_count=maximum_attempts,
+        request_run_id='wait-recheck-revoked-before-provider',
+        result_snapshot_id=None,
+        result_action=None,
+        last_error_payload=None,
+        completed_at=None,
+        last_attempt_at=revoked_at,
+        updated_at=revoked_at,
+        observed_at=revoked_at - timedelta(seconds=5),
+    )
+    session = Mock()
+    session.execute.return_value.scalar_one_or_none.return_value = event
+
+    class FakeSessionScope:
+        def __enter__(self) -> Mock:
+            return session
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    with (
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope',
+            return_value=FakeSessionScope(),
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service._utcnow',
+            return_value=revoked_at,
+        ),
+    ):
+        service._finish_event(
+            event_id=20,
+            request_run_id='wait-recheck-revoked-before-provider',
+            status='expired',
+            error_code='wait_recheck_market_session_revoked',
+            expected_cache_epoch=service.candidate_cache_epoch(),
+        )
+
+    assert event.status == 'expired'
+    assert event.attempt_count == maximum_attempts - 1
+    assert event.request_run_id is None
+    assert event.last_error_payload == {
+        'code': 'wait_recheck_market_session_revoked',
+    }
+    assert _event_retry_not_before(event) == revoked_at
+
+    # Fresh evidence archives the revoked attempt before reusing the restored
+    # attempt number.  The never-dispatched reservation must not poison the
+    # successfully completed retry that receives the same deterministic id.
+    reused_run_id = 'wait-recheck-revoked-before-provider'
+    event.attempt_history_payload = [
+        {
+            'status': 'expired',
+            'request_run_id': event.request_run_id,
+        }
+    ]
+    event.status = 'completed'
+    event.request_run_id = reused_run_id
+    assert reused_run_id not in _unaccepted_decision_run_ids([event])
+
+
+def test_invalid_begin_attempt_cannot_refresh_after_concurrent_clear() -> None:
+    service = SignalDeciderWaitRecheckService()
+    target_trade_date = date(2026, 10, 21)
+    candidate = build_wait_recheck_candidate(
+        _snapshot(),
+        target_trade_date=target_trade_date,
+    )
+    assert candidate is not None
+    assert service.replace_candidate_cache([candidate])
+    begin_epoch = service.candidate_cache_epoch()
+    event = SimpleNamespace(
+        attempt_count=0,
+        status='queued',
+        context_payload={'invalid': True},
+        context_sha256='invalid',
+        target_trade_date=target_trade_date,
+        last_attempt_at=None,
+        last_error_payload=None,
+    )
+    session = Mock()
+    session.execute.return_value.scalar_one_or_none.return_value = event
+
+    class ClearingSessionScope:
+        def __enter__(self) -> Mock:
+            return session
+
+        def __exit__(self, *_: object) -> None:
+            service.clear_candidate_cache()
+
+    committed: list[bool] = []
+
+    def reload_source(
+        *,
+        target_trade_date: date,
+        expected_cache_epoch: int | None = None,
+    ) -> Mock:
+        assert target_trade_date == event.target_trade_date
+        committed.append(
+            service.replace_candidate_cache(
+                [candidate],
+                expected_cache_epoch=expected_cache_epoch,
+            )
+        )
+        return Mock()
+
+    with (
+        patch(
+            'app.agent_context.wait_recheck_service.session_scope',
+            return_value=ClearingSessionScope(),
+        ),
+        patch(
+            'app.agent_context.wait_recheck_service.'
+            '_target_regular_session_is_open_at',
+            return_value=True,
+        ),
+        patch.object(
+            service,
+            'load_subscription_source',
+            side_effect=reload_source,
+        ),
+    ):
+        result = service._begin_attempt(
+            19,
+            now=datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc),
+            expected_cache_epoch=begin_epoch,
+        )
+
+    assert result is None
+    assert event.status == 'expired'
+    assert committed == [False]
+    assert service.runtime_snapshot()['candidate_count'] == 0
+
+
+def test_session_revocation_expires_durable_queued_event() -> None:
+    service = SignalDeciderWaitRecheckService()
+    event = SimpleNamespace(
+        status='queued',
+        last_attempt_at=None,
+        last_error_payload=None,
+    )
+    session = Mock()
+    session.execute.return_value.scalar_one_or_none.return_value = event
+
+    class FakeSessionScope:
+        def __enter__(self) -> Mock:
+            return session
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    revoked_at = datetime(2026, 10, 21, 0, 5, tzinfo=timezone.utc)
+    with patch(
+        'app.agent_context.wait_recheck_service.session_scope',
+        return_value=FakeSessionScope(),
+    ):
+        service._expire_queued_event_after_session_revocation(
+            20,
+            now=revoked_at,
+        )
+
+    assert event.status == 'expired'
+    assert event.last_attempt_at == revoked_at
+    assert event.last_error_payload == {
+        'code': 'wait_recheck_market_session_revoked',
+    }
 
 
 def test_wait_recheck_context_is_immutable_and_grants_no_order_authority() -> None:
@@ -1456,28 +2345,35 @@ def test_dispatch_event_calls_only_fresh_short_term_recompute_contract() -> None
         assert result['status'] == 'completed'
         assert result['result_action'] == 'watch_for_trigger'
         assert result['direct_order_authority'] is False
-        dispatch.assert_called_once_with(
-            market_date=date(2026, 10, 20),
-            symbols=['005930'],
-            roles=('short-term-decider',),
-            fs_div='CFS',
-            disclosures_limit=5,
-            knowledge_cutoff_at='2026-10-20T11:00:00+00:00',
-            policy_context_as_of_date=date(2026, 10, 21),
-            reuse_existing=True,
-            request_run_id=request_run_id,
-            parent_run_id='source-run',
-            force=False,
-            force_recompute=True,
-            upstream_summary_run_id='summary-run',
-            source_context_overlays={'005930': context},
+        dispatch.assert_called_once()
+        dispatch_kwargs = dict(dispatch.call_args.kwargs)
+        dispatch_entry_callback = dispatch_kwargs.pop(
+            '_dispatch_entry_callback'
         )
+        assert callable(dispatch_entry_callback)
+        assert dispatch_kwargs == {
+            'market_date': date(2026, 10, 20),
+            'symbols': ['005930'],
+            'roles': ('short-term-decider',),
+            'fs_div': 'CFS',
+            'disclosures_limit': 5,
+            'knowledge_cutoff_at': '2026-10-20T11:00:00+00:00',
+            'policy_context_as_of_date': date(2026, 10, 21),
+            'reuse_existing': True,
+            'request_run_id': request_run_id,
+            'parent_run_id': 'source-run',
+            'force': False,
+            'force_recompute': True,
+            'upstream_summary_run_id': 'summary-run',
+            'source_context_overlays': {'005930': context},
+        }
         finish_event.assert_called_once_with(
             event_id=9,
             request_run_id=request_run_id,
             status='completed',
             result_snapshot_id=result_snapshot_id,
             result_action='watch_for_trigger',
+            expected_cache_epoch=0,
         )
     finally:
         with session_scope() as session:
@@ -1589,6 +2485,7 @@ def test_dispatch_event_recomputes_exact_signal_agent_and_reads_signal_buy() -> 
             status='completed',
             result_snapshot_id=result_snapshot_id,
             result_action='buy',
+            expected_cache_epoch=0,
         )
     finally:
         with session_scope() as session:
@@ -1662,6 +2559,11 @@ def test_durable_claim_is_unique_and_context_readback_is_verified() -> None:
         with (
             patch(
                 'app.agent_context.wait_recheck_service.'
+                'is_krx_trading_day',
+                return_value=True,
+            ),
+            patch(
+                'app.agent_context.wait_recheck_service.'
                 'previous_krx_trading_date',
                 return_value=source_market_date,
             ),
@@ -1715,6 +2617,7 @@ def test_durable_claim_is_unique_and_context_readback_is_verified() -> None:
             event_id=event_id,
             request_run_id='stale-attempt',
             status='completed',
+            expected_cache_epoch=service.candidate_cache_epoch(),
             result_action='watch_for_trigger',
         )
         with session_scope() as session:
@@ -1726,6 +2629,7 @@ def test_durable_claim_is_unique_and_context_readback_is_verified() -> None:
             event_id=event_id,
             request_run_id=first_attempt['request_run_id'],
             status='completed',
+            expected_cache_epoch=service.candidate_cache_epoch(),
             result_action='wait',
         )
         context = load_validated_wait_recheck_context(
@@ -1930,6 +2834,11 @@ def test_stale_queued_event_immediately_restores_fresh_evidence_membership() -> 
             ),
             patch(
                 'app.agent_context.wait_recheck_service.'
+                'is_krx_trading_day',
+                return_value=True,
+            ),
+            patch(
+                'app.agent_context.wait_recheck_service.'
                 'previous_krx_trading_date',
                 return_value=source_market_date,
             ),
@@ -1960,7 +2869,11 @@ def test_stale_queued_event_immediately_restores_fresh_evidence_membership() -> 
                     + 1
                 )
             )
-            assert service._begin_attempt(event_id, now=stale_now) is None
+            with patch(
+                'app.agent_context.wait_recheck_service._utcnow',
+                return_value=stale_now,
+            ):
+                assert service._begin_attempt(event_id, now=stale_now) is None
 
             # _begin_attempt refreshes only after the expiry commit. No manual
             # membership poll is needed to resume collecting a new window.
@@ -2134,6 +3047,11 @@ def test_completed_wait_rearms_generation_two_after_cooldown_and_caps_lineage() 
                 settings,
                 'signal_decider_wait_recheck_max_generations_per_day',
                 2,
+            ),
+            patch(
+                'app.agent_context.wait_recheck_service.'
+                'is_krx_trading_day',
+                return_value=True,
             ),
             patch(
                 'app.agent_context.wait_recheck_service.'
@@ -2386,6 +3304,11 @@ def test_failed_attempt_waits_for_fresh_evidence_and_archives_retry_context() ->
             ),
             patch(
                 'app.agent_context.wait_recheck_service.'
+                'is_krx_trading_day',
+                return_value=True,
+            ),
+            patch(
+                'app.agent_context.wait_recheck_service.'
                 'previous_krx_trading_date',
                 return_value=source_market_date,
             ),
@@ -2420,6 +3343,7 @@ def test_failed_attempt_waits_for_fresh_evidence_and_archives_retry_context() ->
                     event_id=event_id,
                     request_run_id=first_attempt['request_run_id'],
                     status='failed',
+                    expected_cache_epoch=service.candidate_cache_epoch(),
                     error_code='provider_rate_limited',
                 )
 

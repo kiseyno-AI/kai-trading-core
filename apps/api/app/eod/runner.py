@@ -20,6 +20,10 @@ from app.eod.auto_pykrx import (
 )
 from app.eod.master import refresh_master_if_due
 from app.market.clock import async_get_market_state
+from app.market.session import (
+    CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
+    CALENDAR_SOURCE_STATUS_OK,
+)
 from app.market.snapshot import market_snapshot_service
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
@@ -434,6 +438,40 @@ class EODBackgroundRunner:
         )
         return True
 
+    async def _schedule_wait_recheck_open_cycle(self) -> bool:
+        cache_epoch_before_market_read = (
+            signal_decider_wait_recheck_service.candidate_cache_epoch()
+        )
+        market = await async_get_market_state()
+        scheduled_cache_epoch = (
+            signal_decider_wait_recheck_service.candidate_cache_epoch()
+        )
+        if (
+            not self._running
+            or cache_epoch_before_market_read != scheduled_cache_epoch
+            or str(getattr(market, 'market', '') or '').strip().upper()
+            != 'KRX'
+            or str(getattr(market, 'state', '') or '').strip().upper()
+            != 'OPEN'
+            or not bool(getattr(market, 'is_trading_day', False))
+            or not bool(getattr(market, 'is_open', False))
+            or getattr(market, 'calendar_source', None)
+            != CALENDAR_SOURCE_KIS_CHK_HOLIDAY
+            or getattr(market, 'calendar_source_status', None)
+            != CALENDAR_SOURCE_STATUS_OK
+        ):
+            return False
+        return self._schedule_blocking_step(
+            WAIT_RECHECK_SINGLE_FLIGHT_KEY,
+            lambda market_snapshot=market, cache_epoch=scheduled_cache_epoch: (
+                signal_decider_wait_recheck_service.run_open_cycle(
+                    market=market_snapshot,
+                    expected_cache_epoch=cache_epoch,
+                )
+            ),
+            wake_on_follow_up=True,
+        )
+
     def _finalize_scheduled_blocking_step(
         self,
         name: str,
@@ -737,15 +775,7 @@ class EODBackgroundRunner:
                     )
                     market_snapshot_refreshed = True
                     if settings.signal_decider_wait_recheck_monitoring_enabled:
-                        self._schedule_blocking_step(
-                            WAIT_RECHECK_SINGLE_FLIGHT_KEY,
-                            lambda market_snapshot=market: (
-                                signal_decider_wait_recheck_service.run_open_cycle(
-                                    market=market_snapshot
-                                )
-                            ),
-                            wake_on_follow_up=True,
-                        )
+                        await self._schedule_wait_recheck_open_cycle()
                 if runtime_background_enabled and market.state == 'PREOPEN':
                     await self._run_buy_authority_critical_step(
                         name='refresh_master_if_due',

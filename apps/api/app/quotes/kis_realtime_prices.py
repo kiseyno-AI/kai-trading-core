@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
@@ -23,6 +23,12 @@ from app.brokers.kis.client import (
 )
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
+from app.market.clock import async_get_market_state
+from app.market.session import (
+    CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
+    CALENDAR_SOURCE_STATUS_OK,
+    CALENDAR_SOURCE_STATUS_UNAVAILABLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,7 @@ KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
 KIS_REALTIME_PRICE_PING_INTERVAL_SECONDS = 30.0
 KIS_REALTIME_PRICE_PING_TIMEOUT_SECONDS = 10.0
 KIS_REALTIME_PRICE_SOURCE_REFRESH_TIMEOUT_SECONDS = 10.0
+KIS_REALTIME_PRICE_MARKET_STATE_POLL_SECONDS = 5.0
 KIS_REALTIME_PRICE_SOURCE_MAX_FUTURE_SKEW = timedelta(seconds=30)
 KIS_REALTIME_MONITORED_SOURCE_SCHEMA_VERSION = (
     'execution_runtime_dashboard_read_model_v1'
@@ -326,6 +333,14 @@ class KISRealtimePriceService:
             'enabled': settings.kis_realtime_price_enabled,
             'configured': False,
             'status': 'idle',
+            'websocket_connected': False,
+            'market_state': None,
+            'market_session_active': False,
+            'market_calendar_source': None,
+            'market_calendar_source_status': None,
+            'market_calendar_source_error': None,
+            'market_session_open_at': None,
+            'market_session_close_at': None,
             'environment': self.client._environment(),
             'tr_id': self._price_tr_id(),
             'ws_url': self.client.websocket_url(),
@@ -430,6 +445,7 @@ class KISRealtimePriceService:
     def _mark_connected(self) -> None:
         with self._state_lock:
             self._health['status'] = 'connected'
+            self._health['websocket_connected'] = True
             self._health['last_connected_at'] = _isoformat(_utc_now())
             self._health['consecutive_failures'] = 0
             self._subscribed_symbols = set()
@@ -437,6 +453,7 @@ class KISRealtimePriceService:
 
     def _mark_disconnected(self) -> None:
         with self._state_lock:
+            self._health['websocket_connected'] = False
             self._health['last_disconnected_at'] = _isoformat(_utc_now())
             self._subscribed_symbols = set()
             self._sync_health_symbols_locked()
@@ -444,6 +461,192 @@ class KISRealtimePriceService:
     def _increment_reconnect_attempt(self) -> None:
         with self._state_lock:
             self._health['reconnect_attempts'] = int(self._health['reconnect_attempts']) + 1
+
+    @staticmethod
+    def _market_session_is_active(market: Any) -> bool:
+        server_time = _parse_iso_datetime(
+            getattr(market, 'server_time', None)
+        )
+        session_open_at = _parse_iso_datetime(
+            getattr(market, 'session_open_at', None)
+        )
+        session_close_at = _parse_iso_datetime(
+            getattr(market, 'session_close_at', None)
+        )
+        now = _utc_now()
+        return bool(
+            str(getattr(market, 'market', '') or '').strip().upper()
+            == 'KRX'
+            and str(getattr(market, 'state', '') or '').strip().upper()
+            == 'OPEN'
+            and bool(getattr(market, 'is_trading_day', False))
+            and bool(getattr(market, 'is_open', False))
+            and getattr(market, 'calendar_source', None)
+            == CALENDAR_SOURCE_KIS_CHK_HOLIDAY
+            and getattr(market, 'calendar_source_status', None)
+            == CALENDAR_SOURCE_STATUS_OK
+            and server_time is not None
+            and session_open_at is not None
+            and session_close_at is not None
+            and session_open_at <= server_time <= session_close_at
+            and session_open_at <= now <= session_close_at
+        )
+
+    def _recorded_market_session_is_active(self) -> bool:
+        with self._state_lock:
+            active = bool(self._health.get('market_session_active'))
+            session_open_at = _parse_iso_datetime(
+                self._health.get('market_session_open_at')
+            )
+            session_close_at = _parse_iso_datetime(
+                self._health.get('market_session_close_at')
+            )
+        now = _utc_now()
+        return bool(
+            active
+            and session_open_at is not None
+            and session_close_at is not None
+            and session_open_at <= now <= session_close_at
+        )
+
+    def _record_market_session(self, market: Any, *, active: bool) -> str:
+        market_state = (
+            str(getattr(market, 'state', '') or '').strip().upper()
+            or 'UNKNOWN'
+        )
+        with self._state_lock:
+            self._health['market_state'] = market_state
+            self._health['market_session_active'] = active
+            self._health['market_calendar_source'] = getattr(
+                market,
+                'calendar_source',
+                None,
+            )
+            self._health['market_calendar_source_status'] = getattr(
+                market,
+                'calendar_source_status',
+                None,
+            )
+            self._health['market_calendar_source_error'] = getattr(
+                market,
+                'calendar_source_error',
+                None,
+            )
+            self._health['market_session_open_at'] = getattr(
+                market,
+                'session_open_at',
+                None,
+            )
+            self._health['market_session_close_at'] = getattr(
+                market,
+                'session_close_at',
+                None,
+            )
+        return market_state
+
+    def _clear_wait_recheck_membership_for_closed_market(
+        self,
+    ) -> None:
+        with self._state_lock:
+            has_wait_recheck_membership = bool(self._wait_recheck_symbols)
+            base_symbol_order = list(self._base_symbol_order)
+            source_version = self._last_source_version
+
+        if has_wait_recheck_membership:
+            self._replace_monitored_symbols(
+                base_symbol_order,
+                trigger='market_session_inactive',
+                source_version=source_version,
+            )
+        self._clear_wait_recheck_candidate_cache()
+
+    @staticmethod
+    def _clear_wait_recheck_candidate_cache() -> None:
+        try:
+            from app.agent_context.wait_recheck_service import (
+                signal_decider_wait_recheck_service,
+            )
+
+            signal_decider_wait_recheck_service.clear_candidate_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'WAIT recheck cache clear failed closed: %s',
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    def _without_wait_recheck_membership(
+        source: KISRealtimeMonitoredSymbolSource,
+    ) -> KISRealtimeMonitoredSymbolSource:
+        source_symbols = list(dict.fromkeys(source.symbols))
+        declared_wait = set(source.wait_recheck_symbols)
+        protected = set(source.protected_symbols)
+        if source.base_symbols is None:
+            base_order = [
+                symbol
+                for symbol in source_symbols
+                if symbol not in declared_wait or symbol in protected
+            ]
+        else:
+            base_order = [
+                symbol
+                for symbol in source.base_symbols
+                if symbol in source_symbols
+            ]
+            base_order.extend(
+                symbol
+                for symbol in source_symbols
+                if symbol not in declared_wait
+                and symbol not in base_order
+            )
+        base_order = list(dict.fromkeys(base_order))
+        base_symbols = set(base_order)
+        return replace(
+            source,
+            symbols=tuple(base_order),
+            protected_symbols=tuple(
+                symbol
+                for symbol in source.protected_symbols
+                if symbol in base_symbols
+            ),
+            critical_protected_symbols=tuple(
+                symbol
+                for symbol in source.critical_protected_symbols
+                if symbol in base_symbols
+            ),
+            base_symbols=tuple(base_order),
+            wait_recheck_symbols=(),
+            wait_recheck_membership_complete=True,
+            wait_recheck_source_version=_utc_now(),
+        )
+
+    def _set_market_idle(self, market: Any) -> None:
+        market_state = self._record_market_session(market, active=False)
+        with self._state_lock:
+            self._health['websocket_connected'] = False
+        self._clear_wait_recheck_membership_for_closed_market()
+        idle_state = (
+            'unverified'
+            if market_state == 'OPEN'
+            else market_state.lower()
+        )
+        self._set_status(f'idle_market_{idle_state}')
+
+    def _set_market_state_unverified(self, *, error: str) -> None:
+        with self._state_lock:
+            self._health['market_state'] = 'UNKNOWN'
+            self._health['market_session_active'] = False
+            self._health['market_calendar_source'] = None
+            self._health[
+                'market_calendar_source_status'
+            ] = CALENDAR_SOURCE_STATUS_UNAVAILABLE
+            self._health['market_calendar_source_error'] = error
+            self._health['market_session_open_at'] = None
+            self._health['market_session_close_at'] = None
+            self._health['websocket_connected'] = False
+            self._health['status'] = 'idle_market_unverified'
+            self._sync_health_symbols_locked()
+        self._clear_wait_recheck_membership_for_closed_market()
 
     async def start(self) -> None:
         self._set_status('starting')
@@ -474,6 +677,10 @@ class KISRealtimePriceService:
         self._source_refresh_task = None
         self._source_refresh_observation_revision = None
         self._websocket = None
+        with self._state_lock:
+            self._health['websocket_connected'] = False
+            self._health['market_session_active'] = False
+        self._clear_wait_recheck_membership_for_closed_market()
 
         if self._subscription_changed_event is not None:
             self._subscription_changed_event.set()
@@ -1267,6 +1474,9 @@ class KISRealtimePriceService:
                         membership_complete=False,
                     )
                 )
+                if not self._recorded_market_session_is_active():
+                    source = self._without_wait_recheck_membership(source)
+                    self._clear_wait_recheck_candidate_cache()
                 self._apply_runtime_monitored_source(
                     source,
                     trigger=trigger,
@@ -1291,8 +1501,12 @@ class KISRealtimePriceService:
             signal_decider_wait_recheck_service,
         )
 
+        if not self._recorded_market_session_is_active():
+            signal_decider_wait_recheck_service.clear_candidate_cache()
+            return self._without_wait_recheck_membership(base_source)
+
         if not settings.signal_decider_wait_recheck_monitoring_enabled:
-            signal_decider_wait_recheck_service.replace_candidate_cache(())
+            signal_decider_wait_recheck_service.clear_candidate_cache()
             with self._state_lock:
                 has_wait_recheck_membership = bool(
                     self._wait_recheck_symbols
@@ -1326,7 +1540,13 @@ class KISRealtimePriceService:
         wait_source = await asyncio.to_thread(
             signal_decider_wait_recheck_service.load_subscription_source,
             target_trade_date=target_trade_date,
+            expected_cache_epoch=(
+                signal_decider_wait_recheck_service.candidate_cache_epoch()
+            ),
         )
+        if not self._recorded_market_session_is_active():
+            signal_decider_wait_recheck_service.clear_candidate_cache()
+            return self._without_wait_recheck_membership(base_source)
         return merge_wait_recheck_monitored_source(
             base_source,
             symbols=wait_source.symbols,
@@ -1335,19 +1555,48 @@ class KISRealtimePriceService:
         )
 
     async def _run(self) -> None:
-        reconnect_delay = max(0.5, float(settings.kis_realtime_reconnect_base_delay_seconds))
+        base_reconnect_delay = max(
+            0.5,
+            float(settings.kis_realtime_reconnect_base_delay_seconds),
+        )
+        reconnect_delay = base_reconnect_delay
         max_reconnect_delay = max(reconnect_delay, float(settings.kis_realtime_reconnect_max_delay_seconds))
 
         while not self._stop_requested:
-            await self.refresh_subscription_source_if_due(trigger='background', force=False)
-            allowed_symbols, _ = self._target_symbols_snapshot()
-            if not allowed_symbols:
-                self._set_status('idle_no_symbols')
-                await self._wait_for_change_or_timeout(settings.kis_realtime_price_idle_poll_seconds)
-                continue
-
-            stage = 'approval'
+            stage = 'market_state'
             try:
+                market = await async_get_market_state()
+                if not self._market_session_is_active(market):
+                    reconnect_delay = base_reconnect_delay
+                    self._set_market_idle(market)
+                    await self._wait_for_change_or_timeout(
+                        settings.kis_realtime_price_idle_poll_seconds
+                    )
+                    continue
+                self._record_market_session(market, active=True)
+
+                stage = 'subscription_source'
+                await self.refresh_subscription_source_if_due(
+                    trigger='background',
+                    force=False,
+                )
+                stage = 'market_state'
+                market = await async_get_market_state()
+                if not self._market_session_is_active(market):
+                    reconnect_delay = base_reconnect_delay
+                    self._set_market_idle(market)
+                    continue
+                self._record_market_session(market, active=True)
+                allowed_symbols, _ = self._target_symbols_snapshot()
+                if not allowed_symbols:
+                    reconnect_delay = base_reconnect_delay
+                    self._set_status('idle_no_symbols')
+                    await self._wait_for_change_or_timeout(
+                        settings.kis_realtime_price_idle_poll_seconds
+                    )
+                    continue
+
+                stage = 'approval'
                 approval = await self.client.issue_approval_key()
                 with self._state_lock:
                     self._health['approval'] = {
@@ -1356,17 +1605,52 @@ class KISRealtimePriceService:
                         'message': 'approval_key_issued',
                     }
 
+                stage = 'market_state'
+                market = await async_get_market_state()
+                if not self._market_session_is_active(market):
+                    reconnect_delay = base_reconnect_delay
+                    self._set_market_idle(market)
+                    continue
+                self._record_market_session(market, active=True)
+
                 stage = 'connect'
                 async with websockets.connect(
                     self.client.websocket_url(),
                     ping_interval=KIS_REALTIME_PRICE_PING_INTERVAL_SECONDS,
                     ping_timeout=KIS_REALTIME_PRICE_PING_TIMEOUT_SECONDS,
                 ) as websocket:
+                    stage = 'market_state'
+                    market = await async_get_market_state()
+                    if not self._market_session_is_active(market):
+                        reconnect_delay = base_reconnect_delay
+                        self._set_market_idle(market)
+                        continue
+                    self._record_market_session(market, active=True)
                     self._websocket = websocket
                     self._mark_connected()
+                    stage = 'subscription'
                     await self._sync_subscriptions(websocket, approval_key=approval['approval_key'])
 
+                    next_market_state_check = 0.0
                     while not self._stop_requested:
+                        now_monotonic = time.monotonic()
+                        if now_monotonic >= next_market_state_check:
+                            stage = 'market_state'
+                            current_market = await async_get_market_state()
+                            if not self._market_session_is_active(
+                                current_market
+                            ):
+                                reconnect_delay = base_reconnect_delay
+                                self._set_market_idle(current_market)
+                                break
+                            self._record_market_session(
+                                current_market,
+                                active=True,
+                            )
+                            next_market_state_check = (
+                                time.monotonic()
+                                + KIS_REALTIME_PRICE_MARKET_STATE_POLL_SECONDS
+                            )
                         stage = 'receive'
                         await self._receive_or_refresh(
                             websocket,
@@ -1386,6 +1670,17 @@ class KISRealtimePriceService:
                     fatal=fatal,
                     retryable=retryable,
                 )
+                if stage == 'market_state':
+                    reconnect_delay = base_reconnect_delay
+                    self._set_market_state_unverified(error=str(exc))
+                    self._mark_disconnected()
+                    self._websocket = None
+                    if self._stop_requested:
+                        break
+                    await self._wait_for_change_or_timeout(
+                        settings.kis_realtime_price_idle_poll_seconds
+                    )
+                    continue
                 self._mark_disconnected()
                 self._websocket = None
                 if fatal or self._stop_requested:
@@ -1394,7 +1689,7 @@ class KISRealtimePriceService:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
             else:
-                reconnect_delay = max(0.5, float(settings.kis_realtime_reconnect_base_delay_seconds))
+                reconnect_delay = base_reconnect_delay
                 self._mark_disconnected()
                 self._websocket = None
 
@@ -1478,6 +1773,9 @@ class KISRealtimePriceService:
         return allowed, limited
 
     async def _sync_subscriptions(self, websocket: Any, *, approval_key: str) -> None:
+        if not self._recorded_market_session_is_active():
+            self._clear_wait_recheck_membership_for_closed_market()
+            return
         allowed_symbols, limited_symbols = self._target_symbols_snapshot()
         with self._state_lock:
             subscribed = set(self._subscribed_symbols)
@@ -1486,6 +1784,9 @@ class KISRealtimePriceService:
         subscribe_symbols = sorted(set(allowed_symbols) - subscribed)
 
         for symbol in unsubscribe_symbols:
+            if not self._recorded_market_session_is_active():
+                self._clear_wait_recheck_membership_for_closed_market()
+                return
             await self._send_subscription(
                 websocket,
                 approval_key=approval_key,
@@ -1497,6 +1798,9 @@ class KISRealtimePriceService:
                 self._health['metrics']['unsubscribe_requests'] += 1
 
         for symbol in subscribe_symbols:
+            if not self._recorded_market_session_is_active():
+                self._clear_wait_recheck_membership_for_closed_market()
+                return
             await self._send_subscription(
                 websocket,
                 approval_key=approval_key,
