@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -485,6 +485,119 @@ class DartFundamentalsRepository:
                 else ordered_stmt.limit(limit)
             ).scalars()
             return [self._serialize_event(row) for row in rows]
+
+    def list_legacy_cfs_no_data_recovery_candidates(
+        self,
+        *,
+        stock_codes: list[str],
+        receipt_date_from: date,
+        receipt_date_to: date,
+        event_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only latest annual legacy CFS [013] snapshots needing OFS retry.
+
+        Ranking happens before the legacy-status filter so an older [013]
+        snapshot cannot re-enter scope after a newer usable snapshot exists.
+        A current dual CFS/OFS no-data proof is terminal and is likewise kept
+        out of retry scope.
+        """
+        normalized_codes = [
+            code for code in dict.fromkeys(stock_codes) if code
+        ]
+        if not normalized_codes or event_ids == []:
+            return []
+
+        with session_scope() as session:
+            latest_rank = func.row_number().over(
+                partition_by=DartFundamentalsSnapshot.stock_code,
+                order_by=(
+                    DartDisclosureEvent.receipt_date.desc().nullslast(),
+                    DartDisclosureEvent.rcept_no.desc(),
+                    DartFundamentalsSnapshot.business_year.desc(),
+                    DartFundamentalsSnapshot.captured_at.desc(),
+                    DartFundamentalsSnapshot.id.desc(),
+                ),
+            ).label('row_rank')
+            ranked = (
+                select(
+                    DartFundamentalsSnapshot.id.label('snapshot_id'),
+                    DartFundamentalsSnapshot.disclosure_event_id.label(
+                        'event_id'
+                    ),
+                    DartFundamentalsSnapshot.source_status.label(
+                        'source_status'
+                    ),
+                    DartFundamentalsSnapshot.fs_div.label('fs_div'),
+                    DartFundamentalsSnapshot.request_payload[
+                        'fallback_from_status'
+                    ].as_string().label('fallback_from_status'),
+                    latest_rank,
+                )
+                .join(
+                    DartDisclosureEvent,
+                    DartDisclosureEvent.id
+                    == DartFundamentalsSnapshot.disclosure_event_id,
+                )
+                .where(
+                    DartDisclosureEvent.is_financial_report.is_(True),
+                    DartDisclosureEvent.filing_category == 'annual_report',
+                    DartFundamentalsSnapshot.period_type == 'annual',
+                    DartFundamentalsSnapshot.stock_code.in_(
+                        normalized_codes
+                    ),
+                    DartDisclosureEvent.receipt_date
+                    >= receipt_date_from,
+                    DartDisclosureEvent.receipt_date
+                    <= receipt_date_to,
+                )
+                .subquery()
+            )
+            dual_no_data_proof = and_(
+                DartDisclosureEvent.fundamentals_capture_status
+                == CAPTURE_STATUS_NO_DATA,
+                func.coalesce(
+                    DartDisclosureEvent.fundamentals_last_error,
+                    '',
+                ).ilike(
+                    '%CFS [013]%'
+                ),
+                func.coalesce(
+                    DartDisclosureEvent.fundamentals_last_error,
+                    '',
+                ).ilike(
+                    '%OFS [013]%'
+                ),
+            )
+            stmt = (
+                select(
+                    DartDisclosureEvent,
+                    ranked.c.snapshot_id,
+                    ranked.c.source_status,
+                )
+                .join(ranked, ranked.c.event_id == DartDisclosureEvent.id)
+                .where(
+                    ranked.c.row_rank == 1,
+                    ranked.c.source_status == '013',
+                    ranked.c.fs_div == 'CFS',
+                    ranked.c.fallback_from_status.is_(None),
+                    ~dual_no_data_proof,
+                )
+                .order_by(
+                    DartDisclosureEvent.stock_code.asc(),
+                    DartDisclosureEvent.id.asc(),
+                )
+            )
+            if event_ids is not None:
+                stmt = stmt.where(DartDisclosureEvent.id.in_(event_ids))
+            rows = session.execute(stmt).all()
+            return [
+                {
+                    **self._serialize_event(event),
+                    'legacy_snapshot_id': snapshot_id,
+                    'legacy_source_status': source_status,
+                }
+                for event, snapshot_id, source_status in rows
+            ]
 
     def list_symbol_fundamentals_states(
         self,

@@ -75,6 +75,10 @@ TARGETED_BACKFILL_MANIFEST_VERSION = (
 TARGETED_CAPTURE_MANIFEST_VERSION = (
     'dart_targeted_capture_stock_code_manifest_v1'
 )
+LEGACY_CFS_NO_DATA_RECOVERY_MODE = 'legacy_cfs_013_to_ofs_v1'
+LEGACY_CFS_RECOVERY_CANDIDATE_MANIFEST_VERSION = (
+    'dart_legacy_cfs_013_recovery_candidates_v1'
+)
 
 
 class TerminalFundamentalsCaptureError(RuntimeError):
@@ -125,6 +129,70 @@ def _stock_code_manifest_sha256(stock_codes: Sequence[str]) -> str:
         json.dumps(
             list(stock_codes),
             ensure_ascii=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+
+
+def legacy_cfs_recovery_candidate_manifest(
+    candidates: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    manifest: list[dict[str, Any]] = []
+    for candidate in candidates:
+        event_id = candidate.get('id')
+        snapshot_id = candidate.get('legacy_snapshot_id')
+        stock_code = str(candidate.get('stock_code') or '').strip()
+        rcept_no = str(candidate.get('rcept_no') or '').strip()
+        source_status = str(
+            candidate.get('legacy_source_status') or ''
+        ).strip()
+        if (
+            isinstance(event_id, bool)
+            or not isinstance(event_id, int)
+            or event_id <= 0
+            or isinstance(snapshot_id, bool)
+            or not isinstance(snapshot_id, int)
+            or snapshot_id <= 0
+            or len(stock_code) != 6
+            or not stock_code.isascii()
+            or not stock_code.isdigit()
+            or not rcept_no
+            or source_status != DART_NO_DATA_STATUS
+        ):
+            raise ValueError(
+                'legacy CFS recovery candidate is malformed'
+            )
+        manifest.append(
+            {
+                'event_id': event_id,
+                'legacy_snapshot_id': snapshot_id,
+                'stock_code': stock_code,
+                'rcept_no': rcept_no,
+                'legacy_source_status': source_status,
+            }
+        )
+    return sorted(
+        manifest,
+        key=lambda item: (
+            item['stock_code'],
+            item['event_id'],
+            item['legacy_snapshot_id'],
+        ),
+    )
+
+
+def legacy_cfs_recovery_candidate_manifest_sha256(
+    candidates: Sequence[dict[str, Any]],
+) -> str:
+    payload = {
+        'version': LEGACY_CFS_RECOVERY_CANDIDATE_MANIFEST_VERSION,
+        'candidates': legacy_cfs_recovery_candidate_manifest(candidates),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
             separators=(',', ':'),
         ).encode('utf-8')
     ).hexdigest()
@@ -963,6 +1031,8 @@ class DartFundamentalsCaptureService:
         event_ids: list[int] | None = None,
         exact_stock_code_manifest: Sequence[str] | None = None,
         root_stock_code_manifest: Sequence[str] | None = None,
+        legacy_cfs_no_data_recovery: bool = False,
+        expected_recovery_candidate_manifest_sha256: str | None = None,
     ) -> dict[str, Any]:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         run_metadata: dict[str, Any] = {'requested_limit': limit}
@@ -1036,6 +1106,73 @@ class DartFundamentalsCaptureService:
                     'stale_run_reconciliation': 'skipped_exact_scope',
                 }
             )
+        normalized_recovery_event_ids: list[int] | None = None
+        expected_recovery_hash = str(
+            expected_recovery_candidate_manifest_sha256 or ''
+        ).strip().lower()
+        if legacy_cfs_no_data_recovery:
+            if force:
+                raise ValueError(
+                    'legacy CFS recovery does not permit force capture'
+                )
+            if limit is not None:
+                raise ValueError(
+                    'legacy CFS recovery requires an unbounded exact '
+                    'candidate manifest'
+                )
+            if resolved_fs_div != 'CFS':
+                raise ValueError(
+                    'legacy CFS recovery requires fs_div=CFS'
+                )
+            if normalized_exact_manifest is None:
+                raise ValueError(
+                    'legacy CFS recovery requires an exact stock-code '
+                    'manifest'
+                )
+            if receipt_date_from is None or receipt_date_to is None:
+                raise ValueError(
+                    'legacy CFS recovery requires an exact receipt-date '
+                    'window'
+                )
+            if event_ids is None or not event_ids:
+                raise ValueError(
+                    'legacy CFS recovery requires exact event IDs'
+                )
+            if any(
+                isinstance(event_id, bool)
+                or not isinstance(event_id, int)
+                or event_id <= 0
+                for event_id in event_ids
+            ):
+                raise ValueError(
+                    'legacy CFS recovery event IDs must be positive integers'
+                )
+            normalized_recovery_event_ids = list(dict.fromkeys(event_ids))
+            if len(normalized_recovery_event_ids) != len(event_ids):
+                raise ValueError(
+                    'legacy CFS recovery event IDs must be unique'
+                )
+            if not re.fullmatch(r'[0-9a-f]{64}', expected_recovery_hash):
+                raise ValueError(
+                    'legacy CFS recovery requires a valid expected '
+                    'candidate-manifest SHA256'
+                )
+            run_metadata.update(
+                {
+                    'recovery_mode': LEGACY_CFS_NO_DATA_RECOVERY_MODE,
+                    'recovery_candidate_manifest_version': (
+                        LEGACY_CFS_RECOVERY_CANDIDATE_MANIFEST_VERSION
+                    ),
+                    'expected_recovery_candidate_manifest_sha256': (
+                        expected_recovery_hash
+                    ),
+                }
+            )
+        elif expected_recovery_candidate_manifest_sha256 is not None:
+            raise ValueError(
+                'expected recovery candidate hash is valid only for legacy '
+                'CFS recovery'
+            )
         log_fetch_event(
             service='dart',
             operation='capture_recent_fundamentals',
@@ -1077,14 +1214,42 @@ class DartFundamentalsCaptureService:
         results: list[dict[str, Any]] = []
 
         try:
-            events = self.repository.list_capture_candidates(
-                limit=limit,
-                force=force,
-                stock_codes=stock_codes,
-                receipt_date_from=receipt_date_from,
-                receipt_date_to=receipt_date_to,
-                event_ids=event_ids,
-            )
+            if legacy_cfs_no_data_recovery:
+                events = (
+                    self.repository
+                    .list_legacy_cfs_no_data_recovery_candidates(
+                        stock_codes=list(normalized_exact_manifest or []),
+                        receipt_date_from=receipt_date_from,
+                        receipt_date_to=receipt_date_to,
+                        event_ids=normalized_recovery_event_ids,
+                    )
+                )
+                actual_recovery_hash = (
+                    legacy_cfs_recovery_candidate_manifest_sha256(events)
+                )
+                actual_event_ids = [event['id'] for event in events]
+                if actual_event_ids != normalized_recovery_event_ids:
+                    raise RuntimeError(
+                        'legacy CFS recovery candidate event IDs changed '
+                        'after review'
+                    )
+                if actual_recovery_hash != expected_recovery_hash:
+                    raise RuntimeError(
+                        'legacy CFS recovery candidate manifest changed '
+                        'after review'
+                    )
+                run_metadata['recovery_candidate_manifest_sha256'] = (
+                    actual_recovery_hash
+                )
+            else:
+                events = self.repository.list_capture_candidates(
+                    limit=limit,
+                    force=force,
+                    stock_codes=stock_codes,
+                    receipt_date_from=receipt_date_from,
+                    receipt_date_to=receipt_date_to,
+                    event_ids=event_ids,
+                )
             run_metadata_with_progress = {**run_metadata, 'candidate_count': len(events)}
             self.repository.update_capture_run_progress(
                 run_id,
@@ -1461,6 +1626,15 @@ class DartFundamentalsCaptureService:
                         'stale_run_reconciliation': (
                             'skipped_exact_scope'
                         ),
+                    }
+                )
+            if legacy_cfs_no_data_recovery:
+                result.update(
+                    {
+                        'recovery_mode': LEGACY_CFS_NO_DATA_RECOVERY_MODE,
+                        'recovery_candidate_manifest_sha256': run_metadata[
+                            'recovery_candidate_manifest_sha256'
+                        ],
                     }
                 )
             log_fetch_event(

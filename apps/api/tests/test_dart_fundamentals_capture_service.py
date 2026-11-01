@@ -10,6 +10,7 @@ from app.dart.fundamentals_capture_service import (
     _load_share_issuance_activation_audit,
     build_row_payloads,
     infer_fundamentals_request,
+    legacy_cfs_recovery_candidate_manifest_sha256,
     resolve_supported_dart_corp_record,
 )
 from app.dart.signals_service import build_authoritative_absence_audit_signal
@@ -194,6 +195,7 @@ class FakeCaptureRepository:
         self.terminals = []
         self.snapshots = []
         self.candidate_call_kwargs = []
+        self.legacy_recovery_call_kwargs = []
 
     def create_capture_run(self, **kwargs):
         self.created_runs.append(kwargs)
@@ -407,6 +409,45 @@ class FakeCaptureRepository:
         if event_ids is not None:
             events = [event for event in events if event['id'] in event_ids]
         return events[:limit] if limit is not None else events
+
+    def list_legacy_cfs_no_data_recovery_candidates(
+        self,
+        *,
+        stock_codes,
+        receipt_date_from,
+        receipt_date_to,
+        event_ids=None,
+    ):
+        self.legacy_recovery_call_kwargs.append(
+            {
+                'stock_codes': stock_codes,
+                'receipt_date_from': receipt_date_from,
+                'receipt_date_to': receipt_date_to,
+                'event_ids': event_ids,
+            }
+        )
+        candidates = [
+            {
+                'id': 8,
+                'rcept_no': '20260413000001',
+                'corp_code': 'no-data',
+                'corp_name': 'No Data Corp',
+                'stock_code': '333333',
+                'report_nm': '사업보고서 (2025.12)',
+                'filing_category': 'annual_report',
+                'fundamentals_capture_status': 'captured',
+                'receipt_date': '2026-04-13',
+                'legacy_snapshot_id': 108,
+                'legacy_source_status': '013',
+            }
+        ]
+        if event_ids is not None:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate['id'] in event_ids
+            ]
+        return candidates
 
     def replace_snapshot_dataset(self, **kwargs):
         self.snapshots.append(kwargs)
@@ -982,6 +1023,113 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(repository.successes, [8])
         self.assertEqual(repository.terminals, [])
+
+    async def test_legacy_cfs_recovery_uses_only_hash_bound_exact_candidates(self):
+        class StandaloneOnlyClient(FakeCaptureClient):
+            async def fetch_financial_statements(self, **kwargs):
+                if kwargs['corp_code'] == 'no-data' and kwargs['fs_div'] == 'CFS':
+                    self.calls.append(kwargs)
+                    return {
+                        'status': '013',
+                        'message': 'No consolidated statements',
+                        'list': [],
+                    }
+                if kwargs['corp_code'] == 'no-data' and kwargs['fs_div'] == 'OFS':
+                    original_corp_code = kwargs['corp_code']
+                    kwargs = {**kwargs, 'corp_code': 'standalone-data'}
+                    payload = await super().fetch_financial_statements(**kwargs)
+                    self.calls[-1] = {
+                        **self.calls[-1],
+                        'corp_code': original_corp_code,
+                    }
+                    return payload
+                return await super().fetch_financial_statements(**kwargs)
+
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=StandaloneOnlyClient(),
+            repository=repository,
+        )
+        candidates = repository.list_legacy_cfs_no_data_recovery_candidates(
+            stock_codes=['333333'],
+            receipt_date_from=date(2026, 1, 1),
+            receipt_date_to=date(2026, 10, 30),
+            event_ids=[8],
+        )
+        repository.legacy_recovery_call_kwargs.clear()
+
+        result = await service.capture_recent_fundamentals(
+            limit=None,
+            force=False,
+            trigger='legacy_cfs_013_repair',
+            fs_div='CFS',
+            stock_codes=['333333'],
+            receipt_date_from=date(2026, 1, 1),
+            receipt_date_to=date(2026, 10, 30),
+            event_ids=[8],
+            exact_stock_code_manifest=['333333'],
+            legacy_cfs_no_data_recovery=True,
+            expected_recovery_candidate_manifest_sha256=(
+                legacy_cfs_recovery_candidate_manifest_sha256(candidates)
+            ),
+        )
+
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(result['results'][0]['fs_div'], 'OFS')
+        self.assertEqual(repository.candidate_call_kwargs, [])
+        self.assertEqual(
+            repository.legacy_recovery_call_kwargs,
+            [
+                {
+                    'stock_codes': ['333333'],
+                    'receipt_date_from': date(2026, 1, 1),
+                    'receipt_date_to': date(2026, 10, 30),
+                    'event_ids': [8],
+                }
+            ],
+        )
+        created_metadata = repository.created_runs[0]['run_metadata']
+        self.assertEqual(
+            created_metadata['recovery_mode'],
+            'legacy_cfs_013_to_ofs_v1',
+        )
+
+    async def test_legacy_cfs_recovery_rejects_broad_or_unbound_scope(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        invalid_cases = [
+            {'force': True},
+            {'limit': 20},
+            {'fs_div': 'OFS'},
+            {'event_ids': None},
+            {'expected_recovery_candidate_manifest_sha256': None},
+        ]
+        base = {
+            'limit': None,
+            'force': False,
+            'fs_div': 'CFS',
+            'stock_codes': ['333333'],
+            'receipt_date_from': date(2026, 1, 1),
+            'receipt_date_to': date(2026, 10, 30),
+            'event_ids': [8],
+            'exact_stock_code_manifest': ['333333'],
+            'legacy_cfs_no_data_recovery': True,
+            'expected_recovery_candidate_manifest_sha256': 'a' * 64,
+        }
+        for override in invalid_cases:
+            with self.subTest(override=override):
+                with self.assertRaises(ValueError):
+                    await service.capture_recent_fundamentals(
+                        **{**base, **override}
+                    )
+
+        self.assertEqual(repository.created_runs, [])
+        self.assertEqual(repository.candidate_call_kwargs, [])
+        self.assertEqual(repository.legacy_recovery_call_kwargs, [])
 
     async def test_capture_recent_fundamentals_keeps_failed_ofs_fallback_retryable(self):
         class FailingStandaloneFallbackClient(FakeCaptureClient):

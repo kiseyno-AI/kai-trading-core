@@ -145,6 +145,7 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         report_code: str = '11011',
         fs_div: str = 'CFS',
         source_status: str | None = '000',
+        request_payload: dict | None = None,
         rcept_no: str | None = None,
         disclosure_event_id: int | None = None,
     ) -> tuple[int, int]:
@@ -193,7 +194,7 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
                 currency='KRW',
                 source_status=source_status,
                 source_message='OK',
-                request_payload={},
+                request_payload=request_payload or {},
                 response_payload={},
             )
             session.add(snapshot)
@@ -204,6 +205,85 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
 
         self.created_snapshot_ids.append(snapshot_id)
         return event_id, snapshot_id
+
+    def test_legacy_cfs_no_data_recovery_candidates_are_latest_exact_and_unproven(self):
+        recoverable = f'T{uuid4().hex[:10]}'.upper()
+        newer_success = f'T{uuid4().hex[:10]}'.upper()
+        already_fallback = f'T{uuid4().hex[:10]}'.upper()
+        terminal_proof = f'T{uuid4().hex[:10]}'.upper()
+
+        recoverable_event_id, recoverable_snapshot_id = (
+            self._create_event_snapshot(
+                stock_code=recoverable,
+                receipt_date=date(2026, 3, 18),
+                capture_status='captured',
+                business_year=2025,
+                source_status='013',
+            )
+        )
+        self._create_event_snapshot(
+            stock_code=newer_success,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2024,
+            source_status='013',
+        )
+        self._create_event_snapshot(
+            stock_code=newer_success,
+            receipt_date=date(2026, 3, 19),
+            capture_status='captured',
+            business_year=2025,
+            source_status='000',
+        )
+        self._create_event_snapshot(
+            stock_code=already_fallback,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2025,
+            source_status='013',
+            request_payload={
+                'requested_fs_div': 'CFS',
+                'fallback_from_status': '013',
+            },
+        )
+        terminal_event_id, _ = self._create_event_snapshot(
+            stock_code=terminal_proof,
+            receipt_date=date(2026, 3, 18),
+            capture_status='no_data',
+            business_year=2025,
+            source_status='013',
+        )
+        with session_scope() as session:
+            terminal_event = session.get(
+                DartDisclosureEvent,
+                terminal_event_id,
+            )
+            terminal_event.fundamentals_last_error = (
+                'CFS [013] no consolidated statements; '
+                'OFS [013]: no standalone statements'
+            )
+
+        candidates = (
+            self.repository.list_legacy_cfs_no_data_recovery_candidates(
+                stock_codes=[
+                    recoverable,
+                    newer_success,
+                    already_fallback,
+                    terminal_proof,
+                ],
+                receipt_date_from=date(2026, 1, 1),
+                receipt_date_to=date(2026, 10, 30),
+            )
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]['id'], recoverable_event_id)
+        self.assertEqual(candidates[0]['stock_code'], recoverable)
+        self.assertEqual(
+            candidates[0]['legacy_snapshot_id'],
+            recoverable_snapshot_id,
+        )
+        self.assertEqual(candidates[0]['legacy_source_status'], '013')
 
     def _create_financial_event(
         self,
