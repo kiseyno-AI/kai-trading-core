@@ -79,6 +79,55 @@ def _semantic_audit_document(
     ).encode('utf-8')
 
 
+def _unmodified_auditor_report_document(
+    *,
+    same_block: bool = False,
+    basis_inline: bool = False,
+    extra_content: str = '',
+) -> bytes:
+    report_body = (
+        '우리는 테스트 주식회사(이하 "회사")의 재무제표를 감사하였습니다. '
+        '해당 재무제표는 2025년 12월 31일 현재의 재무상태표, 동일로 종료되는 '
+        '보고기간의 포괄손익계산서, 자본변동표, 현금흐름표 그리고 중요한 '
+        '회계정책 정보를 포함한 재무제표의 주석으로 구성되어 있습니다. '
+        '우리의 의견으로는 별첨된 회사의 재무제표는 회사의 2025년 12월 31일 '
+        '현재의 재무상태와 동일로 종료되는 보고기간의 재무성과 및 현금흐름을 '
+        '한국채택국제회계기준에 따라 중요성의 관점에서 공정하게 표시하고 '
+        '있습니다.'
+    )
+    inline_basis = (
+        ' 감사의견 근거 우리는 대한민국의 회계감사기준에 따라 '
+        '감사를 수행하였습니다.'
+        if basis_inline
+        else ''
+    )
+    opinion_section = (
+        '<P><SPAN USERMARK="B">감사의견</SPAN>'
+        f'<SPAN>{report_body}{inline_basis}</SPAN></P>'
+        if same_block
+        else (
+            '<P USERMARK="B">감사의견</P>'
+            f'<P>{report_body}{inline_basis}</P>'
+        )
+    )
+    separate_basis = (
+        ''
+        if basis_inline
+        else (
+            '<P USERMARK="B">감사의견근거</P>'
+            '<P>우리는 대한민국의 회계감사기준에 따라 감사를 수행하였습니다.</P>'
+        )
+    )
+    return (
+        '<DOCUMENT>'
+        '<TITLE>독립된 감사인의 감사보고서</TITLE>'
+        f'{opinion_section}'
+        f'{separate_basis}'
+        f'{extra_content}'
+        '</DOCUMENT>'
+    ).encode('utf-8')
+
+
 def _complete_negative_audit_diagnostics():
     return {
         'version': AUDIT_ARCHIVE_DIAGNOSTICS_VERSION,
@@ -1210,6 +1259,200 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.opinion_code, 'unqualified')
         self.assertFalse(result.has_audit_issue)
+
+    async def test_extract_audit_signal_accepts_unmodified_auditor_report_narrative(self):
+        cases = (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        )
+        for same_block, basis_inline in cases:
+            with self.subTest(
+                same_block=same_block,
+                basis_inline=basis_inline,
+            ):
+                result = await DartSignalsService(
+                    client=FakeSignalsClient(
+                        members=[
+                            (
+                                'reports/annual-audit.xml',
+                                _unmodified_auditor_report_document(
+                                    same_block=same_block,
+                                    basis_inline=basis_inline,
+                                ),
+                            )
+                        ]
+                    )
+                )._extract_audit_signal(
+                    {
+                        'rcept_no': '20260327000199',
+                        'report_nm': '[첨부정정]사업보고서 (2025.12)',
+                    }
+                )
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.opinion_code, 'unqualified')
+                self.assertEqual(result.opinion_label, '적정')
+                self.assertFalse(result.has_audit_issue)
+                self.assertEqual(
+                    result.payload['parser'],
+                    'auditor_report_unmodified_opinion_v1',
+                )
+                self.assertEqual(
+                    classify_durable_audit_signal(result),
+                    'parsed_opinion',
+                )
+                tampered_body = result.payload['opinion_body'].replace(
+                    '공정하게 표시하고 있습니다',
+                    '의견을 확인할 수 없습니다',
+                )
+                tampered_payload = dict(result.payload)
+                tampered_payload['opinion_body'] = tampered_body
+                tampered_payload['evidence_blocks'] = [
+                    '독립된 감사인의 감사보고서',
+                    '감사의견',
+                    tampered_body,
+                ]
+                self.assertIsNone(
+                    classify_durable_audit_signal(
+                        {
+                            'opinion_code': result.opinion_code,
+                            'opinion_label': result.opinion_label,
+                            'has_audit_issue': result.has_audit_issue,
+                            'source_section': result.source_section,
+                            'evidence_text': result.evidence_text,
+                            'payload': tampered_payload,
+                        }
+                    )
+                )
+
+    async def test_auditor_report_narrative_outranks_ambiguous_secondary_table(self):
+        ambiguous_secondary_table = _semantic_audit_document(
+            ('제30기(당기)', '-')
+        ).decode('utf-8')
+        result = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    (
+                        'reports/annual-audit.xml',
+                        _unmodified_auditor_report_document(),
+                    ),
+                    (
+                        'reports/business-report.xml',
+                        (
+                            _semantic_audit_document(
+                                ('제30기(당기)', '적정의견')
+                            ).decode('utf-8')
+                            + ambiguous_secondary_table
+                        ).encode('utf-8'),
+                    ),
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000268', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'unqualified')
+        self.assertEqual(
+            result.payload['parser'],
+            'auditor_report_unmodified_opinion_v1',
+        )
+
+    async def test_auditor_report_narrative_requires_direct_report_authority(self):
+        internal_control_only = (
+            '<DOCUMENT>'
+            '<TITLE>독립된 감사인의 내부회계관리제도 감사보고서</TITLE>'
+            '<P USERMARK="B">감사의견</P>'
+            '<P>우리는 회사의 재무제표를 감사하였습니다. 우리의 의견으로는 '
+            '회사의 재무상태와 재무성과 및 현금흐름을 한국채택국제회계기준에 '
+            '따라 중요성의 관점에서 공정하게 표시하고 있습니다.</P>'
+            '<P USERMARK="B">감사의견근거</P>'
+            '</DOCUMENT>'
+        ).encode('utf-8')
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/internal-control.xml', internal_control_only)]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000269', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_auditor_report_narrative_requires_nearby_direct_report_title(self):
+        distant_preamble = ''.join(
+            f'<P>unrelated preamble {index}</P>' for index in range(20)
+        )
+        distant_opinion = _unmodified_auditor_report_document().decode(
+            'utf-8'
+        ).replace(
+            '<TITLE>독립된 감사인의 감사보고서</TITLE>',
+            f'<TITLE>독립된 감사인의 감사보고서</TITLE>{distant_preamble}',
+        )
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    ('reports/distant-opinion.xml', distant_opinion.encode())
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000271', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_auditor_report_narrative_fails_closed_on_unrecognized_opinion_body(self):
+        malformed_primary = (
+            '<DOCUMENT>'
+            '<TITLE>독립된 감사인의 감사보고서</TITLE>'
+            '<P USERMARK="B">감사의견</P>'
+            '<P>감사 절차를 수행했으나 이 문단은 의견을 명시하지 않습니다.</P>'
+            '<P USERMARK="B">감사의견근거</P>'
+            '</DOCUMENT>'
+        ).encode('utf-8')
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    ('reports/primary.xml', malformed_primary),
+                    (
+                        'reports/table.xml',
+                        _semantic_audit_document(
+                            ('제30기(당기)', '적정의견')
+                        ),
+                    ),
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000270', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_auditor_report_narrative_does_not_promote_qualified_opinion(self):
+        qualified_primary = _unmodified_auditor_report_document().decode(
+            'utf-8'
+        ).replace(
+            '우리의 의견으로는 별첨된 회사의 재무제표는',
+            '우리의 의견으로는 한정의견 근거 단락에 기술된 사항이 '
+            '미치는 영향을 제외하고는 별첨된 회사의 재무제표는',
+        )
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    ('reports/qualified-audit.xml', qualified_primary.encode())
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000272', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
 
     async def test_capture_audit_signal_uses_current_column_from_transposed_semantic_table(self):
         document = (

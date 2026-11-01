@@ -105,6 +105,7 @@ _AUDIT_NEGATIVE_AUTHORITY_SENTINELS = {
     'semantic_audit_table_current_period_absent_v1',
 }
 _AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS = {
+    'auditor_report_unmodified_opinion_unrecognized_v1',
     'legacy_aud_opn_markerless_conflict_v1',
     'semantic_audit_table_current_opinion_unrecognized_v1',
     'semantic_audit_table_current_period_ambiguous_v1',
@@ -121,6 +122,10 @@ _PLAIN_TABLE_PATTERN = re.compile(
 )
 _AUDIT_ROW_PATTERN = re.compile(r'<TR[^>]*>(.*?)</TR>', re.IGNORECASE | re.DOTALL)
 _AUDIT_CELL_PATTERN = re.compile(r'<T[EDHU][^>]*>(.*?)</T[EDHU]>', re.IGNORECASE | re.DOTALL)
+_AUDIT_TEXT_BLOCK_PATTERN = re.compile(
+    r'<(?:P|TITLE)(?=[\s>])[^>]*>(.*?)</(?:P|TITLE)>',
+    re.IGNORECASE | re.DOTALL,
+)
 _TAG_PATTERN = re.compile(r'<[^>]+>')
 _WS_PATTERN = re.compile(r'\s+')
 _CURRENT_PERIOD_PATTERN = re.compile(
@@ -134,6 +139,31 @@ _SEMANTIC_AUDIT_HEADERS = (
     '감사인',
     '감사의견',
     '핵심감사사항',
+)
+_AUDITOR_REPORT_TITLE = '독립된 감사인의 감사보고서'
+_AUDITOR_REPORT_INTERNAL_CONTROL_TITLE = (
+    '독립된 감사인의 내부회계관리제도 감사보고서'
+)
+_AUDITOR_REPORT_OPINION_HEADING = '감사의견'
+_AUDITOR_REPORT_OPINION_BASIS_PATTERN = re.compile(r'감사의견\s*근거')
+_AUDITOR_REPORT_MAX_PREAMBLE_BLOCKS = 12
+_AUDITOR_REPORT_MAX_OPINION_BLOCKS = 8
+_AUDITOR_REPORT_MAX_OPINION_CHARS = 20_000
+_AUDITOR_REPORT_UNMODIFIED_PATTERNS = (
+    re.compile(r'재무제표를\s*감사하였습니다'),
+    re.compile(r'우리의\s*의견으로는'),
+    re.compile(r'재무상태'),
+    re.compile(r'재무성과'),
+    re.compile(r'현금흐름'),
+    re.compile(r'한국채택국제회계기준'),
+    re.compile(r'(?:공정|적정)하게\s*표시하고\s*있습니다'),
+)
+_AUDITOR_REPORT_MODIFIED_PATTERNS = (
+    re.compile(r'제외하고는'),
+    re.compile(r'한정의견'),
+    re.compile(r'부적정의견'),
+    re.compile(r'의견\s*거절'),
+    re.compile(r'의견을\s*표명하지\s*않'),
 )
 _ENCODING_DECLARATION_PATTERN = re.compile(
     r'(?:encoding|charset)\s*=\s*["\']?\s*([A-Za-z0-9._-]+)',
@@ -334,6 +364,7 @@ _PARSED_AUDIT_OPINION_LABEL = {
 }
 _PARSED_AUDIT_PAYLOAD_PARSERS = frozenset(
     {
+        'auditor_report_unmodified_opinion_v1',
         'semantic_audit_table_v1',
         'legacy_aud_opn_explicit_current_v1',
         'legacy_aud_opn_markerless_v1',
@@ -365,6 +396,21 @@ def _is_nonempty_audit_text_list(value: Any) -> bool:
     )
 
 
+def _is_unmodified_auditor_report_opinion(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _AUDITOR_REPORT_MAX_OPINION_CHARS
+        and not any(
+            pattern.search(value)
+            for pattern in _AUDITOR_REPORT_MODIFIED_PATTERNS
+        )
+        and all(
+            pattern.search(value)
+            for pattern in _AUDITOR_REPORT_UNMODIFIED_PATTERNS
+        )
+    )
+
+
 def _has_durable_parsed_audit_payload(
     payload: Any,
     *,
@@ -379,27 +425,45 @@ def _has_durable_parsed_audit_payload(
         or parser not in _PARSED_AUDIT_PAYLOAD_PARSERS
     ):
         return False
-    opinion_cell = payload.get('opinion_cell')
-    if not _is_nonempty_audit_text(opinion_cell):
-        return False
-    evidence_cells = payload.get('row_cells')
-    if parser == 'semantic_audit_table_v1' and evidence_cells is None:
-        evidence_cells = payload.get('column_cells')
-    if (
-        not _is_nonempty_audit_text_list(evidence_cells)
-        or opinion_cell not in evidence_cells
-    ):
-        return False
-    parsed_opinion_code = next(
-        (
-            code
-            for pattern, code, _label in _SEMANTIC_AUDIT_PATTERNS
-            if pattern.search(opinion_cell)
-        ),
-        None,
-    )
-    if parsed_opinion_code != opinion_code:
-        return False
+    if parser == 'auditor_report_unmodified_opinion_v1':
+        opinion_body = payload.get('opinion_body')
+        evidence_blocks = payload.get('evidence_blocks')
+        if (
+            opinion_code != 'unqualified'
+            or payload.get('report_title') != _AUDITOR_REPORT_TITLE
+            or payload.get('opinion_heading')
+            != _AUDITOR_REPORT_OPINION_HEADING
+            or not _is_unmodified_auditor_report_opinion(opinion_body)
+            or evidence_blocks
+            != [
+                _AUDITOR_REPORT_TITLE,
+                _AUDITOR_REPORT_OPINION_HEADING,
+                opinion_body,
+            ]
+        ):
+            return False
+    else:
+        opinion_cell = payload.get('opinion_cell')
+        if not _is_nonempty_audit_text(opinion_cell):
+            return False
+        evidence_cells = payload.get('row_cells')
+        if parser == 'semantic_audit_table_v1' and evidence_cells is None:
+            evidence_cells = payload.get('column_cells')
+        if (
+            not _is_nonempty_audit_text_list(evidence_cells)
+            or opinion_cell not in evidence_cells
+        ):
+            return False
+        parsed_opinion_code = next(
+            (
+                code
+                for pattern, code, _label in _SEMANTIC_AUDIT_PATTERNS
+                if pattern.search(opinion_cell)
+            ),
+            None,
+        )
+        if parsed_opinion_code != opinion_code:
+            return False
 
     present_selection_fields = set(payload).intersection(
         _PARSED_AUDIT_SELECTION_FIELDS
@@ -1389,7 +1453,10 @@ class DartSignalsService:
         *,
         source_section: str,
     ) -> list[ParsedAuditSignal]:
-        findings: list[ParsedAuditSignal] = []
+        findings = self._parse_unmodified_auditor_report_opinions(
+            text,
+            source_section=source_section,
+        )
         aud_opn_ranges: list[tuple[int, int]] = []
         for group_match in _AUDIT_TABLE_PATTERN.finditer(text):
             aud_opn_ranges.append(group_match.span())
@@ -1427,6 +1494,136 @@ class DartSignalsService:
             )
             if recognized:
                 findings.extend(table_findings)
+        return findings
+
+    def _parse_unmodified_auditor_report_opinions(
+        self,
+        text: str,
+        *,
+        source_section: str,
+    ) -> list[ParsedAuditSignal]:
+        blocks = [
+            _clean_html_text(match.group(1))
+            for match in _AUDIT_TEXT_BLOCK_PATTERN.finditer(text)
+        ]
+        findings: list[ParsedAuditSignal] = []
+        direct_report_index: int | None = None
+        for index, block in enumerate(blocks):
+            if block == _AUDITOR_REPORT_TITLE:
+                direct_report_index = index
+                continue
+            if (
+                block == _AUDITOR_REPORT_INTERNAL_CONTROL_TITLE
+                or (
+                    block.startswith('독립된 감사인의 ')
+                    and block.endswith('감사보고서')
+                    and block != _AUDITOR_REPORT_TITLE
+                )
+            ):
+                direct_report_index = None
+                continue
+            if direct_report_index is None:
+                continue
+            if (
+                index - direct_report_index
+                > _AUDITOR_REPORT_MAX_PREAMBLE_BLOCKS
+            ):
+                direct_report_index = None
+                continue
+            if block == _AUDITOR_REPORT_OPINION_HEADING:
+                inline_opinion = ''
+            elif block.startswith(
+                f'{_AUDITOR_REPORT_OPINION_HEADING} '
+            ):
+                inline_opinion = block[
+                    len(_AUDITOR_REPORT_OPINION_HEADING) :
+                ].strip()
+            else:
+                continue
+
+            opinion_blocks: list[str] = []
+            basis_found = False
+            if inline_opinion:
+                inline_basis = _AUDITOR_REPORT_OPINION_BASIS_PATTERN.search(
+                    inline_opinion
+                )
+                if inline_basis is not None:
+                    opinion_blocks.append(
+                        inline_opinion[: inline_basis.start()].strip()
+                    )
+                    basis_found = True
+                else:
+                    opinion_blocks.append(inline_opinion)
+            if not basis_found:
+                for following_block in blocks[
+                    index
+                    + 1 : index
+                    + 1
+                    + _AUDITOR_REPORT_MAX_OPINION_BLOCKS
+                ]:
+                    inline_basis = (
+                        _AUDITOR_REPORT_OPINION_BASIS_PATTERN.search(
+                            following_block
+                        )
+                    )
+                    if inline_basis is not None:
+                        opinion_prefix = following_block[
+                            : inline_basis.start()
+                        ].strip()
+                        if opinion_prefix:
+                            opinion_blocks.append(opinion_prefix)
+                        basis_found = True
+                        break
+                    if (
+                        following_block == _AUDITOR_REPORT_TITLE
+                        or following_block
+                        == _AUDITOR_REPORT_INTERNAL_CONTROL_TITLE
+                    ):
+                        break
+                    if following_block:
+                        opinion_blocks.append(following_block)
+
+            opinion_body = ' '.join(opinion_blocks).strip()
+            if (
+                basis_found
+                and _is_unmodified_auditor_report_opinion(opinion_body)
+            ):
+                evidence_blocks = [
+                    _AUDITOR_REPORT_TITLE,
+                    _AUDITOR_REPORT_OPINION_HEADING,
+                    opinion_body,
+                ]
+                findings.append(
+                    ParsedAuditSignal(
+                        opinion_code='unqualified',
+                        opinion_label='적정',
+                        has_audit_issue=False,
+                        source_section=source_section[:255],
+                        evidence_text=' | '.join(evidence_blocks),
+                        payload={
+                            'parser': (
+                                'auditor_report_unmodified_opinion_v1'
+                            ),
+                            'report_title': _AUDITOR_REPORT_TITLE,
+                            'opinion_heading': (
+                                _AUDITOR_REPORT_OPINION_HEADING
+                            ),
+                            'opinion_body': opinion_body,
+                            'evidence_blocks': evidence_blocks,
+                        },
+                    )
+                )
+            else:
+                findings.append(
+                    self._audit_authority_sentinel(
+                        parser=(
+                            'auditor_report_unmodified_opinion_'
+                            'unrecognized_v1'
+                        ),
+                        source_section=source_section,
+                    )
+                )
+            direct_report_index = None
         return findings
 
     @staticmethod
@@ -1772,6 +1969,27 @@ class DartSignalsService:
             str((item.payload or {}).get('parser') or '')
             for item in findings
         }
+        if (
+            'auditor_report_unmodified_opinion_unrecognized_v1'
+            in parser_names
+        ):
+            return None
+        # The signed auditor-report opinion paragraph is primary authority.
+        # Once recognized, a placeholder in a secondary business-report table
+        # cannot invalidate it; an unrecognized primary paragraph still blocks.
+        auditor_report_findings = [
+            item
+            for item in findings
+            if item.opinion_code
+            and (item.payload or {}).get('parser')
+            == 'auditor_report_unmodified_opinion_v1'
+        ]
+        if auditor_report_findings:
+            findings = auditor_report_findings
+            parser_names = {
+                str((item.payload or {}).get('parser') or '')
+                for item in findings
+            }
         if parser_names & _AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS:
             return None
         semantic_findings = [
