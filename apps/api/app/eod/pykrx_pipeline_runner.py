@@ -449,8 +449,18 @@ def _classify_pykrx_enrichment_categories(
         and int(coverage_payload.get('expected_rows') or 0)
         > int(coverage_payload.get('present_rows') or 0)
     )
+    component_retry_debt_categories = sorted(
+        category
+        for category, details in category_results.items()
+        if isinstance(details, dict)
+        and details.get('component_retry_debt')
+    )
     unresolved_categories = sorted(
-        {*coverage_gap_categories, *preflight_failed_categories}
+        {
+            *coverage_gap_categories,
+            *preflight_failed_categories,
+            *component_retry_debt_categories,
+        }
     )
     recovered_categories = sorted(
         set(provider_error_categories) - set(unresolved_categories)
@@ -458,9 +468,35 @@ def _classify_pykrx_enrichment_categories(
     return {
         'provider_error_categories': provider_error_categories,
         'coverage_gap_categories': coverage_gap_categories,
+        'component_retry_debt_categories': (
+            component_retry_debt_categories
+        ),
         'recovered_categories': recovered_categories,
         'unresolved_categories': unresolved_categories,
     }
+
+
+def _pykrx_component_retry_symbols(
+    *,
+    result: dict[str, Any],
+    requested_symbols: Sequence[str],
+) -> list[str]:
+    affected = {
+        str(symbol).strip()
+        for debt in result.get('component_retry_debt') or []
+        if isinstance(debt, dict)
+        for symbol in (
+            debt.get('affected_symbols')
+            or debt.get('affected_symbols_preview')
+            or []
+        )
+        if str(symbol).strip()
+    }
+    return [
+        str(symbol).strip()
+        for symbol in requested_symbols
+        if str(symbol).strip() in affected
+    ]
 
 
 def _partition_pykrx_enrichment_category_gaps(
@@ -2178,7 +2214,13 @@ def _build_macro_provider_coverage(source_statuses: Any) -> dict[str, Any]:
             provider_state = 'disabled'
         elif status in {'partial', 'stale', 'degraded'}:
             provider_state = 'degraded'
-        elif status in {'unavailable', 'failed', 'error', 'missing'}:
+        elif status in {
+            'unavailable',
+            'failed',
+            'error',
+            'missing',
+            'blocked_missing_credential',
+        }:
             provider_state = 'unavailable'
         else:
             provider_state = 'unknown'
@@ -3729,9 +3771,15 @@ def run_market_data_pipeline(
                 preflight_failed_categories=preflight.get('failed_categories') or [],
             )
             provider_error_categories = category_classification['provider_error_categories']
+            component_retry_debt_categories = category_classification[
+                'component_retry_debt_categories'
+            ]
             recovered_categories = category_classification['recovered_categories']
             failed_categories = category_classification['unresolved_categories']
             pykrx_enrichment_result['provider_error_categories'] = provider_error_categories
+            pykrx_enrichment_result['component_retry_debt_categories'] = (
+                component_retry_debt_categories
+            )
             pykrx_enrichment_result['recovered_categories'] = recovered_categories
             pykrx_enrichment_result['unresolved_categories'] = failed_categories
             (
@@ -3752,6 +3800,8 @@ def run_market_data_pipeline(
                 if preflight.get('allowed') and not blocking_failed_categories
                 else 'partial'
             )
+            if component_retry_debt_categories:
+                stage_status = 'partial'
             (
                 exact_scope_outcome,
                 exact_scope_retry_reasons,
@@ -3762,6 +3812,10 @@ def run_market_data_pipeline(
             exact_retry_symbols = list(
                 exact_scope_outcome['retry_debt_stock_codes']
             )
+            component_retry_symbols = _pykrx_component_retry_symbols(
+                result=pykrx_enrichment_result,
+                requested_symbols=requested_symbol_codes,
+            )
             if exact_retry_symbols:
                 stage_status = 'partial'
             pykrx_enrichment_result.update(exact_scope_outcome)
@@ -3771,15 +3825,30 @@ def run_market_data_pipeline(
             pykrx_enrichment_result['status'] = stage_status
             enrichment_failed_count = len(blocking_failed_categories)
             if stage_status != 'completed':
-                pykrx_enrichment_error_message = (
-                    'PyKRX enrichment incomplete for categories: '
-                    + ','.join(blocking_failed_categories)
-                    if blocking_failed_categories
-                    else 'PyKRX enrichment has symbol-level coverage debt'
+                if blocking_failed_categories:
+                    pykrx_enrichment_error_message = (
+                        'PyKRX enrichment incomplete for categories: '
+                        + ','.join(blocking_failed_categories)
+                    )
+                elif component_retry_debt_categories:
+                    pykrx_enrichment_error_message = (
+                        'PyKRX enrichment has non-blocking component retry '
+                        'debt: '
+                        + ','.join(component_retry_debt_categories)
+                    )
+                else:
+                    pykrx_enrichment_error_message = (
+                        'PyKRX enrichment has symbol-level coverage debt'
+                    )
+                retry_symbols = list(
+                    dict.fromkeys(
+                        [*exact_retry_symbols, *component_retry_symbols]
+                    )
                 )
-                pykrx_enrichment_result['_retry_metadata'] = {
-                    'failed_symbols': exact_retry_symbols,
-                }
+                if retry_symbols:
+                    pykrx_enrichment_result['_retry_metadata'] = {
+                        'failed_symbols': retry_symbols,
+                    }
             persist_stage_progress(
                 stage='pykrx_enrichment',
                 status=stage_status,
@@ -3798,6 +3867,13 @@ def run_market_data_pipeline(
                     'category_row_counts': category_row_counts,
                     'failed_categories': failed_categories,
                     'provider_error_categories': provider_error_categories,
+                    'component_retry_debt_categories': (
+                        component_retry_debt_categories
+                    ),
+                    'component_retry_debt': pykrx_enrichment_result.get(
+                        'component_retry_debt'
+                    )
+                    or [],
                     'recovered_categories': recovered_categories,
                     'blocking_failed_categories': blocking_failed_categories,
                     'tolerated_failed_categories': tolerated_failed_categories,
@@ -3822,6 +3898,9 @@ def run_market_data_pipeline(
                 category_row_counts=category_row_counts,
                 failed_categories=failed_categories,
                 provider_error_categories=provider_error_categories,
+                component_retry_debt_categories=(
+                    component_retry_debt_categories
+                ),
                 recovered_categories=recovered_categories,
                 blocking_failed_categories=blocking_failed_categories,
                 tolerated_failed_categories=tolerated_failed_categories,

@@ -92,6 +92,7 @@ from app.eod.pykrx_pipeline_runner import (
     _merge_inherited_downstream_scope,
     _normalize_stage_status,
     _partition_pykrx_enrichment_category_gaps,
+    _pykrx_component_retry_symbols,
     _resolve_result_status,
     _run_daily_factor_followup,
     _run_daily_piotroski_filter_followup,
@@ -917,6 +918,70 @@ class PykrxPipelineResultStatusTests(TestCase):
         self.assertEqual(classification['recovered_categories'], ['sector_classification'])
         self.assertEqual(classification['coverage_gap_categories'], ['foreign_ownership'])
         self.assertEqual(classification['unresolved_categories'], ['foreign_ownership'])
+
+    def test_enrichment_component_retry_debt_is_not_mislabeled_as_recovered(
+        self,
+    ) -> None:
+        classification = _classify_pykrx_enrichment_categories(
+            category_results={
+                'short_selling': {
+                    'errors': [{'error': 'balance unavailable'}],
+                    'component_retry_debt': [
+                        {
+                            'component': 'short_balance',
+                            'status': 'retry_debt',
+                        }
+                    ],
+                },
+            },
+            coverage_categories={
+                'short_selling': {'expected_rows': 2, 'present_rows': 2},
+            },
+            preflight_failed_categories=[],
+        )
+
+        self.assertEqual(
+            classification['component_retry_debt_categories'],
+            ['short_selling'],
+        )
+        self.assertEqual(classification['recovered_categories'], [])
+        self.assertEqual(classification['unresolved_categories'], ['short_selling'])
+
+    def test_component_retry_scope_uses_full_affected_symbols_not_preview(self) -> None:
+        requested_symbols = [f'{index:06d}' for index in range(1, 61)]
+        result = {
+            'component_retry_debt': [
+                {
+                    'component': 'short_balance',
+                    'affected_symbols': requested_symbols,
+                    'affected_symbols_preview': requested_symbols[:50],
+                }
+            ]
+        }
+
+        self.assertEqual(
+            _pykrx_component_retry_symbols(
+                result=result,
+                requested_symbols=requested_symbols,
+            ),
+            requested_symbols,
+        )
+
+    def test_component_retry_scope_keeps_legacy_preview_compatibility(self) -> None:
+        self.assertEqual(
+            _pykrx_component_retry_symbols(
+                result={
+                    'component_retry_debt': [
+                        {
+                            'component': 'short_value',
+                            'affected_symbols_preview': ['005930'],
+                        }
+                    ]
+                },
+                requested_symbols=['000660', '005930'],
+            ),
+            ['005930'],
+        )
 
     def test_enrichment_exact_scope_advances_only_complete_symbols(self) -> None:
         categories = {
@@ -2788,6 +2853,20 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(coverage['status'], 'unknown')
         self.assertEqual(coverage['available_provider_count'], 0)
         self.assertEqual(coverage['configured_provider_count'], 1)
+
+    def test_macro_provider_coverage_treats_missing_credential_as_unavailable(
+        self,
+    ) -> None:
+        coverage = _build_macro_provider_coverage(
+            {
+                'world_bank': {'status': 'available'},
+                'fred': {'status': 'blocked_missing_credential'},
+            }
+        )
+
+        self.assertEqual(coverage['status'], 'partial')
+        self.assertEqual(coverage['gap_provider_count'], 1)
+        self.assertEqual(coverage['providers']['fred'], 'unavailable')
 
     def test_fetch_recent_universe_uses_index_when_market_frame_columns_change(self) -> None:
         service = PykrxBackfillService()
@@ -19899,6 +19978,49 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             '2026-09-11',
             markets=('KOSPI', 'KOSDAQ'),
         )
+        self.assertEqual(scheduler.snapshot()['last_market_date'], '2026-09-11')
+
+    async def test_weekend_scheduler_does_not_rerun_completed_latest_session(
+        self,
+    ) -> None:
+        scheduler = AutoPykrxEODScheduler()
+        market = MarketState(
+            market='KRX',
+            state='WEEKEND',
+            is_trading_day=False,
+            is_open=False,
+            server_time='2026-09-13T14:00:00+09:00',
+            session_open_at=None,
+            session_close_at=None,
+            latest_valid_trading_date='2026-09-11',
+        )
+
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.auto_pykrx.load_latest_eod_collection_run',
+                return_value={
+                    'id': 584,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                    'run_metadata': {},
+                },
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
+        ):
+            await scheduler.schedule_daily_pipeline_if_due()
+
+        self.assertIsNone(scheduler._task)
+        run_pipeline.assert_not_awaited()
+        self.assertEqual(scheduler.snapshot()['last_status'], 'completed')
+        self.assertEqual(scheduler.snapshot()['last_reason'], 'already_completed')
         self.assertEqual(scheduler.snapshot()['last_market_date'], '2026-09-11')
 
     async def test_open_recovery_only_returns_no_debt_without_starting_fresh_daily(

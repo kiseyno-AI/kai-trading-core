@@ -196,6 +196,108 @@ def _metric_group_complete(payload: dict[str, Any], keys: Sequence[str]) -> bool
     return all(_to_float(payload.get(key)) is not None for key in keys)
 
 
+def _preserve_existing_short_selling_components(
+    *,
+    rows: Sequence[dict[str, Any]],
+    existing_rows: Sequence[dict[str, Any]],
+    component_retry_debt: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """Merge only provider-failed components from same-date durable rows.
+
+    A short-volume success must not erase a value/balance component that was
+    already collected successfully for the same market date. Components are
+    copied only when their full metric group (and balance as-of date) matches
+    the current debt contract; unresolved symbols remain exact retry debt.
+    """
+
+    existing_by_scope = {
+        (
+            str(item.get('market') or '').strip().upper(),
+            str(item.get('scope_type') or '').strip().lower(),
+            str(item.get('scope_key') or '').strip(),
+        ): item
+        for item in existing_rows
+        if item.get('scope_key')
+    }
+    component_specs = {
+        'short_value': ('short_volume', SHORT_VALUE_METRIC_KEYS),
+        'short_balance': ('short_balance', SHORT_BALANCE_METRIC_KEYS),
+    }
+    expected_as_of_by_component = {
+        str(item.get('component') or ''): item.get('expected_as_of_date')
+        for item in component_retry_debt
+        if isinstance(item, Mapping)
+    }
+    preserved_counts = {component: 0 for component in component_specs}
+    merged_rows: list[dict[str, Any]] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        payload = dict(row.get('payload') or {})
+        missing_fields = list(payload.get('missing_fields') or [])
+        existing = existing_by_scope.get(
+            (
+                str(row.get('market') or '').strip().upper(),
+                str(row.get('scope_type') or '').strip().lower(),
+                str(row.get('scope_key') or '').strip(),
+            )
+        )
+        existing_payload = dict((existing or {}).get('payload') or {})
+        preserved_components: list[str] = []
+        for component, (payload_group, metric_keys) in component_specs.items():
+            if component not in missing_fields:
+                continue
+            existing_group = dict(existing_payload.get(payload_group) or {})
+            if not _metric_group_complete(existing_group, metric_keys):
+                continue
+            if component == 'short_balance':
+                expected_as_of = expected_as_of_by_component.get(component)
+                if (
+                    expected_as_of
+                    and existing_group.get('as_of_date') != expected_as_of
+                ):
+                    continue
+                payload[payload_group] = existing_group
+            else:
+                current_group = dict(payload.get(payload_group) or {})
+                current_group.update(
+                    {key: existing_group[key] for key in metric_keys}
+                )
+                payload[payload_group] = current_group
+            missing_fields.remove(component)
+            preserved_components.append(component)
+            preserved_counts[component] += 1
+        payload['missing_fields'] = missing_fields
+        if preserved_components:
+            payload['preserved_components_from_existing'] = sorted(
+                preserved_components
+            )
+        row['payload'] = payload
+        merged_rows.append(row)
+
+    unresolved_debt: list[dict[str, Any]] = []
+    for raw_debt in component_retry_debt:
+        debt = dict(raw_debt)
+        component = str(debt.get('component') or '')
+        affected_symbols = sorted(
+            {
+                str(row.get('symbol') or row.get('scope_key') or '').strip()
+                for row in merged_rows
+                if component
+                in list((row.get('payload') or {}).get('missing_fields') or [])
+                and str(
+                    row.get('symbol') or row.get('scope_key') or ''
+                ).strip()
+            }
+        )
+        if not affected_symbols:
+            continue
+        debt['affected_symbol_count'] = len(affected_symbols)
+        debt['affected_symbols'] = affected_symbols
+        debt['affected_symbols_preview'] = affected_symbols[:50]
+        unresolved_debt.append(debt)
+    return merged_rows, unresolved_debt, preserved_counts
+
+
 def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
     """Return whether a persisted row is complete enough to count as coverage.
 
@@ -659,6 +761,7 @@ class PykrxEnrichmentService:
         cache: dict[tuple[Any, ...], pd.DataFrame] = {}
         category_results: dict[str, dict[str, Any]] = {}
         categories_with_errors: list[str] = []
+        component_retry_debt: list[dict[str, Any]] = []
         required_collection_symbol_filter = (
             None if use_full_market_coverage else symbol_filter
         )
@@ -748,6 +851,49 @@ class PykrxEnrichmentService:
                     category_rows.extend(kis_rows)
                     details['kis_candidate_fallback'] = kis_details
 
+            if (
+                use_full_market_coverage
+                and category == 'short_selling'
+                and details.get('component_retry_debt')
+            ):
+                try:
+                    existing_short_rows = load_daily_pykrx_enrichment_rows(
+                        market_date=market_date_iso,
+                        categories=['short_selling'],
+                        markets=normalized_markets,
+                        source='pykrx',
+                        limit=None,
+                    )
+                    (
+                        category_rows,
+                        unresolved_component_debt,
+                        preserved_component_counts,
+                    ) = _preserve_existing_short_selling_components(
+                        rows=category_rows,
+                        existing_rows=existing_short_rows,
+                        component_retry_debt=(
+                            details.get('component_retry_debt') or []
+                        ),
+                    )
+                    details['component_retry_debt'] = (
+                        unresolved_component_debt
+                    )
+                    details['preserved_existing_component_counts'] = {
+                        component: count
+                        for component, count in preserved_component_counts.items()
+                        if count > 0
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    details['persistence_blocked'] = True
+                    details.setdefault('errors', []).append(
+                        {
+                            'operation': (
+                                'short_selling_existing_component_reconciliation'
+                            ),
+                            'error': str(exc),
+                        }
+                    )
+
             category_rows = _prepare_rows_for_persistence(
                 category_rows,
                 point_in_time_recovery=point_in_time_recovery,
@@ -778,17 +924,54 @@ class PykrxEnrichmentService:
                     if supported_replace_markets is None
                     or market in supported_replace_markets
                 ]
-                persisted_count = persist_enrichment_rows(
-                    rows=provider_rows,
-                    replace_scopes=[
-                        {
-                            'market_date': market_date_iso,
-                            'market': market,
-                            'category': category,
-                            'source': 'pykrx',
-                        }
+                failed_replace_markets = {
+                    str(item.get('market') or '').strip().upper()
+                    for item in details.get('errors') or []
+                    if str(item.get('market') or '').strip()
+                }
+                has_unscoped_errors = any(
+                    not str(item.get('market') or '').strip()
+                    for item in details.get('errors') or []
+                )
+                if has_unscoped_errors:
+                    replace_markets = []
+                else:
+                    replace_markets = [
+                        market
                         for market in replace_markets
-                    ],
+                        if market not in failed_replace_markets
+                    ]
+
+                # A failed provider market is never authoritative enough to
+                # overwrite its existing full-market snapshot. Short-selling
+                # is the sole exception: its independent value/balance
+                # components are reconciled above against same-date durable
+                # rows before any upsert. All other categories discard rows
+                # from failed markets and preserve the prior snapshot intact.
+                if details.get('persistence_blocked') or has_unscoped_errors:
+                    provider_rows = []
+                elif category != 'short_selling' and failed_replace_markets:
+                    provider_rows = [
+                        row
+                        for row in provider_rows
+                        if str(row.get('market') or '').strip().upper()
+                        not in failed_replace_markets
+                    ]
+                persisted_count = (
+                    0
+                    if details.get('persistence_blocked')
+                    else persist_enrichment_rows(
+                        rows=provider_rows,
+                        replace_scopes=[
+                            {
+                                'market_date': market_date_iso,
+                                'market': market,
+                                'category': category,
+                                'source': 'pykrx',
+                            }
+                            for market in replace_markets
+                        ],
+                    )
                 )
                 if non_provider_rows:
                     persisted_count += persist_enrichment_rows(
@@ -829,11 +1012,27 @@ class PykrxEnrichmentService:
                         'rows_persisted': persisted_count,
                     }
             details['rows_persisted'] = persisted_count
+            category_component_retry_debt = [
+                dict(item)
+                for item in details.get('component_retry_debt') or []
+                if isinstance(item, dict)
+            ]
+            component_retry_debt.extend(
+                {
+                    'category': category,
+                    **item,
+                }
+                for item in category_component_retry_debt
+            )
             details['status'] = (
                 'recovered'
                 if persisted_count > 0 and fallback_result is not None
                 else 'completed'
-                if persisted_count > 0 and not details.get('errors')
+                if (
+                    persisted_count > 0
+                    and not details.get('errors')
+                    and not category_component_retry_debt
+                )
                 else 'partial'
             )
             if details.get('errors') and persisted_count <= 0:
@@ -899,7 +1098,20 @@ class PykrxEnrichmentService:
             for category, details in category_results.items()
             if details.get('fallback') and int(details.get('rows_persisted') or 0) > 0
         ]
-        status = 'partial' if categories_with_errors else ('recovered' if recovered_categories else 'completed')
+        retry_debt_categories = sorted(
+            {
+                str(item.get('category'))
+                for item in component_retry_debt
+                if item.get('category')
+            }
+        )
+        status = (
+            'partial'
+            if categories_with_errors or component_retry_debt
+            else 'recovered'
+            if recovered_categories
+            else 'completed'
+        )
         _log_pykrx_enrichment_fetch(
             'collect_for_market_date',
             status,
@@ -913,6 +1125,7 @@ class PykrxEnrichmentService:
             },
             failed_categories=categories_with_errors,
             recovered_categories=recovered_categories,
+            retry_debt_categories=retry_debt_categories,
             requested_symbol_count=coverage.get('requested_symbol_count'),
             requested_market_count=coverage.get('requested_market_count'),
         )
@@ -934,6 +1147,8 @@ class PykrxEnrichmentService:
             'status': status,
             'categories': category_results,
             'coverage': coverage,
+            'component_retry_debt': component_retry_debt,
+            'retry_debt_categories': retry_debt_categories,
         }
 
     def _collect_kis_candidate_fallback_rows(
@@ -2166,11 +2381,60 @@ class PykrxEnrichmentService:
                     }
                 )
 
+        component_retry_debt: list[dict[str, Any]] = []
+        component_operations = {
+            'short_value': 'short_selling_value',
+            'short_balance': 'short_selling_balance',
+        }
+        for component, operation in component_operations.items():
+            affected_symbols = sorted(
+                {
+                    str(row.get('symbol') or row.get('scope_key') or '').strip()
+                    for row in rows
+                    if component
+                    in list((row.get('payload') or {}).get('missing_fields') or [])
+                    and str(row.get('symbol') or row.get('scope_key') or '').strip()
+                }
+            )
+            if not affected_symbols:
+                continue
+            operation_errors = [
+                dict(item)
+                for item in errors
+                if item.get('operation') == operation
+            ]
+            component_retry_debt.append(
+                {
+                    'component': component,
+                    'operation': operation,
+                    'status': 'retry_debt',
+                    'retryable': True,
+                    'action_required': 'retry_pykrx_enrichment_for_market_date',
+                    'market_date': market_date_iso,
+                    'expected_as_of_date': (
+                        balance_as_of_date.isoformat()
+                        if component == 'short_balance'
+                        and balance_as_of_date is not None
+                        else market_date_iso
+                    ),
+                    'affected_symbol_count': len(affected_symbols),
+                    'affected_symbols': affected_symbols,
+                    'affected_symbols_preview': affected_symbols[:50],
+                    'provider_errors': operation_errors,
+                    'reason': (
+                        str(operation_errors[0].get('error') or operation)
+                        if operation_errors
+                        else f'{component} is incomplete for persisted rows'
+                    ),
+                }
+            )
+
         return rows, {
             'category': 'short_selling',
             'scope_type': 'symbol',
             'rows_prepared': len(rows),
             'errors': errors,
+            'component_retry_debt': component_retry_debt,
         }
 
     def _collect_valuation_snapshot_rows(

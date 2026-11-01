@@ -545,11 +545,15 @@ class MacroContextService:
                 for config in world_bank_configs
                 if (config.source, config.series_id) in only_series_keys
             ]
-            fred_configs = [
-                config
-                for config in fred_configs
-                if (config.source, config.series_id) in only_series_keys
-            ]
+            if not (
+                settings.macro_context_fred_enabled
+                and not settings.fred_api_key.strip()
+            ):
+                fred_configs = [
+                    config
+                    for config in fred_configs
+                    if (config.source, config.series_id) in only_series_keys
+                ]
 
         world_bank_result = await self._refresh_world_bank(now=now, configs=world_bank_configs)
         source_statuses[WORLD_BANK_SOURCE] = world_bank_result['source_status']
@@ -695,7 +699,12 @@ class MacroContextService:
         if not settings.macro_context_fred_enabled:
             return self._fred_disabled_result(status='disabled', reason='MACRO_CONTEXT_FRED_ENABLED=false')
         if not settings.fred_api_key.strip():
-            return self._fred_disabled_result(status='disabled_missing_api_key', reason='FRED_API_KEY is not configured')
+            return self._fred_disabled_result(
+                status='blocked_missing_credential',
+                reason='FRED_API_KEY is not configured',
+                configs=configs,
+                configuration_blocked=True,
+            )
         if not configs:
             return self._fred_disabled_result(status='disabled_no_series', reason='MACRO_CONTEXT_FRED_SERIES is empty')
 
@@ -741,8 +750,10 @@ class MacroContextService:
                 )
             except FREDConfigurationError as exc:
                 return self._fred_disabled_result(
-                    status='disabled_missing_api_key',
+                    status='blocked_missing_credential',
                     reason=exception_message(exc),
+                    configs=configs,
+                    configuration_blocked=True,
                 )
             except IntegrityError:
                 raise
@@ -786,25 +797,62 @@ class MacroContextService:
         }
 
     @staticmethod
-    def _fred_disabled_result(*, status: str, reason: str) -> dict[str, Any]:
-        return {
-            'source_status': {
+    def _fred_disabled_result(
+        *,
+        status: str,
+        reason: str,
+        configs: Sequence[MacroSeriesConfig] | None = None,
+        configuration_blocked: bool = False,
+    ) -> dict[str, Any]:
+        configured_series = list(configs or [])
+        observations_failed = (
+            len(configured_series) if configuration_blocked else 0
+        )
+        series_statuses = [
+            {
+                'source': FRED_SOURCE,
+                'series_id': config.series_id,
                 'status': status,
                 'reason': reason,
-                'series_count': 0,
-                'observations_upserted': 0,
-                'observations_failed': 0,
-            },
-            'series_statuses': [
+                **(
+                    {
+                        'retryable': False,
+                        'action_required': 'configure_fred_api_key',
+                    }
+                    if configuration_blocked
+                    else {}
+                ),
+            }
+            for config in configured_series
+        ]
+        if not series_statuses:
+            series_statuses = [
                 {
                     'source': FRED_SOURCE,
                     'series_id': None,
                     'status': status,
                     'reason': reason,
                 }
-            ],
+            ]
+        return {
+            'source_status': {
+                'status': status,
+                'reason': reason,
+                'series_count': len(configured_series),
+                'observations_upserted': 0,
+                'observations_failed': observations_failed,
+                **(
+                    {
+                        'retryable': False,
+                        'action_required': 'configure_fred_api_key',
+                    }
+                    if configuration_blocked
+                    else {}
+                ),
+            },
+            'series_statuses': series_statuses,
             'observations_upserted': 0,
-            'observations_failed': 0,
+            'observations_failed': observations_failed,
         }
 
     @staticmethod
@@ -831,7 +879,7 @@ class MacroContextService:
             fred_status = 'disabled'
             reason = 'MACRO_CONTEXT_FRED_ENABLED=false'
         elif not settings.fred_api_key.strip():
-            fred_status = 'disabled_missing_api_key'
+            fred_status = 'blocked_missing_credential'
             reason = 'FRED_API_KEY is not configured'
         else:
             fred_status = 'configured'
@@ -839,6 +887,14 @@ class MacroContextService:
         statuses[FRED_SOURCE] = {
             'status': fred_status,
             'reason': reason,
+            **(
+                {
+                    'retryable': False,
+                    'action_required': 'configure_fred_api_key',
+                }
+                if fred_status == 'blocked_missing_credential'
+                else {}
+            ),
         }
         return statuses
 

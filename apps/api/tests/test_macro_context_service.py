@@ -110,11 +110,14 @@ class MacroContextServiceTests(unittest.TestCase):
         with patch('app.macro_context.service._utcnow', return_value=now):
             result = service.refresh_context(force=True, trigger='unit_test')
 
-        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['observations_upserted'], 3)
-        self.assertEqual(result['observations_failed'], 0)
+        self.assertEqual(result['observations_failed'], 1)
         self.assertEqual(result['source_statuses'][WORLD_BANK_SOURCE]['status'], 'available')
-        self.assertEqual(result['source_statuses'][FRED_SOURCE]['status'], 'disabled_missing_api_key')
+        self.assertEqual(
+            result['source_statuses'][FRED_SOURCE]['status'],
+            'blocked_missing_credential',
+        )
         self.assertEqual(len(world_bank.calls), 3)
         with session_scope() as session:
             row_payloads = [
@@ -143,6 +146,10 @@ class MacroContextServiceTests(unittest.TestCase):
         context = service.get_context(as_of_date='2026-06-20', now=now)
 
         self.assertEqual(context['status'], 'available')
+        self.assertEqual(
+            context['source_statuses'][FRED_SOURCE]['status'],
+            'blocked_missing_credential',
+        )
         self.assertEqual(context['macro_regime_summary']['growth_label'], 'growth_expansion')
         self.assertEqual(context['macro_regime_summary']['inflation_label'], 'inflation_stable')
         self.assertEqual(context['macro_regime_summary']['labor_label'], 'labor_tight')
@@ -186,21 +193,43 @@ class MacroContextServiceTests(unittest.TestCase):
         ):
             service.get_context(as_of_date='2026-06-20')
 
-    def test_disabled_keyed_provider_is_reported_without_failure(self) -> None:
+    def test_enabled_keyed_provider_without_credential_is_configuration_blocked(self) -> None:
         service = self._service()
 
         result = service.refresh_context(force=True, trigger='unit_test')
 
-        self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['source_statuses'][FRED_SOURCE]['status'], 'disabled_missing_api_key')
-        self.assertEqual(result['observations_failed'], 0)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['source_statuses'][FRED_SOURCE],
+            {
+                'status': 'blocked_missing_credential',
+                'reason': 'FRED_API_KEY is not configured',
+                'series_count': 1,
+                'observations_upserted': 0,
+                'observations_failed': 1,
+                'retryable': False,
+                'action_required': 'configure_fred_api_key',
+            },
+        )
+        self.assertEqual(result['observations_failed'], 1)
         self.assertEqual(
             result['series_statuses'][-1],
             {
                 'source': FRED_SOURCE,
-                'series_id': None,
-                'status': 'disabled_missing_api_key',
+                'series_id': 'DEXKOUS',
+                'status': 'blocked_missing_credential',
                 'reason': 'FRED_API_KEY is not configured',
+                'retryable': False,
+                'action_required': 'configure_fred_api_key',
+            },
+        )
+        self.assertEqual(
+            service._configured_source_statuses()[FRED_SOURCE],
+            {
+                'status': 'blocked_missing_credential',
+                'reason': 'FRED_API_KEY is not configured',
+                'retryable': False,
+                'action_required': 'configure_fred_api_key',
             },
         )
 

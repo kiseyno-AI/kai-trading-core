@@ -12,6 +12,7 @@ import pandas as pd
 from app.eod.pykrx_enrichment import (
     PykrxEnrichmentService,
     _market_ticker_membership_frame,
+    _preserve_existing_short_selling_components,
     _resolve_short_balance_as_of_date,
 )
 from app.eod.pykrx_enrichment_gate import build_pykrx_enrichment_preflight
@@ -1172,6 +1173,31 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
         self.assertIsNone(rows[0]['payload']['short_balance']['short_balance_qty'])
         self.assertEqual(rows[0]['payload']['missing_fields'], ['short_balance'])
+        self.assertEqual(
+            details['component_retry_debt'],
+            [
+                {
+                    'component': 'short_balance',
+                    'operation': 'short_selling_balance',
+                    'status': 'retry_debt',
+                    'retryable': True,
+                    'action_required': 'retry_pykrx_enrichment_for_market_date',
+                    'market_date': '2026-04-21',
+                    'expected_as_of_date': '2026-04-17',
+                    'affected_symbol_count': 1,
+                    'affected_symbols': ['005930'],
+                    'affected_symbols_preview': ['005930'],
+                    'provider_errors': [
+                        {
+                            'market': 'KOSPI',
+                            'operation': 'short_selling_balance',
+                            'error': 'no balance rows',
+                        }
+                    ],
+                    'reason': 'no balance rows',
+                }
+            ],
+        )
 
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
@@ -1210,6 +1236,339 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(
             rows[0]['payload']['missing_fields'],
             ['short_value', 'short_balance'],
+        )
+        self.assertEqual(
+            [item['component'] for item in details['component_retry_debt']],
+            ['short_value', 'short_balance'],
+        )
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_collect_for_market_date_exposes_nonblocking_component_retry_debt(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI', 'name_ko': '삼성전자'},
+        ]
+        service = PykrxEnrichmentService()
+        row = {
+            'market_date': '2026-04-21',
+            'market': 'KOSPI',
+            'category': 'short_selling',
+            'scope_type': 'symbol',
+            'scope_key': '005930',
+            'source': 'pykrx',
+            'symbol': '005930',
+            'payload': {
+                'short_volume': {'short_volume': 1000},
+                'short_balance': {'as_of_date': '2026-04-17'},
+                'missing_fields': ['short_balance'],
+            },
+        }
+        debt = {
+            'component': 'short_balance',
+            'operation': 'short_selling_balance',
+            'status': 'retry_debt',
+            'retryable': True,
+            'action_required': 'retry_pykrx_enrichment_for_market_date',
+            'market_date': '2026-04-21',
+            'expected_as_of_date': '2026-04-17',
+            'affected_symbol_count': 1,
+            'affected_symbols_preview': ['005930'],
+            'provider_errors': [],
+            'reason': 'short_balance is incomplete for persisted rows',
+        }
+        coverage = {
+            'market_date': '2026-04-21',
+            'requested_symbol_count': 1,
+            'requested_market_count': 1,
+            'categories': {
+                'short_selling': {
+                    'present_rows': 1,
+                    'expected_rows': 1,
+                    'coverage_status': 'complete',
+                },
+            },
+        }
+        with (
+            patch.object(
+                service,
+                '_collect_short_selling_rows',
+                return_value=(
+                    [row],
+                    {
+                        'category': 'short_selling',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 1,
+                        'errors': [],
+                        'component_retry_debt': [debt],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value=coverage,
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=1,
+            ),
+        ):
+            result = service.collect_for_market_date(
+                market_date='2026-04-21',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['short_selling'],
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['retry_debt_categories'], ['short_selling'])
+        self.assertEqual(
+            result['component_retry_debt'],
+            [{'category': 'short_selling', **debt}],
+        )
+        self.assertEqual(
+            result['categories']['short_selling']['status'],
+            'partial',
+        )
+
+    def test_same_date_short_components_preserve_prior_success(self):
+        row = {
+            'market_date': '2026-04-21',
+            'market': 'KOSPI',
+            'category': 'short_selling',
+            'scope_type': 'symbol',
+            'scope_key': '005930',
+            'source': 'pykrx',
+            'symbol': '005930',
+            'payload': {
+                'short_volume': {
+                    'short_volume': 10,
+                    'total_volume': 100,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': None,
+                    'total_value': None,
+                    'short_value_ratio_pct': None,
+                },
+                'short_balance': {
+                    'as_of_date': '2026-04-17',
+                    'short_balance_qty': None,
+                    'listed_shares': None,
+                    'short_balance_amount': None,
+                    'market_cap': None,
+                    'short_balance_ratio_pct': None,
+                },
+                'missing_fields': ['short_value', 'short_balance'],
+            },
+        }
+        existing = {
+            **row,
+            'payload': {
+                'short_volume': {
+                    'short_volume': 9,
+                    'total_volume': 90,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': 1_000,
+                    'total_value': 10_000,
+                    'short_value_ratio_pct': 10.0,
+                },
+                'short_balance': {
+                    'as_of_date': '2026-04-17',
+                    'short_balance_qty': 50,
+                    'listed_shares': 1_000,
+                    'short_balance_amount': 500,
+                    'market_cap': 10_000,
+                    'short_balance_ratio_pct': 5.0,
+                },
+                'missing_fields': [],
+            },
+        }
+        debts = [
+            {
+                'component': 'short_value',
+                'expected_as_of_date': '2026-04-21',
+            },
+            {
+                'component': 'short_balance',
+                'expected_as_of_date': '2026-04-17',
+            },
+        ]
+
+        rows, unresolved, preserved = (
+            _preserve_existing_short_selling_components(
+                rows=[row],
+                existing_rows=[existing],
+                component_retry_debt=debts,
+            )
+        )
+
+        payload = rows[0]['payload']
+        self.assertEqual(payload['short_volume']['short_volume'], 10)
+        self.assertEqual(payload['short_volume']['short_value'], 1_000)
+        self.assertEqual(payload['short_balance']['short_balance_qty'], 50)
+        self.assertEqual(payload['missing_fields'], [])
+        self.assertEqual(
+            payload['preserved_components_from_existing'],
+            ['short_balance', 'short_value'],
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(
+            preserved,
+            {'short_value': 1, 'short_balance': 1},
+        )
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_failed_full_market_short_scope_is_not_destructively_replaced(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI'},
+        ]
+        service = PykrxEnrichmentService()
+        coverage = {
+            'market_date': '2026-04-21',
+            'requested_symbol_count': 1,
+            'requested_market_count': 1,
+            'categories': {},
+        }
+        with (
+            patch.object(
+                service,
+                '_collect_short_selling_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'short_selling',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 0,
+                        'errors': [
+                            {
+                                'market': 'KOSPI',
+                                'operation': 'short_selling_volume',
+                                'error': 'provider unavailable',
+                            }
+                        ],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value=coverage,
+            ),
+            patch.object(
+                service,
+                '_collect_fallback_rows',
+                return_value=([], {'rows_prepared': 0}),
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=0,
+            ) as upsert_mock,
+        ):
+            service.collect_for_market_date(
+                market_date='2026-04-21',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['short_selling'],
+                use_full_market_coverage=True,
+            )
+
+        self.assertEqual(
+            upsert_mock.call_args_list[0].kwargs['replace_scopes'],
+            [],
+        )
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_failed_full_market_valuation_rows_do_not_overwrite_prior_snapshot(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI'},
+            {'symbol': '035720', 'market': 'KOSDAQ'},
+        ]
+        failed_market_row = {
+            'market_date': '2026-06-09',
+            'market': 'KOSPI',
+            'category': 'valuation_snapshot',
+            'scope_type': 'symbol',
+            'scope_key': '005930',
+            'source': 'pykrx',
+            'symbol': '005930',
+            'payload': {'market_cap': 420_000_000_000, 'per': None},
+        }
+        successful_market_row = {
+            'market_date': '2026-06-09',
+            'market': 'KOSDAQ',
+            'category': 'valuation_snapshot',
+            'scope_type': 'symbol',
+            'scope_key': '035720',
+            'source': 'pykrx',
+            'symbol': '035720',
+            'payload': {'market_cap': 30_000_000_000, 'per': 18.0},
+        }
+        service = PykrxEnrichmentService()
+        with (
+            patch.object(
+                service,
+                '_collect_valuation_snapshot_rows',
+                return_value=(
+                    [failed_market_row, successful_market_row],
+                    {
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 2,
+                        'errors': [
+                            {
+                                'market': 'KOSPI',
+                                'operation': 'valuation_fundamentals',
+                                'error': 'provider unavailable',
+                            }
+                        ],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value={
+                    'market_date': '2026-06-09',
+                    'requested_symbol_count': 2,
+                    'requested_market_count': 2,
+                    'categories': {},
+                },
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=1,
+            ) as upsert_mock,
+        ):
+            service.collect_for_market_date(
+                market_date='2026-06-09',
+                markets=['KOSPI', 'KOSDAQ'],
+                symbols=['005930', '035720'],
+                categories=['valuation_snapshot'],
+                use_full_market_coverage=True,
+            )
+
+        provider_call = upsert_mock.call_args_list[0]
+        self.assertEqual(
+            [row['market'] for row in provider_call.kwargs['rows']],
+            ['KOSDAQ'],
+        )
+        self.assertEqual(
+            provider_call.kwargs['replace_scopes'],
+            [
+                {
+                    'market_date': '2026-06-09',
+                    'market': 'KOSDAQ',
+                    'category': 'valuation_snapshot',
+                    'source': 'pykrx',
+                }
+            ],
         )
 
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
