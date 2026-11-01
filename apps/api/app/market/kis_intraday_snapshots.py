@@ -241,6 +241,39 @@ def _bounded_exception_message(exc: Exception) -> str:
     return message[:RESULT_ERROR_MESSAGE_LIMIT]
 
 
+def _now_kst() -> datetime:
+    return datetime.now(KST)
+
+
+def _non_trading_day_result(
+    *,
+    runtime: dict[str, Any],
+    requested_symbols: list[str],
+    market_state: str,
+    market_date: str,
+) -> dict[str, Any]:
+    return {
+        'status': 'market_closed',
+        'reason': 'non_trading_day',
+        'runtime': runtime,
+        'market_state': market_state,
+        'market_date': market_date,
+        'requested_symbols': requested_symbols,
+        'summary': {
+            'matched_symbol_count': len(requested_symbols),
+            'collected_count': 0,
+            'available_count': 0,
+            'partial_count': 0,
+            'unavailable_count': 0,
+        },
+        'snapshots_persisted': 0,
+        'snapshots_failed': 0,
+        'failed_symbols': [],
+        'failed_symbol_errors': [],
+        'items': [],
+    }
+
+
 class KISIntradaySnapshotService:
     def __init__(self, *, client=None, fetch_concurrency: int = DEFAULT_FETCH_CONCURRENCY) -> None:
         self.client = client or kis_client
@@ -868,29 +901,23 @@ class KISIntradaySnapshotService:
                 'failed_symbol_errors': [],
                 'items': [],
             }
+        now_kst = _now_kst()
+        if now_kst.weekday() >= 5:
+            return _non_trading_day_result(
+                runtime=runtime,
+                requested_symbols=requested_symbols,
+                market_state='WEEKEND',
+                market_date=now_kst.date().isoformat(),
+            )
         market_state = await async_get_market_state()
         market_date = market_state.server_time[:10]
         if not market_state.is_trading_day:
-            return {
-                'status': 'market_closed',
-                'reason': 'non_trading_day',
-                'runtime': runtime,
-                'market_state': market_state.state,
-                'market_date': market_date,
-                'requested_symbols': requested_symbols,
-                'summary': {
-                    'matched_symbol_count': len(requested_symbols),
-                    'collected_count': 0,
-                    'available_count': 0,
-                    'partial_count': 0,
-                    'unavailable_count': 0,
-                },
-                'snapshots_persisted': 0,
-                'snapshots_failed': 0,
-                'failed_symbols': [],
-                'failed_symbol_errors': [],
-                'items': [],
-            }
+            return _non_trading_day_result(
+                runtime=runtime,
+                requested_symbols=requested_symbols,
+                market_state=market_state.state,
+                market_date=market_date,
+            )
         symbol_inputs = self._capture_universe(symbols)
         requested_symbols = [item.symbol for item in symbol_inputs]
         if not symbol_inputs:

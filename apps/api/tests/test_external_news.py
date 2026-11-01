@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.core.settings import settings
 from app.external_news.classifier import classify_external_news_item
@@ -323,35 +323,28 @@ class ExternalNewsServiceTests(unittest.IsolatedAsyncioTestCase):
 
         enrich.assert_not_called()
 
-    def test_enrichment_storage_failure_logs_only_bounded_context(self) -> None:
+    def test_enrichment_storage_and_unknown_failures_remain_fatal(self) -> None:
         service = ExternalNewsService(provider=FakeExternalNewsProvider())
-
-        with (
-            patch(
-                'app.external_news.service.enrich_recent_external_news_classification',
-                side_effect=RuntimeError('database query failed'),
+        failures = (
+            OperationalError(
+                'select from external_news_items',
+                {},
+                RuntimeError('database unavailable'),
             ),
-            patch('app.external_news.service.logger') as logger,
-        ):
-            result = service.enrich_recent_classification(
-                symbols=['000660', '005930'],
-                market_date='2026-10-07',
-                lookback_days=14,
-                limit=1000,
-            )
-
-        self.assertEqual(result['status'], 'unavailable')
-        logger.error.assert_called_once_with(
-            'External news classification enrichment failed.',
-            extra={
-                'market_date': '2026-10-07',
-                'requested_symbol_count': 2,
-                'lookback_days': 14,
-                'limit': 1000,
-                'error_class': 'RuntimeError',
-            },
+            KeyError('unexpected classification shape'),
         )
-        logger.exception.assert_not_called()
+
+        for failure in failures:
+            with self.subTest(error_type=type(failure).__name__), patch(
+                'app.external_news.service.enrich_recent_external_news_classification',
+                side_effect=failure,
+            ), self.assertRaises(type(failure)):
+                service.enrich_recent_classification(
+                    symbols=['000660', '005930'],
+                    market_date='2026-10-07',
+                    lookback_days=14,
+                    limit=1000,
+                )
 
     def test_enrichment_integrity_failure_remains_fatal(self) -> None:
         service = ExternalNewsService(provider=FakeExternalNewsProvider())
@@ -517,6 +510,27 @@ class NaverNewsProviderTests(unittest.IsolatedAsyncioTestCase):
 
         provider = NaverNewsSearchProvider(transport=httpx.MockTransport(handler))
         with self.assertRaisesRegex(RuntimeError, r'failed \[401\]'):
+            await provider.search_news(query='삼성전자 005930', display=1)
+
+        self.assertEqual(attempts, 1)
+
+    async def test_naver_provider_classifies_invalid_json_as_provider_failure(
+        self,
+    ) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(200, content=b'{', request=request)
+
+        provider = NaverNewsSearchProvider(
+            transport=httpx.MockTransport(handler)
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'response JSON decode failed',
+        ):
             await provider.search_news(query='삼성전자 005930', display=1)
 
         self.assertEqual(attempts, 1)

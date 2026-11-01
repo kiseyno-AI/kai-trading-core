@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy.exc import IntegrityError
 
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.agent_context.retry_service import (
@@ -225,6 +224,15 @@ CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
 # optional context whose terminal degradation may lower confidence but must
 # not block feedback. Historical point-in-time recovery also excludes current-
 # only signal features and retains the date-bounded numeric prerequisite set.
+
+
+class DailyPipelineStageCheckpointError(RuntimeError):
+    """A stage progress checkpoint could not be durably persisted."""
+
+
+class DailyPipelineScopeFinalizationError(RuntimeError):
+    """An exact-scope persistence proof could not be durably finalized."""
+
 
 @dataclass(frozen=True)
 class DailyStageDefinition:
@@ -2951,7 +2959,7 @@ class DailyPipelineStageService:
                             if stage_symbols is not None
                             else None
                         )
-                        return self._execute_stage(
+                        stage_result = self._execute_stage(
                             stage_id,
                             market_date=resolved_market_date,
                             symbols=stage_symbols,
@@ -3042,14 +3050,24 @@ class DailyPipelineStageService:
                                 else False
                             ),
                         )
+                        return stage_result
 
                     if stage_id in FACTOR_STAGE_ORDER:
+                        factor_heartbeat_errors: list[Exception] = []
+
+                        def fail_closed_factor_heartbeat() -> bool:
+                            try:
+                                return self.run_state_service.heartbeat_stage(
+                                    pipeline_run_id=pipeline_run_id,
+                                    stage_id=stage_id,
+                                    market_date=resolved_market_date,
+                                )
+                            except Exception as exc:
+                                factor_heartbeat_errors.append(exc)
+                                return False
+
                         stage_heartbeat = PeriodicStageHeartbeat(
-                            lambda: self.run_state_service.heartbeat_stage(
-                                pipeline_run_id=pipeline_run_id,
-                                stage_id=stage_id,
-                                market_date=resolved_market_date,
-                            ),
+                            fail_closed_factor_heartbeat,
                             interval_seconds=(
                                 FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS
                             ),
@@ -3059,6 +3077,12 @@ class DailyPipelineStageService:
                             ),
                         )
                         if not stage_heartbeat.check_now():
+                            if factor_heartbeat_errors:
+                                heartbeat_error = factor_heartbeat_errors[0]
+                                raise DailyPipelineStageCheckpointError(
+                                    'unable to persist factor heartbeat for '
+                                    f'stage {stage_id}: {heartbeat_error}'
+                                ) from heartbeat_error
                             stage_result = {
                                 'triggered': False,
                                 'status': 'interrupted',
@@ -3085,6 +3109,12 @@ class DailyPipelineStageService:
                             }
                         with stage_heartbeat:
                             stage_result = execute_current_stage()
+                        if factor_heartbeat_errors:
+                            heartbeat_error = factor_heartbeat_errors[0]
+                            raise DailyPipelineStageCheckpointError(
+                                'unable to persist factor heartbeat for '
+                                f'stage {stage_id}: {heartbeat_error}'
+                            ) from heartbeat_error
                         if stage_heartbeat.ownership_lost:
                             stage_outcomes[stage_id] = (
                                 self._build_stage_outcome(
@@ -3231,6 +3261,10 @@ class DailyPipelineStageService:
                 if (
                     stage_heartbeat is not None
                     and stage_heartbeat.ownership_lost
+                    and not isinstance(
+                        exc,
+                        DailyPipelineStageCheckpointError,
+                    )
                 ):
                     stage_result = {
                         'triggered': False,
@@ -3795,24 +3829,30 @@ class DailyPipelineStageService:
         market_date: str,
     ) -> Callable[..., None]:
         def _checkpoint(**payload: Any) -> None:
-            self.run_state_service.update_stage(
-                pipeline_run_id=pipeline_run_id,
-                stage_id=stage_id,
-                market_date=market_date,
-                status=str(payload.get('status') or 'running'),
-                current_step=payload.get('current_step'),
-                current_activity=payload.get('current_activity'),
-                processed=payload.get('processed'),
-                total=payload.get('total'),
-                succeeded=payload.get('succeeded'),
-                failed=payload.get('failed'),
-                remaining=payload.get('remaining'),
-                current_symbol=payload.get('current_symbol'),
-                current_period=payload.get('current_period'),
-                error_message=payload.get('error_message'),
-                source_run_ids=payload.get('source_run_ids'),
-                details=payload.get('details'),
-            )
+            try:
+                self.run_state_service.update_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=market_date,
+                    status=str(payload.get('status') or 'running'),
+                    current_step=payload.get('current_step'),
+                    current_activity=payload.get('current_activity'),
+                    processed=payload.get('processed'),
+                    total=payload.get('total'),
+                    succeeded=payload.get('succeeded'),
+                    failed=payload.get('failed'),
+                    remaining=payload.get('remaining'),
+                    current_symbol=payload.get('current_symbol'),
+                    current_period=payload.get('current_period'),
+                    error_message=payload.get('error_message'),
+                    source_run_ids=payload.get('source_run_ids'),
+                    details=payload.get('details'),
+                )
+            except Exception as exc:
+                raise DailyPipelineStageCheckpointError(
+                    f'unable to persist progress for stage {stage_id}: '
+                    f'{exc}'
+                ) from exc
 
         return _checkpoint
 
@@ -3946,11 +3986,6 @@ class DailyPipelineStageService:
             except Exception as exc:
                 last_error = exc
         assert last_error is not None
-        self._finish_run_preserving_primary_error(
-            pipeline_run_id=pipeline_run_id,
-            status='failed',
-            error_message=str(last_error),
-        )
         raise last_error
 
     @staticmethod
@@ -6571,7 +6606,7 @@ class DailyPipelineStageService:
             result = call()
         except Exception:
             if exact_scope_symbols is not None and not atomic_finalization:
-                _finalize_daily_stage_scope(
+                DailyPipelineStageService._finalize_exact_scope_or_raise(
                     market_date=market_date,
                     stage_id=stage_id,
                     exact_symbols=exact_scope_symbols,
@@ -6584,19 +6619,41 @@ class DailyPipelineStageService:
                 isinstance(finalization, Mapping)
                 and finalization.get('ready') is True
             ):
-                raise RuntimeError(
+                raise DailyPipelineScopeFinalizationError(
                     f'{stage_id} atomic exact-scope finalization proof '
                     'is unavailable'
                 )
             return result
         if exact_scope_symbols is not None:
-            result['scope_finalization'] = _finalize_daily_stage_scope(
-                market_date=market_date,
-                stage_id=stage_id,
-                exact_symbols=exact_scope_symbols,
-                result=result,
+            result['scope_finalization'] = (
+                DailyPipelineStageService._finalize_exact_scope_or_raise(
+                    market_date=market_date,
+                    stage_id=stage_id,
+                    exact_symbols=exact_scope_symbols,
+                    result=result,
+                )
             )
         return result
+
+    @staticmethod
+    def _finalize_exact_scope_or_raise(
+        *,
+        market_date: str,
+        stage_id: str,
+        exact_symbols: Sequence[str],
+        result: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        try:
+            return _finalize_daily_stage_scope(
+                market_date=market_date,
+                stage_id=stage_id,
+                exact_symbols=exact_symbols,
+                result=result,
+            )
+        except Exception as exc:
+            raise DailyPipelineScopeFinalizationError(
+                f'{stage_id} exact-scope finalization failed: {exc}'
+            ) from exc
 
     @staticmethod
     def _execute_optional_context_stage(
@@ -6604,29 +6661,8 @@ class DailyPipelineStageService:
         stage_id: str,
         call: Callable[[], dict[str, Any]],
     ) -> dict[str, Any]:
-        try:
-            return call()
-        except IntegrityError:
-            raise
-        except Exception as exc:
-            reason = f'{stage_id}_service_exception'
-            logger.warning(
-                'Optional daily context stage %s degraded: %s',
-                stage_id,
-                type(exc).__name__,
-            )
-            return {
-                'triggered': True,
-                'terminal': True,
-                'retry_pending': False,
-                'retryable': False,
-                'status': 'partial',
-                'stage': stage_id,
-                'reason': reason,
-                'failure_reason': reason,
-                'error_type': type(exc).__name__,
-                'error_message': str(exc),
-            }
+        del stage_id
+        return call()
 
     @staticmethod
     def _combine_technical_scope_outcomes(
@@ -9278,20 +9314,47 @@ class DailyPipelineStageService:
 
     @staticmethod
     def _resolve_overall_status(stage_outcomes: Sequence[dict[str, Any]]) -> str:
-        statuses = [str(item.get('status') or 'completed') for item in stage_outcomes]
-        if any(status == 'blocked' for status in statuses):
-            return 'blocked'
-        if any(status == 'waiting' for status in statuses):
-            return 'waiting'
-        if any(status == 'failed' for status in statuses):
-            return 'failed'
+        statuses = [
+            str(item.get('status') or '').strip().lower()
+            for item in stage_outcomes
+        ]
+        if not statuses:
+            return 'completed'
         if any(status == 'running' for status in statuses):
             return 'running'
-        if any(status == 'partial' for status in statuses):
-            return 'partial'
-        if statuses and all(status == 'skipped' for status in statuses):
-            return 'skipped'
-        return 'completed'
+        if all(status == 'pending' for status in statuses):
+            return 'pending'
+        if any(status == 'failed' for status in statuses):
+            if any(
+                status in {'completed', 'partial'}
+                for status in statuses
+            ):
+                return 'partial'
+            return 'failed'
+        for specific_status in (
+            'blocked',
+            'waiting',
+            'interrupted',
+            'abandoned',
+        ):
+            if all(status == specific_status for status in statuses):
+                return specific_status
+        if all(
+            (
+                status == 'completed'
+                and daily_pipeline_outcome_is_satisfied(outcome)
+            )
+            or (
+                status == 'skipped'
+                and (
+                    outcome.get('safe_skip') is True
+                    or daily_pipeline_outcome_is_satisfied(outcome)
+                )
+            )
+            for status, outcome in zip(statuses, stage_outcomes)
+        ):
+            return 'completed'
+        return 'partial'
 
 
 daily_pipeline_stage_service = DailyPipelineStageService()

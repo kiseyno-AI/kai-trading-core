@@ -504,7 +504,7 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
             patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(['000001', '000002'])),
             patch(
                 'app.signals.composite_factor.upsert_daily_composite_factor_results',
-                side_effect=RuntimeError('batch unavailable'),
+                side_effect=ValueError('batch contains malformed row'),
             ),
             patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as upsert,
         ):
@@ -563,7 +563,7 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
 
         def persist_one(item: dict) -> None:
             if item['symbol'] == '000002':
-                raise RuntimeError('row unavailable')
+                raise ValueError('malformed persisted row')
 
         with (
             patch(
@@ -574,7 +574,7 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
             patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(symbols)),
             patch(
                 'app.signals.composite_factor.upsert_daily_composite_factor_results',
-                side_effect=RuntimeError('batch unavailable'),
+                side_effect=ValueError('batch contains malformed row'),
             ),
             patch(
                 'app.signals.composite_factor.upsert_daily_composite_factor_result',

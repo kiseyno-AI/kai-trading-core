@@ -1145,7 +1145,10 @@ def _is_terminal_followup_continuation_candidate(
 
     terminal_evidence: Mapping[str, Any] | None = None
     evidence_suffix: Mapping[str, Any] | None = None
-    if pipeline_status == 'blocked' and continuation_count == 0:
+    if (
+        pipeline_status in {'blocked', 'partial'}
+        and continuation_count == 0
+    ):
         pass
     elif (
         pipeline_status in {'running', 'interrupted', 'failed'}

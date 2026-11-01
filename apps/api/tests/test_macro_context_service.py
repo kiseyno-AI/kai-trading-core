@@ -3,11 +3,13 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 from sqlalchemy import delete, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.core.settings import settings
 from app.db import engine, session_scope
 from app.db_models import MacroContextObservation
+from app.integrations.fred.client import FREDAPIError
+from app.integrations.world_bank.client import WorldBankAPIError
 from app.macro_context.service import (
     DEFAULT_WORLD_BANK_SERIES,
     FRED_SOURCE,
@@ -48,14 +50,60 @@ class FailingFredClient:
         raise AssertionError('FRED should not be called when FRED_API_KEY is missing')
 
 
+class FakeFredClient:
+    async def fetch_latest_observations(self, **kwargs):
+        return {
+            'observations': [
+                {
+                    'date': '2026-06-19',
+                    'value': '1380.5',
+                }
+            ]
+        }
+
+
 class EmptyErrorWorldBankClient:
     async def fetch_indicator(self, **kwargs):
-        raise RuntimeError()
+        raise WorldBankAPIError()
 
 
 class EmptyErrorFredClient:
     async def fetch_latest_observations(self, **kwargs):
-        raise RuntimeError()
+        raise FREDAPIError()
+
+
+class UnknownFailureWorldBankClient:
+    async def fetch_indicator(self, **kwargs):
+        raise RuntimeError('unexpected world bank invariant')
+
+
+class UnknownFailureFredClient:
+    async def fetch_latest_observations(self, **kwargs):
+        raise RuntimeError('unexpected fred invariant')
+
+
+class MalformedDateWorldBankClient:
+    async def fetch_indicator(self, **kwargs):
+        period = (
+            'not-a-date'
+            if kwargs['indicator'] == 'NY.GDP.MKTP.KD.ZG'
+            else '2024'
+        )
+        return {
+            'metadata': {'source': 'fake-world-bank'},
+            'rows': [{'date': period, 'value': '2.5'}],
+            'raw': {},
+        }
+
+
+class MalformedDateFredClient:
+    async def fetch_latest_observations(self, **kwargs):
+        period = (
+            'not-a-date'
+            if kwargs['series_id'] == 'DEXKOUS'
+            else '2026-06-19'
+        )
+        return {'observations': [{'date': period, 'value': '1380.5'}]}
 
 
 class MacroContextServiceTests(unittest.TestCase):
@@ -175,6 +223,26 @@ class MacroContextServiceTests(unittest.TestCase):
         ):
             service.refresh_context(force=True, trigger='unit_test')
 
+    def test_refresh_operational_failure_remains_fatal(self) -> None:
+        settings.macro_context_world_bank_series = 'NY.GDP.MKTP.KD.ZG'
+        settings.macro_context_fred_enabled = False
+        service = self._service()
+        operational_error = OperationalError(
+            'insert into macro_context_observations',
+            {},
+            RuntimeError('database unavailable'),
+        )
+
+        with (
+            patch.object(
+                service.store,
+                'upsert_observation',
+                side_effect=operational_error,
+            ),
+            self.assertRaises(OperationalError),
+        ):
+            service.refresh_context(force=True, trigger='unit_test')
+
     def test_context_read_integrity_failure_remains_fatal(self) -> None:
         service = self._service()
         integrity_error = IntegrityError(
@@ -190,6 +258,24 @@ class MacroContextServiceTests(unittest.TestCase):
                 side_effect=integrity_error,
             ),
             self.assertRaises(IntegrityError),
+        ):
+            service.get_context(as_of_date='2026-06-20')
+
+    def test_context_read_operational_failure_remains_fatal(self) -> None:
+        service = self._service()
+        operational_error = OperationalError(
+            'select from macro_context_observations',
+            {},
+            RuntimeError('database unavailable'),
+        )
+
+        with (
+            patch.object(
+                service.store,
+                'load_latest_by_series',
+                side_effect=operational_error,
+            ),
+            self.assertRaises(OperationalError),
         ):
             service.get_context(as_of_date='2026-06-20')
 
@@ -264,8 +350,8 @@ class MacroContextServiceTests(unittest.TestCase):
                 'source': WORLD_BANK_SOURCE,
                 'series_id': 'NY.GDP.MKTP.KD.ZG',
                 'status': 'failed',
-                'reason': 'RuntimeError',
-                'error_type': 'RuntimeError',
+                'reason': 'WorldBankAPIError',
+                'error_type': 'WorldBankAPIError',
                 'retryable': True,
                 'action_required': 'automatic_retry_pending',
             },
@@ -278,8 +364,62 @@ class MacroContextServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             latest[(WORLD_BANK_SOURCE, config.series_id)].status_detail,
-            f'refresh_failed_at={now.isoformat()}; RuntimeError',
+            f'refresh_failed_at={now.isoformat()}; WorldBankAPIError',
         )
+
+    def test_unknown_world_bank_failure_remains_fatal(self) -> None:
+        settings.macro_context_world_bank_series = 'NY.GDP.MKTP.KD.ZG'
+        settings.macro_context_fred_enabled = False
+        service = self._service(UnknownFailureWorldBankClient())
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'unexpected world bank invariant',
+        ):
+            service.refresh_context(force=True, trigger='unit_test')
+
+    def test_invalid_world_bank_period_isolated_from_sibling_series(
+        self,
+    ) -> None:
+        settings.macro_context_world_bank_series = (
+            'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG'
+        )
+        settings.macro_context_fred_enabled = False
+        service = self._service(MalformedDateWorldBankClient())
+
+        result = service.refresh_context(force=True, trigger='unit_test')
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['observations_upserted'], 1)
+        self.assertEqual(result['observations_failed'], 1)
+        self.assertEqual(
+            [item['status'] for item in result['series_statuses']],
+            ['failed', 'available', 'disabled'],
+        )
+        self.assertIn(
+            'invalid observation period',
+            result['series_statuses'][0]['reason'],
+        )
+
+    def test_unknown_world_bank_failure_checkpoint_error_remains_fatal(
+        self,
+    ) -> None:
+        settings.macro_context_world_bank_series = 'NY.GDP.MKTP.KD.ZG'
+        settings.macro_context_fred_enabled = False
+        service = self._service(EmptyErrorWorldBankClient())
+
+        with (
+            patch.object(
+                service.store,
+                'mark_refresh_failure',
+                side_effect=RuntimeError('failure checkpoint invariant'),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'failure checkpoint invariant',
+            ),
+        ):
+            service.refresh_context(force=True, trigger='unit_test')
 
     def test_fred_failure_reports_retry_contract_with_nonblank_reason(self) -> None:
         settings.macro_context_world_bank_enabled = False
@@ -300,12 +440,94 @@ class MacroContextServiceTests(unittest.TestCase):
                 'source': FRED_SOURCE,
                 'series_id': 'DEXKOUS',
                 'status': 'failed',
-                'reason': 'RuntimeError',
-                'error_type': 'RuntimeError',
+                'reason': 'FREDAPIError',
+                'error_type': 'FREDAPIError',
                 'retryable': True,
                 'action_required': 'automatic_retry_pending',
             },
         )
+
+    def test_fred_operational_failure_remains_fatal(self) -> None:
+        settings.macro_context_world_bank_enabled = False
+        settings.fred_api_key = 'test-fred-key'
+        service = MacroContextService(
+            store=MacroContextObservationStore(),
+            world_bank_client=FakeWorldBankClient(),
+            fred_client=FakeFredClient(),
+        )
+        operational_error = OperationalError(
+            'insert into macro_context_observations',
+            {},
+            RuntimeError('database unavailable'),
+        )
+
+        with (
+            patch.object(
+                service.store,
+                'upsert_observation',
+                side_effect=operational_error,
+            ),
+            self.assertRaises(OperationalError),
+        ):
+            service.refresh_context(force=True, trigger='unit_test')
+
+    def test_unknown_fred_failure_remains_fatal(self) -> None:
+        settings.macro_context_world_bank_enabled = False
+        settings.fred_api_key = 'test-fred-key'
+        service = MacroContextService(
+            store=MacroContextObservationStore(),
+            world_bank_client=FakeWorldBankClient(),
+            fred_client=UnknownFailureFredClient(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'unexpected fred invariant'):
+            service.refresh_context(force=True, trigger='unit_test')
+
+    def test_invalid_fred_date_isolated_from_sibling_series(self) -> None:
+        settings.macro_context_world_bank_enabled = False
+        settings.macro_context_fred_series = 'DEXKOUS,CPIAUCSL'
+        settings.fred_api_key = 'test-fred-key'
+        service = MacroContextService(
+            store=MacroContextObservationStore(),
+            world_bank_client=FakeWorldBankClient(),
+            fred_client=MalformedDateFredClient(),
+        )
+
+        result = service.refresh_context(force=True, trigger='unit_test')
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['observations_upserted'], 1)
+        self.assertEqual(result['observations_failed'], 1)
+        self.assertEqual(
+            [item['status'] for item in result['series_statuses']],
+            ['failed', 'available'],
+        )
+        self.assertIn(
+            'invalid observation date',
+            result['series_statuses'][0]['reason'],
+        )
+
+    def test_unknown_fred_failure_checkpoint_error_remains_fatal(self) -> None:
+        settings.macro_context_world_bank_enabled = False
+        settings.fred_api_key = 'test-fred-key'
+        service = MacroContextService(
+            store=MacroContextObservationStore(),
+            world_bank_client=FakeWorldBankClient(),
+            fred_client=EmptyErrorFredClient(),
+        )
+
+        with (
+            patch.object(
+                service.store,
+                'mark_refresh_failure',
+                side_effect=RuntimeError('failure checkpoint invariant'),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'failure checkpoint invariant',
+            ),
+        ):
+            service.refresh_context(force=True, trigger='unit_test')
 
     def test_get_context_marks_stale_data(self) -> None:
         settings.macro_context_stale_after_hours = 24
@@ -484,7 +706,7 @@ class _OnceFailingWorldBankClient(FakeWorldBankClient):
         self.calls.append(kwargs)
         if kwargs['indicator'] == self.failed_series_id and not self.failed_once:
             self.failed_once = True
-            raise RuntimeError('temporary provider error')
+            raise WorldBankAPIError('temporary provider error')
         indicator = kwargs['indicator']
         return {
             'metadata': {'source': 'fake-world-bank'},

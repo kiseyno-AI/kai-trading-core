@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy.exc import IntegrityError
+import httpx
 
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.core.audit_logging import exception_message
@@ -19,6 +19,25 @@ from app.market_data_store import load_symbols
 logger = logging.getLogger(__name__)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 EXTERNAL_NEWS_PROVIDER_CIRCUIT_FAILURE_THRESHOLD = 2
+
+
+def _is_expected_provider_failure(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, httpx.HTTPError)):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    if isinstance(exc.__cause__, httpx.HTTPError):
+        return True
+    message = str(exc)
+    return bool(
+        message.startswith('Naver News Search transport error:')
+        or message.startswith('Naver News Search request failed [')
+        or message == 'Naver News Search response JSON decode failed'
+        or message
+        == 'Naver News Search response did not contain an items list'
+        or message == 'naver_search_credentials_missing'
+        or message == 'external_news_provider_disabled'
+    )
 
 
 def _utcnow() -> datetime:
@@ -226,6 +245,8 @@ class ExternalNewsService:
                     display=per_symbol_limit,
                 )
             except Exception as exc:
+                if not _is_expected_provider_failure(exc):
+                    raise
                 consecutive_provider_failures += 1
                 summary['failed_symbol_count'] += 1
                 provider_circuit_open = (
@@ -257,37 +278,11 @@ class ExternalNewsService:
                 continue
 
             consecutive_provider_failures = 0
-            try:
-                persist_result = persist_external_news_items(
-                    symbol=symbol,
-                    items=fetched,
-                    source=self.provider.provider_name,
-                )
-            except IntegrityError:
-                raise
-            except Exception as exc:
-                summary['failed_symbol_count'] += 1
-                logger.warning(
-                    'External news persistence failed for one symbol.',
-                    extra={
-                        'provider': self.provider.provider_name,
-                        'symbol': symbol,
-                        'error_class': type(exc).__name__,
-                    },
-                )
-                items_out.append(
-                    {
-                        'symbol': symbol,
-                        'name_ko': row.get('name_ko'),
-                        'status': 'failed',
-                        'reason': 'persistence_failed',
-                        'query': query,
-                        'fetched_count': len(fetched),
-                        'error_type': type(exc).__name__,
-                        'error_message': exception_message(exc),
-                    }
-                )
-                continue
+            persist_result = persist_external_news_items(
+                symbol=symbol,
+                items=fetched,
+                source=self.provider.provider_name,
+            )
 
             summary['collected_symbol_count'] += 1
             summary['items_fetched'] += len(fetched)
@@ -459,38 +454,13 @@ class ExternalNewsService:
         resolved_lookback_days = (
             lookback_days or settings.external_news_context_lookback_days
         )
-        try:
-            result = enrich_recent_external_news_classification(
-                symbols=normalized_symbols or None,
-                lookback_days=resolved_lookback_days,
-                limit=limit,
-                association_start=association_start,
-                association_end=association_end,
-            )
-        except IntegrityError:
-            raise
-        except Exception as exc:
-            logger.error(
-                'External news classification enrichment failed.',
-                extra={
-                    'market_date': (
-                        normalized_market_date.isoformat()
-                        if normalized_market_date is not None
-                        else None
-                    ),
-                    'requested_symbol_count': len(normalized_symbols),
-                    'lookback_days': resolved_lookback_days,
-                    'limit': int(limit),
-                    'error_class': exc.__class__.__name__,
-                },
-            )
-            return {
-                'status': 'unavailable',
-                'reason': 'external_news_storage_unavailable',
-                'error_class': exc.__class__.__name__,
-                'provider': provider_status,
-                'requested_symbols': normalized_symbols,
-            }
+        result = enrich_recent_external_news_classification(
+            symbols=normalized_symbols or None,
+            lookback_days=resolved_lookback_days,
+            limit=limit,
+            association_start=association_start,
+            association_end=association_end,
+        )
         return {
             **result,
             'provider': provider_status,

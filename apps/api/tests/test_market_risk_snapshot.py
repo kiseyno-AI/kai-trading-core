@@ -235,7 +235,7 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         def upsert_side_effect(item: dict) -> None:
             if item['symbol'] == '000660':
-                raise RuntimeError('write failed')
+                raise ValueError('malformed persisted row')
 
         with (
             patch.object(
@@ -250,7 +250,7 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 'app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots',
-                side_effect=RuntimeError('bulk write failed'),
+                side_effect=ValueError('batch contains malformed row'),
             ) as bulk_upsert,
             patch(
                 'app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshot',
@@ -273,6 +273,59 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upsert.call_count, 2)
         persisted_symbols = {call.args[0]['symbol'] for call in upsert.call_args_list}
         self.assertEqual(persisted_symbols, {'005930', '000660'})
+
+    async def test_collect_propagates_checkpoint_failure_after_symbol_fetch(
+        self,
+    ) -> None:
+        client = FakeKISRiskClient(
+            responses={'005930': {'output': {}}}
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        progress_updates: list[dict] = []
+
+        def _failing_checkpoint_callback(**payload) -> None:
+            progress_updates.append(payload)
+            if len(progress_updates) == 2:
+                raise RuntimeError('checkpoint store unavailable')
+
+        with (
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(
+                    [
+                        MarketRiskSymbolInput(
+                            symbol='005930',
+                            name_ko='삼성전자',
+                            market='KOSPI',
+                        )
+                    ],
+                    ['005930'],
+                    ['005930'],
+                    [],
+                ),
+            ),
+            patch(
+                'app.signals.market_risk_snapshot.'
+                'upsert_daily_market_risk_snapshots'
+            ) as upsert,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'checkpoint store unavailable',
+            ):
+                await service.collect_for_market_date(
+                    market_date='2026-04-14',
+                    progress_callback=_failing_checkpoint_callback,
+                )
+
+        self.assertEqual(client.calls, ['005930'])
+        self.assertEqual(len(progress_updates), 2)
+        self.assertIn(
+            'Fetched KIS market-risk snapshot for 005930',
+            progress_updates[-1]['current_activity'],
+        )
+        upsert.assert_not_called()
 
     async def test_collect_for_market_date_counts_missing_master_symbols_as_failures(
         self,

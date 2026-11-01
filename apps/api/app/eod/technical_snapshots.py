@@ -19,6 +19,12 @@ from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 TECHNICAL_SNAPSHOT_SCOPE_MANIFEST_VERSION = (
     'technical_snapshots_scope_outcomes_v1'
 )
+TECHNICAL_SNAPSHOT_ROW_LOCAL_ERRORS = (
+    ArithmeticError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:
@@ -257,11 +263,7 @@ class DailyTechnicalSnapshotService:
         def _emit_progress(payload: dict) -> None:
             if not progress_callback:
                 return
-            try:
-                progress_callback(payload)
-            except Exception:
-                # Progress persistence is best-effort and must not interrupt snapshot processing.
-                return
+            progress_callback(payload)
 
         if progress_callback:
             first_symbol = target_symbols[0] if target_symbols else None
@@ -283,11 +285,15 @@ class DailyTechnicalSnapshotService:
             )
 
         for index, symbol in enumerate(target_symbols):
+            bars = load_daily_bars_for_symbol(
+                symbol,
+                end_date=market_date,
+                limit=self.history_window,
+            )
             try:
-                bars = load_daily_bars_for_symbol(symbol, end_date=market_date, limit=self.history_window)
                 snapshot = self.compute_snapshot(symbol=symbol, market_date=market_date, bars=bars, source=source)
                 snapshots.append(snapshot.to_row())
-            except Exception:
+            except TECHNICAL_SNAPSHOT_ROW_LOCAL_ERRORS:
                 failed_symbols.append(symbol)
             if progress_callback:
                 next_symbol = target_symbols[index + 1] if index + 1 < len(target_symbols) else None

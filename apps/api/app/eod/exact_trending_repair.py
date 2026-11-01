@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
+from copy import deepcopy
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
@@ -688,7 +689,7 @@ class ExactTrendingRankRepair:
                     'reconciliation': reconciliation,
                 }
                 uncertain_unit = (
-                    dict(previous)
+                    deepcopy(dict(previous))
                     if isinstance(previous, Mapping)
                     else {
                         'status': 'uncertain',

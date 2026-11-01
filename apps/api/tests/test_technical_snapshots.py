@@ -2,6 +2,8 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
+from sqlalchemy.exc import OperationalError
+
 from app.eod.technical_snapshots import DailyTechnicalSnapshotService
 
 
@@ -135,7 +137,7 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
         self.assertFalse(price_bar_context['gap']['reliable'])
         self.assertIsNone(price_bar_context['gap']['gap_points'])
 
-    def test_compute_and_persist_ignores_progress_callback_failures(self):
+    def test_compute_and_persist_propagates_progress_callback_failures(self):
         service = DailyTechnicalSnapshotService()
         progress_updates: list[dict] = []
 
@@ -153,16 +155,20 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
                 return_value=_bars(),
             ),
         ):
-            result = service.rebuild_for_market_date(
-                market_date='2026-04-29',
-                progress_callback=_failing_progress_callback,
-            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'progress store unavailable',
+            ):
+                service.rebuild_for_market_date(
+                    market_date='2026-04-29',
+                    progress_callback=_failing_progress_callback,
+                )
 
-        self.assertEqual(result['snapshots_persisted'], 1)
-        self.assertEqual(result['snapshots_failed'], 0)
-        self.assertEqual(result['failed_symbols'], [])
-        self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
-        self.replace_scope_mock.assert_called_once()
+        self.assertEqual(
+            [item['status'] for item in progress_updates],
+            ['running'],
+        )
+        self.replace_scope_mock.assert_not_called()
 
     def test_rebuild_can_return_full_internal_retry_scope_without_expanding_public_preview(self):
         service = DailyTechnicalSnapshotService()
@@ -186,3 +192,67 @@ class DailyTechnicalSnapshotServiceTests(unittest.TestCase):
             exact_symbols=symbols,
             run_id=None,
         )
+
+    def test_rebuild_propagates_bar_load_infrastructure_failure(self):
+        service = DailyTechnicalSnapshotService()
+        db_error = OperationalError('SELECT 1', {}, RuntimeError('db down'))
+
+        with patch(
+            'app.eod.technical_snapshots.load_daily_bars_for_symbol',
+            side_effect=db_error,
+        ):
+            with self.assertRaises(OperationalError):
+                service.rebuild_for_market_date(
+                    market_date='2026-04-29',
+                    symbols=['005930'],
+                )
+
+        self.replace_scope_mock.assert_not_called()
+
+    def test_rebuild_isolates_known_data_error_and_publishes_sibling(self):
+        service = DailyTechnicalSnapshotService()
+
+        with (
+            patch(
+                'app.eod.technical_snapshots.load_daily_bars_for_symbol',
+                return_value=_bars(),
+            ),
+            patch.object(
+                service,
+                'compute_snapshot',
+                side_effect=[ValueError('bad bar'), service.compute_snapshot(
+                    symbol='000660',
+                    market_date='2026-04-29',
+                    bars=_bars(),
+                )],
+            ),
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-29',
+                symbols=['005930', '000660'],
+            )
+
+        self.assertEqual(result['successful_stock_codes'], ['000660'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+
+    def test_rebuild_propagates_unknown_compute_failure(self):
+        service = DailyTechnicalSnapshotService()
+
+        with (
+            patch(
+                'app.eod.technical_snapshots.load_daily_bars_for_symbol',
+                return_value=_bars(),
+            ),
+            patch.object(
+                service,
+                'compute_snapshot',
+                side_effect=RuntimeError('unexpected technical invariant'),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'unexpected technical'):
+                service.rebuild_for_market_date(
+                    market_date='2026-04-29',
+                    symbols=['005930'],
+                )
+
+        self.replace_scope_mock.assert_not_called()

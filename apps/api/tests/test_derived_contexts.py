@@ -240,7 +240,7 @@ class DailyPriceContextServiceTests(unittest.TestCase):
             for symbol in symbols
         }
         build_price_context_mock.side_effect = [
-            RuntimeError('invalid bar payload'),
+            ValueError('invalid bar payload'),
             {'close_price': 100},
             {'close_price': 200},
         ]
@@ -298,6 +298,28 @@ class DailyPriceContextServiceTests(unittest.TestCase):
             exact_symbols=symbols,
             run_id=None,
         )
+
+    @patch('app.agent_context.derived_contexts.build_price_context')
+    @patch('app.agent_context.derived_contexts.load_recent_price_bars_by_symbol')
+    def test_rebuild_propagates_unknown_compute_failure_without_publication(
+        self,
+        load_recent_price_bars_by_symbol_mock,
+        build_price_context_mock,
+    ):
+        load_recent_price_bars_by_symbol_mock.return_value = {
+            '005930': [{'trade_date': '2026-04-08'}],
+        }
+        build_price_context_mock.side_effect = RuntimeError(
+            'unexpected price-context invariant'
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'unexpected price-context'):
+            DailyPriceContextService().rebuild_for_market_date(
+                market_date='2026-04-08',
+                symbols=['005930'],
+            )
+
+        self.replace_scope_mock.assert_not_called()
 
 
 class DerivedContextBackfillServiceTests(unittest.TestCase):

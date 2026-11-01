@@ -223,7 +223,7 @@ class DailyTrendingRankPersistenceTests(unittest.TestCase):
         self.assertIsNone(daily_loader.call_args.kwargs['limit'])
         self.assertEqual([call.kwargs['limit'] for call in snapshot_loader.call_args_list], [None, None])
 
-    def test_compute_and_persist_ignores_progress_callback_failures(self):
+    def test_compute_and_persist_propagates_progress_callback_failures(self):
         progress_updates: list[dict] = []
 
         def _failing_progress_callback(progress: dict) -> None:
@@ -244,17 +244,23 @@ class DailyTrendingRankPersistenceTests(unittest.TestCase):
                 side_effect=[1, 1],
             ) as replace_mock,
         ):
-            result = compute_and_persist_daily_trending_ranks(
-                market_date='2026-04-29',
-                periods=['1d', '5d'],
-                symbols=['000660', '005930'],
-                authoritative_scope=True,
-                progress_callback=_failing_progress_callback,
-            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'progress store unavailable',
+            ):
+                compute_and_persist_daily_trending_ranks(
+                    market_date='2026-04-29',
+                    periods=['1d', '5d'],
+                    symbols=['000660', '005930'],
+                    authoritative_scope=True,
+                    progress_callback=_failing_progress_callback,
+                )
 
-        self.assertEqual(result['trending_ranks_persisted'], 2)
-        self.assertEqual([item['status'] for item in progress_updates], ['running', 'running', 'completed'])
-        self.assertEqual(replace_mock.call_count, 2)
+        self.assertEqual(
+            [item['status'] for item in progress_updates],
+            ['running'],
+        )
+        replace_mock.assert_not_called()
 
     def test_replace_daily_trending_ranks_uses_one_rollback_scope_for_insert_failure(self):
         class FakeResult:

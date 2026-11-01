@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from app.core.settings import settings
-from app.integrations.fred.client import FREDClient
+from app.integrations.fred.client import FREDAPIError, FREDClient
 from app.integrations.world_bank.client import WorldBankAPIError, WorldBankClient
 
 
@@ -75,11 +75,31 @@ class MacroProviderClientRetryTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, content=b'{', request=request)
 
         client = WorldBankClient(transport=httpx.MockTransport(handler))
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(
+            WorldBankAPIError,
+            'response JSON decode failed',
+        ):
             await client.fetch_indicator(
                 country='KR',
                 indicator='FP.CPI.TOTL.ZG',
             )
+
+        self.assertEqual(attempts, 1)
+
+    async def test_fred_does_not_retry_invalid_json(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(200, content=b'{', request=request)
+
+        client = FREDClient(transport=httpx.MockTransport(handler))
+        with self.assertRaisesRegex(
+            FREDAPIError,
+            'response JSON decode failed',
+        ):
+            await client.fetch_latest_observations(series_id='CPIAUCSL')
 
         self.assertEqual(attempts, 1)
 

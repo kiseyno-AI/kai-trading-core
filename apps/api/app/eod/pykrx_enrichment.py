@@ -129,6 +129,7 @@ SHORT_BALANCE_METRIC_KEYS = (
 )
 SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS = 2
 SHORT_BALANCE_AVAILABILITY_CONTRACT = 'krx_t_plus_2'
+SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING = 'not_applicable_new_listing'
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
 PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 30_000
@@ -194,6 +195,13 @@ def is_decision_usable_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
 
 def _metric_group_complete(payload: dict[str, Any], keys: Sequence[str]) -> bool:
     return all(_to_float(payload.get(key)) is not None for key in keys)
+
+
+def _short_balance_component_satisfied(payload: dict[str, Any]) -> bool:
+    return _metric_group_complete(payload, SHORT_BALANCE_METRIC_KEYS) or (
+        payload.get('availability_status')
+        == SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING
+    )
 
 
 def _preserve_existing_short_selling_components(
@@ -316,9 +324,8 @@ def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
         return (
             _metric_group_complete(short_volume, SHORT_VOLUME_METRIC_KEYS)
             and _metric_group_complete(short_volume, SHORT_VALUE_METRIC_KEYS)
-            and _metric_group_complete(
-                dict(payload.get('short_balance') or {}),
-                SHORT_BALANCE_METRIC_KEYS,
+            and _short_balance_component_satisfied(
+                dict(payload.get('short_balance') or {})
             )
         )
     if category == 'valuation_snapshot':
@@ -2194,6 +2201,9 @@ class PykrxEnrichmentService:
         errors: list[dict[str, Any]] = []
         balance_as_of_date: date | None = None
         balance_date_error: Exception | None = None
+        not_applicable_new_listing_symbols: set[str] = set()
+        historical_membership_resolved = False
+        historical_membership_symbols: set[str] | None = None
         try:
             balance_as_of_date = _resolve_short_balance_as_of_date(
                 market_date_iso
@@ -2201,6 +2211,53 @@ class PykrxEnrichmentService:
         except Exception as exc:  # pragma: no cover - defensive calendar guard
             balance_date_error = exc
         allowed_symbols = self._active_symbol_filter(symbol_filter=symbol_filter, symbol_meta=symbol_meta)
+
+        def load_historical_membership_symbols() -> set[str] | None:
+            nonlocal historical_membership_resolved
+            nonlocal historical_membership_symbols
+            if historical_membership_resolved:
+                return historical_membership_symbols
+            historical_membership_resolved = True
+            if balance_as_of_date is None:
+                return None
+
+            balance_date = _normalize_yyyymmdd(balance_as_of_date)
+            complete_membership: set[str] = set()
+            for historical_market in sorted(SHORTING_SUPPORTED_MARKETS):
+                try:
+                    membership_frame = self._fetch_frame(
+                        cache=cache,
+                        cache_key=(
+                            'stock_universe_membership',
+                            balance_date,
+                            historical_market,
+                        ),
+                        operation='short_selling_balance_membership',
+                        func=_market_ticker_membership_frame,
+                        require_non_empty=True,
+                        date=balance_date,
+                        market=historical_market,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        {
+                            'market': historical_market,
+                            'operation': (
+                                'short_selling_balance_membership'
+                            ),
+                            'error': str(exc),
+                        }
+                    )
+                    historical_membership_symbols = None
+                    return None
+                complete_membership.update(
+                    _normalize_symbol(ticker)
+                    for ticker in membership_frame.index.tolist()
+                    if _normalize_symbol(ticker)
+                )
+            historical_membership_symbols = complete_membership
+            return historical_membership_symbols
+
         for market in markets:
             if market not in SHORTING_SUPPORTED_MARKETS:
                 continue
@@ -2295,6 +2352,47 @@ class PykrxEnrichmentService:
                 str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()
                 for item in volume_frame.index.tolist()
             }
+            eligible_symbols = {
+                symbol
+                for symbol in symbols_for_market
+                if not allowed_symbols or symbol in allowed_symbols
+            }
+            incomplete_balance_symbols = {
+                symbol
+                for symbol in eligible_symbols
+                if not _metric_group_complete(
+                    {
+                        'short_balance_qty': _to_int(
+                            _frame_value(balance_frame, symbol, '공매도잔고')
+                        ),
+                        'listed_shares': _to_int(
+                            _frame_value(balance_frame, symbol, '상장주식수')
+                        ),
+                        'short_balance_amount': _to_int(
+                            _frame_value(balance_frame, symbol, '공매도금액')
+                        ),
+                        'market_cap': _to_int(
+                            _frame_value(balance_frame, symbol, '시가총액')
+                        ),
+                        'short_balance_ratio_pct': _to_float(
+                            _frame_value(balance_frame, symbol, '비중')
+                        ),
+                    },
+                    SHORT_BALANCE_METRIC_KEYS,
+                )
+            }
+            market_not_applicable_new_listings: set[str] = set()
+            if balance_as_of_date is not None and incomplete_balance_symbols:
+                balance_membership_symbols = (
+                    load_historical_membership_symbols()
+                )
+                if balance_membership_symbols is not None:
+                    market_not_applicable_new_listings = (
+                        incomplete_balance_symbols - balance_membership_symbols
+                    )
+                    not_applicable_new_listing_symbols.update(
+                        market_not_applicable_new_listings
+                    )
             reference_count = len(reference_symbols) if reference_symbols else None
             reference_sha256 = (
                 _symbol_membership_sha256(reference_symbols)
@@ -2363,7 +2461,13 @@ class PykrxEnrichmentService:
                     missing_fields.append('short_volume')
                 if not _metric_group_complete(payload['short_volume'], SHORT_VALUE_METRIC_KEYS):
                     missing_fields.append('short_value')
-                if not _metric_group_complete(payload['short_balance'], SHORT_BALANCE_METRIC_KEYS):
+                if symbol in market_not_applicable_new_listings:
+                    payload['short_balance']['availability_status'] = (
+                        SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING
+                    )
+                elif not _metric_group_complete(
+                    payload['short_balance'], SHORT_BALANCE_METRIC_KEYS
+                ):
                     missing_fields.append('short_balance')
                 payload['missing_fields'] = missing_fields
                 rows.append(
@@ -2435,6 +2539,12 @@ class PykrxEnrichmentService:
             'rows_prepared': len(rows),
             'errors': errors,
             'component_retry_debt': component_retry_debt,
+            'short_balance_not_applicable_new_listing_count': len(
+                not_applicable_new_listing_symbols
+            ),
+            'short_balance_not_applicable_new_listing_symbols': sorted(
+                not_applicable_new_listing_symbols
+            ),
         }
 
     def _collect_valuation_snapshot_rows(
@@ -3091,9 +3201,25 @@ class PykrxEnrichmentService:
                         for item in raw_category_rows
                         if (item.get('symbol') or item.get('scope_key'))
                         and item.get('source') != 'pykrx_carry_forward'
-                        and _metric_group_complete(
-                            dict((item.get('payload') or {}).get(payload_group) or {}),
-                            metric_keys,
+                        and (
+                            _short_balance_component_satisfied(
+                                dict(
+                                    (item.get('payload') or {}).get(
+                                        payload_group
+                                    )
+                                    or {}
+                                )
+                            )
+                            if component == 'short_balance'
+                            else _metric_group_complete(
+                                dict(
+                                    (item.get('payload') or {}).get(
+                                        payload_group
+                                    )
+                                    or {}
+                                ),
+                                metric_keys,
+                            )
                         )
                     }
                     eligible_component_scope_keys = (

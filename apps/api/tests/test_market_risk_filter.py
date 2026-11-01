@@ -188,7 +188,7 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
 
         def upsert_side_effect(item: dict) -> None:
             if item['symbol'] == '000660':
-                raise RuntimeError('write failed')
+                raise ValueError('malformed persisted row')
 
         with (
             patch.object(
@@ -198,7 +198,7 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
             ) as collect_snapshots,
             patch(
                 'app.signals.market_risk_filter.upsert_daily_market_risk_filter_results',
-                side_effect=RuntimeError('bulk write failed'),
+                side_effect=ValueError('batch contains malformed row'),
             ) as bulk_upsert,
             patch(
                 'app.signals.market_risk_filter.upsert_daily_market_risk_filter_result',
@@ -246,6 +246,126 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
             result['items'][0]['filter_payload']['watchlist_reasons'],
             ['market_warning_01', 'investment_caution'],
         )
+
+    async def test_exact_scope_preserves_causally_skipped_symbols_as_retry_debt(
+        self,
+    ) -> None:
+        snapshot_service = DailyMarketRiskSnapshotService()
+        service = DailyMarketRiskFilterService(
+            snapshot_service=snapshot_service
+        )
+        exact_symbols = ['000001', '000002', '000003']
+        admitted_symbols = exact_symbols[1:]
+        snapshot_items = [
+            build_market_risk_snapshot(
+                symbol=symbol,
+                market_date='2026-04-14',
+                quote_response={'output': {}},
+            )
+            for symbol in admitted_symbols
+        ]
+        snapshot_collection = {
+            'market_date': '2026-04-14',
+            'source': 'kis_quote2_snapshot_v1',
+            'feature_version': 'kis_quote2_snapshot_v1',
+            'requested_symbols': admitted_symbols,
+            'matched_symbols': admitted_symbols,
+            'missing_symbols': [],
+            'snapshots_persisted': 2,
+            'snapshots_failed': 0,
+            'failed_symbols': [],
+            'failed_symbol_errors': [],
+            'items': snapshot_items,
+            'scope_finalization': {'ready': True},
+        }
+
+        with (
+            patch.object(
+                snapshot_service,
+                'collect_for_market_date',
+                new=AsyncMock(return_value=snapshot_collection),
+            ),
+            patch(
+                'app.signals.market_risk_filter.'
+                'replace_daily_market_risk_filter_results_exact_scope',
+                return_value={
+                    'successful_symbols': admitted_symbols,
+                    'failed_symbols': exact_symbols[:1],
+                    'failed_symbol_errors': [{
+                        'symbol': exact_symbols[0],
+                        'error': 'result_not_persisted',
+                    }],
+                    'scope_finalization': {'ready': True},
+                },
+            ),
+        ):
+            result = await service.rebuild_for_market_date(
+                market_date='2026-04-14',
+                symbols=admitted_symbols,
+                exact_scope_symbols=exact_symbols,
+            )
+
+        self.assertEqual(result['selected_stock_codes'], exact_symbols)
+        self.assertEqual(
+            result['successful_stock_codes'],
+            admitted_symbols,
+        )
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            exact_symbols[:1],
+        )
+        self.assertEqual(result['results_persisted'], 2)
+        self.assertEqual(result['results_failed'], 1)
+
+    async def test_rebuild_propagates_checkpoint_failure_before_persistence(
+        self,
+    ) -> None:
+        snapshot_service = DailyMarketRiskSnapshotService()
+        service = DailyMarketRiskFilterService(
+            snapshot_service=snapshot_service
+        )
+        snapshot_collection = {
+            'market_date': '2026-04-14',
+            'source': 'kis_quote2_snapshot_v1',
+            'feature_version': 'kis_quote2_snapshot_v1',
+            'requested_symbols': ['005930'],
+            'matched_symbols': ['005930'],
+            'missing_symbols': [],
+            'failed_symbols': [],
+            'failed_symbol_errors': [],
+            'items': [
+                build_market_risk_snapshot(
+                    symbol='005930',
+                    market_date='2026-04-14',
+                    quote_response={'output': {}},
+                )
+            ],
+        }
+
+        def _failing_checkpoint_callback(**_payload) -> None:
+            raise RuntimeError('checkpoint store unavailable')
+
+        with (
+            patch.object(
+                snapshot_service,
+                'collect_for_market_date',
+                new=AsyncMock(return_value=snapshot_collection),
+            ),
+            patch(
+                'app.signals.market_risk_filter.'
+                'upsert_daily_market_risk_filter_results'
+            ) as persist_results,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'checkpoint store unavailable',
+            ):
+                await service.rebuild_for_market_date(
+                    market_date='2026-04-14',
+                    progress_callback=_failing_checkpoint_callback,
+                )
+
+        persist_results.assert_not_called()
 
     def test_inspect_resolves_latest_on_or_before_requested_market_date(self) -> None:
         service = DailyMarketRiskFilterService()

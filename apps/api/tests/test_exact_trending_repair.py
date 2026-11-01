@@ -276,6 +276,91 @@ class ExactTrendingRankRepairTests(unittest.TestCase):
             ]
         )
 
+    def test_guard_exit_failure_blocks_when_trending_live_proof_drifts(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        states = iter(
+            [
+                {
+                    'metadata_verified': True,
+                    'source_fingerprints': _source_fingerprints(),
+                    'output_fingerprints': _fingerprints(),
+                },
+                {
+                    'metadata_verified': True,
+                    'source_fingerprints': _source_fingerprints(),
+                    'output_fingerprints': _fingerprints(),
+                },
+                {
+                    'metadata_verified': True,
+                    'source_fingerprints': _source_fingerprints(),
+                    'output_fingerprints': _fingerprints(suffix='drifted'),
+                },
+            ]
+        )
+        repair = self._repair(
+            completion_state_loader=lambda *_args: next(states),
+            guard_factory=failing_exit_guard,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved = json.loads(checkpoint.read_text())
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'guard_transaction_exit_failed')
+        self.assertTrue(result['uncertain_commit'])
+        self.assertTrue(result['retry_required'])
+        self.assertEqual(result['reconciled_proof_count'], 0)
+        self.assertFalse(
+            saved['units']['2026-10-28']['last_uncertain_attempt'][
+                'live_completion_verified'
+            ]
+        )
+
+    def test_guard_exit_failure_preserves_prior_trending_checkpoint(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            initial = self._repair()
+            completed = initial.run(
+                apply=True,
+                expected_manifest_sha256=initial.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved_before = json.loads(checkpoint.read_text())
+            resumed = self._repair(
+                guard_factory=failing_exit_guard,
+            ).run(
+                apply=True,
+                expected_manifest_sha256=initial.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved_after = json.loads(checkpoint.read_text())
+
+        self.assertEqual(completed['status'], 'completed')
+        self.assertEqual(resumed['status'], 'blocked')
+        self.assertEqual(resumed['reason'], 'guard_transaction_exit_failed')
+        self.assertEqual(
+            saved_after['units']['2026-10-28']['status'],
+            saved_before['units']['2026-10-28']['status'],
+        )
+        self.assertEqual(
+            saved_after['units']['2026-10-28']['result'],
+            saved_before['units']['2026-10-28']['result'],
+        )
+
     def test_checkpoint_failure_reconciles_durable_trending_rows(self):
         repair = self._repair()
         with (

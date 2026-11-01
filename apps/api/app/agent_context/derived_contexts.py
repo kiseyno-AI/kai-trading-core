@@ -25,6 +25,12 @@ SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
 PARTICIPATION_CONTEXT_LEADER_LIMIT = 20
 DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS = 7
 PRICE_CONTEXT_SCOPE_MANIFEST_VERSION = 'price_contexts_scope_outcomes_v1'
+PRICE_CONTEXT_ROW_LOCAL_ERRORS = (
+    ArithmeticError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 
 def _to_float(value: Any) -> float | None:
@@ -452,7 +458,7 @@ class DailyPriceContextService:
                         'context_payload': context_payload,
                     }
                 )
-            except Exception:
+            except PRICE_CONTEXT_ROW_LOCAL_ERRORS:
                 failed_symbols.append(symbol)
                 continue
             items.append(

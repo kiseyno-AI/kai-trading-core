@@ -29,8 +29,15 @@ from app.market_data_store import (
 )
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
+    attach_symbol_payloads,
     build_factor_coverage_contract,
+    build_symbol_results,
     factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
 )
 from app.signals.preferred_share_fundamentals import (
     resolve_preferred_fundamentals_issuer_symbols,
@@ -897,11 +904,12 @@ class DailyAdvancedValueFactorService:
                 )
             return result
         ranking_inputs = inputs
+        ranking_missing_symbols: list[str] = []
         if (
             normalized_symbols is not None
             and normalized_symbols != normalized_ranking_symbols
         ):
-            ranking_inputs, _, _ = self._load_inputs(
+            ranking_inputs, _, ranking_missing_symbols = self._load_inputs(
                 market_date=normalized_market_date,
                 symbols=(
                     normalized_ranking_symbols
@@ -910,14 +918,21 @@ class DailyAdvancedValueFactorService:
                 ),
             )
 
-        ranking_items = [
-            self._build_symbol_result(
-                input_row=item,
-                market_date=normalized_market_date,
-                source=source,
-            )
-            for item in ranking_inputs
-        ]
+        (
+            ranking_items,
+            ranking_failed_symbols,
+            ranking_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_inputs,
+            symbol_of=lambda item: item.symbol,
+            build=lambda item: run_symbol_computation(
+                lambda: self._build_symbol_result(
+                    input_row=item,
+                    market_date=normalized_market_date,
+                    source=source,
+                )
+            ),
+        )
         universe_counts = self._assign_metric_rankings(ranking_items)
         self._assign_scores_and_classifications(ranking_items)
         universe_counts['advanced_value_score'] = sum(
@@ -928,24 +943,82 @@ class DailyAdvancedValueFactorService:
             items = _sort_items(ranking_items)
         else:
             ranked_items_by_symbol = {item['symbol']: item for item in ranking_items}
+            ranking_failed_symbol_set = set(ranking_failed_symbols)
             items = []
             for input_row in inputs:
+                if input_row.symbol in ranking_failed_symbol_set:
+                    continue
                 item = ranked_items_by_symbol.get(input_row.symbol)
                 if item is None:
-                    item = self._build_symbol_result(
-                        input_row=input_row,
-                        market_date=normalized_market_date,
-                        source=source,
+                    fallback_items, fallback_failed, fallback_errors = (
+                        build_symbol_results(
+                            [input_row],
+                            symbol_of=lambda value: value.symbol,
+                            build=lambda value: run_symbol_computation(
+                                lambda: self._build_symbol_result(
+                                    input_row=value,
+                                    market_date=normalized_market_date,
+                                    source=source,
+                                )
+                            ),
+                        )
                     )
+                    ranking_failed_symbols.extend(fallback_failed)
+                    ranking_failed_symbol_errors.extend(fallback_errors)
+                    if not fallback_items:
+                        continue
+                    item = fallback_items[0]
                     self._assign_scores_and_classifications([item])
                 items.append(item)
 
-        for item in items:
-            item['factor_payload'] = self._build_factor_payload(
-                item=item,
-                source=source,
-                universe_counts=universe_counts,
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=ranking_failed_symbols,
+            failed_symbol_errors=ranking_failed_symbol_errors,
+            target_symbols=[input_row.symbol for input_row in inputs],
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
+        )
+
+        items, payload_failed_symbols, payload_failed_errors = (
+            attach_symbol_payloads(
+                items,
+                payload_builder=lambda item: self._build_factor_payload(
+                    item=item,
+                    source=source,
+                    universe_counts=universe_counts,
+                ),
             )
+        )
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (payload_failed_symbols, payload_failed_errors),
+            )
+        )
         summary = self._build_summary(
             items,
             requested_symbols=requested_symbols,
@@ -957,8 +1030,8 @@ class DailyAdvancedValueFactorService:
             self._strip_internal_fields(item)
 
         persisted_count = 0
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
         scope_finalization: dict[str, Any] | None = None
         if exact_scope_symbols is not None:
             publication = replace_daily_derived_results_exact_scope(
@@ -969,21 +1042,26 @@ class DailyAdvancedValueFactorService:
                 authoritative_market_scope=authoritative_market_scope,
             )
             persisted_count = int(publication['results_persisted'])
-            failed_symbols = list(publication['failed_symbols'])
-            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (publication['failed_symbols'], publication['failed_symbol_errors']),
+            )
             scope_finalization = publication['scope_finalization']
         else:
-            try:
-                upsert_daily_advanced_value_factor_results(items)
-                persisted_count = len(items)
-            except Exception:
-                for item in items:
-                    try:
-                        upsert_daily_advanced_value_factor_result(item)
-                        persisted_count += 1
-                    except Exception as exc:
-                        failed_symbols.append(item['symbol'])
-                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=upsert_daily_advanced_value_factor_results,
+                item_write=upsert_daily_advanced_value_factor_result,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -1002,7 +1080,13 @@ class DailyAdvancedValueFactorService:
                 persisted_items=persisted_items,
                 missing_symbols=missing_symbols,
                 failed_symbols=failed_symbols,
+                failed_symbol_errors=failed_symbol_errors,
             )
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
         )
 
         result = {
@@ -1773,6 +1857,7 @@ class DailyAdvancedValueFactorService:
                 persisted_items=items,
                 missing_symbols=missing_symbols,
                 failed_symbols=[],
+                failed_symbol_errors=[],
             )
         )
         return summary
@@ -1784,12 +1869,14 @@ class DailyAdvancedValueFactorService:
         persisted_items: list[dict[str, Any]],
         missing_symbols: list[str],
         failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         return build_factor_coverage_contract(
             items=items,
             persisted_items=persisted_items,
             missing_symbols=missing_symbols,
             failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
             is_ready=lambda item: item.get('advanced_value_score') is not None,
             is_complete=lambda item: item.get('advanced_value_components_used')
             == len(ADVANCED_VALUE_SCORE_WEIGHTS),

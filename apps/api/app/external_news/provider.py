@@ -145,7 +145,12 @@ class NaverNewsSearchProvider:
             )
             raise RuntimeError(f'Naver News Search request failed [{response.status_code}]')
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                'Naver News Search response JSON decode failed'
+            ) from exc
         raw_items = payload.get('items') if isinstance(payload, dict) else None
         if not isinstance(raw_items, list):
             raise RuntimeError('Naver News Search response did not contain an items list')

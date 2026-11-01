@@ -36,6 +36,14 @@ from app.market_data_store import (
     upsert_daily_piotroski_filter_results,
 )
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
+    build_symbol_results,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
 from app.signals.preferred_share_fundamentals import (
     resolve_preferred_fundamentals_issuer_symbols,
 )
@@ -474,6 +482,29 @@ def _required_financial_signal_missing_reasons(
     }
 
 
+def _validate_symbol_computation_input(
+    item: PiotroskiInputs,
+) -> dict[str, Any]:
+    """Exercise symbol-local calculations before entering cohort aggregation."""
+
+    if item.pbr is not None:
+        item.pbr > 0
+    if item.return_20d is not None:
+        item.return_20d + 0.0
+    if item.net_income is not None:
+        item.net_income <= 0
+    if item.total_equity is not None:
+        item.total_equity <= 0
+    signals, score, available_signal_count = _compute_signals(item)
+    _required_financial_signal_missing_reasons(item, signals)
+    score / PIOTROSKI_SIGNAL_COUNT
+    available_signal_count / PIOTROSKI_SIGNAL_COUNT
+    fundamentals_provenance = dict(item.fundamentals_provenance)
+    for _, metadata in sorted(fundamentals_provenance.items()):
+        dict(metadata)
+    return {'item': item}
+
+
 class DailyPiotroskiFilterService:
     @daily_price_bar_writer_admission
     def rebuild_for_market_date(
@@ -509,16 +540,74 @@ class DailyPiotroskiFilterService:
                 else None
             ),
         )
+        ranking_input_symbols = [item.symbol for item in ranking_inputs]
+        ranking_scope_symbols = (
+            list(normalized_ranking_symbols or [])
+            if ranking_symbols is not None
+            else ranking_input_symbols
+        )
+        ranking_missing_symbols = [
+            symbol
+            for symbol in ranking_scope_symbols
+            if symbol not in set(ranking_input_symbols)
+        ]
+        (
+            validated_inputs,
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_inputs,
+            symbol_of=lambda item: item.symbol,
+            build=lambda item: run_symbol_computation(
+                lambda: _validate_symbol_computation_input(item)
+            ),
+        )
+        ranking_inputs = [entry['item'] for entry in validated_inputs]
         target_symbol_set = (
             set(normalized_symbols) if normalized_symbols is not None else None
+        )
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=computation_failed_symbols,
+            failed_symbol_errors=computation_failed_symbol_errors,
+            target_symbols=(
+                normalized_symbols
+                if normalized_symbols is not None
+                else ranking_input_symbols
+            ),
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
         )
         pbr_values = [item.pbr for item in ranking_inputs if item.pbr is not None and item.pbr > 0]
         momentum_values = [item.return_20d for item in ranking_inputs if item.return_20d is not None]
         passed_count = 0
         persisted_count = 0
         result_payloads: list[dict[str, Any]] = []
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
         full_signal_usable_count = 0
         full_signal_incomplete_count = 0
         full_signal_unusable_count = 0
@@ -768,22 +857,26 @@ class DailyPiotroskiFilterService:
                 authoritative_market_scope=authoritative_market_scope,
             )
             persisted_count = int(publication['results_persisted'])
-            failed_symbols = list(publication['failed_symbols'])
-            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (publication['failed_symbols'], publication['failed_symbol_errors']),
+            )
             scope_finalization = publication['scope_finalization']
         elif result_payloads:
-            try:
-                upsert_daily_piotroski_filter_results(result_payloads)
-                persisted_count = len(result_payloads)
-            except Exception:
-                for payload in result_payloads:
-                    try:
-                        upsert_daily_piotroski_filter_result(payload)
-                        persisted_count += 1
-                    except Exception as exc:
-                        symbol = str(payload['symbol'])
-                        failed_symbols.append(symbol)
-                        failed_symbol_errors.append({'symbol': symbol, 'error': str(exc)})
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                result_payloads,
+                bulk_write=upsert_daily_piotroski_filter_results,
+                item_write=upsert_daily_piotroski_filter_result,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         evaluated_symbols = {
             str(payload['symbol']) for payload in result_payloads
@@ -791,7 +884,7 @@ class DailyPiotroskiFilterService:
         selected_scope_symbols = (
             list(normalized_symbols)
             if normalized_symbols is not None
-            else sorted(evaluated_symbols)
+            else sorted(set(ranking_input_symbols))
         )
         missing_input_symbols = sorted(
             set(selected_scope_symbols) - evaluated_symbols
@@ -847,9 +940,29 @@ class DailyPiotroskiFilterService:
             elif full_signal_coverage_status == 'incomplete':
                 status = 'partial'
                 evidence_reason = 'piotroski_evidence_incomplete'
+        ranking_dependency_contract: dict[str, Any] = {}
+        attach_ranking_dependency_contract(
+            ranking_dependency_contract,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
+        )
+        if ranking_dependency_failed_symbols and scope_status != 'failed':
+            status = 'partial'
+            evidence_reason = 'ranking_dependency_incomplete'
+        has_blocking_retry_debt = bool(
+            retry_debt_symbols or ranking_dependency_failed_symbols
+        )
 
         result = {
             'status': status,
+            'gate_status': (
+                'blocked' if has_blocking_retry_debt else 'ready'
+            ),
+            'blocking_status': (
+                'blocking'
+                if has_blocking_retry_debt
+                else 'non_blocking'
+            ),
             'market_date': normalized_market_date.isoformat(),
             'source': FILTER_SOURCE,
             'requested_symbol_count': full_signal_total_count,
@@ -899,6 +1012,16 @@ class DailyPiotroskiFilterService:
                 }
                 for symbol in selected_scope_symbols
             ],
+            **{
+                key: ranking_dependency_contract[key]
+                for key in (
+                    'ranking_dependency_status',
+                    'ranking_dependency_failed_symbol_count',
+                    'ranking_dependency_failed_symbols',
+                    'ranking_dependency_failed_symbol_errors',
+                    'ranking_dependency_retry_debt_symbols',
+                )
+            },
         }
         if evidence_reason is not None:
             result['reason'] = evidence_reason

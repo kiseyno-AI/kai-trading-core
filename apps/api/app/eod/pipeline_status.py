@@ -48,6 +48,7 @@ from app.eod.daily_pipeline_stages import (
 )
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
+    daily_pipeline_outcome_is_satisfied,
     daily_pipeline_result_has_no_ready_content,
     daily_pipeline_warning_metadata,
     normalize_daily_pipeline_stage_status,
@@ -6308,44 +6309,59 @@ class EODPipelineStatusService:
         warning_stage_ids = set(
             daily_pipeline_nonblocking_warning_stage_ids(stages)
         )
-        statuses = [
-            EODPipelineStatusService._effective_stage_status(item)
+        stage_outcomes = [
+            {
+                **item,
+                'stage': stage_id,
+                'status': (
+                    EODPipelineStatusService._effective_stage_status(item)
+                    if str(item.get('status') or '').strip()
+                    else ''
+                ),
+            }
             for stage_id, item in stages.items()
             if stage_id not in warning_stage_ids
         ]
-        if not statuses:
+        statuses = [
+            str(outcome.get('status') or '').strip().lower()
+            for outcome in stage_outcomes
+        ]
+        if not stage_outcomes:
             return 'completed' if warning_stage_ids else 'pending'
-        if any(status == 'running' for status in statuses):
+        if 'running' in statuses:
             return 'running'
-        if any(status == 'interrupted' for status in statuses):
-            return 'interrupted'
-        if any(status == 'abandoned' for status in statuses):
-            return 'abandoned'
-        if any(status == 'blocked' for status in statuses):
-            return 'blocked'
-        if any(status == 'waiting' for status in statuses):
-            # ``waiting`` describes a pipeline that has not made durable
-            # progress yet.  Once an upstream stage is already complete (or
-            # has a durable partial result), downstream missing output is a
-            # partial pipeline, not an active wait.  Reporting ``waiting`` in
-            # that state hid terminal gaps such as a completed collection and
-            # fundamentals refresh with no factor rows.
+        if all(status == 'pending' for status in statuses):
+            return 'pending'
+        if 'failed' in statuses:
             if any(
-                status in {'completed', 'partial', 'skipped'}
+                status in {'completed', 'partial'}
                 for status in statuses
             ):
                 return 'partial'
-            return 'waiting'
-        if all(status == 'pending' for status in statuses):
-            return 'pending'
-        if all(status == 'completed' for status in statuses):
-            return 'completed'
-        if statuses and all(status in {'completed', 'skipped'} for status in statuses):
-            return 'completed' if any(status == 'completed' for status in statuses) else 'skipped'
-        if statuses and all(status == 'skipped' for status in statuses):
-            return 'skipped'
-        if any(status == 'failed' for status in statuses) and not any(status in {'completed', 'partial'} for status in statuses):
             return 'failed'
+        for specific_status in (
+            'blocked',
+            'waiting',
+            'interrupted',
+            'abandoned',
+        ):
+            if all(status == specific_status for status in statuses):
+                return specific_status
+        if all(
+            (
+                status == 'completed'
+                and daily_pipeline_outcome_is_satisfied(outcome)
+            )
+            or (
+                status == 'skipped'
+                and (
+                    outcome.get('safe_skip') is True
+                    or daily_pipeline_outcome_is_satisfied(outcome)
+                )
+            )
+            for status, outcome in zip(statuses, stage_outcomes)
+        ):
+            return 'completed'
         return 'partial'
 
     @staticmethod

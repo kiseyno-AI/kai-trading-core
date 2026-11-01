@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import threading
 from typing import Any, Sequence
 
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.audit_logging import exception_message
 from app.core.settings import settings
@@ -446,21 +446,11 @@ class MacroContextService:
         knowledge_cutoff_at = _historical_knowledge_cutoff_at(resolved_as_of, now=resolved_now)
         stale_after_hours = max(1, int(settings.macro_context_stale_after_hours or 72))
         configs = self._context_series()
-        try:
-            latest = self.store.load_latest_by_series(
-                series_keys=[(config.source, config.series_id) for config in configs],
-                as_of_date=resolved_as_of,
-                fetched_at_before=knowledge_cutoff_at,
-            )
-        except IntegrityError:
-            raise
-        except SQLAlchemyError as exc:
-            return self._unavailable_context(
-                as_of_date=resolved_as_of,
-                reason='macro_context_storage_unavailable',
-                detail=str(exc),
-                now=resolved_now,
-            )
+        latest = self.store.load_latest_by_series(
+            series_keys=[(config.source, config.series_id) for config in configs],
+            as_of_date=resolved_as_of,
+            fetched_at_before=knowledge_cutoff_at,
+        )
 
         series_items: list[dict[str, Any]] = []
         series_by_regime_key: dict[str, dict[str, Any]] = {}
@@ -613,13 +603,19 @@ class MacroContextService:
                 period = str(row.get('date') or '').strip()
                 if not period:
                     raise WorldBankAPIError('World Bank returned an empty observation period')
+                try:
+                    observation_date = _observation_date_from_period(period)
+                except ValueError as exc:
+                    raise WorldBankAPIError(
+                        'World Bank returned an invalid observation period'
+                    ) from exc
                 record = self.store.upsert_observation(
                     source=WORLD_BANK_SOURCE,
                     series_id=config.series_id,
                     series_name=config.series_name,
                     country_code=config.country_code or settings.macro_context_world_bank_country,
                     observation_period=period,
-                    observation_date=_observation_date_from_period(period),
+                    observation_date=observation_date,
                     value=value,
                     unit=config.unit,
                     frequency=config.frequency,
@@ -643,22 +639,17 @@ class MacroContextService:
                         'fetched_at': record.fetched_at.isoformat(),
                     }
                 )
-            except IntegrityError:
+            except SQLAlchemyError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
+            except WorldBankAPIError as exc:
                 observations_failed += 1
                 reason = exception_message(exc)
-                try:
-                    self.store.mark_refresh_failure(
-                        source=WORLD_BANK_SOURCE,
-                        series_id=config.series_id,
-                        failed_at=now,
-                        reason=reason,
-                    )
-                except IntegrityError:
-                    raise
-                except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
-                    pass
+                self.store.mark_refresh_failure(
+                    source=WORLD_BANK_SOURCE,
+                    series_id=config.series_id,
+                    failed_at=now,
+                    reason=reason,
+                )
                 series_statuses.append(
                     {
                         'source': WORLD_BANK_SOURCE,
@@ -723,13 +714,19 @@ class MacroContextService:
                 period = str(row.get('date') or '').strip()
                 if not period:
                     raise FREDAPIError('FRED returned an empty observation date')
+                try:
+                    observation_date = _observation_date_from_period(period)
+                except ValueError as exc:
+                    raise FREDAPIError(
+                        'FRED returned an invalid observation date'
+                    ) from exc
                 record = self.store.upsert_observation(
                     source=FRED_SOURCE,
                     series_id=config.series_id,
                     series_name=config.series_name,
                     country_code=config.country_code,
                     observation_period=period,
-                    observation_date=_observation_date_from_period(period),
+                    observation_date=observation_date,
                     value=value,
                     unit=config.unit,
                     frequency=config.frequency,
@@ -755,22 +752,17 @@ class MacroContextService:
                     configs=configs,
                     configuration_blocked=True,
                 )
-            except IntegrityError:
+            except SQLAlchemyError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
+            except FREDAPIError as exc:
                 observations_failed += 1
                 reason = exception_message(exc)
-                try:
-                    self.store.mark_refresh_failure(
-                        source=FRED_SOURCE,
-                        series_id=config.series_id,
-                        failed_at=now,
-                        reason=reason,
-                    )
-                except IntegrityError:
-                    raise
-                except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
-                    pass
+                self.store.mark_refresh_failure(
+                    source=FRED_SOURCE,
+                    series_id=config.series_id,
+                    failed_at=now,
+                    reason=reason,
+                )
                 series_statuses.append(
                     {
                         'source': FRED_SOURCE,
@@ -925,51 +917,5 @@ class MacroContextService:
         if isinstance(value, str) and value.strip():
             return date.fromisoformat(value.strip()[:10])
         return now.date()
-
-    @staticmethod
-    def _unavailable_context(
-        *,
-        as_of_date: date,
-        reason: str,
-        detail: str | None,
-        now: datetime,
-    ) -> dict[str, Any]:
-        return {
-            'schema_version': MACRO_CONTEXT_SCHEMA_VERSION,
-            'status': 'unavailable',
-            'as_of_date': as_of_date.isoformat(),
-            'generated_at': now.isoformat(),
-            'latest_fetched_at': None,
-            'freshness': {
-                'stale_after_hours': settings.macro_context_stale_after_hours,
-                'status': 'unavailable',
-                'reason': reason,
-                'detail': detail,
-            },
-            'source_statuses': {
-                'macro_context': {
-                    'status': 'unavailable',
-                    'reason': reason,
-                }
-            },
-            'series': [],
-            'macro_regime_summary': {
-                'schema_version': 'macro_regime_summary_v1',
-                'method': 'deterministic_threshold_labels',
-                'growth_label': 'growth_unknown',
-                'inflation_label': 'inflation_unknown',
-                'labor_label': 'labor_unknown',
-                'fx_label': 'fx_unknown',
-                'composite_label': 'macro_unknown',
-                'freshness_label': 'macro_context_unavailable',
-                'llm_generated': False,
-            },
-            'usage_policy': {
-                'contextual_input_only': True,
-                'direct_buy_sell_signal': False,
-                'llm_generated': False,
-            },
-        }
-
 
 macro_context_service = MacroContextService()

@@ -13,6 +13,12 @@ from app.market_data_store import (
     upsert_daily_market_risk_filter_results,
 )
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.factor_coverage import (
+    build_symbol_results,
+    merge_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
 from app.signals.market_risk_evaluators import (
     MARKET_RISK_FILTER_SOURCE,
     build_market_risk_filter_result_from_snapshot,
@@ -108,10 +114,21 @@ class DailyMarketRiskFilterService:
         matched_symbols = list(snapshot_collection.get('matched_symbols') or [])
         missing_symbols = list(snapshot_collection.get('missing_symbols') or [])
 
-        items = [
-            build_market_risk_filter_result_from_snapshot(snapshot, source=source, eod_run_id=run_id)
-            for snapshot in snapshot_items
-        ]
+        (
+            items,
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+        ) = build_symbol_results(
+            snapshot_items,
+            symbol_of=lambda snapshot: str(snapshot.get('symbol') or ''),
+            build=lambda snapshot: run_symbol_computation(
+                lambda: build_market_risk_filter_result_from_snapshot(
+                    snapshot,
+                    source=source,
+                    eod_run_id=run_id,
+                )
+            ),
+        )
         items.sort(
             key=lambda item: (
                 item['passed_filter'],
@@ -121,22 +138,24 @@ class DailyMarketRiskFilterService:
         )
 
         persisted_items: list[dict[str, Any]] = []
-        failed_symbols = list(snapshot_collection.get('failed_symbols') or [])
-        failed_symbol_errors = list(snapshot_collection.get('failed_symbol_errors') or [])
+        failed_symbols, failed_symbol_errors = merge_symbol_failures(
+            (
+                list(snapshot_collection.get('failed_symbols') or []),
+                list(snapshot_collection.get('failed_symbol_errors') or []),
+            ),
+            (computation_failed_symbols, computation_failed_symbol_errors),
+        )
         if progress_callback is not None:
-            try:
-                progress_callback(
-                    status='running',
-                    current_step='persisting_market_risk_filter_results',
-                    current_activity='Persisting daily KIS market-risk filter results',
-                    processed=0,
-                    total=len(items),
-                    succeeded=0,
-                    failed=len(failed_symbols),
-                    current_symbol=(items[0].get('symbol') if items else None),
-                )
-            except Exception:
-                pass
+            progress_callback(
+                status='running',
+                current_step='persisting_market_risk_filter_results',
+                current_activity='Persisting daily KIS market-risk filter results',
+                processed=0,
+                total=len(items),
+                succeeded=0,
+                failed=len(failed_symbols),
+                current_symbol=(items[0].get('symbol') if items else None),
+            )
         scope_finalization: dict[str, Any] | None = None
         if exact_scope_symbols is not None:
             publication = (
@@ -153,39 +172,48 @@ class DailyMarketRiskFilterService:
                 for item in items
                 if item['symbol'] in successful_symbol_set
             ]
-            failed_symbols.extend(publication['failed_symbols'])
-            failed_symbol_errors.extend(
-                publication['failed_symbol_errors']
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (
+                    publication['failed_symbols'],
+                    publication['failed_symbol_errors'],
+                ),
             )
             scope_finalization = publication['scope_finalization']
         elif items:
-            try:
-                upsert_daily_market_risk_filter_results(items)
-                persisted_items = [_public_filter_item(item) for item in items]
-            except Exception:
-                for item in items:
-                    try:
-                        upsert_daily_market_risk_filter_result(item)
-                        persisted_items.append(_public_filter_item(item))
-                    except Exception as exc:
-                        failed_symbols.append(item['symbol'])
-                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=upsert_daily_market_risk_filter_results,
+                item_write=upsert_daily_market_risk_filter_result,
+            )
+            persisted_items = [
+                _public_filter_item(item) for item in written_items
+            ]
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
         if progress_callback is not None:
-            try:
-                progress_callback(
-                    status='running',
-                    current_step='persisting_market_risk_filter_results',
-                    current_activity='Persisted daily KIS market-risk filter result batch',
-                    processed=len(items),
-                    total=len(items),
-                    succeeded=len(persisted_items),
-                    failed=len(failed_symbols),
-                    current_symbol=None,
-                )
-            except Exception:
-                pass
+            progress_callback(
+                status='running',
+                current_step='persisting_market_risk_filter_results',
+                current_activity='Persisted daily KIS market-risk filter result batch',
+                processed=len(items),
+                total=len(items),
+                succeeded=len(persisted_items),
+                failed=len(failed_symbols),
+                current_symbol=None,
+            )
 
-        selected_symbols = list(requested_symbols or matched_symbols)
+        selected_symbols = (
+            normalize_symbols(exact_scope_symbols)
+            if exact_scope_symbols is not None
+            else list(requested_symbols or matched_symbols)
+        )
         successful_symbols = [item['symbol'] for item in persisted_items]
         successful_symbol_set = set(successful_symbols)
         retry_debt_symbols = [
@@ -193,8 +221,15 @@ class DailyMarketRiskFilterService:
             for symbol in selected_symbols
             if symbol not in successful_symbol_set
         ]
-        failed_symbols = list(
-            dict.fromkeys([*failed_symbols, *retry_debt_symbols])
+        failed_symbols, failed_symbol_errors = merge_symbol_failures(
+            (failed_symbols, failed_symbol_errors),
+            (
+                retry_debt_symbols,
+                [
+                    {'symbol': symbol, 'error': 'result_not_persisted'}
+                    for symbol in retry_debt_symbols
+                ],
+            ),
         )
 
         result = {

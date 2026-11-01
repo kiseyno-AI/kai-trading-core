@@ -58,7 +58,10 @@ class FREDClient:
         if response.status_code >= 400:
             raise FREDAPIError(f'FRED request failed [{response.status_code}]: {response.text}')
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FREDAPIError('FRED response JSON decode failed') from exc
         observations = payload.get('observations') if isinstance(payload, dict) else None
         if not isinstance(observations, list):
             raise FREDAPIError('FRED observations response was not a JSON list')

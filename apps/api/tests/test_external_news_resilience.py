@@ -58,7 +58,7 @@ def _symbol_rows(*symbols: str) -> list[dict[str, str]]:
 
 class ExternalNewsResilienceTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_failure_isolated_and_later_symbol_still_collected(self) -> None:
-        provider = _SequencedProvider([RuntimeError('temporary outage'), []])
+        provider = _SequencedProvider([ConnectionError('temporary outage'), []])
         service = ExternalNewsService(provider=provider)
 
         with (
@@ -85,9 +85,47 @@ class ExternalNewsResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(provider.queries), 2)
         persist.assert_called_once()
 
+    async def test_provider_json_failure_isolated_and_later_symbol_collected(
+        self,
+    ) -> None:
+        provider = _SequencedProvider(
+            [
+                RuntimeError(
+                    'Naver News Search response JSON decode failed'
+                ),
+                [],
+            ]
+        )
+        service = ExternalNewsService(provider=provider)
+
+        with (
+            patch(
+                'app.external_news.service.load_symbols',
+                return_value=_symbol_rows('005930', '000660'),
+            ),
+            patch(
+                'app.external_news.service.persist_external_news_items',
+                return_value={'inserted': 0, 'updated': 0, 'skipped': 0},
+            ) as persist,
+            patch.object(
+                settings,
+                'external_news_collect_throttle_seconds',
+                0,
+            ),
+        ):
+            result = await service.collect_for_symbols(
+                symbols=['005930', '000660'],
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['summary']['collected_symbol_count'], 1)
+        self.assertEqual(result['summary']['failed_symbol_count'], 1)
+        self.assertEqual(len(provider.queries), 2)
+        persist.assert_called_once()
+
     async def test_repeated_provider_failures_open_circuit_and_skip_remaining_symbols(self) -> None:
         provider = _SequencedProvider(
-            [RuntimeError('outage one'), RuntimeError('outage two')]
+            [ConnectionError('outage one'), ConnectionError('outage two')]
         )
         service = ExternalNewsService(provider=provider)
         symbols = ['005930', '000660', '035420', '051910']
@@ -116,32 +154,64 @@ class ExternalNewsResilienceTests(unittest.IsolatedAsyncioTestCase):
             ['provider_circuit_open', 'provider_circuit_open'],
         )
 
-    async def test_persistence_failure_does_not_trip_provider_circuit(self) -> None:
-        provider = _SequencedProvider([[], []])
+    async def test_unknown_provider_exception_remains_fatal(self) -> None:
+        provider = _SequencedProvider(
+            [RuntimeError('unexpected provider invariant')]
+        )
         service = ExternalNewsService(provider=provider)
 
         with (
             patch(
                 'app.external_news.service.load_symbols',
-                return_value=_symbol_rows('005930', '000660'),
+                return_value=_symbol_rows('005930'),
+            ),
+            patch.object(settings, 'external_news_collect_throttle_seconds', 0),
+            self.assertRaisesRegex(RuntimeError, 'unexpected provider invariant'),
+        ):
+            await service.collect_for_symbols(symbols=['005930'])
+
+    async def test_unrecognized_credentials_suffix_remains_fatal(self) -> None:
+        provider = _SequencedProvider(
+            [RuntimeError('cache_credentials_missing')]
+        )
+        service = ExternalNewsService(provider=provider)
+
+        with (
+            patch(
+                'app.external_news.service.load_symbols',
+                return_value=_symbol_rows('005930'),
+            ),
+            patch.object(
+                settings,
+                'external_news_collect_throttle_seconds',
+                0,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'cache_credentials_missing',
+            ),
+        ):
+            await service.collect_for_symbols(symbols=['005930'])
+
+    async def test_unknown_persistence_failure_remains_fatal(self) -> None:
+        provider = _SequencedProvider([[]])
+        service = ExternalNewsService(provider=provider)
+
+        with (
+            patch(
+                'app.external_news.service.load_symbols',
+                return_value=_symbol_rows('005930'),
             ),
             patch(
                 'app.external_news.service.persist_external_news_items',
-                side_effect=[
-                    RuntimeError('storage unavailable'),
-                    {'inserted': 0, 'updated': 0, 'skipped': 0},
-                ],
+                side_effect=RuntimeError('storage invariant failed'),
             ),
             patch.object(settings, 'external_news_collect_throttle_seconds', 0),
+            self.assertRaisesRegex(RuntimeError, 'storage invariant failed'),
         ):
-            result = await service.collect_for_symbols(
-                symbols=['005930', '000660'],
-            )
+            await service.collect_for_symbols(symbols=['005930'])
 
-        self.assertEqual(result['summary']['collected_symbol_count'], 1)
-        self.assertEqual(result['summary']['failed_symbol_count'], 1)
-        self.assertFalse(result['summary']['provider_circuit_open'])
-        self.assertEqual(len(provider.queries), 2)
+        self.assertEqual(provider.queries, ['name-005930 005930'])
 
     async def test_persistence_integrity_failure_remains_fatal(self) -> None:
         provider = _SequencedProvider([[]])
@@ -171,7 +241,7 @@ class ExternalNewsResilienceTests(unittest.IsolatedAsyncioTestCase):
             await service.collect_for_symbols(symbols=['005930'])
 
     async def test_feedback_collection_preserves_actual_collected_symbol_count(self) -> None:
-        provider = _SequencedProvider([RuntimeError('temporary outage'), []])
+        provider = _SequencedProvider([ConnectionError('temporary outage'), []])
         service = ExternalNewsService(provider=provider)
 
         with (

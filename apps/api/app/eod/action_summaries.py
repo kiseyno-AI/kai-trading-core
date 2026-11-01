@@ -19,6 +19,12 @@ SUMMARY_VERSION = 'mvp_v1'
 ACTION_SUMMARY_SCOPE_MANIFEST_VERSION = (
     'action_summaries_scope_outcomes_v1'
 )
+ACTION_SUMMARY_ROW_LOCAL_ERRORS = (
+    ArithmeticError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:
@@ -411,11 +417,7 @@ class DailyActionSummaryService:
         def _emit_progress(payload: dict) -> None:
             if not progress_callback:
                 return
-            try:
-                progress_callback(payload)
-            except Exception:
-                # Progress persistence is best-effort and must not interrupt action summary processing.
-                return
+            progress_callback(payload)
 
         if progress_callback:
             first_symbol = snapshots[0]['symbol'] if snapshots else None
@@ -442,7 +444,7 @@ class DailyActionSummaryService:
                 row = summary.to_row()
                 row['source'] = source
                 items.append(row)
-            except Exception:
+            except ACTION_SUMMARY_ROW_LOCAL_ERRORS:
                 failed_symbols.append(snapshot['symbol'])
             if progress_callback:
                 next_symbol = snapshots[index + 1]['symbol'] if index + 1 < len(snapshots) else None

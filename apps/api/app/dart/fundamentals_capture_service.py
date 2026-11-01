@@ -48,6 +48,7 @@ from app.integrations.dart.client import DartClient, dart_client
 from app.market_data_store import load_symbols
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 _REPORT_PERIOD_PATTERN = re.compile(r'\((\d{4})\.(\d{2})\)')
 _DIRECT_BACKFILL_REPORT_PATTERN = re.compile(r'direct_backfill_(\d{4})_(\d{5})', re.IGNORECASE)
@@ -95,6 +96,10 @@ class DartFundamentalsNoDataError(TerminalFundamentalsCaptureError):
 
 class DartFundamentalsMappingError(TerminalFundamentalsCaptureError):
     capture_status = CAPTURE_STATUS_MAPPING_FAILED
+
+
+class DartFundamentalsProgressCallbackError(RuntimeError):
+    """Raised when pipeline progress tracking cannot be persisted."""
 
 
 def _utcnow() -> datetime:
@@ -2365,6 +2370,8 @@ class DartFundamentalsCaptureService:
                 run_feedback_followup=False,
                 progress_callback=progress_callback,
             )
+        except (DartFundamentalsProgressCallbackError, SQLAlchemyError):
+            raise
         except Exception as exc:
             fundamentals_result = {
                 'triggered': True,
@@ -3291,33 +3298,40 @@ class DartFundamentalsCaptureService:
                 failed = symbols_failed
             current_sync_group = metadata.get('current_sync_group') if isinstance(metadata.get('current_sync_group'), dict) else {}
             stock_codes_sample = current_sync_group.get('stock_codes_sample') if isinstance(current_sync_group, dict) else None
-            progress_callback(
-                status='running',
-                current_step=stage,
-                current_activity=f'DART fundamentals daily refresh: {stage.replace("_", " ")}',
-                processed=processed,
-                total=total,
-                succeeded=succeeded,
-                failed=failed,
-                remaining=max(total - processed, 0) if total else 0,
-                current_symbol=(stock_codes_sample or [None])[0] if isinstance(stock_codes_sample, list) else None,
-                current_period=resolved_fs_div,
-                source_run_ids={
-                    'dart_refresh_run_id': run_id,
-                    'dart_capture_run_id': metadata.get('capture_run_id'),
-                    'dart_sync_run_ids': [
-                        item.get('run_id')
-                        for item in metadata.get('sync_runs', [])
-                        if isinstance(item, dict) and item.get('run_id') is not None
-                    ],
-                },
-                details={
-                    'source': 'dart_fundamentals_refresh_run',
-                    'fs_div': resolved_fs_div,
-                    'trigger': trigger,
-                    'progress_metadata': metadata,
-                },
-            )
+            try:
+                progress_callback(
+                    status='running',
+                    current_step=stage,
+                    current_activity=f'DART fundamentals daily refresh: {stage.replace("_", " ")}',
+                    processed=processed,
+                    total=total,
+                    succeeded=succeeded,
+                    failed=failed,
+                    remaining=max(total - processed, 0) if total else 0,
+                    current_symbol=(stock_codes_sample or [None])[0] if isinstance(stock_codes_sample, list) else None,
+                    current_period=resolved_fs_div,
+                    source_run_ids={
+                        'dart_refresh_run_id': run_id,
+                        'dart_capture_run_id': metadata.get('capture_run_id'),
+                        'dart_sync_run_ids': [
+                            item.get('run_id')
+                            for item in metadata.get('sync_runs', [])
+                            if isinstance(item, dict) and item.get('run_id') is not None
+                        ],
+                    },
+                    details={
+                        'source': 'dart_fundamentals_refresh_run',
+                        'fs_div': resolved_fs_div,
+                        'trigger': trigger,
+                        'progress_metadata': metadata,
+                    },
+                )
+            except DartFundamentalsProgressCallbackError:
+                raise
+            except Exception as exc:
+                raise DartFundamentalsProgressCallbackError(
+                    f'DART fundamentals progress callback failed: {exc}'
+                ) from exc
 
         def update_refresh_progress(
             *,

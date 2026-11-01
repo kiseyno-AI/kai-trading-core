@@ -190,7 +190,7 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertTrue(result.summary_payload['data_quality']['price_bar_quality']['gap_unreliable_due_to_open'])
         self.assertEqual(result.summary_payload['data_quality']['gap']['reliable'], False)
 
-    def test_rebuild_ignores_progress_callback_failures(self):
+    def test_rebuild_propagates_progress_callback_failures(self):
         service = DailyActionSummaryService()
         progress_updates: list[dict] = []
 
@@ -209,16 +209,20 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
                 return_value=[_snapshot()],
             ),
         ):
-            result = service.rebuild_for_market_date(
-                market_date='2026-04-29',
-                progress_callback=_failing_progress_callback,
-            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'progress store unavailable',
+            ):
+                service.rebuild_for_market_date(
+                    market_date='2026-04-29',
+                    progress_callback=_failing_progress_callback,
+                )
 
-        self.assertEqual(result['action_summaries_persisted'], 1)
-        self.assertEqual(result['action_summaries_failed'], 0)
-        self.assertEqual(result['failed_symbols'], [])
-        self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
-        self.replace_scope_mock.assert_called_once()
+        self.assertEqual(
+            [item['status'] for item in progress_updates],
+            ['running'],
+        )
+        self.replace_scope_mock.assert_not_called()
 
     def test_rebuild_uses_exact_same_day_price_bar_universe_as_denominator(
         self,
@@ -297,3 +301,51 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
             exact_symbols=symbols,
             run_id=None,
         )
+
+    def test_rebuild_isolates_known_data_error_and_publishes_sibling(self):
+        service = DailyActionSummaryService()
+        snapshots = [_snapshot(symbol='005930'), _snapshot(symbol='000660')]
+
+        with (
+            patch(
+                'app.eod.action_summaries.load_daily_technical_snapshot_inputs',
+                return_value=snapshots,
+            ),
+            patch.object(
+                service,
+                'compute_summary',
+                side_effect=[
+                    ValueError('bad snapshot'),
+                    service.compute_summary(snapshots[1]),
+                ],
+            ),
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-29',
+                symbols=['005930', '000660'],
+            )
+
+        self.assertEqual(result['successful_stock_codes'], ['000660'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+
+    def test_rebuild_propagates_unknown_compute_failure(self):
+        service = DailyActionSummaryService()
+
+        with (
+            patch(
+                'app.eod.action_summaries.load_daily_technical_snapshot_inputs',
+                return_value=[_snapshot()],
+            ),
+            patch.object(
+                service,
+                'compute_summary',
+                side_effect=RuntimeError('unexpected action invariant'),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'unexpected action'):
+                service.rebuild_for_market_date(
+                    market_date='2026-04-29',
+                    symbols=['005930'],
+                )
+
+        self.replace_scope_mock.assert_not_called()

@@ -3,8 +3,11 @@ import asyncio
 from datetime import date
 from unittest.mock import AsyncMock, Mock, patch
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.dart.fundamentals_capture_service import (
+    DartFundamentalsProgressCallbackError,
     DartFundamentalsCaptureService as _DartFundamentalsCaptureService,
     _bounded_missing_probe_codes,
     _load_share_issuance_activation_audit,
@@ -3636,6 +3639,87 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 for _, completion in repository.completed_refresh_runs
             )
         )
+
+    async def test_compound_refresh_propagates_core_database_failure(self):
+        service, _repository = self._build_global_followup_service()
+        service._run_daily_incremental_refresh.side_effect = SQLAlchemyError(
+            'fundamentals database unavailable'
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'failed',
+                'scan_status': 'failed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            },
+        ) as issuance:
+            with self.assertRaisesRegex(
+                SQLAlchemyError,
+                'fundamentals database unavailable',
+            ):
+                await service.run_daily_incremental_refresh(
+                    market_date=date(2026, 4, 14),
+                    fs_div='CFS',
+                )
+
+        issuance.assert_not_awaited()
+
+    async def test_compound_refresh_propagates_progress_callback_failure(self):
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {
+                'enabled': True,
+            },
+        )
+
+        def fail_progress(**_payload):
+            raise RuntimeError('pipeline tracking write failed')
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'failed',
+                'scan_status': 'failed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            },
+        ) as issuance:
+            with self.assertRaisesRegex(
+                DartFundamentalsProgressCallbackError,
+                'pipeline tracking write failed',
+            ):
+                await service.run_daily_incremental_refresh(
+                    market_date=date(2026, 4, 14),
+                    fs_div='CFS',
+                    progress_callback=fail_progress,
+                )
+
+        issuance.assert_not_awaited()
 
     async def test_compound_refresh_persists_and_advances_baseline_repair_cursor(self):
         stock_codes = ['000001', '000002', '000003']

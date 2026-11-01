@@ -665,13 +665,13 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
 
         def failing_upsert(payload: dict) -> None:
             if payload['symbol'] == '000660':
-                raise RuntimeError('write failed')
+                raise ValueError('malformed persisted row')
 
         with (
             patch.object(service, '_load_inputs', return_value=inputs),
             patch(
                 'app.signals.piotroski_filter.upsert_daily_piotroski_filter_results',
-                side_effect=RuntimeError('bulk write failed'),
+                side_effect=ValueError('batch contains malformed row'),
             ),
             patch(
                 'app.signals.piotroski_filter.upsert_daily_piotroski_filter_result',

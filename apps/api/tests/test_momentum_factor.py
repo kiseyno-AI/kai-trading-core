@@ -324,7 +324,7 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
 
         def persist_one(row):
             if row.get('has_sufficient_history'):
-                raise RuntimeError('ready row write failed')
+                raise ValueError('ready row contains malformed persisted data')
 
         with (
             patch(
@@ -337,7 +337,7 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
             ),
             patch(
                 'app.signals.momentum_factor.upsert_daily_momentum_factor_results',
-                side_effect=RuntimeError('batch failed'),
+                side_effect=ValueError('batch contains malformed row'),
             ),
             patch(
                 'app.signals.momentum_factor.upsert_daily_momentum_factor_result',

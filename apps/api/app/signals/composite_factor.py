@@ -20,8 +20,14 @@ from app.market_data_store import (
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.momentum_factor import enrich_momentum_audit_fields
 from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
     build_factor_coverage_contract,
+    build_symbol_results,
     factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
 )
 
 COMPOSITE_FACTOR_VERSION = 'composite_v1'
@@ -221,10 +227,29 @@ class DailyCompositeFactorService:
             if ranking_symbols is not None
             else list(authoritative_universe)
         )
+        ranking_scope_missing_symbols = (
+            [
+                symbol
+                for symbol in (normalized_ranking_symbols or [])
+                if symbol not in authoritative_symbol_set
+            ]
+            if ranking_symbols is not None
+            else []
+        )
         ranking_rows_by_family = self._load_factor_rows(
             market_date=normalized_market_date,
             symbols=authoritative_ranking_symbols,
         )
+        missing_factor_families = [
+            family
+            for family in FACTOR_DEFINITION_BY_FAMILY
+            if family not in ranking_rows_by_family
+        ]
+        if missing_factor_families:
+            raise KeyError(
+                'missing shared composite factor families: '
+                + ','.join(missing_factor_families)
+            )
         ranking_symbols = authoritative_ranking_symbols
 
         if normalized_symbols is None:
@@ -267,42 +292,124 @@ class DailyCompositeFactorService:
             factor_rows_by_family=ranking_rows_by_family,
         )
 
-        items_by_symbol: dict[str, dict[str, Any]] = {}
-        for symbol in ranking_symbols:
-            item = self._build_symbol_result(
-                symbol=symbol,
-                market_date=normalized_market_date,
-                source=source,
-                metadata=metadata_map.get(symbol),
-                factor_rows_by_family=ranking_rows_by_family,
+        ranking_items, computation_failed_symbols, computation_failed_symbol_errors = (
+            build_symbol_results(
+                ranking_symbols,
+                symbol_of=lambda symbol: symbol,
+                build=lambda symbol: run_symbol_computation(
+                    lambda: self._build_symbol_result(
+                        symbol=symbol,
+                        market_date=normalized_market_date,
+                        source=source,
+                        metadata=metadata_map.get(symbol),
+                        factor_rows_by_family=ranking_rows_by_family,
+                    )
+                ),
             )
-            items_by_symbol[symbol] = item
+        )
+        items_by_symbol = {item['symbol']: item for item in ranking_items}
 
         extra_symbols = [symbol for symbol in target_symbols if symbol not in items_by_symbol]
-        for symbol in extra_symbols:
-            item = self._build_symbol_result(
-                symbol=symbol,
-                market_date=normalized_market_date,
-                source=source,
-                metadata=metadata_map.get(symbol),
-                factor_rows_by_family=ranking_rows_by_family,
+        retry_extra_symbols = [
+            symbol for symbol in extra_symbols
+            if symbol not in set(computation_failed_symbols)
+        ]
+        extra_items, extra_failed_symbols, extra_failed_symbol_errors = (
+            build_symbol_results(
+                retry_extra_symbols,
+                symbol_of=lambda symbol: symbol,
+                build=lambda symbol: run_symbol_computation(
+                    lambda: self._build_symbol_result(
+                        symbol=symbol,
+                        market_date=normalized_market_date,
+                        source=source,
+                        metadata=metadata_map.get(symbol),
+                        factor_rows_by_family=ranking_rows_by_family,
+                    )
+                ),
             )
-            items_by_symbol[symbol] = item
-
+        )
+        items_by_symbol.update({item['symbol']: item for item in extra_items})
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (extra_failed_symbols, extra_failed_symbol_errors),
+            )
+        )
         all_items = list(items_by_symbol.values())
         input_universe_counts = self._assign_scores_and_rankings(all_items)
-        for item in all_items:
+
+        def finalize_composite_item(item: dict[str, Any]) -> dict[str, Any]:
             self._attach_output_blocks(item)
             item['factor_payload'] = self._build_factor_payload(
                 item=item,
                 source=source,
                 input_universe_counts=input_universe_counts,
             )
+            return item
+
+        (
+            all_items,
+            payload_failed_symbols,
+            payload_failed_symbol_errors,
+        ) = build_symbol_results(
+            all_items,
+            symbol_of=lambda item: str(item.get('symbol') or ''),
+            build=lambda item: run_symbol_computation(
+                lambda: finalize_composite_item(item)
+            ),
+        )
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (payload_failed_symbols, payload_failed_symbol_errors),
+            )
+        )
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=computation_failed_symbols,
+            failed_symbol_errors=computation_failed_symbol_errors,
+            target_symbols=target_symbols,
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_scope_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
+        )
+        items_by_symbol = {item['symbol']: item for item in all_items}
 
         if normalized_symbols is None:
-            items = _sort_items([items_by_symbol[symbol] for symbol in ranking_symbols])
+            items = _sort_items([
+                items_by_symbol[symbol]
+                for symbol in ranking_symbols
+                if symbol in items_by_symbol
+            ])
         else:
-            items = _sort_items([items_by_symbol[symbol] for symbol in target_symbols])
+            items = _sort_items([
+                items_by_symbol[symbol]
+                for symbol in target_symbols
+                if symbol in items_by_symbol
+            ])
 
         summary = self._build_summary(
             items,
@@ -316,8 +423,8 @@ class DailyCompositeFactorService:
             self._strip_internal_fields(item)
 
         persisted_count = 0
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
         scope_finalization: dict[str, Any] | None = None
         if exact_scope_symbols is not None:
             publication = replace_daily_derived_results_exact_scope(
@@ -328,42 +435,53 @@ class DailyCompositeFactorService:
                 authoritative_market_scope=authoritative_market_scope,
             )
             persisted_count = int(publication['results_persisted'])
-            failed_symbols = list(publication['failed_symbols'])
-            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (publication['failed_symbols'], publication['failed_symbol_errors']),
+            )
             scope_finalization = publication['scope_finalization']
         else:
-            try:
-                persisted_count = (
+            def write_composite_batch(
+                batch: Sequence[dict[str, Any]],
+            ) -> None:
+                written_count = (
                     upsert_daily_composite_factor_results(
-                        items,
+                        batch,
                         replace_market_date=normalized_market_date,
                     )
                     if full_scope_replacement
-                    else upsert_daily_composite_factor_results(items)
+                    else upsert_daily_composite_factor_results(batch)
                 )
-                if persisted_count != len(items):
+                if written_count != len(batch):
                     raise RuntimeError(
-                        f'composite batch upsert persisted {persisted_count} of {len(items)} results'
+                        'composite batch upsert persisted '
+                        f'{written_count} of {len(batch)} results'
                     )
-            except Exception as batch_exc:
-                persisted_count = 0
-                if full_scope_replacement:
-                    failed_symbols = [item['symbol'] for item in items]
-                    failed_symbol_errors = [
-                        {
-                            'symbol': item['symbol'],
-                            'error': f'atomic_full_scope_replace_failed: {batch_exc}',
-                        }
-                        for item in items
-                    ]
-                else:
-                    for item in items:
-                        try:
-                            upsert_daily_composite_factor_result(item)
-                            persisted_count += 1
-                        except Exception as exc:
-                            failed_symbols.append(item['symbol'])
-                            failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=write_composite_batch,
+                item_write=(
+                    None
+                    if full_scope_replacement
+                    else upsert_daily_composite_factor_result
+                ),
+                failure_prefix=(
+                    'atomic_full_scope_replace_failed'
+                    if full_scope_replacement
+                    else 'persistence_failed'
+                ),
+                write_empty_batch=full_scope_replacement,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -382,7 +500,13 @@ class DailyCompositeFactorService:
                 persisted_items=persisted_items,
                 missing_symbols=missing_symbols,
                 failed_symbols=failed_symbols,
+                failed_symbol_errors=failed_symbol_errors,
             )
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
         )
         summary['common_complete_cohort_count'] = summary['complete_count']
         summary['renormalized_partial_cohort_count'] = summary['partial_count']
@@ -1030,6 +1154,7 @@ class DailyCompositeFactorService:
                 persisted_items=items,
                 missing_symbols=missing_symbols,
                 failed_symbols=[],
+                failed_symbol_errors=[],
             )
         )
         summary['common_complete_cohort_count'] = summary['complete_count']
@@ -1043,6 +1168,7 @@ class DailyCompositeFactorService:
         persisted_items: list[dict[str, Any]],
         missing_symbols: list[str],
         failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         def snapshot(item: dict[str, Any], family: str) -> dict[str, Any]:
             payload = item.get('factor_payload')
@@ -1055,6 +1181,7 @@ class DailyCompositeFactorService:
             persisted_items=persisted_items,
             missing_symbols=missing_symbols,
             failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
             is_ready=lambda item: item.get('composite_score') is not None,
             is_complete=lambda item: int(item.get('valid_factor_count') or 0)
             == len(FACTOR_DEFINITIONS),

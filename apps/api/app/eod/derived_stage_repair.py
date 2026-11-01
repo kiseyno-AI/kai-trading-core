@@ -680,6 +680,163 @@ class ExactDerivedStageRepair:
         expected = checkpoint_unit['result'].get('completion_evidence')
         return isinstance(expected, Mapping) and live_evidence == dict(expected)
 
+    @classmethod
+    def _partial_date_result_is_valid(
+        cls,
+        result: Mapping[str, Any],
+        item: Mapping[str, Any],
+    ) -> bool:
+        """Validate the exact durable proof carried by a partial stage chain."""
+
+        if (
+            result.get('status') != 'partial'
+            or result.get('market_date') != item['market_date']
+            or result.get('exact_symbol_count') != item['symbol_count']
+            or result.get('membership_sha256') != item['membership_sha256']
+        ):
+            return False
+        successes = result.get('successful_symbols')
+        retry_debt = result.get('retry_debt_symbols')
+        if (
+            not isinstance(successes, Mapping)
+            or not isinstance(retry_debt, Mapping)
+            or set(successes) != set(STAGE_ORDER)
+            or set(retry_debt) != set(STAGE_ORDER)
+        ):
+            return False
+
+        exact_symbols = list(item['symbols'])
+        exact_set = set(exact_symbols)
+        validated_successes: dict[str, list[str]] = {}
+        for stage_id in STAGE_ORDER:
+            raw_successes = successes.get(stage_id)
+            raw_retry_debt = retry_debt.get(stage_id)
+            if not isinstance(raw_successes, list) or not isinstance(
+                raw_retry_debt,
+                list,
+            ):
+                return False
+            try:
+                normalized = sorted(
+                    {_normalize_symbol(symbol) for symbol in raw_successes}
+                )
+            except ValueError:
+                return False
+            if (
+                normalized != raw_successes
+                or len(normalized) != len(raw_successes)
+                or not set(normalized).issubset(exact_set)
+                or raw_retry_debt
+                != sorted(exact_set - set(normalized))
+            ):
+                return False
+            validated_successes[stage_id] = normalized
+        if not any(retry_debt[stage_id] for stage_id in STAGE_ORDER):
+            return False
+        if not set(validated_successes['technical_snapshots']).issubset(
+            validated_successes['price_contexts']
+        ) or not set(validated_successes['action_summaries']).issubset(
+            validated_successes['technical_snapshots']
+        ):
+            return False
+
+        stage_results = result.get('stage_results')
+        if not isinstance(stage_results, Mapping) or set(stage_results) != set(
+            STAGE_ORDER
+        ):
+            return False
+        for stage_id in STAGE_ORDER:
+            stage_result = stage_results.get(stage_id)
+            if not isinstance(stage_result, Mapping):
+                return False
+            nested_result = stage_result.get('result')
+            finalization = stage_result.get('exact_finalization')
+            if not isinstance(nested_result, Mapping) or not isinstance(
+                finalization,
+                Mapping,
+            ):
+                return False
+            try:
+                validated_finalization = cls._validated_stage_finalization(
+                    result=nested_result,
+                    market_date=str(item['market_date']),
+                    stage_id=stage_id,
+                    exact_symbols=exact_symbols,
+                    successful_symbols=validated_successes[stage_id],
+                )
+            except RuntimeError:
+                return False
+            if dict(validated_finalization) != dict(finalization):
+                return False
+
+        completion = result.get('completion_evidence')
+        if not isinstance(completion, Mapping):
+            return False
+        try:
+            validated_completion = cls._validated_completion_evidence(
+                {
+                    'source_fingerprint': completion.get(
+                        'source_fingerprint'
+                    ),
+                    'memberships': validated_successes,
+                    'output_fingerprints': completion.get(
+                        'output_fingerprints'
+                    ),
+                },
+                item,
+                require_complete=False,
+            )
+        except RuntimeError:
+            return False
+        return validated_completion == dict(completion)
+
+    def _partial_date_live_state_is_valid(
+        self,
+        result: Mapping[str, Any],
+        item: Mapping[str, Any],
+    ) -> bool:
+        self._validate_stored_scope(item)
+        live = self.completion_state_loader(
+            str(item['market_date']),
+            list(item['symbols']),
+        )
+        if not isinstance(live, Mapping):
+            return False
+        memberships = live.get('memberships')
+        successes = result.get('successful_symbols')
+        if (
+            not isinstance(memberships, Mapping)
+            or not isinstance(successes, Mapping)
+            or set(memberships) != set(STAGE_ORDER)
+        ):
+            return False
+        for stage_id in STAGE_ORDER:
+            raw_membership = memberships.get(stage_id)
+            if not isinstance(raw_membership, list):
+                return False
+            try:
+                normalized = sorted(
+                    {_normalize_symbol(symbol) for symbol in raw_membership}
+                )
+            except ValueError:
+                return False
+            if (
+                normalized != raw_membership
+                or len(normalized) != len(raw_membership)
+                or normalized != successes.get(stage_id)
+            ):
+                return False
+        try:
+            live_evidence = self._validated_completion_evidence(
+                live,
+                item,
+                require_complete=False,
+            )
+        except RuntimeError:
+            return False
+        expected = result.get('completion_evidence')
+        return isinstance(expected, Mapping) and live_evidence == dict(expected)
+
     def _reconcile_applied_result(
         self,
         *,
@@ -688,18 +845,26 @@ class ExactDerivedStageRepair:
     ) -> tuple[bool, dict[str, Any]]:
         """Re-read durable exact rows after a fence/checkpoint uncertainty."""
 
-        reconciled_unit = {'result': dict(result)}
         try:
-            live_valid = bool(
-                self._completed_date_checkpoint_is_valid(
-                    reconciled_unit,
-                    item,
+            if result.get('status') == 'completed':
+                reconciled_unit = {'result': dict(result)}
+                live_valid = bool(
+                    self._completed_date_checkpoint_is_valid(
+                        reconciled_unit,
+                        item,
+                    )
+                    and self._completed_date_live_state_is_valid(
+                        reconciled_unit,
+                        item,
+                    )
                 )
-                and self._completed_date_live_state_is_valid(
-                    reconciled_unit,
-                    item,
+            elif result.get('status') == 'partial':
+                live_valid = bool(
+                    self._partial_date_result_is_valid(result, item)
+                    and self._partial_date_live_state_is_valid(result, item)
                 )
-            )
+            else:
+                live_valid = False
         except Exception as exc:  # noqa: BLE001
             return False, {
                 'error_type': type(exc).__name__,
@@ -922,7 +1087,7 @@ class ExactDerivedStageRepair:
                     'reconciliation': reconciliation,
                 }
                 uncertain_unit = (
-                    dict(previous)
+                    deepcopy(dict(previous))
                     if isinstance(previous, Mapping)
                     else {
                         'status': 'uncertain',

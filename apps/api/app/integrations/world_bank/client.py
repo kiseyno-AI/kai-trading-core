@@ -52,7 +52,12 @@ class WorldBankClient:
         if response.status_code >= 400:
             raise WorldBankAPIError(f'World Bank request failed [{response.status_code}]: {response.text}')
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise WorldBankAPIError(
+                'World Bank response JSON decode failed'
+            ) from exc
         if not isinstance(payload, list) or len(payload) < 2:
             raise WorldBankAPIError('World Bank response was not the expected JSON list')
         rows = payload[1]

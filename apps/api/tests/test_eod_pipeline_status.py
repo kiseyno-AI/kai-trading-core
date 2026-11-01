@@ -1303,7 +1303,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ],
             ['005930'],
         )
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
 
     def test_signal_feature_stage_requires_semantically_usable_rows_for_requested_scope(self):
         self.assertFalse(
@@ -2180,7 +2180,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'partial',
         )
 
-    def test_completed_required_stage_with_blocked_gate_keeps_pipeline_blocked(self) -> None:
+    def test_completed_stage_with_blocked_gate_makes_mixed_pipeline_partial(self) -> None:
         stages = {
             'technical_snapshots': {
                 'stage_id': 'technical_snapshots',
@@ -2203,12 +2203,129 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(
             EODPipelineStatusService._resolve_overall_status(stages),
-            'blocked',
+            'partial',
         )
         self.assertEqual(
             stages['technical_snapshots']['details']['gate_reason'],
             'missing_rows_intersect_exact_run_universe',
         )
+
+    def test_overall_status_lattice_preserves_only_pure_incomplete_states(
+        self,
+    ) -> None:
+        cases = {
+            'all_pending': (
+                {
+                    'price_collection': {'status': 'pending'},
+                    'technical_snapshots': {'status': 'pending'},
+                },
+                'pending',
+            ),
+            'pure_blocked': (
+                {
+                    'price_collection': {'status': 'blocked'},
+                    'technical_snapshots': {'status': 'blocked'},
+                },
+                'blocked',
+            ),
+            'pure_waiting': (
+                {
+                    'price_collection': {'status': 'waiting'},
+                    'technical_snapshots': {'status': 'waiting'},
+                },
+                'waiting',
+            ),
+            'completed_and_blocked': (
+                {
+                    'price_collection': {'status': 'completed'},
+                    'technical_snapshots': {'status': 'blocked'},
+                },
+                'partial',
+            ),
+            'completed_and_waiting': (
+                {
+                    'price_collection': {'status': 'completed'},
+                    'technical_snapshots': {'status': 'waiting'},
+                },
+                'partial',
+            ),
+            'failed_without_success': (
+                {
+                    'price_collection': {'status': 'failed'},
+                    'technical_snapshots': {'status': 'blocked'},
+                },
+                'failed',
+            ),
+            'failed_with_success': (
+                {
+                    'price_collection': {'status': 'completed'},
+                    'technical_snapshots': {'status': 'failed'},
+                },
+                'partial',
+            ),
+        }
+        for case_name, (stages, expected_status) in cases.items():
+            with self.subTest(case_name=case_name):
+                self.assertEqual(
+                    EODPipelineStatusService._resolve_overall_status(
+                        stages
+                    ),
+                    expected_status,
+                )
+
+    def test_overall_status_requires_satisfied_terminal_outcomes(self) -> None:
+        cases = {
+            'generic_skip_with_completed': (
+                {
+                    'price_collection': {'status': 'completed'},
+                    'signal_decider': {'status': 'skipped'},
+                },
+                'partial',
+            ),
+            'malformed_with_completed': (
+                {
+                    'price_collection': {'status': 'completed'},
+                    'signal_decider': {},
+                },
+                'partial',
+            ),
+            'completed_with_failure_evidence': (
+                {
+                    'signal_decider': {
+                        'status': 'completed',
+                        'failed': 1,
+                    }
+                },
+                'partial',
+            ),
+            'explicit_safe_skip_with_completed': (
+                {
+                    'price_collection': {'status': 'completed'},
+                    'signal_decider': {
+                        'status': 'skipped',
+                        'safe_skip': True,
+                    }
+                },
+                'completed',
+            ),
+            'satisfied_skip_reason': (
+                {
+                    'signal_decider': {
+                        'status': 'skipped',
+                        'reason': 'already_completed',
+                    }
+                },
+                'completed',
+            ),
+        }
+        for case_name, (stages, expected_status) in cases.items():
+            with self.subTest(case_name=case_name):
+                self.assertEqual(
+                    EODPipelineStatusService._resolve_overall_status(
+                        stages
+                    ),
+                    expected_status,
+                )
 
     def test_optional_context_warning_only_resolves_completed(self) -> None:
         stages = {
@@ -4513,7 +4630,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
         self.assertEqual(
             result['stages']['momentum_factors']['current_activity'],
@@ -4604,7 +4721,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'failed')
         self.assertEqual(result['stages']['advanced_value_factors']['status'], 'pending')
         self.assertEqual(
@@ -4992,7 +5109,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date='2026-05-06')
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
         self.assertEqual(result['stages']['momentum_factors']['total'], 2810)
         self.assertEqual(
@@ -5654,7 +5771,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date=market_date)
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['total_stages'], 26)
         self.assertEqual(result['completed_stages'], 17)
         self.assertEqual(result['skipped_stages'], 2)

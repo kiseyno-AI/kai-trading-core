@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
@@ -1208,6 +1210,27 @@ def _extract_result_counts(
     }
 
 
+def _truthful_failed_stage_counts(
+    counts: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, int], bool]:
+    """Keep attempt failure separate from unknown item-scope counts."""
+
+    raw_counts = counts or {}
+    normalized = {
+        key: max(int(raw_counts.get(key) or 0), 0)
+        for key in ('processed', 'total', 'succeeded', 'failed')
+    }
+    scope_known = normalized['total'] > 0
+    if not scope_known:
+        normalized = {
+            'processed': 0,
+            'total': 0,
+            'succeeded': 0,
+            'failed': 0,
+        }
+    return normalized, scope_known
+
+
 def _compact_result_summary(result: dict[str, Any]) -> dict[str, Any]:
     omitted_keys = {'items', 'rows', 'payloads', 'results'}
     return {
@@ -1261,6 +1284,7 @@ class _OfficialDailyPipelineTracker:
         self.pipeline_run_id: int | None = None
         self.market_date: str | None = None
         self.eod_run_id: int | None = None
+        self.resolved_stage_ids: tuple[str, ...] = ()
         self.stage_statuses: dict[str, str] = {}
         self.stage_outcomes: dict[str, dict[str, Any]] = {}
         self.stage_source_run_ids: dict[str, dict[str, Any]] = {}
@@ -1327,6 +1351,13 @@ class _OfficialDailyPipelineTracker:
             self.pipeline_run_id = int(run['id'])
             self.market_date = market_date
             self.eod_run_id = eod_run_id
+            self.resolved_stage_ids = tuple(
+                dict.fromkeys(
+                    stage_id
+                    for value in resolved_stages
+                    if (stage_id := str(value or '').strip())
+                )
+            )
             return run
         except Exception as exc:
             logger.warning('daily pipeline tracker start failed for auto EOD run %s: %s', eod_run_id, exc)
@@ -1445,7 +1476,7 @@ class _OfficialDailyPipelineTracker:
                     market_date=self.market_date,
                 )
             )
-        except Exception as exc:  # pragma: no cover - defensive production guard
+        except Exception as exc:
             logger.warning(
                 'daily pipeline heartbeat failed for run %s stage %s: %s',
                 self.eod_run_id,
@@ -1456,7 +1487,10 @@ class _OfficialDailyPipelineTracker:
                 stage=stage,
                 exc=exc,
             )
-            return True
+            raise DailyPipelineTrackingWriteError(
+                f'daily pipeline heartbeat checkpoint failed for '
+                f'{stage}: {exc}'
+            ) from exc
 
     def link_eod_run(self, eod_run_id: int) -> None:
         self.eod_run_id = int(eod_run_id)
@@ -1549,24 +1583,60 @@ class _OfficialDailyPipelineTracker:
                 self.stage_outcomes,
             )
         )
-        statuses = {
-            status
-            for stage_id, status in self.stage_statuses.items()
-            if stage_id not in warning_stage_ids
+        tracked_stage_ids = {
+            *self.resolved_stage_ids,
+            *self.stage_statuses,
         }
-        if not statuses:
+        stage_outcomes = [
+            {
+                **dict(self.stage_outcomes.get(stage_id) or {}),
+                'stage': stage_id,
+                'status': str(
+                    self.stage_statuses.get(stage_id) or ''
+                ).strip().lower(),
+            }
+            for stage_id in tracked_stage_ids
+            if stage_id not in warning_stage_ids
+        ]
+        statuses = [
+            str(outcome.get('status') or '').strip().lower()
+            for outcome in stage_outcomes
+        ]
+        if not stage_outcomes:
             return 'completed'
-        if 'failed' in statuses:
-            return 'failed'
-        if 'blocked' in statuses:
-            return 'blocked'
-        if 'waiting' in statuses:
-            return 'waiting'
         if 'running' in statuses:
             return 'running'
-        if 'partial' in statuses:
-            return 'partial'
-        if statuses <= {'completed', 'skipped'}:
+        if all(status == 'pending' for status in statuses):
+            return 'pending'
+        if 'failed' in statuses:
+            if any(
+                status in {'completed', 'partial'}
+                for status in statuses
+            ):
+                return 'partial'
+            return 'failed'
+        for specific_status in (
+            'blocked',
+            'waiting',
+            'interrupted',
+            'abandoned',
+        ):
+            if all(status == specific_status for status in statuses):
+                return specific_status
+        if all(
+            (
+                status == 'completed'
+                and daily_pipeline_outcome_is_satisfied(outcome)
+            )
+            or (
+                status == 'skipped'
+                and (
+                    outcome.get('safe_skip') is True
+                    or daily_pipeline_outcome_is_satisfied(outcome)
+                )
+            )
+            for status, outcome in zip(statuses, stage_outcomes)
+        ):
             return 'completed'
         return 'partial'
 
@@ -1698,31 +1768,17 @@ def _run_daily_piotroski_filter_followup(
             'Piotroski admitted scope falls outside exact EOD membership: '
             f'{outside_membership[:20]}'
         )
-    try:
-        result = daily_piotroski_filter_service.rebuild_for_market_date(
-            market_date=market_date,
-            symbols=normalized_admitted_symbols,
-            ranking_symbols=normalized_symbols,
-            exact_scope_symbols=normalized_symbols,
-            authoritative_market_scope=(
-                authoritative_market_scope
-                if set(normalized_admitted_symbols) == set(normalized_symbols)
-                else None
-            ),
-        )
-    except Exception:
-        _finalize_daily_stage_scope(
-            market_date=market_date,
-            stage_id='piotroski_filter',
-            exact_symbols=normalized_symbols,
-            result=None,
-            authoritative_market_scope=(
-                authoritative_market_scope
-                if set(normalized_admitted_symbols) == set(normalized_symbols)
-                else None
-            ),
-        )
-        raise
+    result = daily_piotroski_filter_service.rebuild_for_market_date(
+        market_date=market_date,
+        symbols=normalized_admitted_symbols,
+        ranking_symbols=normalized_symbols,
+        exact_scope_symbols=normalized_symbols,
+        authoritative_market_scope=(
+            authoritative_market_scope
+            if set(normalized_admitted_symbols) == set(normalized_symbols)
+            else None
+        ),
+    )
     if not (
         isinstance(result.get('scope_finalization'), Mapping)
         and result['scope_finalization'].get('ready') is True
@@ -1842,12 +1898,23 @@ def _execute_factor_stage_with_heartbeat(
     interval_seconds: float,
     thread_name: str,
 ) -> tuple[dict[str, Any], bool]:
+    heartbeat_errors: list[Exception] = []
+
+    def fail_closed_heartbeat() -> bool:
+        try:
+            return heartbeat()
+        except Exception as exc:
+            heartbeat_errors.append(exc)
+            return False
+
     pulse = PeriodicStageHeartbeat(
-        heartbeat,
+        fail_closed_heartbeat,
         interval_seconds=interval_seconds,
         thread_name=thread_name,
     )
     if not pulse.check_now():
+        if heartbeat_errors:
+            raise heartbeat_errors[0]
         return (
             {
                 'status': 'interrupted',
@@ -1859,6 +1926,8 @@ def _execute_factor_stage_with_heartbeat(
         with pulse:
             result = call()
     except Exception as exc:
+        if heartbeat_errors:
+            raise heartbeat_errors[0] from exc
         if not pulse.ownership_lost:
             raise
         return (
@@ -1870,6 +1939,8 @@ def _execute_factor_stage_with_heartbeat(
             },
             False,
         )
+    if heartbeat_errors:
+        raise heartbeat_errors[0]
     return result, not pulse.ownership_lost
 
 
@@ -1989,7 +2060,6 @@ def _run_daily_factor_followup(
     for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
         stage_invocation_symbols = list(current_admitted_symbols)
         stage_call = build_stage_call(stage_id, stage_invocation_symbols)
-        scope_finalized = False
         try:
             if stage_executor is None:
                 result = stage_call()
@@ -2019,7 +2089,6 @@ def _run_daily_factor_followup(
                     f'{stage_id} atomic exact-scope finalization proof '
                     'is unavailable'
                 )
-            scope_finalized = True
             stage_status = _resolve_result_status(
                 result,
                 stage_id=stage_id,
@@ -2063,44 +2132,22 @@ def _run_daily_factor_followup(
             stages[stage_id] = stage_result
             if stage_result_callback is not None:
                 stage_result_callback(stage_id, stage_result)
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:  # pragma: no cover - defensive production guard
             logger.exception('Daily factor follow-up failed for %s on %s', stage_id, market_date)
             overall_status = 'partial'
             current_admitted_symbols = []
-            finalization_error: Exception | None = None
-            scope_finalization: dict[str, Any] | None = None
-            if not scope_finalized:
-                try:
-                    scope_finalization = _finalize_daily_stage_scope(
-                        market_date=market_date,
-                        stage_id=stage_id,
-                        exact_symbols=normalized_symbols,
-                        result=None,
-                        authoritative_market_scope=(
-                            authoritative_market_scope
-                            if set(stage_invocation_symbols)
-                            == set(normalized_symbols)
-                            else None
-                        ),
-                    )
-                except Exception as cleanup_exc:  # pragma: no cover - defensive
-                    finalization_error = cleanup_exc
             stage_result = {
                 'status': 'failed',
                 'error_type': type(exc).__name__,
                 'error_message': str(exc),
-                'scope_finalization': scope_finalization,
+                'scope_finalization': None,
             }
-            if finalization_error is not None:
-                stage_result['scope_finalization_error_type'] = type(
-                    finalization_error
-                ).__name__
-                stage_result['scope_finalization_error_message'] = str(
-                    finalization_error
-                )
             stages[stage_id] = stage_result
             if stage_result_callback is not None:
                 stage_result_callback(stage_id, stage_result)
+            break
     retry_debt_symbols = [
         symbol
         for symbol in initial_admitted_symbols
@@ -2438,6 +2485,14 @@ def _run_daily_intraday_snapshot_followup(*, market_date: str, enabled: bool) ->
             include_news=False,
         )
     )
+    if result.get('reason') == 'non_trading_day':
+        return {
+            'market_date': market_date,
+            **result,
+            'triggered': False,
+            'safe_skip': True,
+            'status': 'skipped',
+        }
     return {'triggered': True, 'market_date': market_date, **result}
 
 
@@ -3264,6 +3319,11 @@ def run_market_data_pipeline(
                 )
             except DailyPipelineTrackingWriteError:
                 raise
+            except SQLAlchemyError:
+                # A database outage is an infrastructure failure, not
+                # symbol-local retry debt.  Abort the run so a partial result
+                # cannot be published while persistence is unavailable.
+                raise
             except Exception as exc:
                 symbols_failed += 1
                 failed_symbols.append(item.symbol)
@@ -3649,6 +3709,8 @@ def run_market_data_pipeline(
             )
             if failed_symbols:
                 price_context_result.update(causal_price_skip)
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
             price_context_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -3907,6 +3969,8 @@ def run_market_data_pipeline(
                 downstream_preflight_status=preflight.get('status'),
                 downstream_allowed=bool(preflight.get('allowed')),
             )
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
             pykrx_enrichment_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -3997,6 +4061,8 @@ def run_market_data_pipeline(
                     **causal_price_skip,
                 },
             )
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
             technical_snapshot_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -4142,6 +4208,8 @@ def run_market_data_pipeline(
                     **causal_price_skip,
                 },
             )
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
             action_summary_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -4330,6 +4398,8 @@ def run_market_data_pipeline(
                 failed=trending_failed,
                 extra=_gap_policy_details(failed=trending_failed, total=trending_total),
             )
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
             trending_rank_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -4460,6 +4530,8 @@ def run_market_data_pipeline(
                     **_gap_policy_details(failed=signal_failed, total=signal_total),
                 },
             )
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
             signal_feature_result = build_stage_failure_result(
                 market_date=latest_trade_date,
@@ -4527,7 +4599,6 @@ def run_market_data_pipeline(
             extra={'result_summary': market_risk_filter_result},
         )
     elif 'market_risk_filter' in requested_stage_set:
-        market_risk_scope_finalized = False
         try:
             persist_stage_progress(
                 stage='market_risk_filter',
@@ -4575,59 +4646,36 @@ def run_market_data_pipeline(
                     'market_risk_filter atomic exact-scope finalization '
                     'proof is unavailable'
                 )
-            market_risk_scope_finalized = True
-            _clear_exact_scope_outcome(market_risk_filter_result)
-            market_risk_total = len(price_context_symbols)
-            market_risk_failed = int(market_risk_filter_result.get('results_failed') or 0)
+            market_risk_partition = _validated_exact_scope_outcome(
+                result=market_risk_filter_result,
+                invocation_symbols=exact_piotroski_membership_symbols,
+                status=_resolve_result_status(
+                    market_risk_filter_result,
+                    stage_id='market_risk_filter',
+                ),
+            )
+            if (
+                market_risk_partition is None
+                or market_risk_partition['manifest_version']
+                != 'market_risk_filter_scope_outcomes_v1'
+            ):
+                raise RuntimeError(
+                    'market_risk_filter did not return an exact full-scope '
+                    'outcome manifest'
+                )
+            market_risk_total = len(exact_piotroski_membership_symbols)
+            market_risk_failed = len(
+                market_risk_partition['retry_debt_stock_codes']
+            )
             market_risk_status = _completion_status_for_gap(
                 failed=market_risk_failed,
                 total=market_risk_total,
             )
-            market_risk_retry_symbols = _peek_retry_failed_symbols(
-                market_risk_filter_result
-            )
-            if (
-                len(market_risk_retry_symbols) == market_risk_failed
-                and set(market_risk_retry_symbols).issubset(
-                    price_context_symbols
+            market_risk_filter_result['_retry_metadata'] = {
+                'failed_symbols': list(
+                    market_risk_partition['retry_debt_stock_codes']
                 )
-                and int(
-                    market_risk_filter_result.get(
-                        'results_persisted'
-                    )
-                    or 0
-                )
-                + market_risk_failed
-                == market_risk_total
-            ):
-                market_risk_retry_set = set(
-                    market_risk_retry_symbols
-                )
-                market_risk_filter_result.update(
-                    _build_exact_scope_outcome(
-                        manifest_version=(
-                            'market_risk_filter_scope_outcomes_v1'
-                        ),
-                        selected_symbols=price_context_symbols,
-                        successful_symbols=[
-                            symbol
-                            for symbol in price_context_symbols
-                            if symbol not in market_risk_retry_set
-                        ],
-                        retry_debt_symbols=[
-                            symbol
-                            for symbol in price_context_symbols
-                            if symbol in market_risk_retry_set
-                        ],
-                    )
-                )
-                market_risk_filter_result['_retry_metadata'] = {
-                    'failed_symbols': [
-                        symbol
-                        for symbol in price_context_symbols
-                        if symbol in market_risk_retry_set
-                    ]
-                }
+            }
             market_risk_filter_result['status'] = market_risk_status
             persist_stage_progress(
                 stage='market_risk_filter',
@@ -4651,28 +4699,9 @@ def run_market_data_pipeline(
                     ),
                 },
             )
+        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+            raise
         except Exception as exc:
-            scope_finalization: dict[str, Any] | None = None
-            scope_finalization_error: Exception | None = None
-            if (
-                exact_piotroski_membership_symbols
-                and not market_risk_scope_finalized
-            ):
-                try:
-                    scope_finalization = _finalize_daily_stage_scope(
-                        market_date=latest_trade_date,
-                        stage_id='market_risk_filter',
-                        exact_symbols=exact_piotroski_membership_symbols,
-                        result=None,
-                        authoritative_market_scope=(
-                            daily_derived_market_scope_authority
-                            if set(price_context_symbols)
-                            == set(exact_piotroski_membership_symbols)
-                            else None
-                        ),
-                    )
-                except Exception as cleanup_exc:
-                    scope_finalization_error = cleanup_exc
             market_risk_filter_result = build_stage_failure_result(
                 market_date=latest_trade_date,
                 source=MARKET_RISK_FILTER_SOURCE,
@@ -4687,16 +4716,7 @@ def run_market_data_pipeline(
             market_risk_filter_result['_retry_metadata'] = {
                 'failed_symbols': list(price_context_symbols),
             }
-            market_risk_filter_result['scope_finalization'] = (
-                scope_finalization
-            )
-            if scope_finalization_error is not None:
-                market_risk_filter_result[
-                    'scope_finalization_error_type'
-                ] = type(scope_finalization_error).__name__
-                market_risk_filter_result[
-                    'scope_finalization_error_message'
-                ] = str(scope_finalization_error)
+            market_risk_filter_result['scope_finalization'] = None
             market_risk_filter_error_message = f'Market risk filter persistence failed: {exc}'
             persist_stage_progress(
                 stage='market_risk_filter',
@@ -5013,16 +5033,20 @@ def run_market_data_pipeline(
         )
 
     def record_followup_failure(stage_id: str, exc: Exception) -> None:
+        counts, failure_scope_known = _truthful_failed_stage_counts()
         persist_stage_progress(
             stage=stage_id,
             status='failed',
             current_step=f'{stage_id}_failed',
             current_activity=f'{stage_id.replace("_", " ")} failed: {exc}',
-            processed=0,
-            total=0,
-            succeeded=0,
-            failed=1,
+            processed=counts['processed'],
+            total=counts['total'],
+            succeeded=counts['succeeded'],
+            failed=counts['failed'],
             extra={
+                'failure_reason': 'stage_execution_exception',
+                'failure_scope_known': failure_scope_known,
+                'stage_attempt_failed': True,
                 'error_type': type(exc).__name__,
                 'error_message': str(exc),
             },
@@ -5111,10 +5135,15 @@ def run_market_data_pipeline(
             raw_stage_result.get('status')
         )
         counts = _extract_result_counts(nested_result, default_total=0)
-        if stage_status == 'failed' and counts['failed'] <= 0:
-            counts['failed'] = 1
-            counts['processed'] = max(counts['processed'], 1)
-            counts['total'] = max(counts['total'], 1)
+        failure_metadata: dict[str, Any] = {}
+        if stage_status == 'failed':
+            counts, failure_scope_known = _truthful_failed_stage_counts(
+                counts
+            )
+            failure_metadata = {
+                'failure_scope_known': failure_scope_known,
+                'stage_attempt_failed': True,
+            }
         persist_stage_progress(
             stage=stage_id,
             status=stage_status,
@@ -5130,6 +5159,7 @@ def run_market_data_pipeline(
             extra={
                 'terminal_count_authority': 'result',
                 'factor_scoring_followup_status': factor_followup_status,
+                **failure_metadata,
                 'result_summary': _compact_result_summary(
                     nested_result or raw_stage_result
                 ),
@@ -5370,12 +5400,12 @@ def run_market_data_pipeline(
         (
             'technical_snapshots',
             technical_snapshot_result,
-            price_context_symbols,
+            requested_symbol_codes,
         ),
         (
             'action_summaries',
             action_summary_result,
-            technical_successful_symbols,
+            requested_symbol_codes,
         ),
         (
             'signal_features',
@@ -5385,7 +5415,7 @@ def run_market_data_pipeline(
         (
             'market_risk_filter',
             market_risk_filter_result,
-            price_context_symbols,
+            exact_followup_symbols,
         ),
     ):
         if early_stage_id in requested_stage_set:
@@ -5394,6 +5424,7 @@ def run_market_data_pipeline(
             )
 
     early_scope_proof_valid = bool(daily_followup_admitted_symbols)
+    early_scope_validation_results: list[dict[str, Any]] = []
     for early_stage_id, early_stage_result, invocation_scope in (
         early_scope_results
     ):
@@ -5401,6 +5432,17 @@ def run_market_data_pipeline(
             stage_result=early_stage_result,
             invocation_symbols=invocation_scope,
             stage_id=early_stage_id,
+        )
+        early_scope_validation_results.append(
+            {
+                'stage_id': early_stage_id,
+                'proof_valid': successful_cohort is not None,
+                'successful_symbols_count': (
+                    len(successful_cohort)
+                    if successful_cohort is not None
+                    else 0
+                ),
+            }
         )
         if successful_cohort is None:
             early_scope_proof_valid = False
@@ -5417,14 +5459,12 @@ def run_market_data_pipeline(
         # Its recovery invocation must finish before it can admit symbols.
         early_scope_proof_valid = False
         daily_followup_admitted_symbols = []
-    if early_scope_proof_valid:
-        downstream_retry_set = set(downstream_retry_symbol_codes)
-        daily_followup_admitted_symbols = [
-            symbol
-            for symbol in daily_followup_admitted_symbols
-            if symbol not in downstream_retry_set
-        ]
-    elif chain_fundamentals_followup and mode == 'daily_auto':
+    # The exact per-symbol intersections above are the admission authority.
+    # Generic downstream debt can include a global stage such as trending
+    # ranks and must not erase siblings with complete row-level evidence.
+    if not early_scope_proof_valid and (
+        chain_fundamentals_followup and mode == 'daily_auto'
+    ):
         # Without an exhaustive current-attempt identity proof there is no
         # safe successful complement.  Persist the full exact follow-up scope
         # as debt so a later recovery cannot retry one named failure and
@@ -5466,25 +5506,32 @@ def run_market_data_pipeline(
         ],
     )
     result['followup_admission'] = followup_admission_scope_outcome
+    result['followup_admission_validation'] = (
+        early_scope_validation_results
+    )
     run_metadata['followup_admission_scope_outcome'] = (
         followup_admission_scope_outcome
     )
-    try:
-        dependencies.update_eod_collection_run_progress(
-            run_id,
-            symbols_succeeded=symbols_succeeded,
-            symbols_failed=symbols_failed,
-            run_metadata=run_metadata,
-        )
-    except Exception as exc:
-        # The current run can continue from its in-memory proof, but a later
-        # narrowed PITR run must fail closed rather than infer the successful
-        # complement when this durable checkpoint is unavailable.
-        logger.warning(
-            'Unable to persist follow-up admission scope for EOD run %s: %s',
-            run_id,
-            exc,
-        )
+    run_metadata['followup_admission_validation'] = (
+        early_scope_validation_results
+    )
+    if chain_fundamentals_followup and mode == 'daily_auto':
+        try:
+            dependencies.update_eod_collection_run_progress(
+                run_id,
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                run_metadata=run_metadata,
+            )
+        except Exception as exc:
+            checkpoint_error = DailyPipelineTrackingWriteError(
+                'follow-up admission checkpoint failed before downstream '
+                f'writes: {exc}'
+            )
+            daily_pipeline_tracker.finish_run_preserving_primary_error(
+                error_message=str(checkpoint_error)
+            )
+            raise checkpoint_error from exc
     should_chain_fundamentals = (
         chain_fundamentals_followup
         and 'market_risk_filter' in requested_stage_set
@@ -5679,6 +5726,8 @@ def run_market_data_pipeline(
                     ),
                     default_total=len(requested_symbol_codes),
                 )
+            except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+                raise
             except Exception as exc:
                 result['piotroski_filter_followup'] = {
                     'triggered': True,
@@ -5898,6 +5947,8 @@ def run_market_data_pipeline(
                             default_total=len(requested_symbol_codes),
                         )
                     )
+                except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+                    raise
                 except Exception as exc:
                     result['piotroski_filter_followup'] = {
                         'triggered': True,

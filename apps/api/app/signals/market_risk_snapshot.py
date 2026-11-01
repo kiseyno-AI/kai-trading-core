@@ -16,6 +16,7 @@ from app.market_data_store import (
     upsert_daily_market_risk_snapshots,
 )
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.factor_coverage import persist_symbol_items_with_isolation
 
 MARKET_RISK_SNAPSHOT_SOURCE = 'kis_quote2_snapshot_v1'
 DEFAULT_MARKET_CODE = 'J'
@@ -304,10 +305,7 @@ class DailyMarketRiskSnapshotService:
         async def _emit_progress(**payload: Any) -> None:
             if progress_callback is None:
                 return
-            try:
-                progress_callback(**payload)
-            except Exception:
-                return
+            progress_callback(**payload)
 
         await _emit_progress(
             status='running',
@@ -379,6 +377,16 @@ class DailyMarketRiskSnapshotService:
                                 eod_run_id=run_id,
                             ),
                         }
+                    except Exception as exc:
+                        last_error = exc
+                        if not _is_retryable_fetch_error(exc) or attempt_index >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
+                            break
+                        await asyncio.sleep(RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt_index])
+                    else:
+                        # Progress persistence is part of the stage's durable
+                        # checkpoint contract.  Keep it outside the provider /
+                        # symbol-computation try block so a checkpoint failure
+                        # cannot be mislabeled as retry debt for this symbol.
                         async with progress_lock:
                             processed_count += 1
                             succeeded_count += 1
@@ -393,11 +401,6 @@ class DailyMarketRiskSnapshotService:
                                 current_symbol=item.symbol,
                             )
                         return payload
-                    except Exception as exc:
-                        last_error = exc
-                        if not _is_retryable_fetch_error(exc) or attempt_index >= len(RATE_LIMIT_RETRY_DELAYS_SECONDS):
-                            break
-                        await asyncio.sleep(RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt_index])
                 payload = {
                     'symbol': item.symbol,
                     'error': str(last_error) if last_error is not None else 'unknown KIS market-risk fetch failure',
@@ -458,17 +461,17 @@ class DailyMarketRiskSnapshotService:
             )
             scope_finalization = publication['scope_finalization']
         elif items:
-            try:
-                upsert_daily_market_risk_snapshots(items)
-                persisted_items = list(items)
-            except Exception:
-                for item in items:
-                    try:
-                        upsert_daily_market_risk_snapshot(item)
-                        persisted_items.append(item)
-                    except Exception as exc:
-                        failed_symbols.append(item['symbol'])
-                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+            (
+                persisted_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=upsert_daily_market_risk_snapshots,
+                item_write=upsert_daily_market_risk_snapshot,
+            )
+            failed_symbols.extend(write_failed_symbols)
+            failed_symbol_errors.extend(write_failed_symbol_errors)
 
         result = {
             'market_date': normalized_market_date.isoformat(),

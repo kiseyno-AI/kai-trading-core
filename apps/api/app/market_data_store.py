@@ -22,6 +22,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import aliased
 
 from app.db import engine, session_scope
@@ -98,6 +99,16 @@ from app.repositories.symbol_repository import (
     upsert_symbol_universe,
 )
 from app.scanner.state import scanner_state
+
+
+EXACT_SCOPE_ROW_LOCAL_ERRORS = (
+    ArithmeticError,
+    DataError,
+    IntegrityError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 
 def _parse_trade_date(value: str) -> date:
@@ -2738,7 +2749,7 @@ def _replace_daily_derived_rows_exact_scope(
                         run_id=run_id,
                     )
                 successful_symbols.append(symbol)
-            except Exception as exc:
+            except EXACT_SCOPE_ROW_LOCAL_ERRORS as exc:
                 failed_symbol_errors.append(
                     {'symbol': symbol, 'error': str(exc)}
                 )
@@ -3340,11 +3351,7 @@ def compute_and_persist_daily_trending_ranks(
     def _emit_progress(payload: dict) -> None:
         if not progress_callback:
             return
-        try:
-            progress_callback(payload)
-        except Exception:
-            # Progress persistence is best-effort and must not interrupt trending rank rebuilds.
-            return
+        progress_callback(payload)
 
     if progress_callback:
         first_period = deduped_periods[0] if deduped_periods else None
@@ -3845,7 +3852,7 @@ def replace_daily_signal_features_exact_scope(
                         delete_rows_outside_scope=False,
                     )
                 successful_symbols = sorted(seen_symbols)
-            except Exception as exc:
+            except EXACT_SCOPE_ROW_LOCAL_ERRORS as exc:
                 batch_error = str(exc)
                 for feature in normalized_features:
                     symbol = str(feature['symbol'])
@@ -3857,7 +3864,7 @@ def replace_daily_signal_features_exact_scope(
                                 delete_rows_outside_scope=False,
                             )
                         successful_symbols.append(symbol)
-                    except Exception as item_exc:
+                    except EXACT_SCOPE_ROW_LOCAL_ERRORS as item_exc:
                         failed_symbol_errors.append(
                             {
                                 'symbol': symbol,
@@ -4538,7 +4545,7 @@ def replace_daily_derived_results_exact_scope(
                         constraint=constraint,
                     )
                 successful_symbols = sorted(seen_symbols)
-            except Exception as exc:
+            except EXACT_SCOPE_ROW_LOCAL_ERRORS as exc:
                 batch_error = str(exc)
                 for result in normalized_results:
                     symbol = str(result['symbol'])
@@ -4551,7 +4558,7 @@ def replace_daily_derived_results_exact_scope(
                                 constraint=constraint,
                             )
                         successful_symbols.append(symbol)
-                    except Exception as item_exc:
+                    except EXACT_SCOPE_ROW_LOCAL_ERRORS as item_exc:
                         failed_symbol_errors.append(
                             {
                                 'symbol': symbol,

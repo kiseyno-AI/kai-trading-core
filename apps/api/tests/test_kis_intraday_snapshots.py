@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -177,8 +178,16 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.kis_app_key = 'test-key'
         settings.kis_app_secret = 'test-secret'
         settings.kis_intraday_snapshot_enabled = True
+        self.now_kst_patcher = patch(
+            'app.market.kis_intraday_snapshots._now_kst',
+            return_value=datetime.fromisoformat(
+                '2026-05-07T10:15:35+09:00'
+            ),
+        )
+        self.now_kst_patcher.start()
 
     def tearDown(self) -> None:
+        self.now_kst_patcher.stop()
         settings.kis_app_key = self.original_app_key
         settings.kis_app_secret = self.original_app_secret
         settings.kis_intraday_snapshot_enabled = self.original_enabled
@@ -224,16 +233,56 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['coverage']['status'], 'available')
         self.assertEqual(payload['freshness_status'], 'fresh')
 
-    async def test_collect_snapshots_skips_non_trading_day_before_external_calls(self) -> None:
+    async def test_collect_snapshots_skips_weekend_before_market_state_lookup(self) -> None:
+        service = KISIntradaySnapshotService(client=FakeKISIntradayClient())
+
+        with (
+            patch(
+                'app.market.kis_intraday_snapshots._now_kst',
+                return_value=datetime.fromisoformat(
+                    '2026-05-09T10:15:35+09:00'
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        'weekend fast-path must not query KIS market state'
+                    )
+                ),
+            ) as market_state,
+            patch.object(
+                service,
+                '_capture_universe',
+                side_effect=AssertionError('should not load universe'),
+            ) as capture_universe,
+            patch(
+                'app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot',
+                side_effect=AssertionError('should not persist snapshot'),
+            ) as persist_snapshot,
+        ):
+            result = await service.collect_snapshots(symbols=['005930'])
+
+        self.assertEqual(result['status'], 'market_closed')
+        self.assertEqual(result['reason'], 'non_trading_day')
+        self.assertEqual(result['market_state'], 'WEEKEND')
+        self.assertEqual(result['market_date'], '2026-05-09')
+        self.assertEqual(result['requested_symbols'], ['005930'])
+        self.assertEqual(result['snapshots_persisted'], 0)
+        market_state.assert_not_awaited()
+        capture_universe.assert_not_called()
+        persist_snapshot.assert_not_called()
+
+    async def test_collect_snapshots_skips_calendar_holiday_before_provider_calls(self) -> None:
         service = KISIntradaySnapshotService(client=FakeKISIntradayClient())
 
         with (
             patch(
                 'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(
-                    state='WEEKEND',
+                    state='HOLIDAY',
                     is_trading_day=False,
-                    server_time='2026-05-09T10:15:35+09:00',
+                    server_time='2026-05-05T10:15:35+09:00',
                 ),
             ),
             patch.object(
@@ -260,8 +309,8 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['status'], 'market_closed')
         self.assertEqual(result['reason'], 'non_trading_day')
-        self.assertEqual(result['market_state'], 'WEEKEND')
-        self.assertEqual(result['market_date'], '2026-05-09')
+        self.assertEqual(result['market_state'], 'HOLIDAY')
+        self.assertEqual(result['market_date'], '2026-05-05')
         self.assertEqual(result['requested_symbols'], ['005930'])
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
         self.assertEqual(result['snapshots_persisted'], 0)

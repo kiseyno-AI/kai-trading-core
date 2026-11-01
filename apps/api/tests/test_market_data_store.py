@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import OperationalError
 
 import app.market_data_store as market_data_store
 from app.db import engine, session_scope
@@ -673,6 +674,91 @@ class AtomicDerivedFactorPublicationIntegrationTests(unittest.TestCase):
             {self.SUCCESS_SYMBOL: 10, self.FAILED_SYMBOL: 20},
         )
 
+    def test_infrastructure_factor_write_failures_abort_without_stale_cleanup(
+        self,
+    ) -> None:
+        upsert_daily_momentum_factor_results(
+            [
+                self._row(self.SUCCESS_SYMBOL, close_price=10),
+                self._row(self.FAILED_SYMBOL, close_price=20),
+            ]
+        )
+        failures = (
+            OperationalError(
+                'insert momentum factor',
+                {},
+                RuntimeError('database unavailable'),
+            ),
+            RuntimeError('factor persistence invariant failed'),
+        )
+
+        for failure in failures:
+            with (
+                self.subTest(error_type=type(failure).__name__),
+                patch.object(
+                    market_data_store,
+                    '_upsert_daily_derived_results_in_session',
+                    side_effect=failure,
+                ),
+                self.assertRaises(type(failure)),
+            ):
+                replace_daily_derived_results_exact_scope(
+                    market_date=self.MARKET_DATE,
+                    stage_id='momentum_factors',
+                    results=[
+                        self._row(self.SUCCESS_SYMBOL, close_price=100),
+                        self._row(self.FAILED_SYMBOL, close_price=200),
+                    ],
+                    exact_symbols=(
+                        self.SUCCESS_SYMBOL,
+                        self.FAILED_SYMBOL,
+                    ),
+                )
+
+            self.assertEqual(
+                self._stored_close_prices(),
+                {self.SUCCESS_SYMBOL: 10, self.FAILED_SYMBOL: 20},
+            )
+
+    def test_singleton_factor_infrastructure_failure_aborts_fallback(self) -> None:
+        upsert_daily_momentum_factor_results(
+            [
+                self._row(self.SUCCESS_SYMBOL, close_price=10),
+                self._row(self.FAILED_SYMBOL, close_price=20),
+            ]
+        )
+        singleton_failure = OperationalError(
+            'insert momentum factor',
+            {},
+            RuntimeError('database unavailable'),
+        )
+
+        with (
+            patch.object(
+                market_data_store,
+                '_upsert_daily_derived_results_in_session',
+                side_effect=[
+                    ValueError('batch contains malformed row'),
+                    singleton_failure,
+                ],
+            ),
+            self.assertRaises(OperationalError),
+        ):
+            replace_daily_derived_results_exact_scope(
+                market_date=self.MARKET_DATE,
+                stage_id='momentum_factors',
+                results=[
+                    self._row(self.SUCCESS_SYMBOL, close_price=100),
+                    self._row(self.FAILED_SYMBOL, close_price=200),
+                ],
+                exact_symbols=(self.SUCCESS_SYMBOL, self.FAILED_SYMBOL),
+            )
+
+        self.assertEqual(
+            self._stored_close_prices(),
+            {self.SUCCESS_SYMBOL: 10, self.FAILED_SYMBOL: 20},
+        )
+
     def test_all_atomic_deterministic_stage_mappings_are_registered(
         self,
     ) -> None:
@@ -1067,6 +1153,128 @@ class DailySignalFeatureScopedRepairIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(signal_count, 1)
+
+    def test_infrastructure_signal_write_failures_preserve_existing_scope(
+        self,
+    ) -> None:
+        upsert_daily_signal_features(
+            [
+                self._feature(self.KOSPI_SYMBOL, signal_count=1),
+                self._feature(self.FAILED_SYMBOL, signal_count=2),
+            ]
+        )
+        failures = (
+            OperationalError(
+                'insert signal feature',
+                {},
+                RuntimeError('database unavailable'),
+            ),
+            RuntimeError('signal persistence invariant failed'),
+        )
+
+        for failure in failures:
+            with (
+                self.subTest(error_type=type(failure).__name__),
+                patch.object(
+                    market_data_store,
+                    '_upsert_daily_signal_features_in_session',
+                    side_effect=failure,
+                ),
+                self.assertRaises(type(failure)),
+            ):
+                replace_daily_signal_features_exact_scope(
+                    market_date=self.MARKET_DATE,
+                    features=[
+                        self._feature(self.KOSPI_SYMBOL, signal_count=9),
+                        self._feature(self.FAILED_SYMBOL, signal_count=8),
+                    ],
+                    exact_symbols=(
+                        self.KOSPI_SYMBOL,
+                        self.FAILED_SYMBOL,
+                    ),
+                )
+
+            with session_scope() as session:
+                remaining = dict(
+                    session.execute(
+                        select(
+                            Symbol.symbol,
+                            DailySignalFeature.signal_count,
+                        )
+                        .join(
+                            DailySignalFeature,
+                            DailySignalFeature.symbol_id == Symbol.id,
+                        )
+                        .where(
+                            DailySignalFeature.market_date
+                            == self.MARKET_DATE,
+                            Symbol.symbol.in_(
+                                (
+                                    self.KOSPI_SYMBOL,
+                                    self.FAILED_SYMBOL,
+                                )
+                            ),
+                        )
+                    ).all()
+                )
+            self.assertEqual(
+                remaining,
+                {self.KOSPI_SYMBOL: 1, self.FAILED_SYMBOL: 2},
+            )
+
+    def test_singleton_signal_infrastructure_failure_aborts_fallback(self) -> None:
+        upsert_daily_signal_features(
+            [
+                self._feature(self.KOSPI_SYMBOL, signal_count=1),
+                self._feature(self.FAILED_SYMBOL, signal_count=2),
+            ]
+        )
+        singleton_failure = OperationalError(
+            'insert signal feature',
+            {},
+            RuntimeError('database unavailable'),
+        )
+
+        with (
+            patch.object(
+                market_data_store,
+                '_upsert_daily_signal_features_in_session',
+                side_effect=[
+                    ValueError('batch contains malformed row'),
+                    singleton_failure,
+                ],
+            ),
+            self.assertRaises(OperationalError),
+        ):
+            replace_daily_signal_features_exact_scope(
+                market_date=self.MARKET_DATE,
+                features=[
+                    self._feature(self.KOSPI_SYMBOL, signal_count=9),
+                    self._feature(self.FAILED_SYMBOL, signal_count=8),
+                ],
+                exact_symbols=(self.KOSPI_SYMBOL, self.FAILED_SYMBOL),
+            )
+
+        with session_scope() as session:
+            remaining = dict(
+                session.execute(
+                    select(Symbol.symbol, DailySignalFeature.signal_count)
+                    .join(
+                        DailySignalFeature,
+                        DailySignalFeature.symbol_id == Symbol.id,
+                    )
+                    .where(
+                        DailySignalFeature.market_date == self.MARKET_DATE,
+                        Symbol.symbol.in_(
+                            (self.KOSPI_SYMBOL, self.FAILED_SYMBOL)
+                        ),
+                    )
+                ).all()
+            )
+        self.assertEqual(
+            remaining,
+            {self.KOSPI_SYMBOL: 1, self.FAILED_SYMBOL: 2},
+        )
 
     def test_exact_stage_finalizer_preserves_unrequested_same_market_row(
         self,
@@ -3699,6 +3907,74 @@ class DerivedAttemptFinalizationIntegrationTests(unittest.TestCase):
         self.assertTrue(
             all(row.context_payload == {'attempt': 'old'} for row in rows)
         )
+
+    def test_infrastructure_context_write_failures_preserve_existing_scope(
+        self,
+    ) -> None:
+        failures = (
+            OperationalError(
+                'insert price context',
+                {},
+                RuntimeError('database unavailable'),
+            ),
+            RuntimeError('context persistence invariant failed'),
+        )
+
+        for failure in failures:
+            with (
+                self.subTest(error_type=type(failure).__name__),
+                patch.object(
+                    market_data_store,
+                    '_upsert_daily_price_context_in_session',
+                    side_effect=failure,
+                ),
+                self.assertRaises(type(failure)),
+            ):
+                replace_daily_price_contexts_exact_scope(
+                    market_date=self.MARKET_DATE,
+                    rows=[
+                        self._context_row(
+                            self.SUCCESS_SYMBOL,
+                            attempt='new_attempt',
+                        ),
+                        self._context_row(
+                            self.CONTEXT_FAILED_SYMBOL,
+                            attempt='new_attempt',
+                        ),
+                    ],
+                    exact_symbols=(
+                        self.SUCCESS_SYMBOL,
+                        self.CONTEXT_FAILED_SYMBOL,
+                    ),
+                )
+
+            with session_scope() as session:
+                remaining = dict(
+                    session.execute(
+                        select(Symbol.symbol, DailyPriceContext.source)
+                        .join(
+                            DailyPriceContext,
+                            DailyPriceContext.symbol_id == Symbol.id,
+                        )
+                        .where(
+                            DailyPriceContext.market_date
+                            == self.MARKET_DATE,
+                            Symbol.symbol.in_(
+                                (
+                                    self.SUCCESS_SYMBOL,
+                                    self.CONTEXT_FAILED_SYMBOL,
+                                )
+                            ),
+                        )
+                    ).all()
+                )
+            self.assertEqual(
+                remaining,
+                {
+                    self.SUCCESS_SYMBOL: 'old_attempt',
+                    self.CONTEXT_FAILED_SYMBOL: 'old_attempt',
+                },
+            )
 
     def test_overlapping_exact_context_publishes_are_serialized_before_writes(
         self,

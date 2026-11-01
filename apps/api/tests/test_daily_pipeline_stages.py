@@ -21,9 +21,12 @@ from app.eod.daily_pipeline_stages import (
     CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER,
     FACTOR_STAGE_ORDER,
     STAGE_DEFINITIONS,
+    DailyPipelineScopeFinalizationError,
+    DailyPipelineStageCheckpointError,
     DailyPipelineStageService,
 )
 from app.eod.pykrx_pipeline_runner import (
+    DailyPipelineTrackingWriteError,
     _build_exact_scope_outcome,
     _build_pykrx_invocation_scope_proof,
 )
@@ -1464,7 +1467,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 trigger='auto_followup_recovery',
             )
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         expected_symbol_scope = {
             'market_date': '2026-04-24',
             'symbols': ['005930', '000660'],
@@ -1474,8 +1477,101 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         }
         rebuild_contexts.assert_called_once_with(**expected_symbol_scope)
         rebuild_snapshots.assert_called_once_with(**expected_symbol_scope)
-        rebuild_action_summaries.assert_called_once_with(**expected_symbol_scope)
+        rebuild_action_summaries.assert_called_once_with(
+            **expected_symbol_scope
+        )
         rebuild_trending_ranks.assert_not_called()
+
+    def test_mixed_failed_blocked_and_completed_status_is_partial(
+        self,
+    ) -> None:
+        self.assertEqual(
+            DailyPipelineStageService._resolve_overall_status(
+                [
+                    {'status': 'failed'},
+                    {'status': 'blocked'},
+                    {'status': 'completed'},
+                ]
+            ),
+            'partial',
+        )
+
+    def test_pure_failed_status_remains_failed(self) -> None:
+        self.assertEqual(
+            DailyPipelineStageService._resolve_overall_status(
+                [{'status': 'failed'}]
+            ),
+            'failed',
+        )
+
+    def test_mixed_terminal_incomplete_with_completed_status_is_partial(
+        self,
+    ) -> None:
+        for incomplete_status in (
+            'blocked',
+            'waiting',
+            'interrupted',
+            'abandoned',
+        ):
+            with self.subTest(incomplete_status=incomplete_status):
+                self.assertEqual(
+                    DailyPipelineStageService._resolve_overall_status(
+                        [
+                            {'status': incomplete_status},
+                            {'status': 'completed'},
+                        ]
+                    ),
+                    'partial',
+                )
+
+    def test_pure_terminal_incomplete_statuses_remain_specific(self) -> None:
+        for status in ('blocked', 'waiting', 'interrupted', 'abandoned'):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    DailyPipelineStageService._resolve_overall_status(
+                        [{'status': status}, {'status': status}]
+                    ),
+                    status,
+                )
+
+    def test_all_pending_status_remains_pending(self) -> None:
+        self.assertEqual(
+            DailyPipelineStageService._resolve_overall_status(
+                [{'status': 'pending'}, {'status': 'pending'}]
+            ),
+            'pending',
+        )
+
+    def test_malformed_or_generic_skipped_outcomes_are_not_completed(
+        self,
+    ) -> None:
+        for outcomes in (
+            [{'status': 'completed'}, {}],
+            [{'status': 'completed'}, {'status': 'skipped'}],
+            [{'status': 'skipped'}],
+        ):
+            with self.subTest(outcomes=outcomes):
+                self.assertEqual(
+                    DailyPipelineStageService._resolve_overall_status(
+                        outcomes
+                    ),
+                    'partial',
+                )
+
+    def test_explicit_safe_skip_is_terminally_satisfied(self) -> None:
+        self.assertEqual(
+            DailyPipelineStageService._resolve_overall_status(
+                [
+                    {'stage': 'value_factors', 'status': 'completed'},
+                    {
+                        'stage': 'signal_decider',
+                        'status': 'skipped',
+                        'safe_skip': True,
+                    },
+                ]
+            ),
+            'completed',
+        )
 
     def test_trending_fails_closed_for_narrowed_or_unproven_price_scope(
         self,
@@ -3572,10 +3668,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                             result['stages'][stage_id]['status'],
                             'blocked',
                         )
-                self.assertEqual(
-                    result['status'],
-                    'partial' if completed_prefix_size == 1 else 'blocked',
-                )
+                self.assertEqual(result['status'], 'partial')
 
     def test_terminal_continuation_preserves_original_scope_for_skipped_summary(
         self,
@@ -3990,7 +4083,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         execute_stage.assert_called_once()
         self.assertEqual(execute_stage.call_args.args[0], 'master_refresh')
         pykrx_runner.run_daily_pipeline_stages.assert_not_called()
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
         self.assertEqual(result['stages']['master_refresh']['status'], 'failed')
         self.assertEqual(
             result['stages']['pykrx_universe_refresh']['status'],
@@ -5505,7 +5602,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 trigger='auto_eod_followup_resume',
             )
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
         self.assertEqual(result['stages']['composite_factors']['status'], 'blocked')
         self.assertFalse(
@@ -5560,7 +5657,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 trigger='auto_eod_followup_resume',
             )
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(
             result['stages']['advanced_value_factors']['status'],
             'partial',
@@ -5623,6 +5720,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         with (
             patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
             patch.object(service, '_execute_stage', side_effect=lambda stage_id, **_: {'stage_id': stage_id}) as execute_stage,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': False,
+                    'reason': 'summary_cutoff_proof_unavailable',
+                    'knowledge_cutoff_at': None,
+                    'source_run_id': None,
+                },
+            ),
         ):
             result = service.run(
                 market_date='2026-04-14',
@@ -5641,6 +5748,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         with (
             patch.object(service, '_normalize_market_date', return_value='2026-04-14'),
             patch.object(service, '_execute_stage', side_effect=lambda stage_id, **_: {'stage_id': stage_id}) as execute_stage,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value={
+                    'ready': False,
+                    'reason': 'summary_cutoff_proof_unavailable',
+                    'knowledge_cutoff_at': None,
+                    'source_run_id': None,
+                },
+            ),
         ):
             result = service.run(
                 market_date='2026-04-14',
@@ -6007,6 +6124,85 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'pipeline_run_ownership_lost')
         self.assertNotIn('finish', self.run_state_service.runs[-1])
 
+    def test_factor_stage_is_not_started_when_initial_heartbeat_write_fails(
+        self,
+    ) -> None:
+        self.run_state_service.heartbeat_stage = MagicMock(
+            side_effect=RuntimeError('heartbeat storage unavailable')
+        )
+        service = DailyPipelineStageService()
+
+        with (
+            patch.object(service, '_execute_stage') as execute_stage,
+            self.assertRaisesRegex(
+                DailyPipelineStageCheckpointError,
+                'heartbeat storage unavailable',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['momentum_factors'],
+            )
+
+        execute_stage.assert_not_called()
+        self.assertEqual(
+            self.run_state_service.runs[-1]['status'],
+            'failed',
+        )
+
+    def test_factor_pipeline_stops_after_background_heartbeat_write_fails(
+        self,
+    ) -> None:
+        heartbeat_failed = threading.Event()
+        heartbeat_calls = 0
+
+        def heartbeat(**_kwargs):
+            nonlocal heartbeat_calls
+            heartbeat_calls += 1
+            if heartbeat_calls == 1:
+                return True
+            heartbeat_failed.set()
+            raise RuntimeError('background heartbeat storage unavailable')
+
+        self.run_state_service.heartbeat_stage = MagicMock(
+            side_effect=heartbeat
+        )
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            self.assertEqual(stage_id, 'momentum_factors')
+            self.assertTrue(heartbeat_failed.wait(timeout=0.5))
+            return {
+                'status': 'completed',
+                'results_persisted': 2,
+                'results_failed': 0,
+            }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS',
+                0.01,
+            ),
+            patch.object(service, '_execute_stage', side_effect=execute),
+            self.assertRaisesRegex(
+                DailyPipelineStageCheckpointError,
+                'background heartbeat storage unavailable',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['momentum_factors', 'value_factors'],
+            )
+
+        self.assertEqual(executed_stages, ['momentum_factors'])
+        self.assertEqual(
+            self.run_state_service.runs[-1]['status'],
+            'failed',
+        )
+
     def test_stage_start_failure_retries_run_terminalization_and_preserves_error(
         self,
     ) -> None:
@@ -6132,7 +6328,318 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'failed',
         )
 
-    def test_stage_terminal_checkpoint_failure_closes_parent_run(self) -> None:
+    def test_recoverable_factor_stage_failure_continues_independent_branches(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            if stage_id == 'value_factors':
+                return {
+                    'triggered': True,
+                    'terminal': True,
+                    'retry_pending': True,
+                    'retryable': True,
+                    'status': 'failed',
+                    'stage': stage_id,
+                    'reason': 'valuation_provider_unavailable',
+                    'failure_reason': 'valuation_provider_unavailable',
+                    'error_type': 'ValuationProviderError',
+                    'error_message': 'valuation provider unavailable',
+                    'market_date': '2026-04-14',
+                    'results_failed': 0,
+                    'total': 0,
+                }
+            return {
+                'status': 'completed',
+                'results_persisted': 2,
+                'results_failed': 0,
+            }
+
+        with patch.object(service, '_execute_stage', side_effect=execute):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'value_factors',
+                    'low_risk_factors',
+                    'beta_factors',
+                    'composite_factors',
+                ],
+            )
+
+        self.assertEqual(
+            executed_stages,
+            ['value_factors', 'low_risk_factors', 'beta_factors'],
+        )
+        self.assertEqual(
+            result['stages']['value_factors']['status'],
+            'failed',
+        )
+        self.assertEqual(
+            result['stages']['low_risk_factors']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['beta_factors']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['composite_factors']['status'],
+            'blocked',
+        )
+        self.assertEqual(
+            result['stages']['composite_factors']['result'][
+                'incomplete_dependencies'
+            ],
+            ['value_factors'],
+        )
+        failed_checkpoint = next(
+            event
+            for event in self.run_state_service.stage_events
+            if event['event'] == 'finish_stage'
+            and event['stage_id'] == 'value_factors'
+        )
+        self.assertEqual(failed_checkpoint['status'], 'failed')
+        self.assertEqual(
+            failed_checkpoint['details']['result_summary']['error_type'],
+            'ValuationProviderError',
+        )
+        self.assertEqual(failed_checkpoint['processed'], 0)
+        self.assertEqual(failed_checkpoint['total'], 0)
+        self.assertEqual(failed_checkpoint['failed'], 0)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'partial',
+        )
+
+    def test_factor_stage_integrity_error_remains_fatal(self) -> None:
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+        integrity_error = IntegrityError(
+            'insert into daily_value_factor_results',
+            {},
+            RuntimeError('constraint violation'),
+        )
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            raise integrity_error
+
+        with (
+            patch.object(service, '_execute_stage', side_effect=execute),
+            self.assertRaises(IntegrityError),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['value_factors', 'low_risk_factors'],
+            )
+
+        self.assertEqual(executed_stages, ['value_factors'])
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
+
+    def test_unknown_factor_stage_exception_remains_fatal(self) -> None:
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            raise KeyError('unsafe factor invariant')
+
+        with (
+            patch.object(service, '_execute_stage', side_effect=execute),
+            self.assertRaisesRegex(KeyError, 'unsafe factor invariant'),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['value_factors', 'low_risk_factors'],
+            )
+
+        self.assertEqual(executed_stages, ['value_factors'])
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
+
+    def test_builtin_factor_stage_errors_remain_fatal(self) -> None:
+        cases = (
+            RuntimeError('internal invariant violated'),
+            ValueError('malformed persisted payload'),
+            OSError('disk full'),
+        )
+        for exc in cases:
+            with self.subTest(error_type=type(exc).__name__):
+                service = DailyPipelineStageService()
+                with (
+                    patch.object(
+                        service,
+                        '_execute_stage',
+                        side_effect=exc,
+                    ),
+                    self.assertRaisesRegex(type(exc), str(exc)),
+                ):
+                    service.run(
+                        market_date='2026-04-14',
+                        stages=['value_factors', 'low_risk_factors'],
+                    )
+
+                self.assertEqual(
+                    self.run_state_service.runs[-1]['finish']['status'],
+                    'failed',
+                )
+
+    def test_factor_progress_checkpoint_failure_remains_fatal(self) -> None:
+        service = DailyPipelineStageService()
+        self.run_state_service.update_stage = MagicMock(
+            side_effect=RuntimeError('checkpoint write unavailable')
+        )
+
+        def execute(_stage_id, **kwargs):
+            kwargs['progress_callback'](
+                status='running',
+                current_step='factor_batch',
+            )
+            return {'status': 'completed'}
+
+        with (
+            patch.object(service, '_execute_stage', side_effect=execute),
+            self.assertRaisesRegex(
+                DailyPipelineStageCheckpointError,
+                'checkpoint write unavailable',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['value_factors', 'low_risk_factors'],
+            )
+
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
+
+    def test_pipeline_tracking_write_error_remains_fatal(self) -> None:
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            raise DailyPipelineTrackingWriteError(
+                'official pipeline checkpoint unavailable'
+            )
+
+        with (
+            patch.object(service, '_execute_stage', side_effect=execute),
+            self.assertRaisesRegex(
+                DailyPipelineTrackingWriteError,
+                'official pipeline checkpoint unavailable',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['value_factors', 'low_risk_factors'],
+            )
+
+        self.assertEqual(executed_stages, ['value_factors'])
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
+
+    def test_failed_stage_checkpoint_failure_closes_parent_run(
+        self,
+    ) -> None:
+        self.run_state_service.finish_stage = MagicMock(
+            side_effect=RuntimeError(
+                'failed stage checkpoint unavailable'
+            )
+        )
+        self.run_state_service.finish_run = MagicMock(
+            return_value={'id': 9000, 'status': 'failed'}
+        )
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            return {
+                'status': 'failed',
+                'reason': 'valuation_provider_unavailable',
+                'results_failed': 0,
+                'total': 0,
+            }
+
+        with (
+            patch.object(service, '_execute_stage', side_effect=execute),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'failed stage checkpoint unavailable',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['value_factors', 'low_risk_factors'],
+            )
+
+        self.assertEqual(executed_stages, ['value_factors'])
+        self.assertEqual(self.run_state_service.finish_stage.call_count, 4)
+        self.run_state_service.finish_run.assert_called_once()
+        self.assertEqual(
+            self.run_state_service.finish_run.call_args.kwargs['status'],
+            'failed',
+        )
+        self.assertEqual(
+            self.run_state_service.finish_run.call_args.kwargs[
+                'error_message'
+            ],
+            'failed stage checkpoint unavailable',
+        )
+
+    def test_post_execute_stage_exception_is_not_isolated(self) -> None:
+        service = DailyPipelineStageService()
+        executed_stages: list[str] = []
+
+        def execute(stage_id, **_kwargs):
+            executed_stages.append(stage_id)
+            return {
+                'status': 'completed',
+                'results_persisted': 2,
+                'results_failed': 0,
+            }
+
+        with (
+            patch.object(service, '_execute_stage', side_effect=execute),
+            patch.object(
+                service,
+                '_build_stage_outcome',
+                side_effect=RuntimeError(
+                    'post-execute outcome processing failed'
+                ),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                'post-execute outcome processing failed',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['value_factors', 'low_risk_factors'],
+            )
+
+        self.assertEqual(executed_stages, ['value_factors'])
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
+
+    def test_stage_terminal_checkpoint_failure_defers_parent_close_to_run_handler(
+        self,
+    ) -> None:
         self.run_state_service.finish_stage = MagicMock(
             side_effect=RuntimeError('stage terminal checkpoint unavailable')
         )
@@ -6158,11 +6665,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(self.run_state_service.finish_stage.call_count, 3)
-        self.run_state_service.finish_run.assert_called_once()
-        self.assertEqual(
-            self.run_state_service.finish_run.call_args.kwargs['status'],
-            'failed',
-        )
+        self.run_state_service.finish_run.assert_not_called()
 
     def test_missing_strict_completion_authority_mutates_stage_outcome(self) -> None:
         service = DailyPipelineStageService()
@@ -6357,8 +6860,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
     def test_feedback_rearm_keeps_parent_prerequisite_admission(self) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
+        evaluation_service = _FakeSignalDeciderEvaluationService()
         service = DailyPipelineStageService(
             feedback_retry_service=feedback_retry_service,
+            decision_loop_service=evaluation_service,
         )
         cutoff = datetime(
             2026,
@@ -6388,7 +6893,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'idempotency_key': None,
             'outer_batch_size': 17,
         }
-
         with (
             patch(
                 'app.eod.daily_pipeline_stages.'
@@ -6418,6 +6922,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                         'completed_symbols': list(symbols),
                         'admitted_symbols': list(symbols),
                     },
+                },
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'SignalDeciderNextOpenExecutionService.'
+                '_refresh_plan_items_once',
+                return_value={
+                    'status': 'completed',
+                    'items_refreshed': len(symbols),
                 },
             ),
         ):
@@ -6538,6 +7051,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                         'completed_symbols': list(symbols),
                         'admitted_symbols': list(symbols),
                     },
+                },
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'SignalDeciderNextOpenExecutionService.'
+                '_refresh_plan_items_once',
+                return_value={
+                    'status': 'completed',
+                    'items_refreshed': len(symbols),
                 },
             ),
         ):
@@ -6815,10 +7337,9 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(execute_stage.call_args.args[0], 'master_refresh')
-        # The master control step completed before the grouped runner reported
-        # its existing-run skip, so the aggregate run is completed while every
-        # grouped provider/derived stage remains explicitly skipped.
-        self.assertEqual(result['status'], 'completed')
+        # A generic already-running skip is not terminally satisfied evidence,
+        # so the completed control step cannot promote the aggregate run.
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(
             result['stages']['pykrx_universe_refresh']['status'],
             'skipped',
@@ -7761,7 +8282,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
-    def test_optional_context_service_exceptions_become_terminal_degradation(
+    def test_optional_context_unknown_service_exceptions_remain_fatal(
         self,
     ) -> None:
         service = DailyPipelineStageService()
@@ -7784,37 +8305,35 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             (
                 'external_news_collect',
                 'app.eod.daily_pipeline_stages.external_news_service.collect_for_agent_feedback_candidates',
-                'external_news_collect_service_exception',
             ),
             (
                 'external_news_enrich',
                 'app.eod.daily_pipeline_stages.external_news_service.enrich_recent_classification',
-                'external_news_enrich_service_exception',
             ),
             (
                 'macro_context_refresh',
                 'app.eod.daily_pipeline_stages.macro_context_service.refresh_context',
-                'macro_context_refresh_service_exception',
             ),
         )
 
-        for stage_id, target, expected_reason in cases:
-            with self.subTest(stage_id=stage_id), patch(
-                target,
-                side_effect=RuntimeError('provider unavailable'),
+        for stage_id, target in cases:
+            with (
+                self.subTest(stage_id=stage_id),
+                patch(
+                    target,
+                    side_effect=RuntimeError(
+                        'unexpected service invariant'
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    'unexpected service invariant',
+                ),
             ):
-                result = service._execute_stage(
+                service._execute_stage(
                     stage_id=stage_id,
                     **execute_kwargs,
                 )
-
-            self.assertEqual(result['status'], 'partial')
-            self.assertTrue(result['terminal'])
-            self.assertFalse(result['retry_pending'])
-            self.assertEqual(result['reason'], expected_reason)
-            self.assertEqual(result['failure_reason'], expected_reason)
-            self.assertEqual(result['error_type'], 'RuntimeError')
-            self.assertEqual(result['error_message'], 'provider unavailable')
 
     def test_optional_context_integrity_errors_remain_fatal(self) -> None:
         service = DailyPipelineStageService()
@@ -7892,7 +8411,17 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         with patch(
             'app.eod.daily_pipeline_stages.macro_context_service.refresh_context',
-            side_effect=RuntimeError('provider unavailable'),
+            return_value={
+                'triggered': True,
+                'terminal': True,
+                'retry_pending': False,
+                'retryable': False,
+                'status': 'partial',
+                'reason': 'fred_credentials_missing',
+                'failure_reason': 'fred_credentials_missing',
+                'observations_upserted': 2,
+                'observations_failed': 1,
+            },
         ):
             result = service.run(
                 market_date='2026-04-24',
@@ -8785,6 +9314,78 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 )
             legacy_finalize.assert_not_called()
 
+    def test_exact_scope_finalization_write_error_is_dedicated_fatal(
+        self,
+    ) -> None:
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                '_finalize_daily_stage_scope',
+                side_effect=RuntimeError('scope checkpoint unavailable'),
+            ),
+            self.assertRaisesRegex(
+                DailyPipelineScopeFinalizationError,
+                'value_factors exact-scope finalization failed',
+            ) as raised,
+        ):
+            DailyPipelineStageService._execute_exact_scoped_derived_stage(
+                stage_id='value_factors',
+                market_date='2026-04-24',
+                exact_scope_symbols=['005930', '000660'],
+                call=lambda: {
+                    'status': 'completed',
+                    'results_persisted': 2,
+                },
+            )
+
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+
+    def test_pipeline_missing_atomic_scope_finalization_proof_is_fatal(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        symbols = ['005930', '000660']
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_value_factor_service.rebuild_for_market_date',
+                return_value={
+                    'status': 'completed',
+                    'results_persisted': 2,
+                    'results_failed': 0,
+                },
+            ) as rebuild_value,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_low_risk_factor_service.rebuild_for_market_date',
+                return_value={
+                    'status': 'completed',
+                    'scope_finalization': {'ready': True},
+                },
+            ) as rebuild_low_risk,
+            self.assertRaisesRegex(
+                DailyPipelineScopeFinalizationError,
+                'value_factors atomic exact-scope finalization proof '
+                'is unavailable',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-24',
+                stages=['value_factors', 'low_risk_factors'],
+                symbols=symbols,
+            )
+
+        self.assertEqual(
+            rebuild_value.call_args.kwargs['exact_scope_symbols'],
+            symbols,
+        )
+        rebuild_low_risk.assert_not_called()
+        self.assertEqual(
+            self.run_state_service.runs[-1]['finish']['status'],
+            'failed',
+        )
+
     def test_execute_stage_routes_quality_factor_stage_to_service(self) -> None:
         service = DailyPipelineStageService()
 
@@ -9281,7 +9882,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['status'], 'completed')
         self.assertEqual(feedback_retry_service.calls, [])
         refresh_plan.assert_not_called()
         self.assertEqual(evaluation_service.calls, [])
@@ -9378,7 +9979,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['status'], 'completed')
         self.assertEqual(feedback_retry_service.calls, [])
         refresh_plan.assert_not_called()
         self.assertEqual(evaluation_service.calls, [])
@@ -9459,7 +10060,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 same_day_intraday_watch_rearm_resume=True,
             )
 
-        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['status'], 'partial')
         self.assertEqual(len(feedback_retry_service.calls), 0)
         refresh_plan.assert_not_called()
         self.assertEqual(evaluation_service.calls, [])
@@ -9536,7 +10137,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['status'], 'completed')
         self.assertFalse(
             self.run_state_service.runs[-1]['run_metadata'][
                 'same_day_intraday_watch_continuation_admitted'
