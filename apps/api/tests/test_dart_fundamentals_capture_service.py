@@ -2003,6 +2003,72 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             symbols=['222222'],
         )
 
+    async def test_daily_incremental_refresh_persists_stale_debt_failure_reason(self):
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            stock_code: {
+                'stock_code': stock_code,
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2025-01-01',
+                'latest_resolved_fundamentals_receipt_date': '2025-01-01',
+                'latest_snapshot': {'id': index},
+                'latest_terminal_fundamentals_event': None,
+            }
+            for index, stock_code in enumerate(
+                ('005930', '000660'),
+                start=1,
+            )
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+        )
+
+        with patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            45,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        failure_reason = (
+            'all_selected_symbols_stale_incremental_backfill_deferred'
+        )
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['symbols_failed'], 0)
+        self.assertEqual(result['failure_reason'], failure_reason)
+        self.assertEqual(result['retry_debt_count'], 2)
+        self.assertEqual(
+            result['state_histogram'],
+            {'stale_incremental_backfill_deferred': 2},
+        )
+        completed_run = repository.completed_refresh_runs[-1][1]
+        self.assertEqual(completed_run['status'], 'failed')
+        self.assertEqual(completed_run['symbols_failed'], 0)
+        self.assertEqual(completed_run['error_message'], failure_reason)
+        self.assertEqual(
+            completed_run['run_metadata']['failure_reason'],
+            failure_reason,
+        )
+        self.assertEqual(
+            completed_run['run_metadata']['retry_debt_count'],
+            2,
+        )
+        self.assertEqual(
+            completed_run['run_metadata']['state_histogram'],
+            {'stale_incremental_backfill_deferred': 2},
+        )
+
     async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()
@@ -2946,6 +3012,88 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         repository.create_refresh_run.assert_called_once()
+
+    async def test_compound_refresh_preserves_core_failure_evidence(self):
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        repository = FakeCaptureRepository()
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {
+                'enabled': True,
+            },
+        )
+        failure_reason = (
+            'all_selected_symbols_stale_incremental_backfill_deferred'
+        )
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 188,
+                'status': 'failed',
+                'failure_reason': failure_reason,
+                'retry_debt_count': 1,
+                'state_histogram': {
+                    'stale_incremental_backfill_deferred': 1,
+                },
+                **_exact_fundamentals_scope_outcome(
+                    ['005930'],
+                    retry_debt_stock_codes=['005930'],
+                ),
+            }
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'failed',
+                'scan_status': 'failed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_count'], 1)
+        self.assertGreaterEqual(len(repository.completed_refresh_runs), 3)
+        self.assertTrue(
+            all(
+                completion['error_message'] == failure_reason
+                for _, completion in repository.completed_refresh_runs
+            )
+        )
+        self.assertTrue(
+            all(
+                completion['run_metadata']['fundamentals_failure_reason']
+                == failure_reason
+                for _, completion in repository.completed_refresh_runs
+            )
+        )
 
     async def test_compound_refresh_persists_and_advances_baseline_repair_cursor(self):
         stock_codes = ['000001', '000002', '000003']

@@ -2291,6 +2291,7 @@ class DartFundamentalsCaptureService:
             'selected_stock_codes': selected_stock_codes,
             'successful_stock_codes': successful_stock_codes,
             'retry_debt_stock_codes': retry_debt_stock_codes,
+            'retry_debt_count': len(retry_debt_stock_codes),
             'terminal_not_applicable_stock_codes': sorted(
                 terminal_not_applicable
             ),
@@ -2348,9 +2349,20 @@ class DartFundamentalsCaptureService:
                 )
                 or ''
             ).strip().lower()
+            fundamentals_failure_reason = str(
+                fundamentals_result.get('failure_reason')
+                or fundamentals_result.get('reason')
+                or ''
+            ).strip() or None
+            durable_error_message = (
+                fundamentals_failure_reason
+                if fundamentals_core_status == 'failed'
+                else None
+            )
             durable_metadata = {
                 **latest_run_metadata,
                 'fundamentals_core_status': fundamentals_core_status,
+                'fundamentals_failure_reason': fundamentals_failure_reason,
                 'fundamentals_scope_outcome': fundamentals_scope_outcome,
                 **{
                     key: combined[key]
@@ -2397,6 +2409,7 @@ class DartFundamentalsCaptureService:
                 events_detected=int((latest_run or {}).get('events_detected') or 0),
                 events_captured=int((latest_run or {}).get('events_captured') or 0),
                 events_failed=int((latest_run or {}).get('events_failed') or 0),
+                error_message=durable_error_message,
                 run_metadata=durable_metadata,
             )
 
@@ -2491,6 +2504,7 @@ class DartFundamentalsCaptureService:
                 events_detected=int((latest_run or {}).get('events_detected') or 0),
                 events_captured=int((latest_run or {}).get('events_captured') or 0),
                 events_failed=int((latest_run or {}).get('events_failed') or 0),
+                error_message=durable_error_message,
                 run_metadata=durable_metadata,
             )
 
@@ -2605,6 +2619,7 @@ class DartFundamentalsCaptureService:
                 events_detected=int((latest_run or {}).get('events_detected') or 0),
                 events_captured=int((latest_run or {}).get('events_captured') or 0),
                 events_failed=int((latest_run or {}).get('events_failed') or 0),
+                error_message=durable_error_message,
                 run_metadata=durable_metadata,
             )
         return combined
@@ -3568,6 +3583,37 @@ class DartFundamentalsCaptureService:
                 )
                 else ('partial' if partial_reasons else 'completed')
             )
+            state_histogram: dict[str, int] = defaultdict(int)
+            for stock_code in selected_stock_codes:
+                state = str(
+                    (symbol_results.get(stock_code) or {}).get('state')
+                    or 'unresolved'
+                )
+                state_histogram[state] += 1
+            normalized_state_histogram = dict(sorted(state_histogram.items()))
+            retry_debt_count = len(exact_retry_debt_symbols)
+            all_selected_symbols_stale_deferred = bool(
+                selected_stock_codes
+            ) and all(
+                str(
+                    (symbol_results.get(stock_code) or {}).get('state')
+                    or ''
+                )
+                == 'stale_incremental_backfill_deferred'
+                for stock_code in selected_stock_codes
+            )
+            failure_reason: str | None = None
+            if status == 'failed':
+                if all_sync_groups_failed:
+                    failure_reason = 'all_sync_groups_failed'
+                elif all_selected_lookups_failed:
+                    failure_reason = 'all_selected_lookups_failed'
+                elif all_selected_symbols_stale_deferred:
+                    failure_reason = (
+                        'all_selected_symbols_stale_incremental_backfill_deferred'
+                    )
+                elif all_selected_symbols_are_debt:
+                    failure_reason = 'all_selected_symbols_retry_debt'
 
             piotroski_filter_followup = None
             piotroski_filter_followup_error = None
@@ -3655,6 +3701,9 @@ class DartFundamentalsCaptureService:
                 'over_limit_event_ids_sample': _limited_sample(over_limit_event_ids, limit=100),
                 'retry_cycles_requested': resolved_retry_cycles,
                 'retry_cycles_completed': retry_cycles_completed,
+                'failure_reason': failure_reason,
+                'retry_debt_count': retry_debt_count,
+                'state_histogram': normalized_state_histogram,
                 'partial_reasons': partial_reasons,
                 'piotroski_filter_followup': piotroski_filter_followup,
                 'piotroski_filter_followup_error': piotroski_filter_followup_error,
@@ -3676,6 +3725,7 @@ class DartFundamentalsCaptureService:
                 events_detected=events_detected,
                 events_captured=events_captured,
                 events_failed=events_failed,
+                error_message=failure_reason,
                 run_metadata=metadata,
             )
             feedback_followup = None
@@ -3779,6 +3829,9 @@ class DartFundamentalsCaptureService:
                 'selected_stock_codes': list(selected_stock_codes),
                 'successful_stock_codes': sorted(successful_stock_codes),
                 'retry_debt_stock_codes': sorted(exact_retry_debt_symbols),
+                'retry_debt_count': retry_debt_count,
+                'state_histogram': normalized_state_histogram,
+                'failure_reason': failure_reason,
                 'scope_outcome_manifest': outcome_manifest,
                 'stale_refresh_run_ids_failed': stale_refresh_run_ids,
                 'sync': {
