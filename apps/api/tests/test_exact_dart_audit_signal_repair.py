@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import contextmanager
 from datetime import date
@@ -13,6 +14,7 @@ from app.dart.exact_audit_signal_repair import (
     CHECKPOINT_SCHEMA_VERSION,
     ExactDartAuditSignalRepair,
     MANIFEST_SCHEMA_VERSION,
+    _audit_batch_idle_transaction_timeout_ms,
     exact_dart_audit_batch_guard,
 )
 from app.dart.signals_service import (
@@ -179,11 +181,17 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                 return_value={},
             ),
             patch(
+                'app.dart.exact_audit_signal_repair._audit_batch_idle_transaction_timeout_ms',
+                return_value=123_456,
+            ),
+            patch(
                 'app.dart.signals_service.session_scope',
                 inner_scope,
             ),
             exact_dart_audit_batch_guard(
-                market_date=date(2026, 10, 28)
+                market_date=date(2026, 10, 28),
+                batch_size=1,
+                concurrency=2,
             ) as (acquired, reason),
         ):
             self.assertTrue(acquired)
@@ -217,8 +225,153 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                 for call in outer_session.execute.call_args_list
             )
         )
+        self.assertTrue(
+            any(
+                'SET LOCAL idle_in_transaction_session_timeout = 123456'
+                in str(call.args[0])
+                for call in outer_session.execute.call_args_list
+            )
+        )
         inner_session.execute.assert_called_once()
         self.assertTrue(inner_session.execute.call_args.args[0].is_insert)
+
+    def test_guard_timeout_covers_every_external_fetch_wave(self):
+        with (
+            patch(
+                'app.dart.exact_audit_signal_repair._audit_event_timeout_seconds',
+                return_value=60,
+            ),
+            patch(
+                'app.dart.exact_audit_signal_repair.settings.db_pool_timeout_seconds',
+                5,
+            ),
+            patch(
+                'app.dart.exact_audit_signal_repair.settings.db_connect_timeout_seconds',
+                5,
+            ),
+        ):
+            self.assertEqual(
+                _audit_batch_idle_transaction_timeout_ms(
+                    batch_size=25,
+                    concurrency=4,
+                ),
+                1_605_000,
+            )
+
+    def test_guard_timeout_enforces_minimum_and_rejects_over_cap(self):
+        with patch(
+            'app.dart.exact_audit_signal_repair._audit_event_timeout_seconds',
+            return_value=0.001,
+        ):
+            self.assertEqual(
+                _audit_batch_idle_transaction_timeout_ms(
+                    batch_size=1,
+                    concurrency=8,
+                ),
+                120_000,
+            )
+
+        with patch(
+            'app.dart.exact_audit_signal_repair._audit_event_timeout_seconds',
+            return_value=90_000,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                'exceeds the PostgreSQL idle transaction safety limit',
+            ):
+                _audit_batch_idle_transaction_timeout_ms(
+                    batch_size=1,
+                    concurrency=1,
+                )
+
+    async def test_entry_capture_is_bounded_by_the_guard_timeout_budget(self):
+        entry = _entry('005930', 101, '20260301000001')
+
+        async def capture(*, rcept_no: str):
+            await asyncio.sleep(60)
+            return {'rcept_no': rcept_no, 'audit_signal': {}}
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+
+        with patch(
+            'app.dart.exact_audit_signal_repair._audit_event_timeout_seconds',
+            return_value=0.001,
+        ):
+            result = await repair._attempt_entry(
+                entry,
+                semaphore=asyncio.Semaphore(1),
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error_type'], 'TimeoutError')
+        self.assertEqual(
+            result['error_message'],
+            'audit capture exceeded 0.001s deadline',
+        )
+
+    async def test_run_budgets_the_actual_final_batch_and_concurrency(self):
+        entries = (
+            _entry('005930', 101, '20260301000001'),
+            _entry('000660', 102, '20260301000002'),
+            _entry('035420', 103, '20260301000003'),
+        )
+        events = {
+            entry['event_id']: {**entry, 'report_nm': '사업보고서 (2025.12)'}
+            for entry in entries
+        }
+        guard_calls: list[dict[str, object]] = []
+
+        @contextmanager
+        def recording_guard(**kwargs):
+            guard_calls.append(kwargs)
+            yield True, None
+
+        async def capture(*, rcept_no: str):
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': _parsed_audit_signal(),
+            }
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(*entries, batch_size=2),
+            capture=capture,
+            event_loader=self._event_loader(events),
+            terminal_state_loader=lambda entry: _terminal_proof(entry),
+            guard_factory=recording_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+                concurrency=2,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            guard_calls,
+            [
+                {
+                    'market_date': date(2026, 10, 28),
+                    'batch_size': 2,
+                    'concurrency': 2,
+                },
+                {
+                    'market_date': date(2026, 10, 28),
+                    'batch_size': 1,
+                    'concurrency': 2,
+                },
+            ],
+        )
 
     async def test_failed_batch_is_retried_while_completed_batch_is_skipped(self):
         entries = (

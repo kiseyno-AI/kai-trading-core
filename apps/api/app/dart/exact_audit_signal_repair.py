@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.settings import settings
 from app.dart.signals_service import (
     AUDIT_SIGNAL_WRITER_LOCK_KEY,
     audit_signal_writer_lock_owner,
@@ -44,6 +45,11 @@ CHECKPOINT_SCHEMA_VERSION = 'dart_audit_signal_exact_checkpoint_v2'
 REPLACEMENT_SOURCE_ERROR_CODE = '014'
 MAX_BATCH_SIZE = 100
 MAX_CONCURRENCY = 8
+AUDIT_BATCH_IDLE_TRANSACTION_TIMEOUT_MIN_MS = 120_000
+AUDIT_BATCH_IDLE_TRANSACTION_TIMEOUT_MAX_MS = 86_400_000
+AUDIT_BATCH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS = 60_000
+AUDIT_REPAIR_DB_STATEMENT_TIMEOUT_MS = 5_000
+AUDIT_BATCH_DB_OPERATIONS_PER_ENTRY = 3
 _WRITER_RUN_TABLES = (
     'daily_pipeline_runs',
     'eod_collection_runs',
@@ -211,7 +217,9 @@ def normalize_manifest(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _load_event_identity(event_id: int) -> dict[str, Any] | None:
-    with session_scope(statement_timeout_ms=5_000) as session:
+    with session_scope(
+        statement_timeout_ms=AUDIT_REPAIR_DB_STATEMENT_TIMEOUT_MS
+    ) as session:
         row = session.get(DartDisclosureEvent, event_id)
         if row is None:
             return None
@@ -237,7 +245,9 @@ def _load_audit_terminal_state(
     clean parsed opinion.
     """
 
-    with session_scope(statement_timeout_ms=5_000) as session:
+    with session_scope(
+        statement_timeout_ms=AUDIT_REPAIR_DB_STATEMENT_TIMEOUT_MS
+    ) as session:
         row = session.execute(
             select(
                 DartAuditSignal.disclosure_event_id.label('event_id'),
@@ -296,9 +306,62 @@ def _active_writer_counts(session: Any) -> dict[str, int]:
     return counts
 
 
+def _audit_event_timeout_seconds() -> float:
+    return float(
+        max(
+            1,
+            int(settings.dart_fundamentals_event_timeout_seconds),
+        )
+    )
+
+
+def _audit_batch_idle_transaction_timeout_ms(
+    *,
+    batch_size: int,
+    concurrency: int,
+) -> int:
+    """Budget the writer fence for every bounded external fetch wave."""
+
+    normalized_batch_size = max(1, min(int(batch_size), MAX_BATCH_SIZE))
+    normalized_concurrency = max(1, min(int(concurrency), MAX_CONCURRENCY))
+    fetch_waves = (
+        normalized_batch_size + normalized_concurrency - 1
+    ) // normalized_concurrency
+    configured_event_timeout_ms = int(
+        _audit_event_timeout_seconds() * 1_000
+    )
+    bounded_db_operation_ms = (
+        AUDIT_REPAIR_DB_STATEMENT_TIMEOUT_MS
+        + int(settings.db_pool_timeout_seconds) * 1_000
+        + int(settings.db_connect_timeout_seconds) * 1_000
+    )
+    validation_budget_ms = (
+        normalized_batch_size
+        * AUDIT_BATCH_DB_OPERATIONS_PER_ENTRY
+        * bounded_db_operation_ms
+    )
+    calculated_timeout_ms = (
+        fetch_waves * configured_event_timeout_ms
+        + validation_budget_ms
+        + AUDIT_BATCH_IDLE_TRANSACTION_TIMEOUT_HEADROOM_MS
+    )
+    if calculated_timeout_ms > AUDIT_BATCH_IDLE_TRANSACTION_TIMEOUT_MAX_MS:
+        raise ValueError(
+            'exact DART audit batch timeout budget exceeds the PostgreSQL '
+            'idle transaction safety limit'
+        )
+    return max(
+        AUDIT_BATCH_IDLE_TRANSACTION_TIMEOUT_MIN_MS,
+        calculated_timeout_ms,
+    )
+
+
 @contextmanager
 def exact_dart_audit_batch_guard(
-    *, market_date: date
+    *,
+    market_date: date,
+    batch_size: int = MAX_BATCH_SIZE,
+    concurrency: int = 1,
 ) -> Any:
     """Fence daily/EOD and DART writers for one bounded repair batch."""
 
@@ -321,11 +384,31 @@ def exact_dart_audit_batch_guard(
             guard_yielded = False
             try:
                 with session_scope(
-                    statement_timeout_ms=5_000,
+                    statement_timeout_ms=AUDIT_REPAIR_DB_STATEMENT_TIMEOUT_MS,
                     lock_timeout_ms=1,
                     isolated_connection=True,
                 ) as session:
                     if session.get_bind().dialect.name == 'postgresql':
+                        try:
+                            idle_timeout_ms = (
+                                _audit_batch_idle_transaction_timeout_ms(
+                                    batch_size=batch_size,
+                                    concurrency=concurrency,
+                                )
+                            )
+                        except ValueError:
+                            guard_yielded = True
+                            yield (
+                                False,
+                                'repair_timeout_budget_exceeds_postgres_limit',
+                            )
+                            return
+                        session.execute(
+                            text(
+                                'SET LOCAL idle_in_transaction_session_timeout '
+                                f'= {idle_timeout_ms}'
+                            )
+                        )
                         session.execute(
                             text(
                                 'LOCK TABLE '
@@ -477,7 +560,21 @@ class ExactDartAuditSignalRepair:
             }
         try:
             async with semaphore:
-                result = await self.capture(rcept_no=str(entry['rcept_no']))
+                event_timeout_seconds = _audit_event_timeout_seconds()
+                result = await asyncio.wait_for(
+                    self.capture(rcept_no=str(entry['rcept_no'])),
+                    timeout=event_timeout_seconds,
+                )
+        except TimeoutError:
+            return {
+                **lineage,
+                'status': 'failed',
+                'error_type': 'TimeoutError',
+                'error_message': (
+                    'audit capture exceeded '
+                    f'{event_timeout_seconds:g}s deadline'
+                ),
+            }
         except Exception as exc:  # noqa: BLE001
             return {
                 **lineage,
@@ -769,7 +866,9 @@ class ExactDartAuditSignalRepair:
                     completed_checkpoint = previous
 
             with self.guard_factory(
-                market_date=date.fromisoformat(self.manifest['market_date'])
+                market_date=date.fromisoformat(self.manifest['market_date']),
+                batch_size=len(batch),
+                concurrency=concurrency,
             ) as guard:
                 acquired, reason = guard
                 if not acquired:
