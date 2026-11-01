@@ -84,6 +84,35 @@ def _iter_bulk_upsert_chunks(
     return [item_list[index : index + chunk_size] for index in range(0, len(item_list), chunk_size)]
 
 
+def _iter_snapshot_atomic_bulk_upsert_chunks(
+    items: Sequence[dict[str, Any]],
+    *,
+    chunk_size: int | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Chunk evaluation rows without splitting a decision snapshot."""
+
+    if chunk_size is None:
+        chunk_size = SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE
+    if chunk_size < 1:
+        raise ValueError('chunk_size must be >= 1')
+    grouped_items: dict[Any, list[dict[str, Any]]] = {}
+    for item in items:
+        grouped_items.setdefault(item.get('decision_snapshot_id'), []).append(item)
+    chunks: list[list[dict[str, Any]]] = []
+    current_chunk: list[dict[str, Any]] = []
+    for snapshot_items in grouped_items.values():
+        if current_chunk and len(current_chunk) + len(snapshot_items) > chunk_size:
+            chunks.append(current_chunk)
+            current_chunk = []
+        current_chunk.extend(snapshot_items)
+        if len(current_chunk) >= chunk_size:
+            chunks.append(current_chunk)
+            current_chunk = []
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
 DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON = 5
 DEFAULT_SIGNAL_DECIDER_REVIEW_HORIZONS: tuple[int, ...] = (1, 3, 5)
 SIGNAL_DECIDER_REPLAY_REVIEW_VERSION = 'signal_decider_replay_review_v1'
@@ -2328,7 +2357,7 @@ class SignalDeciderLoopRepository:
         item_list = list(items)
         if len(item_list) > SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE:
             results: list[dict[str, Any]] = []
-            for chunk in _iter_bulk_upsert_chunks(item_list):
+            for chunk in _iter_snapshot_atomic_bulk_upsert_chunks(item_list):
                 results.extend(self.bulk_upsert_evaluations(items=chunk))
             return results
         with session_scope() as session:
@@ -3842,6 +3871,92 @@ class SignalDeciderLoopService:
             ),
         }
 
+    @staticmethod
+    def _evaluation_failure_evidence(
+        *,
+        snapshot_row: SignalDeciderDecisionSnapshotRow,
+        horizons: Sequence[int],
+        reason: str,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        normalized_horizons = sorted({int(horizon) for horizon in horizons})
+        return {
+            'decision_snapshot_id': int(snapshot_row.id),
+            'feedback_id': snapshot_row.feedback_id,
+            'market_date': snapshot_row.market_date.isoformat(),
+            'symbol': snapshot_row.symbol,
+            'horizon_days': normalized_horizons,
+            'failed_evaluation_count': len(normalized_horizons),
+            'reason': reason,
+            'failure_reason': reason,
+            'error_type': type(exc).__name__,
+            'error_message': str(exc)[:500],
+            'retryable': True,
+        }
+
+    def _bulk_upsert_evaluations_with_snapshot_isolation(
+        self,
+        *,
+        snapshot_groups: Sequence[
+            tuple[SignalDeciderDecisionSnapshotRow, Sequence[dict[str, Any]]]
+        ],
+        horizons: Sequence[int],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not snapshot_groups:
+            return [], []
+        all_items = [
+            item
+            for _snapshot_row, snapshot_items in snapshot_groups
+            for item in snapshot_items
+        ]
+        snapshot_rows_by_id = {
+            int(snapshot_row.id): snapshot_row
+            for snapshot_row, _snapshot_items in snapshot_groups
+        }
+        snapshot_items_by_id = {
+            int(snapshot_row.id): snapshot_items
+            for snapshot_row, snapshot_items in snapshot_groups
+        }
+        persisted: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for chunk_items in _iter_snapshot_atomic_bulk_upsert_chunks(all_items):
+            try:
+                persisted.extend(
+                    self.repository.bulk_upsert_evaluations(
+                        items=chunk_items,
+                    )
+                )
+                continue
+            except Exception:
+                pass
+            chunk_snapshot_ids = list(
+                dict.fromkeys(
+                    int(item['decision_snapshot_id'])
+                    for item in chunk_items
+                )
+            )
+            for snapshot_id in chunk_snapshot_ids:
+                snapshot_row = snapshot_rows_by_id[snapshot_id]
+                snapshot_items = snapshot_items_by_id[snapshot_id]
+                try:
+                    persisted.extend(
+                        self.repository.bulk_upsert_evaluations(
+                            items=snapshot_items,
+                        )
+                    )
+                except Exception as exc:
+                    failures.append(
+                        self._evaluation_failure_evidence(
+                            snapshot_row=snapshot_row,
+                            horizons=horizons,
+                            reason=(
+                                'signal_decider_evaluation_row_persistence_failed'
+                            ),
+                            exc=exc,
+                        )
+                    )
+        return persisted, failures
+
     def compute_evaluations(
         self,
         *,
@@ -3872,24 +3987,59 @@ class SignalDeciderLoopService:
             graded_count: int,
             pending_count: int,
             coverage_summary: dict[str, Any],
+            evaluation_failures: Sequence[dict[str, Any]] = (),
         ) -> dict[str, Any]:
             not_computed_count = int(coverage_summary.get('not_computed_count') or 0)
-            warning_message = None
+            retry_debt_snapshot_ids = sorted(
+                {
+                    int(failure['decision_snapshot_id'])
+                    for failure in evaluation_failures
+                }
+            )
+            failed_count = sum(
+                int(failure.get('failed_evaluation_count') or 0)
+                for failure in evaluation_failures
+            )
+            warnings: list[str] = []
             status = 'completed'
-            if not_computed_count > 0:
-                warning_message = (
-                    f'{not_computed_count} mature signal-decider horizon(s) remain '
+            reason: str | None = None
+            if failed_count > 0:
+                status = 'partial' if evaluations_upserted > 0 else 'failed'
+                reason = (
+                    'signal_decider_evaluation_partial_failure'
+                    if evaluations_upserted > 0
+                    else 'signal_decider_evaluation_all_failed'
+                )
+                warnings.append(
+                    f'{failed_count} signal-decider evaluation horizon(s) remain '
+                    'retry debt after snapshot-isolated persistence.'
+                )
+            uncovered_not_computed_count = max(
+                not_computed_count - failed_count,
+                0,
+            )
+            if uncovered_not_computed_count > 0:
+                warnings.append(
+                    f'{uncovered_not_computed_count} mature signal-decider horizon(s) remain '
                     'not_computed after evaluation refresh.'
                 )
-                if force_recompute:
-                    status = 'failed'
+            if force_recompute and not_computed_count > 0:
+                status = 'failed'
+                reason = reason or 'signal_decider_evaluation_coverage_incomplete'
             return {
                 'status': status,
+                'reason': reason,
+                'failure_reason': reason,
                 'decisions_considered': decisions_considered,
                 'outcomes_upserted': outcomes_upserted,
                 'evaluations_upserted': evaluations_upserted,
                 'graded_count': graded_count,
                 'pending_count': pending_count,
+                'failed_count': failed_count,
+                'failed_items': failed_count,
+                'failed_snapshot_count': len(retry_debt_snapshot_ids),
+                'retry_debt_count': failed_count,
+                'retry_debt_snapshot_ids': retry_debt_snapshot_ids,
                 'coverage': coverage_summary,
                 'computed_count': int(coverage_summary.get('computed_count') or 0),
                 'pending_maturity_count': int(coverage_summary.get('pending_maturity_count') or 0),
@@ -3897,8 +4047,8 @@ class SignalDeciderLoopService:
                     coverage_summary.get('insufficient_price_data_count') or 0
                 ),
                 'not_computed_count': not_computed_count,
-                'warning_count': 1 if warning_message is not None else 0,
-                'warnings': [warning_message] if warning_message is not None else [],
+                'warning_count': len(warnings),
+                'warnings': warnings,
             }
 
         rows = self.repository.list_decision_snapshots(
@@ -3914,7 +4064,18 @@ class SignalDeciderLoopService:
             if is_decision_snapshot_valid_for_source_date(row)
         ]
         if not rows:
+            summary = build_summary(
+                decisions_considered=0,
+                outcomes_upserted=0,
+                evaluations_upserted=0,
+                graded_count=0,
+                pending_count=0,
+                coverage_summary=self._build_coverage_summary(
+                    coverage_items=[]
+                ),
+            )
             return {
+                'status': summary['status'],
                 'request': {
                     'market_date_from': normalized_from.isoformat(),
                     'market_date_to': normalized_to.isoformat(),
@@ -3924,14 +4085,11 @@ class SignalDeciderLoopService:
                     'evaluation_rule_set_version': evaluation_profile.rule_set_version,
                     'force_recompute': force_recompute,
                 },
-                'summary': build_summary(
-                    decisions_considered=0,
-                    outcomes_upserted=0,
-                    evaluations_upserted=0,
-                    graded_count=0,
-                    pending_count=0,
-                    coverage_summary=self._build_coverage_summary(coverage_items=[]),
-                ),
+                'summary': summary,
+                'evaluation_failures': [],
+                'evaluation_failure_evidence': {},
+                'retry_debt_count': 0,
+                'retry_debt_snapshot_ids': [],
                 'items': [],
             }
 
@@ -3966,46 +4124,95 @@ class SignalDeciderLoopService:
             (item['decision_snapshot_id'], item['horizon_days']): item
             for item in persisted_outcomes
         }
-        evaluation_items: list[dict[str, Any]] = []
+        evaluation_groups: list[
+            tuple[SignalDeciderDecisionSnapshotRow, list[dict[str, Any]]]
+        ] = []
+        evaluation_failures: list[dict[str, Any]] = []
         for row in rows:
             decision = decision_snapshots[row.id]
-            for horizon_days in normalized_horizons:
-                outcome = outcomes_by_key[(row.id, horizon_days)]
-                evaluation_items.append(
-                    self._build_evaluation_item(
+            snapshot_items: list[dict[str, Any]] = []
+            try:
+                for horizon_days in normalized_horizons:
+                    outcome = outcomes_by_key[(row.id, horizon_days)]
+                    snapshot_items.append(
+                        self._build_evaluation_item(
+                            snapshot_row=row,
+                            decision=decision,
+                            outcome=outcome,
+                            horizon_days=horizon_days,
+                            evaluation_version=resolved_version,
+                            evaluation_profile=evaluation_profile,
+                        )
+                    )
+            except Exception as exc:
+                evaluation_failures.append(
+                    self._evaluation_failure_evidence(
                         snapshot_row=row,
-                        decision=decision,
-                        outcome=outcome,
-                        horizon_days=horizon_days,
-                        evaluation_version=resolved_version,
-                        evaluation_profile=evaluation_profile,
+                        horizons=normalized_horizons,
+                        reason=(
+                            'signal_decider_evaluation_row_construction_failed'
+                        ),
+                        exc=exc,
                     )
                 )
-        persisted_evaluations = self.repository.bulk_upsert_evaluations(items=evaluation_items)
+                continue
+            evaluation_groups.append((row, snapshot_items))
+        (
+            persisted_evaluations,
+            persistence_failures,
+        ) = self._bulk_upsert_evaluations_with_snapshot_isolation(
+            snapshot_groups=evaluation_groups,
+            horizons=normalized_horizons,
+        )
+        evaluation_failures.extend(persistence_failures)
+        evaluation_failures.sort(
+            key=lambda failure: int(failure['decision_snapshot_id'])
+        )
+        evaluation_failure_by_snapshot = {
+            int(failure['decision_snapshot_id']): failure
+            for failure in evaluation_failures
+        }
         outcomes_by_snapshot = self._group_by_snapshot_id(persisted_outcomes)
         evaluations_by_snapshot = self._group_by_snapshot_id(persisted_evaluations)
-        items = [
-            {
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = {
                 **decision_snapshots[row.id],
                 'outcomes': outcomes_by_snapshot.get(row.id, []),
                 'evaluations': evaluations_by_snapshot.get(row.id, []),
             }
-            for row in rows
-        ]
+            failure = evaluation_failure_by_snapshot.get(row.id)
+            if failure is not None:
+                item['evaluation_failure'] = failure
+            items.append(item)
         graded_count = sum(
             1 for item in persisted_evaluations if item.get('evaluation_status') == 'graded'
         )
         pending_count = sum(
             1 for item in persisted_evaluations if item.get('evaluation_status') != 'graded'
         )
-        coverage_summary = self._build_coverage_summary(
-            coverage_items=[
-                _maybe_dict(item.get('coverage'))
-                for item in persisted_evaluations
-                if isinstance(item, dict)
-            ]
+        coverage_items = [
+            _maybe_dict(item.get('coverage'))
+            for item in persisted_evaluations
+            if isinstance(item, dict)
+        ]
+        coverage_items.extend(
+            {'status_reason': 'not_computed'}
+            for failure in evaluation_failures
+            for _horizon in failure['horizon_days']
         )
-        return {
+        coverage_summary = self._build_coverage_summary(coverage_items=coverage_items)
+        summary = build_summary(
+            decisions_considered=len(rows),
+            outcomes_upserted=len(persisted_outcomes),
+            evaluations_upserted=len(persisted_evaluations),
+            graded_count=graded_count,
+            pending_count=pending_count,
+            coverage_summary=coverage_summary,
+            evaluation_failures=evaluation_failures,
+        )
+        result = {
+            'status': summary['status'],
             'request': {
                 'market_date_from': normalized_from.isoformat(),
                 'market_date_to': normalized_to.isoformat(),
@@ -4015,16 +4222,20 @@ class SignalDeciderLoopService:
                 'evaluation_rule_set_version': evaluation_profile.rule_set_version,
                 'force_recompute': force_recompute,
             },
-            'summary': build_summary(
-                decisions_considered=len(rows),
-                outcomes_upserted=len(persisted_outcomes),
-                evaluations_upserted=len(persisted_evaluations),
-                graded_count=graded_count,
-                pending_count=pending_count,
-                coverage_summary=coverage_summary,
-            ),
+            'summary': summary,
+            'evaluation_failures': evaluation_failures,
+            'evaluation_failure_evidence': {
+                str(failure['decision_snapshot_id']): failure
+                for failure in evaluation_failures
+            },
+            'retry_debt_count': summary['retry_debt_count'],
+            'retry_debt_snapshot_ids': summary['retry_debt_snapshot_ids'],
             'items': items,
         }
+        if summary['reason'] is not None:
+            result['reason'] = summary['reason']
+            result['failure_reason'] = summary['failure_reason']
+        return result
 
     def compute_recent_evaluations(
         self,

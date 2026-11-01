@@ -6956,6 +6956,45 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         self.assertNotIn('result_summary_omissions', details)
 
+    def test_stage_result_details_preserve_exact_evaluation_failure_evidence(self) -> None:
+        failure_evidence = {
+            str(snapshot_id): {
+                'decision_snapshot_id': snapshot_id,
+                'symbol': f'{snapshot_id:06d}',
+                'horizon_days': [1],
+                'reason': 'signal_decider_evaluation_row_persistence_failed',
+            }
+            for snapshot_id in range(1, 102)
+        }
+
+        details = DailyPipelineStageService._build_stage_run_details(
+            stage_id='signal_decider_evaluations',
+            result={
+                'status': 'failed',
+                'evaluation_failures': list(failure_evidence.values()),
+                'evaluation_failure_evidence': failure_evidence,
+                'retry_debt_snapshot_ids': list(range(1, 102)),
+                'summary': {
+                    'failed_count': 101,
+                    'failed_snapshot_count': 101,
+                    'retry_debt_count': 101,
+                },
+            },
+        )
+
+        self.assertEqual(
+            details['result_summary']['evaluation_failure_evidence'],
+            failure_evidence,
+        )
+        self.assertEqual(
+            details['result_summary_omissions']['evaluation_failures'],
+            {'type': 'list', 'item_count': 101},
+        )
+        self.assertEqual(
+            details['result_summary_omissions']['retry_debt_snapshot_ids'],
+            {'type': 'list', 'item_count': 101},
+        )
+
     def test_persisted_large_exact_scope_proof_restores_partial_cohort(
         self,
     ) -> None:
@@ -7368,6 +7407,44 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'total': 3_840,
                 'succeeded': 3_840,
                 'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_preserves_evaluation_retry_debt(self) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='signal_decider_evaluations',
+            result={
+                'status': 'partial',
+                'request': {
+                    'horizons': [1],
+                },
+                'summary': {
+                    'status': 'partial',
+                    'decisions_considered': 2,
+                    'outcomes_upserted': 2,
+                    'evaluations_upserted': 1,
+                    'failed_count': 1,
+                    'failed_snapshot_count': 1,
+                    'retry_debt_count': 1,
+                    'retry_debt_snapshot_ids': [102],
+                    'coverage': {
+                        'count': 2,
+                        'computed_count': 1,
+                        'pending_maturity_count': 0,
+                        'insufficient_price_data_count': 0,
+                        'not_computed_count': 1,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 1,
+                'failed': 1,
             },
         )
 
