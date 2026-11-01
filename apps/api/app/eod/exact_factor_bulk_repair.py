@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
-from datetime import date, timedelta
+from contextlib import AbstractContextManager, contextmanager, suppress
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -25,6 +25,8 @@ from app.db_models import (
     Symbol,
 )
 from app.eod.derived_stage_repair import (
+    GuardTransactionExitError,
+    capture_guard_transaction_failure,
     exact_derived_stage_guard,
     normalize_manifest,
 )
@@ -72,6 +74,8 @@ CHECKPOINT_SCHEMA_VERSION = 'factor_exact_date_bulk_checkpoint_v2'
 FACTOR_REPAIR_IMPLEMENTATION_CONTRACT = (
     'factor_exact_date_bulk_implementation_v2'
 )
+FACTOR_LIVE_RECONCILIATION_ORIGIN = 'live_reconciliation_v1'
+FACTOR_LIVE_RECONCILIATION_SCHEMA_VERSION = 1
 FACTOR_PRICE_HISTORY_ROWS = 253
 FACTOR_PRICE_FINGERPRINT_SYMBOL_CHUNK_SIZE = 250
 FACTOR_SOURCE_COMPONENTS = frozenset(
@@ -760,6 +764,7 @@ def _load_factor_completion_state(
     evidence_lineages: set[
         tuple[str, int | None, str | None, str | None, tuple[str, ...]]
     ] = set()
+    completion_records: set[tuple[str, str, tuple[str, ...]]] = set()
     for batch in affected:
         try:
             metadata = dict(batch['factor_rebuild_metadata'])
@@ -853,10 +858,35 @@ def _load_factor_completion_state(
             for stage_id in FACTOR_RESULT_MODELS:
                 if dict(recorded_outputs[stage_id]) != output_fingerprints[stage_id]:
                     raise ValueError('factor rebuild output evidence drift')
+            repair_started_at = datetime.fromisoformat(
+                str(recorded['repair_started_at'])
+            )
+            rebuild_completed_at = datetime.fromisoformat(
+                str(recorded['rebuild_completed_at'])
+            )
+            stage_ids = tuple(recorded['stage_ids'])
+            if (
+                repair_started_at.tzinfo is None
+                or rebuild_completed_at.tzinfo is None
+                or rebuild_completed_at < repair_started_at
+                or stage_ids != tuple(FACTOR_RESULT_MODELS)
+            ):
+                raise ValueError('factor rebuild completion evidence invalid')
+            completion_records.add(
+                (
+                    repair_started_at.isoformat(),
+                    rebuild_completed_at.isoformat(),
+                    stage_ids,
+                )
+            )
         except (KeyError, TypeError, ValueError):
             metadata_verified = False
             break
-    if len(provider_membership_hashes) > 1 or len(evidence_lineages) > 1:
+    if (
+        len(provider_membership_hashes) > 1
+        or len(evidence_lineages) > 1
+        or len(completion_records) > 1
+    ):
         metadata_verified = False
     if evidence_lineages:
         authority_batch_ids = set(next(iter(evidence_lineages))[4])
@@ -868,6 +898,10 @@ def _load_factor_completion_state(
     lineage = next(
         iter(evidence_lineages),
         (None, None, None, None, ()),
+    )
+    completion_record = next(
+        iter(completion_records),
+        (None, None, ()),
     )
     return {
         'source_fingerprints': _load_factor_source_fingerprints(
@@ -888,6 +922,11 @@ def _load_factor_completion_state(
         'membership_evidence_run_source': lineage[2],
         'membership_evidence_sha256': lineage[3],
         'membership_evidence_repair_batch_ids': list(lineage[4]),
+        'completion_metadata': {
+            'repair_started_at': completion_record[0],
+            'rebuild_completed_at': completion_record[1],
+            'stage_ids': list(completion_record[2]),
+        },
     }
 
 
@@ -1198,40 +1237,99 @@ class ExactFactorBulkRepair:
             != proof.get('membership_evidence_repair_batch_ids')
         ):
             return False
-        stage_results = result.get('stage_results')
-        if not isinstance(stage_results, Mapping) or set(stage_results) != set(
-            FACTOR_RESULT_MODELS
-        ):
-            return False
-        for stage_id in FACTOR_RESULT_MODELS:
-            stage_result = stage_results.get(stage_id)
-            if not isinstance(stage_result, Mapping):
-                return False
-            finalization = stage_result.get('scope_finalization')
-            expected = {
-                'stage': stage_id,
-                'market_date': item['market_date'],
-                'exact_symbol_count': item['symbol_count'],
-                'exact_membership_sha256': item['membership_sha256'],
-                'successful_symbol_count': item['symbol_count'],
-                'successful_membership_sha256': item['membership_sha256'],
-                'authoritative_market_scope': True,
-                'authoritative_markets': ['KOSDAQ', 'KOSPI'],
-                'all_market_authority': False,
-                'ready': True,
-            }
-            if not isinstance(finalization, Mapping) or any(
-                finalization.get(field) != value
-                for field, value in expected.items()
-            ):
-                return False
-            deleted_count = finalization.get('deleted_stale_row_count')
+        completion_origin = result.get('completion_origin')
+        if completion_origin == FACTOR_LIVE_RECONCILIATION_ORIGIN:
             if (
-                isinstance(deleted_count, bool)
-                or not isinstance(deleted_count, int)
-                or deleted_count < 0
+                result.get('completion_schema_version')
+                != FACTOR_LIVE_RECONCILIATION_SCHEMA_VERSION
+                or 'stage_results' in result
             ):
                 return False
+            reconciliation = result.get('live_reconciliation_evidence')
+            if not isinstance(reconciliation, Mapping):
+                return False
+            memberships = reconciliation.get('output_memberships')
+            reconciled_fingerprints = reconciliation.get(
+                'output_fingerprints'
+            )
+            completion_metadata = reconciliation.get(
+                'completion_metadata'
+            )
+            try:
+                repair_started_at = datetime.fromisoformat(
+                    str(completion_metadata['repair_started_at'])
+                )
+                rebuild_completed_at = datetime.fromisoformat(
+                    str(completion_metadata['rebuild_completed_at'])
+                )
+                stage_ids = list(completion_metadata['stage_ids'])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if (
+                reconciliation.get('metadata_verified') is not True
+                or int(reconciliation.get('pending_batch_count') or 0) <= 0
+                or not isinstance(memberships, Mapping)
+                or set(memberships) != set(FACTOR_RESULT_MODELS)
+                or not isinstance(reconciled_fingerprints, Mapping)
+                or set(reconciled_fingerprints) != set(FACTOR_RESULT_MODELS)
+                or repair_started_at.tzinfo is None
+                or rebuild_completed_at.tzinfo is None
+                or rebuild_completed_at < repair_started_at
+                or stage_ids != list(FACTOR_RESULT_MODELS)
+            ):
+                return False
+            exact_symbols = set(item['symbols'])
+            protected_symbols = set(proof['protected_provider_codes'])
+            for stage_id in FACTOR_RESULT_MODELS:
+                stage_membership = memberships.get(stage_id)
+                if not isinstance(stage_membership, list):
+                    return False
+                if stage_membership != sorted(set(stage_membership)):
+                    return False
+                observed = set(stage_membership)
+                if (
+                    not exact_symbols.issubset(observed)
+                    or observed.difference(exact_symbols)
+                    - protected_symbols
+                ):
+                    return False
+        else:
+            stage_results = result.get('stage_results')
+            if not isinstance(stage_results, Mapping) or set(
+                stage_results
+            ) != set(FACTOR_RESULT_MODELS):
+                return False
+            for stage_id in FACTOR_RESULT_MODELS:
+                stage_result = stage_results.get(stage_id)
+                if not isinstance(stage_result, Mapping):
+                    return False
+                finalization = stage_result.get('scope_finalization')
+                expected = {
+                    'stage': stage_id,
+                    'market_date': item['market_date'],
+                    'exact_symbol_count': item['symbol_count'],
+                    'exact_membership_sha256': item['membership_sha256'],
+                    'successful_symbol_count': item['symbol_count'],
+                    'successful_membership_sha256': item[
+                        'membership_sha256'
+                    ],
+                    'authoritative_market_scope': True,
+                    'authoritative_markets': ['KOSDAQ', 'KOSPI'],
+                    'all_market_authority': False,
+                    'ready': True,
+                }
+                if not isinstance(finalization, Mapping) or any(
+                    finalization.get(field) != value
+                    for field, value in expected.items()
+                ):
+                    return False
+                deleted_count = finalization.get('deleted_stale_row_count')
+                if (
+                    isinstance(deleted_count, bool)
+                    or not isinstance(deleted_count, int)
+                    or deleted_count < 0
+                ):
+                    return False
         completion = result.get('completion_evidence')
         if not isinstance(completion, Mapping):
             return False
@@ -1257,6 +1355,17 @@ class ExactFactorBulkRepair:
             != proof.get('daily_price_input_sha256')
             or not isinstance(fingerprints, Mapping)
             or set(fingerprints) != set(FACTOR_RESULT_MODELS)
+        ):
+            return False
+        if completion_origin == FACTOR_LIVE_RECONCILIATION_ORIGIN and (
+            completion.get('updated_batch_count')
+            != result['live_reconciliation_evidence'].get(
+                'pending_batch_count'
+            )
+            or fingerprints
+            != result['live_reconciliation_evidence'].get(
+                'output_fingerprints'
+            )
         ):
             return False
         return True
@@ -1297,6 +1406,20 @@ class ExactFactorBulkRepair:
         ):
             return False
         expected_completion = unit['result']['completion_evidence']
+        if unit['result'].get(
+            'completion_origin'
+        ) == FACTOR_LIVE_RECONCILIATION_ORIGIN:
+            reconciliation = unit['result'].get(
+                'live_reconciliation_evidence'
+            )
+            if (
+                not isinstance(reconciliation, Mapping)
+                or live.get('pending_batch_count')
+                != reconciliation.get('pending_batch_count')
+                or live.get('completion_metadata')
+                != reconciliation.get('completion_metadata')
+            ):
+                return False
         expected_sources = self._validated_source_fingerprints(
             unit['result'].get('source_fingerprints')
         )
@@ -1402,6 +1525,136 @@ class ExactFactorBulkRepair:
         proof, _source_state = self._review_date_with_state(item)
         return proof
 
+    def _live_reconciliation_unit(
+        self,
+        *,
+        item: Mapping[str, Any],
+        item_sha256: str,
+        dry_proof: Mapping[str, Any],
+        live_state: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Bind durable factor evidence to a reviewed checkpoint on resume."""
+
+        pending_batch_count = live_state.get('pending_batch_count')
+        output_memberships = live_state.get('output_memberships')
+        output_fingerprints = live_state.get('output_fingerprints')
+        completion_metadata = live_state.get('completion_metadata')
+        try:
+            repair_started_at = datetime.fromisoformat(
+                str(completion_metadata['repair_started_at'])
+            )
+            rebuild_completed_at = datetime.fromisoformat(
+                str(completion_metadata['rebuild_completed_at'])
+            )
+            stage_ids = list(completion_metadata['stage_ids'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            live_state.get('metadata_verified') is not True
+            or isinstance(pending_batch_count, bool)
+            or not isinstance(pending_batch_count, int)
+            or pending_batch_count <= 0
+            or not isinstance(output_memberships, Mapping)
+            or not isinstance(output_fingerprints, Mapping)
+            or repair_started_at.tzinfo is None
+            or rebuild_completed_at.tzinfo is None
+            or rebuild_completed_at < repair_started_at
+            or stage_ids != list(FACTOR_RESULT_MODELS)
+        ):
+            return None
+        result = {
+            'implementation_contract': FACTOR_REPAIR_IMPLEMENTATION_CONTRACT,
+            'completion_origin': FACTOR_LIVE_RECONCILIATION_ORIGIN,
+            'completion_schema_version': (
+                FACTOR_LIVE_RECONCILIATION_SCHEMA_VERSION
+            ),
+            'market_date': item['market_date'],
+            'mode': 'apply',
+            'status': 'completed',
+            'applied': True,
+            'membership_policy': MEMBERSHIP_POLICY_STORED_ONLY,
+            'exact_membership_count': item['symbol_count'],
+            'ranking_membership_sha256': item['membership_sha256'],
+            'membership_sha256': dry_proof[
+                'provider_membership_sha256'
+            ],
+            'membership_evidence_source': dry_proof[
+                'membership_evidence_source'
+            ],
+            'membership_evidence_run_id': dry_proof[
+                'membership_evidence_run_id'
+            ],
+            'membership_evidence_run_source': dry_proof[
+                'membership_evidence_run_source'
+            ],
+            'membership_evidence_sha256': dry_proof[
+                'membership_evidence_sha256'
+            ],
+            'membership_evidence_repair_batch_ids': list(
+                dry_proof['membership_evidence_repair_batch_ids']
+            ),
+            'source_fingerprints': dict(
+                live_state['source_fingerprints']
+            ),
+            'completion_evidence': {
+                'updated_batch_count': pending_batch_count,
+                'exact_membership_count': item['symbol_count'],
+                'ranking_membership_sha256': item['membership_sha256'],
+                'provider_membership_sha256': dry_proof[
+                    'provider_membership_sha256'
+                ],
+                'membership_evidence_source': dry_proof[
+                    'membership_evidence_source'
+                ],
+                'membership_evidence_run_id': dry_proof[
+                    'membership_evidence_run_id'
+                ],
+                'membership_evidence_run_source': dry_proof[
+                    'membership_evidence_run_source'
+                ],
+                'membership_evidence_sha256': dry_proof[
+                    'membership_evidence_sha256'
+                ],
+                'membership_evidence_repair_batch_ids': list(
+                    dry_proof['membership_evidence_repair_batch_ids']
+                ),
+                'daily_price_input_sha256': dry_proof[
+                    'daily_price_input_sha256'
+                ],
+                'stage_output_fingerprints': dict(output_fingerprints),
+            },
+            'live_reconciliation_evidence': {
+                'metadata_verified': True,
+                'pending_batch_count': pending_batch_count,
+                'completion_metadata': {
+                    'repair_started_at': repair_started_at.isoformat(),
+                    'rebuild_completed_at': rebuild_completed_at.isoformat(),
+                    'stage_ids': stage_ids,
+                },
+                'output_memberships': {
+                    stage_id: list(symbols)
+                    for stage_id, symbols in output_memberships.items()
+                    if isinstance(symbols, list)
+                },
+                'output_fingerprints': dict(output_fingerprints),
+            },
+        }
+        unit = {
+            'status': 'completed',
+            'item_sha256': item_sha256,
+            'dry_proof': dict(dry_proof),
+            'result': result,
+        }
+        if not self._completed_checkpoint_is_valid(unit, item):
+            return None
+        if not self._completed_live_state_is_valid(
+            unit,
+            item,
+            live_state=live_state,
+        ):
+            return None
+        return unit
+
     def _apply_date(
         self,
         item: Mapping[str, Any],
@@ -1506,6 +1759,59 @@ class ExactFactorBulkRepair:
                 'factor apply live output/source evidence does not match result'
             )
         return result
+
+    def _reconcile_applied_result(
+        self,
+        *,
+        item: Mapping[str, Any],
+        dry_proof: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Re-read exact durable rows after the outer fence exit failed."""
+
+        try:
+            live_state = self.completion_state_loader(
+                str(item['market_date']),
+                list(item['symbols']),
+            )
+            reconciled_unit = {
+                'dry_proof': dict(dry_proof),
+                'result': dict(result),
+            }
+            live_valid = bool(
+                self._completed_checkpoint_is_valid(
+                    reconciled_unit,
+                    item,
+                )
+                and self._completed_live_state_is_valid(
+                    reconciled_unit,
+                    item,
+                    live_state=live_state,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, {
+                'error_type': type(exc).__name__,
+                'error_message': str(exc)[:500],
+            }
+        memberships = live_state.get('output_memberships')
+        fingerprints = live_state.get('output_fingerprints')
+        return live_valid, {
+            'stage_symbol_counts': (
+                {
+                    stage_id: len(symbols)
+                    for stage_id, symbols in memberships.items()
+                    if isinstance(symbols, list)
+                }
+                if isinstance(memberships, Mapping)
+                else None
+            ),
+            'output_fingerprints': (
+                dict(fingerprints)
+                if isinstance(fingerprints, Mapping)
+                else None
+            ),
+        }
 
     def run(
         self,
@@ -1617,9 +1923,21 @@ class ExactFactorBulkRepair:
                     write_checkpoint(checkpoint_path, checkpoint)
                     continue
 
-            with self.guard_factory(
-                market_date=date.fromisoformat(market_date)
-            ) as guard:
+            applied_result: dict[str, Any] | None = None
+            reviewed_proof: dict[str, Any] | None = None
+            guard_exit_state: dict[str, Any] = {}
+            guard_context = (
+                capture_guard_transaction_failure(
+                    self.guard_factory,
+                    state=guard_exit_state,
+                    market_date=date.fromisoformat(market_date),
+                )
+                if apply
+                else self.guard_factory(
+                    market_date=date.fromisoformat(market_date)
+                )
+            )
+            with suppress(GuardTransactionExitError), guard_context as guard:
                 acquired, reason = guard
                 if not acquired:
                     return {
@@ -1694,6 +2012,37 @@ class ExactFactorBulkRepair:
                         'reason': 'reviewed_dry_proof_drift',
                         'market_date': market_date,
                     }
+                if previous.get('status') != 'completed':
+                    reconciled_unit = self._live_reconciliation_unit(
+                        item=item,
+                        item_sha256=item_sha256,
+                        dry_proof=reviewed_proof,
+                        live_state=current_state,
+                    )
+                    if reconciled_unit is not None:
+                        checkpoint['units'][market_date] = reconciled_unit
+                        try:
+                            write_checkpoint(checkpoint_path, checkpoint)
+                        except Exception as exc:  # noqa: BLE001
+                            return {
+                                **base,
+                                'status': 'partial',
+                                'applied': False,
+                                'reason': (
+                                    'checkpoint_write_failed_after_'
+                                    'live_reconciliation'
+                                ),
+                                'market_date': market_date,
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                                'uncertain_commit': False,
+                                'checkpoint_persisted': False,
+                                'reconciled_proof_count': 1,
+                                'retry_required': True,
+                            }
+                        completed_dates += 1
+                        skipped_dates += 1
+                        continue
                 completed_valid = False
                 if (
                     previous.get('status') == 'completed'
@@ -1720,7 +2069,7 @@ class ExactFactorBulkRepair:
                     skipped_dates += 1
                     continue
                 try:
-                    result = self._apply_date(
+                    applied_result = self._apply_date(
                         item,
                         reviewed_proof,
                         before_state=current_state,
@@ -1736,13 +2085,102 @@ class ExactFactorBulkRepair:
                     write_checkpoint(checkpoint_path, checkpoint)
                     failed_dates += 1
                     continue
+            guard_exit_error = guard_exit_state.get('error')
+            if isinstance(guard_exit_error, Exception):
+                live_valid = False
+                reconciliation: dict[str, Any] = {}
+                if applied_result is not None and reviewed_proof is not None:
+                    live_valid, reconciliation = (
+                        self._reconcile_applied_result(
+                            item=item,
+                            dry_proof=reviewed_proof,
+                            result=applied_result,
+                        )
+                    )
+                uncertain_attempt = {
+                    'reason': 'guard_transaction_exit_failed',
+                    'error_type': type(guard_exit_error).__name__,
+                    'error_message': str(guard_exit_error)[:500],
+                    'live_completion_verified': live_valid,
+                    'reconciliation': reconciliation,
+                }
+                uncertain_unit = (
+                    dict(previous)
+                    if isinstance(previous, Mapping)
+                    else {
+                        'status': 'uncertain',
+                        'item_sha256': item_sha256,
+                    }
+                )
+                uncertain_unit['last_uncertain_attempt'] = uncertain_attempt
+                checkpoint['units'][market_date] = uncertain_unit
+                checkpoint_error: Exception | None = None
+                try:
+                    write_checkpoint(checkpoint_path, checkpoint)
+                except Exception as exc:  # noqa: BLE001
+                    checkpoint_error = exc
+                uncertain_result = {
+                    **base,
+                    'status': 'partial' if live_valid else 'blocked',
+                    'applied': False,
+                    'reason': 'guard_transaction_exit_failed',
+                    'market_date': market_date,
+                    'error_type': type(guard_exit_error).__name__,
+                    'error_message': str(guard_exit_error)[:500],
+                    'uncertain_commit': True,
+                    'checkpoint_persisted': checkpoint_error is None,
+                    'reconciled_proof_count': int(live_valid),
+                    'retry_required': True,
+                    'reconciliation': reconciliation,
+                }
+                if checkpoint_error is not None:
+                    uncertain_result.update(
+                        {
+                            'checkpoint_error_type': type(
+                                checkpoint_error
+                            ).__name__,
+                            'checkpoint_error_message': str(
+                                checkpoint_error
+                            )[:500],
+                        }
+                    )
+                return uncertain_result
+            if applied_result is None or reviewed_proof is None:
+                return {
+                    **base,
+                    'status': 'blocked',
+                    'applied': False,
+                    'reason': 'factor_apply_result_missing',
+                    'market_date': market_date,
+                }
             checkpoint['units'][market_date] = {
                 'status': 'completed',
                 'item_sha256': item_sha256,
                 'dry_proof': reviewed_proof,
-                'result': result,
+                'result': applied_result,
             }
-            write_checkpoint(checkpoint_path, checkpoint)
+            try:
+                write_checkpoint(checkpoint_path, checkpoint)
+            except Exception as checkpoint_error:  # noqa: BLE001
+                live_valid, reconciliation = self._reconcile_applied_result(
+                    item=item,
+                    dry_proof=reviewed_proof,
+                    result=applied_result,
+                )
+                return {
+                    **base,
+                    'status': 'partial' if live_valid else 'blocked',
+                    'applied': False,
+                    'reason': 'checkpoint_write_failed_after_commit',
+                    'market_date': market_date,
+                    'error_type': type(checkpoint_error).__name__,
+                    'error_message': str(checkpoint_error)[:500],
+                    'uncertain_commit': True,
+                    'checkpoint_persisted': False,
+                    'reconciled_proof_count': int(live_valid),
+                    'retry_required': True,
+                    'reconciliation': reconciliation,
+                }
             completed_dates += 1
 
         if not apply:

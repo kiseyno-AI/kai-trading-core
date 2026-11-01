@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
@@ -11,6 +11,8 @@ from typing import Any
 from app.db import session_scope
 from app.db_models import DailyTrendingRank
 from app.eod.derived_stage_repair import (
+    GuardTransactionExitError,
+    capture_guard_transaction_failure,
     exact_derived_stage_guard,
     normalize_manifest,
 )
@@ -451,6 +453,41 @@ class ExactTrendingRankRepair:
             return False
         return True
 
+    def _reconcile_applied_result(
+        self,
+        *,
+        item: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Re-read durable exact rows after a fence/checkpoint uncertainty."""
+
+        reconciled_unit = {'result': dict(result)}
+        try:
+            live_valid = bool(
+                self._completed_checkpoint_is_valid(
+                    reconciled_unit,
+                    item,
+                )
+                and self._completed_live_state_is_valid(
+                    reconciled_unit,
+                    item,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, {
+                'error_type': type(exc).__name__,
+                'error_message': str(exc)[:500],
+            }
+        evidence = result.get('evidence')
+        return live_valid, {
+            'output_fingerprints': (
+                dict(evidence.get('output_fingerprints'))
+                if isinstance(evidence, Mapping)
+                and isinstance(evidence.get('output_fingerprints'), Mapping)
+                else None
+            )
+        }
+
     def run(
         self,
         *,
@@ -578,8 +615,14 @@ class ExactTrendingRankRepair:
                 failed_dates += 1
                 continue
 
-            with self.guard_factory(
-                market_date=date.fromisoformat(market_date)
+            result: dict[str, Any] | None = None
+            guard_exit_state: dict[str, Any] = {}
+            with suppress(
+                GuardTransactionExitError
+            ), capture_guard_transaction_failure(
+                self.guard_factory,
+                state=guard_exit_state,
+                market_date=date.fromisoformat(market_date),
             ) as guard:
                 acquired, reason = guard
                 if not acquired:
@@ -621,12 +664,104 @@ class ExactTrendingRankRepair:
                         'error_type': type(exc).__name__,
                         'error_message': str(exc)[:500],
                     }
+            guard_exit_error = guard_exit_state.get('error')
+            if isinstance(guard_exit_error, Exception):
+                live_valid = False
+                reconciliation: dict[str, Any] = {}
+                if result is not None:
+                    live_valid, reconciliation = (
+                        self._reconcile_applied_result(
+                            item=item,
+                            result=result,
+                        )
+                    )
+                uncertain_attempt = {
+                    'reason': 'guard_transaction_exit_failed',
+                    'error_type': type(guard_exit_error).__name__,
+                    'error_message': str(guard_exit_error)[:500],
+                    'result_status': (
+                        result.get('status')
+                        if isinstance(result, Mapping)
+                        else None
+                    ),
+                    'live_completion_verified': live_valid,
+                    'reconciliation': reconciliation,
+                }
+                uncertain_unit = (
+                    dict(previous)
+                    if isinstance(previous, Mapping)
+                    else {
+                        'status': 'uncertain',
+                        'item_sha256': item_sha256,
+                    }
+                )
+                uncertain_unit['last_uncertain_attempt'] = uncertain_attempt
+                checkpoint['units'][market_date] = uncertain_unit
+                checkpoint_error: Exception | None = None
+                try:
+                    write_checkpoint(checkpoint_path, checkpoint)
+                except Exception as exc:  # noqa: BLE001
+                    checkpoint_error = exc
+                response = {
+                    **base,
+                    'status': 'partial' if live_valid else 'blocked',
+                    'applied': False,
+                    'reason': 'guard_transaction_exit_failed',
+                    'market_date': market_date,
+                    'error_type': type(guard_exit_error).__name__,
+                    'error_message': str(guard_exit_error)[:500],
+                    'uncertain_commit': True,
+                    'checkpoint_persisted': checkpoint_error is None,
+                    'reconciled_proof_count': int(live_valid),
+                    'retry_required': True,
+                    'reconciliation': reconciliation,
+                }
+                if checkpoint_error is not None:
+                    response.update(
+                        {
+                            'checkpoint_error_type': type(
+                                checkpoint_error
+                            ).__name__,
+                            'checkpoint_error_message': str(
+                                checkpoint_error
+                            )[:500],
+                        }
+                    )
+                return response
+            if result is None:
+                return {
+                    **base,
+                    'status': 'blocked',
+                    'applied': False,
+                    'reason': 'trending_apply_result_missing',
+                    'market_date': market_date,
+                }
             checkpoint['units'][market_date] = {
                 'status': result['status'],
                 'item_sha256': item_sha256,
                 'result': result,
             }
-            write_checkpoint(checkpoint_path, checkpoint)
+            try:
+                write_checkpoint(checkpoint_path, checkpoint)
+            except Exception as checkpoint_error:  # noqa: BLE001
+                live_valid, reconciliation = self._reconcile_applied_result(
+                    item=item,
+                    result=result,
+                )
+                return {
+                    **base,
+                    'status': 'partial' if live_valid else 'blocked',
+                    'applied': False,
+                    'reason': 'checkpoint_write_failed_after_commit',
+                    'market_date': market_date,
+                    'error_type': type(checkpoint_error).__name__,
+                    'error_message': str(checkpoint_error)[:500],
+                    'uncertain_commit': True,
+                    'checkpoint_persisted': False,
+                    'reconciled_proof_count': int(live_valid),
+                    'retry_required': True,
+                    'reconciliation': reconciliation,
+                }
             if result['status'] == 'completed':
                 completed_dates += 1
             else:

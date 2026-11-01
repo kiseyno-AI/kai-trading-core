@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,6 +23,10 @@ from app.dart.signals_service import dart_signals_service
 from app.dart.signals_service import (
     DartSignalsService,
     build_authoritative_absence_audit_signal,
+)
+from app.eod.derived_stage_repair import (
+    GuardTransactionExitError,
+    capture_guard_transaction_failure,
 )
 from app.internal.exact_repair_manifest import (
     canonical_json_sha256,
@@ -146,6 +150,31 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             return {'receipt_date': '2026-10-28', **event}
 
         return load
+
+    def test_guard_exit_failure_cancels_continue_before_reconciliation(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        events = []
+        state = {}
+        for _ in range(1):
+            with suppress(
+                GuardTransactionExitError
+            ), capture_guard_transaction_failure(
+                failing_exit_guard,
+                state=state,
+            ):
+                events.append('continue_requested')
+                continue
+            events.append('reconciliation_reached')
+
+        self.assertEqual(
+            events,
+            ['continue_requested', 'reconciliation_reached'],
+        )
+        self.assertIsInstance(state.get('error'), SQLAlchemyError)
 
     def test_guard_owns_shared_audit_lock_without_nested_writer_deadlock(self):
         outer_session = MagicMock()
@@ -825,6 +854,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'partial')
         self.assertFalse(result['applied'])
         self.assertTrue(result['uncertain_commit'])
+        self.assertTrue(result['retry_required'])
         self.assertEqual(result['reconciled_proof_count'], 1)
         self.assertEqual(result['repair_committed_entry_count'], 1)
         self.assertEqual(
@@ -1160,6 +1190,43 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['reason'], 'active_writer:daily_pipeline_runs')
+        self.assertFalse(capture_called)
+
+    async def test_guard_exit_failure_cancels_active_writer_return(self):
+        entry = _entry('005930', 101, '20260301000001')
+        capture_called = False
+
+        async def capture(*, rcept_no: str):
+            nonlocal capture_called
+            capture_called = True
+            return {'rcept_no': rcept_no, 'audit_signal': {}}
+
+        @contextmanager
+        def failing_blocked_guard(**_kwargs):
+            yield False, 'active_writer:daily_pipeline_runs'
+            raise SQLAlchemyError('guard commit failed')
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            guard_factory=failing_blocked_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'guard_transaction_exit_failed')
+        self.assertEqual(result['error_type'], 'SQLAlchemyError')
+        self.assertTrue(result['uncertain_commit'])
+        self.assertTrue(result['retry_required'])
         self.assertFalse(capture_called)
 
     async def test_reviewed_replacement_lineage_is_bound_to_manifest(self):

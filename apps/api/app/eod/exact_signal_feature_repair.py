@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from copy import deepcopy
 from datetime import date, datetime, timezone
 import json
@@ -10,8 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, select, text
-from sqlalchemy.exc import SQLAlchemyError
-
 from app.db import session_scope
 from app.db_models import (
     DailyMarketRiskFilterResult,
@@ -19,6 +17,8 @@ from app.db_models import (
     Symbol,
 )
 from app.eod.derived_stage_repair import (
+    GuardTransactionExitError,
+    capture_guard_transaction_failure,
     exact_derived_stage_guard,
     normalize_manifest,
 )
@@ -536,22 +536,6 @@ def exact_signal_feature_guard(*, market_date: date):
         lock_symbol_writes=True,
     ) as guard:
         yield guard
-
-
-@contextmanager
-def _capture_guard_transaction_failure(
-    guard_factory: Callable[..., AbstractContextManager[Any]],
-    *,
-    state: dict[str, Any],
-    **guard_kwargs: Any,
-):
-    """Expose a post-yield guard DB failure without losing child commits."""
-
-    try:
-        with guard_factory(**guard_kwargs) as guard:
-            yield guard
-    except SQLAlchemyError as exc:
-        state['error'] = exc
 
 
 class ExactSignalFeatureRepair:
@@ -1252,7 +1236,9 @@ class ExactSignalFeatureRepair:
             applied_result: dict[str, Any] | None = None
             reviewed_proof: dict[str, Any] | None = None
             guard_exit_state: dict[str, Any] = {}
-            with _capture_guard_transaction_failure(
+            with suppress(
+                GuardTransactionExitError
+            ), capture_guard_transaction_failure(
                 self.guard_factory,
                 state=guard_exit_state,
                 market_date=date.fromisoformat(market_date),

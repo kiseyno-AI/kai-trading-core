@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from copy import deepcopy
 from datetime import date
 import json
@@ -30,6 +30,10 @@ from app.db_models import (
     DartFundamentalsCaptureRun,
     DartFundamentalsRefreshRun,
     EODCollectionRun,
+)
+from app.eod.derived_stage_repair import (
+    GuardTransactionExitError,
+    capture_guard_transaction_failure,
 )
 from app.eod.finality import validate_finalized_krx_write_date
 from app.internal.exact_repair_manifest import (
@@ -497,22 +501,6 @@ def exact_dart_audit_batch_guard(
                 if guard_yielded:
                     raise
                 yield False, 'writer_table_lock_unavailable'
-
-
-@contextmanager
-def _capture_guard_transaction_failure(
-    guard_factory: Callable[..., AbstractContextManager[Any]],
-    *,
-    state: dict[str, Any],
-    **guard_kwargs: Any,
-):
-    """Convert a post-yield guard DB failure into structured repair state."""
-
-    try:
-        with guard_factory(**guard_kwargs) as guard:
-            yield guard
-    except SQLAlchemyError as exc:
-        state['error'] = exc
 
 
 class ExactDartAuditSignalRepair:
@@ -1339,7 +1327,9 @@ class ExactDartAuditSignalRepair:
                         }
 
             guard_exit_state: dict[str, Any] = {}
-            with _capture_guard_transaction_failure(
+            with suppress(
+                GuardTransactionExitError
+            ), capture_guard_transaction_failure(
                 self.guard_factory,
                 state=guard_exit_state,
                 market_date=date.fromisoformat(self.manifest['market_date']),
@@ -1577,6 +1567,7 @@ class ExactDartAuditSignalRepair:
                     'error_type': type(guard_exit_error).__name__,
                     'error_message': str(guard_exit_error)[:500],
                     'uncertain_commit': True,
+                    'retry_required': True,
                     'reconciled_proof_count': len(reconciled_results),
                     'checkpoint_persisted': checkpoint_write_error is None,
                     **progress(reconciled_results),

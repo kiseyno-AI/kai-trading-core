@@ -9,11 +9,14 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.eod.derived_stage_repair import MANIFEST_SCHEMA_VERSION
 from app.eod.exact_factor_bulk_repair import (
     CHECKPOINT_SCHEMA_VERSION,
     FACTOR_PRICE_HISTORY_ROWS,
+    FACTOR_LIVE_RECONCILIATION_ORIGIN,
+    FACTOR_LIVE_RECONCILIATION_SCHEMA_VERSION,
     FACTOR_REPAIR_IMPLEMENTATION_CONTRACT,
     FACTOR_SOURCE_COMPONENTS,
     ExactFactorBulkRepair,
@@ -953,6 +956,108 @@ def test_failed_date_retries_from_reviewed_proof() -> None:
     assert first['status'] == 'partial'
     assert resumed['status'] == 'completed'
     assert service.apply_calls == 2
+
+
+def test_guard_exit_failure_reconciles_durable_factor_rows() -> None:
+    service = _RepairService()
+
+    @contextmanager
+    def failing_apply_exit_guard(**_kwargs):
+        yield True, None
+        if service.apply_calls:
+            raise SQLAlchemyError('guard commit failed')
+
+    repair = _repair(
+        service,
+        guard_factory=failing_apply_exit_guard,
+    )
+    with TemporaryDirectory() as directory:
+        checkpoint = Path(directory) / 'factor.json'
+        reviewed = repair.run(checkpoint_path=checkpoint)
+        result = repair.run(
+            apply=True,
+            expected_manifest_sha256=repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+        saved = json.loads(checkpoint.read_text())
+
+    assert reviewed['status'] == 'dry_run'
+    assert result['status'] == 'partial'
+    assert result['applied'] is False
+    assert result['reason'] == 'guard_transaction_exit_failed'
+    assert result['uncertain_commit'] is True
+    assert result['checkpoint_persisted'] is True
+    assert result['reconciled_proof_count'] == 1
+    assert saved['units'][MARKET_DATE]['last_uncertain_attempt'][
+        'live_completion_verified'
+    ] is True
+
+
+def test_checkpoint_failure_reconciles_durable_factor_rows() -> None:
+    service = _RepairService()
+    repair = _repair(service)
+    with TemporaryDirectory() as directory:
+        checkpoint = Path(directory) / 'factor.json'
+        reviewed = repair.run(checkpoint_path=checkpoint)
+        with patch(
+            'app.eod.exact_factor_bulk_repair.write_checkpoint',
+            side_effect=OSError('checkpoint disk unavailable'),
+        ):
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+    assert reviewed['status'] == 'dry_run'
+    assert result['status'] == 'partial'
+    assert result['applied'] is False
+    assert result['reason'] == 'checkpoint_write_failed_after_commit'
+    assert result['uncertain_commit'] is True
+    assert result['checkpoint_persisted'] is False
+    assert result['reconciled_proof_count'] == 1
+
+
+def test_reviewed_checkpoint_adopts_verified_live_completion_without_rerun() -> None:
+    service = _RepairService()
+
+    def completed_live_state(*_args):
+        state = _completion_state()
+        state['completion_metadata'] = {
+            'repair_started_at': '2026-11-01T01:00:00+00:00',
+            'rebuild_completed_at': '2026-11-01T01:03:00+00:00',
+            'stage_ids': list(FACTOR_RESULT_MODELS),
+        }
+        return state
+
+    repair = _repair(
+        service,
+        completion_state_loader=completed_live_state,
+    )
+    with TemporaryDirectory() as directory:
+        checkpoint = Path(directory) / 'factor.json'
+        reviewed = repair.run(checkpoint_path=checkpoint)
+        resumed = repair.run(
+            apply=True,
+            expected_manifest_sha256=repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+        saved = json.loads(checkpoint.read_text())
+
+    assert reviewed['status'] == 'dry_run'
+    assert resumed['status'] == 'completed'
+    assert resumed['skipped_dates'] == 1
+    assert service.apply_calls == 0
+    unit = saved['units'][MARKET_DATE]
+    assert unit['status'] == 'completed'
+    assert unit['result']['completion_origin'] == (
+        FACTOR_LIVE_RECONCILIATION_ORIGIN
+    )
+    assert unit['result']['completion_schema_version'] == (
+        FACTOR_LIVE_RECONCILIATION_SCHEMA_VERSION
+    )
+    assert 'stage_results' not in unit['result']
+    assert 'deleted_stale_row_count' not in json.dumps(unit['result'])
 
 
 def test_completed_checkpoint_reruns_after_live_factor_output_drift() -> None:

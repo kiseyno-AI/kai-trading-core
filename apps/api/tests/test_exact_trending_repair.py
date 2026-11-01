@@ -10,6 +10,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.eod.derived_stage_repair import MANIFEST_SCHEMA_VERSION
 from app.eod.exact_trending_repair import (
     ExactTrendingRankRepair,
@@ -247,6 +249,56 @@ class ExactTrendingRankRepairTests(unittest.TestCase):
             evidence_recorder.call_args.kwargs['exact_symbols'],
             SYMBOLS,
         )
+
+    def test_guard_exit_failure_reconciles_durable_trending_rows(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        repair = self._repair(guard_factory=failing_exit_guard)
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved = json.loads(checkpoint.read_text())
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'guard_transaction_exit_failed')
+        self.assertTrue(result['uncertain_commit'])
+        self.assertEqual(result['reconciled_proof_count'], 1)
+        self.assertTrue(
+            saved['units']['2026-10-28']['last_uncertain_attempt'][
+                'live_completion_verified'
+            ]
+        )
+
+    def test_checkpoint_failure_reconciles_durable_trending_rows(self):
+        repair = self._repair()
+        with (
+            TemporaryDirectory() as directory,
+            patch(
+                'app.eod.exact_trending_repair.write_checkpoint',
+                side_effect=OSError('checkpoint disk unavailable'),
+            ),
+        ):
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['reason'],
+            'checkpoint_write_failed_after_commit',
+        )
+        self.assertTrue(result['uncertain_commit'])
+        self.assertFalse(result['checkpoint_persisted'])
+        self.assertEqual(result['reconciled_proof_count'], 1)
 
     def test_completed_date_is_rebuilt_after_output_fingerprint_drift(self):
         live_fingerprints = _fingerprints()

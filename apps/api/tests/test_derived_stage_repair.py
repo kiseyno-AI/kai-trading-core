@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.eod.derived_stage_repair import (
+    DERIVED_GUARD_IDLE_TRANSACTION_TIMEOUT_MS,
     ExactDerivedStageRepair,
+    GuardTransactionExitError,
     MANIFEST_SCHEMA_VERSION,
+    capture_guard_transaction_failure,
     exact_derived_stage_guard,
 )
 from app.eod.market_membership import market_membership_sha256
@@ -122,6 +128,9 @@ class _GuardSession:
 
     def execute(self, statement, *_args, **_kwargs):
         rendered = str(statement)
+        if rendered.startswith('SET LOCAL idle_in_transaction_session_timeout'):
+            self.events.append(rendered)
+            return None
         if rendered.startswith('LOCK TABLE'):
             self.events.append(
                 'symbol_writers_locked'
@@ -137,6 +146,68 @@ class _GuardSession:
 
 
 class ExactDerivedStageRepairTests(unittest.TestCase):
+    def test_guard_failure_capture_does_not_swallow_entry_sql_error(self):
+        @contextmanager
+        def failing_entry_guard(**_kwargs):
+            raise SQLAlchemyError('entry failed')
+            yield True, None
+
+        state = {}
+        with self.assertRaisesRegex(SQLAlchemyError, 'entry failed'):
+            with capture_guard_transaction_failure(
+                failing_entry_guard,
+                state=state,
+            ):
+                pass
+
+        self.assertEqual(state, {})
+
+    def test_guard_failure_capture_does_not_swallow_body_sql_error(self):
+        @contextmanager
+        def healthy_guard(**_kwargs):
+            yield True, None
+
+        state = {}
+        with self.assertRaisesRegex(SQLAlchemyError, 'body failed'):
+            with capture_guard_transaction_failure(
+                healthy_guard,
+                state=state,
+            ):
+                raise SQLAlchemyError('body failed')
+
+        self.assertEqual(state, {})
+
+    def test_guard_failure_capture_marks_post_yield_sql_error(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('exit failed')
+
+        state = {}
+        with self.assertRaises(GuardTransactionExitError):
+            with capture_guard_transaction_failure(
+                failing_exit_guard,
+                state=state,
+            ):
+                pass
+
+        self.assertIsInstance(state.get('error'), SQLAlchemyError)
+
+    def test_guard_rejects_unbounded_or_role_default_idle_budget(self):
+        with patch(
+            'app.eod.derived_stage_repair.'
+            'DERIVED_GUARD_IDLE_TRANSACTION_TIMEOUT_MS',
+            60_000,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                'idle transaction budget is invalid',
+            ):
+                with exact_derived_stage_guard(
+                    market_date=date(2026, 10, 28)
+                ):
+                    pass
+
     def test_guard_requires_global_price_writer_admission_for_history_reads(self):
         observed = {}
 
@@ -209,6 +280,18 @@ class ExactDerivedStageRepairTests(unittest.TestCase):
         self.assertLess(
             events.index('repair_body'),
             events.index('writer_session_released'),
+        )
+        self.assertIn(
+            'SET LOCAL idle_in_transaction_session_timeout '
+            f'= {DERIVED_GUARD_IDLE_TRANSACTION_TIMEOUT_MS}',
+            events,
+        )
+        self.assertLess(
+            events.index(
+                'SET LOCAL idle_in_transaction_session_timeout '
+                f'= {DERIVED_GUARD_IDLE_TRANSACTION_TIMEOUT_MS}'
+            ),
+            events.index('writer_tables_locked'),
         )
 
     def test_factor_guard_blocks_global_symbol_writers_through_repair_body(self):
@@ -384,6 +467,196 @@ class ExactDerivedStageRepairTests(unittest.TestCase):
             action_runner.call_args.kwargs['exact_scope_symbols'],
             SYMBOLS,
         )
+
+    def test_guard_exit_failure_reconciles_durable_derived_rows(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        repair = ExactDerivedStageRepair(
+            _manifest(),
+            price_runner=Mock(
+                return_value=_stage_result(
+                    SYMBOLS,
+                    stage_id='price_contexts',
+                )
+            ),
+            technical_runner=Mock(
+                return_value=_stage_result(
+                    SYMBOLS,
+                    stage_id='technical_snapshots',
+                )
+            ),
+            action_runner=Mock(
+                return_value=_stage_result(
+                    SYMBOLS,
+                    stage_id='action_summaries',
+                )
+            ),
+            stored_symbols_loader=lambda _market_date: SYMBOLS,
+            completion_state_loader=lambda *_args: _completion_state(),
+            guard_factory=failing_exit_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved = json.loads(checkpoint.read_text())
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'guard_transaction_exit_failed')
+        self.assertTrue(result['uncertain_commit'])
+        self.assertEqual(result['reconciled_proof_count'], 1)
+        self.assertTrue(
+            saved['units']['2026-10-28']['last_uncertain_attempt'][
+                'live_completion_verified'
+            ]
+        )
+
+    def test_guard_exit_failure_cancels_active_writer_return(self):
+        @contextmanager
+        def failing_blocked_guard(**_kwargs):
+            yield False, 'active_writer'
+            raise SQLAlchemyError('guard commit failed')
+
+        repair = ExactDerivedStageRepair(
+            _manifest(),
+            price_runner=Mock(),
+            technical_runner=Mock(),
+            action_runner=Mock(),
+            stored_symbols_loader=lambda _market_date: SYMBOLS,
+            guard_factory=failing_blocked_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'guard_transaction_exit_failed')
+        self.assertEqual(result['error_type'], 'SQLAlchemyError')
+        self.assertTrue(result['uncertain_commit'])
+
+    def test_guard_exit_failure_cancels_completed_checkpoint_continue(self):
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        price_runner = Mock(
+            return_value=_stage_result(
+                SYMBOLS,
+                stage_id='price_contexts',
+            )
+        )
+        technical_runner = Mock(
+            return_value=_stage_result(
+                SYMBOLS,
+                stage_id='technical_snapshots',
+            )
+        )
+        action_runner = Mock(
+            return_value=_stage_result(
+                SYMBOLS,
+                stage_id='action_summaries',
+            )
+        )
+        common_kwargs = {
+            'price_runner': price_runner,
+            'technical_runner': technical_runner,
+            'action_runner': action_runner,
+            'stored_symbols_loader': lambda _market_date: SYMBOLS,
+            'completion_state_loader': lambda *_args: _completion_state(),
+            'finality_validator': lambda _market_date: None,
+        }
+        initial = ExactDerivedStageRepair(
+            _manifest(),
+            guard_factory=_guard,
+            **common_kwargs,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            completed = initial.run(
+                apply=True,
+                expected_manifest_sha256=initial.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            resumed = ExactDerivedStageRepair(
+                _manifest(),
+                guard_factory=failing_exit_guard,
+                **common_kwargs,
+            ).run(
+                apply=True,
+                expected_manifest_sha256=initial.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+        self.assertEqual(completed['status'], 'completed')
+        self.assertEqual(resumed['status'], 'blocked')
+        self.assertEqual(
+            resumed['reason'],
+            'guard_transaction_exit_failed',
+        )
+        self.assertEqual(resumed['error_type'], 'SQLAlchemyError')
+        self.assertEqual(price_runner.call_count, 1)
+        self.assertEqual(technical_runner.call_count, 1)
+        self.assertEqual(action_runner.call_count, 1)
+
+    def test_checkpoint_failure_reconciles_durable_derived_rows(self):
+        repair = ExactDerivedStageRepair(
+            _manifest(),
+            price_runner=Mock(
+                return_value=_stage_result(
+                    SYMBOLS,
+                    stage_id='price_contexts',
+                )
+            ),
+            technical_runner=Mock(
+                return_value=_stage_result(
+                    SYMBOLS,
+                    stage_id='technical_snapshots',
+                )
+            ),
+            action_runner=Mock(
+                return_value=_stage_result(
+                    SYMBOLS,
+                    stage_id='action_summaries',
+                )
+            ),
+            stored_symbols_loader=lambda _market_date: SYMBOLS,
+            completion_state_loader=lambda *_args: _completion_state(),
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with (
+            TemporaryDirectory() as directory,
+            patch(
+                'app.eod.derived_stage_repair.write_checkpoint',
+                side_effect=OSError('checkpoint disk unavailable'),
+            ),
+        ):
+            result = repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['reason'],
+            'checkpoint_write_failed_after_commit',
+        )
+        self.assertTrue(result['uncertain_commit'])
+        self.assertFalse(result['checkpoint_persisted'])
+        self.assertEqual(result['reconciled_proof_count'], 1)
 
     def test_dry_run_validates_scope_without_running_stages(self):
         price_runner = Mock()
