@@ -6,6 +6,7 @@ import unittest
 import zipfile
 from contextlib import contextmanager
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -26,6 +27,7 @@ from app.dart.signals_service import (
     AUDIT_SIGNAL_WRITER_LOCK_KEY,
     DartSignalsRepository,
     DartSignalsService,
+    ParsedAuditSignal,
     _decode_document_text,
     audit_signal_writer_lock_owner,
     build_authoritative_absence_audit_signal,
@@ -1360,6 +1362,282 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             'auditor_report_unmodified_opinion_v1',
         )
 
+    async def test_modified_semantic_opinion_outranks_unmodified_narrative(self):
+        cases = (
+            ('한정의견', 'qualified'),
+            ('부적정의견', 'adverse'),
+            ('의견거절', 'disclaimer'),
+        )
+        for semantic_opinion, expected_code in cases:
+            with self.subTest(semantic_opinion=semantic_opinion):
+                result = await DartSignalsService(
+                    client=FakeSignalsClient(
+                        members=[
+                            (
+                                'reports/annual-audit.xml',
+                                _unmodified_auditor_report_document(),
+                            ),
+                            (
+                                'reports/business-report.xml',
+                                _semantic_audit_document(
+                                    ('제30기(당기)', semantic_opinion)
+                                ),
+                            ),
+                        ]
+                    )
+                )._extract_audit_signal(
+                    {
+                        'rcept_no': '20260319000273',
+                        'report_nm': '사업보고서',
+                    }
+                )
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.opinion_code, expected_code)
+                self.assertTrue(result.has_audit_issue)
+                self.assertEqual(
+                    result.payload['parser'],
+                    'semantic_audit_table_v1',
+                )
+
+    async def test_scoped_audit_capture_revalidates_before_persistence(self):
+        repository = MagicMock()
+        repository.audit_capture_scope_matches.return_value = False
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    (
+                        'reports/annual-audit.xml',
+                        _unmodified_auditor_report_document(),
+                    )
+                ]
+            ),
+            repository=repository,
+        )
+        event = {
+            'id': 101,
+            'rcept_no': '20260319000274',
+            'corp_code': '00126380',
+            'stock_code': '005930',
+            'corp_name': '삼성전자',
+            'receipt_date': date(2026, 3, 19),
+            'report_nm': '사업보고서 (2025.12)',
+            'filing_category': 'annual_report',
+            'payload': {},
+        }
+
+        with patch.object(service, '_load_event', return_value=event):
+            with self.assertRaisesRegex(
+                ValueError,
+                'selected annual audit candidate changed',
+            ):
+                await service.capture_audit_signal_for_event(
+                    rcept_no=event['rcept_no'],
+                    selected_candidate_identity={
+                        'event_id': 101,
+                        'rcept_no': event['rcept_no'],
+                        'stock_code': event['stock_code'],
+                    },
+                    selected_candidate_market_date=date(2026, 10, 30),
+                )
+
+        repository.audit_capture_scope_matches.assert_called_once()
+
+    async def test_reviewed_replacement_projects_parsed_opinion_to_target(self):
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/audit.xml', _audit_document('적정의견'))]
+            ),
+            repository=MagicMock(),
+        )
+        source_event = {
+            'id': 102,
+            'rcept_no': '20260318000002',
+            'corp_code': '00126380',
+            'stock_code': '005930',
+            'corp_name': '삼성전자',
+            'receipt_date': date(2026, 3, 18),
+            'report_nm': '감사보고서 replacement',
+            'filing_category': 'audit_report',
+            'payload': {},
+        }
+        target_event = {
+            **source_event,
+            'id': 101,
+            'rcept_no': '20260319000001',
+            'receipt_date': date(2026, 3, 19),
+            'report_nm': '사업보고서 (2025.12)',
+            'filing_category': 'annual_report',
+        }
+        events = {
+            source_event['rcept_no']: source_event,
+            target_event['rcept_no']: target_event,
+        }
+        replacement_target = {
+            'event_id': target_event['id'],
+            'rcept_no': target_event['rcept_no'],
+            'stock_code': target_event['stock_code'],
+            'source_error_code': '014',
+            'reason': 'reviewed source document is unavailable',
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_event',
+                side_effect=lambda rcept_no: events[rcept_no],
+            ),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=source_event['rcept_no'],
+                selected_candidate_identity={
+                    key: replacement_target[key]
+                    for key in ('event_id', 'rcept_no', 'stock_code')
+                },
+                selected_candidate_market_date=date(2026, 10, 30),
+                replacement_target_identity=replacement_target,
+                replacement_manifest_sha256='a' * 64,
+            )
+
+        stored = store_signals.call_args.kwargs
+        self.assertEqual(stored['event'], target_event)
+        self.assertEqual(stored['expected_event'], source_event)
+        self.assertEqual(stored['expected_persistence_event'], target_event)
+        projected = stored['audit_signal']
+        self.assertEqual(
+            classify_durable_audit_signal(
+                projected,
+                event_id=target_event['id'],
+                rcept_no=target_event['rcept_no'],
+                receipt_date=target_event['receipt_date'],
+            ),
+            'parsed_opinion',
+        )
+        lineage = projected.payload['replacement_lineage']
+        self.assertEqual(lineage['source']['event_id'], source_event['id'])
+        self.assertEqual(lineage['target']['event_id'], target_event['id'])
+        self.assertEqual(lineage['manifest_sha256'], 'a' * 64)
+        self.assertEqual(result['persisted_rcept_no'], target_event['rcept_no'])
+
+        tampered = dict(projected.__dict__)
+        tampered['payload'] = dict(projected.payload)
+        tampered['payload']['replacement_lineage'] = dict(lineage)
+        tampered['payload']['replacement_lineage']['reason'] = 'tampered'
+        self.assertIsNone(
+            classify_durable_audit_signal(
+                tampered,
+                event_id=target_event['id'],
+                rcept_no=target_event['rcept_no'],
+                receipt_date=target_event['receipt_date'],
+            )
+        )
+
+        missing_replacement = dict(projected.__dict__)
+        missing_replacement['payload'] = dict(projected.payload)
+        missing_replacement['payload'].pop('replacement_lineage')
+        self.assertIsNone(
+            classify_durable_audit_signal(
+                missing_replacement,
+                event_id=target_event['id'],
+                rcept_no=target_event['rcept_no'],
+                receipt_date=target_event['receipt_date'],
+            )
+        )
+
+    async def test_replacement_never_projects_authoritative_absence(self):
+        service = DartSignalsService(client=MagicMock(), repository=MagicMock())
+        source_event = _audit_event(event_id=102, rcept_no='20260318000002')
+        target_event = {
+            **source_event,
+            'id': 101,
+            'rcept_no': '20260319000001',
+            'receipt_date': date(2026, 3, 19),
+        }
+        source_event['receipt_date'] = date(2026, 3, 18)
+        events = {
+            source_event['rcept_no']: source_event,
+            target_event['rcept_no']: target_event,
+        }
+        with (
+            patch.object(
+                service,
+                '_load_event',
+                side_effect=lambda rcept_no: events[rcept_no],
+            ),
+            patch.object(
+                service,
+                '_extract_audit_signal_with_diagnostics',
+                new=AsyncMock(
+                    return_value=(None, _complete_negative_audit_diagnostics())
+                ),
+            ),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                'absence evidence cannot be projected',
+            ):
+                await service.capture_audit_signal_for_event(
+                    rcept_no=source_event['rcept_no'],
+                    selected_candidate_identity={
+                        'event_id': target_event['id'],
+                        'rcept_no': target_event['rcept_no'],
+                        'stock_code': target_event['stock_code'],
+                    },
+                    selected_candidate_market_date=date(2026, 10, 30),
+                    replacement_target_identity={
+                        'event_id': target_event['id'],
+                        'rcept_no': target_event['rcept_no'],
+                        'stock_code': target_event['stock_code'],
+                        'source_error_code': '014',
+                        'reason': 'reviewed source document is unavailable',
+                    },
+                    replacement_manifest_sha256='b' * 64,
+                )
+
+        store_signals.assert_not_called()
+
+    async def test_exact_direct_authoritative_absence_carries_repair_lineage(self):
+        service = DartSignalsService(client=MagicMock(), repository=MagicMock())
+        event = _audit_event()
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(
+                service,
+                '_extract_audit_signal_with_diagnostics',
+                new=AsyncMock(
+                    return_value=(None, _complete_negative_audit_diagnostics())
+                ),
+            ),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no'],
+                selected_candidate_identity={
+                    'event_id': event['id'],
+                    'rcept_no': event['rcept_no'],
+                    'stock_code': event['stock_code'],
+                },
+                selected_candidate_market_date=date(2026, 10, 30),
+                repair_manifest_sha256='c' * 64,
+            )
+
+        signal = store_signals.call_args.kwargs['audit_signal']
+        lineage = signal.payload['exact_repair_lineage']
+        self.assertEqual(lineage['manifest_sha256'], 'c' * 64)
+        self.assertEqual(lineage['mode'], 'direct')
+        self.assertEqual(
+            classify_durable_audit_signal(
+                signal,
+                event_id=event['id'],
+                rcept_no=event['rcept_no'],
+                receipt_date=event['receipt_date'],
+            ),
+            'authoritative_absence',
+        )
+        self.assertTrue(result['audit_signal_evaluated'])
+
     async def test_auditor_report_narrative_requires_direct_report_authority(self):
         internal_control_only = (
             '<DOCUMENT>'
@@ -1860,6 +2138,66 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_incomplete_parse_reuses_durable_exact_repair_signal(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        event = _audit_event(rcept_no='20250325000543')
+        stored = _durable_unqualified_audit_signal()
+        stored['payload']['exact_repair_lineage'] = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': 'a' * 64,
+            'source': {'rcept_no': event['rcept_no']},
+            'target': {'rcept_no': event['rcept_no']},
+            'mode': 'direct',
+            'lineage_sha256': 'b' * 64,
+        }
+        durable_signal = ParsedAuditSignal(**stored)
+        incomplete_diagnostics = {
+            'member_count': 1,
+            'decoded_member_count': 0,
+            'positive_authority_evidence_count': 0,
+            'negative_authority_evidence_count': 0,
+            'ambiguous_authority_evidence_count': 1,
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(
+                service,
+                '_extract_audit_signal_with_diagnostics',
+                new=AsyncMock(
+                    return_value=(None, incomplete_diagnostics)
+                ),
+            ),
+            patch.object(
+                service,
+                '_extract_dilution_signal',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_store_signals',
+                return_value=durable_signal,
+            ) as store_signals,
+        ):
+            result = await service.capture_signals_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertTrue(result['audit_signal_evaluated'])
+        self.assertEqual(
+            result['audit_signal']['payload']['exact_repair_lineage'],
+            stored['payload']['exact_repair_lineage'],
+        )
+        self.assertNotIn('audit_diagnostics', result)
+        self.assertTrue(
+            store_signals.call_args.kwargs[
+                'reuse_protected_existing_audit'
+            ]
+        )
+
     async def test_explicit_current_opinion_wins_over_prior_only_document(self):
         prior_only = _semantic_audit_document(
             ('제9기(전기)', '의견거절'),
@@ -2069,14 +2407,145 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
                 audit_signal_evaluated=True,
             )
 
-        self.assertEqual(session.execute.call_count, 2)
-        lock_call, upsert_call = session.execute.call_args_list
+        self.assertEqual(session.execute.call_count, 3)
+        lock_call, existing_call, upsert_call = session.execute.call_args_list
         self.assertIn('pg_advisory_xact_lock', str(lock_call.args[0]))
         self.assertEqual(
             lock_call.args[1],
             {'audit_signal_writer_lock_key': AUDIT_SIGNAL_WRITER_LOCK_KEY},
         )
+        self.assertTrue(existing_call.args[0].is_select)
         self.assertTrue(upsert_call.args[0].is_insert)
+
+    def test_ordinary_capture_cannot_overwrite_exact_repair_lineage(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        event = _audit_event()
+        identity = {
+            'event_id': event['id'],
+            'rcept_no': event['rcept_no'],
+            'stock_code': event['stock_code'],
+            'receipt_date': event['receipt_date'].isoformat(),
+        }
+        lineage = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': 'a' * 64,
+            'source': identity,
+            'target': identity,
+            'mode': 'direct',
+        }
+        lineage['lineage_sha256'] = hashlib.sha256(
+            json.dumps(
+                lineage,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        stored = _durable_unqualified_audit_signal()
+        stored['payload']['exact_repair_lineage'] = lineage
+        existing = SimpleNamespace(
+            disclosure_event_id=event['id'],
+            rcept_no=event['rcept_no'],
+            receipt_date=event['receipt_date'],
+            **stored,
+        )
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = 'postgresql'
+        lock_result = MagicMock()
+        existing_result = MagicMock()
+        existing_result.scalar_one_or_none.return_value = existing
+        session.execute.side_effect = [lock_result, existing_result]
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        incoming = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
+        with patch(
+            'app.dart.signals_service.session_scope',
+            return_value=context,
+        ):
+            stored_signal = service._store_signals(
+                event=event,
+                audit_signal=incoming,
+                dilution_signal=None,
+                audit_signal_evaluated=True,
+            )
+
+        self.assertEqual(session.execute.call_count, 2)
+        self.assertTrue(session.execute.call_args_list[1].args[0].is_select)
+        self.assertEqual(stored_signal.payload, stored['payload'])
+
+    def test_incomplete_ordinary_capture_reads_protected_exact_repair_lineage(
+        self,
+    ):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        event = _audit_event(rcept_no='20250325000544')
+        identity = {
+            'event_id': event['id'],
+            'rcept_no': event['rcept_no'],
+            'stock_code': event['stock_code'],
+            'receipt_date': event['receipt_date'].isoformat(),
+        }
+        lineage = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': 'a' * 64,
+            'source': identity,
+            'target': identity,
+            'mode': 'direct',
+        }
+        lineage['lineage_sha256'] = hashlib.sha256(
+            json.dumps(
+                lineage,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        stored = _durable_unqualified_audit_signal()
+        stored['payload']['exact_repair_lineage'] = lineage
+        existing = SimpleNamespace(
+            disclosure_event_id=event['id'],
+            rcept_no=event['rcept_no'],
+            receipt_date=event['receipt_date'],
+            **stored,
+        )
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = 'postgresql'
+        existing_result = MagicMock()
+        existing_result.scalar_one_or_none.return_value = existing
+        session.execute.side_effect = [MagicMock(), existing_result]
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        with patch(
+            'app.dart.signals_service.session_scope',
+            return_value=context,
+        ):
+            stored_signal = service._store_signals(
+                event=event,
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=False,
+                reuse_protected_existing_audit=True,
+            )
+
+        self.assertEqual(session.execute.call_count, 2)
+        self.assertIn(
+            'pg_advisory_xact_lock',
+            str(session.execute.call_args_list[0].args[0]),
+        )
+        self.assertTrue(session.execute.call_args_list[1].args[0].is_select)
+        self.assertEqual(stored_signal.payload, stored['payload'])
 
     def test_store_signals_rejects_malformed_authoritative_absence(self):
         service = DartSignalsService(
@@ -2132,8 +2601,9 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
                 audit_signal_evaluated=True,
             )
 
-        session.execute.assert_called_once()
-        self.assertTrue(session.execute.call_args.args[0].is_insert)
+        self.assertEqual(session.execute.call_count, 2)
+        self.assertTrue(session.execute.call_args_list[0].args[0].is_select)
+        self.assertTrue(session.execute.call_args_list[1].args[0].is_insert)
 
     def test_dilution_only_mutation_uses_shared_dart_signal_writer_lock(self):
         service = DartSignalsService(
@@ -3286,7 +3756,7 @@ class DartSignalsRepositoryPostgresTests(unittest.TestCase):
                 return resolved_event, snapshot
 
             eligible = add_symbol('A')
-            _, eligible_snapshot = add_snapshot(
+            eligible_event, eligible_snapshot = add_snapshot(
                 eligible,
                 business_year=2098,
                 receipt_date=date(2099, 3, 1),
@@ -3310,7 +3780,7 @@ class DartSignalsRepositoryPostgresTests(unittest.TestCase):
             )
 
             corrected = add_symbol('D')
-            add_snapshot(
+            corrected_stale_event, _ = add_snapshot(
                 corrected,
                 business_year=2098,
                 receipt_date=date(2099, 3, 1),
@@ -3398,6 +3868,16 @@ class DartSignalsRepositoryPostgresTests(unittest.TestCase):
                         market_date=market_date,
                         limit=100,
                     )
+                    selected_rows = (
+                        repository.list_selected_annual_audit_signal_candidates(
+                            market_date=market_date,
+                            event_ids=[
+                                eligible_event.id,
+                                audited_event.id,
+                                corrected_stale_event.id,
+                            ],
+                        )
+                    )
 
                 rows_by_symbol = {row['stock_code']: row for row in rows}
                 self.assertEqual(
@@ -3430,6 +3910,10 @@ class DartSignalsRepositoryPostgresTests(unittest.TestCase):
                 )
                 self.assertEqual(rows_by_symbol[latest_year.symbol]['business_year'], 2098)
                 self.assertNotIn(audited.symbol, rows_by_symbol)
+                self.assertEqual(
+                    {row['event_id'] for row in selected_rows},
+                    {eligible_event.id, audited_event.id},
+                )
             finally:
                 session.close()
                 transaction.rollback()

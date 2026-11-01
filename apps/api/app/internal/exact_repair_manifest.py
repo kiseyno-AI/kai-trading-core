@@ -1,10 +1,40 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
+
+
+@contextmanager
+def checkpoint_file_lock(path: str | Path):
+    """Hold a non-blocking process lock for one checkpoint contract.
+
+    Atomic replacement prevents torn JSON, but it does not prevent two repair
+    processes from overwriting each other's newer units.  A stable sidecar is
+    therefore locked for the entire apply run; it is intentionally retained so
+    no unlink/recreate race can split lock ownership.
+    """
+
+    resolved = Path(path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = resolved.with_name(f'.{resolved.name}.lock')
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def canonical_json_sha256(value: Any) -> str:

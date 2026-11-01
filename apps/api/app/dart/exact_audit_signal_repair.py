@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from datetime import date
@@ -16,6 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.settings import settings
 from app.dart.signals_service import (
     AUDIT_SIGNAL_WRITER_LOCK_KEY,
+    DartSignalsRepository,
     audit_signal_writer_lock_owner,
     classify_durable_audit_signal,
     dart_signals_service,
@@ -33,6 +34,7 @@ from app.db_models import (
 from app.eod.finality import validate_finalized_krx_write_date
 from app.internal.exact_repair_manifest import (
     canonical_json_sha256,
+    checkpoint_file_lock,
     load_checkpoint,
     load_json_mapping,
     write_checkpoint,
@@ -161,6 +163,8 @@ def normalize_manifest(raw: Mapping[str, Any]) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     event_ids: set[int] = set()
     rcept_nos: set[str] = set()
+    replacement_target_event_ids: set[int] = set()
+    replacement_target_rcept_nos: set[str] = set()
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, Mapping):
             raise ValueError('every manifest entry must be an object')
@@ -205,7 +209,29 @@ def normalize_manifest(raw: Mapping[str, Any]) -> dict[str, Any]:
                 'source_error_code': REPLACEMENT_SOURCE_ERROR_CODE,
                 'reason': reason,
             }
+            if replacement['event_id'] in replacement_target_event_ids:
+                raise ValueError(
+                    'manifest contains duplicate replacement target event_id '
+                    'values'
+                )
+            if replacement['rcept_no'] in replacement_target_rcept_nos:
+                raise ValueError(
+                    'manifest contains duplicate replacement target rcept_no '
+                    'values'
+                )
+            replacement_target_event_ids.add(replacement['event_id'])
+            replacement_target_rcept_nos.add(replacement['rcept_no'])
         entries.append(entry)
+
+    if replacement_target_event_ids.intersection(event_ids):
+        raise ValueError(
+            'replacement target event cannot also be a manifest source event'
+        )
+    if replacement_target_rcept_nos.intersection(rcept_nos):
+        raise ValueError(
+            'replacement target rcept_no cannot also be a manifest source '
+            'rcept_no'
+        )
 
     return {
         'schema_version': MANIFEST_SCHEMA_VERSION,
@@ -294,6 +320,33 @@ def _load_audit_terminal_state(
             'audit_content': audit_content,
             'audit_content_sha256': canonical_json_sha256(audit_content),
         }
+
+
+def _load_current_selected_annual_candidate_scope(
+    market_date: date,
+    entries: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    event_ids = [int(entry['event_id']) for entry in entries]
+    rows = DartSignalsRepository().list_selected_annual_audit_signal_candidates(
+        market_date=market_date,
+        event_ids=event_ids,
+    )
+    return [_normalize_event_identity(row) for row in rows]
+
+
+def _load_current_missing_annual_candidate_scope(
+    market_date: date,
+    entries: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    event_ids = [int(entry['event_id']) for entry in entries]
+    rows = (
+        DartSignalsRepository()
+        .list_missing_selected_annual_audit_signal_candidates(
+            market_date=market_date,
+            event_ids=event_ids,
+        )
+    )
+    return [_normalize_event_identity(row) for row in rows]
 
 
 def _active_writer_counts(session: Any) -> dict[str, int]:
@@ -446,6 +499,22 @@ def exact_dart_audit_batch_guard(
                 yield False, 'writer_table_lock_unavailable'
 
 
+@contextmanager
+def _capture_guard_transaction_failure(
+    guard_factory: Callable[..., AbstractContextManager[Any]],
+    *,
+    state: dict[str, Any],
+    **guard_kwargs: Any,
+):
+    """Convert a post-yield guard DB failure into structured repair state."""
+
+    try:
+        with guard_factory(**guard_kwargs) as guard:
+            yield guard
+    except SQLAlchemyError as exc:
+        state['error'] = exc
+
+
 class ExactDartAuditSignalRepair:
     def __init__(
         self,
@@ -457,16 +526,56 @@ class ExactDartAuditSignalRepair:
             [Mapping[str, Any]], Mapping[str, Any] | None
         ]
         | None = None,
+        candidate_scope_loader: Callable[
+            [date, list[Mapping[str, Any]]], list[Mapping[str, Any]]
+        ]
+        | None = None,
+        selected_candidate_scope_loader: Callable[
+            [date, list[Mapping[str, Any]]], list[Mapping[str, Any]]
+        ]
+        | None = None,
+        missing_candidate_scope_loader: Callable[
+            [date, list[Mapping[str, Any]]], list[Mapping[str, Any]]
+        ]
+        | None = None,
         guard_factory: Callable[..., AbstractContextManager[Any]] | None = None,
         finality_validator: Callable[[date], None] | None = None,
     ) -> None:
         self.manifest = normalize_manifest(manifest)
         self.manifest_sha256 = canonical_json_sha256(self.manifest)
+        self._uses_scoped_production_capture = capture is None
         self.capture = capture or dart_signals_service.capture_audit_signal_for_event
         self.event_loader = event_loader or _load_event_identity
+        self._uses_storage_terminal_state_loader = terminal_state_loader is None
         self.terminal_state_loader = (
             terminal_state_loader or _load_audit_terminal_state
         )
+        if candidate_scope_loader is not None:
+            self.selected_candidate_scope_loader = candidate_scope_loader
+            self.missing_candidate_scope_loader = candidate_scope_loader
+        elif event_loader is None:
+            self.selected_candidate_scope_loader = (
+                _load_current_selected_annual_candidate_scope
+            )
+            self.missing_candidate_scope_loader = (
+                _load_current_missing_annual_candidate_scope
+            )
+        else:
+            # Injected event loaders are a test seam.  Production construction
+            # always uses the storage-backed current-scope loader above.
+            identity_loader = lambda _market_date, entries: [
+                dict(entry) for entry in entries
+            ]
+            self.selected_candidate_scope_loader = identity_loader
+            self.missing_candidate_scope_loader = identity_loader
+        if selected_candidate_scope_loader is not None:
+            self.selected_candidate_scope_loader = (
+                selected_candidate_scope_loader
+            )
+        if missing_candidate_scope_loader is not None:
+            self.missing_candidate_scope_loader = (
+                missing_candidate_scope_loader
+            )
         self.guard_factory = guard_factory or exact_dart_audit_batch_guard
         self.finality_validator = finality_validator or (
             lambda market_date: validate_finalized_krx_write_date(
@@ -474,6 +583,64 @@ class ExactDartAuditSignalRepair:
                 operation='exact DART audit-signal repair',
             )
         )
+
+    @staticmethod
+    def _candidate_scope_anchor(entry: Mapping[str, Any]) -> dict[str, Any]:
+        replacement = entry.get('replacement_for')
+        if isinstance(replacement, Mapping):
+            return _normalize_event_identity(replacement)
+        return _normalize_event_identity(entry)
+
+    def _validate_current_candidate_scope(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        require_missing: bool,
+    ) -> None:
+        if not entries:
+            return
+        anchors = [self._candidate_scope_anchor(entry) for entry in entries]
+        loader = (
+            self.missing_candidate_scope_loader
+            if require_missing
+            else self.selected_candidate_scope_loader
+        )
+        observed_raw = loader(
+            date.fromisoformat(self.manifest['market_date']),
+            anchors,
+        )
+        observed = [
+            _normalize_event_identity(item) for item in observed_raw
+        ]
+        expected_by_event_id = {
+            int(item['event_id']): item for item in anchors
+        }
+        observed_by_event_id = {
+            int(item['event_id']): item for item in observed
+        }
+        if observed_by_event_id != expected_by_event_id:
+            missing_event_ids = sorted(
+                set(expected_by_event_id) - set(observed_by_event_id)
+            )
+            unexpected_event_ids = sorted(
+                set(observed_by_event_id) - set(expected_by_event_id)
+            )
+            mismatched_event_ids = sorted(
+                event_id
+                for event_id in (
+                    set(expected_by_event_id) & set(observed_by_event_id)
+                )
+                if observed_by_event_id[event_id]
+                != expected_by_event_id[event_id]
+            )
+            raise ValueError(
+                'manifest candidate scope is no longer the selected annual '
+                f'{"missing " if require_missing else ""}'
+                'strategy-input scope: '
+                f'missing_event_ids={missing_event_ids}, '
+                f'unexpected_event_ids={unexpected_event_ids}, '
+                f'mismatched_event_ids={mismatched_event_ids}'
+            )
 
     def _validate_identity(self, identity: Mapping[str, Any]) -> dict[str, Any]:
         persisted = self.event_loader(int(identity['event_id']))
@@ -561,8 +728,39 @@ class ExactDartAuditSignalRepair:
         try:
             async with semaphore:
                 event_timeout_seconds = _audit_event_timeout_seconds()
+                capture_kwargs: dict[str, Any] = {
+                    'rcept_no': str(entry['rcept_no'])
+                }
+                if self._uses_scoped_production_capture:
+                    capture_kwargs.update(
+                        {
+                            'selected_candidate_identity': (
+                                self._candidate_scope_anchor(entry)
+                            ),
+                            'selected_candidate_market_date': (
+                                date.fromisoformat(
+                                    self.manifest['market_date']
+                                )
+                            ),
+                            'repair_manifest_sha256': (
+                                self.manifest_sha256
+                            ),
+                        }
+                    )
+                    replacement = entry.get('replacement_for')
+                    if isinstance(replacement, Mapping):
+                        capture_kwargs.update(
+                            {
+                                'replacement_target_identity': dict(
+                                    replacement
+                                ),
+                                'replacement_manifest_sha256': (
+                                    self.manifest_sha256
+                                ),
+                            }
+                        )
                 result = await asyncio.wait_for(
-                    self.capture(rcept_no=str(entry['rcept_no'])),
+                    self.capture(**capture_kwargs),
                     timeout=event_timeout_seconds,
                 )
         except TimeoutError:
@@ -592,11 +790,17 @@ class ExactDartAuditSignalRepair:
         audit_signal = result.get('audit_signal')
         if isinstance(audit_signal, Mapping):
             audit_content = _normalize_audit_content(audit_signal)
+            persistence_identity = self._candidate_scope_anchor(entry)
+            persistence_receipt_date = lineage['persisted_receipt_date']
+            if 'replacement_for' in lineage:
+                persistence_receipt_date = lineage['replacement_for'][
+                    'persisted_receipt_date'
+                ]
             audit_status = _classify_durable_audit_content(
                 audit_content,
-                event_id=entry['event_id'],
-                rcept_no=str(entry['rcept_no']),
-                receipt_date=lineage['persisted_receipt_date'],
+                event_id=persistence_identity['event_id'],
+                rcept_no=str(persistence_identity['rcept_no']),
+                receipt_date=persistence_receipt_date,
             )
             if audit_status is None:
                 return {
@@ -698,13 +902,14 @@ class ExactDartAuditSignalRepair:
                 self._validate_entry(entry)
             except ValueError:
                 return False
-            proof = self.terminal_state_loader(entry)
+            proof_entry = self._candidate_scope_anchor(entry)
+            proof = self.terminal_state_loader(proof_entry)
             if not isinstance(proof, Mapping):
                 return False
             if proof.get('status') != result.get('status'):
                 return False
             if any(
-                proof.get(field) != entry[field]
+                proof.get(field) != proof_entry[field]
                 for field in ('event_id', 'rcept_no', 'stock_code')
             ):
                 return False
@@ -724,11 +929,162 @@ class ExactDartAuditSignalRepair:
                     != result.get('audit_content_sha256')
                 ):
                     return False
-                if proof.get('receipt_date') != result.get(
+                expected_receipt_date = result.get(
                     'persisted_receipt_date'
-                ):
+                )
+                if isinstance(result.get('replacement_for'), Mapping):
+                    expected_receipt_date = result['replacement_for'].get(
+                        'persisted_receipt_date'
+                    )
+                if proof.get('receipt_date') != expected_receipt_date:
                     return False
         return True
+
+    def _durable_result_for_entry(
+        self,
+        entry: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reconcile a durable proof committed before its checkpoint.
+
+        Audit rows commit independently from the repair checkpoint.  A crash
+        in that narrow window must not make a resumed repair overwrite the
+        proof or become permanently stranded behind the missing-only gate.
+        """
+
+        proof_entry = self._candidate_scope_anchor(entry)
+        proof = self.terminal_state_loader(proof_entry)
+        if not isinstance(proof, Mapping):
+            return None
+        if proof.get('status') not in _TERMINAL_AUDIT_STATUSES:
+            return None
+        if any(
+            proof.get(field) != proof_entry[field]
+            for field in ('event_id', 'rcept_no', 'stock_code')
+        ):
+            return None
+        audit_content = proof.get('audit_content')
+        if (
+            not isinstance(audit_content, Mapping)
+            or set(audit_content) != set(_AUDIT_CONTENT_FIELDS)
+            or proof.get('audit_content_sha256')
+            != canonical_json_sha256(dict(audit_content))
+        ):
+            return None
+        lineage = self._validate_entry(entry)
+        expected_receipt_date = lineage['persisted_receipt_date']
+        payload = audit_content.get('payload')
+        stored_exact_repair_lineage = (
+            payload.get('exact_repair_lineage')
+            if isinstance(payload, Mapping)
+            else None
+        )
+        expected_exact_repair_lineage = {
+            'manifest_sha256': self.manifest_sha256,
+            'source': {
+                'event_id': entry['event_id'],
+                'rcept_no': entry['rcept_no'],
+                'stock_code': entry['stock_code'],
+                'receipt_date': lineage['persisted_receipt_date'],
+            },
+            'target': {
+                'event_id': entry['event_id'],
+                'rcept_no': entry['rcept_no'],
+                'stock_code': entry['stock_code'],
+                'receipt_date': lineage['persisted_receipt_date'],
+            },
+            'mode': 'direct',
+        }
+        if isinstance(lineage.get('replacement_for'), Mapping):
+            expected_receipt_date = lineage['replacement_for'][
+                'persisted_receipt_date'
+            ]
+            stored_replacement_lineage = (
+                payload.get('replacement_lineage')
+                if isinstance(payload, Mapping)
+                else None
+            )
+            if stored_replacement_lineage is not None:
+                expected_replacement_lineage = {
+                    'manifest_sha256': self.manifest_sha256,
+                    'source': {
+                        'event_id': entry['event_id'],
+                        'rcept_no': entry['rcept_no'],
+                        'stock_code': entry['stock_code'],
+                        'receipt_date': lineage[
+                            'persisted_receipt_date'
+                        ],
+                    },
+                    'target': {
+                        'event_id': entry['replacement_for']['event_id'],
+                        'rcept_no': entry['replacement_for']['rcept_no'],
+                        'stock_code': entry['replacement_for']['stock_code'],
+                        'receipt_date': expected_receipt_date,
+                    },
+                    'source_error_code': entry['replacement_for'][
+                        'source_error_code'
+                    ],
+                    'reason': entry['replacement_for']['reason'],
+                }
+                if not isinstance(stored_replacement_lineage, Mapping) or any(
+                    stored_replacement_lineage.get(field) != expected_value
+                    for field, expected_value in (
+                        expected_replacement_lineage.items()
+                    )
+                ):
+                    raise ValueError(
+                        'durable replacement proof has conflicting manifest '
+                        'provenance'
+                    )
+            expected_exact_repair_lineage['target'] = {
+                'event_id': entry['replacement_for']['event_id'],
+                'rcept_no': entry['replacement_for']['rcept_no'],
+                'stock_code': entry['replacement_for']['stock_code'],
+                'receipt_date': expected_receipt_date,
+            }
+            expected_exact_repair_lineage['mode'] = (
+                'replacement_projection'
+            )
+        exact_lineage_matches = (
+            isinstance(stored_exact_repair_lineage, Mapping)
+            and all(
+                stored_exact_repair_lineage.get(field) == expected_value
+                for field, expected_value in (
+                    expected_exact_repair_lineage.items()
+                )
+            )
+        )
+        resolution = (
+            'already_durable_matching_repair'
+            if exact_lineage_matches
+            else 'externally_resolved'
+        )
+        status = _classify_durable_audit_content(
+            audit_content,
+            event_id=proof_entry['event_id'],
+            rcept_no=proof_entry['rcept_no'],
+            receipt_date=expected_receipt_date,
+        )
+        if (
+            status != proof.get('status')
+            or proof.get('receipt_date') != expected_receipt_date
+            or (
+                status == 'authoritative_absence'
+                and proof.get('audit_signal_evaluated') is not True
+            )
+        ):
+            return None
+        return {
+            **lineage,
+            'status': status,
+            'opinion_code': audit_content['opinion_code'],
+            'has_audit_issue': audit_content['has_audit_issue'],
+            'audit_signal_evaluated': status == 'authoritative_absence',
+            'audit_content': dict(audit_content),
+            'audit_content_sha256': canonical_json_sha256(
+                dict(audit_content)
+            ),
+            'resolution': resolution,
+        }
 
     async def run(
         self,
@@ -737,6 +1093,7 @@ class ExactDartAuditSignalRepair:
         expected_manifest_sha256: str | None = None,
         checkpoint_path: str | Path | None = None,
         concurrency: int = 1,
+        _checkpoint_lock_held: bool = False,
     ) -> dict[str, Any]:
         if not 1 <= concurrency <= MAX_CONCURRENCY:
             raise ValueError(f'concurrency must be between 1 and {MAX_CONCURRENCY}')
@@ -753,6 +1110,10 @@ class ExactDartAuditSignalRepair:
                 self._validate_entry(entry)
                 for entry in self.manifest['entries']
             ]
+            self._validate_current_candidate_scope(
+                list(self.manifest['entries']),
+                require_missing=True,
+            )
             return {
                 **base,
                 'status': 'dry_run',
@@ -785,6 +1146,22 @@ class ExactDartAuditSignalRepair:
                 'applied': False,
                 'reason': 'checkpoint_path_required',
             }
+        if not _checkpoint_lock_held:
+            with checkpoint_file_lock(checkpoint_path) as lock_acquired:
+                if not lock_acquired:
+                    return {
+                        **base,
+                        'status': 'blocked',
+                        'applied': False,
+                        'reason': 'checkpoint_lock_unavailable',
+                    }
+                return await self.run(
+                    apply=True,
+                    expected_manifest_sha256=expected_manifest_sha256,
+                    checkpoint_path=checkpoint_path,
+                    concurrency=concurrency,
+                    _checkpoint_lock_held=True,
+                )
         try:
             self.finality_validator(
                 date.fromisoformat(self.manifest['market_date'])
@@ -834,13 +1211,108 @@ class ExactDartAuditSignalRepair:
         authoritative_absence = 0
         evidence_missing = 0
         failed = 0
+        externally_resolved = 0
+
+        def progress(
+            live_verified_results: Any = (),
+        ) -> dict[str, Any]:
+            live_verified = list(live_verified_results)
+            live_captured = sum(
+                item.get('status') == 'captured'
+                for item in live_verified
+                if isinstance(item, Mapping)
+            )
+            live_absence = sum(
+                item.get('status') == 'authoritative_absence'
+                for item in live_verified
+                if isinstance(item, Mapping)
+            )
+            live_external = sum(
+                item.get('resolution') == 'externally_resolved'
+                for item in live_verified
+                if isinstance(item, Mapping)
+            )
+            committed_entry_count = (
+                captured
+                + authoritative_absence
+                + live_captured
+                + live_absence
+            )
+            return {
+                'completed_batches': completed_batches,
+                'skipped_batches': skipped_batches,
+                'failed_batches': failed_batches,
+                'audit_signals_captured': captured + live_captured,
+                'audit_signals_authoritatively_absent': (
+                    authoritative_absence + live_absence
+                ),
+                'audit_evidence_missing': evidence_missing,
+                'events_failed': failed,
+                'committed_entry_count': committed_entry_count,
+                'repair_committed_entry_count': (
+                    committed_entry_count
+                    - externally_resolved
+                    - live_external
+                ),
+                'externally_resolved_entry_count': (
+                    externally_resolved + live_external
+                ),
+                'partial_applied': (
+                    committed_entry_count
+                    - externally_resolved
+                    - live_external
+                )
+                > 0,
+                'fully_applied': False,
+                'live_verified_committed_entry_count': (
+                    live_captured + live_absence
+                ),
+            }
+
+        def preserve_blocked_attempt(
+            *,
+            batch_key: str,
+            batch_sha256: str,
+            previous: Mapping[str, Any] | None,
+            blocked_attempt: Mapping[str, Any],
+        ) -> Exception | None:
+            if isinstance(previous, Mapping):
+                preserved = deepcopy(dict(previous))
+                preserved['last_blocked_attempt'] = dict(blocked_attempt)
+            else:
+                preserved = {
+                    'status': 'blocked',
+                    'item_sha256': batch_sha256,
+                    'last_blocked_attempt': dict(blocked_attempt),
+                }
+            checkpoint['units'][batch_key] = preserved
+            try:
+                write_checkpoint(checkpoint_path, checkpoint)
+            except Exception as exc:  # noqa: BLE001
+                # No repair mutation happened on a blocked path. Preserve the
+                # original block reason and let the next run revalidate it.
+                return exc
+            return None
+
+        def reconcile_durable_results(
+            batch: Sequence[Mapping[str, Any]],
+        ) -> list[dict[str, Any]]:
+            reconciled: list[dict[str, Any]] = []
+            for entry in batch:
+                try:
+                    durable_result = self._durable_result_for_entry(entry)
+                except Exception:  # noqa: BLE001
+                    durable_result = None
+                if durable_result is not None:
+                    reconciled.append(durable_result)
+            return reconciled
+
         for start in range(0, len(entries), batch_size):
             batch_index = start // batch_size
             batch_key = str(batch_index)
             batch = entries[start : start + batch_size]
             batch_sha256 = canonical_json_sha256(batch)
             previous = checkpoint['units'].get(batch_key)
-            completed_checkpoint: Mapping[str, Any] | None = None
             if isinstance(previous, Mapping):
                 previous_hash = previous.get('item_sha256')
                 if previous_hash != batch_sha256:
@@ -850,6 +1322,7 @@ class ExactDartAuditSignalRepair:
                         'applied': False,
                         'reason': 'checkpoint_batch_hash_mismatch',
                         'batch_index': batch_index,
+                        **progress(),
                     }
                 if previous.get('status') == 'completed':
                     if not self._completed_batch_checkpoint_is_valid(
@@ -862,71 +1335,298 @@ class ExactDartAuditSignalRepair:
                             'applied': False,
                             'reason': 'checkpoint_completed_batch_invalid',
                             'batch_index': batch_index,
+                            **progress(),
                         }
-                    completed_checkpoint = previous
 
-            with self.guard_factory(
+            guard_exit_state: dict[str, Any] = {}
+            with _capture_guard_transaction_failure(
+                self.guard_factory,
+                state=guard_exit_state,
                 market_date=date.fromisoformat(self.manifest['market_date']),
                 batch_size=len(batch),
                 concurrency=concurrency,
             ) as guard:
                 acquired, reason = guard
                 if not acquired:
-                    checkpoint['units'][batch_key] = {
-                        'status': 'blocked',
-                        'item_sha256': batch_sha256,
+                    blocked_attempt = {
                         'reason': str(reason or 'active_writer'),
                     }
-                    write_checkpoint(checkpoint_path, checkpoint)
+                    preserve_blocked_attempt(
+                        batch_key=batch_key,
+                        batch_sha256=batch_sha256,
+                        previous=(
+                            previous if isinstance(previous, Mapping) else None
+                        ),
+                        blocked_attempt=blocked_attempt,
+                    )
                     return {
                         **base,
                         'status': 'blocked',
                         'applied': False,
                         'reason': str(reason or 'active_writer'),
                         'batch_index': batch_index,
-                        'completed_batches': completed_batches,
-                        'skipped_batches': skipped_batches,
+                        **progress(),
                     }
-                if completed_checkpoint is not None:
-                    try:
-                        live_state_valid = (
-                            self._completed_batch_live_state_is_valid(
-                                completed_checkpoint,
-                                batch,
+
+                try:
+                    # Every manifest anchor must still be the selected annual
+                    # strategy input, regardless of whether durable audit
+                    # proof already exists from an earlier attempt.
+                    self._validate_current_candidate_scope(
+                        batch,
+                        require_missing=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    blocked_attempt = {
+                        'reason': 'manifest_candidate_scope_drift',
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc)[:500],
+                    }
+                    preserve_blocked_attempt(
+                        batch_key=batch_key,
+                        batch_sha256=batch_sha256,
+                        previous=(
+                            previous if isinstance(previous, Mapping) else None
+                        ),
+                        blocked_attempt=blocked_attempt,
+                    )
+                    return {
+                        **base,
+                        'status': 'blocked',
+                        'applied': False,
+                        'reason': 'manifest_candidate_scope_drift',
+                        'batch_index': batch_index,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc)[:500],
+                        **progress(),
+                    }
+
+                retained_results: dict[int, dict[str, Any]] = {}
+                previous_results = (
+                    previous.get('results')
+                    if isinstance(previous, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(previous_results, list)
+                    and len(previous_results) == len(batch)
+                ):
+                    for item_index, (entry, result) in enumerate(
+                        zip(batch, previous_results, strict=True)
+                    ):
+                        single_unit = {'results': [result]}
+                        if not self._completed_batch_checkpoint_is_valid(
+                            single_unit,
+                            [entry],
+                        ):
+                            continue
+                        try:
+                            live_state_valid = (
+                                self._completed_batch_live_state_is_valid(
+                                    single_unit,
+                                    [entry],
+                                )
                             )
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        return {
-                            **base,
-                            'status': 'blocked',
-                            'applied': False,
-                            'reason': 'checkpoint_live_revalidation_failed',
-                            'batch_index': batch_index,
-                            'error_type': type(exc).__name__,
-                            'error_message': str(exc)[:500],
-                        }
-                    if live_state_valid:
-                        for item in completed_checkpoint['results']:
-                            if item['status'] == 'captured':
-                                captured += 1
-                            else:
-                                authoritative_absence += 1
-                        completed_batches += 1
-                        skipped_batches += 1
-                        continue
+                        except Exception as exc:  # noqa: BLE001
+                            return {
+                                **base,
+                                'status': 'blocked',
+                                'applied': False,
+                                'reason': (
+                                    'checkpoint_live_revalidation_failed'
+                                ),
+                                'batch_index': batch_index,
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                                **progress(retained_results.values()),
+                            }
+                        if live_state_valid:
+                            retained_results[item_index] = dict(result)
+
+                if self._uses_storage_terminal_state_loader:
+                    for item_index, entry in enumerate(batch):
+                        if item_index in retained_results:
+                            continue
+                        try:
+                            durable_result = self._durable_result_for_entry(
+                                entry
+                            )
+                        except ValueError as exc:
+                            blocked_attempt = {
+                                'reason': (
+                                    'conflicting_durable_provenance'
+                                ),
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                            }
+                            preserve_blocked_attempt(
+                                batch_key=batch_key,
+                                batch_sha256=batch_sha256,
+                                previous=(
+                                    previous
+                                    if isinstance(previous, Mapping)
+                                    else None
+                                ),
+                                blocked_attempt=blocked_attempt,
+                            )
+                            return {
+                                **base,
+                                'status': 'blocked',
+                                'applied': False,
+                                'reason': (
+                                    'conflicting_durable_provenance'
+                                ),
+                                'batch_index': batch_index,
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                                **progress(retained_results.values()),
+                            }
+                        if durable_result is not None:
+                            retained_results[item_index] = durable_result
+
+                retry_entries = [
+                    entry
+                    for item_index, entry in enumerate(batch)
+                    if item_index not in retained_results
+                ]
+                try:
+                    self._validate_current_candidate_scope(
+                        retry_entries,
+                        require_missing=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    blocked_attempt = {
+                        'reason': 'manifest_candidate_scope_drift',
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc)[:500],
+                    }
+                    preserve_blocked_attempt(
+                        batch_key=batch_key,
+                        batch_sha256=batch_sha256,
+                        previous=(
+                            previous if isinstance(previous, Mapping) else None
+                        ),
+                        blocked_attempt=blocked_attempt,
+                    )
+                    return {
+                        **base,
+                        'status': 'blocked',
+                        'applied': False,
+                        'reason': 'manifest_candidate_scope_drift',
+                        'batch_index': batch_index,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc)[:500],
+                        **progress(retained_results.values()),
+                    }
+                if not retry_entries:
+                    skipped_batches += 1
                 semaphore = asyncio.Semaphore(concurrency)
-                results = await asyncio.gather(
+                retry_results = await asyncio.gather(
                     *(
                         self._attempt_entry(entry, semaphore=semaphore)
-                        for entry in batch
+                        for entry in retry_entries
                     )
                 )
+                retry_results_iter = iter(retry_results)
+                results = [
+                    retained_results[item_index]
+                    if item_index in retained_results
+                    else next(retry_results_iter)
+                    for item_index in range(len(batch))
+                ]
+
+            guard_exit_error = guard_exit_state.get('error')
+            if isinstance(guard_exit_error, Exception):
+                reconciled_results = reconcile_durable_results(batch)
+                uncertain_attempt = {
+                    'reason': 'guard_transaction_exit_failed',
+                    'error_type': type(guard_exit_error).__name__,
+                    'error_message': str(guard_exit_error)[:500],
+                    'reconciled_results': reconciled_results,
+                }
+                if isinstance(previous, Mapping):
+                    uncertain_unit = deepcopy(dict(previous))
+                    uncertain_unit['last_uncertain_attempt'] = (
+                        uncertain_attempt
+                    )
+                else:
+                    uncertain_unit = {
+                        'status': 'uncertain',
+                        'item_sha256': batch_sha256,
+                        'last_uncertain_attempt': uncertain_attempt,
+                    }
+                checkpoint['units'][batch_key] = uncertain_unit
+                checkpoint_write_error: Exception | None = None
+                try:
+                    write_checkpoint(checkpoint_path, checkpoint)
+                except Exception as exc:  # noqa: BLE001
+                    checkpoint_write_error = exc
+                matching_repair_count = sum(
+                    item.get('resolution')
+                    == 'already_durable_matching_repair'
+                    for item in reconciled_results
+                )
+                result = {
+                    **base,
+                    'status': (
+                        'partial' if matching_repair_count else 'blocked'
+                    ),
+                    'applied': False,
+                    'reason': 'guard_transaction_exit_failed',
+                    'batch_index': batch_index,
+                    'error_type': type(guard_exit_error).__name__,
+                    'error_message': str(guard_exit_error)[:500],
+                    'uncertain_commit': True,
+                    'reconciled_proof_count': len(reconciled_results),
+                    'checkpoint_persisted': checkpoint_write_error is None,
+                    **progress(reconciled_results),
+                }
+                if checkpoint_write_error is not None:
+                    result['checkpoint_error_type'] = type(
+                        checkpoint_write_error
+                    ).__name__
+                    result['checkpoint_error_message'] = str(
+                        checkpoint_write_error
+                    )[:500]
+                return result
 
             batch_failed = any(
                 item['status'] not in _TERMINAL_AUDIT_STATUSES
                 for item in results
             )
+            checkpoint['units'][batch_key] = {
+                'status': 'failed' if batch_failed else 'completed',
+                'item_sha256': batch_sha256,
+                'results': results,
+            }
+            try:
+                write_checkpoint(checkpoint_path, checkpoint)
+            except Exception as checkpoint_exc:  # noqa: BLE001
+                reconciled_results = reconcile_durable_results(batch)
+                matching_repair_count = sum(
+                    item.get('resolution')
+                    == 'already_durable_matching_repair'
+                    for item in reconciled_results
+                )
+                return {
+                    **base,
+                    'status': (
+                        'partial' if matching_repair_count else 'blocked'
+                    ),
+                    'applied': False,
+                    'reason': 'checkpoint_write_failed_after_commit',
+                    'batch_index': batch_index,
+                    'error_type': type(checkpoint_exc).__name__,
+                    'error_message': str(checkpoint_exc)[:500],
+                    'uncertain_commit': True,
+                    'checkpoint_persisted': False,
+                    'reconciled_proof_count': len(reconciled_results),
+                    'retry_required': True,
+                    **progress(reconciled_results),
+                }
             for item in results:
+                if item.get('resolution') == 'externally_resolved':
+                    externally_resolved += 1
                 if item['status'] == 'captured':
                     captured += 1
                 elif item['status'] == 'authoritative_absence':
@@ -935,12 +1635,6 @@ class ExactDartAuditSignalRepair:
                     evidence_missing += 1
                 else:
                     failed += 1
-            checkpoint['units'][batch_key] = {
-                'status': 'failed' if batch_failed else 'completed',
-                'item_sha256': batch_sha256,
-                'results': results,
-            }
-            write_checkpoint(checkpoint_path, checkpoint)
             if batch_failed:
                 failed_batches += 1
             else:
@@ -950,14 +1644,22 @@ class ExactDartAuditSignalRepair:
         return {
             **base,
             'status': status,
-            'applied': status == 'completed',
-            'completed_batches': completed_batches,
-            'skipped_batches': skipped_batches,
-            'failed_batches': failed_batches,
-            'audit_signals_captured': captured,
-            'audit_signals_authoritatively_absent': authoritative_absence,
-            'audit_evidence_missing': evidence_missing,
-            'events_failed': failed,
+            'applied': (
+                status == 'completed' and externally_resolved == 0
+            ),
+            **progress(),
+            'fully_applied': (
+                status == 'completed' and externally_resolved == 0
+            ),
+            'partial_applied': (
+                (status != 'completed' or externally_resolved > 0)
+                and (
+                    captured
+                    + authoritative_absence
+                    - externally_resolved
+                )
+                > 0
+            ),
             'retry_required': failed_batches > 0,
         }
 

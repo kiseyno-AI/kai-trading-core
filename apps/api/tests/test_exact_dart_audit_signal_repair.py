@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.dart.exact_audit_signal_repair import (
     CHECKPOINT_SCHEMA_VERSION,
     ExactDartAuditSignalRepair,
@@ -17,11 +19,15 @@ from app.dart.exact_audit_signal_repair import (
     _audit_batch_idle_transaction_timeout_ms,
     exact_dart_audit_batch_guard,
 )
+from app.dart.signals_service import dart_signals_service
 from app.dart.signals_service import (
     DartSignalsService,
     build_authoritative_absence_audit_signal,
 )
-from app.internal.exact_repair_manifest import canonical_json_sha256
+from app.internal.exact_repair_manifest import (
+    canonical_json_sha256,
+    checkpoint_file_lock,
+)
 
 
 def _manifest(*entries: dict, batch_size: int = 1) -> dict:
@@ -232,8 +238,13 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                 for call in outer_session.execute.call_args_list
             )
         )
-        inner_session.execute.assert_called_once()
-        self.assertTrue(inner_session.execute.call_args.args[0].is_insert)
+        self.assertEqual(inner_session.execute.call_count, 2)
+        self.assertTrue(
+            inner_session.execute.call_args_list[0].args[0].is_select
+        )
+        self.assertTrue(
+            inner_session.execute.call_args_list[1].args[0].is_insert
+        )
 
     def test_guard_timeout_covers_every_external_fetch_wave(self):
         with (
@@ -284,6 +295,51 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                     concurrency=1,
                 )
 
+    def test_manifest_rejects_duplicate_or_source_replacement_targets(self):
+        shared_target = {
+            'stock_code': '005930',
+            'event_id': 100,
+            'rcept_no': '20260301000000',
+            'source_error_code': '014',
+            'reason': 'reviewed replacement',
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            'duplicate replacement target event_id',
+        ):
+            ExactDartAuditSignalRepair(
+                _manifest(
+                    _entry(
+                        '005930',
+                        101,
+                        '20260301000001',
+                        replacement_for=shared_target,
+                    ),
+                    _entry(
+                        '005930',
+                        102,
+                        '20260301000002',
+                        replacement_for=shared_target,
+                    ),
+                )
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'target event cannot also be a manifest source',
+        ):
+            ExactDartAuditSignalRepair(
+                _manifest(
+                    _entry('005930', 100, '20260301000000'),
+                    _entry(
+                        '005930',
+                        101,
+                        '20260301000001',
+                        replacement_for=shared_target,
+                    ),
+                )
+            )
+
     async def test_entry_capture_is_bounded_by_the_guard_timeout_budget(self):
         entry = _entry('005930', 101, '20260301000001')
 
@@ -315,6 +371,133 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result['error_message'],
             'audit capture exceeded 0.001s deadline',
+        )
+
+    async def test_apply_refuses_concurrent_checkpoint_writer(self):
+        entry = _entry('005930', 101, '20260301000001')
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=AsyncMock(),
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            with checkpoint_file_lock(checkpoint) as acquired:
+                self.assertTrue(acquired)
+                result = await repair.run(
+                    apply=True,
+                    expected_manifest_sha256=repair.manifest_sha256,
+                    checkpoint_path=checkpoint,
+                )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'checkpoint_lock_unavailable')
+
+    async def test_production_capture_revalidates_selected_scope_at_publish(self):
+        entry = _entry('005930', 101, '20260301000001')
+        capture = AsyncMock(
+            return_value={
+                'rcept_no': entry['rcept_no'],
+                'audit_signal': _parsed_audit_signal(),
+            }
+        )
+        with patch.object(
+            dart_signals_service,
+            'capture_audit_signal_for_event',
+            capture,
+        ):
+            repair = ExactDartAuditSignalRepair(
+                _manifest(entry),
+                event_loader=self._event_loader(
+                    {
+                        101: {
+                            **entry,
+                            'report_nm': '사업보고서 (2025.12)',
+                        }
+                    }
+                ),
+                guard_factory=_guard,
+                finality_validator=lambda _market_date: None,
+            )
+            result = await repair._attempt_entry(
+                entry,
+                semaphore=asyncio.Semaphore(1),
+            )
+
+        self.assertEqual(result['status'], 'captured')
+        capture.assert_awaited_once_with(
+            rcept_no=entry['rcept_no'],
+            selected_candidate_identity={
+                'event_id': 101,
+                'rcept_no': entry['rcept_no'],
+                'stock_code': entry['stock_code'],
+            },
+            selected_candidate_market_date=date(2026, 10, 28),
+            repair_manifest_sha256=repair.manifest_sha256,
+        )
+
+    async def test_production_replacement_binds_target_and_manifest(self):
+        entry = _entry(
+            '005930',
+            102,
+            '20260318000002',
+            replacement_for={
+                'stock_code': '005930',
+                'event_id': 101,
+                'rcept_no': '20260319000001',
+                'source_error_code': '014',
+                'reason': 'reviewed source document is unavailable',
+            },
+        )
+        capture = AsyncMock(
+            return_value={
+                'rcept_no': entry['rcept_no'],
+                'audit_signal': _parsed_audit_signal(),
+            }
+        )
+        with patch.object(
+            dart_signals_service,
+            'capture_audit_signal_for_event',
+            capture,
+        ):
+            repair = ExactDartAuditSignalRepair(
+                _manifest(entry),
+                event_loader=self._event_loader(
+                    {
+                        101: {
+                            **entry['replacement_for'],
+                            'report_nm': '사업보고서 (2025.12)',
+                        },
+                        102: {
+                            **entry,
+                            'report_nm': '감사보고서 replacement',
+                        },
+                    }
+                ),
+                guard_factory=_guard,
+                finality_validator=lambda _market_date: None,
+            )
+            result = await repair._attempt_entry(
+                entry,
+                semaphore=asyncio.Semaphore(1),
+            )
+
+        self.assertEqual(result['status'], 'captured')
+        capture.assert_awaited_once_with(
+            rcept_no=entry['rcept_no'],
+            selected_candidate_identity={
+                'event_id': 101,
+                'rcept_no': '20260319000001',
+                'stock_code': '005930',
+            },
+            selected_candidate_market_date=date(2026, 10, 28),
+            replacement_target_identity=entry['replacement_for'],
+            replacement_manifest_sha256=repair.manifest_sha256,
+            repair_manifest_sha256=repair.manifest_sha256,
         )
 
     async def test_run_budgets_the_actual_final_batch_and_concurrency(self):
@@ -420,6 +603,313 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts[entries[1]['rcept_no']], 1)
         self.assertEqual(second['skipped_batches'], 1)
 
+    async def test_partial_batch_retries_only_nonterminal_entries(self):
+        first_entry = _entry('005930', 101, '20260301000001')
+        second_entry = _entry('000660', 102, '20260301000002')
+        attempts: dict[str, int] = {}
+        durable: set[str] = set()
+
+        async def capture(*, rcept_no: str):
+            attempts[rcept_no] = attempts.get(rcept_no, 0) + 1
+            if rcept_no == second_entry['rcept_no'] and attempts[rcept_no] == 1:
+                raise RuntimeError('temporary provider failure')
+            durable.add(rcept_no)
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': _parsed_audit_signal(),
+            }
+
+        def terminal_state(entry):
+            if entry['rcept_no'] not in durable:
+                return None
+            return _terminal_proof(entry)
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(first_entry, second_entry, batch_size=2),
+            capture=capture,
+            event_loader=self._event_loader(
+                {
+                    101: {
+                        **first_entry,
+                        'report_nm': '사업보고서 (2025.12)',
+                    },
+                    102: {
+                        **second_entry,
+                        'report_nm': '사업보고서 (2025.12)',
+                    },
+                }
+            ),
+            terminal_state_loader=terminal_state,
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            first = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            second = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+        self.assertEqual(first['status'], 'partial')
+        self.assertEqual(second['status'], 'completed')
+        self.assertEqual(attempts[first_entry['rcept_no']], 1)
+        self.assertEqual(attempts[second_entry['rcept_no']], 2)
+
+    async def test_crash_window_reconciles_existing_durable_proof(self):
+        entry = _entry('005930', 101, '20260301000001')
+        capture = AsyncMock()
+        missing_scope_loader = MagicMock()
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            terminal_state_loader=lambda item: _terminal_proof(item),
+            selected_candidate_scope_loader=lambda _date, entries: entries,
+            missing_candidate_scope_loader=missing_scope_loader,
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        repair._uses_storage_terminal_state_loader = True
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved = json.loads(checkpoint.read_text(encoding='utf-8'))
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertFalse(result['applied'])
+        self.assertEqual(result['externally_resolved_entry_count'], 1)
+        self.assertEqual(result['skipped_batches'], 1)
+        self.assertEqual(
+            saved['units']['0']['results'][0]['resolution'],
+            'externally_resolved',
+        )
+        capture.assert_not_awaited()
+        missing_scope_loader.assert_not_called()
+
+    async def test_crash_window_reconciles_matching_repair_lineage_as_applied(self):
+        entry = _entry('005930', 101, '20260301000001')
+        capture = AsyncMock()
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            selected_candidate_scope_loader=lambda _date, entries: entries,
+            missing_candidate_scope_loader=MagicMock(),
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        repair_lineage = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': repair.manifest_sha256,
+            'source': {
+                **entry,
+                'receipt_date': '2026-10-28',
+            },
+            'target': {
+                **entry,
+                'receipt_date': '2026-10-28',
+            },
+            'mode': 'direct',
+        }
+        repair_lineage['lineage_sha256'] = canonical_json_sha256(
+            repair_lineage
+        )
+
+        def terminal_state(item):
+            proof = _terminal_proof(item)
+            proof['audit_content']['payload'][
+                'exact_repair_lineage'
+            ] = repair_lineage
+            proof['audit_content_sha256'] = canonical_json_sha256(
+                proof['audit_content']
+            )
+            return proof
+
+        repair.terminal_state_loader = terminal_state
+        repair._uses_storage_terminal_state_loader = True
+        with TemporaryDirectory() as directory:
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(result['applied'])
+        self.assertEqual(result['externally_resolved_entry_count'], 0)
+        capture.assert_not_awaited()
+
+    async def test_guard_exit_failure_reconciles_committed_repair_proof(self):
+        entry = _entry('005930', 101, '20260301000001')
+        durable = False
+
+        @contextmanager
+        def failing_exit_guard(**_kwargs):
+            yield True, None
+            raise SQLAlchemyError('guard commit failed')
+
+        async def capture(*, rcept_no: str):
+            nonlocal durable
+            durable = True
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': _parsed_audit_signal(),
+            }
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            selected_candidate_scope_loader=lambda _date, entries: entries,
+            missing_candidate_scope_loader=lambda _date, entries: entries,
+            guard_factory=failing_exit_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        repair_lineage = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': repair.manifest_sha256,
+            'source': {
+                **entry,
+                'receipt_date': '2026-10-28',
+            },
+            'target': {
+                **entry,
+                'receipt_date': '2026-10-28',
+            },
+            'mode': 'direct',
+        }
+        repair_lineage['lineage_sha256'] = canonical_json_sha256(
+            repair_lineage
+        )
+
+        def terminal_state(item):
+            if not durable:
+                return None
+            proof = _terminal_proof(item)
+            proof['audit_content']['payload'][
+                'exact_repair_lineage'
+            ] = repair_lineage
+            proof['audit_content_sha256'] = canonical_json_sha256(
+                proof['audit_content']
+            )
+            return proof
+
+        repair.terminal_state_loader = terminal_state
+        repair._uses_storage_terminal_state_loader = True
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            saved = json.loads(checkpoint.read_text(encoding='utf-8'))
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertFalse(result['applied'])
+        self.assertTrue(result['uncertain_commit'])
+        self.assertEqual(result['reconciled_proof_count'], 1)
+        self.assertEqual(result['repair_committed_entry_count'], 1)
+        self.assertEqual(
+            saved['units']['0']['last_uncertain_attempt']['reason'],
+            'guard_transaction_exit_failed',
+        )
+
+    async def test_checkpoint_write_failure_reconciles_committed_repair_proof(self):
+        entry = _entry('005930', 101, '20260301000001')
+        durable = False
+
+        async def capture(*, rcept_no: str):
+            nonlocal durable
+            durable = True
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': _parsed_audit_signal(),
+            }
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            selected_candidate_scope_loader=lambda _date, entries: entries,
+            missing_candidate_scope_loader=lambda _date, entries: entries,
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        repair_lineage = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': repair.manifest_sha256,
+            'source': {
+                **entry,
+                'receipt_date': '2026-10-28',
+            },
+            'target': {
+                **entry,
+                'receipt_date': '2026-10-28',
+            },
+            'mode': 'direct',
+        }
+        repair_lineage['lineage_sha256'] = canonical_json_sha256(
+            repair_lineage
+        )
+
+        def terminal_state(item):
+            if not durable:
+                return None
+            proof = _terminal_proof(item)
+            proof['audit_content']['payload'][
+                'exact_repair_lineage'
+            ] = repair_lineage
+            proof['audit_content_sha256'] = canonical_json_sha256(
+                proof['audit_content']
+            )
+            return proof
+
+        repair.terminal_state_loader = terminal_state
+        repair._uses_storage_terminal_state_loader = True
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            with patch(
+                'app.dart.exact_audit_signal_repair.write_checkpoint',
+                side_effect=OSError('checkpoint disk unavailable'),
+            ):
+                result = await repair.run(
+                    apply=True,
+                    expected_manifest_sha256=repair.manifest_sha256,
+                    checkpoint_path=checkpoint,
+                )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertFalse(result['applied'])
+        self.assertEqual(
+            result['reason'],
+            'checkpoint_write_failed_after_commit',
+        )
+        self.assertTrue(result['uncertain_commit'])
+        self.assertFalse(result['checkpoint_persisted'])
+        self.assertEqual(result['reconciled_proof_count'], 1)
+        self.assertEqual(result['repair_committed_entry_count'], 1)
+        self.assertEqual(result['error_type'], 'OSError')
+
     async def test_checkpoint_rejects_manifest_hash_drift(self):
         first_entry = _entry('005930', 101, '20260301000001')
         second_entry = _entry('005930', 103, '20260301000003')
@@ -438,6 +928,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             _manifest(first_entry),
             capture=capture,
             event_loader=self._event_loader(events),
+            terminal_state_loader=lambda _item: None,
             guard_factory=_guard,
             finality_validator=lambda _market_date: None,
         )
@@ -445,6 +936,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             _manifest(second_entry),
             capture=capture,
             event_loader=self._event_loader(events),
+            terminal_state_loader=lambda _item: None,
             guard_factory=_guard,
             finality_validator=lambda _market_date: None,
         )
@@ -464,6 +956,128 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed['status'], 'completed')
         self.assertEqual(blocked['status'], 'blocked')
         self.assertEqual(blocked['reason'], 'checkpoint_manifest_mismatch')
+
+    async def test_apply_blocks_stale_manifest_candidate_before_provider_call(self):
+        entry = _entry('005930', 101, '20260301000001')
+        capture = AsyncMock(
+            return_value={
+                'rcept_no': entry['rcept_no'],
+                'audit_signal': _parsed_audit_signal(),
+            }
+        )
+        candidate_scope_loader = MagicMock(return_value=[])
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            candidate_scope_loader=candidate_scope_loader,
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+
+        with TemporaryDirectory() as directory:
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'manifest_candidate_scope_drift')
+        self.assertEqual(result['batch_index'], 0)
+        self.assertIn('101', result['error_message'])
+        candidate_scope_loader.assert_called_once_with(
+            date(2026, 10, 28),
+            [
+                {
+                    'event_id': 101,
+                    'rcept_no': '20260301000001',
+                    'stock_code': '005930',
+                }
+            ],
+        )
+        capture.assert_not_awaited()
+
+    async def test_replacement_manifest_revalidates_original_selected_candidate(self):
+        replacement = _entry(
+            '005930',
+            102,
+            '20260302000002',
+            replacement_for={
+                'stock_code': '005930',
+                'event_id': 101,
+                'rcept_no': '20260301000001',
+                'source_error_code': '014',
+                'reason': 'reviewed replacement filing',
+            },
+        )
+        capture = AsyncMock(
+            return_value={
+                'rcept_no': replacement['rcept_no'],
+                'audit_signal': _parsed_audit_signal(),
+            }
+        )
+        selected_candidate_scope_loader = MagicMock(
+            return_value=[replacement['replacement_for']]
+        )
+        missing_candidate_scope_loader = MagicMock(
+            return_value=[replacement['replacement_for']]
+        )
+        repair = ExactDartAuditSignalRepair(
+            _manifest(replacement),
+            capture=capture,
+            event_loader=self._event_loader(
+                {
+                    101: {
+                        **replacement['replacement_for'],
+                        'report_nm': '사업보고서 (2025.12)',
+                    },
+                    102: {
+                        **replacement,
+                        'report_nm': '감사보고서 replacement',
+                    },
+                }
+            ),
+            terminal_state_loader=lambda item: _terminal_proof(item),
+            selected_candidate_scope_loader=(
+                selected_candidate_scope_loader
+            ),
+            missing_candidate_scope_loader=missing_candidate_scope_loader,
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+
+        with TemporaryDirectory() as directory:
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=Path(directory) / 'checkpoint.json',
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        selected_candidate_scope_loader.assert_called_once_with(
+            date(2026, 10, 28),
+            [
+                {
+                    'event_id': 101,
+                    'rcept_no': '20260301000001',
+                    'stock_code': '005930',
+                }
+            ],
+        )
+        missing_candidate_scope_loader.assert_called_once_with(
+            date(2026, 10, 28),
+            [
+                {
+                    'event_id': 101,
+                    'rcept_no': '20260301000001',
+                    'stock_code': '005930',
+                }
+            ],
+        )
+        capture.assert_awaited_once_with(rcept_no='20260302000002')
 
     async def test_checkpoint_v1_is_explicitly_incompatible_with_v2(self):
         entry = _entry('005930', 101, '20260301000001')
@@ -588,6 +1202,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             _manifest(replacement),
             capture=capture,
             event_loader=self._event_loader(events),
+            terminal_state_loader=lambda _item: None,
             guard_factory=_guard,
             finality_validator=lambda _market_date: None,
         )
@@ -690,6 +1305,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             event_loader=self._event_loader(
                 {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
             ),
+            terminal_state_loader=lambda _item: None,
             guard_factory=_guard,
             finality_validator=lambda _market_date: None,
         )
@@ -749,6 +1365,56 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed['status'], 'completed')
         self.assertEqual(resumed['skipped_batches'], 1)
         self.assertEqual(attempts, 1)
+
+    async def test_completed_checkpoint_blocks_when_candidate_scope_drifts(self):
+        entry = _entry('005930', 101, '20260301000001')
+        selected_candidate_scope_loader = MagicMock(
+            side_effect=[[entry], []]
+        )
+        missing_candidate_scope_loader = MagicMock(return_value=[entry])
+
+        async def capture(*, rcept_no: str):
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': _parsed_audit_signal(),
+                'audit_signal_evaluated': True,
+            }
+
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            terminal_state_loader=lambda item: _terminal_proof(item),
+            selected_candidate_scope_loader=(
+                selected_candidate_scope_loader
+            ),
+            missing_candidate_scope_loader=missing_candidate_scope_loader,
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            first = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+            resumed = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+        self.assertEqual(first['status'], 'completed')
+        self.assertEqual(resumed['status'], 'blocked')
+        self.assertEqual(
+            resumed['reason'],
+            'manifest_candidate_scope_drift',
+        )
+        self.assertEqual(selected_candidate_scope_loader.call_count, 2)
+        missing_candidate_scope_loader.assert_called_once()
 
     async def test_malformed_audit_envelopes_remain_retry_debt(self):
         entry = _entry('005930', 101, '20260301000001')
@@ -1009,6 +1675,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             event_loader=self._event_loader(
                 {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
             ),
+            terminal_state_loader=lambda _item: None,
             guard_factory=_guard,
             finality_validator=lambda _market_date: None,
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import re
 import zipfile
 from copy import deepcopy
@@ -55,6 +56,13 @@ AUDIT_AUTHORITATIVE_ABSENCE_EVIDENCE_SEMANTICS = (
     'authoritative_absence'
 )
 AUDIT_SIGNAL_WRITER_LOCK_KEY = 'dart_audit_signals_writer_v1'
+AUDIT_REPLACEMENT_LINEAGE_SCHEMA_VERSION = (
+    'dart_audit_replacement_lineage_v1'
+)
+AUDIT_EXACT_REPAIR_LINEAGE_SCHEMA_VERSION = (
+    'dart_audit_exact_repair_lineage_v1'
+)
+AUDIT_REPLACEMENT_SOURCE_ERROR_CODE = '014'
 _AUDIT_SIGNAL_WRITER_LOCK_OWNED: ContextVar[bool] = ContextVar(
     'dart_audit_signal_writer_lock_owned',
     default=False,
@@ -213,7 +221,7 @@ class ParsedAuditSignal:
     payload: dict[str, Any] | None
 
 
-_AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS = frozenset(
+_AUTHORITATIVE_ABSENCE_BASE_PAYLOAD_FIELDS = frozenset(
     {
         'schema_version',
         'evidence_semantics',
@@ -222,6 +230,12 @@ _AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS = frozenset(
         'rcept_no',
         'receipt_date',
         'audit_diagnostics',
+    }
+)
+_AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS = frozenset(
+    {
+        *_AUTHORITATIVE_ABSENCE_BASE_PAYLOAD_FIELDS,
+        'exact_repair_lineage',
     }
 )
 
@@ -249,7 +263,11 @@ def is_authoritative_absence_audit_payload(
 ) -> bool:
     if not isinstance(payload, Mapping):
         return False
-    if set(payload) != _AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS:
+    payload_fields = set(payload)
+    if payload_fields not in {
+        _AUTHORITATIVE_ABSENCE_BASE_PAYLOAD_FIELDS,
+        _AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS,
+    }:
         return False
     if (
         payload.get('schema_version')
@@ -311,6 +329,17 @@ def is_authoritative_absence_audit_payload(
         or archive_size_bytes <= 0
     ):
         return False
+    exact_repair_lineage = payload.get('exact_repair_lineage')
+    if exact_repair_lineage is not None and (
+        not _is_valid_audit_exact_repair_lineage(
+            exact_repair_lineage,
+            event_id=stored_event_id,
+            rcept_no=stored_rcept_no,
+            receipt_date=stored_receipt_date,
+        )
+        or exact_repair_lineage.get('mode') != 'direct'
+    ):
+        return False
     return True
 
 
@@ -320,7 +349,11 @@ def claims_authoritative_absence_audit_payload(payload: Any) -> bool:
     # Every field in this envelope is reserved for the durable negative
     # sentinel.  Treat even a partly corrupted envelope as a sentinel claim so
     # it cannot downgrade into an apparently clean parsed opinion.
-    return bool(set(payload).intersection(_AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS))
+    return bool(
+        set(payload).intersection(
+            _AUTHORITATIVE_ABSENCE_BASE_PAYLOAD_FIELDS
+        )
+    )
 
 
 def is_authoritative_absence_audit_signal(
@@ -381,6 +414,214 @@ _PARSED_AUDIT_SELECTION_FIELDS = frozenset(
         'selected_source_section',
     }
 )
+_AUDIT_REPLACEMENT_LINEAGE_FIELDS = frozenset(
+    {
+        'schema_version',
+        'manifest_sha256',
+        'lineage_sha256',
+        'source',
+        'target',
+        'source_error_code',
+        'reason',
+    }
+)
+_AUDIT_REPLACEMENT_IDENTITY_FIELDS = frozenset(
+    {'event_id', 'rcept_no', 'stock_code', 'receipt_date'}
+)
+_AUDIT_EXACT_REPAIR_LINEAGE_FIELDS = frozenset(
+    {
+        'schema_version',
+        'manifest_sha256',
+        'lineage_sha256',
+        'source',
+        'target',
+        'mode',
+    }
+)
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _is_valid_audit_replacement_lineage(
+    lineage: Any,
+    *,
+    event_id: int | None,
+    rcept_no: str | None,
+    receipt_date: date | str | None,
+) -> bool:
+    if not isinstance(lineage, Mapping):
+        return False
+    if set(lineage) != _AUDIT_REPLACEMENT_LINEAGE_FIELDS:
+        return False
+    if (
+        lineage.get('schema_version')
+        != AUDIT_REPLACEMENT_LINEAGE_SCHEMA_VERSION
+    ):
+        return False
+    manifest_sha256 = lineage.get('manifest_sha256')
+    if (
+        not isinstance(manifest_sha256, str)
+        or re.fullmatch(r'[0-9a-f]{64}', manifest_sha256) is None
+    ):
+        return False
+    source = lineage.get('source')
+    target = lineage.get('target')
+    if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+        return False
+    if (
+        set(source) != _AUDIT_REPLACEMENT_IDENTITY_FIELDS
+        or set(target) != _AUDIT_REPLACEMENT_IDENTITY_FIELDS
+    ):
+        return False
+    for identity in (source, target):
+        stored_event_id = identity.get('event_id')
+        stored_rcept_no = identity.get('rcept_no')
+        stored_stock_code = identity.get('stock_code')
+        stored_receipt_date = identity.get('receipt_date')
+        if (
+            isinstance(stored_event_id, bool)
+            or not isinstance(stored_event_id, int)
+            or stored_event_id <= 0
+            or not isinstance(stored_rcept_no, str)
+            or not stored_rcept_no
+            or len(stored_rcept_no) > 32
+            or not isinstance(stored_stock_code, str)
+            or len(stored_stock_code) != 6
+            or not stored_stock_code.isdigit()
+            or not isinstance(stored_receipt_date, str)
+            or _canonical_audit_receipt_date(stored_receipt_date)
+            != stored_receipt_date
+        ):
+            return False
+    if (
+        source['stock_code'] != target['stock_code']
+        or source['event_id'] == target['event_id']
+        or source['rcept_no'] == target['rcept_no']
+        or source['receipt_date'] > target['receipt_date']
+        or lineage.get('source_error_code')
+        != AUDIT_REPLACEMENT_SOURCE_ERROR_CODE
+    ):
+        return False
+    reason = lineage.get('reason')
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or reason != reason.strip()
+        or len(reason) > 200
+    ):
+        return False
+    if event_id is not None and target['event_id'] != event_id:
+        return False
+    if rcept_no is not None and target['rcept_no'] != rcept_no:
+        return False
+    if receipt_date is not None:
+        expected_receipt_date = _canonical_audit_receipt_date(receipt_date)
+        if (
+            expected_receipt_date is None
+            or target['receipt_date'] != expected_receipt_date
+        ):
+            return False
+    lineage_without_hash = {
+        key: deepcopy(value)
+        for key, value in lineage.items()
+        if key != 'lineage_sha256'
+    }
+    return lineage.get('lineage_sha256') == _canonical_json_sha256(
+        lineage_without_hash
+    )
+
+
+def _is_valid_audit_exact_repair_lineage(
+    lineage: Any,
+    *,
+    event_id: int | None,
+    rcept_no: str | None,
+    receipt_date: date | str | None,
+) -> bool:
+    if not isinstance(lineage, Mapping):
+        return False
+    if set(lineage) != _AUDIT_EXACT_REPAIR_LINEAGE_FIELDS:
+        return False
+    if (
+        lineage.get('schema_version')
+        != AUDIT_EXACT_REPAIR_LINEAGE_SCHEMA_VERSION
+    ):
+        return False
+    manifest_sha256 = lineage.get('manifest_sha256')
+    if (
+        not isinstance(manifest_sha256, str)
+        or re.fullmatch(r'[0-9a-f]{64}', manifest_sha256) is None
+    ):
+        return False
+    mode = lineage.get('mode')
+    if mode not in {'direct', 'replacement_projection'}:
+        return False
+    source = lineage.get('source')
+    target = lineage.get('target')
+    if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+        return False
+    if (
+        set(source) != _AUDIT_REPLACEMENT_IDENTITY_FIELDS
+        or set(target) != _AUDIT_REPLACEMENT_IDENTITY_FIELDS
+    ):
+        return False
+    for identity in (source, target):
+        stored_event_id = identity.get('event_id')
+        stored_rcept_no = identity.get('rcept_no')
+        stored_stock_code = identity.get('stock_code')
+        stored_receipt_date = identity.get('receipt_date')
+        if (
+            isinstance(stored_event_id, bool)
+            or not isinstance(stored_event_id, int)
+            or stored_event_id <= 0
+            or not isinstance(stored_rcept_no, str)
+            or not stored_rcept_no
+            or len(stored_rcept_no) > 32
+            or not isinstance(stored_stock_code, str)
+            or len(stored_stock_code) != 6
+            or not stored_stock_code.isdigit()
+            or not isinstance(stored_receipt_date, str)
+            or _canonical_audit_receipt_date(stored_receipt_date)
+            != stored_receipt_date
+        ):
+            return False
+    if source['stock_code'] != target['stock_code']:
+        return False
+    if mode == 'direct' and source != target:
+        return False
+    if mode == 'replacement_projection' and (
+        source['event_id'] == target['event_id']
+        or source['rcept_no'] == target['rcept_no']
+        or source['receipt_date'] > target['receipt_date']
+    ):
+        return False
+    if event_id is not None and target['event_id'] != event_id:
+        return False
+    if rcept_no is not None and target['rcept_no'] != rcept_no:
+        return False
+    if receipt_date is not None:
+        expected_receipt_date = _canonical_audit_receipt_date(receipt_date)
+        if (
+            expected_receipt_date is None
+            or target['receipt_date'] != expected_receipt_date
+        ):
+            return False
+    lineage_without_hash = {
+        key: deepcopy(value)
+        for key, value in lineage.items()
+        if key != 'lineage_sha256'
+    }
+    return lineage.get('lineage_sha256') == _canonical_json_sha256(
+        lineage_without_hash
+    )
 
 
 def _is_nonempty_audit_text(value: Any) -> bool:
@@ -416,6 +657,9 @@ def _has_durable_parsed_audit_payload(
     *,
     opinion_code: str,
     source_section: str,
+    event_id: int | None = None,
+    rcept_no: str | None = None,
+    receipt_date: date | str | None = None,
 ) -> bool:
     if not isinstance(payload, Mapping):
         return False
@@ -423,6 +667,43 @@ def _has_durable_parsed_audit_payload(
     if parser is not None and (
         not isinstance(parser, str)
         or parser not in _PARSED_AUDIT_PAYLOAD_PARSERS
+    ):
+        return False
+    replacement_lineage = payload.get('replacement_lineage')
+    exact_repair_lineage = payload.get('exact_repair_lineage')
+    if replacement_lineage is not None and not (
+        _is_valid_audit_replacement_lineage(
+            replacement_lineage,
+            event_id=event_id,
+            rcept_no=rcept_no,
+            receipt_date=receipt_date,
+        )
+    ):
+        return False
+    if exact_repair_lineage is not None and not (
+        _is_valid_audit_exact_repair_lineage(
+            exact_repair_lineage,
+            event_id=event_id,
+            rcept_no=rcept_no,
+            receipt_date=receipt_date,
+        )
+    ):
+        return False
+    if replacement_lineage is not None:
+        if (
+            not isinstance(exact_repair_lineage, Mapping)
+            or exact_repair_lineage.get('mode')
+            != 'replacement_projection'
+            or any(
+                replacement_lineage.get(field)
+                != exact_repair_lineage.get(field)
+                for field in ('manifest_sha256', 'source', 'target')
+            )
+        ):
+            return False
+    elif (
+        isinstance(exact_repair_lineage, Mapping)
+        and exact_repair_lineage.get('mode') == 'replacement_projection'
     ):
         return False
     if parser == 'auditor_report_unmodified_opinion_v1':
@@ -565,6 +846,9 @@ def classify_durable_audit_signal(
             payload,
             opinion_code=opinion_code,
             source_section=str(field('source_section')),
+            event_id=event_id,
+            rcept_no=rcept_no,
+            receipt_date=receipt_date,
         )
     ):
         return None
@@ -610,6 +894,76 @@ class DartSignalsRepository:
         market_date: date,
         limit: int,
         after_event_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        return self._list_annual_audit_signal_candidates(
+            market_date=market_date,
+            limit=limit,
+            after_event_id=after_event_id,
+            event_ids=None,
+            include_durable=False,
+        )
+
+    def list_selected_annual_audit_signal_candidates(
+        self,
+        *,
+        market_date: date,
+        event_ids: list[int],
+        session: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_event_ids = sorted(
+            {
+                int(event_id)
+                for event_id in event_ids
+                if not isinstance(event_id, bool) and int(event_id) > 0
+            }
+        )
+        if not normalized_event_ids:
+            return []
+        return self._list_annual_audit_signal_candidates(
+            market_date=market_date,
+            limit=len(normalized_event_ids),
+            after_event_id=0,
+            event_ids=normalized_event_ids,
+            include_durable=True,
+            session=session,
+        )
+
+    def list_missing_selected_annual_audit_signal_candidates(
+        self,
+        *,
+        market_date: date,
+        event_ids: list[int],
+        session: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return selected events that still lack durable audit evidence."""
+
+        normalized_event_ids = sorted(
+            {
+                int(event_id)
+                for event_id in event_ids
+                if not isinstance(event_id, bool) and int(event_id) > 0
+            }
+        )
+        if not normalized_event_ids:
+            return []
+        return self._list_annual_audit_signal_candidates(
+            market_date=market_date,
+            limit=len(normalized_event_ids),
+            after_event_id=0,
+            event_ids=normalized_event_ids,
+            include_durable=False,
+            session=session,
+        )
+
+    def _list_annual_audit_signal_candidates(
+        self,
+        *,
+        market_date: date,
+        limit: int,
+        after_event_id: int,
+        event_ids: list[int] | None,
+        include_durable: bool,
+        session: Any | None = None,
     ) -> list[dict[str, Any]]:
         latest_filing_per_year_rank = func.row_number().over(
             partition_by=(
@@ -716,14 +1070,18 @@ class DartSignalsRepository:
             )
             .order_by(selected_latest_annual.c.event_id.asc())
         )
+        if event_ids is not None:
+            stmt = stmt.where(
+                selected_latest_annual.c.event_id.in_(event_ids)
+            )
 
-        with session_scope() as session:
+        def collect(active_session: Any) -> list[dict[str, Any]]:
             candidates: list[dict[str, Any]] = []
             scan_after_event_id = after_event_id
             while len(candidates) < limit:
                 scan_limit = limit
                 rows = (
-                    session.execute(
+                    active_session.execute(
                         stmt.where(
                             selected_latest_annual.c.event_id
                             > scan_after_event_id
@@ -754,7 +1112,7 @@ class DartSignalsRepository:
                         rcept_no=str(row['rcept_no']),
                         receipt_date=row['receipt_date'],
                     )
-                    if durable_classification is not None:
+                    if durable_classification is not None and not include_durable:
                         continue
                     candidates.append(
                         {
@@ -775,6 +1133,61 @@ class DartSignalsRepository:
                 if len(rows) < scan_limit:
                     break
             return candidates
+        if session is not None:
+            return collect(session)
+        with session_scope() as managed_session:
+            return collect(managed_session)
+
+    def audit_capture_scope_matches(
+        self,
+        *,
+        session: Any,
+        expected_event: Mapping[str, Any],
+        expected_persistence_event: Mapping[str, Any] | None = None,
+        selected_candidate_identity: Mapping[str, Any],
+        market_date: date,
+    ) -> bool:
+        expected_events = [expected_event]
+        if expected_persistence_event is not None:
+            expected_events.append(expected_persistence_event)
+        checked_event_ids: set[int] = set()
+        for expected in expected_events:
+            event_id = int(expected['id'])
+            if event_id in checked_event_ids:
+                continue
+            checked_event_ids.add(event_id)
+            current_event = session.execute(
+                select(DartDisclosureEvent).where(
+                    DartDisclosureEvent.id == event_id
+                )
+            ).scalar_one_or_none()
+            if current_event is None:
+                return False
+            for field in (
+                'rcept_no',
+                'corp_code',
+                'stock_code',
+                'corp_name',
+                'receipt_date',
+                'report_nm',
+                'filing_category',
+            ):
+                if getattr(current_event, field) != expected.get(field):
+                    return False
+        selected_rows = (
+            self.list_missing_selected_annual_audit_signal_candidates(
+                market_date=market_date,
+                event_ids=[int(selected_candidate_identity['event_id'])],
+                session=session,
+            )
+        )
+        if len(selected_rows) != 1:
+            return False
+        selected = selected_rows[0]
+        return all(
+            selected.get(field) == selected_candidate_identity.get(field)
+            for field in ('event_id', 'rcept_no', 'stock_code')
+        )
 
     def list_recent_share_issuance_scan_evidence(
         self,
@@ -906,10 +1319,36 @@ class DartSignalsService:
 
     async def capture_signals_for_event(self, *, rcept_no: str) -> dict[str, Any]:
         event = self._load_event(rcept_no)
-        audit_signal, audit_diagnostics = (
-            await self._extract_audit_signal_with_diagnostics(event)
-        )
         dilution_signal = self._extract_dilution_signal(event)
+        try:
+            audit_signal, audit_diagnostics = (
+                await self._extract_audit_signal_with_diagnostics(event)
+            )
+        except Exception as provider_error:  # noqa: BLE001
+            # A transient provider failure must not invalidate an exact repair
+            # that is already durable. The same writer lock used by exact
+            # repair closes the race between this read and a concurrent repair
+            # commit. If no protected row exists, preserve the original
+            # provider exception so the event remains retryable.
+            stored_audit_signal = self._store_signals(
+                event=event,
+                audit_signal=None,
+                dilution_signal=dilution_signal,
+                audit_signal_evaluated=False,
+                reuse_protected_existing_audit=True,
+            )
+            if not isinstance(stored_audit_signal, ParsedAuditSignal):
+                raise
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': stored_audit_signal.__dict__,
+                'audit_signal_evaluated': True,
+                'dilution_signal': dilution_signal,
+                'audit_signal_recovery': {
+                    'status': 'reused_durable_exact_repair',
+                    'provider_error': str(provider_error),
+                },
+            }
         authoritative_absence = audit_signal is None and (
             _has_complete_audit_authority_evaluation(audit_diagnostics)
         )
@@ -919,12 +1358,18 @@ class DartSignalsService:
                 audit_diagnostics,
             )
         audit_signal_evaluated = audit_signal is not None
-        self._store_signals(
+        stored_audit_signal = self._store_signals(
             event=event,
             audit_signal=audit_signal,
             dilution_signal=dilution_signal,
             audit_signal_evaluated=audit_signal_evaluated,
+            reuse_protected_existing_audit=(
+                audit_signal is None and not authoritative_absence
+            ),
         )
+        if isinstance(stored_audit_signal, ParsedAuditSignal):
+            audit_signal = stored_audit_signal
+            audit_signal_evaluated = True
         result = {
             'rcept_no': rcept_no,
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
@@ -938,31 +1383,287 @@ class DartSignalsService:
             result['audit_diagnostics'] = audit_diagnostics
         return result
 
-    async def capture_audit_signal_for_event(self, *, rcept_no: str) -> dict[str, Any]:
-        event = self._load_event(rcept_no)
+    async def capture_audit_signal_for_event(
+        self,
+        *,
+        rcept_no: str,
+        selected_candidate_identity: Mapping[str, Any] | None = None,
+        selected_candidate_market_date: date | None = None,
+        replacement_target_identity: Mapping[str, Any] | None = None,
+        replacement_manifest_sha256: str | None = None,
+        repair_manifest_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        if (selected_candidate_identity is None) != (
+            selected_candidate_market_date is None
+        ):
+            raise ValueError(
+                'selected candidate identity and market date must be provided '
+                'together'
+            )
+        if (replacement_target_identity is None) != (
+            replacement_manifest_sha256 is None
+        ):
+            raise ValueError(
+                'replacement target identity and manifest hash must be '
+                'provided together'
+            )
+        if replacement_target_identity is not None and (
+            selected_candidate_identity is None
+            or selected_candidate_market_date is None
+        ):
+            raise ValueError(
+                'replacement projection requires selected candidate scope'
+            )
+        normalized_repair_manifest_sha256 = str(
+            repair_manifest_sha256 or replacement_manifest_sha256 or ''
+        ).lower()
+        if normalized_repair_manifest_sha256 and (
+            re.fullmatch(
+                r'[0-9a-f]{64}', normalized_repair_manifest_sha256
+            )
+            is None
+            or selected_candidate_identity is None
+            or selected_candidate_market_date is None
+        ):
+            raise ValueError(
+                'exact repair manifest hash requires selected candidate scope '
+                'and a lowercase SHA-256'
+            )
+        if (
+            repair_manifest_sha256 is not None
+            and replacement_manifest_sha256 is not None
+            and str(repair_manifest_sha256).lower()
+            != str(replacement_manifest_sha256).lower()
+        ):
+            raise ValueError(
+                'repair and replacement manifest hashes must match'
+            )
+        source_event = self._load_event(rcept_no)
         audit_signal, audit_diagnostics = (
-            await self._extract_audit_signal_with_diagnostics(event)
+            await self._extract_audit_signal_with_diagnostics(source_event)
         )
         authoritative_absence = audit_signal is None and (
             _has_complete_audit_authority_evaluation(audit_diagnostics)
         )
         if authoritative_absence:
             audit_signal = build_authoritative_absence_audit_signal(
-                event,
+                source_event,
                 audit_diagnostics,
             )
+        persistence_event = source_event
+        replacement_lineage: dict[str, Any] | None = None
+        if replacement_target_identity is not None:
+            target_event = self._load_event(
+                str(replacement_target_identity.get('rcept_no') or '')
+            )
+            expected_target = {
+                'event_id': replacement_target_identity.get('event_id'),
+                'rcept_no': replacement_target_identity.get('rcept_no'),
+                'stock_code': replacement_target_identity.get('stock_code'),
+            }
+            observed_target = {
+                'event_id': target_event.get('id'),
+                'rcept_no': target_event.get('rcept_no'),
+                'stock_code': target_event.get('stock_code'),
+            }
+            selected_target = {
+                'event_id': selected_candidate_identity.get('event_id'),
+                'rcept_no': selected_candidate_identity.get('rcept_no'),
+                'stock_code': selected_candidate_identity.get('stock_code'),
+            }
+            if observed_target != expected_target or selected_target != expected_target:
+                raise ValueError(
+                    'replacement target identity does not match the selected '
+                    'annual strategy input'
+                )
+            if source_event.get('stock_code') != target_event.get('stock_code'):
+                raise ValueError(
+                    'replacement source and target stock_code must match'
+                )
+            source_receipt_date = _canonical_audit_receipt_date(
+                source_event.get('receipt_date')
+            )
+            target_receipt_date = _canonical_audit_receipt_date(
+                target_event.get('receipt_date')
+            )
+            if (
+                source_receipt_date is None
+                or target_receipt_date is None
+                or source_receipt_date > target_receipt_date
+            ):
+                raise ValueError(
+                    'replacement source must be available no later than its '
+                    'target filing'
+                )
+            manifest_sha256 = str(replacement_manifest_sha256 or '').lower()
+            if re.fullmatch(r'[0-9a-f]{64}', manifest_sha256) is None:
+                raise ValueError(
+                    'replacement manifest hash must be a lowercase SHA-256'
+                )
+            source_error_code = replacement_target_identity.get(
+                'source_error_code'
+            )
+            reason = str(
+                replacement_target_identity.get('reason') or ''
+            ).strip()
+            if (
+                source_error_code != AUDIT_REPLACEMENT_SOURCE_ERROR_CODE
+                or not reason
+                or len(reason) > 200
+            ):
+                raise ValueError(
+                    'replacement target must carry reviewed DART 014 lineage'
+                )
+            if (
+                audit_signal is None
+                or classify_durable_audit_signal(
+                    audit_signal,
+                    event_id=source_event.get('id'),
+                    rcept_no=source_event.get('rcept_no'),
+                    receipt_date=source_event.get('receipt_date'),
+                )
+                != 'parsed_opinion'
+            ):
+                raise ValueError(
+                    'replacement projection requires a parsed audit opinion; '
+                    'absence evidence cannot be projected'
+                )
+            replacement_lineage = {
+                'schema_version': (
+                    AUDIT_REPLACEMENT_LINEAGE_SCHEMA_VERSION
+                ),
+                'manifest_sha256': manifest_sha256,
+                'source': {
+                    'event_id': int(source_event['id']),
+                    'rcept_no': str(source_event['rcept_no']),
+                    'stock_code': str(source_event['stock_code']),
+                    'receipt_date': source_receipt_date,
+                },
+                'target': {
+                    'event_id': int(target_event['id']),
+                    'rcept_no': str(target_event['rcept_no']),
+                    'stock_code': str(target_event['stock_code']),
+                    'receipt_date': target_receipt_date,
+                },
+                'source_error_code': AUDIT_REPLACEMENT_SOURCE_ERROR_CODE,
+                'reason': reason,
+            }
+            replacement_lineage['lineage_sha256'] = _canonical_json_sha256(
+                replacement_lineage
+            )
+            projected_payload = deepcopy(audit_signal.payload or {})
+            projected_payload['replacement_lineage'] = replacement_lineage
+            audit_signal = ParsedAuditSignal(
+                opinion_code=audit_signal.opinion_code,
+                opinion_label=audit_signal.opinion_label,
+                has_audit_issue=audit_signal.has_audit_issue,
+                source_section=audit_signal.source_section,
+                evidence_text=audit_signal.evidence_text,
+                payload=projected_payload,
+            )
+            persistence_event = target_event
+        if normalized_repair_manifest_sha256 and audit_signal is not None:
+            persistence_classification = (
+                'parsed_opinion'
+                if replacement_target_identity is not None
+                else classify_durable_audit_signal(
+                    audit_signal,
+                    event_id=persistence_event.get('id'),
+                    rcept_no=persistence_event.get('rcept_no'),
+                    receipt_date=persistence_event.get('receipt_date'),
+                )
+            )
+            if persistence_classification in {
+                'parsed_opinion',
+                'authoritative_absence',
+            }:
+                source_receipt_date = _canonical_audit_receipt_date(
+                    source_event.get('receipt_date')
+                )
+                persistence_receipt_date = _canonical_audit_receipt_date(
+                    persistence_event.get('receipt_date')
+                )
+                if (
+                    source_receipt_date is None
+                    or persistence_receipt_date is None
+                ):
+                    raise ValueError(
+                        'exact repair lineage requires canonical receipt dates'
+                    )
+                exact_repair_lineage = {
+                    'schema_version': (
+                        AUDIT_EXACT_REPAIR_LINEAGE_SCHEMA_VERSION
+                    ),
+                    'manifest_sha256': normalized_repair_manifest_sha256,
+                    'source': {
+                        'event_id': int(source_event['id']),
+                        'rcept_no': str(source_event['rcept_no']),
+                        'stock_code': str(source_event['stock_code']),
+                        'receipt_date': source_receipt_date,
+                    },
+                    'target': {
+                        'event_id': int(persistence_event['id']),
+                        'rcept_no': str(persistence_event['rcept_no']),
+                        'stock_code': str(persistence_event['stock_code']),
+                        'receipt_date': persistence_receipt_date,
+                    },
+                    'mode': (
+                        'replacement_projection'
+                        if replacement_target_identity is not None
+                        else 'direct'
+                    ),
+                }
+                exact_repair_lineage[
+                    'lineage_sha256'
+                ] = _canonical_json_sha256(exact_repair_lineage)
+                projected_payload = deepcopy(audit_signal.payload or {})
+                projected_payload[
+                    'exact_repair_lineage'
+                ] = exact_repair_lineage
+                audit_signal = ParsedAuditSignal(
+                    opinion_code=audit_signal.opinion_code,
+                    opinion_label=audit_signal.opinion_label,
+                    has_audit_issue=audit_signal.has_audit_issue,
+                    source_section=audit_signal.source_section,
+                    evidence_text=audit_signal.evidence_text,
+                    payload=projected_payload,
+                )
         audit_signal_evaluated = audit_signal is not None
-        self._store_signals(
-            event=event,
-            audit_signal=audit_signal,
-            dilution_signal=None,
-            audit_signal_evaluated=audit_signal_evaluated,
+        store_kwargs: dict[str, Any] = {
+            'event': persistence_event,
+            'audit_signal': audit_signal,
+            'dilution_signal': None,
+            'audit_signal_evaluated': audit_signal_evaluated,
+        }
+        if selected_candidate_identity is not None:
+            store_kwargs.update(
+                {
+                    'expected_event': source_event,
+                    'expected_persistence_event': persistence_event,
+                    'selected_candidate_identity': (
+                        selected_candidate_identity
+                    ),
+                    'selected_candidate_market_date': (
+                        selected_candidate_market_date
+                    ),
+                }
+            )
+        stored_audit_signal = self._store_signals(
+            **store_kwargs,
         )
+        if isinstance(stored_audit_signal, ParsedAuditSignal):
+            audit_signal = stored_audit_signal
+            audit_signal_evaluated = True
         result = {
             'rcept_no': rcept_no,
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
             'audit_signal_evaluated': audit_signal_evaluated,
         }
+        if replacement_lineage is not None:
+            result['persisted_rcept_no'] = str(
+                persistence_event['rcept_no']
+            )
+            result['replacement_lineage'] = replacement_lineage
         if (
             (audit_signal is None or authoritative_absence)
             and audit_diagnostics is not None
@@ -1974,9 +2675,9 @@ class DartSignalsService:
             in parser_names
         ):
             return None
-        # The signed auditor-report opinion paragraph is primary authority.
-        # Once recognized, a placeholder in a secondary business-report table
-        # cannot invalidate it; an unrecognized primary paragraph still blocks.
+        # A recognized signed narrative can disambiguate only empty/placeholder
+        # secondary authority.  It must not erase an explicit qualified,
+        # adverse, or disclaimer opinion from the current-period table.
         auditor_report_findings = [
             item
             for item in findings
@@ -1985,7 +2686,12 @@ class DartSignalsService:
             == 'auditor_report_unmodified_opinion_v1'
         ]
         if auditor_report_findings:
-            findings = auditor_report_findings
+            findings = [
+                item
+                for item in findings
+                if str((item.payload or {}).get('parser') or '')
+                not in _AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS
+            ]
             parser_names = {
                 str((item.payload or {}).get('parser') or '')
                 for item in findings
@@ -1999,7 +2705,14 @@ class DartSignalsService:
             and (item.payload or {}).get('parser')
             == 'semantic_audit_table_v1'
         ]
-        if semantic_findings:
+        modified_semantic_findings = [
+            item
+            for item in semantic_findings
+            if item.opinion_code in {'qualified', 'adverse', 'disclaimer'}
+        ]
+        if auditor_report_findings and not modified_semantic_findings:
+            findings = auditor_report_findings
+        elif semantic_findings:
             findings = semantic_findings
         else:
             explicit_current_findings = [
@@ -2977,7 +3690,7 @@ class DartSignalsService:
         corp_code: str,
         window_start: date,
         window_end: date,
-    ) -> None:
+    ) -> ParsedAuditSignal | None:
         for raw_item in raw_items:
             if not str(raw_item.get('rcept_no') or '').strip():
                 raise ValueError(
@@ -3090,7 +3803,12 @@ class DartSignalsService:
         audit_signal: ParsedAuditSignal | None,
         dilution_signal: dict[str, Any] | None,
         audit_signal_evaluated: bool = False,
-    ) -> None:
+        reuse_protected_existing_audit: bool = False,
+        expected_event: Mapping[str, Any] | None = None,
+        expected_persistence_event: Mapping[str, Any] | None = None,
+        selected_candidate_identity: Mapping[str, Any] | None = None,
+        selected_candidate_market_date: date | None = None,
+    ) -> ParsedAuditSignal | None:
         if audit_signal is None and audit_signal_evaluated:
             raise ValueError(
                 'completed audit evaluation requires an opinion signal or '
@@ -3117,6 +3835,7 @@ class DartSignalsService:
                 audit_signal is not None
                 or audit_signal_evaluated
                 or dilution_signal is not None
+                or reuse_protected_existing_audit
             )
             if (
                 dart_signal_mutation
@@ -3138,7 +3857,83 @@ class DartSignalsService:
                         )
                     },
                 )
-            if audit_signal is not None:
+            protected_existing_audit = False
+            persisted_audit_signal = audit_signal
+            if expected_event is None and (
+                audit_signal is not None or reuse_protected_existing_audit
+            ):
+                existing_audit = session.execute(
+                    select(DartAuditSignal)
+                    .where(
+                        DartAuditSignal.rcept_no == event['rcept_no']
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if existing_audit is not None:
+                    existing_payload = existing_audit.payload
+                    claims_repair_lineage = isinstance(
+                        existing_payload,
+                        Mapping,
+                    ) and bool(
+                        {
+                            'exact_repair_lineage',
+                            'replacement_lineage',
+                        }.intersection(existing_payload)
+                    )
+                    protected_existing_audit = bool(
+                        claims_repair_lineage
+                        and classify_durable_audit_signal(
+                            existing_audit,
+                            event_id=existing_audit.disclosure_event_id,
+                            rcept_no=existing_audit.rcept_no,
+                            receipt_date=existing_audit.receipt_date,
+                        )
+                        is not None
+                    )
+                    if protected_existing_audit:
+                        persisted_audit_signal = ParsedAuditSignal(
+                            opinion_code=existing_audit.opinion_code,
+                            opinion_label=existing_audit.opinion_label,
+                            has_audit_issue=existing_audit.has_audit_issue,
+                            source_section=existing_audit.source_section,
+                            evidence_text=existing_audit.evidence_text,
+                            payload=deepcopy(existing_audit.payload),
+                        )
+            if expected_event is not None:
+                if (
+                    selected_candidate_identity is None
+                    or selected_candidate_market_date is None
+                ):
+                    raise ValueError(
+                        'scoped audit persistence requires selected candidate '
+                        'identity and market date'
+                    )
+                if session.get_bind().dialect.name == 'postgresql':
+                    # The exact repair validates selection after remote parsing.
+                    # Short SHARE locks keep disclosure/fundamental identity
+                    # stable through the audit upsert without blocking readers.
+                    # Snapshot precedes event to match the normal capture path.
+                    session.execute(
+                        text(
+                            'LOCK TABLE dart_fundamentals_snapshots, '
+                            'dart_disclosure_events, symbols, '
+                            'daily_price_bars IN SHARE MODE'
+                        )
+                    )
+                if not self.repository.audit_capture_scope_matches(
+                    session=session,
+                    expected_event=expected_event,
+                    expected_persistence_event=expected_persistence_event,
+                    selected_candidate_identity=(
+                        selected_candidate_identity
+                    ),
+                    market_date=selected_candidate_market_date,
+                ):
+                    raise ValueError(
+                        'selected annual audit candidate changed before '
+                        'durable persistence'
+                    )
+            if audit_signal is not None and not protected_existing_audit:
                 stmt = pg_insert(DartAuditSignal).values(
                     disclosure_event_id=event['id'],
                     rcept_no=event['rcept_no'],
@@ -3179,6 +3974,7 @@ class DartSignalsService:
                     event=event,
                     dilution_signal=dilution_signal,
                 )
+        return persisted_audit_signal
 
     @staticmethod
     def _execute_dilution_upsert(
