@@ -13,7 +13,7 @@ import json
 import logging
 import math
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, text
@@ -31,7 +31,11 @@ from app.agent_context.decision_input_quality import (
 from app.agent_context.eligibility import AGENT_FEEDBACK_SCOPE_REQUESTED
 from app.agent_context.feedback_failure_taxonomy import build_failure_groups
 from app.agent_context.orchestrator import agent_feedback_orchestrator
-from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+)
 from app.agent_context.run_modes import (
     DAILY_RETRY_CYCLE_MODE,
     FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
@@ -181,6 +185,8 @@ ORDER_SOURCE = 'signal_decider_next_open'
 NEXT_OPEN_COST_EVIDENCE_POLICY_VERSION = 'next_open_cost_evidence_v1'
 NEXT_OPEN_PREOPEN_POLICY_FINGERPRINT_VERSION = 'next_open_preopen_policy_v1'
 CURRENT_LIVE_MARKET_AUTHORITY_SCHEMA_VERSION = 'current_live_market_buy_authority_v1'
+NEXT_OPEN_COMPLETION_MANIFEST_SCHEMA_VERSION = 'next_open_completion_manifest_v1'
+STRICT_DECIDER_COMPLETION_SCOPE_PROOF_VERSION = 'stage_completion_scope_v1'
 AGENT_FEEDBACK_CHILD_RUN_LINEAGE_SCHEMA_VERSION = (
     'agent_feedback_child_run_lineage_v1'
 )
@@ -251,6 +257,123 @@ class _PlanRefreshRevisionConflict(RuntimeError):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_strict_decider_completion_authority(
+    proof: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate the exact parent cohort and decision identities fail closed.
+
+    The daily pipeline proof is intentionally revalidated here instead of
+    trusting its caller.  The next-open service is also invoked by schedulers
+    and operator endpoints, so its strict mode must remain an independent
+    authority boundary.
+    """
+
+    if not isinstance(proof, Mapping):
+        return None
+    payload = dict(proof)
+    digest = str(payload.get('proof_digest') or '').strip()
+    canonical_payload = {
+        str(key): value
+        for key, value in payload.items()
+        if str(key) != 'proof_digest'
+    }
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            canonical_payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=True,
+        ).encode('utf-8')
+    ).hexdigest()
+    raw_symbols = payload.get('completed_symbols')
+    raw_identities = payload.get('decision_identities')
+    parent_run_id = str(payload.get('source_run_id') or '').strip()
+    if not (
+        payload.get('schema_version')
+        == STRICT_DECIDER_COMPLETION_SCOPE_PROOF_VERSION
+        and payload.get('kind')
+        == 'signal_decider_terminal_progression'
+        and digest == expected_digest
+        and parent_run_id
+        and isinstance(raw_symbols, list)
+        and raw_symbols
+        and isinstance(raw_identities, list)
+    ):
+        return None
+    symbols = [str(symbol or '').strip().upper() for symbol in raw_symbols]
+    if not (
+        symbols == raw_symbols
+        and symbols == sorted(set(symbols))
+        and all(
+            len(symbol) == 6
+            and symbol.isascii()
+            and symbol.isdigit()
+            for symbol in symbols
+        )
+    ):
+        return None
+
+    identities_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw_identity in raw_identities:
+        if not isinstance(raw_identity, Mapping):
+            return None
+        identity = dict(raw_identity)
+        if set(identity) != {
+            'symbol',
+            'decision_agent_name',
+            'decision_snapshot_id',
+            'decision_run_id',
+        }:
+            return None
+        symbol = str(identity.get('symbol') or '').strip().upper()
+        decision_agent_name = _normalize_agent_name(
+            identity.get('decision_agent_name')
+        )
+        decision_snapshot_id = identity.get('decision_snapshot_id')
+        decision_run_id = str(
+            identity.get('decision_run_id') or ''
+        ).strip()
+        key = (symbol, decision_agent_name)
+        if not (
+            symbol in symbols
+            and decision_agent_name in DECISION_SUPPORT_AGENT_NAMES
+            and type(decision_snapshot_id) is int
+            and decision_snapshot_id > 0
+            and decision_run_id
+            and key not in identities_by_key
+        ):
+            return None
+        identities_by_key[key] = {
+            'symbol': symbol,
+            'decision_agent_name': decision_agent_name,
+            'decision_snapshot_id': decision_snapshot_id,
+            'decision_run_id': decision_run_id,
+        }
+    expected_keys = {
+        (symbol, role)
+        for symbol in symbols
+        for role in DECISION_SUPPORT_AGENT_NAMES
+    }
+    if set(identities_by_key) != expected_keys:
+        return None
+    identities = sorted(
+        identities_by_key.values(),
+        key=lambda item: (
+            item['symbol'],
+            item['decision_agent_name'],
+        ),
+    )
+    if identities != raw_identities:
+        return None
+    return {
+        'parent_run_id': parent_run_id,
+        'symbols': symbols,
+        'decision_identities': identities,
+        'identities_by_key': identities_by_key,
+        'proof_digest': digest,
+    }
 
 
 def _parse_aware_datetime(value: Any) -> datetime | None:
@@ -4102,6 +4225,7 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None = None,
         trigger: str = 'manual',
         force: bool = False,
+        completion_parent_proof: Mapping[str, Any] | None = None,
         _compact_response: bool = False,
         _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
@@ -4111,6 +4235,7 @@ class SignalDeciderNextOpenExecutionService:
                     target_trade_date=target_trade_date,
                     trigger=trigger,
                     force=force,
+                    completion_parent_proof=completion_parent_proof,
                     _compact_response=_compact_response,
                     _live_market_snapshot_loop=_live_market_snapshot_loop,
                 )
@@ -4139,12 +4264,35 @@ class SignalDeciderNextOpenExecutionService:
         target_trade_date: str | date | None = None,
         trigger: str = 'manual',
         force: bool = False,
+        completion_parent_proof: Mapping[str, Any] | None = None,
         _compact_response: bool = False,
         _live_market_snapshot_loop: asyncio.AbstractEventLoop | None = None,
     ) -> dict[str, Any]:
         resolved_target_date = self._resolve_target_trade_date(target_trade_date)
         source_market_date = _previous_trading_day(resolved_target_date)
         runtime = self.runtime_status()
+        completion_scope_authority = (
+            _normalize_strict_decider_completion_authority(
+                completion_parent_proof
+            )
+            if completion_parent_proof is not None
+            else None
+        )
+        if (
+            completion_parent_proof is not None
+            and completion_scope_authority is None
+        ):
+            return {
+                'status': 'blocked',
+                'reason': 'invalid_parent_completion_scope_proof',
+                'request': {
+                    'target_trade_date': resolved_target_date.isoformat(),
+                    'trigger': trigger,
+                },
+                'runtime': runtime,
+                'completion_manifest': None,
+                'items': [],
+            }
         selection_market_state = self.market_state_getter()
         allow_post_open_intraday_watch = (
             _current_live_market_authority_applies(
@@ -4159,6 +4307,7 @@ class SignalDeciderNextOpenExecutionService:
                 allow_post_open_intraday_watch=(
                     allow_post_open_intraday_watch
                 ),
+                completion_scope_authority=completion_scope_authority,
             )
         )
         snapshots = snapshot_generation_state['snapshots']
@@ -4201,6 +4350,9 @@ class SignalDeciderNextOpenExecutionService:
                         target_trade_date=resolved_target_date,
                         allow_post_open_intraday_watch=(
                             allow_post_open_intraday_watch
+                        ),
+                        completion_scope_authority=(
+                            completion_scope_authority
                         ),
                     )
                 )
@@ -4367,6 +4519,7 @@ class SignalDeciderNextOpenExecutionService:
         )
         price_cache: dict[str, int | None] = {}
         desired_keys: set[tuple[str, str, str]] = set()
+        completion_manifest: dict[str, Any] | None = None
         now = _utcnow()
 
         with session_scope() as session:
@@ -4509,6 +4662,7 @@ class SignalDeciderNextOpenExecutionService:
                 source_market_date=source_market_date,
                 target_trade_date=resolved_target_date,
                 allow_post_open_intraday_watch=live_market_authority_applies,
+                completion_scope_authority=completion_scope_authority,
                 _session=session,
             )
             current_raw_snapshots = sorted(
@@ -5140,6 +5294,16 @@ class SignalDeciderNextOpenExecutionService:
                 )
 
             session.flush()
+            completion_manifest = self._build_completion_manifest(
+                scope_state=current_scope_state,
+                generation_validation=generation_validation,
+                agent_context_completeness=agent_context_completeness,
+                rows=[
+                    row
+                    for row in attached_existing.values()
+                    if row is not None
+                ],
+            )
 
         signal_decider_execution_outcome_service.sync_for_target_trade_date(
             target_trade_date=resolved_target_date,
@@ -5147,8 +5311,16 @@ class SignalDeciderNextOpenExecutionService:
         rows, response_items = self._load_plan_refresh_response(
             target_trade_date=resolved_target_date,
             compact_response=_compact_response,
+            completion_scope_authority=completion_scope_authority,
+        )
+        completion_status = (
+            'completed'
+            if isinstance(completion_manifest, Mapping)
+            and completion_manifest.get('incomplete_decision_count') == 0
+            else 'partial'
         )
         return {
+            'status': completion_status,
             'request': {
                 'target_trade_date': resolved_target_date.isoformat(),
                 'trigger': trigger,
@@ -5165,6 +5337,7 @@ class SignalDeciderNextOpenExecutionService:
             ),
             'enrichment_preflight': enrichment_preflight,
             'weekly_policy_rebind': weekly_policy_rebind,
+            'completion_manifest': completion_manifest,
             'items': response_items,
         }
 
@@ -5959,6 +6132,7 @@ class SignalDeciderNextOpenExecutionService:
         source_market_date: date,
         target_trade_date: date | None = None,
         allow_post_open_intraday_watch: bool = False,
+        completion_scope_authority: Mapping[str, Any] | None = None,
         _session: Any | None = None,
     ) -> dict[str, Any]:
         if _session is None:
@@ -5974,6 +6148,13 @@ class SignalDeciderNextOpenExecutionService:
                     ),
                     session=session,
                 )
+                if completion_scope_authority is not None:
+                    state = self._bind_scope_state_to_completion_authority(
+                        scope_state=state,
+                        completion_scope_authority=(
+                            completion_scope_authority
+                        ),
+                    )
                 detached_snapshot_ids: set[int] = set()
                 for snapshot in state['selected_by_key'].values():
                     if snapshot is None or int(snapshot.id) in detached_snapshot_ids:
@@ -5982,12 +6163,222 @@ class SignalDeciderNextOpenExecutionService:
                     detached_snapshot_ids.add(int(snapshot.id))
                 return state
 
-        return self._load_latest_decider_scope_state_in_session(
+        state = self._load_latest_decider_scope_state_in_session(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
             allow_post_open_intraday_watch=allow_post_open_intraday_watch,
             session=_session,
         )
+        if completion_scope_authority is not None:
+            state = self._bind_scope_state_to_completion_authority(
+                scope_state=state,
+                completion_scope_authority=completion_scope_authority,
+            )
+        return state
+
+    @staticmethod
+    def _bind_scope_state_to_completion_authority(
+        *,
+        scope_state: dict[str, Any],
+        completion_scope_authority: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Constrain latest-state selection to one proven parent cohort."""
+
+        authority = dict(completion_scope_authority)
+        symbols = list(authority['symbols'])
+        identities_by_key = dict(authority['identities_by_key'])
+        expected_keys = set(identities_by_key)
+        source_run = scope_state.get('source_run')
+        observed_parent_run_id = (
+            str(source_run.get('run_id') or '').strip()
+            if isinstance(source_run, Mapping)
+            else ''
+        )
+        parent_matches = (
+            observed_parent_run_id == authority['parent_run_id']
+        )
+        raw_selected_by_key = scope_state.get('selected_by_key')
+        raw_selected_by_key = (
+            raw_selected_by_key
+            if isinstance(raw_selected_by_key, Mapping)
+            else {}
+        )
+        selected_by_key: dict[tuple[str, str], Any] = {}
+        for key, identity in identities_by_key.items():
+            snapshot = raw_selected_by_key.get(key)
+            snapshot_matches = bool(
+                parent_matches
+                and snapshot is not None
+                and int(getattr(snapshot, 'id', 0) or 0)
+                == identity['decision_snapshot_id']
+                and str(
+                    getattr(snapshot, 'decision_run_id', None) or ''
+                ).strip()
+                == identity['decision_run_id']
+                and str(getattr(snapshot, 'symbol', '') or '')
+                .strip()
+                .upper()
+                == key[0]
+                and _snapshot_agent_name(snapshot) == key[1]
+            )
+            selected_by_key[key] = snapshot if snapshot_matches else None
+
+        def scoped_mapping(field: str) -> dict[Any, Any]:
+            raw = scope_state.get(field)
+            if not isinstance(raw, Mapping):
+                return {}
+            return {
+                key: value
+                for key, value in raw.items()
+                if key in expected_keys
+            }
+
+        def scoped_set(field: str) -> set[Any]:
+            raw = scope_state.get(field)
+            if not isinstance(raw, (set, frozenset, list, tuple)):
+                return set()
+            return {key for key in raw if key in expected_keys}
+
+        return {
+            **scope_state,
+            'selected_by_key': selected_by_key,
+            'expired_snapshot_by_key': scoped_mapping(
+                'expired_snapshot_by_key'
+            ),
+            'late_intraday_watch_by_key': scoped_mapping(
+                'late_intraday_watch_by_key'
+            ),
+            'late_intraday_context_by_key': scoped_mapping(
+                'late_intraday_context_by_key'
+            ),
+            'authoritative_run_id_by_key': {
+                key: identity['decision_run_id']
+                for key, identity in identities_by_key.items()
+            },
+            'evidenced_scope_keys': scoped_set('evidenced_scope_keys'),
+            'reused_scope_keys': scoped_set('reused_scope_keys'),
+            'failures_by_key': scoped_mapping('failures_by_key'),
+            'source_run': source_run if parent_matches else None,
+            'source_parent_run_id_by_key': scoped_mapping(
+                'source_parent_run_id_by_key'
+            ),
+            'source_role_symbol_scopes': {
+                role: list(symbols)
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+            'blocked_source_scope_keys': scoped_set(
+                'blocked_source_scope_keys'
+            ),
+            'weekly_policy_rebind_blocked_scope_keys': scoped_set(
+                'weekly_policy_rebind_blocked_scope_keys'
+            ),
+            'completion_scope_authority': {
+                'parent_run_id': authority['parent_run_id'],
+                'symbols': symbols,
+                'decision_identities': list(
+                    authority['decision_identities']
+                ),
+                'proof_digest': authority['proof_digest'],
+                'parent_matches': parent_matches,
+            },
+        }
+
+    def resolve_completion_decision_identities(
+        self,
+        *,
+        source_market_date: str | date,
+        parent_run_id: str,
+        symbols: Sequence[str],
+    ) -> dict[str, Any]:
+        """Return exact persisted decision identities for a terminal parent."""
+
+        resolved_market_date = (
+            source_market_date
+            if isinstance(source_market_date, date)
+            else date.fromisoformat(str(source_market_date))
+        )
+        normalized_parent_run_id = str(parent_run_id or '').strip()
+        normalized_symbols = sorted(
+            {
+                str(symbol or '').strip().upper()
+                for symbol in symbols
+                if str(symbol or '').strip()
+            }
+        )
+        if not (
+            normalized_parent_run_id
+            and normalized_symbols
+            and all(
+                len(symbol) == 6
+                and symbol.isascii()
+                and symbol.isdigit()
+                for symbol in normalized_symbols
+            )
+        ):
+            return {
+                'status': 'blocked',
+                'reason': 'invalid_completion_identity_request',
+                'decision_identities': [],
+            }
+        state = self._load_latest_decider_scope_state(
+            source_market_date=resolved_market_date,
+        )
+        source_run = state.get('source_run')
+        observed_parent_run_id = (
+            str(source_run.get('run_id') or '').strip()
+            if isinstance(source_run, Mapping)
+            else ''
+        )
+        if observed_parent_run_id != normalized_parent_run_id:
+            return {
+                'status': 'blocked',
+                'reason': 'completion_parent_run_mismatch',
+                'parent_run_id': normalized_parent_run_id,
+                'observed_parent_run_id': observed_parent_run_id or None,
+                'decision_identities': [],
+            }
+        selected_by_key = state.get('selected_by_key')
+        selected_by_key = (
+            selected_by_key
+            if isinstance(selected_by_key, Mapping)
+            else {}
+        )
+        identities: list[dict[str, Any]] = []
+        for symbol in normalized_symbols:
+            for role in DECISION_SUPPORT_AGENT_NAMES:
+                snapshot = selected_by_key.get((symbol, role))
+                snapshot_id = getattr(snapshot, 'id', None)
+                decision_run_id = str(
+                    getattr(snapshot, 'decision_run_id', None) or ''
+                ).strip()
+                if not (
+                    snapshot is not None
+                    and type(snapshot_id) is int
+                    and snapshot_id > 0
+                    and decision_run_id
+                    and _snapshot_agent_name(snapshot) == role
+                ):
+                    continue
+                identities.append(
+                    {
+                        'symbol': symbol,
+                        'decision_agent_name': role,
+                        'decision_snapshot_id': snapshot_id,
+                        'decision_run_id': decision_run_id,
+                    }
+                )
+        identities.sort(
+            key=lambda item: (
+                item['symbol'],
+                item['decision_agent_name'],
+            )
+        )
+        return {
+            'status': 'completed',
+            'parent_run_id': normalized_parent_run_id,
+            'symbols': normalized_symbols,
+            'decision_identities': identities,
+        }
 
     def _load_latest_decider_scope_state_in_session(
         self,
@@ -7598,12 +7989,14 @@ class SignalDeciderNextOpenExecutionService:
         source_market_date: date,
         target_trade_date: date | None = None,
         allow_post_open_intraday_watch: bool = False,
+        completion_scope_authority: Mapping[str, Any] | None = None,
         _session: Any | None = None,
     ) -> list[SignalDeciderDecisionSnapshot]:
         return self._load_latest_snapshot_generation_state(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
             allow_post_open_intraday_watch=allow_post_open_intraday_watch,
+            completion_scope_authority=completion_scope_authority,
             _session=_session,
         )['snapshots']
 
@@ -7613,12 +8006,14 @@ class SignalDeciderNextOpenExecutionService:
         source_market_date: date,
         target_trade_date: date | None = None,
         allow_post_open_intraday_watch: bool = False,
+        completion_scope_authority: Mapping[str, Any] | None = None,
         _session: Any | None = None,
     ) -> dict[str, Any]:
         scope_state = self._load_latest_decider_scope_state(
             source_market_date=source_market_date,
             target_trade_date=target_trade_date,
             allow_post_open_intraday_watch=allow_post_open_intraday_watch,
+            completion_scope_authority=completion_scope_authority,
             _session=_session,
         )
         raw_snapshots = sorted(
@@ -7857,6 +8252,7 @@ class SignalDeciderNextOpenExecutionService:
         *,
         target_trade_date: date,
         compact_response: bool,
+        completion_scope_authority: Mapping[str, Any] | None = None,
     ) -> tuple[list[SignalDeciderExecutionPlanItem], list[dict[str, Any]]]:
         if compact_response:
             rows = self._load_plan_rows(
@@ -7865,12 +8261,303 @@ class SignalDeciderNextOpenExecutionService:
                 include_payloads=False,
                 include_validation_payload=True,
             )
+            if completion_scope_authority is not None:
+                rows = self._filter_rows_to_completion_authority(
+                    rows=rows,
+                    completion_scope_authority=(
+                        completion_scope_authority
+                    ),
+                )
             return rows, []
         rows = self._load_plan_rows(
             target_trade_date=target_trade_date,
             account_reference=None,
         )
+        if completion_scope_authority is not None:
+            rows = self._filter_rows_to_completion_authority(
+                rows=rows,
+                completion_scope_authority=completion_scope_authority,
+            )
         return rows, [self._serialize_row(row) for row in rows]
+
+    @staticmethod
+    def _filter_rows_to_completion_authority(
+        *,
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+        completion_scope_authority: Mapping[str, Any],
+    ) -> list[SignalDeciderExecutionPlanItem]:
+        identities_by_key = completion_scope_authority.get(
+            'identities_by_key'
+        )
+        if not isinstance(identities_by_key, Mapping):
+            return []
+        filtered: list[SignalDeciderExecutionPlanItem] = []
+        for row in rows:
+            key = (
+                str(getattr(row, 'symbol', '') or '').strip().upper(),
+                _normalize_agent_name(
+                    getattr(row, 'decision_agent_name', None)
+                ),
+            )
+            identity = identities_by_key.get(key)
+            if not isinstance(identity, Mapping):
+                continue
+            if getattr(row, 'decision_snapshot_id', None) != identity.get(
+                'decision_snapshot_id'
+            ):
+                continue
+            filtered.append(row)
+        return filtered
+
+    def _build_completion_manifest(
+        self,
+        *,
+        scope_state: dict[str, Any],
+        generation_validation: dict[str, Any],
+        agent_context_completeness: dict[str, Any],
+        rows: Sequence[SignalDeciderExecutionPlanItem],
+    ) -> dict[str, Any]:
+        raw_role_symbol_scopes = scope_state.get('source_role_symbol_scopes')
+        role_symbol_scopes = {
+            agent_name: sorted(
+                {
+                    str(symbol or '').strip().upper()
+                    for symbol in (
+                        raw_role_symbol_scopes.get(agent_name) or []
+                        if isinstance(raw_role_symbol_scopes, dict)
+                        else []
+                    )
+                    if str(symbol or '').strip()
+                }
+            )
+            for agent_name in DECISION_SUPPORT_AGENT_NAMES
+        }
+        source_run = scope_state.get('source_run')
+        completion_scope_authority = scope_state.get(
+            'completion_scope_authority'
+        )
+        parent_run_id = (
+            _normalize_optional_text(
+                completion_scope_authority.get('parent_run_id')
+            )
+            if isinstance(completion_scope_authority, Mapping)
+            else _normalize_optional_text(source_run.get('run_id'))
+            if isinstance(source_run, dict)
+            else None
+        )
+        generation_summary = agent_context_completeness.get(
+            'decision_input_generation_validation'
+        )
+        generation_fingerprint = (
+            _normalize_optional_text(generation_summary.get('generation_fingerprint'))
+            if isinstance(generation_summary, dict)
+            else None
+        )
+        authority_fingerprint = _normalize_optional_text(
+            agent_context_completeness.get('authority_fingerprint')
+        )
+        valid_snapshot_ids = {
+            int(snapshot_id)
+            for snapshot_id in generation_validation.get('valid_snapshot_ids') or []
+        }
+        selected_by_key = scope_state.get('selected_by_key')
+        selected_by_key = selected_by_key if isinstance(selected_by_key, dict) else {}
+        authoritative_run_id_by_key = scope_state.get(
+            'authoritative_run_id_by_key'
+        )
+        authoritative_run_id_by_key = (
+            authoritative_run_id_by_key
+            if isinstance(authoritative_run_id_by_key, dict)
+            else {}
+        )
+
+        rows_by_scope: dict[
+            tuple[str, str],
+            list[SignalDeciderExecutionPlanItem],
+        ] = {}
+        for row in rows:
+            row_id = getattr(row, 'id', None)
+            account_reference = _normalize_optional_text(
+                getattr(row, 'account_reference', None)
+            )
+            symbol = _normalize_optional_text(getattr(row, 'symbol', None))
+            if type(row_id) is not int or row_id <= 0 or not account_reference or not symbol:
+                continue
+            key = (
+                symbol.upper(),
+                _normalize_agent_name(getattr(row, 'decision_agent_name', None)),
+            )
+            rows_by_scope.setdefault(key, []).append(row)
+
+        decision_partition: list[dict[str, Any]] = []
+        for decision_agent_name in DECISION_SUPPORT_AGENT_NAMES:
+            for symbol in role_symbol_scopes[decision_agent_name]:
+                key = (symbol, decision_agent_name)
+                snapshot = selected_by_key.get(key)
+                snapshot_id = (
+                    int(snapshot.id)
+                    if snapshot is not None and type(getattr(snapshot, 'id', None)) is int
+                    else None
+                )
+                decision_run_id = _normalize_optional_text(
+                    getattr(snapshot, 'decision_run_id', None)
+                    if snapshot is not None
+                    else authoritative_run_id_by_key.get(key)
+                )
+                canonical_action = (
+                    _short_term_tactical_action(snapshot)
+                    if snapshot is not None
+                    and decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    else _normalize_action(
+                        snapshot.next_day_open_action or snapshot.decision_action
+                    )
+                    if snapshot is not None
+                    else None
+                )
+                candidate_context = _candidate_agent_context(
+                    agent_context_completeness,
+                    symbol=symbol,
+                )
+                candidate_generation = candidate_context.get(
+                    'decision_input_generation_validation'
+                )
+                decision_authority_fingerprint = _normalize_optional_text(
+                    candidate_context.get('authority_fingerprint')
+                )
+                decision_generation_fingerprint = (
+                    _normalize_optional_text(
+                        candidate_generation.get('generation_fingerprint')
+                    )
+                    if isinstance(candidate_generation, dict)
+                    else None
+                )
+                snapshot_is_valid = bool(
+                    snapshot_id is not None
+                    and snapshot_id in valid_snapshot_ids
+                    and decision_authority_fingerprint
+                    and decision_generation_fingerprint
+                )
+
+                included_items: list[dict[str, Any]] = []
+                if snapshot_is_valid and _is_actionable_snapshot(snapshot):
+                    matching_rows = [
+                        row
+                        for row in rows_by_scope.get(key, [])
+                        if int(row.decision_snapshot_id) == snapshot_id
+                    ]
+                    for row in sorted(
+                        matching_rows,
+                        key=lambda item: (item.account_reference, int(item.id)),
+                    ):
+                        traceability = row.__dict__.get('traceability_payload')
+                        traceability = (
+                            traceability if isinstance(traceability, dict) else {}
+                        )
+                        validation = _row_validation_payload(row)
+                        handoff = validation.get('handoff')
+                        handoff = handoff if isinstance(handoff, dict) else {}
+                        handoff_intent = _normalize_optional_text(
+                            traceability.get('handoff_intent')
+                            or validation.get('handoff_intent')
+                            or handoff.get('handoff_intent')
+                        )
+                        handoff_active = bool(
+                            traceability.get('handoff_active')
+                            or handoff.get('exec_monitoring_active')
+                            or (
+                                decision_agent_name
+                                == SHORT_TERM_DECIDER_AGENT_NAME
+                                and row.eligibility_status
+                                in {
+                                    ELIGIBILITY_ELIGIBLE,
+                                    ELIGIBILITY_MONITOR_CANDIDATE,
+                                }
+                                and handoff_intent
+                                in {'tactical_buy', 'intraday_watch_buy'}
+                            )
+                        )
+                        exec_monitoring_active = bool(
+                            traceability.get('exec_monitoring_active')
+                            or handoff.get('exec_monitoring_active')
+                            or handoff_active
+                        )
+                        included_items.append(
+                            {
+                                'plan_item_id': int(row.id),
+                                'account_reference': row.account_reference,
+                                'eligibility_status': row.eligibility_status,
+                                'handoff_active': handoff_active,
+                                'exec_monitoring_active': exec_monitoring_active,
+                                'row_authority_fingerprint': (
+                                    _execution_plan_row_authority_fingerprint(row)
+                                ),
+                            }
+                        )
+
+                if included_items:
+                    disposition = 'included'
+                    exclusion = None
+                elif snapshot_is_valid and not _is_actionable_snapshot(snapshot):
+                    disposition = 'non_actionable'
+                    exclusion = {
+                        'kind': 'non_actionable',
+                        'reason_code': 'latest_snapshot_not_actionable',
+                    }
+                else:
+                    disposition = 'incomplete'
+                    exclusion = None
+                decision_partition.append(
+                    {
+                        'symbol': symbol,
+                        'decision_agent_name': decision_agent_name,
+                        'decision_run_id': decision_run_id,
+                        'decision_snapshot_id': snapshot_id,
+                        'canonical_action': canonical_action,
+                        'authority_fingerprint': decision_authority_fingerprint,
+                        'generation_fingerprint': decision_generation_fingerprint,
+                        'disposition': disposition,
+                        'included_items': included_items,
+                        'exclusion': exclusion,
+                    }
+                )
+
+        decision_partition.sort(
+            key=lambda item: (item['symbol'], item['decision_agent_name'])
+        )
+        manifest = {
+            'schema_version': NEXT_OPEN_COMPLETION_MANIFEST_SCHEMA_VERSION,
+            'parent_run_id': parent_run_id,
+            'authority_fingerprint': authority_fingerprint,
+            'generation_fingerprint': generation_fingerprint,
+            'role_symbol_scopes': role_symbol_scopes,
+            'decision_partition': decision_partition,
+            'decision_count': len(decision_partition),
+            'included_decision_count': sum(
+                item['disposition'] == 'included'
+                for item in decision_partition
+            ),
+            'excluded_decision_count': sum(
+                item['disposition'] == 'non_actionable'
+                for item in decision_partition
+            ),
+            'incomplete_decision_count': sum(
+                item['disposition'] == 'incomplete'
+                for item in decision_partition
+            ),
+            'included_item_count': sum(
+                len(item['included_items']) for item in decision_partition
+            ),
+        }
+        canonical = json.dumps(
+            _to_json_safe(manifest),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        manifest['manifest_digest'] = hashlib.sha256(
+            canonical.encode('utf-8')
+        ).hexdigest()
+        return manifest
 
     def _build_validation_payload(
         self,

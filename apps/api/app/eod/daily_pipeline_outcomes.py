@@ -72,6 +72,25 @@ def pykrx_enrichment_preflight_is_ready(
         return False
     required_categories = preflight.get('required_categories')
     category_row_counts = preflight.get('category_row_counts')
+    category_decision_usable_row_counts = preflight.get(
+        'category_decision_usable_row_counts'
+    )
+    decision_usable_counts_are_ready = bool(
+        not isinstance(category_decision_usable_row_counts, Mapping)
+        or all(
+            (
+                _optional_int(
+                    category_decision_usable_row_counts.get(category)
+                )
+                or 0
+            )
+            > 0
+            for category in PYKRX_ENRICHMENT_REQUIRED_CATEGORIES
+        )
+    )
+    zero_decision_usable_categories = preflight.get(
+        'zero_decision_usable_categories'
+    )
     return bool(
         preflight.get('allowed') is True
         and str(preflight.get('status') or '').strip().lower() == 'ready'
@@ -87,10 +106,15 @@ def pykrx_enrichment_preflight_is_ready(
             (_optional_int(category_row_counts.get(category)) or 0) > 0
             for category in PYKRX_ENRICHMENT_REQUIRED_CATEGORIES
         )
+        and decision_usable_counts_are_ready
         and preflight.get('failed_categories') == []
         and preflight.get('blocked_categories') == []
         and preflight.get('waiting_categories') == []
         and preflight.get('zero_coverage_categories') == []
+        and (
+            zero_decision_usable_categories is None
+            or zero_decision_usable_categories == []
+        )
     )
 
 

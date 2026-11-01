@@ -25,6 +25,8 @@ from app.db_models import (
     Symbol,
 )
 from app.eod.market_membership import (
+    MARKET_MEMBERSHIP_BASIS,
+    MARKET_MEMBERSHIP_SCHEMA_VERSION,
     market_membership_sha256,
     validate_market_membership_snapshot,
 )
@@ -40,6 +42,7 @@ from app.eod.price_bar_repair_state import (
 )
 from app.market_data_store import (
     advisory_eod_collection_lock,
+    build_daily_derived_market_scope_authority,
     list_symbols_with_daily_bar_on_date,
 )
 from app.repositories.eod_run_repository import list_eod_collection_runs
@@ -65,6 +68,14 @@ MINIMUM_MARKET_MEMBERSHIP = {
     'KOSDAQ': 1200,
 }
 EXACT_FACTOR_REPAIR_STATEMENT_TIMEOUT_MS = 60_000
+MEMBERSHIP_POLICY_LIVE_THEN_STORED = 'live_then_stored'
+MEMBERSHIP_POLICY_STORED_ONLY = 'stored_only'
+MEMBERSHIP_POLICIES = frozenset(
+    {
+        MEMBERSHIP_POLICY_LIVE_THEN_STORED,
+        MEMBERSHIP_POLICY_STORED_ONLY,
+    }
+)
 
 FACTOR_RESULT_MODELS = {
     'piotroski_filter': DailyPiotroskiFilterResult,
@@ -239,6 +250,39 @@ def _extract_stored_exact_market_membership(
         symbols_by_market[market] = sorted(numeric_symbols)
         skipped_by_market[market] = sorted(skipped_codes)
     return symbols_by_market, skipped_by_market
+
+
+def _build_ranking_membership_snapshot(
+    symbols_by_market: Mapping[str, Sequence[str]],
+) -> dict[str, Any]:
+    if set(symbols_by_market) != set(EXACT_FACTOR_REPAIR_MARKETS):
+        raise ValueError('ranking membership markets are incomplete')
+    normalized = {
+        market: sorted(str(symbol).strip().upper() for symbol in symbols)
+        for market, symbols in symbols_by_market.items()
+    }
+    all_symbols = [
+        symbol
+        for market in EXACT_FACTOR_REPAIR_MARKETS
+        for symbol in normalized[market]
+    ]
+    if len(all_symbols) != len(set(all_symbols)):
+        raise ValueError('ranking membership contains duplicate symbols')
+    return {
+        'schema_version': MARKET_MEMBERSHIP_SCHEMA_VERSION,
+        'membership_basis': MARKET_MEMBERSHIP_BASIS,
+        'symbol_count': len(all_symbols),
+        'markets': {
+            market: {
+                'symbols': normalized[market],
+                'symbol_count': len(normalized[market]),
+                'membership_sha256': market_membership_sha256(
+                    normalized[market]
+                ),
+            }
+            for market in EXACT_FACTOR_REPAIR_MARKETS
+        },
+    }
 
 
 def _build_factor_symbols_for_date_query(
@@ -545,6 +589,51 @@ class ExactFactorRepairService:
             result['reason'] = reason
         return result
 
+    @staticmethod
+    def _validated_atomic_scope_finalization(
+        *,
+        stage_id: str,
+        market_date: str,
+        exact_symbols: Sequence[str],
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        finalization = result.get('scope_finalization')
+        if not isinstance(finalization, Mapping):
+            raise RuntimeError(
+                f'{stage_id} did not return atomic exact-scope finalization'
+            )
+        membership_hash = market_membership_sha256(exact_symbols)
+        expected = {
+            'stage': stage_id,
+            'market_date': market_date,
+            'exact_symbol_count': len(exact_symbols),
+            'exact_membership_sha256': membership_hash,
+            'successful_symbol_count': len(exact_symbols),
+            'successful_membership_sha256': membership_hash,
+            'authoritative_market_scope': True,
+            'authoritative_markets': sorted(EXACT_FACTOR_REPAIR_MARKETS),
+            'all_market_authority': False,
+            'ready': True,
+        }
+        mismatches = [
+            field
+            for field, expected_value in expected.items()
+            if finalization.get(field) != expected_value
+        ]
+        deleted_count = finalization.get('deleted_stale_row_count')
+        if (
+            isinstance(deleted_count, bool)
+            or not isinstance(deleted_count, int)
+            or deleted_count < 0
+        ):
+            mismatches.append('deleted_stale_row_count')
+        if mismatches:
+            raise RuntimeError(
+                f'{stage_id} atomic exact-scope finalization mismatch: '
+                + ','.join(dict.fromkeys(mismatches))
+            )
+        return dict(finalization)
+
     def repair_for_market_date(
         self,
         *,
@@ -553,8 +642,18 @@ class ExactFactorRepairService:
         prune_stale: bool = False,
         expected_provider_membership_count: int | None = None,
         expected_membership_sha256: str | None = None,
+        membership_policy: str = MEMBERSHIP_POLICY_LIVE_THEN_STORED,
     ) -> dict[str, Any]:
         normalized_date = _normalize_market_date(market_date)
+        normalized_membership_policy = str(membership_policy).strip().lower()
+        if normalized_membership_policy not in MEMBERSHIP_POLICIES:
+            return self._result(
+                market_date=normalized_date,
+                apply=apply,
+                status='blocked',
+                reason='unsupported_membership_policy',
+                membership_policy=normalized_membership_policy,
+            )
         if apply:
             validate_finalized_krx_write_date(
                 normalized_date,
@@ -602,14 +701,24 @@ class ExactFactorRepairService:
                     error_message=str(exc),
                 )
 
+            stored_only = (
+                normalized_membership_policy
+                == MEMBERSHIP_POLICY_STORED_ONLY
+            )
             live_trade_date_error: Exception | None = None
-            try:
-                resolved_date = _normalize_market_date(
-                    self.trade_date_resolver(end_date=compact_date)
+            if stored_only:
+                live_trade_date_error = RuntimeError(
+                    'live membership disabled by stored-only policy'
                 )
-            except Exception as exc:  # noqa: BLE001
-                live_trade_date_error = exc
                 resolved_date = None
+            else:
+                try:
+                    resolved_date = _normalize_market_date(
+                        self.trade_date_resolver(end_date=compact_date)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    live_trade_date_error = exc
+                    resolved_date = None
             if (
                 live_trade_date_error is None
                 and resolved_date != normalized_date
@@ -623,6 +732,7 @@ class ExactFactorRepairService:
                 )
 
             exact_symbols: list[str] = []
+            ranking_symbols_by_market: dict[str, list[str]] = {}
             market_symbol_counts: dict[str, int] = {}
             skipped_provider_code_counts_by_market: dict[str, int] = {}
             skipped_provider_codes: list[dict[str, str]] = []
@@ -662,6 +772,7 @@ class ExactFactorRepairService:
                     )
                 seen_provider_codes.update(provider_codes)
                 exact_symbols.extend(market_symbols)
+                ranking_symbols_by_market[market] = list(market_symbols)
                 protected_provider_codes.extend(market_skipped_codes)
                 market_symbol_counts[market] = len(market_symbols)
                 skipped_provider_code_counts_by_market[market] = len(
@@ -717,6 +828,7 @@ class ExactFactorRepairService:
                         live_error_message=str(live_membership_error),
                     )
                 exact_symbols = []
+                ranking_symbols_by_market = {}
                 market_symbol_counts = {}
                 skipped_provider_code_counts_by_market = {}
                 skipped_provider_codes = []
@@ -725,6 +837,7 @@ class ExactFactorRepairService:
                     market_symbols = stored_symbols[market]
                     market_skipped_codes = stored_skipped[market]
                     exact_symbols.extend(market_symbols)
+                    ranking_symbols_by_market[market] = list(market_symbols)
                     protected_provider_codes.extend(market_skipped_codes)
                     market_symbol_counts[market] = len(market_symbols)
                     skipped_provider_code_counts_by_market[market] = len(
@@ -770,6 +883,27 @@ class ExactFactorRepairService:
             if frozen_membership is not None:
                 exact_symbols = list(frozen_membership)
             ranking_membership_hash = market_membership_sha256(exact_symbols)
+            try:
+                authoritative_market_scope = (
+                    build_daily_derived_market_scope_authority(
+                        market_date=normalized_date,
+                        exact_symbols=exact_symbols,
+                        market_membership_snapshot=(
+                            _build_ranking_membership_snapshot(
+                                ranking_symbols_by_market
+                            )
+                        ),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                return self._result(
+                    market_date=normalized_date,
+                    apply=apply,
+                    status='blocked',
+                    reason='invalid_authoritative_market_scope',
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
             exact_symbol_set = set(exact_symbols)
             full_provider_membership_set = set(full_provider_membership)
             try:
@@ -818,6 +952,7 @@ class ExactFactorRepairService:
                 for stage_id, details in stale_details.items()
             }
             evidence = {
+                'membership_policy': normalized_membership_policy,
                 'membership_basis': 'exact_market_date_ohlcv',
                 'membership_evidence_source': membership_evidence_source,
                 'membership_evidence_run_id': membership_evidence_run_id,
@@ -840,6 +975,9 @@ class ExactFactorRepairService:
                 ),
                 'provider_excluded_from_ranking_counts_by_market': (
                     skipped_provider_code_counts_by_market
+                ),
+                'provider_excluded_from_ranking_codes': (
+                    protected_provider_codes
                 ),
                 'provider_excluded_from_ranking_preview': skipped_provider_codes[:20],
                 'stored_price_bar_count': len(stored_bar_symbols),
@@ -912,6 +1050,10 @@ class ExactFactorRepairService:
                         market_date=iso_date,
                         symbols=exact_symbols,
                         ranking_symbols=exact_symbols,
+                        exact_scope_symbols=exact_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception(
@@ -963,6 +1105,30 @@ class ExactFactorRepairService:
                         stage_results=stage_results,
                         **evidence,
                     )
+                try:
+                    atomic_finalization = (
+                        self._validated_atomic_scope_finalization(
+                            stage_id=stage_id,
+                            market_date=iso_date,
+                            exact_symbols=exact_symbols,
+                            result=result,
+                        )
+                    )
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    return self._result(
+                        market_date=normalized_date,
+                        apply=True,
+                        status='partial',
+                        reason='factor_stage_atomic_finalization_failed',
+                        failed_stage=stage_id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                        stage_results=stage_results,
+                        **evidence,
+                    )
+                stage_results[stage_id]['scope_finalization'] = (
+                    atomic_finalization
+                )
 
             try:
                 persistence_verification = self.applied_scope_verifier(
@@ -1074,7 +1240,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--apply',
         action='store_true',
-        help='Persist exact-membership factor results; default is dry-run.',
+        help=(
+            'Deprecated and blocked here. Use '
+            'app.eod.exact_factor_bulk_repair for guarded publication.'
+        ),
     )
     parser.add_argument(
         '--prune-stale',
@@ -1099,19 +1268,44 @@ def _build_parser() -> argparse.ArgumentParser:
             'dry-run of the same date.'
         ),
     )
+    parser.add_argument(
+        '--stored-membership-only',
+        action='store_true',
+        help=(
+            'Disable all live trade-date and PyKRX membership calls; require '
+            'strict same-date stored EOD metadata plus pending frozen scope.'
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    result = exact_factor_repair_service.repair_for_market_date(
-        market_date=args.market_date,
-        apply=bool(args.apply),
-        prune_stale=bool(args.prune_stale),
-        expected_provider_membership_count=(
+    if args.apply:
+        result = {
+            'market_date': args.market_date,
+            'mode': 'apply',
+            'status': 'blocked',
+            'applied': False,
+            'reason': 'direct_apply_requires_exact_factor_bulk_repair',
+            'required_driver': 'app.eod.exact_factor_bulk_repair',
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 1
+
+    repair_kwargs: dict[str, Any] = {
+        'market_date': args.market_date,
+        'apply': bool(args.apply),
+        'prune_stale': bool(args.prune_stale),
+        'expected_provider_membership_count': (
             args.expected_provider_membership_count
         ),
-        expected_membership_sha256=args.expected_membership_sha256,
+        'expected_membership_sha256': args.expected_membership_sha256,
+    }
+    if args.stored_membership_only:
+        repair_kwargs['membership_policy'] = MEMBERSHIP_POLICY_STORED_ONLY
+    result = exact_factor_repair_service.repair_for_market_date(
+        **repair_kwargs,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0 if result.get('status') in {'ready', 'completed'} else 1

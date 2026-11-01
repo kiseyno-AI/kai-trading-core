@@ -22,9 +22,11 @@ from app.db_models import (
     Symbol,
 )
 from app.dart.signals_service import (
+    AUDIT_SIGNAL_WRITER_LOCK_KEY,
     DartSignalsRepository,
     DartSignalsService,
     _decode_document_text,
+    audit_signal_writer_lock_owner,
 )
 
 
@@ -42,6 +44,33 @@ def _audit_document(*opinions):
         for opinion in opinions
     )
     return f'<TABLE-GROUP ACLASS="AUD_OPN">{rows}</TABLE-GROUP>'.encode('utf-8')
+
+
+def _semantic_audit_document(
+    *rows: tuple[str, str],
+    table_class: str = 'NORMAL',
+    use_table_group: bool = False,
+):
+    header = (
+        '<TR><TH>사업연도</TH><TH>감사인</TH><TH>감사의견</TH>'
+        '<TH>강조사항 등</TH><TH>핵심감사사항</TH></TR>'
+    )
+    body = ''.join(
+        '<TR>'
+        f'<TD>{business_year}</TD><TD>한영회계법인</TD>'
+        f'<TD>{opinion}</TD><TD>-</TD><TD>-</TD>'
+        '</TR>'
+        for business_year, opinion in rows
+    )
+    if use_table_group:
+        return (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            f'{header}{body}'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+    return (
+        f'<TABLE ACLASS="{table_class}">{header}{body}</TABLE>'
+    ).encode('utf-8')
 
 
 def _share_issuance_attempt_row(
@@ -481,7 +510,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.source_section, 'reports/late-audit.xml')
         self.assertIn('의견거절', result.evidence_text)
 
-    async def test_extract_audit_signal_is_order_invariant_and_selects_worst_finding(self):
+    async def test_extract_audit_signal_rejects_conflicting_markerless_members(self):
         member_sets = [
             [
                 ('reports/clean.xml', _audit_document('적정의견')),
@@ -503,21 +532,9 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             results.append(result)
 
         for result in results:
-            self.assertIsNotNone(result)
-            self.assertEqual(result.opinion_code, 'adverse')
-            self.assertTrue(result.has_audit_issue)
-            self.assertEqual(result.source_section, 'reports/risk.xml')
-            self.assertEqual(result.payload['evidence_count'], 2)
-            self.assertEqual(
-                result.payload['conflicting_opinion_codes'],
-                ['adverse', 'unqualified'],
-            )
-            self.assertEqual(
-                result.payload['source_sections'],
-                ['reports/clean.xml', 'reports/risk.xml'],
-            )
+            self.assertIsNone(result)
 
-    async def test_extract_audit_signal_scans_every_relevant_row(self):
+    async def test_extract_audit_signal_rejects_conflicting_markerless_rows(self):
         client = FakeSignalsClient(
             members=[
                 (
@@ -531,13 +548,326 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             {'rcept_no': '20260422000003', 'report_nm': '사업보고서'}
         )
 
-        self.assertIsNotNone(result)
-        self.assertEqual(result.opinion_code, 'disclaimer')
-        self.assertEqual(result.payload['evidence_count'], 3)
-        self.assertEqual(
-            result.payload['findings_by_opinion'],
-            {'disclaimer': 1, 'qualified': 1, 'unqualified': 1},
+        self.assertIsNone(result)
+
+    async def test_extract_audit_signal_legacy_uses_only_explicit_current_row(self):
+        document = (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            '<TR><TD>감사보고서(당기)</TD><TD>적정의견</TD></TR>'
+            '<TR><TD>감사보고서(전기)</TD><TD>의견거절</TD></TR>'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(members=[('reports/legacy.xml', document)])
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000007', 'report_nm': '사업보고서'}
         )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'unqualified')
+        self.assertFalse(result.has_audit_issue)
+        self.assertIn('감사보고서(당기)', result.evidence_text)
+        self.assertNotIn('감사보고서(전기)', result.evidence_text)
+
+    async def test_extract_audit_signal_legacy_prior_only_fails_closed(self):
+        document = (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            '<TR><TD>감사보고서(전기)</TD><TD>의견거절</TD></TR>'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(members=[('reports/prior.xml', document)])
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000008', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_extract_audit_signal_semantic_current_outranks_legacy_prior(self):
+        semantic_current = _semantic_audit_document(
+            ('제10기(당기)', '적정의견')
+        )
+        legacy_prior = (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            '<TR><TD>감사보고서(전기)</TD><TD>의견거절</TD></TR>'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    ('reports/semantic.xml', semantic_current),
+                    ('reports/legacy-prior.xml', legacy_prior),
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000009', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'unqualified')
+        self.assertEqual(result.source_section, 'reports/semantic.xml')
+        self.assertFalse(result.has_audit_issue)
+
+    async def test_extract_audit_signal_accepts_semantic_plain_table_current_row_only(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/annual.xml',
+                    _semantic_audit_document(
+                        ('제70기(당기)', '적정의견'),
+                        ('제69기(전기)', '의견거절'),
+                    ),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260325001443', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'unqualified')
+        self.assertFalse(result.has_audit_issue)
+        self.assertEqual(result.payload['evidence_count'], 1)
+        self.assertIn('제70기(당기)', result.evidence_text)
+        self.assertNotIn('제69기(전기)', result.evidence_text)
+
+    async def test_extract_audit_signal_accepts_semantic_aud_opn_without_report_label(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/aud-opn.xml',
+                    _semantic_audit_document(
+                        ('제52기(당기)', '적정'),
+                        table_class='AUD_OPN',
+                        use_table_group=True,
+                    ),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260319000588', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'unqualified')
+        self.assertFalse(result.has_audit_issue)
+
+    async def test_capture_audit_signal_uses_current_column_from_transposed_semantic_table(self):
+        document = (
+            '<TABLE ACLASS="NORMAL">'
+            '<TR><TH>사업연도</TH><TD>제10기(당기)</TD><TD>제9기(전기)</TD></TR>'
+            '<TR><TH>감사인</TH><TD>한영회계법인</TD><TD>삼정회계법인</TD></TR>'
+            '<TR><TH>감사의견</TH><TD>적정</TD><TD>의견거절</TD></TR>'
+            '<TR><TH>강조사항 등</TH><TD>-</TD><TD>-</TD></TR>'
+            '<TR><TH>핵심감사사항</TH><TD>-</TD><TD>-</TD></TR>'
+            '</TABLE>'
+        ).encode('utf-8')
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/transposed-audit.xml', document)]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20260319000589',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2026, 3, 19),
+            'report_nm': '사업보고서 (2025.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        audit_signal = store_signals.call_args.kwargs['audit_signal']
+        self.assertIsNotNone(audit_signal)
+        self.assertEqual(audit_signal.opinion_code, 'unqualified')
+        self.assertFalse(audit_signal.has_audit_issue)
+        self.assertIn('제10기(당기)', audit_signal.evidence_text)
+        self.assertNotIn('의견거절', audit_signal.evidence_text)
+        self.assertTrue(
+            store_signals.call_args.kwargs['audit_signal_evaluated']
+        )
+        self.assertEqual(result['audit_signal']['opinion_code'], 'unqualified')
+
+    async def test_extract_audit_signal_maps_bare_disclaimer_only_in_current_opinion_cell(self):
+        current_disclaimer = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    (
+                        'reports/current.xml',
+                        _semantic_audit_document(('제10기(당기)', '거절')),
+                    )
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000001', 'report_nm': '사업보고서'}
+        )
+        unrelated_narrative = await DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    (
+                        'reports/narrative.xml',
+                        b'<DOCUMENT>\xea\xb1\xb0\xec\xa0\x88</DOCUMENT>',
+                    )
+                ]
+            )
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000002', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(current_disclaimer)
+        self.assertEqual(current_disclaimer.opinion_code, 'disclaimer')
+        self.assertTrue(current_disclaimer.has_audit_issue)
+        self.assertIsNone(unrelated_narrative)
+
+    async def test_extract_audit_signal_does_not_map_other_current_row_columns(self):
+        document = (
+            '<TABLE>'
+            '<TR><TH>사업연도</TH><TH>감사인</TH><TH>감사의견</TH>'
+            '<TH>강조사항 등</TH><TH>핵심감사사항</TH></TR>'
+            '<TR><TD>제10기(당기)</TD><TD>한영회계법인</TD><TD>적정</TD>'
+            '<TD>의견거절 가능성을 검토했음</TD><TD>-</TD></TR>'
+            '</TABLE>'
+        ).encode('utf-8')
+
+        result = await DartSignalsService(
+            client=FakeSignalsClient(members=[('reports/current.xml', document)])
+        )._extract_audit_signal(
+            {'rcept_no': '20260319000005', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'unqualified')
+        self.assertFalse(result.has_audit_issue)
+
+    async def test_extract_audit_signal_selects_worst_conflicting_current_semantic_rows(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/conflict.xml',
+                    _semantic_audit_document(
+                        ('제10기(당기)', '적정'),
+                        ('제10기(당기)', '한정의견'),
+                        ('제9기(전기)', '부적정의견'),
+                    ),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260319000003', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.opinion_code, 'qualified')
+        self.assertEqual(result.payload['evidence_count'], 2)
+        self.assertEqual(
+            result.payload['conflicting_opinion_codes'],
+            ['qualified', 'unqualified'],
+        )
+
+    async def test_extract_audit_signal_rejects_semantic_lookalikes_without_exact_headers(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/lookalike.xml',
+                    (
+                        '<TABLE ACLASS="NORMAL">'
+                        '<TR><TH>사업연도</TH><TH>감사의견</TH></TR>'
+                        '<TR><TD>제10기(당기)</TD><TD>적정</TD></TR>'
+                        '</TABLE>'
+                        '<DOCUMENT>감사인 핵심감사사항 의견거절</DOCUMENT>'
+                    ).encode('utf-8'),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260319000004', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_extract_audit_signal_requires_current_marker_in_business_year_column(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/wrong-current-column.xml',
+                    (
+                        '<TABLE ACLASS="NORMAL">'
+                        '<TR><TH>사업연도</TH><TH>감사인</TH><TH>감사의견</TH>'
+                        '<TH>강조사항 등</TH><TH>핵심감사사항</TH></TR>'
+                        '<TR><TD>제9기(전기)</TD><TD>한영회계법인(당기)</TD>'
+                        '<TD>의견거절</TD><TD>-</TD><TD>-</TD></TR>'
+                        '</TABLE>'
+                    ).encode('utf-8'),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260319000005', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_extract_audit_signal_requires_legacy_current_marker_in_report_label_cell(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/legacy-wrong-current-column.xml',
+                    (
+                        '<TABLE-GROUP ACLASS="AUD_OPN">'
+                        '<TR><TD>감사보고서(전기)</TD><TD>한영회계법인(당기)</TD>'
+                        '<TD>의견거절</TD></TR>'
+                        '</TABLE-GROUP>'
+                    ).encode('utf-8'),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260319000006', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
+
+    async def test_extract_audit_signal_does_not_fallback_when_current_row_is_missing(self):
+        client = FakeSignalsClient(
+            members=[
+                (
+                    'reports/stale-only.xml',
+                    (
+                        '<TABLE-GROUP ACLASS="AUD_OPN">'
+                        '<TR><TH>사업연도</TH><TH>감사인</TH><TH>감사의견</TH>'
+                        '<TH>강조사항 등</TH><TH>핵심감사사항</TH></TR>'
+                        '<TR><TD>제9기(전기)</TD><TD>한영회계법인</TD>'
+                        '<TD>의견거절</TD><TD>-</TD><TD>-</TD></TR>'
+                        '<TR><TD>감사보고서</TD><TD>의견거절</TD></TR>'
+                        '</TABLE-GROUP>'
+                    ).encode('utf-8'),
+                )
+            ]
+        )
+
+        result = await DartSignalsService(client=client)._extract_audit_signal(
+            {'rcept_no': '20260319000006', 'report_nm': '사업보고서'}
+        )
+
+        self.assertIsNone(result)
 
     async def test_missing_audit_signal_reports_bounded_non_content_archive_diagnostics(self):
         secret_body = 'SECRET-AUDIT-BODY-MUST-NOT-BE-PERSISTED'
@@ -601,6 +931,365 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret_body, persisted_shape)
         self.assertNotIn('감사보고서', persisted_shape)
         self.assertNotIn('적정의견', persisted_shape)
+
+    async def test_non_audit_document_preserves_stale_parser_signal(self):
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/plain.xml', b'<DOCUMENT>plain</DOCUMENT>')]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000541',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertIsNone(result['audit_signal'])
+        self.assertIn('audit_diagnostics', result)
+        self.assertFalse(result['audit_signal_evaluated'])
+        store_signals.assert_called_once_with(
+            event=event,
+            audit_signal=None,
+            dilution_signal=None,
+            audit_signal_evaluated=False,
+        )
+
+    async def test_prior_period_audit_authority_revokes_stale_parser_signal(self):
+        document = (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            '<TR><TD>감사보고서(전기)</TD><TD>의견거절</TD></TR>'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/prior-only.xml', document)]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000542',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertIsNone(result['audit_signal'])
+        self.assertIn('audit_diagnostics', result)
+        self.assertTrue(result['audit_signal_evaluated'])
+        self.assertEqual(
+            result['audit_diagnostics'][
+                'negative_authority_evidence_count'
+            ],
+            1,
+        )
+        store_signals.assert_called_once_with(
+            event=event,
+            audit_signal=None,
+            dilution_signal=None,
+            audit_signal_evaluated=True,
+        )
+
+    async def test_explicit_current_opinion_wins_over_prior_only_document(self):
+        prior_only = _semantic_audit_document(
+            ('제9기(전기)', '의견거절'),
+            use_table_group=True,
+        )
+        explicit_current = (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            '<TR><TD>감사보고서(당기)</TD><TD>적정의견</TD></TR>'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    ('reports/prior-only.xml', prior_only),
+                    ('reports/current.xml', explicit_current),
+                ]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000545',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertEqual(result['audit_signal']['opinion_code'], 'unqualified')
+        self.assertTrue(result['audit_signal_evaluated'])
+        stored_signal = store_signals.call_args.kwargs['audit_signal']
+        self.assertEqual(stored_signal.opinion_code, 'unqualified')
+        self.assertTrue(store_signals.call_args.kwargs['audit_signal_evaluated'])
+
+    async def test_undecodable_archive_preserves_stale_parser_signal(self):
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/undecodable.xml', b'\x81')]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000543',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertIsNone(result['audit_signal'])
+        self.assertEqual(
+            result['audit_diagnostics']['decoded_member_count'],
+            0,
+        )
+        self.assertFalse(result['audit_signal_evaluated'])
+        store_signals.assert_called_once_with(
+            event=event,
+            audit_signal=None,
+            dilution_signal=None,
+            audit_signal_evaluated=False,
+        )
+
+    async def test_unknown_current_opinion_preserves_stale_parser_signal(self):
+        transposed = (
+            '<TABLE ACLASS="NORMAL">'
+            '<TR><TH>사업연도</TH><TD>제10기(당기)</TD>'
+            '<TD>제9기(전기)</TD></TR>'
+            '<TR><TH>감사인</TH><TD>한영회계법인</TD>'
+            '<TD>삼정회계법인</TD></TR>'
+            '<TR><TH>감사의견</TH><TD>검토중</TD>'
+            '<TD>의견거절</TD></TR>'
+            '<TR><TH>핵심감사사항</TH><TD>-</TD><TD>-</TD></TR>'
+            '</TABLE>'
+        ).encode('utf-8')
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[
+                    (
+                        'reports/aud-opn-current-unknown.xml',
+                        _semantic_audit_document(
+                            ('제10기(당기)', '검토중'),
+                            ('제9기(전기)', '의견거절'),
+                            use_table_group=True,
+                        ),
+                    ),
+                    ('reports/transposed-current-unknown.xml', transposed),
+                ]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000544',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertIsNone(result['audit_signal'])
+        self.assertFalse(result['audit_signal_evaluated'])
+        self.assertEqual(
+            result['audit_diagnostics'][
+                'ambiguous_authority_evidence_count'
+            ],
+            2,
+        )
+        store_signals.assert_called_once_with(
+            event=event,
+            audit_signal=None,
+            dilution_signal=None,
+            audit_signal_evaluated=False,
+        )
+
+    def test_store_signals_deletes_stale_audit_only_after_completed_evaluation(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        event = {'rcept_no': '20250325000541'}
+        session = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        with patch(
+            'app.dart.signals_service.session_scope',
+            return_value=context,
+        ):
+            service._store_signals(
+                event=event,
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=True,
+            )
+
+        session.execute.assert_called_once()
+        statement = session.execute.call_args.args[0]
+        self.assertTrue(statement.is_delete)
+        self.assertIn('dart_audit_signals', str(statement))
+
+        session.reset_mock()
+        with patch(
+            'app.dart.signals_service.session_scope',
+            return_value=context,
+        ):
+            service._store_signals(
+                event=event,
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=False,
+            )
+        session.execute.assert_not_called()
+
+    def test_store_signals_serializes_every_audit_mutation_transaction(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        event = {'rcept_no': '20250325000541'}
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = 'postgresql'
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        with patch(
+            'app.dart.signals_service.session_scope',
+            return_value=context,
+        ):
+            service._store_signals(
+                event=event,
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=True,
+            )
+
+        self.assertEqual(session.execute.call_count, 2)
+        lock_call, delete_call = session.execute.call_args_list
+        self.assertIn('pg_advisory_xact_lock', str(lock_call.args[0]))
+        self.assertEqual(
+            lock_call.args[1],
+            {'audit_signal_writer_lock_key': AUDIT_SIGNAL_WRITER_LOCK_KEY},
+        )
+        self.assertTrue(delete_call.args[0].is_delete)
+
+    def test_guard_owned_audit_mutation_bypasses_nested_lock_without_deadlock(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = 'postgresql'
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        with (
+            patch(
+                'app.dart.signals_service.session_scope',
+                return_value=context,
+            ),
+            audit_signal_writer_lock_owner(),
+        ):
+            service._store_signals(
+                event={'rcept_no': '20250325000541'},
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=True,
+            )
+
+        session.execute.assert_called_once()
+        self.assertTrue(session.execute.call_args.args[0].is_delete)
+
+    def test_dilution_only_mutation_uses_shared_dart_signal_writer_lock(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = 'postgresql'
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        with (
+            patch(
+                'app.dart.signals_service.session_scope',
+                return_value=context,
+            ),
+            patch.object(service, '_execute_dilution_upsert') as upsert,
+        ):
+            service._store_signals(
+                event={'rcept_no': '20250325000541'},
+                audit_signal=None,
+                dilution_signal={'signal_type': 'share_issuance'},
+                audit_signal_evaluated=False,
+            )
+
+        session.execute.assert_called_once()
+        self.assertIn(
+            'pg_advisory_xact_lock',
+            str(session.execute.call_args.args[0]),
+        )
+        upsert.assert_called_once_with(
+            session,
+            event={'rcept_no': '20250325000541'},
+            dilution_signal={'signal_type': 'share_issuance'},
+        )
 
     async def test_missing_audit_signal_diagnostics_bound_member_metadata_and_names(self):
         members = [

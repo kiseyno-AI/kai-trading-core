@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import unittest
 from copy import deepcopy
@@ -34,8 +35,11 @@ from app.repositories.eod_run_repository import (
     complete_eod_collection_run,
     count_eod_run_persisted_symbols,
     create_eod_collection_run,
+    daily_price_bar_writer_admission,
+    daily_price_bar_writer_admission_lock,
     daily_price_bar_has_current_eod_run_provenance,
     eod_collection_advisory_lock_keys,
+    eod_collection_advisory_lock_is_held,
     list_eod_collection_runs,
     load_latest_eod_collection_run,
     load_latest_pykrx_enrichment_repair_checkpoint,
@@ -490,12 +494,34 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         started_at=completed_at - timedelta(minutes=1),
                         completed_at=completed_at,
                         source_run_ids=(
-                            {'agent_feedback_run_id': 'decider-run'}
+                            {
+                                'signal_decider_run_id': 'decider-run',
+                                'source_summary_run_id': 'summary-run',
+                            }
                             if is_signal_stage
+                            else {
+                                'parent_signal_decider_run_id': (
+                                    'decider-run'
+                                ),
+                                'source_summary_run_id': 'summary-run',
+                            }
+                            if stage_id in {
+                                'next_open_execution_plan',
+                                'signal_decider_evaluations',
+                            }
                             else {}
                         ),
                         details=(
-                            {'result_summary': deepcopy(stage['result'])}
+                            {
+                                'result_summary': deepcopy(
+                                    stage['result']
+                                ),
+                                'completion_scope_proof': deepcopy(
+                                    stage['details'][
+                                        'completion_scope_proof'
+                                    ]
+                                ),
+                            }
                             if is_signal_stage
                             else {
                                 'nonblocking_scope_proof': deepcopy(
@@ -505,7 +531,12 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                                         == 'next_open_execution_plan'
                                         else 'evaluation_scope_proof'
                                     ]
-                                )
+                                ),
+                                'completion_scope_proof': deepcopy(
+                                    stage['details'][
+                                        'completion_scope_proof'
+                                    ]
+                                ),
                             }
                             if stage_id in {
                                 'next_open_execution_plan',
@@ -4273,6 +4304,170 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
 
 
 class AdvisoryEODCollectionLockTests(unittest.TestCase):
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_same_context_lock_is_reentrant_and_resets_ownership(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        self.assertFalse(
+            eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            )
+        )
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-09-23',
+            source='daily_price_bars',
+        ) as acquired:
+            self.assertTrue(acquired)
+            self.assertTrue(
+                eod_collection_advisory_lock_is_held(
+                    market='KRX',
+                    trade_date='2026-09-23',
+                    source='daily_price_bars',
+                )
+            )
+            with advisory_eod_collection_lock(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            ) as nested_acquired:
+                self.assertTrue(nested_acquired)
+
+        self.assertFalse(
+            eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            )
+        )
+        engine.connect.assert_called_once_with()
+        self.assertEqual(connection.execute.call_count, 4)
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_sync_writer_admission_holds_fence_for_complete_call(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+        observed_ownership: list[bool] = []
+
+        @daily_price_bar_writer_admission
+        def writer(*, market_date: date) -> str:
+            observed_ownership.append(
+                eod_collection_advisory_lock_is_held(
+                    market='KRX',
+                    trade_date=market_date,
+                    source='daily_price_bars',
+                )
+            )
+            return market_date.isoformat()
+
+        self.assertEqual(
+            writer(market_date=date(2026, 9, 23)),
+            '2026-09-23',
+        )
+        self.assertEqual(observed_ownership, [True])
+        self.assertFalse(
+            eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            )
+        )
+        engine.connect.assert_called_once_with()
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_async_writer_admission_is_reentrant_under_outer_fence(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        @daily_price_bar_writer_admission
+        async def writer(*, market_date: date) -> bool:
+            return eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date=market_date,
+                source='daily_price_bars',
+            )
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-09-23',
+            source='daily_price_bars',
+        ) as acquired:
+            self.assertTrue(acquired)
+            self.assertTrue(
+                asyncio.run(writer(market_date=date(2026, 9, 23)))
+            )
+
+        engine.connect.assert_called_once_with()
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_writer_admission_fails_closed_when_date_fence_is_busy(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = False
+
+        @daily_price_bar_writer_admission
+        def writer(*, market_date: date) -> None:
+            self.fail('contended writer must not run')
+
+        with self.assertRaisesRegex(RuntimeError, 'already held'):
+            writer(market_date=date(2026, 9, 23))
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_writer_admission_context_is_reentrant_under_outer_fence(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-09-23',
+            source='daily_price_bars',
+        ) as acquired:
+            self.assertTrue(acquired)
+            with daily_price_bar_writer_admission_lock(
+                market_date=date(2026, 9, 23),
+            ):
+                self.assertTrue(
+                    eod_collection_advisory_lock_is_held(
+                        market='KRX',
+                        trade_date='2026-09-23',
+                        source='daily_price_bars',
+                    )
+                )
+
+        engine.connect.assert_called_once_with()
+
     @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_sorts_deduplicates_and_unlocks_in_reverse(
         self,

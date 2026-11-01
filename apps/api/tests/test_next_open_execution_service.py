@@ -38,6 +38,7 @@ from app.market.clock import MarketState
 from app.agent_context.signal_decider_loop_service import (
     SignalDeciderLoopRepository,
 )
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
 from app.agent_context.decision_input_quality import (
     build_decision_input_quality_envelope,
 )
@@ -555,6 +556,7 @@ def test_scheduler_refresh_requests_compact_response() -> None:
         target_trade_date='2026-04-30',
         trigger='preopen_scheduler',
         force=False,
+        completion_parent_proof=None,
         _compact_response=True,
         _live_market_snapshot_loop=None,
     )
@@ -1403,6 +1405,230 @@ class NextOpenRefreshUnitTests(unittest.TestCase):
             account_reference=None,
         )
         serialize_row.assert_called_once_with(rows[0])
+
+    def test_completion_manifest_partitions_the_exact_parent_cohort(self) -> None:
+        def snapshot(
+            *,
+            snapshot_id: int,
+            symbol: str,
+            agent_name: str,
+            action: str,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                id=snapshot_id,
+                symbol=symbol,
+                agent_name=agent_name,
+                decision_run_id=f'decision-{snapshot_id}',
+                next_day_open_action=action,
+                decision_action=action,
+                response_payload=(
+                    {'tactical_action': action}
+                    if agent_name == 'short-term-decider'
+                    else {}
+                ),
+                request_payload={
+                    'symbol_day_context': {'market': 'KOSPI'},
+                },
+            )
+
+        def row(
+            *,
+            row_id: int,
+            snapshot_id: int,
+            symbol: str,
+            agent_name: str,
+            account_reference: str,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                id=row_id,
+                decision_snapshot_id=snapshot_id,
+                decision_agent_name=agent_name,
+                account_reference=account_reference,
+                symbol=symbol,
+                eligibility_status=ELIGIBILITY_ELIGIBLE,
+                traceability_payload={
+                    'handoff_intent': 'tactical_buy',
+                    'handoff_active': agent_name == 'short-term-decider',
+                    'exec_monitoring_active': agent_name
+                    == 'short-term-decider',
+                },
+                validation_payload={},
+            )
+
+        short_actionable = snapshot(
+            snapshot_id=1,
+            symbol='000660',
+            agent_name='short-term-decider',
+            action='scalp_buy_candidate',
+        )
+        short_wait = snapshot(
+            snapshot_id=2,
+            symbol='005930',
+            agent_name='short-term-decider',
+            action='wait',
+        )
+        signal_actionable = snapshot(
+            snapshot_id=3,
+            symbol='005930',
+            agent_name='signal-decider',
+            action='buy',
+        )
+        invalid_wait = snapshot(
+            snapshot_id=4,
+            symbol='051910',
+            agent_name='signal-decider',
+            action='wait',
+        )
+        rowless_actionable = snapshot(
+            snapshot_id=5,
+            symbol='068270',
+            agent_name='signal-decider',
+            action='buy',
+        )
+        scope_state = {
+            'source_run': {'run_id': 'parent-run'},
+            'source_role_symbol_scopes': {
+                'short-term-decider': ['005930', '000660', '005930'],
+                'signal-decider': ['068270', '035420', '051910', '005930'],
+            },
+            'selected_by_key': {
+                ('000660', 'short-term-decider'): short_actionable,
+                ('005930', 'short-term-decider'): short_wait,
+                ('005930', 'signal-decider'): signal_actionable,
+                ('035420', 'signal-decider'): None,
+                ('051910', 'signal-decider'): invalid_wait,
+                ('068270', 'signal-decider'): rowless_actionable,
+            },
+            'authoritative_run_id_by_key': {
+                ('035420', 'signal-decider'): 'missing-decision-run',
+            },
+        }
+        fingerprints_by_symbol = {
+            symbol: {
+                'authority_fingerprint': f'authority:{symbol}',
+                'decision_input_generation_validation': {
+                    'generation_fingerprint': f'generation:{symbol}',
+                },
+            }
+            for symbol in ('000660', '005930', '035420', '051910', '068270')
+        }
+        agent_context = {
+            'authority_fingerprint': 'authority:all',
+            'decision_input_generation_validation': {
+                'generation_fingerprint': 'generation:all',
+            },
+            '_candidate_contexts_by_symbol': fingerprints_by_symbol,
+        }
+        rows = [
+            row(
+                row_id=12,
+                snapshot_id=3,
+                symbol='005930',
+                agent_name='signal-decider',
+                account_reference='KIS:22222222-01',
+            ),
+            row(
+                row_id=11,
+                snapshot_id=3,
+                symbol='005930',
+                agent_name='signal-decider',
+                account_reference='KIS:11111111-01',
+            ),
+            row(
+                row_id=10,
+                snapshot_id=1,
+                symbol='000660',
+                agent_name='short-term-decider',
+                account_reference='KIS:33333333-01',
+            ),
+        ]
+        service = SignalDeciderNextOpenExecutionService()
+
+        with patch(
+            'app.orders.next_open_execution._execution_plan_row_authority_fingerprint',
+            side_effect=lambda item: f'row-authority:{item.id}',
+        ):
+            manifest = service._build_completion_manifest(
+                scope_state=scope_state,
+                generation_validation={
+                    'valid_snapshot_ids': [1, 2, 3, 5],
+                    'invalid_snapshot_ids': [4],
+                },
+                agent_context_completeness=agent_context,
+                rows=rows,
+            )
+
+        self.assertEqual(
+            manifest['role_symbol_scopes'],
+            {
+                'short-term-decider': ['000660', '005930'],
+                'signal-decider': ['005930', '035420', '051910', '068270'],
+            },
+        )
+        self.assertEqual(manifest['parent_run_id'], 'parent-run')
+        self.assertEqual(manifest['decision_count'], 6)
+        self.assertEqual(manifest['included_decision_count'], 2)
+        self.assertEqual(manifest['excluded_decision_count'], 1)
+        self.assertEqual(manifest['incomplete_decision_count'], 3)
+        self.assertEqual(manifest['included_item_count'], 3)
+        partition = {
+            (item['symbol'], item['decision_agent_name']): item
+            for item in manifest['decision_partition']
+        }
+        self.assertEqual(
+            partition[('005930', 'short-term-decider')]['exclusion'],
+            {
+                'kind': 'non_actionable',
+                'reason_code': 'latest_snapshot_not_actionable',
+            },
+        )
+        self.assertEqual(
+            partition[('051910', 'signal-decider')]['disposition'],
+            'incomplete',
+        )
+        self.assertEqual(
+            partition[('068270', 'signal-decider')]['disposition'],
+            'incomplete',
+        )
+        self.assertEqual(
+            partition[('035420', 'signal-decider')]['decision_run_id'],
+            'missing-decision-run',
+        )
+        self.assertEqual(
+            partition[('005930', 'signal-decider')]['included_items'],
+            [
+                {
+                    'plan_item_id': 11,
+                    'account_reference': 'KIS:11111111-01',
+                    'eligibility_status': ELIGIBILITY_ELIGIBLE,
+                    'handoff_active': False,
+                    'exec_monitoring_active': False,
+                    'row_authority_fingerprint': 'row-authority:11',
+                },
+                {
+                    'plan_item_id': 12,
+                    'account_reference': 'KIS:22222222-01',
+                    'eligibility_status': ELIGIBILITY_ELIGIBLE,
+                    'handoff_active': False,
+                    'exec_monitoring_active': False,
+                    'row_authority_fingerprint': 'row-authority:12',
+                },
+            ],
+        )
+        digest_payload = {
+            key: value
+            for key, value in manifest.items()
+            if key != 'manifest_digest'
+        }
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                digest_payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        self.assertEqual(manifest['manifest_digest'], expected_digest)
 
 
 class AgentContextCompletenessUnitTests(unittest.TestCase):
@@ -2770,6 +2996,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         snapshot_received_at_by_key: (
             dict[tuple[str, str], datetime] | None
         ) = None,
+        started_at: datetime | None = None,
+        short_term_action: str = 'watch_for_trigger',
+        signal_action: str = 'buy',
     ) -> tuple[str, str, str]:
         normalized_symbols = sorted(symbols)
         roles = ['short-term-decider', 'signal-decider']
@@ -2806,12 +3035,20 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         exact_scope_total = len(normalized_symbols) * len(roles)
+        parent_started_at = started_at or datetime(
+            2026,
+            4,
+            29,
+            5,
+            0,
+            tzinfo=timezone.utc,
+        )
         self._seed_feedback_run(
             run_id=weekly_parent,
             symbols=normalized_symbols,
             roles=roles,
             role_symbol_scopes=role_symbol_scopes,
-            started_at=datetime(2026, 4, 29, 5, 0, tzinfo=timezone.utc),
+            started_at=parent_started_at,
             symbols_total=exact_scope_total,
             completed_count=exact_scope_total,
             mode='daily_retry_cycle_role_sequenced',
@@ -2824,20 +3061,21 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             run_id=short_child,
             symbols=normalized_symbols,
             roles=['short-term-decider'],
-            started_at=datetime(2026, 4, 29, 5, 10, tzinfo=timezone.utc),
+            started_at=parent_started_at + timedelta(minutes=10),
             parent_run_id=weekly_parent,
         )
         self._seed_feedback_run(
             run_id=signal_child,
             symbols=normalized_symbols,
             roles=['signal-decider'],
-            started_at=datetime(2026, 4, 29, 5, 11, tzinfo=timezone.utc),
+            started_at=parent_started_at + timedelta(minutes=11),
             parent_run_id=weekly_parent,
         )
         received_at_by_key = snapshot_received_at_by_key or {}
         for symbol in normalized_symbols:
             self._seed_short_term_snapshot(
                 symbol=symbol,
+                tactical_action=short_term_action,
                 decision_run_id=short_child,
                 feedback_received_at=received_at_by_key.get(
                     (symbol, 'short-term-decider')
@@ -2845,12 +3083,73 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self._seed_snapshot(
                 symbol=symbol,
+                next_day_open_action=signal_action,
                 decision_run_id=signal_child,
                 feedback_received_at=received_at_by_key.get(
                     (symbol, 'signal-decider')
                 ),
             )
         return weekly_parent, short_child, signal_child
+
+    def _strict_completion_parent_proof(
+        self,
+        *,
+        service: SignalDeciderNextOpenExecutionService,
+        parent_run_id: str,
+        symbols: list[str],
+    ) -> dict[str, object]:
+        normalized_symbols = sorted(symbols)
+        identity_resolution = (
+            service.resolve_completion_decision_identities(
+                source_market_date=self.market_date,
+                parent_run_id=parent_run_id,
+                symbols=normalized_symbols,
+            )
+        )
+        self.assertEqual(
+            identity_resolution['status'],
+            'completed',
+            identity_resolution,
+        )
+        decision_identities = identity_resolution[
+            'decision_identities'
+        ]
+        self.assertEqual(
+            len(decision_identities),
+            len(normalized_symbols) * len(DECISION_SUPPORT_AGENT_NAMES),
+        )
+        proof: dict[str, object] = {
+            'schema_version': 'stage_completion_scope_v1',
+            'kind': 'signal_decider_terminal_progression',
+            'roles': list(DECISION_SUPPORT_AGENT_NAMES),
+            'source_run_id': parent_run_id,
+            'source_summary_run_id': 'summary-source-run',
+            'knowledge_cutoff_at': '2026-04-29T08:30:00+00:00',
+            'admitted_symbols': normalized_symbols,
+            'completed_symbols': normalized_symbols,
+            'failed_symbols_by_role': {
+                role: [] for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+            'decision_identities': decision_identities,
+            'total_items': (
+                len(normalized_symbols)
+                * len(DECISION_SUPPORT_AGENT_NAMES)
+            ),
+            'completed_items': (
+                len(normalized_symbols)
+                * len(DECISION_SUPPORT_AGENT_NAMES)
+            ),
+            'failed_items': 0,
+        }
+        proof['proof_digest'] = hashlib.sha256(
+            json.dumps(
+                proof,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        return proof
 
     def _seed_short_term_snapshot(
         self,
@@ -3246,6 +3545,11 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('summary', result)
         self.assertEqual(result['items'], [])
+        self.assertEqual(
+            result['completion_manifest']['schema_version'],
+            'next_open_completion_manifest_v1',
+        )
+        self.assertEqual(len(result['completion_manifest']['manifest_digest']), 64)
         self.assertEqual(load_scope_state.call_count, 2)
         self.assertIsNone(
             load_scope_state.call_args_list[0].kwargs.get('_session')
@@ -8933,6 +9237,216 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(x_item['execution_status'], EXECUTION_STATUS_REVOCATION_PENDING)
         self.assertEqual(x_item['submission']['revocation']['reason_code'], 'candidate_removed')
 
+    def test_strict_parent_proof_drives_actual_next_open_response(self) -> None:
+        parent_run_id, _, _ = self._seed_completed_weekly_policy_cohort(
+            symbols=['005930'],
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        parent_proof = self._strict_completion_parent_proof(
+            service=service,
+            parent_run_id=parent_run_id,
+            symbols=['005930'],
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='strict_parent_response',
+                completion_parent_proof=parent_proof,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        manifest = result['completion_manifest']
+        self.assertEqual(manifest['parent_run_id'], parent_run_id)
+        self.assertEqual(manifest['incomplete_decision_count'], 0)
+        self.assertEqual(manifest['decision_count'], 2)
+        self.assertEqual(
+            {
+                (item['symbol'], item['decision_agent_name'])
+                for item in result['items']
+            },
+            {
+                ('005930', 'short-term-decider'),
+                ('005930', 'signal-decider'),
+            },
+        )
+        identities = {
+            (
+                identity['symbol'],
+                identity['decision_agent_name'],
+            ): (
+                identity['decision_snapshot_id'],
+                identity['decision_run_id'],
+            )
+            for identity in parent_proof['decision_identities']
+        }
+        self.assertEqual(
+            {
+                (entry['symbol'], entry['decision_agent_name']): (
+                    entry['decision_snapshot_id'],
+                    entry['decision_run_id'],
+                )
+                for entry in manifest['decision_partition']
+            },
+            identities,
+        )
+
+    def test_strict_parent_all_nonactionable_is_completed_with_zero_items(self) -> None:
+        parent_run_id, _, _ = self._seed_completed_weekly_policy_cohort(
+            symbols=['005930'],
+            short_term_action='wait',
+            signal_action='wait',
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        parent_proof = self._strict_completion_parent_proof(
+            service=service,
+            parent_run_id=parent_run_id,
+            symbols=['005930'],
+        )
+
+        result = service.refresh_plan_items(
+            target_trade_date=self.target_trade_date,
+            trigger='strict_parent_zero_items',
+            completion_parent_proof=parent_proof,
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['items'], [])
+        manifest = result['completion_manifest']
+        self.assertEqual(manifest['decision_count'], 2)
+        self.assertEqual(manifest['included_decision_count'], 0)
+        self.assertEqual(manifest['excluded_decision_count'], 2)
+        self.assertEqual(manifest['incomplete_decision_count'], 0)
+        self.assertEqual(manifest['included_item_count'], 0)
+        self.assertEqual(
+            {
+                entry['disposition']
+                for entry in manifest['decision_partition']
+            },
+            {'non_actionable'},
+        )
+
+    def test_strict_parent_excludes_stale_prior_cohort_rows_from_response(
+        self,
+    ) -> None:
+        old_parent_run_id, _, _ = (
+            self._seed_completed_weekly_policy_cohort(
+                symbols=['000660', '005930'],
+                started_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    4,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+                short_term_action='wait',
+            )
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        old_parent_proof = self._strict_completion_parent_proof(
+            service=service,
+            parent_run_id=old_parent_run_id,
+            symbols=['000660', '005930'],
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='strict_old_parent',
+                completion_parent_proof=old_parent_proof,
+            )
+        stale_row_id = self._mark_row_as_handed_off(symbol='005930')
+
+        new_parent_run_id, _, _ = (
+            self._seed_completed_weekly_policy_cohort(
+                symbols=['000660'],
+                started_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    6,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+                short_term_action='wait',
+            )
+        )
+        new_parent_proof = self._strict_completion_parent_proof(
+            service=service,
+            parent_run_id=new_parent_run_id,
+            symbols=['000660'],
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[
+                {'trade_date': '2026-04-29', 'close_price': 50000}
+            ],
+        ):
+            refreshed = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='strict_new_parent',
+                completion_parent_proof=new_parent_proof,
+            )
+
+        self.assertEqual(refreshed['status'], 'completed')
+        self.assertEqual(
+            {item['symbol'] for item in refreshed['items']},
+            {'000660'},
+        )
+        self.assertEqual(
+            refreshed['completion_manifest']['role_symbol_scopes'],
+            {
+                role: ['000660']
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+        )
+        with session_scope() as session:
+            stale_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                stale_row_id,
+            )
+            self.assertIsNotNone(stale_row)
+            self.assertEqual(
+                stale_row.eligibility_status,
+                ELIGIBILITY_BLOCKED,
+            )
+            self.assertIn(
+                stale_row.execution_status,
+                {
+                    EXECUTION_STATUS_REVOCATION_PENDING,
+                    EXECUTION_STATUS_REVOKED,
+                },
+            )
+            self.assertFalse(
+                bool(stale_row.traceability_payload['handoff_active'])
+            )
+            self.assertFalse(
+                bool(
+                    stale_row.traceability_payload[
+                        'exec_monitoring_active'
+                    ]
+                )
+            )
+
     def test_partial_decider_cohort_tombstones_failed_symbol_without_older_fallback(
         self,
     ) -> None:
@@ -9704,6 +10218,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 source_market_date: date,
                 target_trade_date: date | None = None,
                 allow_post_open_intraday_watch: bool = False,
+                completion_scope_authority=None,
             ):
                 nonlocal load_count
                 load_count += 1
@@ -9722,6 +10237,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     target_trade_date=target_trade_date,
                     allow_post_open_intraday_watch=(
                         allow_post_open_intraday_watch
+                    ),
+                    completion_scope_authority=(
+                        completion_scope_authority
                     ),
                 )
 
@@ -9794,6 +10312,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 source_market_date: date,
                 target_trade_date: date | None = None,
                 allow_post_open_intraday_watch: bool = False,
+                completion_scope_authority=None,
             ):
                 nonlocal load_count
                 load_count += 1
@@ -9817,6 +10336,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     target_trade_date=target_trade_date,
                     allow_post_open_intraday_watch=(
                         allow_post_open_intraday_watch
+                    ),
+                    completion_scope_authority=(
+                        completion_scope_authority
                     ),
                 )
 

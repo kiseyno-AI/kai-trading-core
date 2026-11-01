@@ -1593,6 +1593,9 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         coverage = result['categories']['short_selling']
         self.assertEqual(coverage['present_rows'], 1)
         self.assertEqual(coverage['coverage_status'], 'complete')
+        self.assertEqual(coverage['decision_usable_present_rows'], 1)
+        self.assertEqual(coverage['decision_usable_ratio'], 1.0)
+        self.assertEqual(coverage['decision_usable_status'], 'complete')
         self.assertEqual(coverage['complete_present_rows'], 0)
         self.assertEqual(coverage['completeness_status'], 'missing')
         self.assertEqual(
@@ -1656,6 +1659,8 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         coverage = result['categories']['valuation_snapshot']
         self.assertEqual(coverage['present_rows'], 0)
         self.assertEqual(coverage['raw_present_rows'], 1)
+        self.assertEqual(coverage['decision_usable_present_rows'], 0)
+        self.assertEqual(coverage['decision_usable_status'], 'missing')
         self.assertEqual(coverage['complete_present_rows'], 0)
         self.assertEqual(coverage['missing_component_rows'], 1)
         self.assertEqual(coverage['coverage_status'], 'missing')

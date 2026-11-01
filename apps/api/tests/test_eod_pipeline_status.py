@@ -1,10 +1,18 @@
+import hashlib
+import json
 import unittest
 from copy import deepcopy
 from contextlib import contextmanager
+from datetime import date
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
+from app.agent_context.roles import (
+    DECISION_SUPPORT_AGENT_NAMES,
+    SUMMARIZER_AGENT_NAMES,
+)
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.db_models import DailyMomentumFactorResult
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
@@ -14,6 +22,7 @@ from app.eod.pipeline_status import (
     _load_latest_feedback_run_summary,
     _load_latest_pipeline_pykrx_run,
     _load_pipeline_pykrx_run_rows,
+    _load_row_count_missing_diagnostics_for_model,
     _signal_feature_row_is_semantically_ready,
 )
 from app.eod.market_membership import build_market_membership_snapshot
@@ -206,6 +215,409 @@ def _completed_official_stage(
             'details': {},
         },
     }
+
+
+def _terminal_decider_completion_scope_proof(
+    *,
+    symbols: list[str],
+    parent_run_id: str,
+    source_summary_run_id: str,
+) -> dict:
+    decision_identities = sorted(
+        (
+            {
+                'symbol': symbol,
+                'decision_agent_name': role,
+                'decision_snapshot_id': (index * 2) + role_index + 1,
+                'decision_run_id': (
+                    f'{parent_run_id}-'
+                    f'{"short" if role == "short-term-decider" else "signal"}'
+                    f'-{index}'
+                ),
+            }
+            for index, symbol in enumerate(symbols)
+            for role_index, role in enumerate(
+                DECISION_SUPPORT_AGENT_NAMES
+            )
+        ),
+        key=lambda identity: (
+            identity['symbol'],
+            identity['decision_agent_name'],
+        ),
+    )
+    proof = {
+        'schema_version': 'stage_completion_scope_v1',
+        'kind': 'signal_decider_terminal_progression',
+        'roles': list(DECISION_SUPPORT_AGENT_NAMES),
+        'source_run_id': parent_run_id,
+        'source_summary_run_id': source_summary_run_id,
+        'knowledge_cutoff_at': '2026-10-07T08:00:00+00:00',
+        'admitted_symbols': list(symbols),
+        'completed_symbols': list(symbols),
+        'failed_symbols_by_role': {
+            role: [] for role in DECISION_SUPPORT_AGENT_NAMES
+        },
+        'decision_identities': decision_identities,
+        'total_items': len(symbols) * len(DECISION_SUPPORT_AGENT_NAMES),
+        'completed_items': (
+            len(symbols) * len(DECISION_SUPPORT_AGENT_NAMES)
+        ),
+        'failed_items': 0,
+    }
+    proof['proof_digest'] = (
+        DailyPipelineStageService._stage_completion_scope_proof_digest(
+            proof
+        )
+    )
+    return proof
+
+
+def _completed_signal_decider_history_stage(
+    *,
+    run_id: int,
+    market_date: str,
+    symbol_count: int,
+    updated_at: str = '2026-05-28T08:30:00+00:00',
+) -> dict[str, dict]:
+    symbols = [f'{index:06d}' for index in range(1, symbol_count + 1)]
+    parent_run_id = f'feedback-cycle-{market_date}-{run_id}'
+    source_summary_run_id = f'feedback-summary-{market_date}-{run_id}'
+    proof = _terminal_decider_completion_scope_proof(
+        symbols=symbols,
+        parent_run_id=parent_run_id,
+        source_summary_run_id=source_summary_run_id,
+    )
+    item = _completed_official_stage(
+        run_id=run_id,
+        stage_id='signal_decider',
+        market_date=market_date,
+        processed=proof['total_items'],
+        total=proof['total_items'],
+        updated_at=updated_at,
+    )
+    item['stage']['details'] = {'completion_scope_proof': proof}
+    item['stage']['source_run_ids'] = {
+        'signal_decider_run_id': parent_run_id,
+        'source_summary_run_id': source_summary_run_id,
+    }
+    return item
+
+
+def _completed_feedback_history_stage(
+    *,
+    run_id: int,
+    market_date: str,
+    total: int,
+    role_counts: tuple[int, ...] | None = None,
+    updated_at: str = '2026-05-28T08:30:00+00:00',
+) -> dict[str, dict]:
+    item = _completed_official_stage(
+        run_id=run_id,
+        stage_id='agent_feedback_summaries',
+        market_date=market_date,
+        processed=total,
+        total=total,
+        updated_at=updated_at,
+    )
+    feedback_run_id = f'feedback-cycle-{market_date}-{run_id}'
+    if role_counts is None:
+        base_count, remainder = divmod(
+            total,
+            len(SUMMARIZER_AGENT_NAMES),
+        )
+        role_counts = tuple(
+            base_count + int(index < remainder)
+            for index, _ in enumerate(SUMMARIZER_AGENT_NAMES)
+        )
+    if not (
+        len(role_counts) == len(SUMMARIZER_AGENT_NAMES)
+        and all(type(count) is int and count >= 0 for count in role_counts)
+        and sum(role_counts) == total
+    ):
+        raise ValueError('role_counts must exactly partition total')
+    next_symbol = 1
+    role_symbol_scopes: dict[str, list[str]] = {}
+    role_progress = {
+        role: {
+            'role': role,
+            'status': 'completed',
+            'boundary_status': 'completed',
+            'total_symbols': role_counts[index],
+            'processed_symbols': role_counts[index],
+            'completed_symbols': role_counts[index],
+            'in_progress_symbols': 0,
+            'pending_symbols': 0,
+            'failed_items': 0,
+            'retry_pending_symbols': 0,
+        }
+        for index, role in enumerate(SUMMARIZER_AGENT_NAMES)
+    }
+    for role in SUMMARIZER_AGENT_NAMES:
+        count = role_progress[role]['total_symbols']
+        role_symbol_scopes[role] = [
+            f'{symbol:06d}'
+            for symbol in range(next_symbol, next_symbol + count)
+        ]
+        next_symbol += count
+    result = {
+        'status': 'completed',
+        'run_id': feedback_run_id,
+        'knowledge_cutoff_at': '2026-10-07T08:00:00+00:00',
+        'feedback_scope_mode': 'broad_feedback_universe',
+        'roles': list(SUMMARIZER_AGENT_NAMES),
+        'progress': {
+            'summary': {
+                'run_id': feedback_run_id,
+                'expected_feedback_count': total,
+                'completed_feedback_count': total,
+                'failed_items': 0,
+                'role_symbol_scopes': role_symbol_scopes,
+                'role_progress': role_progress,
+            }
+        },
+    }
+    item['stage']['source_run_ids'] = {'run_id': feedback_run_id}
+    item['stage']['details'] = (
+        DailyPipelineStageService._build_stage_run_details(
+            stage_id='agent_feedback_summaries',
+            result=result,
+            invocation_symbols=sorted(
+                {
+                    symbol
+                    for symbols in role_symbol_scopes.values()
+                    for symbol in symbols
+                }
+            ),
+        )
+    )
+    return item
+
+
+def _completed_next_open_history_stage(
+    *,
+    run_id: int,
+    market_date: str,
+    total: int,
+    updated_at: str = '2026-05-28T08:30:00+00:00',
+) -> dict[str, dict]:
+    item = _completed_official_stage(
+        run_id=run_id,
+        stage_id='next_open_execution_plan',
+        market_date=market_date,
+        processed=total,
+        total=total,
+        updated_at=updated_at,
+    )
+    parent_run_id = f'feedback-cycle-{market_date}-{run_id}'
+    source_summary_run_id = f'feedback-summary-{market_date}-{run_id}'
+    symbols = [f'{index:06d}' for index in range(1, total + 1)]
+    plan_items = []
+    decision_partition = []
+    for index, symbol in enumerate(symbols):
+        active = index == 0
+        plan_item_id = index + 1
+        snapshot_id = (index * 2) + 2
+        decision_run_id = f'{parent_run_id}-signal-{index}'
+        plan_items.append({
+            'plan_item_id': plan_item_id,
+            'account_reference': 'paper-primary',
+            'symbol': symbol,
+            'decision_agent_name': 'signal-decider',
+            'decision_run_id': decision_run_id,
+            'decision_snapshot_id': snapshot_id,
+            'eligibility_status': 'eligible' if active else 'blocked',
+            'handoff_active': active,
+            'exec_monitoring_active': active,
+        })
+        decision_partition.extend(
+            [
+                {
+                    'symbol': symbol,
+                    'decision_agent_name': 'short-term-decider',
+                    'decision_run_id': (
+                        f'{parent_run_id}-short-{index}'
+                    ),
+                    'decision_snapshot_id': (index * 2) + 1,
+                    'canonical_action': 'wait',
+                    'authority_fingerprint': f'authority-short-{index}',
+                    'generation_fingerprint': f'generation-short-{index}',
+                    'disposition': 'non_actionable',
+                    'included_items': [],
+                    'exclusion': {
+                        'kind': 'non_actionable',
+                        'reason_code': 'latest_snapshot_not_actionable',
+                    },
+                },
+                {
+                    'symbol': symbol,
+                    'decision_agent_name': 'signal-decider',
+                    'decision_run_id': decision_run_id,
+                    'decision_snapshot_id': snapshot_id,
+                    'canonical_action': 'buy',
+                    'authority_fingerprint': f'authority-signal-{index}',
+                    'generation_fingerprint': f'generation-signal-{index}',
+                    'disposition': 'included',
+                    'included_items': [
+                        {
+                            'plan_item_id': plan_item_id,
+                            'account_reference': 'paper-primary',
+                            'eligibility_status': (
+                                'eligible' if active else 'blocked'
+                            ),
+                            'handoff_active': active,
+                            'exec_monitoring_active': active,
+                            'row_authority_fingerprint': (
+                                f'row-authority-{index}'
+                            ),
+                        }
+                    ],
+                    'exclusion': None,
+                },
+            ]
+        )
+    decision_partition.sort(
+        key=lambda entry: (
+            entry['symbol'],
+            entry['decision_agent_name'],
+        )
+    )
+    completion_manifest = {
+        'schema_version': 'next_open_completion_manifest_v1',
+        'parent_run_id': parent_run_id,
+        'authority_fingerprint': f'authority-{parent_run_id}',
+        'generation_fingerprint': f'generation-{parent_run_id}',
+        'role_symbol_scopes': {
+            role: list(symbols) for role in DECISION_SUPPORT_AGENT_NAMES
+        },
+        'decision_partition': decision_partition,
+        'decision_count': len(decision_partition),
+        'included_decision_count': len(symbols),
+        'excluded_decision_count': len(symbols),
+        'incomplete_decision_count': 0,
+        'included_item_count': len(plan_items),
+    }
+    completion_manifest['manifest_digest'] = hashlib.sha256(
+        json.dumps(
+            completion_manifest,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    item['stage']['details'] = (
+        DailyPipelineStageService._build_stage_run_details(
+            stage_id='next_open_execution_plan',
+            result={
+                'status': 'completed',
+                'completion_manifest': completion_manifest,
+                'items': plan_items,
+            },
+            completion_parent_proof=(
+                _terminal_decider_completion_scope_proof(
+                    symbols=symbols,
+                    parent_run_id=parent_run_id,
+                    source_summary_run_id=source_summary_run_id,
+                )
+            ),
+        )
+    )
+    item['stage']['source_run_ids'] = {
+        'parent_signal_decider_run_id': parent_run_id,
+        'source_summary_run_id': source_summary_run_id,
+    }
+    return item
+
+
+def _completed_zero_item_next_open_history_stage(
+    *,
+    run_id: int,
+    market_date: str,
+    updated_at: str = '2026-05-28T08:30:00+00:00',
+) -> dict[str, dict]:
+    item = _completed_official_stage(
+        run_id=run_id,
+        stage_id='next_open_execution_plan',
+        market_date=market_date,
+        processed=0,
+        total=0,
+        updated_at=updated_at,
+    )
+    symbol = '000001'
+    parent_run_id = f'feedback-cycle-{market_date}-{run_id}'
+    source_summary_run_id = f'feedback-summary-{market_date}-{run_id}'
+    partition = [
+        {
+            'symbol': symbol,
+            'decision_agent_name': role,
+            'decision_run_id': (
+                f'{parent_run_id}-'
+                f'{"short" if role == "short-term-decider" else "signal"}'
+                '-0'
+            ),
+            'decision_snapshot_id': index + 1,
+            'canonical_action': 'wait',
+            'authority_fingerprint': f'authority-{role}',
+            'generation_fingerprint': f'generation-{role}',
+            'disposition': 'non_actionable',
+            'included_items': [],
+            'exclusion': {
+                'kind': 'non_actionable',
+                'reason_code': 'latest_snapshot_not_actionable',
+            },
+        }
+        for index, role in enumerate(DECISION_SUPPORT_AGENT_NAMES)
+    ]
+    partition.sort(
+        key=lambda entry: (
+            entry['symbol'],
+            entry['decision_agent_name'],
+        )
+    )
+    manifest = {
+        'schema_version': 'next_open_completion_manifest_v1',
+        'parent_run_id': parent_run_id,
+        'authority_fingerprint': f'authority-{parent_run_id}',
+        'generation_fingerprint': f'generation-{parent_run_id}',
+        'role_symbol_scopes': {
+            role: [symbol] for role in DECISION_SUPPORT_AGENT_NAMES
+        },
+        'decision_partition': partition,
+        'decision_count': len(partition),
+        'included_decision_count': 0,
+        'excluded_decision_count': len(partition),
+        'incomplete_decision_count': 0,
+        'included_item_count': 0,
+    }
+    manifest['manifest_digest'] = hashlib.sha256(
+        json.dumps(
+            manifest,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+    item['stage']['details'] = (
+        DailyPipelineStageService._build_stage_run_details(
+            stage_id='next_open_execution_plan',
+            result={
+                'status': 'completed',
+                'completion_manifest': manifest,
+                'items': [],
+            },
+            completion_parent_proof=(
+                _terminal_decider_completion_scope_proof(
+                    symbols=[symbol],
+                    parent_run_id=parent_run_id,
+                    source_summary_run_id=source_summary_run_id,
+                )
+            ),
+        )
+    )
+    item['stage']['source_run_ids'] = {
+        'parent_signal_decider_run_id': parent_run_id,
+        'source_summary_run_id': source_summary_run_id,
+    }
+    return item
 
 
 def _incomplete_official_stage(
@@ -531,6 +943,78 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_row_count_membership_diagnostics_detect_equal_count_wrong_symbol(self):
+        session = MagicMock()
+        price_result = MagicMock()
+        price_result.scalars.return_value.all.return_value = [1, 2]
+        factor_result = MagicMock()
+        factor_result.scalars.return_value.all.return_value = [1, 3]
+        missing_detail_result = MagicMock()
+        missing_detail_result.all.return_value = [
+            SimpleNamespace(symbol='005930', name_ko='삼성전자', market='KOSPI')
+        ]
+        session.execute.side_effect = [
+            price_result,
+            factor_result,
+            missing_detail_result,
+        ]
+
+        diagnostics = _load_row_count_missing_diagnostics_for_model(
+            session=session,
+            model=DailyMomentumFactorResult,
+            market_date=date(2026, 4, 21),
+            limit=10,
+        )
+
+        self.assertEqual(diagnostics['membership_requested_count'], 2)
+        self.assertEqual(diagnostics['membership_present_count'], 1)
+        self.assertEqual(diagnostics['membership_extra_count'], 1)
+        self.assertEqual(diagnostics['missing_count'], 1)
+        self.assertEqual(diagnostics['missing_symbols_sample'], ['005930'])
+
+    def test_equal_count_wrong_symbol_factor_rows_are_partial_and_blocked(self):
+        service = EODPipelineStatusService()
+        price_stage = {
+            'status': 'completed',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'total': 2,
+            'succeeded': 2,
+            'details': {},
+        }
+
+        stage = service._build_row_count_stage(
+            stage_id='momentum_factors',
+            market_date='2026-04-21',
+            price_stage=price_stage,
+            price_rows_persisted=2,
+            prior_stages={'price_collection': price_stage},
+            aggregate={
+                'persisted': 2,
+                'membership_evidence_version': 'row_count_scope_gap_v1',
+                'membership_authoritative': True,
+                'membership_requested_count': 2,
+                'membership_present_count': 1,
+                'membership_extra_count': 1,
+                'missing_count': 1,
+                'missing_symbols_sample': ['005930'],
+            },
+            live_symbols_total=2,
+            feedback_run=None,
+            scope_symbols=[],
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['total'], 2)
+        self.assertEqual(stage['succeeded'], 1)
+        self.assertEqual(stage['remaining'], 1)
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'missing_rows_intersect_daily_price_membership',
+        )
+        self.assertEqual(stage['details']['off_scope_rows_persisted'], 1)
+
     def test_read_keeps_aggregate_only_price_coverage_unverified(self):
         pykrx_run = {
             'id': 900,
@@ -724,6 +1208,103 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ['005930'],
         )
 
+    def test_read_rejects_equal_count_wrong_symbol_factor_coverage_and_keeps_official_partial(self):
+        requested_symbols = ['000660', '005930']
+        membership = build_market_membership_snapshot(
+            symbols=[
+                SimpleNamespace(symbol='000660', market='KOSPI'),
+                SimpleNamespace(symbol='005930', market='KOSPI'),
+            ],
+            markets=['KOSPI'],
+        )
+        pykrx_run = {
+            'id': 903,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': requested_symbols,
+                'universe_snapshot': {
+                    'markets': ['KOSPI'],
+                    'market_membership': membership,
+                },
+            },
+        }
+        official_item = _incomplete_official_stage(
+            run_id=904,
+            stage_id='momentum_factors',
+            market_date='2026-04-21',
+            status='partial',
+            updated_at='2026-04-21T10:00:00+00:00',
+            succeeded=1,
+            failed=1,
+        )
+        official_run = {
+            **official_item['run'],
+            'stages': {'momentum_factors': official_item['stage']},
+        }
+
+        def scope_gap_loader(*, stage_id, market_date, symbols):
+            assert market_date == '2026-04-21'
+            assert symbols == requested_symbols
+            if stage_id == 'momentum_factors':
+                return _scope_gap_evidence(
+                    requested_count=2,
+                    present_count=1,
+                    missing_symbols_sample=['005930'],
+                )
+            return _scope_gap_evidence(
+                requested_count=2,
+                present_count=2,
+            )
+
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: pykrx_run,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: 2,
+            technical_snapshot_count_loader=lambda *_: 2,
+            action_summary_count_loader=lambda *_: 2,
+            row_count_stage_counts_loader=lambda **_: (
+                _full_feedback_prerequisite_stage_counts(
+                    total=2,
+                    updated_at='2026-04-21T09:45:00+00:00',
+                )
+            ),
+            row_count_scope_gap_loader=scope_gap_loader,
+            signal_feature_counts_loader=lambda **_: {
+                'persisted': 2,
+                'semantic_ready_count': 2,
+            },
+        )
+
+        result = service.read(market_date='2026-04-21')
+
+        momentum_stage = result['stages']['momentum_factors']
+        self.assertEqual(momentum_stage['status'], 'partial')
+        self.assertEqual(momentum_stage['source_status'], 'partial')
+        self.assertEqual(momentum_stage['gate_status'], 'blocked')
+        self.assertEqual(
+            momentum_stage['details']['mode'],
+            'official_daily_pipeline_run_state',
+        )
+        self.assertFalse(
+            momentum_stage['details']['exact_universe_verified']
+        )
+        self.assertEqual(
+            momentum_stage['details']['exact_universe_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['005930'],
+        )
+        self.assertEqual(result['status'], 'blocked')
+
     def test_signal_feature_stage_requires_semantically_usable_rows_for_requested_scope(self):
         self.assertFalse(
             _signal_feature_row_is_semantically_ready(
@@ -876,6 +1457,51 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             failed_stage['details']['gate_reason'],
             'official_stage_failed',
         )
+
+    def test_stored_full_coverage_does_not_override_terminal_source_stage(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+            ),
+        )
+        exact_scope_gap = _scope_gap_evidence(
+            requested_count=1,
+            present_count=1,
+        )
+
+        for status in ('failed', 'blocked', 'partial', 'interrupted'):
+            with self.subTest(status=status):
+                source_stage = {
+                    'status': status,
+                    'gate_status': 'blocked',
+                    'severity': 'blocked',
+                    'blocking_status': 'blocking',
+                    'details': {'gate_reason': f'official_stage_{status}'},
+                }
+                normalized = service._normalize_stored_pykrx_coverage_stage(
+                    source_stage,
+                    persisted=1,
+                    expected_total=1,
+                    exact_scope_gap=exact_scope_gap,
+                    expected_total_source=(
+                        'validated_eod_run_market_membership'
+                    ),
+                )
+                gated = service._apply_scope_coverage_gate(
+                    stage_id='technical_snapshots',
+                    market_date='2026-04-21',
+                    stage=normalized,
+                    scope_symbols=['005930'],
+                )
+
+                self.assertEqual(gated['status'], status)
+                self.assertEqual(gated['gate_status'], 'blocked')
+                self.assertEqual(gated['blocking_status'], 'blocking')
+                self.assertEqual(
+                    gated['details']['gate_reason'],
+                    f'official_stage_{status}',
+                )
 
     def test_requested_scope_completion_isolates_out_of_scope_partial_dependency(self):
         service = EODPipelineStatusService(
@@ -1489,6 +2115,36 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'partial',
         )
 
+    def test_completed_required_stage_with_blocked_gate_keeps_pipeline_blocked(self) -> None:
+        stages = {
+            'technical_snapshots': {
+                'stage_id': 'technical_snapshots',
+                'status': 'completed',
+                'gate_status': 'blocked',
+                'blocking_status': 'blocking',
+                'details': {
+                    'gate_reason': 'missing_rows_intersect_exact_run_universe',
+                    'missing_count': 1,
+                },
+            },
+            'action_summaries': {
+                'stage_id': 'action_summaries',
+                'status': 'completed',
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'details': {},
+            },
+        }
+
+        self.assertEqual(
+            EODPipelineStatusService._resolve_overall_status(stages),
+            'blocked',
+        )
+        self.assertEqual(
+            stages['technical_snapshots']['details']['gate_reason'],
+            'missing_rows_intersect_exact_run_universe',
+        )
+
     def test_optional_context_warning_only_resolves_completed(self) -> None:
         stages = {
             'macro_context_refresh': {
@@ -1547,6 +2203,89 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     gates[category]['gate_status'],
                     'not_applicable',
                 )
+
+    def test_pykrx_stage_remains_partial_when_decision_usable_core_is_missing(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2767,
+            market_count=2,
+            updated_at='2026-10-30T15:40:00+09:00',
+        )
+        coverage['categories']['short_selling'].update(
+            {
+                'present_rows': 2767,
+                'expected_rows': 2767,
+                'coverage_ratio': 1.0,
+                'coverage_status': 'complete',
+                'decision_usable_present_rows': 0,
+                'decision_usable_ratio': 0.0,
+                'decision_usable_status': 'missing',
+                'complete_present_rows': 0,
+                'completeness_ratio': 0.0,
+                'completeness_status': 'missing',
+            }
+        )
+
+        stage = EODPipelineStatusService()._build_pykrx_enrichment_stage(
+            market_date='2026-10-30',
+            coverage=coverage,
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['source_status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertGreater(stage['failed'], 0)
+        self.assertIn(
+            'short_selling',
+            stage['details']['missing_categories'],
+        )
+        short_gate = next(
+            item
+            for item in stage['details']['decider_blocking_categories']
+            if item['category'] == 'short_selling'
+        )
+        self.assertEqual(
+            short_gate['reason'],
+            'missing_required_pykrx_enrichment_decision_evidence',
+        )
+        self.assertEqual(short_gate['decision_usable_rows'], 0)
+
+    def test_pykrx_stage_completes_with_warning_when_only_short_balance_is_missing(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2767,
+            market_count=2,
+            updated_at='2026-10-30T15:40:00+09:00',
+        )
+        coverage['categories']['short_selling'].update(
+            {
+                'present_rows': 2767,
+                'expected_rows': 2767,
+                'coverage_ratio': 1.0,
+                'coverage_status': 'complete',
+                'decision_usable_present_rows': 2767,
+                'decision_usable_ratio': 1.0,
+                'decision_usable_status': 'complete',
+                'complete_present_rows': 0,
+                'completeness_ratio': 0.0,
+                'completeness_status': 'missing',
+            }
+        )
+
+        stage = EODPipelineStatusService()._build_pykrx_enrichment_stage(
+            market_date='2026-10-30',
+            coverage=coverage,
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(
+            stage['source_status'],
+            'completed_with_coverage_warnings',
+        )
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['failed'], 0)
+        self.assertIn(
+            'short_selling',
+            stage['details']['coverage_warning_categories'],
+        )
 
     def test_pykrx_partial_stage_counts_not_applicable_categories_as_processed(self):
         coverage = _full_pykrx_enrichment_coverage(
@@ -1623,6 +2362,149 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(stage['failed'], 100)
         self.assertEqual(stage['current_activity'], 'Completed with 100 failed items.')
 
+    def test_strict_completion_stages_without_scope_proof_are_downgraded(
+        self,
+    ) -> None:
+        service = EODPipelineStatusService()
+        for stage_id in (
+            'agent_feedback_summaries',
+            'next_open_execution_plan',
+        ):
+            with self.subTest(stage_id=stage_id):
+                item = _completed_official_stage(
+                    run_id=386,
+                    stage_id=stage_id,
+                    market_date='2026-05-28',
+                    processed=2,
+                    total=2,
+                )
+                built = service._build_official_stage(
+                    stage_id=stage_id,
+                    market_date='2026-05-28',
+                    official_run=item['run'],
+                    official_stage=item['stage'],
+                    fallback_stage={
+                        'status': 'pending',
+                        'details': {},
+                        'source_run_ids': {},
+                    },
+                )
+
+                self.assertEqual(
+                    built['status'],
+                    (
+                        'blocked'
+                        if stage_id == 'next_open_execution_plan'
+                        else 'partial'
+                    ),
+                )
+                self.assertEqual(
+                    built['details']['status_repair_reason'],
+                    'non_authoritative_terminal_result',
+                )
+
+    def test_next_open_completed_accepts_exact_partial_decider_terminal_scope(
+        self,
+    ) -> None:
+        decider = _completed_signal_decider_history_stage(
+            run_id=386,
+            market_date='2026-05-28',
+            symbol_count=2,
+        )['stage']
+        decider['status'] = 'partial'
+        decider.update(
+            processed=6,
+            total=6,
+            succeeded=4,
+            failed=2,
+            remaining=0,
+        )
+        decider_proof = decider['details']['completion_scope_proof']
+        decider_proof['admitted_symbols'].append('000003')
+        for role in DECISION_SUPPORT_AGENT_NAMES:
+            decider_proof['failed_symbols_by_role'][role] = ['000003']
+        decider_proof.update(
+            total_items=6,
+            completed_items=4,
+            failed_items=2,
+        )
+        decider_proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(decider_proof)
+        )
+
+        next_open = _completed_next_open_history_stage(
+            run_id=386,
+            market_date='2026-05-28',
+            total=2,
+        )['stage']
+        next_open_proof = next_open['details'][
+            'completion_scope_proof'
+        ]
+        next_open_proof['parent_admitted_symbols'].append('000003')
+        next_open_proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(next_open_proof)
+        )
+
+        normalized = EODPipelineStatusService._normalize_stage_contract(
+            {
+                'signal_decider': decider,
+                'next_open_execution_plan': next_open,
+            }
+        )
+
+        self.assertEqual(
+            normalized['next_open_execution_plan']['status'],
+            'completed',
+        )
+
+        mismatched = deepcopy(next_open)
+        mismatched_proof = mismatched['details'][
+            'completion_scope_proof'
+        ]
+        mismatched_proof['parent_completed_symbols'] = [
+            '000001',
+            '000003',
+        ]
+        mismatched_proof['role_symbol_scopes'] = {
+            role: ['000001', '000003']
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        for entry in mismatched_proof['decision_partition']:
+            if entry['symbol'] == '000002':
+                entry['symbol'] = '000003'
+        mismatched_proof['decision_partition'].sort(
+            key=lambda entry: (
+                entry['symbol'],
+                entry['decision_agent_name'],
+            )
+        )
+        mismatched_proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(mismatched_proof)
+        )
+
+        mismatched_normalized = (
+            EODPipelineStatusService._normalize_stage_contract(
+                {
+                    'signal_decider': decider,
+                    'next_open_execution_plan': mismatched,
+                }
+            )
+        )
+
+        self.assertEqual(
+            mismatched_normalized['next_open_execution_plan']['status'],
+            'blocked',
+        )
+        self.assertEqual(
+            mismatched_normalized['next_open_execution_plan']['details'][
+                'status_repair_reason'
+            ],
+            'signal_decider_completion_proof_unavailable_or_mismatched',
+        )
+
     def test_completed_next_open_plan_is_blocked_when_decider_counts_are_incomplete(self):
         market_date = '2026-05-28'
         decider_item = _completed_official_stage(
@@ -1663,7 +2545,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         stage = result['stages']['next_open_execution_plan']
         self.assertEqual(stage['status'], 'blocked')
         self.assertEqual(stage['source_status'], 'completed')
-        self.assertEqual(stage['details']['status_repair_reason'], 'signal_decider_incomplete')
+        self.assertEqual(
+            stage['details']['status_repair_reason'],
+            'signal_decider_completion_proof_unavailable_or_mismatched',
+        )
 
     def test_official_external_news_results_repair_legacy_zero_counters(self):
         market_date = '2026-05-28'
@@ -3506,7 +4391,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
         self.assertEqual(
             result['stages']['momentum_factors']['current_activity'],
@@ -3597,7 +4482,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read()
 
-        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['stages']['fundamentals_daily_refresh']['status'], 'failed')
         self.assertEqual(result['stages']['advanced_value_factors']['status'], 'pending')
         self.assertEqual(
@@ -3985,7 +4870,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date='2026-05-06')
 
-        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['stages']['momentum_factors']['status'], 'partial')
         self.assertEqual(result['stages']['momentum_factors']['total'], 2810)
         self.assertEqual(
@@ -4350,7 +5235,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             run_id='feedback-cycle-2026-10-07-summarizers',
         )
 
-    def test_read_treats_stored_full_coverage_as_completed_after_scoped_retry_run(self):
+    def test_read_preserves_partial_source_stage_despite_stored_full_coverage(self):
         pykrx_run = {
             'id': 401,
             'market': 'KRX',
@@ -4398,12 +5283,19 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         for stage_id in ('price_collection', 'technical_snapshots', 'action_summaries'):
-            self.assertEqual(result['stages'][stage_id]['status'], 'completed')
-            self.assertEqual(result['stages'][stage_id]['total'], 3683)
-            self.assertEqual(result['stages'][stage_id]['succeeded'], 3683)
-            self.assertEqual(result['stages'][stage_id]['failed'], 0)
-        self.assertEqual(result['stages']['market_risk_filter']['status'], 'completed')
-        self.assertEqual(result['stages']['market_risk_filter']['details']['blocking_stages'], [])
+            self.assertEqual(result['stages'][stage_id]['status'], 'partial')
+            self.assertEqual(
+                result['stages'][stage_id]['source_run_ids'],
+                {'eod_run_id': 401},
+            )
+            self.assertNotIn(
+                'stored_rows_coverage_override',
+                result['stages'][stage_id]['details'],
+            )
+        self.assertNotEqual(
+            result['stages']['market_risk_filter']['status'],
+            'completed',
+        )
 
     def test_read_maps_completed_pipeline_stages_from_completed_run_and_aggregate_counts(self):
         pykrx_run = {
@@ -4605,18 +5497,14 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ),
             official_run_loader=lambda **_: official_run,
             official_stage_history_loader=lambda **_: {
-                'agent_feedback_summaries': _completed_official_stage(
+                'agent_feedback_summaries': _completed_feedback_history_stage(
                     run_id=8,
-                    stage_id='agent_feedback_summaries',
                     market_date=market_date,
-                    processed=570,
                     total=570,
                 ),
-                'next_open_execution_plan': _completed_official_stage(
+                'next_open_execution_plan': _completed_next_open_history_stage(
                     run_id=8,
-                    stage_id='next_open_execution_plan',
                     market_date=market_date,
-                    processed=114,
                     total=114,
                 ),
             },
@@ -4644,16 +5532,16 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date=market_date)
 
-        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['status'], 'blocked')
         self.assertEqual(result['total_stages'], 26)
-        self.assertEqual(result['completed_stages'], 19)
+        self.assertEqual(result['completed_stages'], 17)
         self.assertEqual(result['skipped_stages'], 2)
-        self.assertEqual(result['display_completed_stages'], 21)
+        self.assertEqual(result['display_completed_stages'], 19)
         self.assertEqual(result['pending_stages'], 5)
-        self.assertEqual(result['partial_stages'], 0)
+        self.assertEqual(result['partial_stages'], 1)
         self.assertEqual(result['running_stages'], 0)
-        self.assertEqual(result['current_stage'], 'piotroski_filter')
-        self.assertEqual(result['current_stage_status'], 'pending')
+        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        self.assertEqual(result['current_stage_status'], 'partial')
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(
             result['stages']['master_refresh']['details']['reason'],
@@ -4670,7 +5558,20 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['signal_decider']['status'], 'completed')
         self.assertEqual(result['stages']['signal_decider']['details']['feedback_rows'], 114)
         self.assertEqual(result['stages']['signal_decider']['details']['decision_snapshots'], 228)
-        self.assertEqual(result['stages']['signal_decider_evaluations']['status'], 'completed')
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['status'],
+            'blocked',
+        )
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['details'][
+                'status_repair_reason'
+            ],
+            'signal_decider_completion_proof_unavailable_or_mismatched',
+        )
+        self.assertEqual(
+            result['stages']['signal_decider_evaluations']['status'],
+            'partial',
+        )
         pykrx_stage = result['stages']['pykrx_enrichment']
         self.assertEqual(pykrx_stage['status'], 'completed')
         self.assertEqual(pykrx_stage['gate_status'], 'blocked')
@@ -4766,8 +5667,18 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 self.assertEqual(stage['details']['features_failed'], 2)
                 self.assertTrue(stage['details']['historical_stage_state'])
                 self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
-                self.assertEqual(result['current_stage'], 'signal_features')
-                self.assertEqual(result['stages']['signal_decider_evaluations']['status'], 'completed')
+                self.assertEqual(
+                    result['current_stage'],
+                    (
+                        'signal_features'
+                        if official_status == 'partial'
+                        else 'signal_decider_evaluations'
+                    ),
+                )
+                self.assertEqual(
+                    result['stages']['signal_decider_evaluations']['status'],
+                    'partial',
+                )
 
     def test_read_prefers_newer_persisted_outputs_over_older_blocked_eod_progress(self):
         market_date = '2026-10-07'
@@ -4886,7 +5797,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 {'eod_run_id': 561},
             )
 
-    def test_read_recovers_real_shaped_legacy_decision_history_before_newer_unrelated_safe_skip(
+    def test_read_legacy_zero_semantics_do_not_authorize_next_open_without_parent_proof(
         self,
     ) -> None:
         market_date = '2026-10-07'
@@ -4904,9 +5815,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         ):
             eod_run['run_metadata']['stage_progress'][stage_id] = {
                 'status': 'blocked',
-                'processed': 65 if stage_id == 'signal_decider' else 0,
-                'total': 115 if stage_id == 'signal_decider' else 0,
-                'succeeded': 65 if stage_id == 'signal_decider' else 0,
+                'processed': 0,
+                'total': 0,
+                'succeeded': 0,
                 'failed': 0,
                 'updated_at': blocked_at,
                 'result_summary': {
@@ -4954,11 +5865,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     market_date=market_date,
                     updated_at=recovered_at,
                 ),
-                'next_open_execution_plan': _completed_official_stage(
+                'next_open_execution_plan': _completed_next_open_history_stage(
                     run_id=516,
-                    stage_id='next_open_execution_plan',
                     market_date=market_date,
-                    processed=5,
                     total=5,
                     updated_at=recovered_at,
                 ),
@@ -4974,23 +5883,21 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         result = service.read(market_date=market_date)
 
-        expected_counts = {
-            'signal_decider': 160,
-            'next_open_execution_plan': 5,
-            'signal_decider_evaluations': 3_840,
+        expected_statuses = {
+            'signal_decider': 'completed',
+            'next_open_execution_plan': 'blocked',
+            'signal_decider_evaluations': 'completed',
         }
-        for stage_id, expected_count in expected_counts.items():
+        for stage_id, expected_status in expected_statuses.items():
             with self.subTest(stage_id=stage_id):
                 stage = result['stages'][stage_id]
-                self.assertEqual(stage['status'], 'completed')
-                self.assertEqual(stage['processed'], expected_count)
-                self.assertEqual(stage['total'], expected_count)
-                self.assertEqual(stage['succeeded'], expected_count)
-                self.assertEqual(stage['failed'], 0)
-                self.assertEqual(
-                    stage['details']['progress_source'],
-                    'official_stage_history',
-                )
+                self.assertEqual(stage['status'], expected_status)
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['details'][
+                'status_repair_reason'
+            ],
+            'signal_decider_completion_proof_unavailable_or_mismatched',
+        )
 
     def test_legacy_zero_count_decision_history_requires_stage_specific_semantic_proof(
         self,
@@ -4998,11 +5905,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         market_date = '2026-10-07'
         current = {
             'status': 'blocked',
-            'processed': 65,
-            'total': 115,
-            'succeeded': 65,
+            'processed': 0,
+            'total': 0,
+            'succeeded': 0,
             'failed': 0,
-            'remaining': 50,
+            'remaining': 0,
             'updated_at': '2026-10-07T13:00:00+00:00',
         }
         decider_factory = lambda: _legacy_completed_signal_decider_stage(
@@ -5125,11 +6032,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         )
         current = {
             'status': 'blocked',
-            'processed': 65,
-            'total': 115,
-            'succeeded': 65,
+            'processed': 0,
+            'total': 0,
+            'succeeded': 0,
             'failed': 0,
-            'remaining': 50,
+            'remaining': 0,
             'updated_at': '2026-10-07T13:00:00+00:00',
         }
         for stage_id, factory in (
@@ -5273,7 +6180,464 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             )
         )
 
-    def test_real_shaped_legacy_evaluation_wrapper_remains_completed(
+    def test_feedback_history_counts_require_summary_identity_proof(
+        self,
+    ) -> None:
+        candidate = _completed_official_stage(
+            run_id=519,
+            stage_id='agent_feedback_summaries',
+            market_date='2026-10-07',
+            processed=6,
+            total=6,
+        )['stage']
+
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='agent_feedback_summaries',
+                candidate=candidate,
+            )
+        )
+
+        candidate = _completed_feedback_history_stage(
+            run_id=519,
+            market_date='2026-10-07',
+            total=6,
+        )['stage']
+
+        self.assertTrue(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='agent_feedback_summaries',
+                candidate=candidate,
+            )
+        )
+        empty_role_scope_candidate = _completed_feedback_history_stage(
+            run_id=520,
+            market_date='2026-10-07',
+            total=2,
+            role_counts=(2, 0, 0),
+        )['stage']
+        empty_role_scope_proof = empty_role_scope_candidate['details'][
+            'completion_scope_proof'
+        ]
+        self.assertEqual(
+            empty_role_scope_proof['role_symbol_scopes'][
+                SUMMARIZER_AGENT_NAMES[1]
+            ],
+            [],
+        )
+        self.assertTrue(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='agent_feedback_summaries',
+                candidate=empty_role_scope_candidate,
+            )
+        )
+        mismatched_identity = deepcopy(candidate)
+        mismatched_identity['source_run_ids'] = {
+            'run_id': 'feedback-cycle-2026-10-07-other'
+        }
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='agent_feedback_summaries',
+                candidate=mismatched_identity,
+            )
+        )
+        one_role_carries_total = deepcopy(candidate)
+        role_progress = one_role_carries_total['details'][
+            'result_summary'
+        ]['progress']['summary']['role_progress']
+        first_role = SUMMARIZER_AGENT_NAMES[0]
+        role_progress.clear()
+        role_progress[first_role] = {
+            'role': first_role,
+            'status': 'completed',
+            'boundary_status': 'completed',
+            'total_symbols': 6,
+            'processed_symbols': 6,
+            'completed_symbols': 6,
+            'in_progress_symbols': 0,
+            'pending_symbols': 0,
+            'failed_items': 0,
+            'retry_pending_symbols': 0,
+        }
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='agent_feedback_summaries',
+                candidate=one_role_carries_total,
+            )
+        )
+        self.assertFalse(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='agent_feedback_summaries',
+                candidate=candidate,
+                current={
+                    'status': 'blocked',
+                    'processed': 6,
+                    'total': 9,
+                    'succeeded': 6,
+                    'failed': 0,
+                    'remaining': 3,
+                    'updated_at': '2026-05-28T07:30:00+00:00',
+                },
+                candidate_is_history=True,
+            )
+        )
+        same_scope_current = deepcopy(candidate)
+        same_scope_current.update(
+            status='blocked',
+            updated_at='2026-05-28T07:30:00+00:00',
+        )
+        self.assertTrue(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='agent_feedback_summaries',
+                candidate=candidate,
+                current=same_scope_current,
+                candidate_is_history=True,
+            )
+        )
+        proofless_blocked_current = deepcopy(same_scope_current)
+        proofless_blocked_current['details'].pop(
+            'completion_scope_proof'
+        )
+        self.assertFalse(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='agent_feedback_summaries',
+                candidate=candidate,
+                current=proofless_blocked_current,
+                candidate_is_history=True,
+            )
+        )
+        for field, replacement in (
+            ('source_run_id', 'feedback-cycle-2026-10-07-other'),
+            ('knowledge_cutoff_at', '2026-10-07T09:00:00+00:00'),
+        ):
+            with self.subTest(feedback_authority_field=field):
+                different_authority_current = deepcopy(
+                    same_scope_current
+                )
+                authority_proof = different_authority_current[
+                    'details'
+                ]['completion_scope_proof']
+                authority_proof[field] = replacement
+                authority_proof['proof_digest'] = (
+                    DailyPipelineStageService
+                    ._stage_completion_scope_proof_digest(
+                        authority_proof
+                    )
+                )
+                self.assertFalse(
+                    EODPipelineStatusService._recovery_state_is_newer(
+                        stage_id='agent_feedback_summaries',
+                        candidate=candidate,
+                        current=different_authority_current,
+                        candidate_is_history=True,
+                    )
+                )
+        different_role_scope_current = deepcopy(same_scope_current)
+        different_scope_proof = different_role_scope_current['details'][
+            'completion_scope_proof'
+        ]
+        first_role, second_role = SUMMARIZER_AGENT_NAMES[:2]
+        role_scopes = different_scope_proof['role_symbol_scopes']
+        role_scopes[first_role], role_scopes[second_role] = (
+            role_scopes[second_role],
+            role_scopes[first_role],
+        )
+        different_scope_proof['role_scope_manifest_fingerprint'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(
+                {
+                    'requested_symbols': different_scope_proof[
+                        'requested_symbols'
+                    ],
+                    'role_symbol_scopes': role_scopes,
+                }
+            )
+        )
+        different_scope_proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(different_scope_proof)
+        )
+        self.assertFalse(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='agent_feedback_summaries',
+                candidate=candidate,
+                current=different_role_scope_current,
+                candidate_is_history=True,
+            )
+        )
+
+    def test_next_open_history_counts_require_bound_scope_proof(
+        self,
+    ) -> None:
+        candidate = _completed_official_stage(
+            run_id=519,
+            stage_id='next_open_execution_plan',
+            market_date='2026-10-07',
+            processed=2,
+            total=2,
+        )['stage']
+
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=candidate,
+            )
+        )
+
+        candidate = _completed_next_open_history_stage(
+            run_id=519,
+            market_date='2026-10-07',
+            total=2,
+        )['stage']
+
+        self.assertTrue(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=candidate,
+            )
+        )
+        mismatched_scope = deepcopy(candidate)
+        mismatched_scope['details']['nonblocking_scope_proof'].update(
+            item_count=3,
+            blocked_item_count=2,
+        )
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=mismatched_scope,
+            )
+        )
+        unrelated_decision_run = deepcopy(candidate)
+        unrelated_decision_run['details']['nonblocking_scope_proof'][
+            'active_scope'
+        ][0]['decision_run_id'] = 'unrelated-child-run'
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=unrelated_decision_run,
+            )
+        )
+        unrelated_parent = deepcopy(candidate)
+        unrelated_parent['source_run_ids'][
+            'parent_signal_decider_run_id'
+        ] = 'unrelated-parent-run'
+        self.assertFalse(
+            EODPipelineStatusService._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=unrelated_parent,
+            )
+        )
+        unrelated_current = _completed_next_open_history_stage(
+            run_id=520,
+            market_date='2026-10-07',
+            total=2,
+            updated_at='2026-05-28T07:30:00+00:00',
+        )['stage']
+        unrelated_current['status'] = 'blocked'
+        self.assertFalse(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='next_open_execution_plan',
+                candidate=candidate,
+                current=unrelated_current,
+                candidate_is_history=True,
+            )
+        )
+        proofless_blocked_current = deepcopy(candidate)
+        proofless_blocked_current.update(
+            status='blocked',
+            updated_at='2026-05-28T07:30:00+00:00',
+        )
+        proofless_blocked_current['details'].pop(
+            'completion_scope_proof'
+        )
+        self.assertFalse(
+            EODPipelineStatusService._recovery_state_is_newer(
+                stage_id='next_open_execution_plan',
+                candidate=candidate,
+                current=proofless_blocked_current,
+                candidate_is_history=True,
+            )
+        )
+        for field, replacement in (
+            ('decision_snapshot_id', 99),
+            ('authority_fingerprint', 'regenerated-authority'),
+            ('generation_fingerprint', 'regenerated-generation'),
+            ('active', False),
+        ):
+            with self.subTest(next_open_authority_field=field):
+                regenerated_current = deepcopy(candidate)
+                regenerated_current.update(
+                    status='blocked',
+                    updated_at='2026-05-28T07:30:00+00:00',
+                )
+                regenerated_proof = regenerated_current['details'][
+                    'completion_scope_proof'
+                ]
+                included_entry = next(
+                    entry
+                    for entry in regenerated_proof[
+                        'decision_partition'
+                    ]
+                    if entry['disposition'] == 'included'
+                )
+                if field == 'active':
+                    included_entry['included_items'][0][
+                        'handoff_active'
+                    ] = False
+                    included_entry['included_items'][0][
+                        'exec_monitoring_active'
+                    ] = False
+                    regenerated_proof['active_item_count'] -= 1
+                    regenerated_proof['blocked_item_count'] += 1
+                else:
+                    included_entry[field] = replacement
+                regenerated_proof['proof_digest'] = (
+                    DailyPipelineStageService
+                    ._stage_completion_scope_proof_digest(
+                        regenerated_proof
+                    )
+                )
+                self.assertFalse(
+                    EODPipelineStatusService._recovery_state_is_newer(
+                        stage_id='next_open_execution_plan',
+                        candidate=candidate,
+                        current=regenerated_current,
+                        candidate_is_history=True,
+                    )
+                )
+
+    def test_zero_item_next_open_history_requires_full_non_actionable_partition(
+        self,
+    ) -> None:
+        item = _completed_zero_item_next_open_history_stage(
+            run_id=521,
+            market_date='2026-10-07',
+        )
+        candidate = item['stage']
+
+        self.assertTrue(
+            EODPipelineStatusService
+            ._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=candidate,
+            )
+        )
+        built = EODPipelineStatusService()._build_official_stage(
+            stage_id='next_open_execution_plan',
+            market_date='2026-10-07',
+            official_run=item['run'],
+            official_stage=candidate,
+            fallback_stage={
+                'status': 'pending',
+                'details': {},
+                'source_run_ids': {},
+            },
+        )
+        self.assertEqual(built['status'], 'completed')
+
+        missing_partition = deepcopy(candidate)
+        missing_partition['details'].pop('completion_scope_proof')
+        self.assertFalse(
+            EODPipelineStatusService
+            ._history_stage_has_authoritative_completion(
+                stage_id='next_open_execution_plan',
+                candidate=missing_partition,
+            )
+        )
+
+    def test_decision_history_cannot_overlay_different_authoritative_denominator(
+        self,
+    ) -> None:
+        cases = (
+            (
+                'signal_decider',
+                _legacy_completed_signal_decider_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                    expected=130,
+                    completed=130,
+                )['stage'],
+                230,
+            ),
+            (
+                'signal_decider_evaluations',
+                _legacy_completed_signal_decider_evaluations_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )['stage'],
+                8_000,
+            ),
+        )
+        for stage_id, candidate, current_total in cases:
+            with self.subTest(stage_id=stage_id):
+                self.assertFalse(
+                    EODPipelineStatusService._recovery_state_is_newer(
+                        stage_id=stage_id,
+                        candidate=candidate,
+                        current={
+                            'status': 'blocked',
+                            'processed': 0,
+                            'total': current_total,
+                            'succeeded': 0,
+                            'failed': 0,
+                            'remaining': current_total,
+                            'updated_at': (
+                                '2026-10-07T13:00:00+00:00'
+                            ),
+                            'details': {},
+                        },
+                        candidate_is_history=True,
+                    )
+                )
+
+    def test_legacy_decision_history_cannot_claim_same_size_current_cohort(
+        self,
+    ) -> None:
+        cases = (
+            (
+                'signal_decider',
+                _legacy_completed_signal_decider_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                    expected=130,
+                    completed=130,
+                )['stage'],
+                130,
+            ),
+            (
+                'signal_decider_evaluations',
+                _legacy_completed_signal_decider_evaluations_stage(
+                    market_date='2026-10-07',
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )['stage'],
+                3_840,
+            ),
+        )
+        for stage_id, candidate, current_total in cases:
+            with self.subTest(stage_id=stage_id):
+                self.assertFalse(
+                    EODPipelineStatusService._recovery_state_is_newer(
+                        stage_id=stage_id,
+                        candidate=candidate,
+                        current={
+                            'status': 'blocked',
+                            'processed': 0,
+                            'total': current_total,
+                            'succeeded': 0,
+                            'failed': 0,
+                            'remaining': current_total,
+                            'updated_at': (
+                                '2026-10-07T13:00:00+00:00'
+                            ),
+                            'details': {
+                                'requested_symbols': ['999999'],
+                            },
+                        },
+                        candidate_is_history=True,
+                    )
+                )
+
+    def test_real_shaped_legacy_evaluation_wrapper_fails_closed_without_proof(
         self,
     ) -> None:
         item = _legacy_wrapped_signal_decider_evaluations_stage(
@@ -5282,7 +6646,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         )
         candidate = item['stage']
 
-        self.assertTrue(
+        self.assertFalse(
             EODPipelineStatusService._history_stage_has_authoritative_completion(
                 stage_id='signal_decider_evaluations',
                 candidate=candidate,
@@ -5300,7 +6664,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(built_stage['status'], 'completed')
+        self.assertEqual(built_stage['status'], 'partial')
         self.assertEqual(built_stage['processed'], 2_843)
         self.assertEqual(built_stage['total'], 2_843)
         self.assertEqual(built_stage['succeeded'], 2_843)
@@ -5873,6 +7237,26 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         total=115,
                         updated_at='2026-10-07T14:00:00+00:00',
                     )
+                    expected_total = 115
+                    if stage_id == 'signal_decider':
+                        completed_history = (
+                            _completed_signal_decider_history_stage(
+                                run_id=516,
+                                market_date=market_date,
+                                symbol_count=58,
+                                updated_at=(
+                                    '2026-10-07T14:00:00+00:00'
+                                ),
+                            )
+                        )
+                        expected_total = 116
+                    elif stage_id == 'next_open_execution_plan':
+                        completed_history = _completed_next_open_history_stage(
+                            run_id=516,
+                            market_date=market_date,
+                            total=115,
+                            updated_at='2026-10-07T14:00:00+00:00',
+                        )
                     blocked = _incomplete_official_stage(
                         run_id=511,
                         stage_id=stage_id,
@@ -5907,13 +7291,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         }
                     stage_history = {stage_id: completed_history}
                     if stage_id == 'next_open_execution_plan':
-                        stage_history['signal_decider'] = _completed_official_stage(
-                            run_id=516,
-                            stage_id='signal_decider',
-                            market_date=market_date,
-                            processed=115,
-                            total=115,
-                            updated_at='2026-10-07T13:59:00+00:00',
+                        stage_history['signal_decider'] = (
+                            _completed_signal_decider_history_stage(
+                                run_id=516,
+                                market_date=market_date,
+                                symbol_count=115,
+                                updated_at=(
+                                    '2026-10-07T13:59:00+00:00'
+                                ),
+                            )
                         )
                     service = EODPipelineStatusService(
                         market_state_loader=lambda: _FakeMarketState(),
@@ -5929,8 +7315,8 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
                     stage = result['stages'][stage_id]
                     self.assertEqual(stage['status'], 'completed')
-                    self.assertEqual(stage['processed'], 115)
-                    self.assertEqual(stage['total'], 115)
+                    self.assertEqual(stage['processed'], expected_total)
+                    self.assertEqual(stage['total'], expected_total)
                     self.assertEqual(
                         stage['details']['progress_source'],
                         'official_stage_history',
@@ -6216,11 +7602,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             fundamentals_refresh_loader=lambda **_: None,
             official_run_loader=lambda **_: None,
             official_stage_history_loader=lambda **_: {
-                'agent_feedback_summaries': _completed_official_stage(
+                'agent_feedback_summaries': _completed_feedback_history_stage(
                     run_id=514,
-                    stage_id='agent_feedback_summaries',
                     market_date=market_date,
-                    processed=470,
                     total=470,
                     updated_at='2026-10-07T16:08:53+00:00',
                 ),

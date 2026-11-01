@@ -35,6 +35,7 @@ from app.market_data_store import (
     upsert_daily_signal_feature,
     upsert_daily_signal_features,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 
 SIGNAL_FEATURE_VERSION = 'daily_signal_features_v2'
 SIGNAL_FEATURE_SOURCE = 'kis_ranking'
@@ -1507,6 +1508,7 @@ class DailySignalFeatureService:
             source_diagnostics=source_diagnostics,
         )
 
+    @daily_price_bar_writer_admission
     async def refresh_for_market_date(
         self,
         *,
@@ -1820,6 +1822,7 @@ class DailySignalFeatureService:
             }
         return result
 
+    @daily_price_bar_writer_admission
     def rebuild_stored_owned_fallback_for_market_date(
         self,
         *,

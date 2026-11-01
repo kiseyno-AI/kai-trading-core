@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from functools import wraps
+import inspect
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import and_, func, or_, select, text
@@ -19,6 +22,7 @@ from app.db_models import (
     DailyPipelineRun,
     DailyPipelineStageRun,
     DailyPriceBar,
+    DailyPriceContext,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
     EODCollectionRun,
@@ -87,6 +91,12 @@ _EOD_COLLECTION_LOCK_SOURCE_KEYS = {
 }
 _DAILY_PRICE_BAR_LOCK_IDENTITY = ('KRX', 'daily_price_bars')
 _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY = 0
+_HELD_EOD_COLLECTION_LOCKS: ContextVar[
+    frozenset[tuple[str, str, str]]
+] = ContextVar(
+    'held_eod_collection_locks',
+    default=frozenset(),
+)
 _AUTO_DAILY_PIPELINE_ENTRYPOINT = (
     'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
 )
@@ -198,6 +208,91 @@ def eod_collection_admission_advisory_lock_keys(
     )
 
 
+def _eod_collection_lock_identity(
+    *,
+    market: str,
+    trade_date: str | date,
+    source: str,
+) -> tuple[str, str, str]:
+    return (
+        str(market).strip().upper(),
+        str(source).strip(),
+        _normalize_trade_date(trade_date).isoformat(),
+    )
+
+
+def eod_collection_advisory_lock_is_held(
+    *,
+    market: str,
+    trade_date: str | date,
+    source: str,
+) -> bool:
+    """Return whether this execution context already owns the date fence.
+
+    The database lock is session-scoped, while pipeline stages use separate
+    SQLAlchemy sessions for their atomic publications.  Tracking ownership in
+    a context variable makes those nested calls re-entrant without weakening
+    admission for concurrent API/CLI writers in other threads or tasks.
+    """
+
+    return _eod_collection_lock_identity(
+        market=market,
+        trade_date=trade_date,
+        source=source,
+    ) in _HELD_EOD_COLLECTION_LOCKS.get()
+
+
+@contextmanager
+def daily_price_bar_writer_admission_lock(
+    *,
+    market_date: str | date,
+):
+    """Hold the date fence for one complete price-dependent write."""
+
+    normalized = _normalize_trade_date(market_date).isoformat()
+    with advisory_eod_collection_lock(
+        market='KRX',
+        trade_date=normalized,
+        source='daily_price_bars',
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError(
+                'daily price-dependent writer lock is already held for '
+                f'{normalized}'
+            )
+        yield
+
+
+def daily_price_bar_writer_admission(func):
+    """Serialize a complete same-date derived-data computation and publish.
+
+    Mutating services decorated with this helper join the same date-scoped
+    fence as the official pipeline and exact repair tools.  Existing owners
+    are re-entrant through :func:`eod_collection_advisory_lock_is_held`.
+    """
+
+    async def _async_call(*args: Any, **kwargs: Any):
+        market_date = kwargs.get('market_date')
+        if market_date is None:
+            raise ValueError('market_date is required for writer admission')
+        with daily_price_bar_writer_admission_lock(
+            market_date=market_date,
+        ):
+            return await func(*args, **kwargs)
+
+    def _sync_call(*args: Any, **kwargs: Any):
+        market_date = kwargs.get('market_date')
+        if market_date is None:
+            raise ValueError('market_date is required for writer admission')
+        with daily_price_bar_writer_admission_lock(
+            market_date=market_date,
+        ):
+            return func(*args, **kwargs)
+
+    wrapper = _async_call if inspect.iscoroutinefunction(func) else _sync_call
+    return wraps(func)(wrapper)
+
+
 def _invalidate_advisory_lock_connection(connection: Any) -> None:
     """Discard a pooled session whose advisory-lock cleanup failed."""
 
@@ -231,6 +326,18 @@ def advisory_eod_collection_locks(
     )
     if not normalized_dates:
         raise ValueError('at least one EOD advisory-lock date is required')
+    lock_identities = frozenset(
+        _eod_collection_lock_identity(
+            market=market,
+            trade_date=item,
+            source=source,
+        )
+        for item in normalized_dates
+    )
+    held_identities = _HELD_EOD_COLLECTION_LOCKS.get()
+    if lock_identities.issubset(held_identities):
+        yield True, None
+        return
     source_key = _EOD_COLLECTION_LOCK_SOURCE_KEYS.get(
         (market, source),
         19_999,
@@ -241,6 +348,7 @@ def advisory_eod_collection_locks(
     acquired_trade_keys: list[int] = []
     blocked_date: date | None = None
     cleanup_failed = False
+    ownership_token = None
     with engine.connect() as raw_connection:
         connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
         try:
@@ -285,11 +393,17 @@ def advisory_eod_collection_locks(
                     blocked_date = trade_date
                     break
                 acquired_trade_keys.append(trade_key)
+            if blocked_date is None:
+                ownership_token = _HELD_EOD_COLLECTION_LOCKS.set(
+                    held_identities.union(lock_identities)
+                )
             yield (
                 blocked_date is None,
                 blocked_date.isoformat() if blocked_date is not None else None,
             )
         finally:
+            if ownership_token is not None:
+                _HELD_EOD_COLLECTION_LOCKS.reset(ownership_token)
             for trade_key in reversed(acquired_trade_keys):
                 try:
                     connection.execute(
@@ -3054,6 +3168,15 @@ def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
 
 @contextmanager
 def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
+    identity = _eod_collection_lock_identity(
+        market=market,
+        trade_date=trade_date,
+        source=source,
+    )
+    held_identities = _HELD_EOD_COLLECTION_LOCKS.get()
+    if identity in held_identities:
+        yield True
+        return
     source_key, trade_key = eod_collection_advisory_lock_keys(
         market=market,
         trade_date=trade_date,
@@ -3074,6 +3197,7 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
         admission_acquired = False
         acquired = False
         cleanup_failed = False
+        ownership_token = None
         try:
             if uses_global_admission:
                 admission_acquired = bool(
@@ -3105,8 +3229,14 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
                     },
                 ).scalar()
             )
+            if acquired:
+                ownership_token = _HELD_EOD_COLLECTION_LOCKS.set(
+                    held_identities.union({identity})
+                )
             yield acquired
         finally:
+            if ownership_token is not None:
+                _HELD_EOD_COLLECTION_LOCKS.reset(ownership_token)
             if acquired:
                 try:
                     connection.execute(
@@ -3220,6 +3350,19 @@ def count_daily_price_bars_for_live_symbols(trade_date: str | date) -> int:
                 .select_from(DailyPriceBar)
                 .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
                 .where(DailyPriceBar.trade_date == _normalize_trade_date(trade_date))
+                .where(Symbol.is_active.is_(True))
+            ).scalar_one()
+        )
+
+
+def count_daily_price_contexts_for_live_symbols(market_date: str | date) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyPriceContext.symbol_id)))
+                .select_from(DailyPriceContext)
+                .join(Symbol, Symbol.id == DailyPriceContext.symbol_id)
+                .where(DailyPriceContext.market_date == _normalize_trade_date(market_date))
                 .where(Symbol.is_active.is_(True))
             ).scalar_one()
         )

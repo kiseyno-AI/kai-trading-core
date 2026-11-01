@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
@@ -13,9 +13,11 @@ from app.market_data_store import (
     load_daily_momentum_factor_results,
     load_daily_value_factor_results,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_composite_factor_result,
     upsert_daily_composite_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.momentum_factor import enrich_momentum_audit_fields
 from app.signals.factor_coverage import (
     build_factor_coverage_contract,
@@ -156,6 +158,7 @@ def _sort_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class DailyCompositeFactorService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -163,6 +166,8 @@ class DailyCompositeFactorService:
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = COMPOSITE_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -181,7 +186,7 @@ class DailyCompositeFactorService:
         requested_symbols = list(normalized_symbols or [])
         full_scope_replacement = symbols is None and ranking_symbols is None
         if normalized_symbols == []:
-            return self._empty_rebuild_result(
+            result = self._empty_rebuild_result(
                 market_date=normalized_market_date,
                 source=source,
                 requested_symbols=requested_symbols,
@@ -189,6 +194,19 @@ class DailyCompositeFactorService:
                 missing_symbols=[],
                 explicit_empty_scope=True,
             )
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='composite_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         authoritative_universe = list_symbols_with_daily_bar_on_date(
             normalized_market_date.isoformat()
@@ -223,13 +241,26 @@ class DailyCompositeFactorService:
             missing_symbols = [symbol for symbol in normalized_symbols if symbol not in matched_symbol_set]
             target_symbols = matched_symbols
             if not matched_symbols:
-                return self._empty_rebuild_result(
+                result = self._empty_rebuild_result(
                     market_date=normalized_market_date,
                     source=source,
                     requested_symbols=requested_symbols,
                     matched_symbols=[],
                     missing_symbols=missing_symbols,
                 )
+                if exact_scope_symbols is not None:
+                    result['scope_finalization'] = (
+                        replace_daily_derived_results_exact_scope(
+                            market_date=normalized_market_date,
+                            stage_id='composite_factors',
+                            results=[],
+                            exact_symbols=exact_scope_symbols,
+                            authoritative_market_scope=(
+                                authoritative_market_scope
+                            ),
+                        )['scope_finalization']
+                    )
+                return result
 
         metadata_map = self._load_symbol_metadata(
             symbols=sorted(set(ranking_symbols).union(target_symbols)),
@@ -287,38 +318,52 @@ class DailyCompositeFactorService:
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            persisted_count = (
-                upsert_daily_composite_factor_results(
-                    items,
-                    replace_market_date=normalized_market_date,
-                )
-                if full_scope_replacement
-                else upsert_daily_composite_factor_results(items)
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='composite_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
             )
-            if persisted_count != len(items):
-                raise RuntimeError(
-                    f'composite batch upsert persisted {persisted_count} of {len(items)} results'
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols = list(publication['failed_symbols'])
+            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            scope_finalization = publication['scope_finalization']
+        else:
+            try:
+                persisted_count = (
+                    upsert_daily_composite_factor_results(
+                        items,
+                        replace_market_date=normalized_market_date,
+                    )
+                    if full_scope_replacement
+                    else upsert_daily_composite_factor_results(items)
                 )
-        except Exception as batch_exc:
-            persisted_count = 0
-            if full_scope_replacement:
-                failed_symbols = [item['symbol'] for item in items]
-                failed_symbol_errors = [
-                    {
-                        'symbol': item['symbol'],
-                        'error': f'atomic_full_scope_replace_failed: {batch_exc}',
-                    }
-                    for item in items
-                ]
-            else:
-                for item in items:
-                    try:
-                        upsert_daily_composite_factor_result(item)
-                        persisted_count += 1
-                    except Exception as exc:
-                        failed_symbols.append(item['symbol'])
-                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+                if persisted_count != len(items):
+                    raise RuntimeError(
+                        f'composite batch upsert persisted {persisted_count} of {len(items)} results'
+                    )
+            except Exception as batch_exc:
+                persisted_count = 0
+                if full_scope_replacement:
+                    failed_symbols = [item['symbol'] for item in items]
+                    failed_symbol_errors = [
+                        {
+                            'symbol': item['symbol'],
+                            'error': f'atomic_full_scope_replace_failed: {batch_exc}',
+                        }
+                        for item in items
+                    ]
+                else:
+                    for item in items:
+                        try:
+                            upsert_daily_composite_factor_result(item)
+                            persisted_count += 1
+                        except Exception as exc:
+                            failed_symbols.append(item['symbol'])
+                            failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -342,7 +387,7 @@ class DailyCompositeFactorService:
         summary['common_complete_cohort_count'] = summary['complete_count']
         summary['renormalized_partial_cohort_count'] = summary['partial_count']
 
-        return {
+        result = {
             **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
@@ -357,6 +402,9 @@ class DailyCompositeFactorService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': items,
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,

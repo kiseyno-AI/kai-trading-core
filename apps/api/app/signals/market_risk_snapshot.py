@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from app.brokers.kis.provider import kis_client
 from app.market_data_store import (
@@ -11,9 +11,11 @@ from app.market_data_store import (
     load_daily_market_risk_snapshots,
     load_latest_available_daily_market_risk_snapshot_date,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_market_risk_snapshot,
     upsert_daily_market_risk_snapshots,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 
 MARKET_RISK_SNAPSHOT_SOURCE = 'kis_quote2_snapshot_v1'
 DEFAULT_MARKET_CODE = 'J'
@@ -177,33 +179,42 @@ class DailyMarketRiskSnapshotService:
         *,
         market_date: date,
         symbols: Sequence[str] | None,
-    ) -> tuple[list[MarketRiskSymbolInput], list[str], list[str]]:
+    ) -> tuple[
+        list[MarketRiskSymbolInput],
+        list[str],
+        list[str],
+        list[str],
+    ]:
         if symbols is None:
-            matched_symbols = list_symbols_with_daily_bar_on_date(market_date.isoformat())
-            if not matched_symbols:
-                return [], [], []
-            missing_symbols: list[str] = []
+            requested_symbols = list_symbols_with_daily_bar_on_date(
+                market_date.isoformat()
+            )
+            if not requested_symbols:
+                return [], [], [], []
         else:
             requested_symbols = list(symbols)
-            symbol_rows = load_symbols(symbols=requested_symbols)
-            rows_by_symbol = {row['symbol']: row for row in symbol_rows}
-            matched_symbols = [symbol for symbol in requested_symbols if symbol in rows_by_symbol]
-            missing_symbols = [symbol for symbol in requested_symbols if symbol not in rows_by_symbol]
-            if not matched_symbols:
-                return [], [], missing_symbols
 
-        row_map = {row['symbol']: row for row in load_symbols(symbols=matched_symbols)}
+        row_map = {
+            row['symbol']: row
+            for row in load_symbols(symbols=requested_symbols)
+        }
+        matched_symbols = [
+            symbol for symbol in requested_symbols if symbol in row_map
+        ]
+        missing_symbols = [
+            symbol for symbol in requested_symbols if symbol not in row_map
+        ]
         inputs = [
             MarketRiskSymbolInput(
                 symbol=symbol,
-                name_ko=(row_map.get(symbol) or {}).get('name_ko'),
-                market=(row_map.get(symbol) or {}).get('market'),
+                name_ko=row_map[symbol].get('name_ko'),
+                market=row_map[symbol].get('market'),
             )
             for symbol in matched_symbols
-            if symbol in row_map
         ]
-        return inputs, matched_symbols, missing_symbols
+        return inputs, requested_symbols, matched_symbols, missing_symbols
 
+    @daily_price_bar_writer_admission
     async def collect_for_market_date(
         self,
         *,
@@ -214,18 +225,40 @@ class DailyMarketRiskSnapshotService:
         run_id: int | None = None,
         fetch_concurrency: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = normalize_market_date(market_date)
         normalized_symbols = normalize_symbols(symbols)
         normalized_market_code = normalize_market_code(market_code)
-        requested_symbols = list(normalized_symbols or [])
-        symbol_rows, matched_symbols, missing_symbols = self._load_symbol_rows(
+        loaded_symbol_rows = self._load_symbol_rows(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
+        if len(loaded_symbol_rows) == 3:
+            # Preserve compatibility with injected loaders that predate the
+            # explicit requested-symbol return value.
+            symbol_rows, matched_symbols, missing_symbols = loaded_symbol_rows
+            requested_symbols = [*matched_symbols, *missing_symbols]
+        else:
+            (
+                symbol_rows,
+                requested_symbols,
+                matched_symbols,
+                missing_symbols,
+            ) = loaded_symbol_rows
+
+        failed_symbols: list[str] = list(missing_symbols)
+        failed_symbol_errors: list[dict[str, str]] = [
+            {
+                'symbol': symbol,
+                'error': 'symbol_not_found_in_symbol_master',
+            }
+            for symbol in missing_symbols
+        ]
 
         if not symbol_rows:
-            return {
+            result = {
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
@@ -240,20 +273,33 @@ class DailyMarketRiskSnapshotService:
                     'trade_halted_count': 0,
                 },
                 'snapshots_persisted': 0,
-                'snapshots_failed': 0,
-                'failed_symbols': [],
-                'failed_symbol_errors': [],
+                'snapshots_failed': len(failed_symbols),
+                'failed_symbols': failed_symbols,
+                'failed_symbol_errors': failed_symbol_errors,
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='market_risk_snapshots',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         semaphore = asyncio.Semaphore(max(int(fetch_concurrency or self.fetch_concurrency), 1))
         throttle_lock = asyncio.Lock()
         progress_lock = asyncio.Lock()
         last_request_at = 0.0
-        processed_count = 0
+        processed_count = len(missing_symbols)
         succeeded_count = 0
-        failed_count = 0
-        total_count = len(symbol_rows)
+        failed_count = len(missing_symbols)
+        total_count = len(requested_symbols)
 
         async def _emit_progress(**payload: Any) -> None:
             if progress_callback is None:
@@ -271,10 +317,10 @@ class DailyMarketRiskSnapshotService:
                 if symbol_rows
                 else 'Fetching KIS market-risk snapshots'
             ),
-            processed=0,
+            processed=processed_count,
             total=total_count,
             succeeded=0,
-            failed=0,
+            failed=failed_count,
             current_symbol=symbol_rows[0].symbol if symbol_rows else None,
         )
 
@@ -374,8 +420,6 @@ class DailyMarketRiskSnapshotService:
         fetch_results = await asyncio.gather(*[_fetch_symbol(item) for item in symbol_rows])
 
         items: list[dict[str, Any]] = []
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
         for result in fetch_results:
             item = result.get('item')
             if item is not None:
@@ -394,7 +438,26 @@ class DailyMarketRiskSnapshotService:
         )
 
         persisted_items: list[dict[str, Any]] = []
-        if items:
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='market_risk_snapshots',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            successful_symbol_set = set(publication['successful_symbols'])
+            persisted_items = [
+                item for item in items
+                if item['symbol'] in successful_symbol_set
+            ]
+            failed_symbols.extend(publication['failed_symbols'])
+            failed_symbol_errors.extend(
+                publication['failed_symbol_errors']
+            )
+            scope_finalization = publication['scope_finalization']
+        elif items:
             try:
                 upsert_daily_market_risk_snapshots(items)
                 persisted_items = list(items)
@@ -407,7 +470,7 @@ class DailyMarketRiskSnapshotService:
                         failed_symbols.append(item['symbol'])
                         failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
 
-        return {
+        result = {
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -427,6 +490,9 @@ class DailyMarketRiskSnapshotService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': persisted_items,
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,

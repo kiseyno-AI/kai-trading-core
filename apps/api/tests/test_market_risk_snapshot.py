@@ -97,6 +97,102 @@ class MarketRiskSnapshotNormalizationTests(unittest.TestCase):
 
 
 class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_load_symbol_rows_partitions_missing_master_from_bar_scope(
+        self,
+    ) -> None:
+        service = DailyMarketRiskSnapshotService()
+
+        with (
+            patch(
+                'app.signals.market_risk_snapshot.'
+                'list_symbols_with_daily_bar_on_date',
+                return_value=['005930', '999999'],
+            ),
+            patch(
+                'app.signals.market_risk_snapshot.load_symbols',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'name_ko': '삼성전자',
+                        'market': 'KOSPI',
+                    }
+                ],
+            ) as load_master,
+        ):
+            rows, requested, matched, missing = service._load_symbol_rows(
+                market_date=date(2026, 4, 14),
+                symbols=None,
+            )
+
+        load_master.assert_called_once_with(
+            symbols=['005930', '999999']
+        )
+        self.assertEqual([row.symbol for row in rows], ['005930'])
+        self.assertEqual(requested, ['005930', '999999'])
+        self.assertEqual(matched, ['005930'])
+        self.assertEqual(missing, ['999999'])
+
+    async def test_collect_broad_scope_preserves_missing_master_in_denominator(
+        self,
+    ) -> None:
+        client = FakeKISRiskClient(
+            responses={
+                '005930': {
+                    'output': {
+                        'mrkt_warn_cls_code': '00',
+                        'mang_issu_yn': 'N',
+                        'invt_caful_yn': 'N',
+                        'short_over_yn': 'N',
+                        'ssts_hot_yn': 'N',
+                        'vi_cls_code': '00',
+                        'insn_pbnt_yn': 'N',
+                        'trht_yn': 'N',
+                    }
+                }
+            }
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        progress: list[dict] = []
+
+        with (
+            patch(
+                'app.signals.market_risk_snapshot.'
+                'list_symbols_with_daily_bar_on_date',
+                return_value=['999999', '005930'],
+            ),
+            patch(
+                'app.signals.market_risk_snapshot.load_symbols',
+                return_value=[
+                    {
+                        'symbol': '005930',
+                        'name_ko': '삼성전자',
+                        'market': 'KOSPI',
+                    }
+                ],
+            ),
+            patch(
+                'app.signals.market_risk_snapshot.'
+                'upsert_daily_market_risk_snapshots'
+            ) as upsert,
+        ):
+            result = await service.collect_for_market_date(
+                market_date='2026-04-14',
+                symbols=None,
+                progress_callback=lambda **payload: progress.append(payload),
+            )
+
+        self.assertEqual(result['requested_symbols'], ['999999', '005930'])
+        self.assertEqual(result['matched_symbols'], ['005930'])
+        self.assertEqual(result['missing_symbols'], ['999999'])
+        self.assertEqual(result['snapshots_persisted'], 1)
+        self.assertEqual(result['snapshots_failed'], 1)
+        self.assertEqual(result['failed_symbols'], ['999999'])
+        self.assertEqual(progress[0]['processed'], 1)
+        self.assertEqual(progress[0]['total'], 2)
+        self.assertEqual(progress[-1]['processed'], 2)
+        self.assertEqual(progress[-1]['total'], 2)
+        upsert.assert_called_once()
+
     async def test_collect_for_market_date_continues_on_fetch_and_persist_failures(self) -> None:
         service = DailyMarketRiskSnapshotService(
             client=FakeKISRiskClient(
@@ -142,7 +238,16 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError('write failed')
 
         with (
-            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['005930', '000660', '051910'], [])),
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(
+                    inputs,
+                    ['005930', '000660', '051910'],
+                    ['005930', '000660', '051910'],
+                    [],
+                ),
+            ),
             patch(
                 'app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots',
                 side_effect=RuntimeError('bulk write failed'),
@@ -156,6 +261,10 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['snapshots_persisted'], 1)
         self.assertEqual(result['snapshots_failed'], 2)
+        self.assertEqual(
+            result['requested_symbols'],
+            ['005930', '000660', '051910'],
+        )
         self.assertEqual(result['summary']['matched_symbol_count'], 3)
         self.assertEqual(result['summary']['collected_count'], 2)
         self.assertEqual(result['failed_symbols'], ['051910', '000660'])
@@ -164,6 +273,122 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upsert.call_count, 2)
         persisted_symbols = {call.args[0]['symbol'] for call in upsert.call_args_list}
         self.assertEqual(persisted_symbols, {'005930', '000660'})
+
+    async def test_collect_for_market_date_counts_missing_master_symbols_as_failures(
+        self,
+    ) -> None:
+        client = FakeKISRiskClient(
+            responses={
+                '005930': {
+                    'output': {
+                        'mrkt_warn_cls_code': '00',
+                        'mang_issu_yn': 'N',
+                        'invt_caful_yn': 'N',
+                        'short_over_yn': 'N',
+                        'ssts_hot_yn': 'N',
+                        'vi_cls_code': '00',
+                        'insn_pbnt_yn': 'N',
+                        'trht_yn': 'N',
+                    }
+                }
+            }
+        )
+        service = DailyMarketRiskSnapshotService(client=client)
+        inputs = [
+            MarketRiskSymbolInput(
+                symbol='005930',
+                name_ko='삼성전자',
+                market='KOSPI',
+            )
+        ]
+        progress: list[dict] = []
+
+        with (
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(
+                    inputs,
+                    ['005930', '999999'],
+                    ['005930'],
+                    ['999999'],
+                ),
+            ),
+            patch(
+                'app.signals.market_risk_snapshot.'
+                'upsert_daily_market_risk_snapshots'
+            ) as upsert,
+        ):
+            result = await service.collect_for_market_date(
+                market_date='2026-04-14',
+                symbols=['005930', '999999'],
+                progress_callback=lambda **payload: progress.append(payload),
+            )
+
+        self.assertEqual(result['requested_symbols'], ['005930', '999999'])
+        self.assertEqual(result['matched_symbols'], ['005930'])
+        self.assertEqual(result['missing_symbols'], ['999999'])
+        self.assertEqual(result['snapshots_persisted'], 1)
+        self.assertEqual(result['snapshots_failed'], 1)
+        self.assertEqual(result['failed_symbols'], ['999999'])
+        self.assertEqual(
+            result['failed_symbol_errors'],
+            [
+                {
+                    'symbol': '999999',
+                    'error': 'symbol_not_found_in_symbol_master',
+                }
+            ],
+        )
+        self.assertEqual(progress[0]['processed'], 1)
+        self.assertEqual(progress[0]['total'], 2)
+        self.assertEqual(progress[0]['failed'], 1)
+        self.assertEqual(progress[-1]['processed'], 2)
+        self.assertEqual(progress[-1]['total'], 2)
+        self.assertEqual(progress[-1]['failed'], 1)
+        upsert.assert_called_once()
+
+    async def test_collect_for_market_date_all_missing_scope_is_failed_partition(
+        self,
+    ) -> None:
+        service = DailyMarketRiskSnapshotService(
+            client=FakeKISRiskClient(responses={})
+        )
+
+        with (
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(
+                    [],
+                    ['999998', '999999'],
+                    [],
+                    ['999998', '999999'],
+                ),
+            ),
+            patch(
+                'app.signals.market_risk_snapshot.'
+                'upsert_daily_market_risk_snapshots'
+            ) as upsert,
+        ):
+            result = await service.collect_for_market_date(
+                market_date='2026-04-14',
+                symbols=['999998', '999999'],
+            )
+
+        self.assertEqual(result['requested_symbols'], ['999998', '999999'])
+        self.assertEqual(result['matched_symbols'], [])
+        self.assertEqual(result['snapshots_persisted'], 0)
+        self.assertEqual(result['snapshots_failed'], 2)
+        self.assertEqual(result['failed_symbols'], ['999998', '999999'])
+        self.assertEqual(
+            [item['error'] for item in result['failed_symbol_errors']],
+            [
+                'symbol_not_found_in_symbol_master',
+                'symbol_not_found_in_symbol_master',
+            ],
+        )
+        upsert.assert_not_called()
 
     async def test_collect_for_market_date_retries_kis_rate_limit_errors(self) -> None:
         client = FakeKISRiskClient(
@@ -187,7 +412,11 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         inputs = [MarketRiskSymbolInput(symbol='005930', name_ko='삼성전자', market='KOSPI')]
 
         with (
-            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['005930'], [])),
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(inputs, ['005930'], ['005930'], []),
+            ),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
             patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
@@ -227,7 +456,11 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         inputs = [MarketRiskSymbolInput(symbol='272110', name_ko='케이엔제이', market='KOSDAQ')]
 
         with (
-            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['272110'], [])),
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(inputs, ['272110'], ['272110'], []),
+            ),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
             patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
@@ -252,7 +485,11 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         inputs = [MarketRiskSymbolInput(symbol='272110', name_ko='케이엔제이', market='KOSDAQ')]
 
         with (
-            patch.object(service, '_load_symbol_rows', return_value=(inputs, ['272110'], [])),
+            patch.object(
+                service,
+                '_load_symbol_rows',
+                return_value=(inputs, ['272110'], ['272110'], []),
+            ),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
             patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
         ):
@@ -324,7 +561,12 @@ class DailyMarketRiskSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 service,
                 '_load_symbol_rows',
-                return_value=(inputs, ['008775', '159800'], []),
+                return_value=(
+                    inputs,
+                    ['008775', '159800'],
+                    ['008775', '159800'],
+                    [],
+                ),
             ),
             patch('app.signals.market_risk_snapshot.asyncio.sleep', return_value=None) as sleep,
             patch('app.signals.market_risk_snapshot.upsert_daily_market_risk_snapshots') as upsert,
@@ -444,7 +686,11 @@ class MarketRiskSnapshotPersistenceIntegrationTests(unittest.IsolatedAsyncioTest
             MarketRiskSymbolInput(symbol='196002', name_ko='테스트관리', market='KOSDAQ'),
         ]
 
-        with patch.object(self.service, '_load_symbol_rows', return_value=(inputs, self.symbols, [])):
+        with patch.object(
+            self.service,
+            '_load_symbol_rows',
+            return_value=(inputs, self.symbols, self.symbols, []),
+        ):
             result = await self.service.collect_for_market_date(
                 market_date=self.market_date,
                 run_id=self.run_id,

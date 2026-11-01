@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
     load_daily_unified_value_factor_results,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_unified_value_factor_result,
     upsert_daily_unified_value_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.advanced_value_factor import (
     ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
     ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
@@ -150,6 +152,7 @@ def _sort_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -157,6 +160,8 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = UNIFIED_VALUE_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -181,7 +186,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                 missing_symbols=[],
                 universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
             )
-            return {
+            result = {
                 **factor_stage_result_contract(
                     summary,
                     explicit_empty_scope=True,
@@ -199,6 +204,19 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                 'failed_symbol_errors': [],
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='unified_value_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         if normalized_symbols is not None:
             resolved_symbols = [item['symbol'] for item in load_symbols(symbols=normalized_symbols)]
@@ -210,7 +228,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                     missing_symbols=requested_symbols,
                     universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
                 )
-                return {
+                result = {
                     **factor_stage_result_contract(summary),
                     'market_date': normalized_market_date.isoformat(),
                     'source': source,
@@ -225,6 +243,19 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                     'failed_symbol_errors': [],
                     'items': [],
                 }
+                if exact_scope_symbols is not None:
+                    result['scope_finalization'] = (
+                        replace_daily_derived_results_exact_scope(
+                            market_date=normalized_market_date,
+                            stage_id='unified_value_factors',
+                            results=[],
+                            exact_symbols=exact_scope_symbols,
+                            authoritative_market_scope=(
+                                authoritative_market_scope
+                            ),
+                        )['scope_finalization']
+                    )
+                return result
 
         inputs, matched_symbols, missing_symbols = self._load_inputs(
             market_date=normalized_market_date,
@@ -293,17 +324,31 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            upsert_daily_unified_value_factor_results(items)
-            persisted_count = len(items)
-        except Exception:
-            for item in items:
-                try:
-                    upsert_daily_unified_value_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='unified_value_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols = list(publication['failed_symbols'])
+            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            scope_finalization = publication['scope_finalization']
+        else:
+            try:
+                upsert_daily_unified_value_factor_results(items)
+                persisted_count = len(items)
+            except Exception:
+                for item in items:
+                    try:
+                        upsert_daily_unified_value_factor_result(item)
+                        persisted_count += 1
+                    except Exception as exc:
+                        failed_symbols.append(item['symbol'])
+                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -325,7 +370,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             )
         )
 
-        return {
+        result = {
             **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
@@ -340,6 +385,9 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             'failed_symbol_errors': failed_symbol_errors,
             'items': _sort_items(items),
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,

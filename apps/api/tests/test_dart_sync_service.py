@@ -2348,6 +2348,19 @@ class FilingClassificationTests(unittest.TestCase):
         self.assertEqual(result['filing_category'], 'other')
         self.assertFalse(result['is_financial_report'])
 
+    def test_classify_filing_rejects_periodic_report_prefix_lookalikes(self):
+        for report_name in (
+            '사업보고서제출기한연장신고서',
+            '반기보고서제출기한연장신고서',
+            '분기보고서제출기한연장신고서',
+            '사업보고서 (2025.12) 제출기한 연장신고서',
+        ):
+            with self.subTest(report_name=report_name):
+                result = classify_filing(report_name)
+
+                self.assertEqual(result['filing_category'], 'other')
+                self.assertFalse(result['is_financial_report'])
+
 
 if __name__ == '__main__':
     unittest.main()

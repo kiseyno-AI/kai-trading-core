@@ -5,12 +5,14 @@ import hashlib
 import io
 import re
 import zipfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.settings import settings
@@ -45,9 +47,42 @@ MAX_AUDIT_DIAGNOSTIC_MEMBERS = 50
 MAX_AUDIT_DIAGNOSTIC_MEMBER_NAME_CHARS = 255
 MAX_AUDIT_DIAGNOSTIC_ENCODING_CHARS = 64
 AUDIT_ARCHIVE_DIAGNOSTICS_VERSION = 'dart_audit_archive_diagnostics_v1'
+AUDIT_SIGNAL_WRITER_LOCK_KEY = 'dart_audit_signals_writer_v1'
+_AUDIT_SIGNAL_WRITER_LOCK_OWNED: ContextVar[bool] = ContextVar(
+    'dart_audit_signal_writer_lock_owned',
+    default=False,
+)
+
+
+@contextmanager
+def audit_signal_writer_lock_owner():
+    """Allow a guarded repair to publish through its separately held lock.
+
+    The exact repair holds the advisory transaction lock on its guard
+    connection.  Its capture service persists on another connection, so that
+    nested mutation must not wait on the repair's own lock.  Context ownership
+    is limited to tasks spawned inside the guard; ordinary writers still take
+    the database lock in ``_store_signals``.
+    """
+
+    token = _AUDIT_SIGNAL_WRITER_LOCK_OWNED.set(True)
+    try:
+        yield
+    finally:
+        _AUDIT_SIGNAL_WRITER_LOCK_OWNED.reset(token)
 
 _AUDIT_PATTERNS = [
     (re.compile(r'의견거절'), 'disclaimer', '의견거절'),
+    (re.compile(r'부적정의견|부적정'), 'adverse', '부적정'),
+    (re.compile(r'한정의견|한정'), 'qualified', '한정'),
+    (re.compile(r'적정의견|적정'), 'unqualified', '적정'),
+]
+_SEMANTIC_AUDIT_PATTERNS = [
+    (
+        re.compile(r'의견\s*거절|(?<![가-힣A-Za-z0-9])거절(?![가-힣A-Za-z0-9])'),
+        'disclaimer',
+        '의견거절',
+    ),
     (re.compile(r'부적정의견|부적정'), 'adverse', '부적정'),
     (re.compile(r'한정의견|한정'), 'qualified', '한정'),
     (re.compile(r'적정의견|적정'), 'unqualified', '적정'),
@@ -58,15 +93,41 @@ _AUDIT_OPINION_SEVERITY = {
     'adverse': 2,
     'disclaimer': 3,
 }
+_AUDIT_NEGATIVE_AUTHORITY_SENTINELS = {
+    'legacy_aud_opn_period_without_current_v1',
+    'semantic_audit_table_current_period_absent_v1',
+}
+_AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS = {
+    'legacy_aud_opn_markerless_conflict_v1',
+    'semantic_audit_table_current_opinion_unrecognized_v1',
+    'semantic_audit_table_current_period_ambiguous_v1',
+}
 
 _AUDIT_TABLE_PATTERN = re.compile(
-    r'<TABLE-GROUP[^>]+ACLASS="AUD_OPN"[^>]*>(.*?)</TABLE-GROUP>',
+    r'<TABLE-GROUP\b[^>]*\bACLASS\s*=\s*["\']AUD_OPN["\'][^>]*>'
+    r'(.*?)</TABLE-GROUP>',
+    re.IGNORECASE | re.DOTALL,
+)
+_PLAIN_TABLE_PATTERN = re.compile(
+    r'<TABLE(?=[\s>])[^>]*>(.*?)</TABLE>',
     re.IGNORECASE | re.DOTALL,
 )
 _AUDIT_ROW_PATTERN = re.compile(r'<TR[^>]*>(.*?)</TR>', re.IGNORECASE | re.DOTALL)
 _AUDIT_CELL_PATTERN = re.compile(r'<T[EDHU][^>]*>(.*?)</T[EDHU]>', re.IGNORECASE | re.DOTALL)
 _TAG_PATTERN = re.compile(r'<[^>]+>')
 _WS_PATTERN = re.compile(r'\s+')
+_CURRENT_PERIOD_PATTERN = re.compile(
+    r'[\(（]\s*당\s*기\s*[\)）]'
+)
+_EXPLICIT_PERIOD_PATTERN = re.compile(
+    r'[\(（]\s*(?:당\s*기|전\s*기|전\s*전\s*기)\s*[\)）]'
+)
+_SEMANTIC_AUDIT_HEADERS = (
+    '사업연도',
+    '감사인',
+    '감사의견',
+    '핵심감사사항',
+)
 _ENCODING_DECLARATION_PATTERN = re.compile(
     r'(?:encoding|charset)\s*=\s*["\']?\s*([A-Za-z0-9._-]+)',
     re.IGNORECASE,
@@ -365,10 +426,19 @@ class DartSignalsService:
             await self._extract_audit_signal_with_diagnostics(event)
         )
         dilution_signal = self._extract_dilution_signal(event)
-        self._store_signals(event=event, audit_signal=audit_signal, dilution_signal=dilution_signal)
+        audit_signal_evaluated = bool(audit_signal) or (
+            _has_complete_audit_authority_evaluation(audit_diagnostics)
+        )
+        self._store_signals(
+            event=event,
+            audit_signal=audit_signal,
+            dilution_signal=dilution_signal,
+            audit_signal_evaluated=audit_signal_evaluated,
+        )
         result = {
             'rcept_no': rcept_no,
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
+            'audit_signal_evaluated': audit_signal_evaluated,
             'dilution_signal': dilution_signal,
         }
         if audit_signal is None and audit_diagnostics is not None:
@@ -380,10 +450,19 @@ class DartSignalsService:
         audit_signal, audit_diagnostics = (
             await self._extract_audit_signal_with_diagnostics(event)
         )
-        self._store_signals(event=event, audit_signal=audit_signal, dilution_signal=None)
+        audit_signal_evaluated = bool(audit_signal) or (
+            _has_complete_audit_authority_evaluation(audit_diagnostics)
+        )
+        self._store_signals(
+            event=event,
+            audit_signal=audit_signal,
+            dilution_signal=None,
+            audit_signal_evaluated=audit_signal_evaluated,
+        )
         result = {
             'rcept_no': rcept_no,
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
+            'audit_signal_evaluated': audit_signal_evaluated,
         }
         if audit_signal is None and audit_diagnostics is not None:
             result['audit_diagnostics'] = audit_diagnostics
@@ -788,6 +867,10 @@ class DartSignalsService:
                         source_section=info.filename,
                     )
                 )
+        finding_parser_names = [
+            str((finding.payload or {}).get('parser') or '')
+            for finding in findings
+        ]
         diagnostics = {
             'version': AUDIT_ARCHIVE_DIAGNOSTICS_VERSION,
             'archive_sha256': hashlib.sha256(archive_bytes).hexdigest(),
@@ -798,6 +881,17 @@ class DartSignalsService:
             'aud_opn_table_count': aud_opn_table_count,
             'audit_report_label_row_count': audit_report_label_row_count,
             'known_opinion_token_row_count': known_opinion_token_row_count,
+            'positive_authority_evidence_count': sum(
+                finding.opinion_code is not None for finding in findings
+            ),
+            'negative_authority_evidence_count': sum(
+                parser in _AUDIT_NEGATIVE_AUTHORITY_SENTINELS
+                for parser in finding_parser_names
+            ),
+            'ambiguous_authority_evidence_count': sum(
+                parser in _AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS
+                for parser in finding_parser_names
+            ),
             'truncated': diagnostics_truncated,
         }
         return self._select_conservative_audit_signal(findings), diagnostics
@@ -817,44 +911,376 @@ class DartSignalsService:
         source_section: str,
     ) -> list[ParsedAuditSignal]:
         findings: list[ParsedAuditSignal] = []
-        for table_html in _AUDIT_TABLE_PATTERN.findall(text):
-            for row_html in _AUDIT_ROW_PATTERN.findall(table_html):
-                cells = [
-                    _clean_html_text(cell)
-                    for cell in _AUDIT_CELL_PATTERN.findall(row_html)
-                ]
-                if not cells:
-                    continue
-                row_text = ' | '.join(cell for cell in cells if cell)
-                if '감사보고서' not in row_text and '연결감사보고서' not in row_text:
-                    continue
-                opinion_cell = next(
-                    (
-                        cell
-                        for cell in cells
-                        if any(pattern.search(cell) for pattern, _, _ in _AUDIT_PATTERNS)
-                    ),
-                    None,
+        aud_opn_ranges: list[tuple[int, int]] = []
+        for group_match in _AUDIT_TABLE_PATTERN.finditer(text):
+            aud_opn_ranges.append(group_match.span())
+            group_html = group_match.group(1)
+            nested_tables = _PLAIN_TABLE_PATTERN.findall(group_html)
+            semantic_findings: list[ParsedAuditSignal] = []
+            semantic_table_found = False
+            for table_html in nested_tables or [group_html]:
+                table_findings, recognized = self._parse_semantic_audit_table(
+                    table_html,
+                    source_section=source_section,
                 )
-                if not opinion_cell:
-                    continue
-                for pattern, code, label in _AUDIT_PATTERNS:
-                    if pattern.search(opinion_cell):
-                        findings.append(
-                            ParsedAuditSignal(
-                                opinion_code=code,
-                                opinion_label=label,
-                                has_audit_issue=code
-                                in {'disclaimer', 'adverse', 'qualified'},
-                                source_section=source_section[:255],
-                                evidence_text=row_text,
-                                payload={
-                                    'opinion_cell': opinion_cell,
-                                    'row_cells': cells,
-                                },
-                            )
+                semantic_table_found = semantic_table_found or recognized
+                semantic_findings.extend(table_findings)
+            if semantic_table_found:
+                findings.extend(semantic_findings)
+                continue
+            findings.extend(
+                self._parse_legacy_aud_opn_table(
+                    group_html,
+                    source_section=source_section,
+                )
+            )
+
+        for table_match in _PLAIN_TABLE_PATTERN.finditer(text):
+            table_start, table_end = table_match.span()
+            if any(
+                group_start <= table_start and table_end <= group_end
+                for group_start, group_end in aud_opn_ranges
+            ):
+                continue
+            table_findings, recognized = self._parse_semantic_audit_table(
+                table_match.group(1),
+                source_section=source_section,
+            )
+            if recognized:
+                findings.extend(table_findings)
+        return findings
+
+    @staticmethod
+    def _audit_authority_sentinel(
+        *,
+        parser: str,
+        source_section: str,
+    ) -> ParsedAuditSignal:
+        return ParsedAuditSignal(
+            opinion_code=None,
+            opinion_label=None,
+            has_audit_issue=False,
+            source_section=source_section[:255],
+            evidence_text=None,
+            payload={'parser': parser},
+        )
+
+    def _parse_semantic_audit_table(
+        self,
+        table_html: str,
+        *,
+        source_section: str,
+    ) -> tuple[list[ParsedAuditSignal], bool]:
+        findings: list[ParsedAuditSignal] = []
+        business_year_column_index: int | None = None
+        opinion_column_index: int | None = None
+        semantic_header_found = False
+        current_period_row_found = False
+        rows = [
+            [
+                _clean_html_text(cell)
+                for cell in _AUDIT_CELL_PATTERN.findall(row_html)
+            ]
+            for row_html in _AUDIT_ROW_PATTERN.findall(table_html)
+        ]
+        canonical_rows = [
+            [_WS_PATTERN.sub('', cell) for cell in cells]
+            for cells in rows
+        ]
+        for cells, canonical_cells in zip(rows, canonical_rows):
+            if not cells:
+                continue
+            if all(
+                any(header in cell for cell in canonical_cells)
+                for header in _SEMANTIC_AUDIT_HEADERS
+            ):
+                semantic_header_found = True
+                business_year_column_index = next(
+                    index
+                    for index, cell in enumerate(canonical_cells)
+                    if '사업연도' in cell
+                )
+                opinion_column_index = next(
+                    index
+                    for index, cell in enumerate(canonical_cells)
+                    if '감사의견' in cell
+                )
+                continue
+            if (
+                business_year_column_index is None
+                or opinion_column_index is None
+            ):
+                continue
+            if (
+                business_year_column_index >= len(cells)
+                or opinion_column_index >= len(cells)
+            ):
+                continue
+            if not _CURRENT_PERIOD_PATTERN.search(
+                cells[business_year_column_index]
+            ):
+                continue
+            current_period_row_found = True
+            opinion_cell = cells[opinion_column_index]
+            matched_opinion = next(
+                (
+                    (code, label)
+                    for pattern, code, label in _SEMANTIC_AUDIT_PATTERNS
+                    if pattern.search(opinion_cell)
+                ),
+                None,
+            )
+            if matched_opinion is None:
+                continue
+            code, label = matched_opinion
+            findings.append(
+                ParsedAuditSignal(
+                    opinion_code=code,
+                    opinion_label=label,
+                    has_audit_issue=code
+                    in {'disclaimer', 'adverse', 'qualified'},
+                    source_section=source_section[:255],
+                    evidence_text=' | '.join(cell for cell in cells if cell),
+                    payload={
+                        'parser': 'semantic_audit_table_v1',
+                        'business_year_column_index': (
+                            business_year_column_index
+                        ),
+                        'opinion_cell': opinion_cell,
+                        'opinion_column_index': opinion_column_index,
+                        'row_cells': cells,
+                    },
+                )
+            )
+        if semantic_header_found:
+            if findings:
+                return findings, True
+            sentinel_parser = (
+                'semantic_audit_table_current_opinion_unrecognized_v1'
+                if current_period_row_found
+                else 'semantic_audit_table_current_period_absent_v1'
+            )
+            return [
+                self._audit_authority_sentinel(
+                    parser=sentinel_parser,
+                    source_section=source_section,
+                )
+            ], True
+
+        header_locations: dict[str, tuple[int, int]] = {}
+        for header in _SEMANTIC_AUDIT_HEADERS:
+            locations = [
+                (row_index, column_index)
+                for row_index, canonical_cells in enumerate(canonical_rows)
+                for column_index, cell in enumerate(canonical_cells)
+                if header in cell
+            ]
+            if len(locations) != 1:
+                return [], False
+            header_locations[header] = locations[0]
+        if (
+            len({row_index for row_index, _ in header_locations.values()})
+            != len(_SEMANTIC_AUDIT_HEADERS)
+            or len(
+                {
+                    column_index
+                    for _, column_index in header_locations.values()
+                }
+            )
+            != 1
+        ):
+            return [], False
+
+        business_year_row_index = header_locations['사업연도'][0]
+        current_period_column_indices = [
+            column_index
+            for column_index, cell in enumerate(rows[business_year_row_index])
+            if _CURRENT_PERIOD_PATTERN.search(cell)
+        ]
+        if not current_period_column_indices:
+            return [
+                self._audit_authority_sentinel(
+                    parser='semantic_audit_table_current_period_absent_v1',
+                    source_section=source_section,
+                )
+            ], True
+        if len(current_period_column_indices) != 1:
+            return [
+                self._audit_authority_sentinel(
+                    parser=(
+                        'semantic_audit_table_current_period_ambiguous_v1'
+                    ),
+                    source_section=source_section,
+                )
+            ], True
+        current_period_column_index = current_period_column_indices[0]
+        opinion_row_index = header_locations['감사의견'][0]
+        if current_period_column_index >= len(rows[opinion_row_index]):
+            return [
+                self._audit_authority_sentinel(
+                    parser=(
+                        'semantic_audit_table_current_opinion_unrecognized_v1'
+                    ),
+                    source_section=source_section,
+                )
+            ], True
+        opinion_cell = rows[opinion_row_index][current_period_column_index]
+        matched_opinion = next(
+            (
+                (code, label)
+                for pattern, code, label in _SEMANTIC_AUDIT_PATTERNS
+                if pattern.search(opinion_cell)
+            ),
+            None,
+        )
+        if matched_opinion is None:
+            return [
+                self._audit_authority_sentinel(
+                    parser=(
+                        'semantic_audit_table_current_opinion_unrecognized_v1'
+                    ),
+                    source_section=source_section,
+                )
+            ], True
+        code, label = matched_opinion
+        current_column_cells = [
+            cells[current_period_column_index]
+            for cells in rows
+            if current_period_column_index < len(cells)
+        ]
+        return [
+            ParsedAuditSignal(
+                opinion_code=code,
+                opinion_label=label,
+                has_audit_issue=code
+                in {'disclaimer', 'adverse', 'qualified'},
+                source_section=source_section[:255],
+                evidence_text=' | '.join(
+                    cell for cell in current_column_cells if cell
+                ),
+                payload={
+                    'parser': 'semantic_audit_table_v1',
+                    'orientation': 'period_columns',
+                    'business_year_row_index': business_year_row_index,
+                    'current_period_column_index': (
+                        current_period_column_index
+                    ),
+                    'opinion_cell': opinion_cell,
+                    'opinion_row_index': opinion_row_index,
+                    'column_cells': current_column_cells,
+                },
+            )
+        ], True
+
+    def _parse_legacy_aud_opn_table(
+        self,
+        table_html: str,
+        *,
+        source_section: str,
+    ) -> list[ParsedAuditSignal]:
+        candidates: list[
+            tuple[list[str], str, str, str, str, str]
+        ] = []
+        explicit_period_marker_found = False
+        for row_html in _AUDIT_ROW_PATTERN.findall(table_html):
+            cells = [
+                _clean_html_text(cell)
+                for cell in _AUDIT_CELL_PATTERN.findall(row_html)
+            ]
+            if not cells:
+                continue
+            row_text = ' | '.join(cell for cell in cells if cell)
+            report_label_cell = next(
+                (
+                    cell
+                    for cell in cells
+                    if '감사보고서' in cell
+                    or '연결감사보고서' in cell
+                ),
+                None,
+            )
+            if report_label_cell is None:
+                continue
+            explicit_period_marker_found = (
+                explicit_period_marker_found
+                or bool(_EXPLICIT_PERIOD_PATTERN.search(row_text))
+            )
+            opinion_cell = next(
+                (
+                    cell
+                    for cell in cells
+                    if any(
+                        pattern.search(cell)
+                        for pattern, _, _ in _AUDIT_PATTERNS
+                    )
+                ),
+                None,
+            )
+            if not opinion_cell:
+                continue
+            for pattern, code, label in _AUDIT_PATTERNS:
+                if pattern.search(opinion_cell):
+                    candidates.append(
+                        (
+                            cells,
+                            row_text,
+                            opinion_cell,
+                            code,
+                            label,
+                            report_label_cell,
                         )
-                        break
+                    )
+                    break
+
+        if explicit_period_marker_found:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if _CURRENT_PERIOD_PATTERN.search(candidate[5])
+            ]
+            if not candidates:
+                return [
+                    self._audit_authority_sentinel(
+                        parser='legacy_aud_opn_period_without_current_v1',
+                        source_section=source_section,
+                    )
+                ]
+            parser = 'legacy_aud_opn_explicit_current_v1'
+        else:
+            opinion_codes = {candidate[3] for candidate in candidates}
+            if len(opinion_codes) > 1:
+                return [
+                    self._audit_authority_sentinel(
+                        parser='legacy_aud_opn_markerless_conflict_v1',
+                        source_section=source_section,
+                    )
+                ]
+            parser = 'legacy_aud_opn_markerless_v1'
+
+        findings: list[ParsedAuditSignal] = []
+        for (
+            cells,
+            row_text,
+            opinion_cell,
+            code,
+            label,
+            _report_label_cell,
+        ) in candidates:
+            findings.append(
+                ParsedAuditSignal(
+                    opinion_code=code,
+                    opinion_label=label,
+                    has_audit_issue=code
+                    in {'disclaimer', 'adverse', 'qualified'},
+                    source_section=source_section[:255],
+                    evidence_text=row_text,
+                    payload={
+                        'parser': parser,
+                        'opinion_cell': opinion_cell,
+                        'row_cells': cells,
+                    },
+                )
+            )
         return findings
 
     def _select_conservative_audit_signal(
@@ -863,6 +1289,48 @@ class DartSignalsService:
     ) -> ParsedAuditSignal | None:
         if not findings:
             return None
+        parser_names = {
+            str((item.payload or {}).get('parser') or '')
+            for item in findings
+        }
+        if parser_names & _AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS:
+            return None
+        semantic_findings = [
+            item
+            for item in findings
+            if item.opinion_code
+            and (item.payload or {}).get('parser')
+            == 'semantic_audit_table_v1'
+        ]
+        if semantic_findings:
+            findings = semantic_findings
+        else:
+            explicit_current_findings = [
+                item
+                for item in findings
+                if item.opinion_code
+                and (item.payload or {}).get('parser')
+                == 'legacy_aud_opn_explicit_current_v1'
+            ]
+            if explicit_current_findings:
+                findings = explicit_current_findings
+            elif parser_names & _AUDIT_NEGATIVE_AUTHORITY_SENTINELS:
+                return None
+            elif parser_names & (
+                _AUDIT_AMBIGUOUS_AUTHORITY_SENTINELS
+                | _AUDIT_NEGATIVE_AUTHORITY_SENTINELS
+            ):
+                return None
+            else:
+                markerless_findings = [
+                    item for item in findings if item.opinion_code
+                ]
+                markerless_opinion_codes = {
+                    item.opinion_code for item in markerless_findings
+                }
+                if len(markerless_opinion_codes) != 1:
+                    return None
+                findings = markerless_findings
         ordered = sorted(
             findings,
             key=lambda item: (
@@ -1918,8 +2386,40 @@ class DartSignalsService:
             ),
         )
 
-    def _store_signals(self, *, event: dict[str, Any], audit_signal: ParsedAuditSignal | None, dilution_signal: dict[str, Any] | None) -> None:
+    def _store_signals(
+        self,
+        *,
+        event: dict[str, Any],
+        audit_signal: ParsedAuditSignal | None,
+        dilution_signal: dict[str, Any] | None,
+        audit_signal_evaluated: bool = False,
+    ) -> None:
         with session_scope() as session:
+            dart_signal_mutation = (
+                audit_signal is not None
+                or audit_signal_evaluated
+                or dilution_signal is not None
+            )
+            if (
+                dart_signal_mutation
+                and session.get_bind().dialect.name == 'postgresql'
+                and not _AUDIT_SIGNAL_WRITER_LOCK_OWNED.get()
+            ):
+                # All audit/dilution signal mutations flow through this
+                # transaction.  A transaction-scoped advisory lock therefore
+                # serializes ordinary capture/backfill writers with exact
+                # audit and factor repair fences.
+                session.execute(
+                    text(
+                        'SELECT pg_advisory_xact_lock('
+                        'hashtext(:audit_signal_writer_lock_key))'
+                    ),
+                    {
+                        'audit_signal_writer_lock_key': (
+                            AUDIT_SIGNAL_WRITER_LOCK_KEY
+                        )
+                    },
+                )
             if audit_signal is not None:
                 stmt = pg_insert(DartAuditSignal).values(
                     disclosure_event_id=event['id'],
@@ -1953,6 +2453,16 @@ class DartSignalsService:
                             'evidence_text': stmt.excluded.evidence_text,
                             'payload': stmt.excluded.payload,
                         },
+                    )
+                )
+            elif audit_signal_evaluated:
+                # A successfully downloaded and parsed filing that no longer
+                # yields current-period authority must revoke any signal left
+                # by an older parser. Provider errors never reach this branch,
+                # so transient upstream failures preserve last-known-good data.
+                session.execute(
+                    delete(DartAuditSignal).where(
+                        DartAuditSignal.rcept_no == event['rcept_no']
                     )
                 )
             if dilution_signal is not None:
@@ -2027,6 +2537,47 @@ def _audit_document_diagnostic_counts(document: str) -> dict[str, int]:
         'audit_report_label_row_count': audit_report_label_row_count,
         'known_opinion_token_row_count': known_opinion_token_row_count,
     }
+
+
+def _has_complete_audit_authority_evaluation(
+    diagnostics: dict[str, Any] | None,
+) -> bool:
+    """Return whether a negative parse may revoke prior audit authority.
+
+    A downloaded archive is not a completed authority evaluation merely because
+    bounded diagnostics were produced.  Every member must be decodable and at
+    least one decoded document must contain audit-opinion evidence.  Otherwise
+    the absence of a parsed signal remains retry debt and the last-known-good
+    signal must be preserved.
+    """
+
+    if not isinstance(diagnostics, dict):
+        return False
+    member_count = diagnostics.get('member_count')
+    decoded_member_count = diagnostics.get('decoded_member_count')
+    if (
+        isinstance(member_count, bool)
+        or not isinstance(member_count, int)
+        or member_count <= 0
+        or isinstance(decoded_member_count, bool)
+        or not isinstance(decoded_member_count, int)
+        or decoded_member_count != member_count
+    ):
+        return False
+    positive_count = diagnostics.get('positive_authority_evidence_count')
+    negative_count = diagnostics.get('negative_authority_evidence_count')
+    ambiguous_count = diagnostics.get('ambiguous_authority_evidence_count')
+    return (
+        isinstance(positive_count, int)
+        and not isinstance(positive_count, bool)
+        and positive_count == 0
+        and isinstance(negative_count, int)
+        and not isinstance(negative_count, bool)
+        and negative_count > 0
+        and isinstance(ambiguous_count, int)
+        and not isinstance(ambiguous_count, bool)
+        and ambiguous_count == 0
+    )
 
 
 def _decode_document_text(raw_bytes: bytes) -> str | None:

@@ -37,6 +37,7 @@ _FINANCIAL_REPORT_PREFIXES = (
     ('반기보고서', _SEMIANNUAL_REPORT),
     ('분기보고서', _QUARTERLY_REPORT),
 )
+_FINANCIAL_REPORT_EXCLUSION_MARKERS = ('제출기한연장',)
 
 _CONSECUTIVE_PROVIDER_FAILURE_LIMIT = 3
 DEFAULT_DART_DISCLOSURE_SYNC_CONCURRENCY = 1
@@ -337,13 +338,26 @@ def _normalize_report_name(report_name: str) -> str:
 
 def classify_filing(report_name: str) -> dict[str, Any]:
     normalized = _normalize_report_name(report_name)
+    if any(
+        marker in normalized
+        for marker in _FINANCIAL_REPORT_EXCLUSION_MARKERS
+    ):
+        return {
+            'filing_category': _OTHER_REPORT,
+            'is_financial_report': False,
+            'normalized_report_name': normalized,
+        }
     for prefix, category in _FINANCIAL_REPORT_PREFIXES:
-        if normalized.startswith(prefix):
-            return {
-                'filing_category': category,
-                'is_financial_report': True,
-                'normalized_report_name': normalized,
-            }
+        if not normalized.startswith(prefix):
+            continue
+        suffix = normalized[len(prefix) :]
+        if suffix and not suffix.startswith(('(', '（')):
+            continue
+        return {
+            'filing_category': category,
+            'is_financial_report': True,
+            'normalized_report_name': normalized,
+        }
     return {
         'filing_category': _OTHER_REPORT,
         'is_financial_report': False,

@@ -44,7 +44,9 @@ from app.eod.scope_outcomes import (
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.market.clock import get_market_state
 from app.market.session import previous_krx_trading_date
-from app.market_data_store import build_daily_derived_market_scope_authority
+from app.market_data_store import (
+    build_daily_derived_market_scope_authority,
+)
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
@@ -783,9 +785,19 @@ def _build_pykrx_enrichment_symbol_scope_outcome(
             continue
 
         raw_expected = payload.get('expected_scope_keys')
-        raw_complete = payload.get('complete_scope_keys')
+        # Exact retry debt follows the same decision-usable contract as the
+        # required-category gate.  Full component completeness remains
+        # operator-visible, but an unavailable optional short-balance
+        # component must not deadlock otherwise usable short-volume evidence.
+        # Persisted legacy snapshots predate the decision-usable manifest and
+        # may safely fall back to their stricter complete manifest.
+        raw_decision_usable = (
+            payload.get('decision_usable_scope_keys')
+            if 'decision_usable_scope_keys' in payload
+            else payload.get('complete_scope_keys')
+        )
         if not isinstance(raw_expected, list) or not isinstance(
-            raw_complete, list
+            raw_decision_usable, list
         ):
             for symbol in selected:
                 retry_reasons[symbol].append(
@@ -798,20 +810,20 @@ def _build_pykrx_enrichment_symbol_scope_outcome(
             for value in raw_expected
             if str(value).strip()
         }
-        complete = {
+        decision_usable = {
             str(value).strip()
-            for value in raw_complete
+            for value in raw_decision_usable
             if str(value).strip()
         }
-        if len(expected) != len(raw_expected) or len(complete) != len(
-            raw_complete
+        if len(expected) != len(raw_expected) or len(decision_usable) != len(
+            raw_decision_usable
         ):
             for symbol in selected:
                 retry_reasons[symbol].append(
                     f'{category}:malformed_exact_scope_identity'
                 )
             continue
-        if not complete <= expected:
+        if not decision_usable <= expected:
             for symbol in selected:
                 retry_reasons[symbol].append(
                     f'{category}:non_exhaustive_exact_scope_identity'
@@ -820,9 +832,9 @@ def _build_pykrx_enrichment_symbol_scope_outcome(
 
         # A category may legitimately exclude a symbol from its exact expected
         # universe (for example, a zero-volume investor-flow scope).  Once a
-        # symbol is expected, complete coverage is mandatory.
+        # symbol is expected, decision-usable coverage is mandatory.
         for symbol in selected_set & expected:
-            if symbol not in complete:
+            if symbol not in decision_usable:
                 retry_reasons[symbol].append(
                     f'{category}:incomplete_required_coverage'
                 )
@@ -876,6 +888,7 @@ def _resolve_result_status(
         'symbols_failed',
         'events_failed',
         'results_failed',
+        'contexts_failed',
         'features_failed',
         'snapshots_failed',
         'action_summaries_failed',
@@ -965,11 +978,11 @@ def _extract_raw_result_counts(
             if 'collected_symbol_count' in summary
             else summary.get('matched_symbol_count')
         )
-        succeeded = _int(
-            summary.get('recent_news_symbol_count')
-            if 'recent_news_symbol_count' in summary
-            else collected
-        )
+        # Stale/no-result provider responses are successful collection work.
+        # Keep freshness coverage in the summary, but do not turn it into a
+        # terminal progress counter or processed will no longer reconcile to
+        # succeeded + failed.
+        succeeded = collected
         failed = _int(summary.get('failed_symbol_count')) + _int(
             summary.get('skipped_symbol_count')
         )
@@ -1001,6 +1014,32 @@ def _extract_raw_result_counts(
         }
 
     if stage_id == 'signal_features':
+        selected_scope = result.get('selected_stock_codes')
+        if isinstance(selected_scope, list):
+            scope_status = str(result.get('status') or '').strip().lower()
+            if scope_status not in {'completed', 'partial'}:
+                scope_status = (
+                    'partial'
+                    if result.get('retry_debt_stock_codes')
+                    else 'completed'
+                )
+            partition = _validated_exact_scope_outcome(
+                result=result,
+                invocation_symbols=selected_scope,
+                status=scope_status,
+            )
+            if partition is not None:
+                succeeded = len(partition['successful_stock_codes']) + len(
+                    partition['terminal_not_applicable_stock_codes']
+                )
+                failed = len(partition['retry_debt_stock_codes'])
+                total = len(partition['selected_stock_codes'])
+                return {
+                    'processed': succeeded + failed,
+                    'total': total,
+                    'succeeded': succeeded,
+                    'failed': failed,
+                }
         succeeded = _int(result.get('features_persisted'))
         failed = _int(result.get('features_failed'))
         processed = succeeded + failed
@@ -1628,6 +1667,12 @@ def _run_daily_piotroski_filter_followup(
             market_date=market_date,
             symbols=normalized_admitted_symbols,
             ranking_symbols=normalized_symbols,
+            exact_scope_symbols=normalized_symbols,
+            authoritative_market_scope=(
+                authoritative_market_scope
+                if set(normalized_admitted_symbols) == set(normalized_symbols)
+                else None
+            ),
         )
     except Exception:
         _finalize_daily_stage_scope(
@@ -1642,17 +1687,13 @@ def _run_daily_piotroski_filter_followup(
             ),
         )
         raise
-    result['scope_finalization'] = _finalize_daily_stage_scope(
-        market_date=market_date,
-        stage_id='piotroski_filter',
-        exact_symbols=normalized_symbols,
-        result=result,
-        authoritative_market_scope=(
-            authoritative_market_scope
-            if set(normalized_admitted_symbols) == set(normalized_symbols)
-            else None
-        ),
-    )
+    if not (
+        isinstance(result.get('scope_finalization'), Mapping)
+        and result['scope_finalization'].get('ready') is True
+    ):
+        raise RuntimeError(
+            'Piotroski atomic exact-scope finalization proof is unavailable.'
+        )
     return result
 
 
@@ -1682,7 +1723,12 @@ def _successful_symbols_from_stage_result(
                 and str(item.get('symbol') or '').strip()
             )
         )
-        persisted_count = int(result.get('results_persisted') or 0)
+        persisted_count_key = {
+            'price_contexts': 'contexts_persisted',
+            'technical_snapshots': 'snapshots_persisted',
+            'action_summaries': 'action_summaries_persisted',
+        }.get(stage_id, 'results_persisted')
+        persisted_count = int(result.get(persisted_count_key) or 0)
         if len(item_symbols) == persisted_count:
             successful = item_symbols
         else:
@@ -1708,11 +1754,17 @@ def _successful_symbols_from_stage_result(
             'stage reported success outside exact membership: '
             f'stage={stage_id}, preview={outside[:20]}'
         )
-    if len(successful) != int(result.get('results_persisted') or 0):
+    persisted_count_key = {
+        'price_contexts': 'contexts_persisted',
+        'technical_snapshots': 'snapshots_persisted',
+        'action_summaries': 'action_summaries_persisted',
+    }.get(stage_id, 'results_persisted')
+    persisted_count = int(result.get(persisted_count_key) or 0)
+    if len(successful) != persisted_count:
         raise RuntimeError(
             'stage success evidence does not match persisted count: '
             f'stage={stage_id}, successful={len(successful)}, '
-            f"persisted={int(result.get('results_persisted') or 0)}"
+            f'persisted={persisted_count}'
         )
     return sorted(successful)
 
@@ -1851,6 +1903,12 @@ def _run_daily_factor_followup(
             'market_date': market_date,
             'symbols': list(stage_symbols),
             'ranking_symbols': normalized_symbols,
+            'exact_scope_symbols': normalized_symbols,
+            'authoritative_market_scope': (
+                authoritative_market_scope
+                if set(stage_symbols) == set(normalized_symbols)
+                else None
+            ),
         }
         if stage_id == 'momentum_factors':
             return lambda: daily_momentum_factor_service.rebuild_for_market_date(
@@ -1917,18 +1975,14 @@ def _run_daily_factor_followup(
                     'status': 'interrupted',
                     'stages': stages,
                 }
-            result['scope_finalization'] = _finalize_daily_stage_scope(
-                market_date=market_date,
-                stage_id=stage_id,
-                exact_symbols=normalized_symbols,
-                result=result,
-                authoritative_market_scope=(
-                    authoritative_market_scope
-                    if set(stage_invocation_symbols)
-                    == set(normalized_symbols)
-                    else None
-                ),
-            )
+            if not (
+                isinstance(result.get('scope_finalization'), Mapping)
+                and result['scope_finalization'].get('ready') is True
+            ):
+                raise RuntimeError(
+                    f'{stage_id} atomic exact-scope finalization proof '
+                    'is unavailable'
+                )
             scope_finalized = True
             stage_status = _resolve_result_status(
                 result,
@@ -3536,14 +3590,20 @@ def run_market_data_pipeline(
     )
     price_context_result: dict
     price_context_error_message: str | None = None
-    if price_context_symbols:
+    current_context_successes: list[str] = []
+    context_scope_is_exact = False
+    if requested_symbol_codes:
         try:
             price_context_result = dependencies.price_context_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
                 symbols=price_context_symbols,
+                exact_scope_symbols=requested_symbol_codes,
                 source='pykrx',
                 run_id=run_id,
                 include_retry_metadata=True,
+                authoritative_market_scope=(
+                    daily_derived_market_scope_authority
+                ),
             )
             if failed_symbols:
                 price_context_result.update(causal_price_skip)
@@ -3576,6 +3636,40 @@ def run_market_data_pipeline(
             'contexts_failed': 0,
             **causal_price_skip,
         }
+
+    if requested_symbol_codes:
+        context_partition = _validated_exact_scope_outcome(
+            result=price_context_result,
+            invocation_symbols=requested_symbol_codes,
+            status=_resolve_result_status(
+                price_context_result,
+                stage_id='technical_snapshots',
+            ),
+        )
+        context_finalization = price_context_result.get(
+            'scope_finalization'
+        )
+        context_scope_is_exact = bool(
+            context_partition is not None
+            and context_partition['manifest_version']
+            == 'price_contexts_scope_outcomes_v1'
+            and isinstance(context_finalization, Mapping)
+            and context_finalization.get('ready') is True
+        )
+        current_context_successes = (
+            context_partition['successful_stock_codes']
+            if context_scope_is_exact
+            else []
+        )
+        if (
+            not context_scope_is_exact
+            and price_context_error_message is None
+        ):
+            price_context_error_message = (
+                'Price context persistence did not return an exact '
+                'atomically finalized scope; dependent derived stages '
+                'were blocked.'
+            )
 
     pykrx_enrichment_result: dict
     pykrx_enrichment_error_message: str | None = None
@@ -3714,6 +3808,9 @@ def run_market_data_pipeline(
                     'downstream_preflight_status': preflight.get('status'),
                     'downstream_allowed': bool(preflight.get('allowed')),
                     'zero_coverage_categories': preflight.get('zero_coverage_categories'),
+                    'zero_decision_usable_categories': preflight.get(
+                        'zero_decision_usable_categories'
+                    ),
                 },
             )
             dependencies.log_fetch(
@@ -3776,11 +3873,15 @@ def run_market_data_pipeline(
 
     technical_snapshot_result: dict
     snapshot_error_message: str | None = None
-    if 'technical_snapshots' in requested_stage_set and price_context_symbols:
+    if (
+        'technical_snapshots' in requested_stage_set
+        and context_scope_is_exact
+    ):
         try:
             technical_snapshot_result = dependencies.technical_snapshot_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
-                symbols=price_context_symbols,
+                symbols=current_context_successes,
+                exact_scope_symbols=requested_symbol_codes,
                 source='pykrx',
                 run_id=run_id,
                 progress_callback=make_stage_progress_callback(
@@ -3791,6 +3892,9 @@ def run_market_data_pipeline(
                     include_current_symbol=True,
                 ),
                 include_retry_metadata=True,
+                authoritative_market_scope=(
+                    daily_derived_market_scope_authority
+                ),
             )
             if failed_symbols:
                 technical_snapshot_result.update(causal_price_skip)
@@ -3806,7 +3910,7 @@ def run_market_data_pipeline(
                 if technical_status == 'completed'
                 else 'Daily technical snapshots completed with errors',
                 processed=technical_total,
-                total=len(price_context_symbols),
+                total=len(requested_symbol_codes),
                 succeeded=technical_succeeded,
                 failed=technical_failed,
                 extra={
@@ -3820,15 +3924,15 @@ def run_market_data_pipeline(
                 source='pykrx',
                 error=exc,
                 totals={
-                    'requested_symbols': len(price_context_symbols),
+                    'requested_symbols': len(requested_symbol_codes),
                     'snapshots_persisted': 0,
-                    'snapshots_failed': len(price_context_symbols),
+                    'snapshots_failed': len(requested_symbol_codes),
                 },
-                failed_symbols=price_context_symbols,
+                failed_symbols=requested_symbol_codes,
                 items_key='items',
             )
             technical_snapshot_result['_retry_metadata'] = {
-                'failed_symbols': list(price_context_symbols),
+                'failed_symbols': list(requested_symbol_codes),
             }
             snapshot_error_message = f'Technical snapshot persistence failed: {exc}'
             persist_stage_progress(
@@ -3837,23 +3941,27 @@ def run_market_data_pipeline(
                 current_step='technical_snapshots_failed',
                 current_activity='Daily technical snapshot persistence failed',
                 processed=0,
-                total=len(price_context_symbols),
+                total=len(requested_symbol_codes),
                 succeeded=0,
-                failed=len(price_context_symbols),
+                failed=len(requested_symbol_codes),
                 extra=causal_price_skip,
             )
     elif 'technical_snapshots' in requested_stage_set:
         technical_snapshot_result = {
             'skipped': True,
-            'status': 'skipped',
-            'reason': 'no_fresh_price_rows',
+            'status': 'blocked',
+            'reason': 'price_context_exact_scope_unavailable',
             'market_date': latest_trade_date,
             'source': 'pykrx',
-            'requested_symbols': 0,
+            'requested_symbols': len(requested_symbol_codes),
             'snapshots_persisted': 0,
-            'snapshots_failed': 0,
+            'snapshots_failed': len(requested_symbol_codes),
             **causal_price_skip,
         }
+        snapshot_error_message = (
+            'Technical snapshot persistence blocked: price context exact '
+            'scope unavailable.'
+        )
         persist_stage_progress(
             stage='technical_snapshots',
             status='skipped',
@@ -3874,82 +3982,51 @@ def run_market_data_pipeline(
         }
 
     technical_successful_symbols: list[str] = []
+    technical_retry_symbols: list[str] = list(requested_symbol_codes)
     technical_scope_is_exact = False
     if 'technical_snapshots' in requested_stage_set:
-        _clear_exact_scope_outcome(technical_snapshot_result)
-        context_retry_symbols = _peek_retry_failed_symbols(
-            price_context_result
+        technical_partition = _validated_exact_scope_outcome(
+            result=technical_snapshot_result,
+            invocation_symbols=requested_symbol_codes,
+            status=_resolve_result_status(
+                technical_snapshot_result,
+                stage_id='technical_snapshots',
+            ),
         )
-        snapshot_retry_symbols = _peek_retry_failed_symbols(
-            technical_snapshot_result
+        technical_finalization = technical_snapshot_result.get(
+            'scope_finalization'
         )
-        context_failed_count = int(
-            price_context_result.get('contexts_failed') or 0
-        )
-        snapshot_failed_count = int(
-            technical_snapshot_result.get('snapshots_failed') or 0
-        )
-        selected_technical_symbol_set = set(price_context_symbols)
-        technical_scope_is_exact = (
-            len(context_retry_symbols) == context_failed_count
-            and len(snapshot_retry_symbols) == snapshot_failed_count
-            and set(context_retry_symbols).issubset(
-                selected_technical_symbol_set
-            )
-            and set(snapshot_retry_symbols).issubset(
-                selected_technical_symbol_set
-            )
-            and int(
-                price_context_result.get('contexts_persisted') or 0
-            )
-            + context_failed_count
-            == len(price_context_symbols)
-            and int(
-                technical_snapshot_result.get('snapshots_persisted') or 0
-            )
-            + snapshot_failed_count
-            == len(price_context_symbols)
+        technical_scope_is_exact = bool(
+            technical_partition is not None
+            and technical_partition['manifest_version']
+            == 'technical_snapshots_scope_outcomes_v1'
+            and isinstance(technical_finalization, Mapping)
+            and technical_finalization.get('ready') is True
         )
         if technical_scope_is_exact:
-            technical_retry_set = {
-                *context_retry_symbols,
-                *snapshot_retry_symbols,
-            }
-            technical_retry_symbols = [
-                symbol
-                for symbol in price_context_symbols
-                if symbol in technical_retry_set
-            ]
-            technical_successful_symbols = [
-                symbol
-                for symbol in price_context_symbols
-                if symbol not in technical_retry_set
-            ]
-            technical_snapshot_result.update(
-                _build_exact_scope_outcome(
-                    manifest_version=(
-                        'technical_snapshots_scope_outcomes_v1'
-                    ),
-                    selected_symbols=price_context_symbols,
-                    successful_symbols=technical_successful_symbols,
-                    retry_debt_symbols=technical_retry_symbols,
-                )
+            technical_successful_symbols = list(
+                technical_partition['successful_stock_codes']
             )
-            if technical_retry_symbols and not technical_snapshot_result.get(
-                'skipped'
-            ):
-                technical_snapshot_result['status'] = 'partial'
+            technical_retry_symbols = list(
+                technical_partition['retry_debt_stock_codes']
+            )
+        elif snapshot_error_message is None:
+            snapshot_error_message = (
+                'Technical snapshot persistence did not return an exact '
+                'atomically finalized scope.'
+            )
 
     action_summary_result: dict
     action_summary_error_message: str | None = None
     if (
         'action_summaries' in requested_stage_set
-        and technical_successful_symbols
+        and technical_scope_is_exact
     ):
         try:
             action_summary_result = dependencies.action_summary_service.rebuild_for_market_date(
                 market_date=latest_trade_date,
                 symbols=technical_successful_symbols,
+                exact_scope_symbols=requested_symbol_codes,
                 source='pykrx',
                 run_id=run_id,
                 progress_callback=make_stage_progress_callback(
@@ -3960,6 +4037,9 @@ def run_market_data_pipeline(
                     include_current_symbol=True,
                 ),
                 include_retry_metadata=True,
+                authoritative_market_scope=(
+                    daily_derived_market_scope_authority
+                ),
             )
             if failed_symbols:
                 action_summary_result.update(causal_price_skip)
@@ -3975,7 +4055,7 @@ def run_market_data_pipeline(
                 if action_status == 'completed'
                 else 'Daily action summaries completed with errors',
                 processed=action_total,
-                total=len(technical_successful_symbols),
+                total=len(requested_symbol_codes),
                 succeeded=action_succeeded,
                 failed=action_failed,
                 extra={
@@ -3989,19 +4069,15 @@ def run_market_data_pipeline(
                 source='pykrx',
                 error=exc,
                 totals={
-                    'requested_symbols': len(
-                        technical_successful_symbols
-                    ),
+                    'requested_symbols': len(requested_symbol_codes),
                     'action_summaries_persisted': 0,
-                    'action_summaries_failed': len(
-                        technical_successful_symbols
-                    ),
+                    'action_summaries_failed': len(requested_symbol_codes),
                 },
-                failed_symbols=technical_successful_symbols,
+                failed_symbols=requested_symbol_codes,
                 items_key='items',
             )
             action_summary_result['_retry_metadata'] = {
-                'failed_symbols': list(technical_successful_symbols),
+                'failed_symbols': list(requested_symbol_codes),
             }
             action_summary_error_message = f'Action summary persistence failed: {exc}'
             persist_stage_progress(
@@ -4010,9 +4086,9 @@ def run_market_data_pipeline(
                 current_step='action_summaries_failed',
                 current_activity='Daily action summary persistence failed',
                 processed=0,
-                total=len(technical_successful_symbols),
+                total=len(requested_symbol_codes),
                 succeeded=0,
-                failed=len(technical_successful_symbols),
+                failed=len(requested_symbol_codes),
                 extra=causal_price_skip,
             )
     elif 'action_summaries' in requested_stage_set:
@@ -4054,55 +4130,30 @@ def run_market_data_pipeline(
             'source': 'pykrx',
         }
 
-    if (
-        'action_summaries' in requested_stage_set
-        and technical_successful_symbols
-    ):
-        _clear_exact_scope_outcome(action_summary_result)
-        action_retry_symbols = _peek_retry_failed_symbols(
-            action_summary_result
+    if 'action_summaries' in requested_stage_set:
+        action_partition = _validated_exact_scope_outcome(
+            result=action_summary_result,
+            invocation_symbols=requested_symbol_codes,
+            status=_resolve_result_status(
+                action_summary_result,
+                stage_id='action_summaries',
+            ),
         )
-        action_failed_count = int(
-            action_summary_result.get('action_summaries_failed') or 0
+        action_finalization = action_summary_result.get(
+            'scope_finalization'
         )
-        if (
-            len(action_retry_symbols) == action_failed_count
-            and set(action_retry_symbols).issubset(
-                technical_successful_symbols
+        action_scope_is_exact = bool(
+            action_partition is not None
+            and action_partition['manifest_version']
+            == 'action_summaries_scope_outcomes_v1'
+            and isinstance(action_finalization, Mapping)
+            and action_finalization.get('ready') is True
+        )
+        if not action_scope_is_exact and action_summary_error_message is None:
+            action_summary_error_message = (
+                'Action summary persistence did not return an exact '
+                'atomically finalized scope.'
             )
-            and int(
-                action_summary_result.get(
-                    'action_summaries_persisted'
-                )
-                or 0
-            )
-            + action_failed_count
-            == len(technical_successful_symbols)
-        ):
-            action_retry_set = set(action_retry_symbols)
-            action_successful_symbols = [
-                symbol
-                for symbol in technical_successful_symbols
-                if symbol not in action_retry_set
-            ]
-            action_summary_result.update(
-                _build_exact_scope_outcome(
-                    manifest_version=(
-                        'action_summaries_scope_outcomes_v1'
-                    ),
-                    selected_symbols=technical_successful_symbols,
-                    successful_symbols=action_successful_symbols,
-                    retry_debt_symbols=[
-                        symbol
-                        for symbol in technical_successful_symbols
-                        if symbol in action_retry_set
-                    ],
-                )
-            )
-            if action_retry_symbols and not action_summary_result.get(
-                'skipped'
-            ):
-                action_summary_result['status'] = 'partial'
 
     trending_rank_result: dict
     trending_rank_error_message: str | None = None
@@ -4127,6 +4178,20 @@ def run_market_data_pipeline(
                     'Trending rank rebuild requires complete fresh price '
                     'collection. Per-symbol downstream stages may continue, '
                     'but global ranks are preserved until recovery completes.'
+                )
+            if not technical_scope_is_exact:
+                raise RuntimeError(
+                    'Trending rank rebuild requires an exact atomically '
+                    'finalized technical snapshot scope. Existing global '
+                    'ranks are preserved when technical persistence '
+                    'authority is unavailable.'
+                )
+            if technical_retry_symbols:
+                raise RuntimeError(
+                    'Trending rank rebuild requires complete technical '
+                    'snapshot persistence for 5d/20d ranks. Existing global '
+                    'ranks are preserved while technical retry debt remains: '
+                    + ','.join(technical_retry_symbols[:20])
                 )
             trending_rank_result = dependencies.compute_trending_ranks(
                 market_date=latest_trade_date,
@@ -4266,14 +4331,17 @@ def run_market_data_pipeline(
                     **signal_refresh_kwargs,
                 )
             )
-            signal_total = int(signal_feature_result.get('features_persisted', 0)) + int(
-                signal_feature_result.get('features_failed', 0)
+            signal_counts = _extract_raw_result_counts(
+                signal_feature_result,
+                default_total=len(exact_piotroski_membership_symbols or ()),
+                stage_id='signal_features',
             )
+            signal_total = signal_counts['total']
             signal_source_errors = signal_feature_result.get('source_errors') or {}
             signal_incomplete_sources = list(
                 signal_feature_result.get('incomplete_sources') or []
             )
-            signal_failed = int(signal_feature_result.get('features_failed') or 0)
+            signal_failed = signal_counts['failed']
             signal_status = _completion_status_for_gap(failed=signal_failed, total=signal_total)
             if signal_source_errors or signal_incomplete_sources:
                 signal_status = 'partial'
@@ -4299,10 +4367,10 @@ def run_market_data_pipeline(
                 status=signal_status,
                 current_step='signal_features_completed',
                 current_activity='Daily KIS signal features collected',
-                processed=signal_total,
+                processed=signal_counts['processed'],
                 total=signal_total,
-                succeeded=signal_feature_result.get('features_persisted'),
-                failed=signal_feature_result.get('features_failed'),
+                succeeded=signal_counts['succeeded'],
+                failed=signal_failed,
                 extra={
                     'sources': signal_feature_result.get('sources'),
                     'source_counts': signal_feature_result.get('source_counts'),
@@ -4398,6 +4466,15 @@ def run_market_data_pipeline(
                     symbols=price_context_symbols,
                     source=MARKET_RISK_FILTER_SOURCE,
                     run_id=run_id,
+                    exact_scope_symbols=(
+                        exact_piotroski_membership_symbols
+                    ),
+                    authoritative_market_scope=(
+                        daily_derived_market_scope_authority
+                        if set(price_context_symbols)
+                        == set(exact_piotroski_membership_symbols or [])
+                        else None
+                    ),
                 )
             )
             if not exact_piotroski_membership_symbols:
@@ -4405,20 +4482,20 @@ def run_market_data_pipeline(
                     'Market-risk filter requires validated exact EOD '
                     'membership proof.'
                 )
-            market_risk_filter_result['scope_finalization'] = (
-                _finalize_daily_stage_scope(
-                    market_date=latest_trade_date,
-                    stage_id='market_risk_filter',
-                    exact_symbols=exact_piotroski_membership_symbols,
-                    result=market_risk_filter_result,
-                    authoritative_market_scope=(
-                        daily_derived_market_scope_authority
-                        if set(price_context_symbols)
-                        == set(exact_piotroski_membership_symbols)
-                        else None
-                    ),
+            if not (
+                isinstance(
+                    market_risk_filter_result.get('scope_finalization'),
+                    Mapping,
                 )
-            )
+                and market_risk_filter_result['scope_finalization'].get(
+                    'ready'
+                )
+                is True
+            ):
+                raise RuntimeError(
+                    'market_risk_filter atomic exact-scope finalization '
+                    'proof is unavailable'
+                )
             market_risk_scope_finalized = True
             _clear_exact_scope_outcome(market_risk_filter_result)
             market_risk_total = len(price_context_symbols)

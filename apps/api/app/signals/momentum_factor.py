@@ -5,14 +5,19 @@ import math
 from dataclasses import dataclass
 from datetime import date
 from statistics import stdev
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_momentum_factor_results,
     load_recent_price_bars_by_symbol,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_momentum_factor_result,
     upsert_daily_momentum_factor_results,
+)
+from app.repositories.eod_run_repository import (
+    daily_price_bar_writer_admission,
+    daily_price_bar_writer_admission_lock,
 )
 from app.signals.factor_coverage import (
     build_factor_coverage_contract,
@@ -712,6 +717,31 @@ class DailyMomentumFactorService:
         universe_symbols: Sequence[str] | None = None,
         persist: bool = False,
     ) -> dict[str, Any]:
+        if persist:
+            with daily_price_bar_writer_admission_lock(
+                market_date=market_date,
+            ):
+                return self._evaluate_symbol(
+                    symbol=symbol,
+                    market_date=market_date,
+                    universe_symbols=universe_symbols,
+                    persist=True,
+                )
+        return self._evaluate_symbol(
+            symbol=symbol,
+            market_date=market_date,
+            universe_symbols=universe_symbols,
+            persist=False,
+        )
+
+    def _evaluate_symbol(
+        self,
+        *,
+        symbol: str,
+        market_date: str | date,
+        universe_symbols: Sequence[str] | None,
+        persist: bool,
+    ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbol = _normalize_symbol(symbol)
         selected_symbols = _normalize_symbols(universe_symbols)
@@ -748,12 +778,15 @@ class DailyMomentumFactorService:
             upsert_daily_momentum_factor_result(row)
         return enrich_momentum_audit_fields(row)
 
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         requested_symbols = _normalize_symbols(symbols)
@@ -802,7 +835,7 @@ class DailyMomentumFactorService:
                 if explicit_empty_scope
                 else factor_stage_result_contract(summary)
             )
-            return {
+            result = {
                 **stage_contract,
                 'market_date': normalized_market_date,
                 'source': MOMENTUM_FACTOR_SOURCE,
@@ -827,6 +860,19 @@ class DailyMomentumFactorService:
                 'summary': summary,
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='momentum_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         price_histories = load_recent_price_bars_by_symbol(
             market_date=normalized_market_date,
@@ -854,16 +900,33 @@ class DailyMomentumFactorService:
 
         persisted_items: list[dict[str, Any]] = []
         write_failed_symbols: list[str] = []
-        try:
-            upsert_daily_momentum_factor_results(rows)
-            persisted_items = list(rows)
-        except Exception:
-            for row in rows:
-                try:
-                    upsert_daily_momentum_factor_result(row)
-                    persisted_items.append(row)
-                except Exception:
-                    write_failed_symbols.append(row['symbol'])
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='momentum_factors',
+                results=rows,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            successful_symbol_set = set(publication['successful_symbols'])
+            persisted_items = [
+                row for row in rows
+                if row['symbol'] in successful_symbol_set
+            ]
+            write_failed_symbols = list(publication['failed_symbols'])
+            scope_finalization = publication['scope_finalization']
+        else:
+            try:
+                upsert_daily_momentum_factor_results(rows)
+                persisted_items = list(rows)
+            except Exception:
+                for row in rows:
+                    try:
+                        upsert_daily_momentum_factor_result(row)
+                        persisted_items.append(row)
+                    except Exception:
+                        write_failed_symbols.append(row['symbol'])
 
         combined_failed_symbols = list(dict.fromkeys([*failed_symbols, *write_failed_symbols]))
         persisted_ready_count = sum(
@@ -875,7 +938,7 @@ class DailyMomentumFactorService:
             missing_symbols=failed_symbols,
             failed_symbols=write_failed_symbols,
         )
-        return {
+        result = {
             **factor_stage_result_contract(summary),
             'market_date': normalized_market_date,
             'source': MOMENTUM_FACTOR_SOURCE,
@@ -905,6 +968,9 @@ class DailyMomentumFactorService:
             'summary': summary,
             'items': [enrich_momentum_audit_fields(item) for item in persisted_items],
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,

@@ -8,8 +8,8 @@ from app.eod.daily_pipeline_outcomes import (
     GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO,
     daily_pipeline_result_has_no_ready_content,
 )
-from app.eod.pykrx_enrichment_coverage_policy import (
-    required_category_minimum_coverage_ratio,
+from app.eod.pykrx_enrichment_gate import (
+    build_pykrx_enrichment_category_gate_item,
 )
 
 FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
@@ -71,6 +71,14 @@ class AgentFeedbackPrerequisiteService:
             return 'blocked'
         if status in {'pending', 'running', 'waiting'}:
             return 'waiting'
+        if (
+            status == 'completed'
+            and AgentFeedbackPrerequisiteService
+            ._has_explicit_zero_success_or_persistence(stage_payload)
+            and not AgentFeedbackPrerequisiteService
+            ._is_explicitly_not_applicable_pykrx_scope(stage_payload)
+        ):
+            return 'blocked'
         explicit_gate_status = str(
             stage_payload.get('gate_status') or details.get('gate_status') or ''
         ).strip().lower()
@@ -110,18 +118,17 @@ class AgentFeedbackPrerequisiteService:
         if isinstance(failed_blocking_stages, list) and failed_blocking_stages:
             return False
 
-        total = AgentFeedbackPrerequisiteService._coerce_positive_int(
+        total = AgentFeedbackPrerequisiteService._coerce_max_positive_int(
             stage_payload.get('total'),
             details.get('expected_rows'),
             details.get('requested_symbol_count'),
         )
-        succeeded = AgentFeedbackPrerequisiteService._coerce_positive_int(
+        succeeded = AgentFeedbackPrerequisiteService._coerce_min_non_negative_int(
             stage_payload.get('succeeded'),
-            stage_payload.get('processed'),
             details.get('rows_persisted'),
             details.get('stored_rows_present'),
         )
-        if total <= 0 or succeeded <= 0:
+        if total <= 0 or succeeded is None or succeeded <= 0:
             return False
         coverage_ratio = min(succeeded, total) / total
         if coverage_ratio < GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO:
@@ -144,16 +151,19 @@ class AgentFeedbackPrerequisiteService:
     @staticmethod
     def _has_complete_persisted_stage_coverage(stage_payload: dict[str, Any]) -> bool:
         details = stage_payload.get('details') if isinstance(stage_payload.get('details'), dict) else {}
-        expected_rows = AgentFeedbackPrerequisiteService._coerce_positive_int(
+        expected_rows = AgentFeedbackPrerequisiteService._coerce_max_positive_int(
             details.get('expected_rows'),
             stage_payload.get('total'),
         )
-        rows_persisted = AgentFeedbackPrerequisiteService._coerce_positive_int(
+        rows_persisted = AgentFeedbackPrerequisiteService._coerce_min_non_negative_int(
             details.get('rows_persisted'),
             stage_payload.get('succeeded'),
-            stage_payload.get('processed'),
         )
-        return expected_rows > 0 and rows_persisted >= expected_rows
+        return bool(
+            expected_rows > 0
+            and rows_persisted is not None
+            and rows_persisted >= expected_rows
+        )
 
     @staticmethod
     def _is_nonblocking_fundamentals_partial(stage_payload: dict[str, Any]) -> bool:
@@ -187,6 +197,85 @@ class AgentFeedbackPrerequisiteService:
         return 0
 
     @staticmethod
+    def _coerce_max_positive_int(*values: Any) -> int:
+        parsed_values: list[int] = []
+        for value in values:
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                parsed_values.append(parsed)
+        return max(parsed_values, default=0)
+
+    @staticmethod
+    def _has_explicit_zero_success_or_persistence(
+        stage_payload: dict[str, Any],
+    ) -> bool:
+        details = (
+            stage_payload.get('details')
+            if isinstance(stage_payload.get('details'), dict)
+            else {}
+        )
+        for payload, key in (
+            (stage_payload, 'succeeded'),
+            (details, 'rows_persisted'),
+        ):
+            if key not in payload or payload.get(key) is None:
+                continue
+            try:
+                if int(payload[key]) == 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    @staticmethod
+    def _is_explicitly_not_applicable_pykrx_scope(
+        stage_payload: dict[str, Any],
+    ) -> bool:
+        if (
+            str(stage_payload.get('task') or '')
+            != PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID
+        ):
+            return False
+        details = (
+            stage_payload.get('details')
+            if isinstance(stage_payload.get('details'), dict)
+            else {}
+        )
+        category_gates = details.get('decider_category_gates')
+        return bool(
+            str(
+                details.get('decider_category_gate_status') or ''
+            ).strip().lower()
+            == 'ready'
+            and isinstance(category_gates, list)
+            and category_gates
+            and all(
+                isinstance(item, dict)
+                and item.get('gate_status') == 'not_applicable'
+                for item in category_gates
+            )
+        )
+
+    @staticmethod
+    def _coerce_min_non_negative_int(*values: Any) -> int | None:
+        """Keep the most conservative explicit success/persistence count."""
+
+        parsed_values: list[int] = []
+        for value in values:
+            if value is None:
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                parsed_values.append(parsed)
+        return min(parsed_values) if parsed_values else None
+
+    @staticmethod
     def _coerce_optional_int(value: Any) -> int | None:
         if value is None:
             return None
@@ -196,27 +285,20 @@ class AgentFeedbackPrerequisiteService:
             return None
 
     @staticmethod
-    def _coerce_optional_float(value: Any) -> float | None:
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
     def _has_pykrx_provider_error(payload: dict[str, Any]) -> bool:
         errors = payload.get('errors')
         if not isinstance(errors, list):
             return False
         for item in errors:
-            message = ''
-            if isinstance(item, dict):
-                message = str(item.get('error') or '')
-            else:
-                message = str(item or '')
-            normalized = message.lower()
-            if 'pykrx stock client is unavailable' in normalized or 'expecting value' in normalized:
+            message = (
+                str(item.get('error') or '')
+                if isinstance(item, dict)
+                else str(item or '')
+            ).lower()
+            if (
+                'pykrx stock client is unavailable' in message
+                or 'expecting value' in message
+            ):
                 return True
         return False
 
@@ -229,66 +311,51 @@ class AgentFeedbackPrerequisiteService:
         missing_category_payload: bool,
         provider_degraded: bool = False,
     ) -> dict[str, Any]:
-        expected_rows = cls._coerce_optional_int(payload.get('expected_rows'))
+        item = build_pykrx_enrichment_category_gate_item(
+            category=category,
+            payload=payload,
+            missing_category_payload=missing_category_payload,
+        )
         present_rows = cls._coerce_optional_int(payload.get('present_rows')) or 0
-        coverage_ratio = cls._coerce_optional_float(payload.get('coverage_ratio'))
-        if expected_rows and expected_rows > 0:
-            coverage_ratio = round(min(present_rows, expected_rows) / expected_rows, 6)
-        coverage_status = str(payload.get('coverage_status') or 'missing').strip().lower()
-        expectation_status = str(
-            payload.get('expectation_status') or 'available'
-        ).strip().lower()
-        missing_rows = max(expected_rows - present_rows, 0) if expected_rows is not None else None
-        minimum_coverage_ratio = required_category_minimum_coverage_ratio(category)
-
-        provider_error = cls._has_pykrx_provider_error(payload)
-
+        expected_rows = cls._coerce_optional_int(payload.get('expected_rows'))
         if (
-            not missing_category_payload
-            and expectation_status == 'not_applicable'
-            and coverage_status == 'not_applicable'
-            and expected_rows is not None
-            and expected_rows <= 0
+            item.get('gate_status') == 'waiting'
+            and item.get('decision_usable_evidence_available') is False
+            and present_rows <= 0
+            and (expected_rows is None or expected_rows <= 0)
+            and (
+                provider_degraded
+                or cls._has_pykrx_provider_error(payload)
+            )
         ):
-            gate_status = 'not_applicable'
-            reason = 'no_expected_rows_for_category'
-        elif provider_degraded and present_rows <= 0 and (expected_rows is None or expected_rows <= 0):
-            gate_status = 'ready'
-            reason = 'pykrx_provider_unavailable_optional_enrichment_degraded'
-        elif provider_error and present_rows <= 0:
-            gate_status = 'ready'
-            reason = 'pykrx_provider_unavailable_optional_enrichment_degraded'
-        elif (
-            missing_category_payload
-            or expectation_status == 'unavailable'
-            or expected_rows is None
-            or expected_rows <= 0
+            item['gate_status'] = 'ready'
+            item['reason'] = (
+                'pykrx_provider_unavailable_optional_enrichment_degraded'
+            )
+            item['operator_warning'] = True
+        if (
+            item.get('decision_usable_evidence_available')
+            or item.get('completeness_evidence_available')
         ):
-            gate_status = 'waiting'
-            reason = 'coverage_expectation_unavailable'
-        elif present_rows <= 0 or coverage_status == 'missing':
-            gate_status = 'blocked'
-            reason = 'missing_required_pykrx_enrichment_category'
-        elif coverage_ratio is None or coverage_ratio < minimum_coverage_ratio:
-            gate_status = 'blocked'
-            reason = 'incomplete_required_pykrx_enrichment_category'
-        elif coverage_status != 'complete':
-            gate_status = 'ready'
-            reason = 'required_pykrx_enrichment_category_near_complete'
-        else:
-            gate_status = 'ready'
-            reason = None
-
+            return item
+        if (
+            item.get('reason')
+            == 'required_pykrx_enrichment_category_below_min_coverage'
+        ):
+            item['reason'] = 'incomplete_required_pykrx_enrichment_category'
         return {
-            'category': category,
-            'scope_type': payload.get('scope_type'),
-            'gate_status': gate_status,
-            'coverage_status': coverage_status,
-            'expected_rows': expected_rows,
-            'present_rows': present_rows,
-            'missing_rows': missing_rows,
-            'coverage_ratio': coverage_ratio,
-            'reason': reason,
+            key: item.get(key)
+            for key in (
+                'category',
+                'scope_type',
+                'gate_status',
+                'coverage_status',
+                'expected_rows',
+                'present_rows',
+                'missing_rows',
+                'coverage_ratio',
+                'reason',
+            )
         }
 
     @classmethod
@@ -316,11 +383,23 @@ class AgentFeedbackPrerequisiteService:
             price_bar_universe_rows=price_bar_universe_rows,
             price_market_count=price_market_count,
         )
-        result_summary = details.get('result_summary') if isinstance(details.get('result_summary'), dict) else {}
-        provider_degraded = str(result_summary.get('status') or stage_payload.get('status') or '').strip().lower() == 'partial' and any(
-            cls._has_pykrx_provider_error(dict(payload))
-            for payload in category_payloads.values()
-            if isinstance(payload, dict)
+        result_summary = (
+            details.get('result_summary')
+            if isinstance(details.get('result_summary'), dict)
+            else {}
+        )
+        provider_degraded = bool(
+            str(
+                result_summary.get('status')
+                or stage_payload.get('status')
+                or ''
+            ).strip().lower()
+            == 'partial'
+            and any(
+                cls._has_pykrx_provider_error(dict(payload))
+                for payload in category_payloads.values()
+                if isinstance(payload, dict)
+            )
         )
         details.update(
             cls.build_pykrx_enrichment_gate_details(
@@ -438,7 +517,16 @@ class AgentFeedbackPrerequisiteService:
         warning_categories = [
             item
             for item in gate_items
-            if item['gate_status'] == 'ready' and item.get('coverage_status') != 'complete'
+            if item.get('operator_warning') is True
+            or (
+                'operator_warning' not in item
+                and item.get('gate_status') == 'ready'
+                and item.get(
+                    'decision_usable_status',
+                    item.get('coverage_status'),
+                )
+                != 'complete'
+            )
         ]
         if blocked_categories:
             category_gate_status = 'blocked'

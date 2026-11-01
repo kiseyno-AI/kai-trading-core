@@ -5127,6 +5127,7 @@ class SignalDeciderLoopService:
             'snapshot_id': row.id,
             'feedback_id': row.feedback_id,
             'decision_run_id': row.decision_run_id,
+            'agent_name': row.agent_name,
             'market_date': row.market_date.isoformat(),
             'symbol': row.symbol,
             'policy_version': policy_version,

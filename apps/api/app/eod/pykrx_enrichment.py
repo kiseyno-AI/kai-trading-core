@@ -2716,12 +2716,21 @@ class PykrxEnrichmentService:
                 if expected_scope_keys is None
                 else complete_scope_keys & expected_scope_keys
             )
+            # ``category_rows`` is the exact set admitted to required-stage
+            # decisions.  It intentionally differs from full component
+            # completeness for short selling: same-day short-volume evidence
+            # is decision-usable even when the optional T+2 balance component
+            # is unavailable.  Valuation keeps its stricter observed-row
+            # contract because ``category_rows`` is built from complete rows.
             eligible_decision_usable_scope_keys = (
-                decision_usable_scope_keys
+                present_scope_keys
                 if expected_scope_keys is None
-                else decision_usable_scope_keys & expected_scope_keys
+                else present_scope_keys & expected_scope_keys
             )
             present_rows = len(eligible_present_scope_keys)
+            decision_usable_present_rows = len(
+                eligible_decision_usable_scope_keys
+            )
             complete_present_rows = len(eligible_complete_scope_keys)
             latest_captured_at = None
             latest_parsed = None
@@ -2745,9 +2754,12 @@ class PykrxEnrichmentService:
                 ),
                 'present_rows': present_rows,
                 'raw_present_rows': len(decision_usable_scope_keys),
+                'decision_usable_present_rows': (
+                    decision_usable_present_rows
+                ),
                 'complete_present_rows': complete_present_rows,
                 'missing_component_rows': max(
-                    len(eligible_decision_usable_scope_keys) - complete_present_rows,
+                    len(decision_usable_scope_keys) - complete_present_rows,
                     0,
                 ),
                 'expected_rows': expected_rows,
@@ -2763,6 +2775,21 @@ class PykrxEnrichmentService:
                     if expectation_status == 'not_applicable'
                     else _coverage_status(
                         present_rows=present_rows,
+                        expected_rows=expected_rows,
+                    )
+                ),
+                'decision_usable_ratio': (
+                    round(decision_usable_present_rows / expected_rows, 6)
+                    if expected_rows is not None and expected_rows > 0
+                    else None
+                ),
+                'decision_usable_status': (
+                    'unavailable'
+                    if expectation_status == 'unavailable'
+                    else 'not_applicable'
+                    if expectation_status == 'not_applicable'
+                    else _coverage_status(
+                        present_rows=decision_usable_present_rows,
                         expected_rows=expected_rows,
                     )
                 ),

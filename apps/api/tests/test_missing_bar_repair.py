@@ -2069,11 +2069,20 @@ class MissingDailyBarRepairRepositoryPostgresTests(unittest.TestCase):
                     frozen[downstream_date.isoformat()]['basis'],
                     'validated_eod_run_market_membership',
                 )
-                durable = _missing_bar_insert_repair_evidence(
-                    session,
-                    batch=batch,
-                )
-                self.assertTrue(durable['ready'])
+                # The production validator deliberately re-applies the
+                # market-size safety floor when it revalidates the persisted
+                # EOD proof.  Keep the artificial one-symbol fixture under
+                # the same test-only floor used while the batch is prepared.
+                with patch.dict(
+                    'app.eod.missing_bar_repair.MINIMUM_MARKET_MEMBERSHIP',
+                    {'KOSPI': 1, 'KOSDAQ': 0, 'KONEX': 0},
+                    clear=True,
+                ):
+                    durable = _missing_bar_insert_repair_evidence(
+                        session,
+                        batch=batch,
+                    )
+                self.assertTrue(durable['ready'], durable['issues'])
                 self.assertEqual(
                     durable['price_dependent_membership_by_date'][
                         downstream_date.isoformat()
@@ -2088,10 +2097,15 @@ class MissingDailyBarRepairRepositoryPostgresTests(unittest.TestCase):
                 )
                 downstream_bar.open_price = 301
                 session.flush()
-                changed = _missing_bar_insert_repair_evidence(
-                    session,
-                    batch=batch,
-                )
+                with patch.dict(
+                    'app.eod.missing_bar_repair.MINIMUM_MARKET_MEMBERSHIP',
+                    {'KOSPI': 1, 'KOSDAQ': 0, 'KONEX': 0},
+                    clear=True,
+                ):
+                    changed = _missing_bar_insert_repair_evidence(
+                        session,
+                        batch=batch,
+                    )
                 self.assertFalse(changed['ready'])
                 self.assertIn(
                     'missing_bar_insert_frozen_membership_input_sha256_mismatch',

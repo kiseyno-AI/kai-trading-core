@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 import json
 from typing import Any
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,7 @@ from app.eod import exact_factor_repair
 from app.eod.market_membership import market_membership_sha256
 from app.eod.exact_factor_repair import (
     FACTOR_RESULT_MODELS,
+    MEMBERSHIP_POLICY_STORED_ONLY,
     ExactFactorRepairService,
     prune_stale_factor_rows,
     verify_exact_factor_rows,
@@ -73,10 +75,24 @@ def _service(
     def stage_runner(stage_id: str):
         def run(**kwargs):
             calls.append((stage_id, kwargs))
+            membership_hash = market_membership_sha256(exact_symbols)
             return {
                 'results_persisted': len(exact_symbols),
                 'results_failed': 0,
                 'missing_symbols': [],
+                'scope_finalization': {
+                    'stage': stage_id,
+                    'market_date': kwargs['market_date'],
+                    'exact_symbol_count': len(exact_symbols),
+                    'exact_membership_sha256': membership_hash,
+                    'successful_symbol_count': len(exact_symbols),
+                    'successful_membership_sha256': membership_hash,
+                    'authoritative_market_scope': True,
+                    'authoritative_markets': ['KOSDAQ', 'KOSPI'],
+                    'all_market_authority': False,
+                    'deleted_stale_row_count': 0,
+                    'ready': True,
+                },
             }
 
         return run
@@ -258,6 +274,38 @@ def test_trade_date_provider_failure_uses_strict_same_date_eod_membership() -> N
     assert result['membership_evidence_source'] == 'stored_eod_run_metadata'
     assert result['membership_evidence_run_id'] == 321
     assert market_loader_called is False
+
+
+def test_stored_only_policy_never_calls_live_membership_providers() -> None:
+    membership = _membership_by_market()
+    live_calls: list[str] = []
+
+    def resolver(**_kwargs):
+        live_calls.append('trade_date')
+        raise AssertionError('stored-only mode must not resolve a live date')
+
+    def market_loader(_date: str, _market: str):
+        live_calls.append('market_ohlcv')
+        raise AssertionError('stored-only mode must not load live PyKRX')
+
+    service, exact_symbols, _calls = _service()
+    service.trade_date_resolver = resolver
+    service.market_ohlcv_loader = market_loader
+    service.stored_eod_run_loader = lambda **_kwargs: [
+        _stored_eod_membership_run(membership)
+    ]
+
+    result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=False,
+        membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
+    )
+
+    assert result['status'] == 'ready'
+    assert result['exact_membership_count'] == len(exact_symbols)
+    assert result['membership_policy'] == MEMBERSHIP_POLICY_STORED_ONLY
+    assert result['membership_evidence_source'] == 'stored_eod_run_metadata'
+    assert live_calls == []
 
 
 def test_stored_fallback_skips_newer_unsuitable_retry_for_latest_valid_run() -> None:
@@ -500,6 +548,7 @@ def test_dry_run_discloses_exact_scope_and_never_runs_factor_stage() -> None:
     assert result['stale_outside_membership_price_bar_count'] == 1
     assert result['exact_provider_membership_count'] == len(exact_symbols) + 1
     assert result['provider_excluded_from_ranking_count'] == 1
+    assert result['provider_excluded_from_ranking_codes'] == ['00104K']
     assert result['provider_excluded_from_ranking_counts_by_market'] == {
         'KOSPI': 1,
         'KOSDAQ': 0,
@@ -537,6 +586,12 @@ def test_apply_passes_same_exact_membership_to_every_stage_in_order() -> None:
     for _stage_id, kwargs in calls:
         assert kwargs['symbols'] == exact_symbols
         assert kwargs['ranking_symbols'] == exact_symbols
+        assert kwargs['exact_scope_symbols'] == exact_symbols
+        authority = kwargs['authoritative_market_scope']
+        assert authority['symbol_count'] == len(exact_symbols)
+        assert authority['membership_sha256'] == (
+            market_membership_sha256(exact_symbols)
+        )
 
 
 def test_apply_requires_reviewed_membership_count_and_hash() -> None:
@@ -615,6 +670,26 @@ def test_apply_stops_partial_when_stage_does_not_persist_exact_membership() -> N
     assert result['reason'] == 'factor_stage_incomplete'
     assert result['failed_stage'] == 'value_factors'
     assert 'low_risk_factors' not in result['stage_results']
+
+
+def test_apply_rejects_stage_without_atomic_scope_finalization() -> None:
+    service, exact_symbols, _calls = _service()
+    service.stage_runners['value_factors'] = lambda **_kwargs: {
+        'results_persisted': len(exact_symbols),
+        'results_failed': 0,
+        'missing_symbols': [],
+    }
+
+    result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=True,
+        **_pinned_membership(exact_symbols),
+    )
+
+    assert result['status'] == 'partial'
+    assert result['reason'] == 'factor_stage_atomic_finalization_failed'
+    assert result['failed_stage'] == 'value_factors'
+    assert 'atomic exact-scope finalization' in result['error_message']
 
 
 def test_prune_requires_apply() -> None:
@@ -710,17 +785,14 @@ def test_blocks_when_resolved_date_is_not_requested_session() -> None:
     assert result['reason'] == 'not_an_exact_trading_session'
 
 
-def test_cli_returns_nonzero_for_blocked_result(monkeypatch, capsys) -> None:
-    observed: dict = {}
-
-    def blocked(**kwargs):
-        observed.update(kwargs)
-        return {'status': 'blocked', 'reason': 'test'}
-
+def test_cli_blocks_direct_apply_before_service_dispatch(
+    monkeypatch, capsys
+) -> None:
+    service = Mock()
     monkeypatch.setattr(
         exact_factor_repair.exact_factor_repair_service,
         'repair_for_market_date',
-        blocked,
+        service,
     )
 
     exit_code = exact_factor_repair.main(
@@ -728,14 +800,69 @@ def test_cli_returns_nonzero_for_blocked_result(monkeypatch, capsys) -> None:
     )
 
     assert exit_code == 1
-    assert observed == {
+    service.assert_not_called()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
         'market_date': '2026-09-23',
-        'apply': True,
-        'prune_stale': True,
-        'expected_provider_membership_count': None,
-        'expected_membership_sha256': None,
+        'mode': 'apply',
+        'status': 'blocked',
+        'applied': False,
+        'reason': 'direct_apply_requires_exact_factor_bulk_repair',
+        'required_driver': 'app.eod.exact_factor_bulk_repair',
     }
-    assert json.loads(capsys.readouterr().out)['status'] == 'blocked'
+
+
+def test_cli_reviewed_stored_membership_proof_cannot_bypass_bulk_guard(
+    monkeypatch, capsys
+) -> None:
+    service = Mock()
+    monkeypatch.setattr(
+        exact_factor_repair.exact_factor_repair_service,
+        'repair_for_market_date',
+        service,
+    )
+
+    exit_code = exact_factor_repair.main(
+        [
+            '--market-date',
+            '2026-09-23',
+            '--apply',
+            '--stored-membership-only',
+            '--expected-provider-membership-count',
+            '2705',
+            '--expected-membership-sha256',
+            'a' * 64,
+        ]
+    )
+
+    assert exit_code == 1
+    service.assert_not_called()
+    assert (
+        json.loads(capsys.readouterr().out)['reason']
+        == 'direct_apply_requires_exact_factor_bulk_repair'
+    )
+
+
+def test_cli_explicit_stored_only_policy_is_forwarded(monkeypatch, capsys) -> None:
+    observed: dict = {}
+
+    def ready(**kwargs):
+        observed.update(kwargs)
+        return {'status': 'ready'}
+
+    monkeypatch.setattr(
+        exact_factor_repair.exact_factor_repair_service,
+        'repair_for_market_date',
+        ready,
+    )
+
+    exit_code = exact_factor_repair.main(
+        ['--market-date', '2026-09-23', '--stored-membership-only']
+    )
+
+    assert exit_code == 0
+    assert observed['membership_policy'] == MEMBERSHIP_POLICY_STORED_ONLY
+    assert json.loads(capsys.readouterr().out)['status'] == 'ready'
 
 
 def _unique_numeric_symbol() -> str:

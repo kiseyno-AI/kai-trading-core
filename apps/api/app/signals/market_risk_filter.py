@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
     load_latest_available_daily_market_risk_filter_result_date,
+    replace_daily_market_risk_filter_results_exact_scope,
     upsert_daily_market_risk_filter_result,
     upsert_daily_market_risk_filter_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.market_risk_evaluators import (
     MARKET_RISK_FILTER_SOURCE,
     build_market_risk_filter_result_from_snapshot,
@@ -59,6 +61,7 @@ class DailyMarketRiskFilterService:
     def __init__(self, *, snapshot_service: DailyMarketRiskSnapshotService | None = None) -> None:
         self.snapshot_service = snapshot_service or daily_market_risk_snapshot_service
 
+    @daily_price_bar_writer_admission
     async def rebuild_for_market_date(
         self,
         *,
@@ -69,17 +72,37 @@ class DailyMarketRiskFilterService:
         run_id: int | None = None,
         fetch_concurrency: int | None = None,
         progress_callback: Callable[..., Any] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = normalize_market_date(market_date)
         normalized_symbols = normalize_symbols(symbols)
-        snapshot_collection = await self.snapshot_service.collect_for_market_date(
-            market_date=normalized_market_date,
-            symbols=normalized_symbols,
-            market_code=market_code,
-            run_id=run_id,
-            fetch_concurrency=fetch_concurrency,
-            progress_callback=progress_callback,
+        snapshot_kwargs: dict[str, Any] = {
+            'market_date': normalized_market_date,
+            'symbols': normalized_symbols,
+            'market_code': market_code,
+            'run_id': run_id,
+            'fetch_concurrency': fetch_concurrency,
+            'progress_callback': progress_callback,
+        }
+        if exact_scope_symbols is not None:
+            snapshot_kwargs.update(
+                exact_scope_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+        snapshot_collection = (
+            await self.snapshot_service.collect_for_market_date(
+                **snapshot_kwargs
+            )
         )
+        if exact_scope_symbols is not None and not (
+            isinstance(snapshot_collection.get('scope_finalization'), Mapping)
+            and snapshot_collection['scope_finalization'].get('ready') is True
+        ):
+            raise RuntimeError(
+                'market-risk snapshot atomic exact-scope finalization proof '
+                'is unavailable'
+            )
         snapshot_items = list(snapshot_collection.get('items') or [])
         requested_symbols = list(snapshot_collection.get('requested_symbols') or [])
         matched_symbols = list(snapshot_collection.get('matched_symbols') or [])
@@ -114,7 +137,28 @@ class DailyMarketRiskFilterService:
                 )
             except Exception:
                 pass
-        if items:
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = (
+                replace_daily_market_risk_filter_results_exact_scope(
+                    market_date=normalized_market_date,
+                    results=items,
+                    exact_symbols=exact_scope_symbols,
+                    authoritative_market_scope=authoritative_market_scope,
+                )
+            )
+            successful_symbol_set = set(publication['successful_symbols'])
+            persisted_items = [
+                _public_filter_item(item)
+                for item in items
+                if item['symbol'] in successful_symbol_set
+            ]
+            failed_symbols.extend(publication['failed_symbols'])
+            failed_symbol_errors.extend(
+                publication['failed_symbol_errors']
+            )
+            scope_finalization = publication['scope_finalization']
+        elif items:
             try:
                 upsert_daily_market_risk_filter_results(items)
                 persisted_items = [_public_filter_item(item) for item in items]
@@ -153,7 +197,7 @@ class DailyMarketRiskFilterService:
             dict.fromkeys([*failed_symbols, *retry_debt_symbols])
         )
 
-        return {
+        result = {
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -184,6 +228,9 @@ class DailyMarketRiskFilterService:
                 retry_debt_symbols=retry_debt_symbols,
             ),
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,

@@ -2,6 +2,7 @@ import hashlib
 import unittest
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from threading import Event, Thread, current_thread
 from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,12 +10,17 @@ from unittest.mock import patch
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects import postgresql
 
+import app.market_data_store as market_data_store
 from app.db import engine, session_scope
 from app.db_models import (
     CurrentKISIntradaySnapshotCache,
+    DailyActionSummary,
+    DailyMomentumFactorResult,
     DailyPriceBar,
+    DailyPriceContext,
     DailyPykrxEnrichmentRow,
     DailySignalFeature,
+    DailyTechnicalSnapshot,
     EODCollectionRun,
     KISIntradaySnapshot,
     Symbol,
@@ -45,6 +51,8 @@ from app.market_data_store import (
     persist_daily_price_bars,
     persist_kis_intraday_snapshot,
     replace_daily_signal_features_exact_scope,
+    replace_daily_price_contexts_exact_scope,
+    replace_daily_derived_results_exact_scope,
     sanitize_daily_signal_feature_metrics,
     upsert_daily_action_summary,
     upsert_daily_composite_factor_results,
@@ -56,6 +64,17 @@ from app.market_data_store import (
     upsert_daily_signal_features,
     upsert_daily_technical_snapshot,
 )
+from app.agent_context.derived_contexts import DailyPriceContextService
+from app.agent_context.prerequisite_service import (
+    AgentFeedbackPrerequisiteService,
+)
+from app.eod.action_summaries import DailyActionSummaryService
+from app.eod.daily_pipeline_stages import DailyPipelineStageService
+from app.eod.pipeline_status import (
+    EODPipelineStatusService,
+    _load_row_count_stage_scope_gap,
+)
+from app.eod.technical_snapshots import DailyTechnicalSnapshotService
 
 
 class DailySignalFeatureAuthorityTests(unittest.TestCase):
@@ -470,6 +489,215 @@ class DailySignalFeatureAuthorityTests(unittest.TestCase):
         self.assertIn('daily_composite_factor_results.market_date =', compiled[0])
         self.assertIn('daily_composite_factor_results.symbol_id not in', compiled[0])
         self.assertTrue(any(sql.startswith('insert into daily_composite_factor_results') for sql in compiled[1:]))
+
+
+class AtomicDerivedFactorPublicationIntegrationTests(unittest.TestCase):
+    MARKET_DATE = date(2036, 1, 5)
+    SUCCESS_SYMBOL = '992001'
+    FAILED_SYMBOL = '992002'
+    OUTSIDE_SYMBOL = '992003'
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        Symbol.__table__.create(bind=engine, checkfirst=True)
+        DailyMomentumFactorResult.__table__.create(
+            bind=engine,
+            checkfirst=True,
+        )
+
+    def setUp(self) -> None:
+        self._cleanup()
+        with session_scope() as session:
+            session.add_all(
+                [
+                    Symbol(
+                        symbol=symbol,
+                        name_ko=symbol,
+                        market='KOSPI',
+                        instrument_type='equity',
+                        source='test',
+                        is_active=True,
+                    )
+                    for symbol in (
+                        self.SUCCESS_SYMBOL,
+                        self.FAILED_SYMBOL,
+                        self.OUTSIDE_SYMBOL,
+                    )
+                ]
+            )
+
+    def tearDown(self) -> None:
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        symbols = (
+            self.SUCCESS_SYMBOL,
+            self.FAILED_SYMBOL,
+            self.OUTSIDE_SYMBOL,
+        )
+        with session_scope() as session:
+            symbol_ids = list(
+                session.scalars(
+                    select(Symbol.id).where(Symbol.symbol.in_(symbols))
+                ).all()
+            )
+            if symbol_ids:
+                session.execute(
+                    delete(DailyMomentumFactorResult).where(
+                        DailyMomentumFactorResult.symbol_id.in_(symbol_ids)
+                    )
+                )
+            session.execute(delete(Symbol).where(Symbol.symbol.in_(symbols)))
+
+    def _row(
+        self,
+        symbol: str,
+        *,
+        close_price: int,
+    ) -> dict:
+        return {
+            'symbol': symbol,
+            'market_date': self.MARKET_DATE.isoformat(),
+            'source': 'test',
+            'close_price': close_price,
+            'has_sufficient_history': True,
+            'is_price_above_ma120': True,
+            'is_ma60_above_ma120': True,
+            'is_recent_overheated': False,
+            'momentum_percentile_threshold': 0.8,
+            'passes_momentum_top_percentile': True,
+            'is_momentum_eligible': True,
+            'factor_payload': {'attempt': close_price},
+        }
+
+    def _stored_close_prices(self) -> dict[str, int]:
+        with session_scope() as session:
+            return {
+                str(symbol): int(close_price)
+                for symbol, close_price in session.execute(
+                    select(
+                        Symbol.symbol,
+                        DailyMomentumFactorResult.close_price,
+                    )
+                    .join(
+                        DailyMomentumFactorResult,
+                        DailyMomentumFactorResult.symbol_id == Symbol.id,
+                    )
+                    .where(
+                        DailyMomentumFactorResult.market_date
+                        == self.MARKET_DATE,
+                        Symbol.symbol.in_(
+                            (
+                                self.SUCCESS_SYMBOL,
+                                self.FAILED_SYMBOL,
+                                self.OUTSIDE_SYMBOL,
+                            )
+                        ),
+                    )
+                ).all()
+            }
+
+    def test_partial_row_failure_publishes_success_and_removes_failed_stale(
+        self,
+    ) -> None:
+        upsert_daily_momentum_factor_results(
+            [
+                self._row(self.SUCCESS_SYMBOL, close_price=10),
+                self._row(self.FAILED_SYMBOL, close_price=20),
+                self._row(self.OUTSIDE_SYMBOL, close_price=30),
+            ]
+        )
+        malformed = self._row(self.FAILED_SYMBOL, close_price=200)
+        malformed.pop('factor_payload')
+
+        result = replace_daily_derived_results_exact_scope(
+            market_date=self.MARKET_DATE,
+            stage_id='momentum_factors',
+            results=[
+                self._row(self.SUCCESS_SYMBOL, close_price=100),
+                malformed,
+            ],
+            exact_symbols=(self.SUCCESS_SYMBOL, self.FAILED_SYMBOL),
+        )
+
+        self.assertEqual(
+            self._stored_close_prices(),
+            {self.SUCCESS_SYMBOL: 100, self.OUTSIDE_SYMBOL: 30},
+        )
+        self.assertEqual(result['successful_symbols'], [self.SUCCESS_SYMBOL])
+        self.assertEqual(result['failed_symbols'], [self.FAILED_SYMBOL])
+        self.assertIsNotNone(result['batch_error'])
+        proof = result['scope_finalization']
+        self.assertTrue(proof['ready'])
+        self.assertEqual(proof['stage'], 'momentum_factors')
+        self.assertEqual(proof['exact_symbol_count'], 2)
+        self.assertEqual(proof['successful_symbol_count'], 1)
+        self.assertEqual(proof['deleted_stale_row_count'], 1)
+        self.assertEqual(
+            proof['exact_membership_sha256'],
+            market_data_store.market_membership_sha256(
+                (self.SUCCESS_SYMBOL, self.FAILED_SYMBOL)
+            ),
+        )
+
+    def test_finalization_failure_rolls_back_new_factor_rows(self) -> None:
+        upsert_daily_momentum_factor_results(
+            [
+                self._row(self.SUCCESS_SYMBOL, close_price=10),
+                self._row(self.FAILED_SYMBOL, close_price=20),
+            ]
+        )
+        with patch.object(
+            market_data_store,
+            '_finalize_daily_derived_stage_exact_scope_in_session',
+            side_effect=RuntimeError('injected atomic proof failure'),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'injected atomic proof failure',
+            ):
+                replace_daily_derived_results_exact_scope(
+                    market_date=self.MARKET_DATE,
+                    stage_id='momentum_factors',
+                    results=[
+                        self._row(self.SUCCESS_SYMBOL, close_price=100)
+                    ],
+                    exact_symbols=(
+                        self.SUCCESS_SYMBOL,
+                        self.FAILED_SYMBOL,
+                    ),
+                )
+
+        self.assertEqual(
+            self._stored_close_prices(),
+            {self.SUCCESS_SYMBOL: 10, self.FAILED_SYMBOL: 20},
+        )
+
+    def test_all_atomic_deterministic_stage_mappings_are_registered(
+        self,
+    ) -> None:
+        expected = {
+            'market_risk_snapshots',
+            'market_risk_filter',
+            'piotroski_filter',
+            'momentum_factors',
+            'value_factors',
+            'low_risk_factors',
+            'beta_factors',
+            'advanced_value_factors',
+            'unified_value_factors',
+            'quality_factors',
+            'composite_factors',
+        }
+        self.assertEqual(
+            set(market_data_store.DAILY_DERIVED_RESULT_CONSTRAINTS),
+            expected,
+        )
+        self.assertTrue(
+            expected.issubset(
+                market_data_store.DAILY_EXACT_SCOPE_RESULT_MODELS
+            )
+        )
 
 
 class DailySignalFeatureScopedRepairIntegrationTests(unittest.TestCase):
@@ -3055,6 +3283,74 @@ class PykrxEnrichmentStoreIntegrationTests(unittest.TestCase):
                     ]
                 )
 
+    def test_null_metric_valuation_snapshot_still_holds_date_fence(
+        self,
+    ) -> None:
+        lock_calls: list[dict[str, object]] = []
+
+        @contextmanager
+        def valuation_lock(**kwargs):
+            lock_calls.append(kwargs)
+            yield True, None
+
+        with patch(
+            'app.market_data_store.advisory_eod_collection_locks',
+            new=valuation_lock,
+        ):
+            inserted = upsert_daily_pykrx_enrichment_rows(
+                rows=[
+                    {
+                        'market_date': '2026-04-22',
+                        'market': 'KOSPI',
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'scope_key': '661501',
+                        'source': 'pykrx',
+                        'symbol': '661501',
+                        'payload': {'per': None, 'pbr': None},
+                    }
+                ]
+            )
+
+        self.assertEqual(inserted, 1)
+        self.assertEqual(
+            lock_calls,
+            [
+                {
+                    'market': 'KRX',
+                    'trade_dates': (date(2026, 4, 22),),
+                    'source': 'daily_price_bars',
+                }
+            ],
+        )
+
+    def test_empty_valuation_replacement_fails_closed_when_date_fence_busy(
+        self,
+    ) -> None:
+        @contextmanager
+        def busy_lock(**_kwargs):
+            yield False, '2026-04-22'
+
+        with patch(
+            'app.market_data_store.advisory_eod_collection_locks',
+            new=busy_lock,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'daily price-bar writer lock is already held for 2026-04-22',
+            ):
+                upsert_daily_pykrx_enrichment_rows(
+                    rows=[],
+                    replace_scopes=[
+                        {
+                            'market_date': '2026-04-22',
+                            'market': 'KOSPI',
+                            'category': 'valuation_snapshot',
+                            'source': 'pykrx',
+                        }
+                    ],
+                )
+
     def test_sparse_valuation_snapshot_preserves_existing_daily_price_bar_fundamentals(self) -> None:
         persist_daily_price_bar(
             {
@@ -3186,6 +3482,457 @@ class KISIntradaySnapshotStoreIntegrationTests(unittest.TestCase):
         self.assertEqual(row['liquidity']['volume_power_rank'], 3)
         self.assertIsNotNone(row['captured_at'])
         self.assertIsNotNone(row['cached_at'])
+
+
+class DerivedAttemptFinalizationIntegrationTests(unittest.TestCase):
+    MARKET_DATE = date(2036, 1, 7)
+    SUCCESS_SYMBOL = '992101'
+    CONTEXT_FAILED_SYMBOL = '992102'
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        Symbol.__table__.create(bind=engine, checkfirst=True)
+        DailyPriceContext.__table__.create(bind=engine, checkfirst=True)
+        DailyTechnicalSnapshot.__table__.create(bind=engine, checkfirst=True)
+        DailyActionSummary.__table__.create(bind=engine, checkfirst=True)
+
+    def setUp(self) -> None:
+        self._cleanup()
+        with session_scope() as session:
+            session.add_all(
+                [
+                    Symbol(
+                        symbol=self.SUCCESS_SYMBOL,
+                        name_ko='Current success',
+                        market='KOSPI',
+                        instrument_type='equity',
+                        source='test',
+                        is_active=True,
+                    ),
+                    Symbol(
+                        symbol=self.CONTEXT_FAILED_SYMBOL,
+                        name_ko='Current context failure',
+                        market='KOSPI',
+                        instrument_type='equity',
+                        source='test',
+                        is_active=True,
+                    ),
+                ]
+            )
+        for symbol in (self.SUCCESS_SYMBOL, self.CONTEXT_FAILED_SYMBOL):
+            upsert_daily_price_context(
+                {
+                    'symbol': symbol,
+                    'market_date': self.MARKET_DATE.isoformat(),
+                    'source': 'old_attempt',
+                    'context_payload': {'attempt': 'old'},
+                }
+            )
+            upsert_daily_technical_snapshot(self._snapshot_row(symbol))
+            upsert_daily_action_summary(self._action_row(symbol))
+
+    def tearDown(self) -> None:
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        with session_scope() as session:
+            symbol_ids = list(
+                session.scalars(
+                    select(Symbol.id).where(
+                        Symbol.symbol.in_(
+                            (
+                                self.SUCCESS_SYMBOL,
+                                self.CONTEXT_FAILED_SYMBOL,
+                            )
+                        )
+                    )
+                ).all()
+            )
+            if symbol_ids:
+                session.execute(
+                    delete(DailyActionSummary).where(
+                        DailyActionSummary.symbol_id.in_(symbol_ids)
+                    )
+                )
+                session.execute(
+                    delete(DailyTechnicalSnapshot).where(
+                        DailyTechnicalSnapshot.symbol_id.in_(symbol_ids)
+                    )
+                )
+                session.execute(
+                    delete(DailyPriceContext).where(
+                        DailyPriceContext.symbol_id.in_(symbol_ids)
+                    )
+                )
+            session.execute(
+                delete(Symbol).where(
+                    Symbol.symbol.in_(
+                        (self.SUCCESS_SYMBOL, self.CONTEXT_FAILED_SYMBOL)
+                    )
+                )
+            )
+
+    def _technical_bars(self) -> list[dict]:
+        return [
+            {
+                'trade_date': '2036-01-06',
+                'open_price': 100,
+                'high_price': 102,
+                'low_price': 99,
+                'close_price': 101,
+                'volume': 1000,
+                'turnover': 101000,
+                'source': 'test',
+                'captured_at': '2036-01-06T06:30:00+00:00',
+            },
+            {
+                'trade_date': self.MARKET_DATE.isoformat(),
+                'open_price': 101,
+                'high_price': 104,
+                'low_price': 100,
+                'close_price': 103,
+                'volume': 1200,
+                'turnover': 123600,
+                'source': 'test',
+                'captured_at': '2036-01-07T06:30:00+00:00',
+            },
+        ]
+
+    def _context_bars(self) -> list[dict]:
+        return list(reversed(self._technical_bars()))
+
+    def _snapshot_row(self, symbol: str) -> dict:
+        return {
+            'symbol': symbol,
+            'market_date': self.MARKET_DATE.isoformat(),
+            'source': 'old_attempt',
+            'close_price': 101,
+            'volume': 1000,
+            'trend_state': 'insufficient_history',
+            'ma_alignment': 'insufficient_history',
+            'breakout_20d': False,
+            'breakdown_20d': False,
+            'return_5d': None,
+            'return_20d': None,
+            'volume_ratio_20d': None,
+            'atr_14': None,
+            'atr_pct_14': None,
+            'signal_payload': {'attempt': 'old'},
+        }
+
+    def _action_row(self, symbol: str) -> dict:
+        return {
+            'symbol': symbol,
+            'market_date': self.MARKET_DATE.isoformat(),
+            'source': 'old_attempt',
+            'action_label': 'neutral',
+            'bias_direction': 'neutral',
+            'signal_score': 0,
+            'confidence_tier': 'low',
+            'risk_tier': 'unknown',
+            'trigger_price': None,
+            'invalidation_price': None,
+            'support_price': None,
+            'resistance_price': None,
+            'reasons': ['old_attempt'],
+            'summary_payload': {'attempt': 'old'},
+        }
+
+    def _context_row(self, symbol: str, *, attempt: str) -> dict:
+        return {
+            'symbol': symbol,
+            'market_date': self.MARKET_DATE.isoformat(),
+            'source': attempt,
+            'context_payload': {'attempt': attempt},
+        }
+
+    def test_exact_context_publish_rolls_back_upserts_when_finalization_fails(
+        self,
+    ) -> None:
+        with patch.object(
+            market_data_store,
+            '_finalize_daily_derived_stage_exact_scope_in_session',
+            side_effect=RuntimeError('injected finalization failure'),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'injected finalization failure',
+            ):
+                replace_daily_price_contexts_exact_scope(
+                    market_date=self.MARKET_DATE,
+                    rows=[
+                        self._context_row(
+                            self.SUCCESS_SYMBOL,
+                            attempt='new_attempt',
+                        )
+                    ],
+                    exact_symbols=[
+                        self.SUCCESS_SYMBOL,
+                        self.CONTEXT_FAILED_SYMBOL,
+                    ],
+                )
+
+        with session_scope() as session:
+            rows = session.execute(
+                select(
+                    Symbol.symbol,
+                    DailyPriceContext.source,
+                    DailyPriceContext.context_payload,
+                )
+                .join(
+                    DailyPriceContext,
+                    DailyPriceContext.symbol_id == Symbol.id,
+                )
+                .where(DailyPriceContext.market_date == self.MARKET_DATE)
+                .where(
+                    Symbol.symbol.in_(
+                        (
+                            self.SUCCESS_SYMBOL,
+                            self.CONTEXT_FAILED_SYMBOL,
+                        )
+                    )
+                )
+                .order_by(Symbol.symbol.asc())
+            ).all()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row.source == 'old_attempt' for row in rows))
+        self.assertTrue(
+            all(row.context_payload == {'attempt': 'old'} for row in rows)
+        )
+
+    def test_overlapping_exact_context_publishes_are_serialized_before_writes(
+        self,
+    ) -> None:
+        first_upserted = Event()
+        release_first = Event()
+        second_entered_upsert = Event()
+        errors: list[BaseException] = []
+        original_upsert = (
+            market_data_store._upsert_daily_price_context_in_session
+        )
+
+        def _blocking_upsert(session, row, *, run_id=None):
+            original_upsert(session, row, run_id=run_id)
+            current_name = current_thread().name
+            if current_name == 'first-publisher':
+                first_upserted.set()
+                if not release_first.wait(5):
+                    raise TimeoutError('first publisher was not released')
+            elif current_name == 'second-publisher':
+                second_entered_upsert.set()
+
+        exact_symbols = [
+            self.SUCCESS_SYMBOL,
+            self.CONTEXT_FAILED_SYMBOL,
+        ]
+
+        def _publish(*, rows: list[dict]) -> None:
+            try:
+                replace_daily_price_contexts_exact_scope(
+                    market_date=self.MARKET_DATE,
+                    rows=rows,
+                    exact_symbols=exact_symbols,
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch.object(
+            market_data_store,
+            '_upsert_daily_price_context_in_session',
+            side_effect=_blocking_upsert,
+        ):
+            first = Thread(
+                name='first-publisher',
+                target=_publish,
+                kwargs={
+                    'rows': [
+                        self._context_row(
+                            self.SUCCESS_SYMBOL,
+                            attempt='first',
+                        )
+                    ],
+                },
+            )
+            second = Thread(
+                name='second-publisher',
+                target=_publish,
+                kwargs={
+                    'rows': [
+                        self._context_row(symbol, attempt='second')
+                        for symbol in exact_symbols
+                    ],
+                },
+            )
+            first.start()
+            self.assertTrue(first_upserted.wait(5))
+            second.start()
+            self.assertFalse(second_entered_upsert.wait(0.25))
+            release_first.set()
+            first.join(5)
+            second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered_upsert.is_set())
+        with session_scope() as session:
+            rows = session.execute(
+                select(Symbol.symbol, DailyPriceContext.source)
+                .join(
+                    DailyPriceContext,
+                    DailyPriceContext.symbol_id == Symbol.id,
+                )
+                .where(DailyPriceContext.market_date == self.MARKET_DATE)
+                .where(Symbol.symbol.in_(exact_symbols))
+                .order_by(Symbol.symbol.asc())
+            ).all()
+        self.assertEqual(
+            [(row.symbol, row.source) for row in rows],
+            [
+                (self.SUCCESS_SYMBOL, 'second'),
+                (self.CONTEXT_FAILED_SYMBOL, 'second'),
+            ],
+        )
+
+    def test_context_failure_cannot_resurrect_stale_derived_rows_or_readiness(
+        self,
+    ) -> None:
+        selected = [self.SUCCESS_SYMBOL, self.CONTEXT_FAILED_SYMBOL]
+        with patch(
+            'app.agent_context.derived_contexts.'
+            'load_recent_price_bars_by_symbol',
+            return_value={self.SUCCESS_SYMBOL: self._context_bars()},
+        ):
+            context_result = DailyPriceContextService().rebuild_for_market_date(
+                market_date=self.MARKET_DATE,
+                symbols=selected,
+                source='current_attempt',
+            )
+
+        with patch(
+            'app.eod.technical_snapshots.load_daily_bars_for_symbol',
+            return_value=self._technical_bars(),
+        ):
+            snapshot_result = (
+                DailyTechnicalSnapshotService().rebuild_for_market_date(
+                    market_date=self.MARKET_DATE.isoformat(),
+                    symbols=selected,
+                    source='current_attempt',
+                )
+            )
+
+        combined = DailyPipelineStageService._combine_technical_scope_outcomes(
+            price_context_result=context_result,
+            technical_result=snapshot_result,
+            invocation_symbols=selected,
+        )
+        self.assertEqual(
+            combined['successful_stock_codes'],
+            [self.SUCCESS_SYMBOL],
+        )
+        self.assertEqual(
+            combined['retry_debt_stock_codes'],
+            [self.CONTEXT_FAILED_SYMBOL],
+        )
+        self.assertEqual(combined['snapshots_persisted'], 1)
+        self.assertEqual(combined['snapshots_failed'], 1)
+        self.assertEqual(
+            [item['symbol'] for item in combined['items']],
+            [self.SUCCESS_SYMBOL],
+        )
+        self.assertEqual(
+            combined['_retry_metadata']['failed_symbols'],
+            [self.CONTEXT_FAILED_SYMBOL],
+        )
+        finalize_daily_derived_stage_exact_scope(
+            market_date=self.MARKET_DATE,
+            stage_id='technical_snapshots',
+            exact_symbols=selected,
+            successful_symbols=combined['successful_stock_codes'],
+        )
+
+        action_result = DailyActionSummaryService().rebuild_for_market_date(
+            market_date=self.MARKET_DATE.isoformat(),
+            symbols=selected,
+            source='current_attempt',
+        )
+        self.assertEqual(
+            action_result['retry_debt_stock_codes'],
+            [self.CONTEXT_FAILED_SYMBOL],
+        )
+
+        with session_scope() as session:
+            remaining_contexts = set(
+                session.scalars(
+                    select(Symbol.symbol)
+                    .join(
+                        DailyPriceContext,
+                        DailyPriceContext.symbol_id == Symbol.id,
+                    )
+                    .where(DailyPriceContext.market_date == self.MARKET_DATE)
+                    .where(Symbol.symbol.in_(selected))
+                ).all()
+            )
+            remaining_snapshots = set(
+                session.scalars(
+                    select(Symbol.symbol)
+                    .join(
+                        DailyTechnicalSnapshot,
+                        DailyTechnicalSnapshot.symbol_id == Symbol.id,
+                    )
+                    .where(
+                        DailyTechnicalSnapshot.market_date
+                        == self.MARKET_DATE
+                    )
+                    .where(Symbol.symbol.in_(selected))
+                ).all()
+            )
+            remaining_actions = set(
+                session.scalars(
+                    select(Symbol.symbol)
+                    .join(
+                        DailyActionSummary,
+                        DailyActionSummary.symbol_id == Symbol.id,
+                    )
+                    .where(
+                        DailyActionSummary.market_date == self.MARKET_DATE
+                    )
+                    .where(Symbol.symbol.in_(selected))
+                ).all()
+            )
+        self.assertEqual(remaining_contexts, {self.SUCCESS_SYMBOL})
+        self.assertEqual(remaining_snapshots, {self.SUCCESS_SYMBOL})
+        self.assertEqual(remaining_actions, {self.SUCCESS_SYMBOL})
+
+        status_service = EODPipelineStatusService(
+            row_count_scope_gap_loader=_load_row_count_stage_scope_gap,
+        )
+        for stage_id in ('technical_snapshots', 'action_summaries'):
+            gated = status_service._apply_scope_coverage_gate(
+                stage_id=stage_id,
+                market_date=self.MARKET_DATE.isoformat(),
+                stage={
+                    'task': stage_id,
+                    'label': stage_id,
+                    'status': 'completed',
+                    'gate_status': 'ready',
+                    'details': {},
+                },
+                scope_symbols=selected,
+            )
+            self.assertEqual(gated['gate_status'], 'blocked')
+            self.assertEqual(
+                gated['details']['requested_scope_coverage'][
+                    'missing_symbols_sample'
+                ],
+                [self.CONTEXT_FAILED_SYMBOL],
+            )
+            self.assertEqual(
+                AgentFeedbackPrerequisiteService._classify_stage_gate_status(
+                    gated
+                ),
+                'blocked',
+            )
 
 
 if __name__ == '__main__':

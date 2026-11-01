@@ -2,17 +2,19 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_signal_feature_context_rows,
     load_recent_daily_price_trade_dates,
     load_recent_price_bars_by_symbol,
+    replace_daily_price_contexts_exact_scope,
     upsert_daily_market_participation_context,
-    upsert_daily_price_context,
 )
 from app.eod.market_membership import market_membership_sha256
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 
 
 SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
@@ -22,6 +24,7 @@ SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
 )
 PARTICIPATION_CONTEXT_LEADER_LIMIT = 20
 DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS = 7
+PRICE_CONTEXT_SCOPE_MANIFEST_VERSION = 'price_contexts_scope_outcomes_v1'
 
 
 def _to_float(value: Any) -> float | None:
@@ -382,44 +385,76 @@ def apply_participation_run_coverage(
 
 
 class DailyPriceContextService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
         source: str = 'pykrx',
         run_id: int | None = None,
         include_retry_metadata: bool = False,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
-        target_symbols = list(dict.fromkeys(symbols or list_symbols_with_daily_bar_on_date(normalized_market_date.isoformat())))
+        target_symbols = list(dict.fromkeys(
+            symbols
+            if symbols is not None
+            else (
+                exact_scope_symbols
+                if exact_scope_symbols is not None
+                else list_symbols_with_daily_bar_on_date(
+                    normalized_market_date.isoformat()
+                )
+            )
+        ))
+        authority_symbols = list(dict.fromkeys(
+            exact_scope_symbols
+            if exact_scope_symbols is not None
+            else target_symbols
+        ))
+        outside_authority = sorted(set(target_symbols) - set(authority_symbols))
+        if outside_authority:
+            raise ValueError(
+                'price context processing symbols outside exact scope: '
+                + ','.join(outside_authority[:20])
+            )
         price_bars_by_symbol = load_recent_price_bars_by_symbol(
             market_date=normalized_market_date,
             symbols=target_symbols,
         )
 
         items: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
         expected_trade_date = normalized_market_date.isoformat()
         for symbol in target_symbols:
-            price_bars = price_bars_by_symbol.get(symbol, [])
-            if not price_bars or price_bars[0].get('trade_date') != expected_trade_date:
-                failed_symbols.append(symbol)
-                continue
+            try:
+                price_bars = price_bars_by_symbol.get(symbol, [])
+                if (
+                    not price_bars
+                    or price_bars[0].get('trade_date')
+                    != expected_trade_date
+                ):
+                    failed_symbols.append(symbol)
+                    continue
 
-            context_payload = build_price_context(price_bars)
-            if context_payload is None:
+                context_payload = build_price_context(price_bars)
+                if context_payload is None:
+                    failed_symbols.append(symbol)
+                    continue
+                rows.append(
+                    {
+                        'symbol': symbol,
+                        'market_date': normalized_market_date.isoformat(),
+                        'source': source,
+                        'context_payload': context_payload,
+                    }
+                )
+            except Exception:
                 failed_symbols.append(symbol)
                 continue
-            upsert_daily_price_context(
-                {
-                    'symbol': symbol,
-                    'market_date': normalized_market_date.isoformat(),
-                    'source': source,
-                    'context_payload': context_payload,
-                },
-                run_id=run_id,
-            )
             items.append(
                 {
                     'symbol': symbol,
@@ -428,14 +463,60 @@ class DailyPriceContextService:
                 }
             )
 
+        publication = (
+            replace_daily_price_contexts_exact_scope(
+                market_date=normalized_market_date,
+                rows=rows,
+                exact_symbols=authority_symbols,
+                run_id=run_id,
+                **(
+                    {
+                        'authoritative_market_scope': (
+                            authoritative_market_scope
+                        )
+                    }
+                    if authoritative_market_scope is not None
+                    else {}
+                ),
+            )
+            if authority_symbols
+            else None
+        )
+        successful_symbols = (
+            list(publication['successful_symbols'])
+            if publication is not None
+            else []
+        )
+        successful_set = set(successful_symbols)
+        items = [
+            item for item in items if item['symbol'] in successful_set
+        ]
+        failed_symbols = [
+            symbol
+            for symbol in authority_symbols
+            if symbol not in successful_set
+        ]
+        scope_finalization = (
+            publication['scope_finalization']
+            if publication is not None
+            else None
+        )
+
         result = {
             'market_date': normalized_market_date.isoformat(),
             'source': source,
-            'requested_symbols': len(target_symbols),
+            'requested_symbols': len(authority_symbols),
             'contexts_persisted': len(items),
             'contexts_failed': len(failed_symbols),
             'failed_symbols': failed_symbols[:50],
             'items': items,
+            'scope_finalization': scope_finalization,
+            **build_exact_symbol_scope_outcome(
+                manifest_version=PRICE_CONTEXT_SCOPE_MANIFEST_VERSION,
+                selected_symbols=authority_symbols,
+                successful_symbols=successful_symbols,
+                retry_debt_symbols=failed_symbols,
+            ),
         }
         if include_retry_metadata:
             result['_retry_metadata'] = {'failed_symbols': failed_symbols}
@@ -443,6 +524,7 @@ class DailyPriceContextService:
 
 
 class DailyMarketParticipationContextService:
+    @daily_price_bar_writer_admission
     def rebuild_from_rows(
         self,
         *,
@@ -468,6 +550,7 @@ class DailyMarketParticipationContextService:
             'context_payload': context_payload,
         }
 
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,

@@ -523,10 +523,17 @@ def validated_nonblocking_partial_progression_marker(
     summary = marker.get('summary')
     decider = marker.get('decider')
     downstream = marker.get('downstream')
+    completion_authority = marker.get('completion_authority')
     retry_debt = marker.get('retry_debt')
     if not all(
         isinstance(payload, Mapping)
-        for payload in (summary, decider, downstream, retry_debt)
+        for payload in (
+            summary,
+            decider,
+            downstream,
+            completion_authority,
+            retry_debt,
+        )
     ):
         return None
     summary_admitted = canonical_symbols(summary.get('admitted_symbols'))
@@ -567,6 +574,106 @@ def validated_nonblocking_partial_progression_marker(
         return None
     summary_failed = summary_failed_scope[1]
     decider_failed = decider_failed_scope[1]
+
+    raw_decision_identities = completion_authority.get(
+        'decision_identities'
+    )
+    if not (
+        set(completion_authority)
+        == {
+            'schema_version',
+            'parent_run_id',
+            'parent_summary_run_id',
+            'completed_symbols',
+            'decision_identities',
+            'signal_decider_proof_digest',
+            'next_open_execution_plan_proof_digest',
+            'signal_decider_evaluations_proof_digest',
+            'next_open_manifest_digest',
+        }
+        and completion_authority.get('schema_version')
+        == 'nonblocking_strict_completion_authority_v1'
+        and completion_authority.get('parent_run_id')
+        == decider.get('source_run_id')
+        and completion_authority.get('parent_summary_run_id')
+        == decider.get('source_summary_run_id')
+        and completion_authority.get('completed_symbols') == actionable
+        and isinstance(raw_decision_identities, list)
+        and all(
+            isinstance(completion_authority.get(field), str)
+            and len(str(completion_authority.get(field))) == 64
+            for field in (
+                'signal_decider_proof_digest',
+                'next_open_execution_plan_proof_digest',
+                'signal_decider_evaluations_proof_digest',
+                'next_open_manifest_digest',
+            )
+        )
+    ):
+        return None
+    decision_identities: list[dict[str, Any]] = []
+    seen_identity_keys: set[tuple[str, str]] = set()
+    for raw_identity in raw_decision_identities:
+        if not isinstance(raw_identity, Mapping):
+            return None
+        identity = dict(raw_identity)
+        if set(identity) != {
+            'symbol',
+            'decision_agent_name',
+            'decision_snapshot_id',
+            'decision_run_id',
+        }:
+            return None
+        normalized_symbol = normalize_symbol_codes(
+            [identity.get('symbol')]
+        )
+        role = str(
+            identity.get('decision_agent_name') or ''
+        ).strip()
+        snapshot_id = identity.get('decision_snapshot_id')
+        decision_run_id = str(
+            identity.get('decision_run_id') or ''
+        ).strip()
+        key = (
+            normalized_symbol[0] if normalized_symbol else '',
+            role,
+        )
+        if not (
+            len(normalized_symbol) == 1
+            and identity.get('symbol') == normalized_symbol[0]
+            and normalized_symbol[0] in actionable
+            and role in DECISION_SUPPORT_AGENT_NAMES
+            and type(snapshot_id) is int
+            and snapshot_id > 0
+            and decision_run_id
+            and key not in seen_identity_keys
+        ):
+            return None
+        seen_identity_keys.add(key)
+        decision_identities.append(
+            {
+                'symbol': normalized_symbol[0],
+                'decision_agent_name': role,
+                'decision_snapshot_id': snapshot_id,
+                'decision_run_id': decision_run_id,
+            }
+        )
+    decision_identities.sort(
+        key=lambda identity: (
+            identity['symbol'],
+            identity['decision_agent_name'],
+        )
+    )
+    if not (
+        decision_identities == raw_decision_identities
+        and seen_identity_keys
+        == {
+            (symbol, role)
+            for symbol in actionable
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+    ):
+        return None
 
     def terminal_counts_are_exact(
         payload: Mapping[str, Any],
@@ -856,6 +963,169 @@ def validated_nonblocking_partial_progression_marker(
             marker_payload=decider,
             require_scope_authority=True,
         )
+    ):
+        return None
+
+    # Lazy import avoids the daily-pipeline -> run-stage-support import cycle.
+    from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+    def validated_completion_scope_proof(
+        stage_id: str,
+        *,
+        parent_scope_proof: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        stage = stages.get(stage_id)
+        if not isinstance(stage, Mapping):
+            return None
+        details = stage.get('details')
+        persisted_proof = (
+            details.get('completion_scope_proof')
+            if isinstance(details, Mapping)
+            else None
+        )
+        validated = (
+            DailyPipelineStageService
+            .validated_stage_completion_scope_proof(
+                stage_id,
+                persisted_proof,
+            )
+        )
+        if validated is not None:
+            return validated
+        result = stage.get('result')
+        if not isinstance(result, Mapping):
+            return None
+        if stage_id == 'signal_decider':
+            return (
+                DailyPipelineStageService
+                ._terminal_decider_progression_proof(
+                    dict(stage),
+                    expected_decider_symbols=decider_admitted,
+                    feedback_cutoff_resolution=dict(persisted_cutoff),
+                )
+            )
+        if stage_id == 'next_open_execution_plan':
+            return (
+                DailyPipelineStageService
+                ._build_next_open_completion_scope_proof(
+                    result,
+                    parent_scope_proof=parent_scope_proof,
+                )
+            )
+        if stage_id == 'signal_decider_evaluations':
+            return (
+                DailyPipelineStageService
+                ._build_evaluations_completion_scope_proof(
+                    result,
+                    parent_scope_proof=parent_scope_proof,
+                )
+            )
+        return None
+
+    signal_completion_proof = validated_completion_scope_proof(
+        'signal_decider'
+    )
+    plan_completion_proof = validated_completion_scope_proof(
+        'next_open_execution_plan',
+        parent_scope_proof=signal_completion_proof,
+    )
+    evaluation_completion_proof = validated_completion_scope_proof(
+        'signal_decider_evaluations',
+        parent_scope_proof=signal_completion_proof,
+    )
+    if not (
+        isinstance(signal_completion_proof, Mapping)
+        and isinstance(plan_completion_proof, Mapping)
+        and isinstance(evaluation_completion_proof, Mapping)
+        and signal_completion_proof.get('proof_digest')
+        == completion_authority.get('signal_decider_proof_digest')
+        and plan_completion_proof.get('proof_digest')
+        == completion_authority.get(
+            'next_open_execution_plan_proof_digest'
+        )
+        and evaluation_completion_proof.get('proof_digest')
+        == completion_authority.get(
+            'signal_decider_evaluations_proof_digest'
+        )
+        and plan_completion_proof.get('manifest_digest')
+        == completion_authority.get('next_open_manifest_digest')
+        and signal_completion_proof.get('source_run_id')
+        == completion_authority.get('parent_run_id')
+        and signal_completion_proof.get('source_summary_run_id')
+        == completion_authority.get('parent_summary_run_id')
+        and signal_completion_proof.get('completed_symbols')
+        == actionable
+        and signal_completion_proof.get('decision_identities')
+        == decision_identities
+        and plan_completion_proof.get('parent_run_id')
+        == completion_authority.get('parent_run_id')
+        and plan_completion_proof.get('parent_completed_symbols')
+        == actionable
+        and evaluation_completion_proof.get('parent_run_id')
+        == completion_authority.get('parent_run_id')
+        and evaluation_completion_proof.get(
+            'parent_completed_symbols'
+        )
+        == actionable
+    ):
+        return None
+
+    expected_identity_by_key = {
+        (
+            identity['symbol'],
+            identity['decision_agent_name'],
+        ): (
+            identity['decision_snapshot_id'],
+            identity['decision_run_id'],
+        )
+        for identity in decision_identities
+    }
+    plan_identity_by_key = {
+        (
+            entry['symbol'],
+            entry['decision_agent_name'],
+        ): (
+            entry['decision_snapshot_id'],
+            entry['decision_run_id'],
+        )
+        for entry in plan_completion_proof['decision_partition']
+    }
+    expected_signal_identity_by_symbol = {
+        symbol: expected_identity_by_key[(symbol, 'signal-decider')]
+        for symbol in actionable
+    }
+    evaluation_identities_by_symbol: dict[
+        str,
+        set[tuple[int, str]],
+    ] = {}
+    for entry in evaluation_completion_proof['decision_horizon_scope']:
+        evaluation_identities_by_symbol.setdefault(
+            entry['symbol'],
+            set(),
+        ).add(
+            (
+                entry['snapshot_id'],
+                entry['decision_run_id'],
+            )
+        )
+    if not (
+        plan_completion_proof.get('parent_summary_run_id')
+        == completion_authority.get('parent_summary_run_id')
+        and plan_completion_proof.get('parent_admitted_symbols')
+        == decider_admitted
+        and plan_identity_by_key == expected_identity_by_key
+        and evaluation_completion_proof.get('parent_summary_run_id')
+        == completion_authority.get('parent_summary_run_id')
+        and evaluation_completion_proof.get('request_symbols')
+        == actionable
+        and evaluation_completion_proof.get('decision_count')
+        == len(actionable)
+        and evaluation_identities_by_symbol
+        == {
+            symbol: {identity}
+            for symbol, identity
+            in expected_signal_identity_by_symbol.items()
+        }
     ):
         return None
 

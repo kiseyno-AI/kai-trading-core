@@ -14,9 +14,11 @@ EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS = frozenset(
         'factor_scope_outcomes_v1',
         'market_risk_filter_scope_outcomes_v1',
         'piotroski_scope_outcomes_v1',
+        'price_contexts_scope_outcomes_v1',
         'pykrx_enrichment_scope_outcomes_v1',
         'signal_features_scope_outcomes_v1',
         'technical_snapshots_scope_outcomes_v1',
+        'trending_ranks_scope_outcomes_v1',
     }
 )
 

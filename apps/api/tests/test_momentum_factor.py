@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from datetime import date, timedelta
 from unittest.mock import patch
 
@@ -414,6 +415,60 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['symbol'], '005930')
         self.assertEqual(result['momentum_rank'], 1)
         self.assertEqual(result['factor_payload']['ranking']['ranked_universe_size'], 2)
+
+    def test_evaluate_symbol_holds_date_fence_before_persisting(self) -> None:
+        service = DailyMomentumFactorService()
+        histories = {
+            '005930': list(reversed(_build_bars([100] + [150] * 252))),
+            '000660': list(reversed(_build_bars([100] + [120] * 252))),
+        }
+        events: list[tuple[str, str]] = []
+
+        @contextmanager
+        def admission(*, market_date: str | date):
+            normalized = (
+                market_date.isoformat()
+                if isinstance(market_date, date)
+                else market_date
+            )
+            events.append(('lock_enter', normalized))
+            yield
+            events.append(('lock_exit', normalized))
+
+        def persist(row: dict) -> None:
+            self.assertEqual(events, [('lock_enter', '2025-09-10')])
+            events.append(('persist', row['symbol']))
+
+        with (
+            patch(
+                'app.signals.momentum_factor.daily_price_bar_writer_admission_lock',
+                side_effect=admission,
+            ),
+            patch(
+                'app.signals.momentum_factor.load_recent_price_bars_by_symbol',
+                return_value=histories,
+            ),
+            patch(
+                'app.signals.momentum_factor.upsert_daily_momentum_factor_result',
+                side_effect=persist,
+            ),
+        ):
+            result = service.evaluate_symbol(
+                symbol='005930',
+                market_date='2025-09-10',
+                universe_symbols=['005930', '000660'],
+                persist=True,
+            )
+
+        self.assertEqual(result['symbol'], '005930')
+        self.assertEqual(
+            events,
+            [
+                ('lock_enter', '2025-09-10'),
+                ('persist', '005930'),
+                ('lock_exit', '2025-09-10'),
+            ],
+        )
 
     def test_inspect_returns_summary_for_requested_symbols(self) -> None:
         service = DailyMomentumFactorService()

@@ -1163,6 +1163,45 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
                 )
             session.commit()
 
+    def _add_comparative_statement_rows(
+        self,
+        snapshot_id: int,
+        **amounts: tuple[str, str, int, int],
+    ) -> None:
+        with Session(self.engine) as session:
+            for metric_key, (
+                statement_type,
+                account_id,
+                current_amount,
+                prior_amount,
+            ) in amounts.items():
+                is_flow = statement_type in {'IS', 'CIS', 'CF'}
+                session.add(
+                    DartFundamentalsRow(
+                        snapshot_id=snapshot_id,
+                        row_key=f'{metric_key}:{uuid4().hex}',
+                        statement_type=statement_type,
+                        account_id=account_id,
+                        account_name=metric_key,
+                        current_amount=(
+                            None if is_flow else current_amount
+                        ),
+                        current_cumulative_amount=(
+                            current_amount if is_flow else None
+                        ),
+                        prior_amount=(
+                            None if is_flow else prior_amount
+                        ),
+                        prior_cumulative_amount=(
+                            prior_amount if is_flow else None
+                        ),
+                        row_order=1,
+                        currency='KRW',
+                        payload={},
+                    )
+                )
+            session.commit()
+
     def test_load_inputs_reuses_preferred_issuer_metrics_and_signals_with_provenance(
         self,
     ) -> None:
@@ -1919,6 +1958,320 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         self.assertEqual(
             input_row.fundamentals_provenance[2024]['raw_row_derived_ratios'],
             ['current_ratio', 'gross_margin'],
+        )
+
+    def test_load_inputs_recovers_prior_ratios_from_latest_annual_comparatives(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        current_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+            total_equity=60,
+        )
+        self._add_amount_highlights(
+            current_snapshot_id,
+            total_assets=100,
+            total_liabilities=40,
+        )
+        self._add_comparative_statement_rows(
+            current_snapshot_id,
+            net_income=('IS', 'ifrs-full_ProfitLoss', 20, 10),
+            total_assets=('BS', 'ifrs-full_Assets', 100, 100),
+            total_equity=('BS', 'ifrs-full_Equity', 60, 50),
+            total_liabilities=(
+                'BS',
+                'ifrs-full_Liabilities',
+                40,
+                50,
+            ),
+            current_assets=(
+                'BS',
+                'ifrs-full_CurrentAssets',
+                50,
+                30,
+            ),
+            current_liabilities=(
+                'BS',
+                'ifrs-full_CurrentLiabilities',
+                25,
+                20,
+            ),
+            gross_profit=('IS', 'ifrs-full_GrossProfit', 40, 28),
+            revenue=('IS', 'ifrs-full_Revenue', 80, 70),
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertEqual(len(inputs), 1)
+        input_row = inputs[0]
+        self.assertEqual(input_row.annual_year, 2025)
+        self.assertEqual(input_row.prior_annual_year, 2024)
+        self.assertAlmostEqual(input_row.current_ratio, 2.0)
+        self.assertAlmostEqual(input_row.prior_current_ratio, 1.5)
+        self.assertAlmostEqual(input_row.gross_margin, 0.5)
+        self.assertAlmostEqual(input_row.prior_gross_margin, 0.4)
+        self.assertAlmostEqual(input_row.prior_debt_ratio, 1.0)
+        self.assertAlmostEqual(input_row.prior_asset_turnover, 0.7)
+        self.assertEqual(input_row.prior_net_income, 10.0)
+        self.assertEqual(input_row.prior_total_assets, 100.0)
+
+        prior_provenance = input_row.fundamentals_provenance[2024]
+        self.assertEqual(
+            prior_provenance['source'],
+            'dart_latest_annual_filing_comparative',
+        )
+        self.assertEqual(
+            prior_provenance['snapshot_id'],
+            current_snapshot_id,
+        )
+        self.assertEqual(prior_provenance['source_business_year'], 2025)
+        current_assets_provenance = prior_provenance[
+            'comparative_prior_facts'
+        ]['current_assets']
+        self.assertEqual(
+            current_assets_provenance['amount_field'],
+            'prior_amount',
+        )
+        self.assertIsNotNone(current_assets_provenance['row_id'])
+        gross_profit_provenance = prior_provenance[
+            'comparative_prior_facts'
+        ]['gross_profit']
+        self.assertEqual(
+            gross_profit_provenance['amount_field'],
+            'prior_cumulative_amount',
+        )
+        self.assertIsNotNone(gross_profit_provenance['row_id'])
+        self.assertAlmostEqual(
+            prior_provenance['comparative_prior_derived_ratios'][
+                'current_ratio'
+            ],
+            1.5,
+        )
+        self.assertAlmostEqual(
+            prior_provenance['comparative_prior_derived_ratios'][
+                'gross_margin'
+            ],
+            0.4,
+        )
+
+    def test_latest_annual_comparative_overrides_conflicting_prior_filing(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        prior_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2024,
+            receipt_date=date(2025, 3, 20),
+            net_income=8,
+        )
+        self._add_amount_highlights(
+            prior_snapshot_id,
+            cumulative_metrics={'gross_profit', 'revenue'},
+            current_assets=300,
+            current_liabilities=100,
+            gross_profit=60,
+            revenue=100,
+        )
+        self._add_ratio_highlights(
+            prior_snapshot_id,
+            current_ratio=3.0,
+            gross_margin=0.6,
+        )
+        current_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_comparative_statement_rows(
+            current_snapshot_id,
+            current_assets=(
+                'BS',
+                'ifrs-full_CurrentAssets',
+                50,
+                30,
+            ),
+            current_liabilities=(
+                'BS',
+                'ifrs-full_CurrentLiabilities',
+                25,
+                20,
+            ),
+            gross_profit=('IS', 'ifrs-full_GrossProfit', 40, 28),
+            revenue=('IS', 'ifrs-full_Revenue', 80, 70),
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        input_row = inputs[0]
+        self.assertAlmostEqual(input_row.prior_current_ratio, 1.5)
+        self.assertAlmostEqual(input_row.prior_gross_margin, 0.4)
+        prior_provenance = input_row.fundamentals_provenance[2024]
+        self.assertEqual(
+            prior_provenance['comparative_value_precedence'],
+            'latest_selected_annual_filing_comparative_'
+            'over_prior_filing_current',
+        )
+        self.assertEqual(
+            prior_provenance['superseded_prior_filing_provenance'][
+                'snapshot_id'
+            ],
+            prior_snapshot_id,
+        )
+        self.assertEqual(
+            prior_provenance['snapshot_id'],
+            current_snapshot_id,
+        )
+        self.assertEqual(
+            prior_provenance['comparative_prior_facts'][
+                'current_assets'
+            ]['superseded_prior_filing_value'],
+            300.0,
+        )
+
+    def test_partial_latest_comparative_invalidates_prior_stored_ratio(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        prior_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2024,
+            receipt_date=date(2025, 3, 20),
+            net_income=8,
+        )
+        self._add_amount_highlights(
+            prior_snapshot_id,
+            current_assets=300,
+            current_liabilities=100,
+        )
+        self._add_ratio_highlights(
+            prior_snapshot_id,
+            current_ratio=3.0,
+        )
+        current_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_comparative_statement_rows(
+            current_snapshot_id,
+            current_assets=(
+                'BS',
+                'ifrs-full_CurrentAssets',
+                50,
+                30,
+            ),
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        input_row = inputs[0]
+        self.assertIsNone(input_row.prior_current_ratio)
+        prior_provenance = input_row.fundamentals_provenance[2024]
+        self.assertEqual(
+            prior_provenance['comparative_prior_derived_ratios'],
+            {},
+        )
+        self.assertEqual(
+            prior_provenance['invalidated_derived_inputs'][
+                'current_ratio'
+            ],
+            ['current_liabilities'],
+        )
+        self.assertEqual(
+            prior_provenance['comparative_prior_facts'][
+                'current_liabilities'
+            ]['reason'],
+            'latest_comparative_derived_input_incomplete',
+        )
+
+    def test_zero_denominator_latest_comparative_invalidates_prior_ratio(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        prior_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2024,
+            receipt_date=date(2025, 3, 20),
+            net_income=8,
+        )
+        self._add_amount_highlights(
+            prior_snapshot_id,
+            current_assets=300,
+            current_liabilities=100,
+        )
+        self._add_ratio_highlights(
+            prior_snapshot_id,
+            current_ratio=3.0,
+        )
+        current_snapshot_id, _, _ = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        self._add_comparative_statement_rows(
+            current_snapshot_id,
+            current_assets=(
+                'BS',
+                'ifrs-full_CurrentAssets',
+                50,
+                30,
+            ),
+            current_liabilities=(
+                'BS',
+                'ifrs-full_CurrentLiabilities',
+                25,
+                0,
+            ),
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        input_row = inputs[0]
+        self.assertIsNone(input_row.prior_current_ratio)
+        prior_provenance = input_row.fundamentals_provenance[2024]
+        self.assertEqual(
+            prior_provenance['comparative_prior_derived_ratios'],
+            {},
+        )
+        self.assertEqual(
+            prior_provenance['invalidated_derived_inputs'][
+                'current_ratio'
+            ],
+            ['current_liabilities'],
         )
 
     def test_load_inputs_recovers_asset_turnover_when_other_ratios_are_stored(self) -> None:

@@ -63,6 +63,7 @@ from app.eod.pykrx_enrichment_gate import (
 from app.eod.pykrx_pipeline_runner import (
     POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS,
     POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
+    _build_pykrx_enrichment_symbol_scope_outcome,
     resolve_point_in_time_recovery,
     should_skip_point_in_time_current_only_stage,
     _finalize_daily_stage_scope,
@@ -82,7 +83,10 @@ from app.eod.run_stage_support import (
     is_exact_auto_pitr_intraday_watch_recovery_request,
     nonblocking_partial_progression_digest,
 )
-from app.eod.scope_outcomes import EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS
+from app.eod.scope_outcomes import (
+    EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
+    build_exact_symbol_scope_outcome,
+)
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
@@ -138,6 +142,7 @@ FACTOR_STAGE_ORDER: tuple[str, ...] = (
 )
 EXACT_MEMBERSHIP_BOUND_STAGE_IDS = frozenset(
     {
+        'pykrx_enrichment',
         'trending_ranks',
         'market_risk_filter',
         'fundamentals_daily_refresh',
@@ -203,6 +208,9 @@ DEFAULT_FEEDBACK_OUTER_BATCH_SIZE = 20
 FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS = 60.0
 DAILY_PIPELINE_FINALIZATION_ATTEMPTS = 3
 EXACT_SCOPE_OUTCOME_PROOF_SCHEMA_VERSION = 'exact_scope_outcome_proof_v1'
+STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION = (
+    'stage_completion_scope_v1'
+)
 PYKRX_INVOCATION_SCOPE_MANIFEST_VERSION = (
     'pykrx_daily_invocation_scope_v1'
 )
@@ -269,6 +277,7 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         label='pykrx universe refresh',
         group='market_data',
         description='Refresh the active pykrx universe used by daily price collection.',
+        depends_on=('master_refresh',),
         supports_market_date=False,
         supports_markets=True,
         supports_symbol_limit=True,
@@ -281,6 +290,7 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         label='pykrx daily price collection',
         group='market_data',
         description='Persist daily pykrx price bars for the selected market date.',
+        depends_on=('pykrx_universe_refresh',),
         supports_symbols=True,
         supports_markets=True,
         supports_force=True,
@@ -625,17 +635,51 @@ class DailyPipelineStageService:
         market_date: str | date | None,
         stages: Sequence[str] | None,
         resume_from_stage: str | None,
+        include_provider_dependency_closure: bool = True,
     ) -> dict[str, Any]:
+        stages_were_explicit = stages is not None
         requested_stages = self._resolve_requested_stages_for_resume(
             requested_stages=list(stages or DEFAULT_DAILY_STAGE_ORDER),
             resume_from_stage=resume_from_stage,
         )
+        provider_prefix_requested = any(
+            stage_id in {'pykrx_universe_refresh', 'price_collection'}
+            for stage_id in requested_stages
+        )
+        stages_to_resolve = list(requested_stages)
+        if (
+            stages_were_explicit
+            and include_provider_dependency_closure
+            and provider_prefix_requested
+        ):
+            # An explicit price/provider request owns only its acquisition
+            # control prefix.  Do not recursively pull the prerequisites of
+            # unrelated requested suffix stages: those stages validate their
+            # persisted inputs and fail closed when evidence is absent.
+            stages_to_resolve.append('master_refresh')
+            if 'price_collection' in requested_stages:
+                stages_to_resolve.append('pykrx_universe_refresh')
         return {
             'market_date': self._normalize_market_date(market_date),
             'requested_stages': requested_stages,
             'resolved_stages': self._resolve_stage_ids(
-                requested_stages,
-                inject_next_open_dependency=resume_from_stage is None,
+                stages_to_resolve,
+                # Explicit suffix/recovery requests consume persisted
+                # prerequisites.  They must never turn a stored-data repair
+                # into a new decider or provider run merely because a stage
+                # definition advertises its normal full-process predecessor.
+                inject_next_open_dependency=(
+                    resume_from_stage is None and not stages_were_explicit
+                ),
+                # Only an explicitly requested provider control stage (or the
+                # default official process, which contains price_collection)
+                # owns acquisition of its master -> universe prefix.  Derived
+                # and terminal suffixes validate/reuse persisted inputs.
+                include_dependency_closure=(
+                    resume_from_stage is None
+                    and include_provider_dependency_closure
+                    and not stages_were_explicit
+                ),
             ),
         }
 
@@ -676,16 +720,9 @@ class DailyPipelineStageService:
         summary_cutoff_contract_repair: bool = False,
         same_day_intraday_watch_rearm_resume: bool = False,
     ) -> dict[str, Any]:
-        validated_request = self.validate_run_request(
-            market_date=market_date,
-            stages=stages,
-            resume_from_stage=resume_from_stage,
-        )
-        requested_stages = validated_request['requested_stages']
-        resolved_stages = validated_request['resolved_stages']
-        resolved_market_date = validated_request['market_date']
+        normalized_market_date = self._normalize_market_date(market_date)
         point_in_time_recovery = resolve_point_in_time_recovery(
-            market_date=resolved_market_date,
+            market_date=normalized_market_date,
             requested=point_in_time_recovery,
             recovery_context=(
                 trigger in POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS
@@ -697,6 +734,15 @@ class DailyPipelineStageService:
                 else None
             ),
         )
+        validated_request = self.validate_run_request(
+            market_date=normalized_market_date,
+            stages=stages,
+            resume_from_stage=resume_from_stage,
+            include_provider_dependency_closure=not point_in_time_recovery,
+        )
+        requested_stages = validated_request['requested_stages']
+        resolved_stages = validated_request['resolved_stages']
+        resolved_market_date = validated_request['market_date']
         resolved_symbols = self._normalize_symbols(symbols)
         resolved_exact_membership_symbols = self._normalize_symbols(
             exact_membership_symbols
@@ -1775,23 +1821,183 @@ class DailyPipelineStageService:
                 'stages': pipeline_run.get('stages') or {},
             }
 
-        pykrx_requested = [stage_id for stage_id in resolved_stages if stage_id in PYKRX_PIPELINE_STAGE_ORDER]
+        pykrx_requested = [
+            stage_id
+            for stage_id in resolved_stages
+            if stage_id in PYKRX_PIPELINE_STAGE_ORDER
+        ]
+        grouped_pykrx_requested = 'price_collection' in pykrx_requested
         official_membership_symbols: list[str] | None = (
             list(resolved_exact_membership_symbols)
             if resolved_exact_membership_symbols is not None
-            else None
+            else (
+                list(resolved_symbols)
+                if resolved_symbols is not None
+                and not grouped_pykrx_requested
+                else None
+            )
         )
-        if 'price_collection' in pykrx_requested:
+
+        # The grouped PyKRX runner owns the authoritative universe acquisition
+        # used by price collection.  Run the advertised control prefix first so
+        # a failed master refresh cannot be followed by price or derived writes.
+        if (
+            grouped_pykrx_requested
+            and 'master_refresh' in resolved_stages
+            and 'master_refresh' not in handled
+        ):
+            self._start_tracked_stage(
+                pipeline_run_id=pipeline_run_id,
+                stage_id='master_refresh',
+                market_date=resolved_market_date,
+                symbols=None,
+            )
+            try:
+                master_result = self._execute_stage(
+                    'master_refresh',
+                    market_date=resolved_market_date,
+                    symbols=None,
+                    exact_scope_symbols=official_membership_symbols,
+                    markets=resolved_markets,
+                    force=force,
+                    bypass_prerequisite_gate=bypass_prerequisite_gate,
+                    allow_expired_analysis_replay=(
+                        allow_expired_analysis_replay
+                    ),
+                    fs_div=resolved_fs_div,
+                    symbol_limit=symbol_limit,
+                    symbol_offset=symbol_offset,
+                    capture_limit=capture_limit,
+                    retry_cycles=retry_cycles,
+                    feedback_max_cycles=feedback_max_cycles,
+                    feedback_outer_batch_size=feedback_outer_batch_size,
+                    reuse_existing_feedback=reuse_existing_feedback,
+                    point_in_time_recovery=point_in_time_recovery,
+                    allow_same_day_intraday_watch_continuation=(
+                        allow_same_day_intraday_watch_continuation
+                    ),
+                    allow_previous_session_preopen_recovery=(
+                        allow_previous_session_preopen_recovery
+                    ),
+                    provider_admission_fence_owned=(
+                        provider_admission_fence_owned
+                    ),
+                    run_id=reused_eod_collection_run_id,
+                )
+            except Exception as exc:
+                failed_result = {
+                    'status': 'failed',
+                    'reason': 'master_refresh_failed',
+                    'error_message': str(exc),
+                    'market_date': resolved_market_date,
+                }
+                failed_outcome = self._build_stage_outcome(
+                    'master_refresh',
+                    failed_result,
+                )
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id='master_refresh',
+                    market_date=resolved_market_date,
+                    outcome=failed_outcome,
+                    result=failed_result,
+                )
+                self._finish_run_preserving_primary_error(
+                    pipeline_run_id=pipeline_run_id,
+                    status='failed',
+                    error_message=str(exc),
+                )
+                raise
+            stage_outcomes['master_refresh'] = self._build_stage_outcome(
+                'master_refresh',
+                master_result,
+            )
+            self._finish_tracked_stage(
+                pipeline_run_id=pipeline_run_id,
+                stage_id='master_refresh',
+                market_date=resolved_market_date,
+                outcome=stage_outcomes['master_refresh'],
+                result=master_result,
+            )
+            handled.add('master_refresh')
+
+        grouped_control_prefix_ready = bool(
+            grouped_pykrx_requested
+            and (
+                'master_refresh' not in resolved_stages
+                or self._dependency_outcome_is_satisfied(
+                    stage_outcomes.get('master_refresh')
+                )
+            )
+        )
+        if grouped_pykrx_requested and not grouped_control_prefix_ready:
+            blocked_stage_ids = [
+                stage_id
+                for stage_id in (
+                    'pykrx_universe_refresh',
+                    *pykrx_requested,
+                )
+                if stage_id in resolved_stages and stage_id not in handled
+            ]
+            for blocked_stage_id in blocked_stage_ids:
+                blocked_result = {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'control_prefix_incomplete',
+                    'market_date': resolved_market_date,
+                    'incomplete_dependencies': ['master_refresh'],
+                }
+                self._start_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=blocked_stage_id,
+                    market_date=resolved_market_date,
+                    symbols=resolved_symbols,
+                )
+                stage_outcomes[blocked_stage_id] = (
+                    self._build_stage_outcome(
+                        blocked_stage_id,
+                        blocked_result,
+                    )
+                )
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=blocked_stage_id,
+                    market_date=resolved_market_date,
+                    outcome=stage_outcomes[blocked_stage_id],
+                    result=blocked_result,
+                    invocation_symbols=resolved_symbols,
+                )
+                handled.add(blocked_stage_id)
+
+        if grouped_control_prefix_ready:
+            universe_stage_started = bool(
+                'pykrx_universe_refresh' in resolved_stages
+                and 'pykrx_universe_refresh' not in handled
+            )
+            if universe_stage_started:
+                self._start_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id='pykrx_universe_refresh',
+                    market_date=resolved_market_date,
+                    symbols=None,
+                )
             try:
                 pykrx_kwargs = {
                     'market_date': resolved_market_date,
                     'stages': pykrx_requested,
                     'markets': resolved_markets,
                     'trigger': trigger,
+                    # An explicitly requested universe stage is fulfilled by
+                    # this one grouped acquisition.  The frozen snapshot it
+                    # returns is reused as downstream membership authority.
                     'refresh_universe': (
-                        settings.eod_auto_pykrx_refresh_universe
-                        if refresh_universe is None
-                        else refresh_universe
+                        True
+                        if universe_stage_started
+                        else (
+                            settings.eod_auto_pykrx_refresh_universe
+                            if refresh_universe is None
+                            else refresh_universe
+                        )
                     ),
                     'force': force,
                     'symbols': resolved_symbols,
@@ -1803,6 +2009,24 @@ class DailyPipelineStageService:
                     **pykrx_kwargs,
                 )
             except Exception as exc:
+                if universe_stage_started:
+                    universe_failure = {
+                        'status': 'failed',
+                        'reason': 'authoritative_universe_acquisition_failed',
+                        'error_message': str(exc),
+                        'market_date': resolved_market_date,
+                    }
+                    universe_failure_outcome = self._build_stage_outcome(
+                        'pykrx_universe_refresh',
+                        universe_failure,
+                    )
+                    self._finish_tracked_stage(
+                        pipeline_run_id=pipeline_run_id,
+                        stage_id='pykrx_universe_refresh',
+                        market_date=resolved_market_date,
+                        outcome=universe_failure_outcome,
+                        result=universe_failure,
+                    )
                 self._finish_run_preserving_primary_error(
                     pipeline_run_id=pipeline_run_id,
                     status='failed',
@@ -1855,6 +2079,85 @@ class DailyPipelineStageService:
                 official_membership_symbols = (
                     validated_snapshot_membership
                 )
+            if universe_stage_started:
+                universe_snapshot = pykrx_result.get('universe_snapshot')
+                grouped_run_skipped = bool(
+                    pykrx_result.get('skipped')
+                    or pykrx_result.get('triggered') is False
+                )
+                universe_authority_available = bool(
+                    official_membership_symbols
+                    and (
+                        validated_snapshot_membership is not None
+                        or (
+                            point_in_time_recovery
+                            and resolved_exact_membership_symbols is not None
+                        )
+                    )
+                )
+                universe_result: dict[str, Any] = {
+                    'status': (
+                        'skipped'
+                        if grouped_run_skipped
+                        else 'completed'
+                        if universe_authority_available
+                        else 'blocked'
+                    ),
+                    'reason': (
+                        str(
+                            pykrx_result.get('reason')
+                            or 'grouped_pykrx_run_skipped'
+                        )
+                        if grouped_run_skipped
+                        else 'frozen_point_in_time_membership_reused'
+                        if universe_authority_available
+                        and validated_snapshot_membership is None
+                        else 'authoritative_universe_snapshot_acquired'
+                        if universe_authority_available
+                        else 'authoritative_universe_membership_unavailable'
+                    ),
+                    'market_date': resolved_market_date,
+                    'triggered': (
+                        False if grouped_run_skipped else True
+                    ),
+                    'skipped': grouped_run_skipped,
+                    'source': 'pykrx',
+                    'markets': list(resolved_markets),
+                    'symbol_count': len(official_membership_symbols or ()),
+                    'persisted_count': (
+                        int(universe_snapshot.get('persisted_count') or 0)
+                        if isinstance(universe_snapshot, Mapping)
+                        else 0
+                    ),
+                    'membership_sha256': (
+                        market_membership_sha256(
+                            official_membership_symbols
+                        )
+                        if official_membership_symbols
+                        else None
+                    ),
+                    'frozen_for_pipeline': universe_authority_available,
+                    'universe_snapshot': (
+                        dict(universe_snapshot)
+                        if isinstance(universe_snapshot, Mapping)
+                        else None
+                    ),
+                }
+                stage_outcomes['pykrx_universe_refresh'] = (
+                    self._build_stage_outcome(
+                        'pykrx_universe_refresh',
+                        universe_result,
+                    )
+                )
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id='pykrx_universe_refresh',
+                    market_date=resolved_market_date,
+                    outcome=stage_outcomes['pykrx_universe_refresh'],
+                    result=universe_result,
+                    invocation_symbols=official_membership_symbols,
+                )
+                handled.add('pykrx_universe_refresh')
             pykrx_admitted_symbols: dict[
                 str, list[str] | None
             ] = {}
@@ -1952,8 +2255,8 @@ class DailyPipelineStageService:
                 )
             ):
                 stage_symbols = list(official_membership_symbols)
-            terminal_decider_symbols = (
-                self._terminal_decider_completed_symbols(
+            terminal_decider_progression_proof = (
+                self._terminal_decider_progression_proof(
                     stage_outcomes.get('signal_decider'),
                     expected_decider_symbols=(
                         feedback_cutoff_resolution.get(
@@ -1975,8 +2278,23 @@ class DailyPipelineStageService:
                 }
                 else None
             )
+            terminal_decider_symbols = (
+                list(
+                    terminal_decider_progression_proof[
+                        'completed_symbols'
+                    ]
+                )
+                if isinstance(
+                    terminal_decider_progression_proof,
+                    Mapping,
+                )
+                else None
+            )
             if (
-                stage_id == 'signal_decider_evaluations'
+                stage_id in {
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                }
                 and terminal_decider_symbols
             ):
                 stage_symbols = list(terminal_decider_symbols)
@@ -2071,6 +2389,35 @@ class DailyPipelineStageService:
                 and terminal_decider_symbols
             ):
                 incomplete_dependencies.remove('signal_decider')
+            if (
+                stage_id == 'signal_decider_evaluations'
+                and stage_outcomes.get('signal_decider') is not None
+                and not terminal_decider_symbols
+                and str(
+                    stage_outcomes['signal_decider'].get('status') or ''
+                ).strip().lower()
+                == 'completed'
+                and 'signal_decider' not in incomplete_dependencies
+            ):
+                incomplete_dependencies.append('signal_decider')
+            if (
+                stage_id in {
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                }
+                and terminal_decider_symbols is None
+                and stage_outcomes.get('signal_decider') is None
+                and (
+                    resume_from_stage is None
+                    or same_day_intraday_watch_rearm_resume
+                )
+                and 'signal_decider' not in incomplete_dependencies
+            ):
+                # An ordinary direct suffix resume may validate a persisted
+                # boundary in the downstream service.  Same-day rearm must
+                # carry same-run terminal proof; never speculate from a
+                # proofless persisted completion during an open session.
+                incomplete_dependencies.append('signal_decider')
             if STAGE_DEFINITIONS[stage_id].supports_symbols:
                 for dependency in STAGE_DEFINITIONS[stage_id].depends_on:
                     if dependency not in resolved_stages:
@@ -2207,9 +2554,20 @@ class DailyPipelineStageService:
             if stage_id == 'next_open_execution_plan':
                 decider_outcome = stage_outcomes.get('signal_decider')
                 decider_status = str((decider_outcome or {}).get('status') or '').strip().lower()
-                if decider_outcome is not None and not self._dependency_outcome_is_satisfied(
-                    decider_outcome
-                ) and not terminal_decider_symbols:
+                if (
+                    not terminal_decider_symbols
+                    and (
+                        resume_from_stage is None
+                        or same_day_intraday_watch_rearm_resume
+                    )
+                    and (
+                        decider_outcome is None
+                        or decider_status == 'completed'
+                        or not self._dependency_outcome_is_satisfied(
+                            decider_outcome
+                        )
+                    )
+                ):
                     stage_result = {
                         'triggered': False,
                         'status': 'blocked',
@@ -2634,6 +2992,15 @@ class DailyPipelineStageService:
                             feedback_cutoff_resolution=(
                                 feedback_cutoff_resolution
                             ),
+                            completion_parent_proof=(
+                                terminal_decider_progression_proof
+                                if stage_id
+                                in {
+                                    'next_open_execution_plan',
+                                    'signal_decider_evaluations',
+                                }
+                                else None
+                            ),
                             point_in_time_recovery=(
                                 point_in_time_recovery
                             ),
@@ -2653,6 +3020,24 @@ class DailyPipelineStageService:
                                     stage_id=stage_id,
                                     market_date=resolved_market_date,
                                 )
+                            ),
+                            complete_price_scope_proven=(
+                                self._complete_price_scope_is_proven(
+                                    exact_scope_symbols=(
+                                        official_membership_symbols
+                                    ),
+                                    admitted_symbols=stage_symbols,
+                                    price_outcome=stage_outcomes.get(
+                                        'price_collection'
+                                    ),
+                                    price_invocation_symbols=(
+                                        stage_invocation_symbols.get(
+                                            'price_collection'
+                                        )
+                                    ),
+                                )
+                                if stage_id == 'trending_ranks'
+                                else False
                             ),
                         )
 
@@ -2727,6 +3112,31 @@ class DailyPipelineStageService:
                         'requested_symbols': list(stage_symbols or []),
                     }
                 stage_outcomes[stage_id] = self._build_stage_outcome(stage_id, stage_result)
+                stage_completion_authority = (
+                    self._terminal_decider_progression_proof(
+                        stage_outcomes[stage_id],
+                        expected_decider_symbols=(
+                            feedback_cutoff_resolution.get(
+                                'requested_symbols'
+                            )
+                            if isinstance(
+                                feedback_cutoff_resolution,
+                                Mapping,
+                            )
+                            else None
+                        ),
+                        feedback_cutoff_resolution=(
+                            feedback_cutoff_resolution
+                        ),
+                    )
+                    if stage_id == 'signal_decider'
+                    else terminal_decider_progression_proof
+                    if stage_id in {
+                        'next_open_execution_plan',
+                        'signal_decider_evaluations',
+                    }
+                    else None
+                )
                 self._finish_tracked_stage(
                     pipeline_run_id=pipeline_run_id,
                     stage_id=stage_id,
@@ -2735,6 +3145,9 @@ class DailyPipelineStageService:
                     result=stage_result,
                     invocation_symbols=stage_invocation_symbols.get(
                         stage_id
+                    ),
+                    completion_parent_proof=(
+                        stage_completion_authority
                     ),
                 )
                 if (
@@ -3074,6 +3487,27 @@ class DailyPipelineStageService:
                 (evaluation_outcome or {}).get('result'),
             )
         )
+        decider_completion_scope_proof = (
+            DailyPipelineStageService
+            .validated_stage_completion_scope_proof(
+                'signal_decider',
+                decider_proof,
+            )
+        )
+        plan_completion_scope_proof = (
+            DailyPipelineStageService
+            ._build_next_open_completion_scope_proof(
+                (plan_outcome or {}).get('result') or {},
+                parent_scope_proof=decider_completion_scope_proof,
+            )
+        )
+        evaluation_completion_scope_proof = (
+            DailyPipelineStageService
+            ._build_evaluations_completion_scope_proof(
+                (evaluation_outcome or {}).get('result') or {},
+                parent_scope_proof=decider_completion_scope_proof,
+            )
+        )
         if not (
             str((plan_outcome or {}).get('status') or '').strip().lower()
             == 'completed'
@@ -3084,6 +3518,9 @@ class DailyPipelineStageService:
             and actionable_symbols
             and isinstance(plan_scope_proof, Mapping)
             and isinstance(evaluation_scope_proof, Mapping)
+            and isinstance(decider_completion_scope_proof, Mapping)
+            and isinstance(plan_completion_scope_proof, Mapping)
+            and isinstance(evaluation_completion_scope_proof, Mapping)
             and evaluation_scope_proof.get('requested_symbols')
             == actionable_symbols
             and set(plan_scope_proof.get('active_symbols') or [])
@@ -3171,6 +3608,37 @@ class DailyPipelineStageService:
                 'actionable_symbols': actionable_symbols,
                 'plan_scope_proof': plan_scope_proof,
                 'evaluation_scope_proof': evaluation_scope_proof,
+            },
+            'completion_authority': {
+                'schema_version': (
+                    'nonblocking_strict_completion_authority_v1'
+                ),
+                'parent_run_id': decider_completion_scope_proof[
+                    'source_run_id'
+                ],
+                'parent_summary_run_id': (
+                    decider_completion_scope_proof[
+                        'source_summary_run_id'
+                    ]
+                ),
+                'completed_symbols': list(actionable_symbols),
+                'decision_identities': list(
+                    decider_completion_scope_proof[
+                        'decision_identities'
+                    ]
+                ),
+                'signal_decider_proof_digest': (
+                    decider_completion_scope_proof['proof_digest']
+                ),
+                'next_open_execution_plan_proof_digest': (
+                    plan_completion_scope_proof['proof_digest']
+                ),
+                'signal_decider_evaluations_proof_digest': (
+                    evaluation_completion_scope_proof['proof_digest']
+                ),
+                'next_open_manifest_digest': (
+                    plan_completion_scope_proof['manifest_digest']
+                ),
             },
             'retry_debt': {
                 'schema_version': (
@@ -3355,9 +3823,83 @@ class DailyPipelineStageService:
         outcome: dict[str, Any],
         result: dict[str, Any],
         invocation_symbols: Sequence[str] | None = None,
+        completion_parent_proof: Mapping[str, Any] | None = None,
     ) -> None:
         counts = self._extract_stage_counts(stage_id=stage_id, result=result)
         status = str(outcome.get('status') or 'completed')
+        details = self._build_stage_run_details(
+            stage_id=stage_id,
+            result=result,
+            invocation_symbols=invocation_symbols,
+            completion_parent_proof=completion_parent_proof,
+        )
+        source_run_ids = self._extract_stage_source_run_ids(result)
+        completion_scope_proof = details.get('completion_scope_proof')
+        missing_completion_authority = bool(
+            status == 'completed'
+            and (
+                (
+                    stage_id == 'signal_decider'
+                    and not isinstance(
+                        completion_scope_proof,
+                        Mapping,
+                    )
+                )
+                or (
+                    stage_id == 'next_open_execution_plan'
+                    and not isinstance(
+                        completion_scope_proof,
+                        Mapping,
+                    )
+                )
+                or (
+                    stage_id == 'signal_decider_evaluations'
+                    and not isinstance(
+                        completion_scope_proof,
+                        Mapping,
+                    )
+                )
+            )
+        )
+        if missing_completion_authority:
+            status = 'partial'
+            outcome['status'] = status
+            details['completion_authority_status'] = 'invalid'
+            details['completion_authority_reason'] = (
+                'terminal_progression_proof_unavailable'
+            )
+        if (
+            stage_id in {
+                'signal_decider',
+                'next_open_execution_plan',
+                'signal_decider_evaluations',
+            }
+            and isinstance(completion_scope_proof, Mapping)
+        ):
+            if stage_id == 'signal_decider':
+                source_run_ids.update(
+                    {
+                        'signal_decider_run_id': (
+                            completion_scope_proof['source_run_id']
+                        ),
+                        'source_summary_run_id': (
+                            completion_scope_proof[
+                                'source_summary_run_id'
+                            ]
+                        ),
+                    }
+                )
+            else:
+                source_run_ids.update({
+                    'parent_signal_decider_run_id': (
+                        completion_scope_proof['parent_run_id']
+                    ),
+                    'source_summary_run_id': (
+                        completion_scope_proof[
+                            'parent_summary_run_id'
+                        ]
+                    ),
+                })
         finish_kwargs = {
             'pipeline_run_id': pipeline_run_id,
             'stage_id': stage_id,
@@ -3380,12 +3922,8 @@ class DailyPipelineStageService:
                 )
                 or None
             ),
-            'source_run_ids': self._extract_stage_source_run_ids(result),
-            'details': self._build_stage_run_details(
-                stage_id=stage_id,
-                result=result,
-                invocation_symbols=invocation_symbols,
-            ),
+            'source_run_ids': source_run_ids,
+            'details': details,
         }
         last_error: Exception | None = None
         for _attempt in range(DAILY_PIPELINE_FINALIZATION_ATTEMPTS):
@@ -3751,6 +4289,25 @@ class DailyPipelineStageService:
                 snapshot_succeeded + snapshot_failed,
                 context_succeeded + context_failed,
             )
+            if (
+                result.get('scope_outcome_contract_status') == 'invalid'
+            ):
+                retryable_symbols = result.get('retryable_symbols')
+                retryable_count = _int(
+                    result.get('retryable_symbol_count')
+                )
+                if isinstance(retryable_symbols, list):
+                    retryable_count = max(
+                        retryable_count,
+                        len(retryable_symbols),
+                    )
+                total = max(total, retryable_count)
+                return {
+                    'processed': total,
+                    'total': total,
+                    'succeeded': 0,
+                    'failed': total,
+                }
             failed = max(snapshot_failed, context_failed)
             return {
                 'processed': total,
@@ -3776,7 +4333,15 @@ class DailyPipelineStageService:
         if stage_id == 'market_risk_snapshots':
             succeeded = _int(result.get('snapshots_persisted'))
             failed = _int(result.get('snapshots_failed'))
-            total = len(result.get('matched_symbols') or []) or succeeded + failed
+            requested_symbols = result.get('requested_symbols')
+            if isinstance(requested_symbols, list):
+                total = len(requested_symbols)
+                failed = max(failed, total - succeeded)
+            else:
+                total = (
+                    len(result.get('matched_symbols') or [])
+                    or succeeded + failed
+                )
             return {
                 'processed': succeeded + failed,
                 'total': total,
@@ -3866,11 +4431,12 @@ class DailyPipelineStageService:
                 if 'collected_symbol_count' in summary
                 else summary.get('matched_symbol_count')
             )
-            succeeded = _int(
-                summary.get('recent_news_symbol_count')
-                if 'recent_news_symbol_count' in summary
-                else collected
-            )
+            # A successful collection attempt is terminal work even when the
+            # provider returns no recent article.  Fresh/stale/no-result is a
+            # data-quality distinction, not a task outcome; using only
+            # ``recent_news_symbol_count`` made successful no-result and stale
+            # symbols disappear from both success and failure totals.
+            succeeded = collected
             failed = _int(summary.get('failed_symbol_count')) + _int(
                 summary.get('skipped_symbol_count')
             )
@@ -3919,6 +4485,37 @@ class DailyPipelineStageService:
                 'succeeded': succeeded,
                 'failed': failed,
             }
+        if stage_id == 'signal_features':
+            selected_scope = result.get('selected_stock_codes')
+            if isinstance(selected_scope, list):
+                scope_status = str(
+                    result.get('status') or ''
+                ).strip().lower()
+                if scope_status not in {'completed', 'partial'}:
+                    scope_status = (
+                        'partial'
+                        if result.get('retry_debt_stock_codes')
+                        else 'completed'
+                    )
+                partition = _validated_exact_scope_outcome(
+                    result=result,
+                    invocation_symbols=selected_scope,
+                    status=scope_status,
+                )
+                if partition is not None:
+                    succeeded = len(
+                        partition['successful_stock_codes']
+                    ) + len(
+                        partition['terminal_not_applicable_stock_codes']
+                    )
+                    failed = len(partition['retry_debt_stock_codes'])
+                    total = len(partition['selected_stock_codes'])
+                    return {
+                        'processed': succeeded + failed,
+                        'total': total,
+                        'succeeded': succeeded,
+                        'failed': failed,
+                    }
 
         count_pairs = (
             ('snapshots_persisted', 'snapshots_failed'),
@@ -4095,6 +4692,1601 @@ class DailyPipelineStageService:
         }
 
     @staticmethod
+    def _stage_completion_scope_proof_digest(
+        proof: Mapping[str, Any],
+    ) -> str:
+        payload = {
+            str(key): value
+            for key, value in proof.items()
+            if str(key) != 'proof_digest'
+        }
+        serialized = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=True,
+        )
+        return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _build_feedback_completion_scope_proof(
+        result: Mapping[str, Any],
+        *,
+        invocation_symbols: Sequence[str] | None,
+    ) -> dict[str, Any] | None:
+        if str(result.get('status') or '').strip().lower() != 'completed':
+            return None
+        roles = result.get('roles')
+        progress = result.get('progress')
+        summary = (
+            progress.get('summary')
+            if isinstance(progress, Mapping)
+            and isinstance(progress.get('summary'), Mapping)
+            else None
+        )
+        role_progress = (
+            summary.get('role_progress')
+            if isinstance(summary, Mapping)
+            else None
+        )
+        role_scopes = (
+            summary.get('role_symbol_scopes')
+            if isinstance(summary, Mapping)
+            else None
+        )
+        source_run_id = str(result.get('run_id') or '').strip()
+        raw_knowledge_cutoff_at = result.get('knowledge_cutoff_at')
+        try:
+            knowledge_cutoff_at = (
+                raw_knowledge_cutoff_at
+                if isinstance(raw_knowledge_cutoff_at, datetime)
+                else datetime.fromisoformat(
+                    str(raw_knowledge_cutoff_at or '').strip()
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            knowledge_cutoff_at.tzinfo is None
+            or knowledge_cutoff_at.utcoffset() is None
+        ):
+            return None
+        knowledge_cutoff_at_iso = knowledge_cutoff_at.astimezone(
+            timezone.utc
+        ).isoformat()
+        feedback_scope_mode = str(
+            result.get('feedback_scope_mode') or ''
+        ).strip()
+        expected_roles = list(SUMMARIZER_AGENT_NAMES)
+        if not (
+            isinstance(roles, list)
+            and len(roles) == len(expected_roles)
+            and set(roles) == set(expected_roles)
+            and isinstance(summary, Mapping)
+            and isinstance(role_progress, Mapping)
+            and set(role_progress) == set(expected_roles)
+            and isinstance(role_scopes, Mapping)
+            and set(role_scopes) == set(expected_roles)
+            and source_run_id
+            and str(summary.get('run_id') or source_run_id).strip()
+            == source_run_id
+            and feedback_scope_mode
+            in {
+                FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            }
+        ):
+            return None
+
+        def strict_count(value: Any) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value if value >= 0 else None
+
+        canonical_scopes: dict[str, list[str]] = {}
+        role_counts: dict[str, int] = {}
+        for role in expected_roles:
+            raw_scope = role_scopes.get(role)
+            state = role_progress.get(role)
+            if not isinstance(raw_scope, list) or not isinstance(
+                state,
+                Mapping,
+            ):
+                return None
+            normalized_scope = normalize_symbol_codes(raw_scope)
+            if (
+                len(normalized_scope) != len(raw_scope)
+                or len(set(normalized_scope)) != len(normalized_scope)
+            ):
+                return None
+            normalized_scope = sorted(normalized_scope)
+            counts = {
+                key: strict_count(state.get(key))
+                for key in (
+                    'total_symbols',
+                    'processed_symbols',
+                    'completed_symbols',
+                    'in_progress_symbols',
+                    'pending_symbols',
+                    'failed_items',
+                    'retry_pending_symbols',
+                )
+            }
+            if not (
+                str(state.get('role') or '').strip() == role
+                and str(state.get('status') or '').strip().lower()
+                == 'completed'
+                and str(
+                    state.get('boundary_status') or ''
+                ).strip().lower()
+                == 'completed'
+                and counts['total_symbols'] == len(normalized_scope)
+                and counts['processed_symbols'] == len(normalized_scope)
+                and counts['completed_symbols'] == len(normalized_scope)
+                and counts['in_progress_symbols'] == 0
+                and counts['pending_symbols'] == 0
+                and counts['failed_items'] == 0
+                and counts['retry_pending_symbols'] == 0
+            ):
+                return None
+            canonical_scopes[role] = normalized_scope
+            role_counts[role] = len(normalized_scope)
+
+        total_item_count = sum(role_counts.values())
+        if not (
+            total_item_count > 0
+            and strict_count(summary.get('expected_feedback_count'))
+            == total_item_count
+            and strict_count(summary.get('completed_feedback_count'))
+            == total_item_count
+            and strict_count(summary.get('failed_items')) == 0
+        ):
+            return None
+        scope_symbols = sorted(
+            {
+                symbol
+                for role_scope in canonical_scopes.values()
+                for symbol in role_scope
+            }
+        )
+        if invocation_symbols is None:
+            requested_scope_kind = 'resolved_role_scope_union'
+            requested_symbols = list(scope_symbols)
+        else:
+            requested_symbols = sorted(
+                normalize_symbol_codes(invocation_symbols)
+            )
+            if not (
+                requested_symbols
+                and len(requested_symbols) == len(invocation_symbols)
+                and len(set(requested_symbols)) == len(requested_symbols)
+                and set(scope_symbols) <= set(requested_symbols)
+            ):
+                return None
+            requested_scope_kind = 'explicit_invocation'
+        proof: dict[str, Any] = {
+            'schema_version': (
+                STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION
+            ),
+            'kind': 'agent_feedback_summaries_role_scope',
+            'source_run_id': source_run_id,
+            'knowledge_cutoff_at': knowledge_cutoff_at_iso,
+            'feedback_scope_mode': feedback_scope_mode,
+            'roles': expected_roles,
+            'requested_scope_kind': requested_scope_kind,
+            'requested_symbols': requested_symbols,
+            'scope_symbols': scope_symbols,
+            'role_symbol_scopes': canonical_scopes,
+            'role_symbol_counts': role_counts,
+            'role_scope_manifest_fingerprint': (
+                DailyPipelineStageService
+                ._stage_completion_scope_proof_digest(
+                    {
+                        'requested_symbols': requested_symbols,
+                        'role_symbol_scopes': canonical_scopes,
+                    }
+                )
+            ),
+            'total_item_count': total_item_count,
+        }
+        proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(proof)
+        )
+        return proof
+
+    @staticmethod
+    def _build_next_open_completion_scope_proof(
+        result: Mapping[str, Any],
+        *,
+        parent_scope_proof: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        parent_scope_proof = (
+            DailyPipelineStageService
+            .validated_stage_completion_scope_proof(
+                'signal_decider',
+                parent_scope_proof,
+            )
+        )
+        if parent_scope_proof is None:
+            return None
+        parent_run_id = str(
+            parent_scope_proof.get('source_run_id') or ''
+        ).strip()
+        parent_summary_run_id = str(
+            parent_scope_proof.get('source_summary_run_id') or ''
+        ).strip()
+        raw_admitted_symbols = parent_scope_proof.get(
+            'admitted_symbols'
+        )
+        raw_completed_symbols = parent_scope_proof.get(
+            'completed_symbols'
+        )
+        if not (
+            parent_run_id
+            and parent_summary_run_id
+            and isinstance(raw_admitted_symbols, list)
+            and isinstance(raw_completed_symbols, list)
+        ):
+            return None
+        parent_admitted_symbols = sorted(
+            normalize_symbol_codes(raw_admitted_symbols)
+        )
+        parent_completed_symbols = sorted(
+            normalize_symbol_codes(raw_completed_symbols)
+        )
+        raw_parent_identities = parent_scope_proof.get(
+            'decision_identities'
+        )
+        if not (
+            parent_admitted_symbols
+            and parent_completed_symbols
+            and len(parent_admitted_symbols)
+            == len(raw_admitted_symbols)
+            and len(parent_completed_symbols)
+            == len(raw_completed_symbols)
+            and set(parent_completed_symbols)
+            <= set(parent_admitted_symbols)
+            and isinstance(raw_parent_identities, list)
+        ):
+            return None
+        parent_identities_by_key = {
+            (
+                str(identity['symbol']),
+                str(identity['decision_agent_name']),
+            ): (
+                int(identity['decision_snapshot_id']),
+                str(identity['decision_run_id']),
+            )
+            for identity in raw_parent_identities
+        }
+        manifest = result.get('completion_manifest')
+        items = result.get('items')
+        if not (
+            str(result.get('status') or '').strip().lower()
+            == 'completed'
+            and isinstance(manifest, Mapping)
+            and isinstance(items, list)
+        ):
+            return None
+        raw_manifest_digest = str(
+            manifest.get('manifest_digest') or ''
+        ).strip()
+        manifest_payload = {
+            str(key): value
+            for key, value in manifest.items()
+            if str(key) != 'manifest_digest'
+        }
+        manifest_digest = hashlib.sha256(
+            json.dumps(
+                manifest_payload,
+                sort_keys=True,
+                separators=(',', ':'),
+                ensure_ascii=True,
+            ).encode('utf-8')
+        ).hexdigest()
+        role_symbol_scopes = manifest.get('role_symbol_scopes')
+        partition = manifest.get('decision_partition')
+        if not (
+            manifest.get('schema_version')
+            == 'next_open_completion_manifest_v1'
+            and raw_manifest_digest == manifest_digest
+            and str(manifest.get('parent_run_id') or '').strip()
+            == parent_run_id
+            and str(
+                manifest.get('authority_fingerprint') or ''
+            ).strip()
+            and str(
+                manifest.get('generation_fingerprint') or ''
+            ).strip()
+            and isinstance(role_symbol_scopes, Mapping)
+            and set(role_symbol_scopes)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
+            and isinstance(partition, list)
+        ):
+            return None
+        manifest_role_scopes: dict[str, list[str]] = {}
+        for role in DECISION_SUPPORT_AGENT_NAMES:
+            raw_scope = role_symbol_scopes.get(role)
+            if not (
+                isinstance(raw_scope, list)
+                and normalize_symbol_codes(raw_scope) == raw_scope
+                and sorted(set(raw_scope)) == raw_scope
+                and raw_scope == parent_completed_symbols
+            ):
+                return None
+            manifest_role_scopes[role] = list(raw_scope)
+        canonical_role_scopes = {
+            role: list(parent_completed_symbols)
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        expected_decisions = {
+            (symbol, role)
+            for role in DECISION_SUPPORT_AGENT_NAMES
+            for symbol in parent_completed_symbols
+        }
+        manifest_decisions = {
+            (symbol, role)
+            for role, symbols in manifest_role_scopes.items()
+            for symbol in symbols
+        }
+
+        canonical_partition: list[dict[str, Any]] = []
+        result_item_identity: set[
+            tuple[int, str, str, str, int, str]
+        ] = set()
+        for item in items:
+            if not isinstance(item, Mapping):
+                return None
+            plan_item_id = item.get('plan_item_id')
+            account_reference = str(
+                item.get('account_reference') or ''
+            ).strip()
+            normalized_symbol = normalize_symbol_codes(
+                [item.get('symbol')]
+            )
+            decision_agent_name = str(
+                item.get('decision_agent_name')
+                or item.get('agent_name')
+                or ''
+            ).strip()
+            decision_snapshot_id = item.get('decision_snapshot_id')
+            decision_run_id = str(
+                item.get('decision_run_id') or ''
+            ).strip()
+            identity = (
+                plan_item_id,
+                account_reference,
+                normalized_symbol[0] if normalized_symbol else '',
+                decision_agent_name,
+                decision_snapshot_id,
+                decision_run_id,
+            )
+            if not (
+                type(plan_item_id) is int
+                and plan_item_id > 0
+                and account_reference
+                and len(normalized_symbol) == 1
+                and decision_agent_name
+                in DECISION_SUPPORT_AGENT_NAMES
+                and type(decision_snapshot_id) is int
+                and decision_snapshot_id > 0
+                and decision_run_id
+                and identity not in result_item_identity
+            ):
+                return None
+            result_item_identity.add(identity)
+
+        manifest_item_identity: set[
+            tuple[int, str, str, str, int, str]
+        ] = set()
+        seen_decisions: set[tuple[str, str]] = set()
+        included_decision_count = 0
+        excluded_decision_count = 0
+        active_item_count = 0
+        manifest_included_decision_count = 0
+        manifest_excluded_decision_count = 0
+        manifest_incomplete_decision_count = 0
+        for raw_entry in partition:
+            if not isinstance(raw_entry, Mapping):
+                return None
+            normalized_symbol = normalize_symbol_codes(
+                [raw_entry.get('symbol')]
+            )
+            role = str(
+                raw_entry.get('decision_agent_name') or ''
+            ).strip()
+            decision_run_id = str(
+                raw_entry.get('decision_run_id') or ''
+            ).strip()
+            snapshot_id = raw_entry.get('decision_snapshot_id')
+            canonical_action = str(
+                raw_entry.get('canonical_action') or ''
+            ).strip().lower()
+            authority_fingerprint = str(
+                raw_entry.get('authority_fingerprint') or ''
+            ).strip()
+            generation_fingerprint = str(
+                raw_entry.get('generation_fingerprint') or ''
+            ).strip()
+            disposition = str(
+                raw_entry.get('disposition') or ''
+            ).strip().lower()
+            included_items = raw_entry.get('included_items')
+            exclusion = raw_entry.get('exclusion')
+            decision_key = (
+                normalized_symbol[0] if normalized_symbol else '',
+                role,
+            )
+            actionable = bool(
+                (role == 'signal-decider' and canonical_action == 'buy')
+                or (
+                    role == 'short-term-decider'
+                    and canonical_action
+                    in {'scalp_buy_candidate', 'watch_for_trigger'}
+                )
+            )
+            if not (
+                len(normalized_symbol) == 1
+                and role in DECISION_SUPPORT_AGENT_NAMES
+                and decision_key in manifest_decisions
+                and decision_key not in seen_decisions
+                and disposition
+                in {'included', 'non_actionable', 'incomplete'}
+                and isinstance(included_items, list)
+            ):
+                return None
+            seen_decisions.add(decision_key)
+            if disposition == 'included':
+                manifest_included_decision_count += 1
+            elif disposition == 'non_actionable':
+                manifest_excluded_decision_count += 1
+            else:
+                manifest_incomplete_decision_count += 1
+
+            expected_identity = parent_identities_by_key.get(
+                decision_key
+            )
+            if not (
+                expected_identity is not None
+                and decision_run_id
+                and (snapshot_id, decision_run_id)
+                == expected_identity
+                and type(snapshot_id) is int
+                and snapshot_id > 0
+                and canonical_action
+                and authority_fingerprint
+                and generation_fingerprint
+                and disposition in {'included', 'non_actionable'}
+            ):
+                return None
+            canonical_items: list[dict[str, Any]] = []
+            if disposition == 'included':
+                if not actionable or not included_items or exclusion is not None:
+                    return None
+                included_decision_count += 1
+                for raw_item in included_items:
+                    if not isinstance(raw_item, Mapping):
+                        return None
+                    plan_item_id = raw_item.get('plan_item_id')
+                    account_reference = str(
+                        raw_item.get('account_reference') or ''
+                    ).strip()
+                    eligibility_status = str(
+                        raw_item.get('eligibility_status') or ''
+                    ).strip().lower()
+                    handoff_active = raw_item.get('handoff_active')
+                    exec_monitoring_active = raw_item.get(
+                        'exec_monitoring_active'
+                    )
+                    row_authority_fingerprint = str(
+                        raw_item.get('row_authority_fingerprint')
+                        or ''
+                    ).strip()
+                    item_identity = (
+                        plan_item_id,
+                        account_reference,
+                        normalized_symbol[0],
+                        role,
+                        snapshot_id,
+                        decision_run_id,
+                    )
+                    if not (
+                        type(plan_item_id) is int
+                        and plan_item_id > 0
+                        and account_reference
+                        and eligibility_status
+                        and type(handoff_active) is bool
+                        and type(exec_monitoring_active) is bool
+                        and row_authority_fingerprint
+                        and item_identity not in manifest_item_identity
+                    ):
+                        return None
+                    manifest_item_identity.add(item_identity)
+                    active_item_count += int(
+                        handoff_active or exec_monitoring_active
+                    )
+                    canonical_items.append(
+                        {
+                            'plan_item_id': plan_item_id,
+                            'account_reference': account_reference,
+                            'eligibility_status': eligibility_status,
+                            'handoff_active': handoff_active,
+                            'exec_monitoring_active': (
+                                exec_monitoring_active
+                            ),
+                            'row_authority_fingerprint': (
+                                row_authority_fingerprint
+                            ),
+                        }
+                    )
+                canonical_items.sort(
+                    key=lambda item: (
+                        item['account_reference'],
+                        item['plan_item_id'],
+                    )
+                )
+                if canonical_items != included_items:
+                    return None
+                canonical_exclusion = None
+            else:
+                if not (
+                    not actionable
+                    and not included_items
+                    and isinstance(exclusion, Mapping)
+                    and set(exclusion) == {'kind', 'reason_code'}
+                    and exclusion.get('kind') == 'non_actionable'
+                    and exclusion.get('reason_code')
+                    == 'latest_snapshot_not_actionable'
+                ):
+                    return None
+                excluded_decision_count += 1
+                canonical_exclusion = dict(exclusion)
+            canonical_partition.append(
+                {
+                    'symbol': normalized_symbol[0],
+                    'decision_agent_name': role,
+                    'decision_run_id': decision_run_id,
+                    'decision_snapshot_id': snapshot_id,
+                    'canonical_action': canonical_action,
+                    'authority_fingerprint': authority_fingerprint,
+                    'generation_fingerprint': generation_fingerprint,
+                    'disposition': disposition,
+                    'included_items': canonical_items,
+                    'exclusion': canonical_exclusion,
+                }
+            )
+        canonical_partition.sort(
+            key=lambda entry: (
+                entry['symbol'],
+                entry['decision_agent_name'],
+            )
+        )
+        included_item_count = len(manifest_item_identity)
+        if not (
+            manifest_decisions == expected_decisions
+            and seen_decisions == expected_decisions
+            and len(canonical_partition) == len(expected_decisions)
+            and result_item_identity == manifest_item_identity
+            and manifest.get('decision_count')
+            == len(manifest_decisions)
+            and manifest.get('included_decision_count')
+            == manifest_included_decision_count
+            and manifest.get('excluded_decision_count')
+            == manifest_excluded_decision_count
+            and manifest.get('incomplete_decision_count')
+            == manifest_incomplete_decision_count
+            == 0
+            and manifest.get('included_item_count')
+            == included_item_count
+        ):
+            return None
+        proof: dict[str, Any] = {
+            'schema_version': (
+                STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION
+            ),
+            'kind': 'next_open_execution_plan_parent_scope',
+            'parent_run_id': parent_run_id,
+            'parent_summary_run_id': parent_summary_run_id,
+            'parent_admitted_symbols': parent_admitted_symbols,
+            'parent_completed_symbols': parent_completed_symbols,
+            'authority_fingerprint': str(
+                manifest['authority_fingerprint']
+            ),
+            'generation_fingerprint': str(
+                manifest['generation_fingerprint']
+            ),
+            'role_symbol_scopes': canonical_role_scopes,
+            'decision_partition': canonical_partition,
+            'decision_count': len(expected_decisions),
+            'included_decision_count': included_decision_count,
+            'excluded_decision_count': excluded_decision_count,
+            'item_count': included_item_count,
+            'active_item_count': active_item_count,
+            'blocked_item_count': (
+                included_item_count - active_item_count
+            ),
+            'manifest_digest': manifest_digest,
+        }
+        proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(proof)
+        )
+        return proof
+
+    @staticmethod
+    def _build_evaluations_completion_scope_proof(
+        result: Mapping[str, Any],
+        *,
+        parent_scope_proof: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Bind an evaluation refresh to one exact terminal decider scope."""
+
+        parent_scope_proof = (
+            DailyPipelineStageService
+            .validated_stage_completion_scope_proof(
+                'signal_decider',
+                parent_scope_proof,
+            )
+        )
+        if parent_scope_proof is None:
+            return None
+        parent_run_id = str(
+            parent_scope_proof.get('source_run_id') or ''
+        ).strip()
+        parent_summary_run_id = str(
+            parent_scope_proof.get('source_summary_run_id') or ''
+        ).strip()
+        raw_parent_symbols = parent_scope_proof.get('completed_symbols')
+        raw_parent_identities = parent_scope_proof.get(
+            'decision_identities'
+        )
+        if not (
+            parent_run_id
+            and parent_summary_run_id
+            and isinstance(raw_parent_symbols, list)
+            and isinstance(raw_parent_identities, list)
+        ):
+            return None
+        parent_symbols = sorted(normalize_symbol_codes(raw_parent_symbols))
+        signal_identity_by_symbol = {
+            str(identity['symbol']): (
+                int(identity['decision_snapshot_id']),
+                str(identity['decision_run_id']),
+            )
+            for identity in raw_parent_identities
+            if identity.get('decision_agent_name') == 'signal-decider'
+        }
+        request = result.get('request')
+        summary = result.get('summary')
+        items = result.get('items')
+        if not (
+            parent_symbols
+            and len(parent_symbols) == len(raw_parent_symbols)
+            and set(signal_identity_by_symbol) == set(parent_symbols)
+            and str(result.get('status') or '').strip().lower()
+            == 'completed'
+            and isinstance(request, Mapping)
+            and isinstance(summary, Mapping)
+            and isinstance(items, list)
+        ):
+            return None
+        raw_request_symbols = request.get('symbols')
+        raw_horizons = request.get('horizons')
+        if not (
+            isinstance(raw_request_symbols, list)
+            and normalize_symbol_codes(raw_request_symbols)
+            == raw_request_symbols
+            and raw_request_symbols == parent_symbols
+            and isinstance(raw_horizons, list)
+            and raw_horizons
+            and all(
+                type(horizon) is int and horizon > 0
+                for horizon in raw_horizons
+            )
+            and len(set(raw_horizons)) == len(raw_horizons)
+        ):
+            return None
+        horizons = sorted(raw_horizons)
+        evaluation_version = str(
+            request.get('evaluation_version') or ''
+        ).strip()
+        evaluation_rule_set_version = str(
+            request.get('evaluation_rule_set_version') or ''
+        ).strip()
+        if (
+            horizons != raw_horizons
+            or not evaluation_version
+            or not evaluation_rule_set_version
+        ):
+            return None
+
+        def strict_count(value: Any) -> int | None:
+            return (
+                value
+                if type(value) is int and value >= 0
+                else None
+            )
+
+        decisions_considered = strict_count(
+            summary.get('decisions_considered')
+        )
+        expected_item_count = len(items) * len(horizons)
+        if not (
+            str(summary.get('status') or '').strip().lower()
+            == 'completed'
+            and decisions_considered == len(items)
+            and decisions_considered > 0
+            and strict_count(summary.get('outcomes_upserted'))
+            == expected_item_count
+            and strict_count(summary.get('evaluations_upserted'))
+            == expected_item_count
+        ):
+            return None
+
+        decision_horizon_scope: list[dict[str, Any]] = []
+        seen_snapshots: set[int] = set()
+        seen_symbols: set[str] = set()
+        for item in items:
+            if not isinstance(item, Mapping):
+                return None
+            snapshot_id = item.get('snapshot_id')
+            feedback_id = item.get('feedback_id')
+            decision_run_id = str(
+                item.get('decision_run_id') or ''
+            ).strip()
+            agent_name = str(item.get('agent_name') or '').strip()
+            normalized_symbol = normalize_symbol_codes(
+                [item.get('symbol')]
+            )
+            market_date = str(item.get('market_date') or '').strip()
+            policy_version = str(
+                item.get('policy_version') or ''
+            ).strip()
+            decision_payload = item.get('decision')
+            decision_action = str(
+                decision_payload.get('action')
+                if isinstance(decision_payload, Mapping)
+                else ''
+            ).strip().lower()
+            outcomes = item.get('outcomes')
+            evaluations = item.get('evaluations')
+            symbol = normalized_symbol[0] if normalized_symbol else ''
+            expected_identity = signal_identity_by_symbol.get(symbol)
+            if not (
+                type(snapshot_id) is int
+                and snapshot_id > 0
+                and type(feedback_id) is int
+                and feedback_id > 0
+                and snapshot_id not in seen_snapshots
+                and decision_run_id
+                and agent_name == 'signal-decider'
+                and len(normalized_symbol) == 1
+                and symbol in parent_symbols
+                and symbol not in seen_symbols
+                and expected_identity
+                == (snapshot_id, decision_run_id)
+                and market_date
+                and policy_version
+                and decision_action
+                and isinstance(outcomes, list)
+                and isinstance(evaluations, list)
+            ):
+                return None
+            seen_snapshots.add(snapshot_id)
+            seen_symbols.add(symbol)
+            outcomes_by_horizon: dict[int, Mapping[str, Any]] = {}
+            evaluations_by_horizon: dict[int, Mapping[str, Any]] = {}
+            for raw_entry, target in (
+                (outcomes, outcomes_by_horizon),
+                (evaluations, evaluations_by_horizon),
+            ):
+                for entry in raw_entry:
+                    if not isinstance(entry, Mapping):
+                        return None
+                    horizon = entry.get('horizon_days')
+                    if not (
+                        type(horizon) is int
+                        and horizon in horizons
+                        and horizon not in target
+                        and entry.get('decision_snapshot_id')
+                        == snapshot_id
+                    ):
+                        return None
+                    target[horizon] = entry
+            if (
+                sorted(outcomes_by_horizon) != horizons
+                or sorted(evaluations_by_horizon) != horizons
+            ):
+                return None
+            for horizon in horizons:
+                outcome = outcomes_by_horizon[horizon]
+                evaluation = evaluations_by_horizon[horizon]
+                outcome_id = outcome.get('id')
+                evaluation_id = evaluation.get('id')
+                entry_evaluation_version = str(
+                    evaluation.get('evaluation_version') or ''
+                ).strip()
+                outcome_action = str(
+                    outcome.get('decision_action') or ''
+                ).strip().lower()
+                evaluation_action = str(
+                    evaluation.get('decision_action') or ''
+                ).strip().lower()
+                if not (
+                    type(outcome_id) is int
+                    and outcome_id > 0
+                    and type(evaluation_id) is int
+                    and evaluation_id > 0
+                    and entry_evaluation_version == evaluation_version
+                    and outcome_action == decision_action
+                    and evaluation_action == decision_action
+                ):
+                    return None
+                decision_horizon_scope.append(
+                    {
+                        'snapshot_id': snapshot_id,
+                        'feedback_id': feedback_id,
+                        'decision_run_id': decision_run_id,
+                        'decision_agent_name': agent_name,
+                        'symbol': normalized_symbol[0],
+                        'market_date': market_date,
+                        'decision_action': decision_action,
+                        'policy_version': policy_version,
+                        'horizon_days': horizon,
+                        'outcome_id': outcome_id,
+                        'evaluation_id': evaluation_id,
+                        'evaluation_version': entry_evaluation_version,
+                        'evaluation_rule_set_version': (
+                            evaluation_rule_set_version
+                        ),
+                        'evaluation_status': str(
+                            evaluation.get('evaluation_status') or ''
+                        ).strip().lower(),
+                    }
+                )
+        decision_horizon_scope.sort(
+            key=lambda entry: (
+                entry['market_date'],
+                entry['symbol'],
+                entry['decision_run_id'],
+                entry['snapshot_id'],
+                entry['horizon_days'],
+            )
+        )
+        evaluated_symbols = sorted(
+            {
+                entry['symbol']
+                for entry in decision_horizon_scope
+            }
+        )
+        if not (
+            len(decision_horizon_scope) == expected_item_count
+            and evaluated_symbols == parent_symbols
+            and seen_symbols == set(parent_symbols)
+            and len(items) == len(parent_symbols)
+        ):
+            return None
+        proof: dict[str, Any] = {
+            'schema_version': STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION,
+            'kind': 'signal_decider_evaluations_parent_scope',
+            'parent_run_id': parent_run_id,
+            'parent_summary_run_id': parent_summary_run_id,
+            'parent_completed_symbols': parent_symbols,
+            'request_symbols': list(raw_request_symbols),
+            'horizons': horizons,
+            'evaluation_version': evaluation_version,
+            'evaluation_rule_set_version': evaluation_rule_set_version,
+            'decision_horizon_scope': decision_horizon_scope,
+            'decision_count': len(items),
+            'item_count': expected_item_count,
+        }
+        proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(proof)
+        )
+        return proof
+
+    @staticmethod
+    def validated_stage_completion_scope_proof(
+        stage_id: str,
+        proof: object,
+    ) -> dict[str, Any] | None:
+        if not isinstance(proof, Mapping):
+            return None
+        proof = dict(proof)
+        if not (
+            proof.get('schema_version')
+            == STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION
+            and str(proof.get('proof_digest') or '')
+            == DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(proof)
+        ):
+            return None
+
+        if stage_id == 'signal_decider':
+            expected_keys = {
+                'schema_version',
+                'kind',
+                'roles',
+                'source_run_id',
+                'source_summary_run_id',
+                'knowledge_cutoff_at',
+                'admitted_symbols',
+                'completed_symbols',
+                'failed_symbols_by_role',
+                'decision_identities',
+                'total_items',
+                'completed_items',
+                'failed_items',
+                'proof_digest',
+            }
+            roles = proof.get('roles')
+            admitted_symbols = proof.get('admitted_symbols')
+            completed_symbols = proof.get('completed_symbols')
+            failed_by_role = proof.get('failed_symbols_by_role')
+            decision_identities = proof.get('decision_identities')
+            try:
+                knowledge_cutoff_at = datetime.fromisoformat(
+                    str(proof.get('knowledge_cutoff_at') or '').strip()
+                )
+            except (TypeError, ValueError):
+                return None
+            if not (
+                set(proof) == expected_keys
+                and proof.get('kind')
+                == 'signal_decider_terminal_progression'
+                and roles == list(DECISION_SUPPORT_AGENT_NAMES)
+                and str(proof.get('source_run_id') or '').strip()
+                and str(
+                    proof.get('source_summary_run_id') or ''
+                ).strip()
+                and knowledge_cutoff_at.tzinfo is not None
+                and knowledge_cutoff_at.utcoffset() is not None
+                and proof.get('knowledge_cutoff_at')
+                == knowledge_cutoff_at.astimezone(timezone.utc).isoformat()
+                and isinstance(admitted_symbols, list)
+                and admitted_symbols
+                and normalize_symbol_codes(admitted_symbols)
+                == admitted_symbols
+                and sorted(set(admitted_symbols)) == admitted_symbols
+                and isinstance(completed_symbols, list)
+                and completed_symbols
+                and normalize_symbol_codes(completed_symbols)
+                == completed_symbols
+                and sorted(set(completed_symbols)) == completed_symbols
+                and set(completed_symbols) <= set(admitted_symbols)
+                and isinstance(failed_by_role, Mapping)
+                and set(failed_by_role)
+                == set(DECISION_SUPPORT_AGENT_NAMES)
+                and isinstance(decision_identities, list)
+            ):
+                return None
+            total_items = proof.get('total_items')
+            completed_items = proof.get('completed_items')
+            failed_items = proof.get('failed_items')
+            canonical_failed_by_role: dict[str, list[str]] = {}
+            for role in DECISION_SUPPORT_AGENT_NAMES:
+                failed_symbols = failed_by_role.get(role)
+                if not (
+                    isinstance(failed_symbols, list)
+                    and normalize_symbol_codes(failed_symbols)
+                    == failed_symbols
+                    and sorted(set(failed_symbols)) == failed_symbols
+                    and set(failed_symbols) <= set(admitted_symbols)
+                ):
+                    return None
+                canonical_failed_by_role[role] = list(failed_symbols)
+            canonical_identities: list[dict[str, Any]] = []
+            seen_identity_keys: set[tuple[str, str]] = set()
+            for raw_identity in decision_identities:
+                if not isinstance(raw_identity, Mapping):
+                    return None
+                identity = dict(raw_identity)
+                if set(identity) != {
+                    'symbol',
+                    'decision_agent_name',
+                    'decision_snapshot_id',
+                    'decision_run_id',
+                }:
+                    return None
+                normalized_symbol = normalize_symbol_codes(
+                    [identity.get('symbol')]
+                )
+                role = str(
+                    identity.get('decision_agent_name') or ''
+                ).strip()
+                snapshot_id = identity.get('decision_snapshot_id')
+                decision_run_id = str(
+                    identity.get('decision_run_id') or ''
+                ).strip()
+                key = (
+                    normalized_symbol[0]
+                    if normalized_symbol
+                    else '',
+                    role,
+                )
+                if not (
+                    len(normalized_symbol) == 1
+                    and identity.get('symbol')
+                    == normalized_symbol[0]
+                    and normalized_symbol[0] in completed_symbols
+                    and role in DECISION_SUPPORT_AGENT_NAMES
+                    and type(snapshot_id) is int
+                    and snapshot_id > 0
+                    and decision_run_id
+                    and key not in seen_identity_keys
+                ):
+                    return None
+                seen_identity_keys.add(key)
+                canonical_identities.append(
+                    {
+                        'symbol': normalized_symbol[0],
+                        'decision_agent_name': role,
+                        'decision_snapshot_id': snapshot_id,
+                        'decision_run_id': decision_run_id,
+                    }
+                )
+            canonical_identities.sort(
+                key=lambda identity: (
+                    identity['symbol'],
+                    identity['decision_agent_name'],
+                )
+            )
+            expected_identity_keys = {
+                (symbol, role)
+                for symbol in completed_symbols
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            }
+            if not (
+                type(total_items) is int
+                and total_items == (
+                    len(admitted_symbols)
+                    * len(DECISION_SUPPORT_AGENT_NAMES)
+                )
+                and type(completed_items) is int
+                and type(failed_items) is int
+                and completed_items + failed_items == total_items
+                and failed_items
+                == sum(
+                    len(symbols)
+                    for symbols in canonical_failed_by_role.values()
+                )
+                and set(completed_symbols)
+                == set(admitted_symbols).difference(
+                    {
+                        symbol
+                        for symbols in canonical_failed_by_role.values()
+                        for symbol in symbols
+                    }
+                )
+                and seen_identity_keys == expected_identity_keys
+                and decision_identities == canonical_identities
+            ):
+                return None
+            return proof
+
+        if stage_id == 'agent_feedback_summaries':
+            expected_keys = {
+                'schema_version',
+                'kind',
+                'source_run_id',
+                'knowledge_cutoff_at',
+                'feedback_scope_mode',
+                'roles',
+                'requested_scope_kind',
+                'requested_symbols',
+                'scope_symbols',
+                'role_symbol_scopes',
+                'role_symbol_counts',
+                'role_scope_manifest_fingerprint',
+                'total_item_count',
+                'proof_digest',
+            }
+            roles = proof.get('roles')
+            role_scopes = proof.get('role_symbol_scopes')
+            role_counts = proof.get('role_symbol_counts')
+            requested_symbols = proof.get('requested_symbols')
+            scope_symbols = proof.get('scope_symbols')
+            try:
+                knowledge_cutoff_at = datetime.fromisoformat(
+                    str(proof.get('knowledge_cutoff_at') or '').strip()
+                )
+            except (TypeError, ValueError):
+                return None
+            if not (
+                set(proof) == expected_keys
+                and proof.get('kind')
+                == 'agent_feedback_summaries_role_scope'
+                and proof.get('feedback_scope_mode')
+                in {
+                    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+                    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                }
+                and str(proof.get('source_run_id') or '').strip()
+                and knowledge_cutoff_at.tzinfo is not None
+                and knowledge_cutoff_at.utcoffset() is not None
+                and proof.get('knowledge_cutoff_at')
+                == knowledge_cutoff_at.astimezone(timezone.utc).isoformat()
+                and roles == list(SUMMARIZER_AGENT_NAMES)
+                and proof.get('requested_scope_kind')
+                in {
+                    'explicit_invocation',
+                    'resolved_role_scope_union',
+                }
+                and isinstance(role_scopes, Mapping)
+                and set(role_scopes) == set(SUMMARIZER_AGENT_NAMES)
+                and isinstance(role_counts, Mapping)
+                and set(role_counts) == set(SUMMARIZER_AGENT_NAMES)
+                and isinstance(requested_symbols, list)
+                and requested_symbols
+                and normalize_symbol_codes(requested_symbols)
+                == requested_symbols
+                and isinstance(scope_symbols, list)
+                and scope_symbols
+                and normalize_symbol_codes(scope_symbols) == scope_symbols
+                and set(scope_symbols) <= set(requested_symbols)
+            ):
+                return None
+            union_symbols: set[str] = set()
+            total_item_count = 0
+            for role in SUMMARIZER_AGENT_NAMES:
+                role_scope = role_scopes.get(role)
+                role_count = role_counts.get(role)
+                if not (
+                    isinstance(role_scope, list)
+                    and normalize_symbol_codes(role_scope) == role_scope
+                    and type(role_count) is int
+                    and role_count == len(role_scope)
+                ):
+                    return None
+                union_symbols.update(role_scope)
+                total_item_count += role_count
+            if not (
+                sorted(union_symbols) == scope_symbols
+                and type(proof.get('total_item_count')) is int
+                and proof.get('total_item_count') == total_item_count
+                and total_item_count > 0
+                and proof.get('role_scope_manifest_fingerprint')
+                == DailyPipelineStageService
+                ._stage_completion_scope_proof_digest(
+                    {
+                        'requested_symbols': requested_symbols,
+                        'role_symbol_scopes': dict(role_scopes),
+                    }
+                )
+            ):
+                return None
+            return proof
+
+        if stage_id == 'next_open_execution_plan':
+            expected_keys = {
+                'schema_version',
+                'kind',
+                'parent_run_id',
+                'parent_summary_run_id',
+                'parent_admitted_symbols',
+                'parent_completed_symbols',
+                'authority_fingerprint',
+                'generation_fingerprint',
+                'role_symbol_scopes',
+                'decision_partition',
+                'decision_count',
+                'included_decision_count',
+                'excluded_decision_count',
+                'item_count',
+                'active_item_count',
+                'blocked_item_count',
+                'manifest_digest',
+                'proof_digest',
+            }
+            admitted_symbols = proof.get('parent_admitted_symbols')
+            completed_symbols = proof.get('parent_completed_symbols')
+            role_symbol_scopes = proof.get('role_symbol_scopes')
+            partition = proof.get('decision_partition')
+            decision_count = proof.get('decision_count')
+            included_decision_count = proof.get(
+                'included_decision_count'
+            )
+            excluded_decision_count = proof.get(
+                'excluded_decision_count'
+            )
+            item_count = proof.get('item_count')
+            active_item_count = proof.get('active_item_count')
+            blocked_item_count = proof.get('blocked_item_count')
+            if not (
+                set(proof) == expected_keys
+                and proof.get('kind')
+                == 'next_open_execution_plan_parent_scope'
+                and str(proof.get('parent_run_id') or '').strip()
+                and str(
+                    proof.get('parent_summary_run_id') or ''
+                ).strip()
+                and isinstance(admitted_symbols, list)
+                and admitted_symbols
+                and normalize_symbol_codes(admitted_symbols)
+                == admitted_symbols
+                and isinstance(completed_symbols, list)
+                and completed_symbols
+                and normalize_symbol_codes(completed_symbols)
+                == completed_symbols
+                and set(completed_symbols) <= set(admitted_symbols)
+                and str(
+                    proof.get('authority_fingerprint') or ''
+                ).strip()
+                and str(
+                    proof.get('generation_fingerprint') or ''
+                ).strip()
+                and isinstance(role_symbol_scopes, Mapping)
+                and set(role_symbol_scopes)
+                == set(DECISION_SUPPORT_AGENT_NAMES)
+                and all(
+                    role_symbol_scopes.get(role) == completed_symbols
+                    for role in DECISION_SUPPORT_AGENT_NAMES
+                )
+                and isinstance(partition, list)
+                and all(
+                    type(value) is int and value >= 0
+                    for value in (
+                        decision_count,
+                        included_decision_count,
+                        excluded_decision_count,
+                        item_count,
+                        active_item_count,
+                        blocked_item_count,
+                    )
+                )
+                and decision_count
+                == len(completed_symbols)
+                * len(DECISION_SUPPORT_AGENT_NAMES)
+                and len(partition) == decision_count
+                and included_decision_count
+                + excluded_decision_count
+                == decision_count
+                and active_item_count + blocked_item_count == item_count
+                and len(str(proof.get('manifest_digest') or '')) == 64
+            ):
+                return None
+            canonical_partition: list[dict[str, Any]] = []
+            seen_decisions: set[tuple[str, str]] = set()
+            seen_plan_items: set[tuple[int, str]] = set()
+            actual_included_decisions = 0
+            actual_excluded_decisions = 0
+            actual_active_items = 0
+            for entry in partition:
+                if not (
+                    isinstance(entry, Mapping)
+                    and set(entry)
+                    == {
+                        'symbol',
+                        'decision_agent_name',
+                        'decision_run_id',
+                        'decision_snapshot_id',
+                        'canonical_action',
+                        'authority_fingerprint',
+                        'generation_fingerprint',
+                        'disposition',
+                        'included_items',
+                        'exclusion',
+                    }
+                ):
+                    return None
+                normalized_symbol = normalize_symbol_codes(
+                    [entry.get('symbol')]
+                )
+                role = str(
+                    entry.get('decision_agent_name') or ''
+                ).strip()
+                canonical_action = str(
+                    entry.get('canonical_action') or ''
+                ).strip().lower()
+                disposition = str(
+                    entry.get('disposition') or ''
+                ).strip().lower()
+                included_items = entry.get('included_items')
+                exclusion = entry.get('exclusion')
+                decision_key = (
+                    normalized_symbol[0] if normalized_symbol else '',
+                    role,
+                )
+                actionable = bool(
+                    (
+                        role == 'signal-decider'
+                        and canonical_action == 'buy'
+                    )
+                    or (
+                        role == 'short-term-decider'
+                        and canonical_action
+                        in {
+                            'scalp_buy_candidate',
+                            'watch_for_trigger',
+                        }
+                    )
+                )
+                if not (
+                    len(normalized_symbol) == 1
+                    and normalized_symbol[0] in completed_symbols
+                    and role in DECISION_SUPPORT_AGENT_NAMES
+                    and decision_key not in seen_decisions
+                    and str(
+                        entry.get('decision_run_id') or ''
+                    ).strip()
+                    and type(entry.get('decision_snapshot_id')) is int
+                    and entry.get('decision_snapshot_id') > 0
+                    and canonical_action
+                    and str(
+                        entry.get('authority_fingerprint') or ''
+                    ).strip()
+                    and str(
+                        entry.get('generation_fingerprint') or ''
+                    ).strip()
+                    and disposition in {
+                        'included',
+                        'non_actionable',
+                    }
+                    and isinstance(included_items, list)
+                ):
+                    return None
+                seen_decisions.add(decision_key)
+                canonical_items: list[dict[str, Any]] = []
+                if disposition == 'included':
+                    if not (
+                        actionable
+                        and included_items
+                        and exclusion is None
+                    ):
+                        return None
+                    actual_included_decisions += 1
+                    for item in included_items:
+                        if not (
+                            isinstance(item, Mapping)
+                            and set(item)
+                            == {
+                                'plan_item_id',
+                                'account_reference',
+                                'eligibility_status',
+                                'handoff_active',
+                                'exec_monitoring_active',
+                                'row_authority_fingerprint',
+                            }
+                        ):
+                            return None
+                        plan_item_id = item.get('plan_item_id')
+                        account_reference = str(
+                            item.get('account_reference') or ''
+                        ).strip()
+                        item_identity = (
+                            plan_item_id,
+                            account_reference,
+                        )
+                        if not (
+                            type(plan_item_id) is int
+                            and plan_item_id > 0
+                            and account_reference
+                            and item_identity not in seen_plan_items
+                            and str(
+                                item.get('eligibility_status') or ''
+                            ).strip()
+                            and type(item.get('handoff_active')) is bool
+                            and type(
+                                item.get('exec_monitoring_active')
+                            ) is bool
+                            and str(
+                                item.get('row_authority_fingerprint')
+                                or ''
+                            ).strip()
+                        ):
+                            return None
+                        seen_plan_items.add(item_identity)
+                        actual_active_items += int(
+                            item['handoff_active']
+                            or item['exec_monitoring_active']
+                        )
+                        canonical_items.append(dict(item))
+                    canonical_items.sort(
+                        key=lambda item: (
+                            item['account_reference'],
+                            item['plan_item_id'],
+                        )
+                    )
+                    if canonical_items != included_items:
+                        return None
+                    canonical_exclusion = None
+                else:
+                    if not (
+                        not actionable
+                        and not included_items
+                        and isinstance(exclusion, Mapping)
+                        and dict(exclusion)
+                        == {
+                            'kind': 'non_actionable',
+                            'reason_code': (
+                                'latest_snapshot_not_actionable'
+                            ),
+                        }
+                    ):
+                        return None
+                    actual_excluded_decisions += 1
+                    canonical_exclusion = dict(exclusion)
+                canonical_partition.append(
+                    {
+                        **{
+                            key: entry[key]
+                            for key in (
+                                'symbol',
+                                'decision_agent_name',
+                                'decision_run_id',
+                                'decision_snapshot_id',
+                                'canonical_action',
+                                'authority_fingerprint',
+                                'generation_fingerprint',
+                                'disposition',
+                            )
+                        },
+                        'included_items': canonical_items,
+                        'exclusion': canonical_exclusion,
+                    }
+                )
+            canonical_partition.sort(
+                key=lambda entry: (
+                    entry['symbol'],
+                    entry['decision_agent_name'],
+                )
+            )
+            if not (
+                seen_decisions
+                == {
+                    (symbol, role)
+                    for role in DECISION_SUPPORT_AGENT_NAMES
+                    for symbol in completed_symbols
+                }
+                and canonical_partition == partition
+                and actual_included_decisions
+                == included_decision_count
+                and actual_excluded_decisions
+                == excluded_decision_count
+                and len(seen_plan_items) == item_count
+                and actual_active_items == active_item_count
+            ):
+                return None
+            return proof
+        if stage_id == 'signal_decider_evaluations':
+            expected_keys = {
+                'schema_version',
+                'kind',
+                'parent_run_id',
+                'parent_summary_run_id',
+                'parent_completed_symbols',
+                'request_symbols',
+                'horizons',
+                'evaluation_version',
+                'evaluation_rule_set_version',
+                'decision_horizon_scope',
+                'decision_count',
+                'item_count',
+                'proof_digest',
+            }
+            parent_symbols = proof.get('parent_completed_symbols')
+            request_symbols = proof.get('request_symbols')
+            horizons = proof.get('horizons')
+            scope = proof.get('decision_horizon_scope')
+            decision_count = proof.get('decision_count')
+            item_count = proof.get('item_count')
+            evaluation_version = str(
+                proof.get('evaluation_version') or ''
+            ).strip()
+            evaluation_rule_set_version = str(
+                proof.get('evaluation_rule_set_version') or ''
+            ).strip()
+            if not (
+                set(proof) == expected_keys
+                and proof.get('kind')
+                == 'signal_decider_evaluations_parent_scope'
+                and str(proof.get('parent_run_id') or '').strip()
+                and str(
+                    proof.get('parent_summary_run_id') or ''
+                ).strip()
+                and isinstance(parent_symbols, list)
+                and parent_symbols
+                and normalize_symbol_codes(parent_symbols)
+                == parent_symbols
+                and request_symbols == parent_symbols
+                and isinstance(horizons, list)
+                and horizons
+                and all(
+                    type(horizon) is int and horizon > 0
+                    for horizon in horizons
+                )
+                and sorted(set(horizons)) == horizons
+                and evaluation_version
+                and evaluation_rule_set_version
+                and isinstance(scope, list)
+                and type(decision_count) is int
+                and decision_count > 0
+                and type(item_count) is int
+                and item_count == decision_count * len(horizons)
+                and len(scope) == item_count
+            ):
+                return None
+            canonical_scope: list[dict[str, Any]] = []
+            for entry in scope:
+                if not (
+                    isinstance(entry, Mapping)
+                    and set(entry)
+                    == {
+                        'snapshot_id',
+                        'feedback_id',
+                        'decision_run_id',
+                        'decision_agent_name',
+                        'symbol',
+                        'market_date',
+                        'decision_action',
+                        'policy_version',
+                        'horizon_days',
+                        'outcome_id',
+                        'evaluation_id',
+                        'evaluation_version',
+                        'evaluation_rule_set_version',
+                        'evaluation_status',
+                    }
+                    and type(entry.get('snapshot_id')) is int
+                    and entry.get('snapshot_id') > 0
+                    and type(entry.get('feedback_id')) is int
+                    and entry.get('feedback_id') > 0
+                    and str(
+                        entry.get('decision_run_id') or ''
+                    ).strip()
+                    and entry.get('decision_agent_name')
+                    == 'signal-decider'
+                    and entry.get('symbol') in parent_symbols
+                    and str(entry.get('market_date') or '').strip()
+                    and str(
+                        entry.get('decision_action') or ''
+                    ).strip()
+                    and str(
+                        entry.get('policy_version') or ''
+                    ).strip()
+                    and entry.get('horizon_days') in horizons
+                    and type(entry.get('outcome_id')) is int
+                    and entry.get('outcome_id') > 0
+                    and type(entry.get('evaluation_id')) is int
+                    and entry.get('evaluation_id') > 0
+                    and str(
+                        entry.get('evaluation_version') or ''
+                    ).strip() == evaluation_version
+                    and str(
+                        entry.get('evaluation_rule_set_version') or ''
+                    ).strip() == evaluation_rule_set_version
+                    and str(
+                        entry.get('evaluation_status') or ''
+                    ).strip()
+                ):
+                    return None
+                canonical_scope.append(dict(entry))
+            canonical_scope.sort(
+                key=lambda entry: (
+                    entry['market_date'],
+                    entry['symbol'],
+                    entry['decision_run_id'],
+                    entry['snapshot_id'],
+                    entry['horizon_days'],
+                )
+            )
+            if canonical_scope != scope:
+                return None
+            identity_keys = {
+                (
+                    entry['snapshot_id'],
+                    entry['horizon_days'],
+                )
+                for entry in scope
+            }
+            if len(identity_keys) != item_count:
+                return None
+            return proof
+        return None
+
+    @staticmethod
     def compact_stage_result_summary(
         result: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
@@ -4169,6 +6361,7 @@ class DailyPipelineStageService:
         stage_id: str,
         result: dict[str, Any],
         invocation_symbols: Sequence[str] | None = None,
+        completion_parent_proof: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         definition = STAGE_DEFINITIONS[stage_id]
         result_summary, result_summary_omissions = (
@@ -4199,6 +6392,37 @@ class DailyPipelineStageService:
         )
         if nonblocking_scope_proof is not None:
             details['nonblocking_scope_proof'] = nonblocking_scope_proof
+        completion_scope_proof = (
+            DailyPipelineStageService
+            ._build_feedback_completion_scope_proof(
+                result,
+                invocation_symbols=invocation_symbols,
+            )
+            if stage_id == 'agent_feedback_summaries'
+            else DailyPipelineStageService
+            .validated_stage_completion_scope_proof(
+                'signal_decider',
+                completion_parent_proof,
+            )
+            if stage_id == 'signal_decider'
+            else DailyPipelineStageService
+            ._build_next_open_completion_scope_proof(
+                result,
+                parent_scope_proof=completion_parent_proof,
+            )
+            if stage_id == 'next_open_execution_plan'
+            else DailyPipelineStageService
+            ._build_evaluations_completion_scope_proof(
+                result,
+                parent_scope_proof=completion_parent_proof,
+            )
+            if stage_id == 'signal_decider_evaluations'
+            else None
+        )
+        if completion_scope_proof is not None:
+            details['completion_scope_proof'] = (
+                completion_scope_proof
+            )
         count_semantics = DailyPipelineStageService._extract_stage_count_semantics(
             stage_id=stage_id,
             result=result,
@@ -4214,11 +6438,12 @@ class DailyPipelineStageService:
         market_date: str,
         exact_scope_symbols: Sequence[str] | None,
         call: Callable[[], dict[str, Any]],
+        atomic_finalization: bool = False,
     ) -> dict[str, Any]:
         try:
             result = call()
         except Exception:
-            if exact_scope_symbols is not None:
+            if exact_scope_symbols is not None and not atomic_finalization:
                 _finalize_daily_stage_scope(
                     market_date=market_date,
                     stage_id=stage_id,
@@ -4226,6 +6451,17 @@ class DailyPipelineStageService:
                     result=None,
                 )
             raise
+        if atomic_finalization:
+            finalization = result.get('scope_finalization')
+            if exact_scope_symbols is not None and not (
+                isinstance(finalization, Mapping)
+                and finalization.get('ready') is True
+            ):
+                raise RuntimeError(
+                    f'{stage_id} atomic exact-scope finalization proof '
+                    'is unavailable'
+                )
+            return result
         if exact_scope_symbols is not None:
             result['scope_finalization'] = _finalize_daily_stage_scope(
                 market_date=market_date,
@@ -4234,6 +6470,325 @@ class DailyPipelineStageService:
                 result=result,
             )
         return result
+
+    @staticmethod
+    def _combine_technical_scope_outcomes(
+        *,
+        price_context_result: Mapping[str, Any],
+        technical_result: Mapping[str, Any],
+        invocation_symbols: Sequence[str] | None,
+    ) -> dict[str, Any]:
+        """Return only a proven context-and-snapshot success partition."""
+
+        combined_result = dict(technical_result)
+        exact_scope_keys = (
+            'scope_outcome_manifest_version',
+            'selected_stock_codes',
+            'successful_stock_codes',
+            'retry_debt_stock_codes',
+            'terminal_not_applicable_stock_codes',
+            'scope_outcome_manifest',
+        )
+        for key in exact_scope_keys:
+            combined_result.pop(key, None)
+
+        def fail_closed_scope_contract(
+            *,
+            reason: str,
+            retry_symbols: Sequence[str],
+            retry_count: int | None = None,
+        ) -> dict[str, Any]:
+            normalized_retry_symbols = normalize_symbol_codes(
+                retry_symbols
+            )
+            resolved_retry_count = max(
+                int(retry_count or 0),
+                len(normalized_retry_symbols),
+            )
+            raw_status = str(
+                combined_result.get('status') or ''
+            ).strip().lower()
+            if raw_status not in {
+                'blocked',
+                'failed',
+                'interrupted',
+                'waiting',
+            }:
+                combined_result['status'] = 'partial'
+            combined_result.update(
+                {
+                    'reason': (
+                        'technical_scope_outcome_contract_invalid'
+                    ),
+                    'gate_status': 'blocked',
+                    'blocking_status': 'blocking',
+                    'scope_outcome_contract_status': 'invalid',
+                    'scope_outcome_contract_reason': reason,
+                    'retryable_symbols': normalized_retry_symbols,
+                    'retryable_symbol_count': resolved_retry_count,
+                    'remaining_retryable_events': resolved_retry_count,
+                    'retry_required': True,
+                }
+            )
+            retry_metadata = (
+                dict(combined_result['_retry_metadata'])
+                if isinstance(
+                    combined_result.get('_retry_metadata'),
+                    Mapping,
+                )
+                else {}
+            )
+            retry_metadata.update(
+                {
+                    'failed_symbols': normalized_retry_symbols,
+                    'failed_symbols_count': resolved_retry_count,
+                    'retry_required': True,
+                }
+            )
+            combined_result['_retry_metadata'] = retry_metadata
+            return combined_result
+
+        def reported_invocation_count(
+            result: Mapping[str, Any],
+        ) -> int:
+            value = result.get('requested_symbols')
+            if isinstance(value, bool):
+                return 0
+            try:
+                return max(int(value or 0), 0)
+            except (TypeError, ValueError):
+                return 0
+
+        if invocation_symbols is None:
+            context_selected = price_context_result.get(
+                'selected_stock_codes'
+            )
+            snapshot_selected = technical_result.get(
+                'selected_stock_codes'
+            )
+            if not (
+                isinstance(context_selected, list)
+                and isinstance(snapshot_selected, list)
+                and set(normalize_symbol_codes(context_selected))
+                == set(normalize_symbol_codes(snapshot_selected))
+            ):
+                candidate_symbols = normalize_symbol_codes(
+                    [
+                        *(
+                            context_selected
+                            if isinstance(context_selected, list)
+                            else []
+                        ),
+                        *(
+                            snapshot_selected
+                            if isinstance(snapshot_selected, list)
+                            else []
+                        ),
+                    ]
+                )
+                return fail_closed_scope_contract(
+                    reason='invocation_scope_identity_unavailable',
+                    retry_symbols=candidate_symbols,
+                    retry_count=max(
+                        reported_invocation_count(
+                            price_context_result
+                        ),
+                        reported_invocation_count(technical_result),
+                    ),
+                )
+            expected_symbols: Sequence[str] = context_selected
+        else:
+            expected_symbols = normalize_symbol_codes(
+                invocation_symbols
+            )
+
+        expected_symbol_count = len(expected_symbols)
+        for child_name, child_result in (
+            ('price_context', price_context_result),
+            ('technical_snapshot', technical_result),
+        ):
+            raw_requested_count = child_result.get(
+                'requested_symbols'
+            )
+            if raw_requested_count is None:
+                continue
+            reported_count = (
+                raw_requested_count
+                if type(raw_requested_count) is int
+                and raw_requested_count >= 0
+                else 0
+            )
+            if (
+                type(raw_requested_count) is not int
+                or raw_requested_count < 0
+                or reported_count != expected_symbol_count
+            ):
+                return fail_closed_scope_contract(
+                    reason=(
+                        f'{child_name}_requested_scope_count_mismatch'
+                    ),
+                    retry_symbols=expected_symbols,
+                    retry_count=max(
+                        expected_symbol_count,
+                        reported_count,
+                    ),
+                )
+        if invocation_symbols is None and expected_symbol_count == 0:
+            return fail_closed_scope_contract(
+                reason='derived_empty_scope_not_authoritative',
+                retry_symbols=[],
+                retry_count=0,
+            )
+
+        context_scope = _validated_exact_scope_outcome(
+            result=price_context_result,
+            invocation_symbols=expected_symbols,
+            status=DailyPipelineStageService._resolve_result_status(
+                dict(price_context_result)
+            ),
+        )
+        snapshot_scope = _validated_exact_scope_outcome(
+            result=technical_result,
+            invocation_symbols=expected_symbols,
+            status=DailyPipelineStageService._resolve_result_status(
+                dict(technical_result)
+            ),
+        )
+        if context_scope is None:
+            return fail_closed_scope_contract(
+                reason='price_context_scope_outcome_invalid',
+                retry_symbols=expected_symbols,
+            )
+        if snapshot_scope is None:
+            return fail_closed_scope_contract(
+                reason='technical_snapshot_scope_outcome_invalid',
+                retry_symbols=expected_symbols,
+            )
+        if (
+            context_scope['manifest_version']
+            != 'price_contexts_scope_outcomes_v1'
+        ):
+            return fail_closed_scope_contract(
+                reason='price_context_scope_manifest_version_invalid',
+                retry_symbols=expected_symbols,
+            )
+        if (
+            snapshot_scope['manifest_version']
+            != 'technical_snapshots_scope_outcomes_v1'
+        ):
+            return fail_closed_scope_contract(
+                reason=(
+                    'technical_snapshot_scope_manifest_version_invalid'
+                ),
+                retry_symbols=expected_symbols,
+            )
+
+        def partition_matches_counts(
+            *,
+            scope: Mapping[str, Any],
+            result: Mapping[str, Any],
+            persisted_key: str,
+            failed_key: str,
+        ) -> bool:
+            persisted = result.get(persisted_key)
+            failed = result.get(failed_key)
+            if (
+                isinstance(persisted, bool)
+                or isinstance(failed, bool)
+            ):
+                return False
+            try:
+                persisted_count = int(persisted)
+                failed_count = int(failed)
+            except (TypeError, ValueError):
+                return False
+            successful_count = len(
+                scope['successful_stock_codes']
+            )
+            unsuccessful_count = len(
+                scope['retry_debt_stock_codes']
+            ) + len(scope['terminal_not_applicable_stock_codes'])
+            return (
+                persisted_count >= 0
+                and failed_count >= 0
+                and persisted_count == successful_count
+                and failed_count == unsuccessful_count
+                and persisted_count + failed_count
+                == len(scope['selected_stock_codes'])
+            )
+
+        if not partition_matches_counts(
+            scope=context_scope,
+            result=price_context_result,
+            persisted_key='contexts_persisted',
+            failed_key='contexts_failed',
+        ):
+            return fail_closed_scope_contract(
+                reason='price_context_scope_count_mismatch',
+                retry_symbols=expected_symbols,
+            )
+        if not partition_matches_counts(
+            scope=snapshot_scope,
+            result=technical_result,
+            persisted_key='snapshots_persisted',
+            failed_key='snapshots_failed',
+        ):
+            return fail_closed_scope_contract(
+                reason='technical_snapshot_scope_count_mismatch',
+                retry_symbols=expected_symbols,
+            )
+
+        selected_symbols = context_scope['selected_stock_codes']
+        if set(selected_symbols) != set(
+            snapshot_scope['selected_stock_codes']
+        ):
+            return fail_closed_scope_contract(
+                reason='child_scope_identity_mismatch',
+                retry_symbols=expected_symbols,
+            )
+        context_successes = set(
+            context_scope['successful_stock_codes']
+        )
+        snapshot_successes = set(
+            snapshot_scope['successful_stock_codes']
+        )
+        successful_symbols = [
+            symbol
+            for symbol in selected_symbols
+            if symbol in context_successes
+            and symbol in snapshot_successes
+        ]
+        successful_set = set(successful_symbols)
+        retry_debt_symbols = [
+            symbol
+            for symbol in selected_symbols
+            if symbol not in successful_set
+        ]
+        combined_result.update(
+            build_exact_symbol_scope_outcome(
+                manifest_version=(
+                    'technical_snapshots_scope_outcomes_v1'
+                ),
+                selected_symbols=selected_symbols,
+                successful_symbols=successful_symbols,
+                retry_debt_symbols=retry_debt_symbols,
+            )
+        )
+        combined_result['snapshots_persisted'] = len(successful_symbols)
+        combined_result['snapshots_failed'] = len(retry_debt_symbols)
+        combined_result['failed_symbols'] = retry_debt_symbols[:50]
+        combined_result['items'] = [
+            item
+            for item in (combined_result.get('items') or [])
+            if isinstance(item, Mapping)
+            and str(item.get('symbol') or '').strip() in successful_set
+        ]
+        combined_result['_retry_metadata'] = {
+            'failed_symbols': list(retry_debt_symbols),
+        }
+        if retry_debt_symbols:
+            combined_result['status'] = 'partial'
+        return combined_result
 
     def _execute_stage(
         self,
@@ -4256,6 +6811,7 @@ class DailyPipelineStageService:
         feedback_reuse_parent_run_id: str | None = None,
         feedback_retry_config_override: Mapping[str, Any] | None = None,
         feedback_cutoff_resolution: dict[str, Any] | None = None,
+        completion_parent_proof: Mapping[str, Any] | None = None,
         point_in_time_recovery: bool = False,
         allow_same_day_intraday_watch_continuation: bool = False,
         allow_previous_session_preopen_recovery: bool = False,
@@ -4264,6 +6820,7 @@ class DailyPipelineStageService:
         progress_callback: Callable[..., Any] | None = None,
         allow_expired_analysis_replay: bool = False,
         exact_scope_symbols: list[str] | None = None,
+        complete_price_scope_proven: bool = False,
     ) -> dict[str, Any]:
         if (
             point_in_time_recovery
@@ -4355,22 +6912,118 @@ class DailyPipelineStageService:
                 and result_status not in {'failed', 'blocked', 'waiting'}
             ):
                 result['status'] = 'partial'
+
+            coverage_payload = (
+                result.get('coverage')
+                if isinstance(result.get('coverage'), dict)
+                else {}
+            )
+            coverage_categories = (
+                coverage_payload.get('categories')
+                if isinstance(coverage_payload.get('categories'), dict)
+                else {}
+            )
+            raw_requested_symbols = (
+                symbols
+                if symbols is not None
+                else result.get('symbols_requested')
+            )
+            exact_scope_symbols = (
+                normalize_symbol_codes(raw_requested_symbols)
+                if isinstance(raw_requested_symbols, (list, tuple))
+                else []
+            )
+            if exact_scope_symbols:
+                (
+                    exact_scope_outcome,
+                    exact_scope_retry_reasons,
+                ) = _build_pykrx_enrichment_symbol_scope_outcome(
+                    selected_symbols=exact_scope_symbols,
+                    coverage_categories=coverage_categories,
+                )
+                result.update(exact_scope_outcome)
+                result['exact_scope_retry_reasons'] = (
+                    exact_scope_retry_reasons
+                )
+                exact_retry_symbols = list(
+                    exact_scope_outcome['retry_debt_stock_codes']
+                )
+                if exact_retry_symbols:
+                    if str(result.get('status') or '').strip().lower() not in {
+                        'failed',
+                        'blocked',
+                        'waiting',
+                    }:
+                        result['status'] = 'partial'
+                    retry_metadata = (
+                        dict(result.get('_retry_metadata'))
+                        if isinstance(result.get('_retry_metadata'), dict)
+                        else {}
+                    )
+                    retry_metadata['failed_symbols'] = exact_retry_symbols
+                    result['_retry_metadata'] = retry_metadata
+            elif str(result.get('status') or '').strip().lower() not in {
+                'failed',
+                'blocked',
+                'waiting',
+            }:
+                # Exact downstream narrowing requires a durable invocation
+                # identity.  Aggregate category readiness cannot prove which
+                # symbols are safe to advance.
+                result['status'] = 'partial'
+                result['exact_scope_status'] = 'unavailable'
+                result['exact_scope_retry_reasons'] = {
+                    '__scope__': ['missing_exact_invocation_symbols']
+                }
             return result
         if stage_id == 'technical_snapshots':
-            price_context_result = daily_price_context_service.rebuild_for_market_date(
+            price_context_result = self._execute_exact_scoped_derived_stage(
+                stage_id='price_contexts',
                 market_date=market_date,
-                symbols=symbols,
-                source='stage_orchestrator',
-                run_id=run_id,
+                exact_scope_symbols=exact_scope_symbols,
+                call=lambda: daily_price_context_service.rebuild_for_market_date(
+                    market_date=market_date,
+                    symbols=symbols,
+                    exact_scope_symbols=exact_scope_symbols,
+                    source='stage_orchestrator',
+                    run_id=run_id,
+                ),
+                atomic_finalization=True,
             )
-            technical_result = daily_technical_snapshot_service.rebuild_for_market_date(
+            price_scope = _validated_exact_scope_outcome(
+                result=price_context_result,
+                invocation_symbols=exact_scope_symbols or symbols,
+                status=self._resolve_result_status(price_context_result),
+            )
+            price_context_successes = (
+                list(price_scope['successful_stock_codes'])
+                if price_scope is not None
+                and price_scope['manifest_version']
+                == 'price_contexts_scope_outcomes_v1'
+                else []
+            )
+            technical_result = self._execute_exact_scoped_derived_stage(
+                stage_id='technical_snapshots',
                 market_date=market_date,
-                symbols=symbols,
-                source='stage_orchestrator',
-                run_id=run_id,
+                exact_scope_symbols=exact_scope_symbols,
+                call=lambda: daily_technical_snapshot_service.rebuild_for_market_date(
+                    market_date=market_date,
+                    symbols=price_context_successes,
+                    exact_scope_symbols=exact_scope_symbols,
+                    source='stage_orchestrator',
+                    run_id=run_id,
+                ),
+                atomic_finalization=True,
+            )
+            combined_technical_result = (
+                self._combine_technical_scope_outcomes(
+                    price_context_result=price_context_result,
+                    technical_result=technical_result,
+                    invocation_symbols=exact_scope_symbols or symbols,
+                )
             )
             return {
-                **technical_result,
+                **combined_technical_result,
                 'contexts_persisted': int(
                     price_context_result.get('contexts_persisted') or 0
                 ),
@@ -4384,21 +7037,51 @@ class DailyPipelineStageService:
                 },
             }
         if stage_id == 'action_summaries':
-            return daily_action_summary_service.rebuild_for_market_date(
+            return self._execute_exact_scoped_derived_stage(
+                stage_id=stage_id,
                 market_date=market_date,
-                symbols=symbols,
-                source='stage_orchestrator',
-                run_id=run_id,
+                exact_scope_symbols=exact_scope_symbols,
+                call=lambda: daily_action_summary_service.rebuild_for_market_date(
+                    market_date=market_date,
+                    symbols=symbols,
+                    exact_scope_symbols=exact_scope_symbols,
+                    source='stage_orchestrator',
+                    run_id=run_id,
+                ),
+                atomic_finalization=True,
             )
         if stage_id == 'trending_ranks':
-            if (
-                exact_scope_symbols is None
-                or not {'KOSPI', 'KOSDAQ'}.issubset(set(markets))
-            ):
-                return {
+            normalized_exact_scope = normalize_symbol_codes(
+                exact_scope_symbols or []
+            )
+            normalized_admitted_scope = normalize_symbol_codes(
+                symbols or []
+            )
+            exact_scope_admitted = bool(
+                normalized_exact_scope
+                and normalized_admitted_scope
+                and len(normalized_exact_scope)
+                == len(normalized_admitted_scope)
+                and set(normalized_exact_scope)
+                == set(normalized_admitted_scope)
+            )
+            authoritative_scope_ready = bool(
+                exact_scope_admitted
+                and complete_price_scope_proven
+                and {'KOSPI', 'KOSDAQ'}.issubset(set(markets))
+            )
+            if not authoritative_scope_ready:
+                retry_debt_scope = (
+                    normalized_exact_scope
+                    or normalized_admitted_scope
+                )
+                blocked_result: dict[str, Any] = {
                     'status': 'blocked',
                     'reason': (
                         'authoritative_trending_membership_unavailable'
+                        if not normalized_exact_scope
+                        or not {'KOSPI', 'KOSDAQ'}.issubset(set(markets))
+                        else 'complete_price_scope_authority_unavailable'
                     ),
                     'market_date': market_date,
                     'periods_persisted': 0,
@@ -4406,7 +7089,23 @@ class DailyPipelineStageService:
                         DAY_BASED_TRENDING_PERIODS
                     ),
                     'periods_total': len(DAY_BASED_TRENDING_PERIODS),
+                    'admitted_stock_codes': normalized_admitted_scope,
+                    '_retry_metadata': {
+                        'failed_symbols': retry_debt_scope,
+                    },
                 }
+                if retry_debt_scope:
+                    blocked_result.update(
+                        build_exact_symbol_scope_outcome(
+                            manifest_version=(
+                                'trending_ranks_scope_outcomes_v1'
+                            ),
+                            selected_symbols=retry_debt_scope,
+                            successful_symbols=[],
+                            retry_debt_symbols=retry_debt_scope,
+                        )
+                    )
+                return blocked_result
             return compute_and_persist_daily_trending_ranks(
                 market_date=market_date,
                 source='stage_orchestrator',
@@ -4414,7 +7113,7 @@ class DailyPipelineStageService:
                 # Trending ranks are a global cross-sectional artifact.  A
                 # narrowed recovery subset must never replace the whole
                 # date's ranks; only a proven full membership is authoritative.
-                symbols=exact_scope_symbols,
+                symbols=normalized_exact_scope,
                 authoritative_scope=True,
             )
         if stage_id == 'signal_features':
@@ -4427,14 +7126,27 @@ class DailyPipelineStageService:
                 )
             )
         if stage_id == 'market_risk_snapshots':
-            return asyncio.run(
-                daily_market_risk_snapshot_service.collect_for_market_date(
-                    market_date=market_date,
-                    symbols=symbols,
-                    source=MARKET_RISK_SNAPSHOT_SOURCE,
-                    market_code='J',
-                    progress_callback=progress_callback,
-                )
+            return self._execute_exact_scoped_derived_stage(
+                stage_id=stage_id,
+                market_date=market_date,
+                exact_scope_symbols=exact_scope_symbols,
+                call=lambda: asyncio.run(
+                    daily_market_risk_snapshot_service.collect_for_market_date(
+                        market_date=market_date,
+                        symbols=symbols,
+                        source=MARKET_RISK_SNAPSHOT_SOURCE,
+                        market_code='J',
+                        progress_callback=progress_callback,
+                        **(
+                            {
+                                'exact_scope_symbols': exact_scope_symbols,
+                            }
+                            if exact_scope_symbols is not None
+                            else {}
+                        ),
+                    )
+                ),
+                atomic_finalization=True,
             )
         if stage_id == 'market_risk_filter':
             return self._execute_exact_scoped_derived_stage(
@@ -4443,13 +7155,19 @@ class DailyPipelineStageService:
                 exact_scope_symbols=exact_scope_symbols,
                 call=lambda: asyncio.run(
                     daily_market_risk_filter_service.rebuild_for_market_date(
-                    market_date=market_date,
-                    symbols=symbols,
-                    source=MARKET_RISK_FILTER_SOURCE,
-                    market_code='J',
-                    progress_callback=progress_callback,
+                        market_date=market_date,
+                        symbols=symbols,
+                        source=MARKET_RISK_FILTER_SOURCE,
+                        market_code='J',
+                        progress_callback=progress_callback,
+                        **(
+                            {'exact_scope_symbols': exact_scope_symbols}
+                            if exact_scope_symbols is not None
+                            else {}
+                        ),
                     )
-                )
+                ),
+                atomic_finalization=True,
             )
         if stage_id == 'fundamentals_daily_refresh':
             return asyncio.run(
@@ -4477,11 +7195,15 @@ class DailyPipelineStageService:
                     market_date=market_date,
                     symbols=symbols,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'momentum_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4492,11 +7214,15 @@ class DailyPipelineStageService:
                     market_date=market_date,
                     symbols=symbols,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'value_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4508,11 +7234,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=VALUE_FACTOR_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'low_risk_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4524,11 +7254,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=LOW_RISK_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'beta_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4540,11 +7274,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=BETA_FACTOR_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'advanced_value_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4556,11 +7294,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=ADVANCED_VALUE_FACTOR_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'unified_value_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4572,11 +7314,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=UNIFIED_VALUE_FACTOR_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'quality_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4588,11 +7334,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=QUALITY_FACTOR_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'composite_factors':
             return self._execute_exact_scoped_derived_stage(
@@ -4604,11 +7354,15 @@ class DailyPipelineStageService:
                     symbols=symbols,
                     source=COMPOSITE_FACTOR_SOURCE,
                     **(
-                        {'ranking_symbols': exact_scope_symbols}
+                        {
+                            'ranking_symbols': exact_scope_symbols,
+                            'exact_scope_symbols': exact_scope_symbols,
+                        }
                         if exact_scope_symbols is not None
                         else {}
                     ),
                 ),
+                atomic_finalization=True,
             )
         if stage_id == 'external_news_collect':
             return asyncio.run(
@@ -4834,6 +7588,53 @@ class DailyPipelineStageService:
                     **expired_after_completion,
                     'completed_after_action_window': True,
                 }
+            if stage_id == 'signal_decider':
+                from app.orders.next_open_execution import (
+                    signal_decider_next_open_execution_service,
+                )
+
+                parent_run_id = str(result.get('run_id') or '').strip()
+                requested_identity_symbols = result.get(
+                    'requested_symbols'
+                )
+                existing_decision_identities = result.get(
+                    'decision_identities'
+                )
+                identity_resolution = (
+                    {
+                        'status': 'completed',
+                        'parent_run_id': parent_run_id,
+                        'symbols': list(requested_identity_symbols),
+                        'decision_identities': list(
+                            existing_decision_identities
+                        ),
+                    }
+                    if isinstance(existing_decision_identities, list)
+                    and existing_decision_identities
+                    else
+                    signal_decider_next_open_execution_service
+                    .resolve_completion_decision_identities(
+                        source_market_date=market_date,
+                        parent_run_id=parent_run_id,
+                        symbols=requested_identity_symbols,
+                    )
+                    if parent_run_id
+                    and isinstance(requested_identity_symbols, list)
+                    and requested_identity_symbols
+                    else {
+                        'status': 'blocked',
+                        'reason': 'completion_identity_scope_unavailable',
+                        'decision_identities': [],
+                    }
+                )
+                result = {
+                    **result,
+                    'decision_identity_resolution': identity_resolution,
+                    'decision_identities': list(
+                        identity_resolution.get('decision_identities')
+                        or []
+                    ),
+                }
             return result
         if stage_id == 'next_open_execution_plan':
             from app.orders.next_open_execution import signal_decider_next_open_execution_service
@@ -4855,6 +7656,7 @@ class DailyPipelineStageService:
                 target_trade_date=target_trade_date,
                 trigger='daily_pipeline_post_decider',
                 force=force,
+                completion_parent_proof=completion_parent_proof,
             )
         if stage_id == 'signal_decider_evaluations':
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
@@ -5098,6 +7900,43 @@ class DailyPipelineStageService:
     @staticmethod
     def _dependency_outcome_is_satisfied(outcome: dict[str, Any] | None) -> bool:
         return daily_pipeline_outcome_is_satisfied(outcome)
+
+    @classmethod
+    def _complete_price_scope_is_proven(
+        cls,
+        *,
+        exact_scope_symbols: Sequence[str] | None,
+        admitted_symbols: Sequence[str] | None,
+        price_outcome: dict[str, Any] | None,
+        price_invocation_symbols: Sequence[str] | None,
+    ) -> bool:
+        """Require an exhaustive same-run price partition for global ranks."""
+
+        exact_scope = normalize_symbol_codes(exact_scope_symbols or [])
+        admitted_scope = normalize_symbol_codes(admitted_symbols or [])
+        if not (
+            exact_scope
+            and admitted_scope
+            and len(exact_scope) == len(admitted_scope)
+            and set(exact_scope) == set(admitted_scope)
+        ):
+            return False
+        price_scope = cls._exact_partial_success_scope(
+            outcome=price_outcome,
+            invocation_symbols=price_invocation_symbols,
+        )
+        return bool(
+            price_scope is not None
+            and not price_scope['retry_debt_stock_codes']
+            and len(price_scope['selected_stock_codes'])
+            == len(exact_scope)
+            and set(price_scope['selected_stock_codes'])
+            == set(exact_scope)
+            and len(price_scope['successful_stock_codes'])
+            == len(exact_scope)
+            and set(price_scope['successful_stock_codes'])
+            == set(exact_scope)
+        )
 
     @staticmethod
     def _exact_partial_success_scope(
@@ -5549,13 +8388,108 @@ class DailyPipelineStageService:
             and completed_symbols
         ):
             return None
-        return {
-            **resolution,
+        raw_decision_identities = (
+            result.get('decision_identities')
+            if isinstance(result, Mapping)
+            else None
+        )
+        if not isinstance(raw_decision_identities, list):
+            return None
+        completed_symbol_set = set(completed_symbols)
+        decision_identities_by_key: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        for raw_identity in raw_decision_identities:
+            if not isinstance(raw_identity, Mapping):
+                return None
+            identity = dict(raw_identity)
+            if set(identity) != {
+                'symbol',
+                'decision_agent_name',
+                'decision_snapshot_id',
+                'decision_run_id',
+            }:
+                return None
+            normalized_symbol = normalize_symbol_codes(
+                [identity.get('symbol')]
+            )
+            role = str(
+                identity.get('decision_agent_name') or ''
+            ).strip()
+            snapshot_id = identity.get('decision_snapshot_id')
+            decision_run_id = str(
+                identity.get('decision_run_id') or ''
+            ).strip()
+            key = (
+                normalized_symbol[0] if normalized_symbol else '',
+                role,
+            )
+            if key[0] not in completed_symbol_set:
+                # Identities from failed retry-debt scopes are intentionally
+                # omitted from terminal progression authority.
+                continue
+            if not (
+                len(normalized_symbol) == 1
+                and identity.get('symbol') == normalized_symbol[0]
+                and role in DECISION_SUPPORT_AGENT_NAMES
+                and type(snapshot_id) is int
+                and snapshot_id > 0
+                and decision_run_id
+                and key not in decision_identities_by_key
+            ):
+                return None
+            decision_identities_by_key[key] = {
+                'symbol': normalized_symbol[0],
+                'decision_agent_name': role,
+                'decision_snapshot_id': snapshot_id,
+                'decision_run_id': decision_run_id,
+            }
+        expected_identity_keys = {
+            (symbol, role)
+            for symbol in completed_symbols
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        if set(decision_identities_by_key) != expected_identity_keys:
+            return None
+        decision_identities = sorted(
+            decision_identities_by_key.values(),
+            key=lambda identity: (
+                identity['symbol'],
+                identity['decision_agent_name'],
+            ),
+        )
+        proof: dict[str, Any] = {
+            'schema_version': STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION,
+            'kind': 'signal_decider_terminal_progression',
+            'roles': list(DECISION_SUPPORT_AGENT_NAMES),
             'source_run_id': str(result.get('run_id') or '').strip(),
             'source_summary_run_id': cutoff_source_run_id,
+            'knowledge_cutoff_at': normalized_cutoff_at.isoformat(),
             'admitted_symbols': list(normalized_expected_symbols),
             'completed_symbols': list(completed_symbols),
+            'failed_symbols_by_role': {
+                role: list(
+                    resolution['failed_symbols_by_role'].get(role, [])
+                )
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+            'decision_identities': decision_identities,
+            'total_items': resolution['total_items'],
+            'completed_items': resolution['completed_items'],
+            'failed_items': resolution['failed_items'],
         }
+        proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(proof)
+        )
+        return (
+            DailyPipelineStageService
+            .validated_stage_completion_scope_proof(
+                'signal_decider',
+                proof,
+            )
+        )
 
     @staticmethod
     def _terminal_decider_completed_symbols(
@@ -5596,6 +8530,7 @@ class DailyPipelineStageService:
         requested_stages: Sequence[str],
         *,
         inject_next_open_dependency: bool = True,
+        include_dependency_closure: bool = True,
     ) -> list[str]:
         requested_set: set[str] = set()
         normalized: list[str] = []
@@ -5616,6 +8551,15 @@ class DailyPipelineStageService:
             # run. Resume requests intentionally retain their persisted-output
             # boundary and let the plan service validate stored candidates.
             requested_set.add('signal_decider')
+        if include_dependency_closure:
+            pending = list(requested_set)
+            while pending:
+                stage_id = pending.pop()
+                for dependency in STAGE_DEFINITIONS[stage_id].depends_on:
+                    if dependency in requested_set:
+                        continue
+                    requested_set.add(dependency)
+                    pending.append(dependency)
         for stage_id in DAILY_STAGE_ORDER:
             if stage_id in requested_set:
                 normalized.append(stage_id)

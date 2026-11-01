@@ -6869,6 +6869,7 @@ class AgentFeedbackRetryService:
 
         return {
             'market_date': config.market_date.isoformat(),
+            'knowledge_cutoff_at': knowledge_cutoff_at,
             'policy_context_as_of_date': (
                 resolved_policy_context_as_of_date.isoformat()
             ),

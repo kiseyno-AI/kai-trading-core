@@ -42,6 +42,29 @@ def _snapshot(**overrides) -> dict:
 
 
 class DailyActionSummaryServiceTests(unittest.TestCase):
+    def setUp(self):
+        def _publish(**kwargs):
+            successful_symbols = [
+                row['symbol'] for row in kwargs['rows']
+            ]
+            return {
+                'successful_symbols': successful_symbols,
+                'failed_symbols': [],
+                'failed_symbol_errors': [],
+                'scope_finalization': {
+                    'ready': True,
+                    'deleted_stale_row_count': 0,
+                },
+            }
+
+        self.replace_scope_patcher = patch(
+            'app.eod.action_summaries.'
+            'replace_daily_action_summaries_exact_scope',
+            side_effect=_publish,
+        )
+        self.replace_scope_mock = self.replace_scope_patcher.start()
+        self.addCleanup(self.replace_scope_patcher.stop)
+
     def test_compute_summary_returns_long_breakout_setup(self):
         service = DailyActionSummaryService()
 
@@ -185,7 +208,6 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
                 'app.eod.action_summaries.load_daily_technical_snapshot_inputs',
                 return_value=[_snapshot()],
             ),
-            patch('app.eod.action_summaries.upsert_daily_action_summary') as upsert_mock,
         ):
             result = service.rebuild_for_market_date(
                 market_date='2026-04-29',
@@ -196,7 +218,7 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertEqual(result['action_summaries_failed'], 0)
         self.assertEqual(result['failed_symbols'], [])
         self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
-        upsert_mock.assert_called_once()
+        self.replace_scope_mock.assert_called_once()
 
     def test_rebuild_uses_exact_same_day_price_bar_universe_as_denominator(
         self,
@@ -214,9 +236,6 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
                 'load_daily_technical_snapshot_inputs',
                 return_value=[_snapshot()],
             ) as snapshot_inputs,
-            patch(
-                'app.eod.action_summaries.upsert_daily_action_summary'
-            ),
         ):
             result = service.rebuild_for_market_date(
                 market_date='2026-04-29',
@@ -249,6 +268,12 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
             result['denominator_source'],
             'same_day_daily_price_bars',
         )
+        self.replace_scope_mock.assert_called_once_with(
+            market_date='2026-04-29',
+            rows=[self.replace_scope_mock.call_args.kwargs['rows'][0]],
+            exact_symbols=['005930', '000660'],
+            run_id=None,
+        )
 
     def test_rebuild_can_return_full_internal_retry_scope_without_expanding_public_preview(self):
         service = DailyActionSummaryService()
@@ -256,7 +281,6 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
 
         with (
             patch('app.eod.action_summaries.load_daily_technical_snapshot_inputs', return_value=[]),
-            patch('app.eod.action_summaries.upsert_daily_action_summary') as upsert_mock,
         ):
             result = service.rebuild_for_market_date(
                 market_date='2026-04-29',
@@ -267,4 +291,9 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertEqual(result['action_summaries_failed'], 60)
         self.assertEqual(result['failed_symbols'], symbols[:50])
         self.assertEqual(result['_retry_metadata']['failed_symbols'], symbols)
-        upsert_mock.assert_not_called()
+        self.replace_scope_mock.assert_called_once_with(
+            market_date='2026-04-29',
+            rows=[],
+            exact_symbols=symbols,
+            run_id=None,
+        )

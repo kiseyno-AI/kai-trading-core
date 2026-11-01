@@ -10,6 +10,7 @@ from app.eod.daily_pipeline_state import (
 )
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pykrx_pipeline_runner import _extract_result_counts
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 
 
 def test_build_counts_repairs_out_of_order_and_negative_values() -> None:
@@ -152,7 +153,7 @@ def test_fundamentals_terminal_counts_prefer_actual_captured_events() -> None:
     }
 
 
-def test_news_terminal_counts_do_not_treat_stale_symbols_as_success() -> None:
+def test_news_terminal_counts_treat_stale_symbols_as_successful_collection() -> None:
     counts = _extract_result_counts(
         {
             'status': 'completed',
@@ -172,7 +173,7 @@ def test_news_terminal_counts_do_not_treat_stale_symbols_as_success() -> None:
     assert counts == {
         'processed': 201,
         'total': 201,
-        'succeeded': 118,
+        'succeeded': 201,
         'failed': 0,
     }
 
@@ -193,6 +194,34 @@ def test_result_count_extraction_repairs_success_above_reported_total() -> None:
         'total': 9,
         'succeeded': 9,
         'failed': 0,
+    }
+
+
+def test_stage_orchestrator_counts_signal_feature_retry_debt() -> None:
+    selected = ['005930', '000660', '035420']
+    counts = DailyPipelineStageService._extract_stage_counts(
+        stage_id='signal_features',
+        result={
+            'status': 'partial',
+            'features_persisted': 0,
+            'features_failed': 0,
+            'items_total': 0,
+            **build_exact_symbol_scope_outcome(
+                manifest_version=(
+                    'signal_features_scope_outcomes_v1'
+                ),
+                selected_symbols=selected,
+                successful_symbols=[],
+                retry_debt_symbols=selected,
+            ),
+        },
+    )
+
+    assert counts == {
+        'processed': 3,
+        'total': 3,
+        'succeeded': 0,
+        'failed': 3,
     }
 
 
@@ -217,7 +246,7 @@ def test_stage_orchestrator_uses_fundamentals_event_counts() -> None:
     }
 
 
-def test_stage_orchestrator_news_counts_use_recent_success_only() -> None:
+def test_stage_orchestrator_news_counts_keep_freshness_out_of_progress() -> None:
     counts = DailyPipelineStageService._extract_stage_counts(
         stage_id='external_news_collect',
         result={
@@ -237,7 +266,7 @@ def test_stage_orchestrator_news_counts_use_recent_success_only() -> None:
     assert counts == {
         'processed': 201,
         'total': 201,
-        'succeeded': 118,
+        'succeeded': 201,
         'failed': 0,
     }
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.agent_context.derived_contexts import build_price_context
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
@@ -11,8 +11,9 @@ from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_bars_for_symbol,
     load_daily_technical_snapshots,
-    upsert_daily_technical_snapshot,
+    replace_daily_technical_snapshots_exact_scope,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 
 
 TECHNICAL_SNAPSHOT_SCOPE_MANIFEST_VERSION = (
@@ -217,23 +218,39 @@ class DailyTechnicalSnapshotService:
             signal_payload=signal_payload,
         )
 
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
         market_date: str,
         symbols: Sequence[str] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
         source: str = 'pykrx',
         run_id: int | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         include_retry_metadata: bool = False,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict:
-        target_symbols = list(
-            dict.fromkeys(
-                symbols
-                if symbols
+        target_symbols = list(dict.fromkeys(
+            symbols
+            if symbols is not None
+            else (
+                exact_scope_symbols
+                if exact_scope_symbols is not None
                 else list_symbols_with_daily_bar_on_date(market_date)
             )
-        )
+        ))
+        authority_symbols = list(dict.fromkeys(
+            exact_scope_symbols
+            if exact_scope_symbols is not None
+            else target_symbols
+        ))
+        outside_authority = sorted(set(target_symbols) - set(authority_symbols))
+        if outside_authority:
+            raise ValueError(
+                'technical snapshot processing symbols outside exact scope: '
+                + ','.join(outside_authority[:20])
+            )
         snapshots: list[dict] = []
         failed_symbols: list[str] = []
 
@@ -269,7 +286,6 @@ class DailyTechnicalSnapshotService:
             try:
                 bars = load_daily_bars_for_symbol(symbol, end_date=market_date, limit=self.history_window)
                 snapshot = self.compute_snapshot(symbol=symbol, market_date=market_date, bars=bars, source=source)
-                upsert_daily_technical_snapshot(snapshot.to_row(), run_id=run_id)
                 snapshots.append(snapshot.to_row())
             except Exception:
                 failed_symbols.append(symbol)
@@ -300,22 +316,62 @@ class DailyTechnicalSnapshotService:
                     }
                 )
 
+        publication = (
+            replace_daily_technical_snapshots_exact_scope(
+                market_date=market_date,
+                rows=snapshots,
+                exact_symbols=authority_symbols,
+                run_id=run_id,
+                **(
+                    {
+                        'authoritative_market_scope': (
+                            authoritative_market_scope
+                        )
+                    }
+                    if authoritative_market_scope is not None
+                    else {}
+                ),
+            )
+            if authority_symbols
+            else None
+        )
+        successful_symbols = (
+            list(publication['successful_symbols'])
+            if publication is not None
+            else []
+        )
+        successful_set = set(successful_symbols)
+        snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot['symbol'] in successful_set
+        ]
+        failed_symbols = [
+            symbol
+            for symbol in authority_symbols
+            if symbol not in successful_set
+        ]
+        scope_finalization = (
+            publication['scope_finalization']
+            if publication is not None
+            else None
+        )
+
         result = {
             'market_date': market_date,
             'source': source,
-            'requested_symbols': len(target_symbols),
+            'requested_symbols': len(authority_symbols),
             'snapshots_persisted': len(snapshots),
             'snapshots_failed': len(failed_symbols),
             'failed_symbols': failed_symbols[:50],
             'items': snapshots,
+            'scope_finalization': scope_finalization,
             **build_exact_symbol_scope_outcome(
                 manifest_version=(
                     TECHNICAL_SNAPSHOT_SCOPE_MANIFEST_VERSION
                 ),
-                selected_symbols=target_symbols,
-                successful_symbols=[
-                    snapshot['symbol'] for snapshot in snapshots
-                ],
+                selected_symbols=authority_symbols,
+                successful_symbols=successful_symbols,
                 retry_debt_symbols=failed_symbols,
             ),
         }

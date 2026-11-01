@@ -4,15 +4,16 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_action_summaries,
     load_daily_technical_snapshot_inputs,
-    upsert_daily_action_summary,
+    replace_daily_action_summaries_exact_scope,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 
 SUMMARY_VERSION = 'mvp_v1'
 ACTION_SUMMARY_SCOPE_MANIFEST_VERSION = (
@@ -358,27 +359,49 @@ class DailyActionSummaryService:
             summary_payload=summary_payload,
         )
 
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
         market_date: str,
         symbols: Sequence[str] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
         source: str = 'pykrx',
         run_id: int | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         include_retry_metadata: bool = False,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict:
-        requested_symbols = list(dict.fromkeys(symbols or []))
-        if not requested_symbols:
-            requested_symbols = list_symbols_with_daily_bar_on_date(
-                market_date
+        requested_symbols = list(dict.fromkeys(
+            symbols
+            if symbols is not None
+            else (
+                exact_scope_symbols
+                if exact_scope_symbols is not None
+                else list_symbols_with_daily_bar_on_date(market_date)
             )
-        snapshots = load_daily_technical_snapshot_inputs(
-            market_date=market_date,
-            symbols=requested_symbols or None,
-            limit=max(len(requested_symbols), 100)
+        ))
+        authority_symbols = list(dict.fromkeys(
+            exact_scope_symbols
+            if exact_scope_symbols is not None
+            else requested_symbols
+        ))
+        outside_authority = sorted(
+            set(requested_symbols) - set(authority_symbols)
+        )
+        if outside_authority:
+            raise ValueError(
+                'action summary processing symbols outside exact scope: '
+                + ','.join(outside_authority[:20])
+            )
+        snapshots = (
+            load_daily_technical_snapshot_inputs(
+                market_date=market_date,
+                symbols=requested_symbols,
+                limit=max(len(requested_symbols), 100),
+            )
             if requested_symbols
-            else 10000,
+            else []
         )
         available_symbols = {item['symbol'] for item in snapshots}
 
@@ -418,7 +441,6 @@ class DailyActionSummaryService:
                 summary = self.compute_summary(snapshot)
                 row = summary.to_row()
                 row['source'] = source
-                upsert_daily_action_summary(row, run_id=run_id)
                 items.append(row)
             except Exception:
                 failed_symbols.append(snapshot['symbol'])
@@ -449,20 +471,58 @@ class DailyActionSummaryService:
                     }
                 )
 
-        deduped_failed = list(dict.fromkeys(failed_symbols))
+        publication = (
+            replace_daily_action_summaries_exact_scope(
+                market_date=market_date,
+                rows=items,
+                exact_symbols=authority_symbols,
+                run_id=run_id,
+                **(
+                    {
+                        'authoritative_market_scope': (
+                            authoritative_market_scope
+                        )
+                    }
+                    if authoritative_market_scope is not None
+                    else {}
+                ),
+            )
+            if authority_symbols
+            else None
+        )
+        successful_symbols = (
+            list(publication['successful_symbols'])
+            if publication is not None
+            else []
+        )
+        successful_set = set(successful_symbols)
+        items = [
+            item for item in items if item['symbol'] in successful_set
+        ]
+        deduped_failed = [
+            symbol
+            for symbol in authority_symbols
+            if symbol not in successful_set
+        ]
+        scope_finalization = (
+            publication['scope_finalization']
+            if publication is not None
+            else None
+        )
         result = {
             'market_date': market_date,
             'source': source,
-            'requested_symbols': len(requested_symbols),
+            'requested_symbols': len(authority_symbols),
             'action_summaries_persisted': len(items),
             'action_summaries_failed': len(deduped_failed),
             'failed_symbols': deduped_failed[:50],
             'items': items,
+            'scope_finalization': scope_finalization,
             'denominator_source': 'same_day_daily_price_bars',
             **build_exact_symbol_scope_outcome(
                 manifest_version=ACTION_SUMMARY_SCOPE_MANIFEST_VERSION,
-                selected_symbols=requested_symbols,
-                successful_symbols=[item['symbol'] for item in items],
+                selected_symbols=authority_symbols,
+                successful_symbols=successful_symbols,
                 retry_debt_symbols=deduped_failed,
             ),
         }

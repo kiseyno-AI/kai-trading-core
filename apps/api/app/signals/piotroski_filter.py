@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy import and_, case, func, select
 
@@ -30,9 +30,11 @@ from app.eod.finality import validate_finalized_krx_write_date
 from app.market_data_store import (
     load_daily_piotroski_filter_results,
     load_latest_available_daily_piotroski_filter_result_date,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_piotroski_filter_result,
     upsert_daily_piotroski_filter_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.preferred_share_fundamentals import (
     resolve_preferred_fundamentals_issuer_symbols,
 )
@@ -73,7 +75,16 @@ PIOTROSKI_RAW_FALLBACK_FACT_KEYS = (
     'gross_profit',
     'revenue',
 )
-
+PIOTROSKI_COMPARATIVE_PRIOR_FACT_KEYS = (
+    'net_income',
+    'total_assets',
+    'total_equity',
+    'total_liabilities',
+    'current_assets',
+    'current_liabilities',
+    'gross_profit',
+    'revenue',
+)
 INDEX_GROSS_MARGIN = 'M211300'
 INDEX_CURRENT_RATIO = 'M221200'
 INDEX_ASSET_TURNOVER = 'M241000'
@@ -83,6 +94,39 @@ CANONICAL_GROSS_MARGIN = 'gross_margin'
 CANONICAL_CURRENT_RATIO = 'current_ratio'
 CANONICAL_ASSET_TURNOVER = 'asset_turnover'
 CANONICAL_DEBT_RATIO = 'debt_ratio'
+PIOTROSKI_COMPARATIVE_PRIOR_RATIO_INPUTS = {
+    CANONICAL_DEBT_RATIO: (
+        'total_liabilities',
+        'total_equity',
+        True,
+        INDEX_DEBT_RATIO,
+    ),
+    CANONICAL_CURRENT_RATIO: (
+        'current_assets',
+        'current_liabilities',
+        False,
+        INDEX_CURRENT_RATIO,
+    ),
+    CANONICAL_GROSS_MARGIN: (
+        'gross_profit',
+        'revenue',
+        False,
+        INDEX_GROSS_MARGIN,
+    ),
+    CANONICAL_ASSET_TURNOVER: (
+        'revenue',
+        'total_assets',
+        False,
+        INDEX_ASSET_TURNOVER,
+    ),
+}
+PIOTROSKI_COMPARATIVE_PRIOR_DERIVED_INPUTS = {
+    'roa': ('net_income', 'total_assets'),
+    **{
+        ratio_key: (inputs[0], inputs[1])
+        for ratio_key, inputs in PIOTROSKI_COMPARATIVE_PRIOR_RATIO_INPUTS.items()
+    },
+}
 
 
 @dataclass(slots=True)
@@ -179,6 +223,37 @@ def _current_highlight_value(highlight: dict[str, Any] | None) -> Any:
     if current_amount is not None:
         return current_amount
     return highlight.get('current_cumulative_amount')
+
+
+def _comparative_prior_highlight_value(
+    highlight: dict[str, Any] | None,
+) -> tuple[Any, str | None]:
+    """Resolve the prior-year value carried by the selected annual filing.
+
+    DART annual income/cash-flow rows can expose the comparative period in
+    ``prior_cumulative_amount`` while balance-sheet rows use
+    ``prior_amount``.  This mirrors the canonical current-value preference
+    and keeps the exact raw amount field in provenance.
+    """
+
+    if not isinstance(highlight, dict):
+        return None, None
+    statement_type = str(
+        highlight.get('statement_type') or ''
+    ).strip().upper()
+    if statement_type in {'IS', 'CIS', 'CF'}:
+        prior_cumulative_amount = highlight.get(
+            'prior_cumulative_amount'
+        )
+        if prior_cumulative_amount is not None:
+            return prior_cumulative_amount, 'prior_cumulative_amount'
+    prior_amount = highlight.get('prior_amount')
+    if prior_amount is not None:
+        return prior_amount, 'prior_amount'
+    prior_cumulative_amount = highlight.get('prior_cumulative_amount')
+    if prior_cumulative_amount is not None:
+        return prior_cumulative_amount, 'prior_cumulative_amount'
+    return None, None
 
 
 def _validated_negative_dilution_coverage(
@@ -399,12 +474,15 @@ def _required_financial_signal_missing_reasons(
 
 
 class DailyPiotroskiFilterService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
         normalized_symbols = _normalize_symbols(symbols)
@@ -617,7 +695,9 @@ class DailyPiotroskiFilterService:
                         'fundamentals_selection_policy': (
                             'latest_two_available_annual_years_as_of_market_date; '
                             'latest_filing_per_year; CFS_preferred_within_same_filing_'
-                            'with_OFS_fallback'
+                            'with_OFS_fallback; latest_selected_annual_filing_'
+                            'comparative_values_override_prior_filing_current_'
+                            'values_for_restated_prior_year_facts'
                         ),
                         'fundamentals_by_business_year': {
                             str(year): dict(metadata)
@@ -677,7 +757,20 @@ class DailyPiotroskiFilterService:
                 passed_count += 1
             result_payloads.append(payload)
 
-        if result_payloads:
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='piotroski_filter',
+                results=result_payloads,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols = list(publication['failed_symbols'])
+            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            scope_finalization = publication['scope_finalization']
+        elif result_payloads:
             try:
                 upsert_daily_piotroski_filter_results(result_payloads)
                 persisted_count = len(result_payloads)
@@ -809,6 +902,8 @@ class DailyPiotroskiFilterService:
         if evidence_reason is not None:
             result['reason'] = evidence_reason
             result['quality_warning'] = evidence_reason
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
         return result
 
     def inspect(
@@ -1068,6 +1163,20 @@ class DailyPiotroskiFilterService:
                 snapshot_ids = list(snapshot_metadata_by_id)
                 if not snapshot_ids:
                     continue
+                latest_snapshot_id_by_symbol: dict[str, int] = {}
+                for snapshot_id, metadata in snapshot_metadata_by_id.items():
+                    symbol = str(metadata['symbol'])
+                    current_latest_id = latest_snapshot_id_by_symbol.get(
+                        symbol
+                    )
+                    if current_latest_id is None or int(
+                        metadata['business_year']
+                    ) > int(
+                        snapshot_metadata_by_id[current_latest_id][
+                            'business_year'
+                        ]
+                    ):
+                        latest_snapshot_id_by_symbol[symbol] = snapshot_id
                 stored_highlights_by_snapshot: dict[int, dict[str, Any]] = {}
                 stored_ratios_by_snapshot: dict[int, dict[str, Any]] = {}
                 highlight_rows = session.execute(
@@ -1161,6 +1270,16 @@ class DailyPiotroskiFilterService:
                         or asset_turnover_missing
                     ):
                         raw_fallback_snapshot_ids.append(snapshot_id)
+                # The newest selected annual filing is also the authority for
+                # its prior-period comparative column.  Load those raw rows
+                # even when current-year highlights are complete so restated
+                # prior-year values cannot be hidden behind an older filing.
+                raw_fallback_snapshot_ids = sorted(
+                    {
+                        *raw_fallback_snapshot_ids,
+                        *latest_snapshot_id_by_symbol.values(),
+                    }
+                )
 
                 raw_rows_by_snapshot: dict[int, list[dict[str, Any]]] = {}
                 for start in range(
@@ -1173,6 +1292,7 @@ class DailyPiotroskiFilterService:
                     ]
                     raw_rows = session.execute(
                         select(
+                            DartFundamentalsRow.id.label('row_id'),
                             DartFundamentalsRow.snapshot_id.label('snapshot_id'),
                             DartFundamentalsRow.statement_type.label('statement_type'),
                             DartFundamentalsRow.statement_name.label('statement_name'),
@@ -1204,6 +1324,10 @@ class DailyPiotroskiFilterService:
 
                 raw_fallback_metrics_by_snapshot: dict[int, list[str]] = {}
                 raw_derived_ratios_by_snapshot: dict[int, list[str]] = {}
+                comparative_prior_by_snapshot: dict[
+                    int,
+                    dict[str, Any],
+                ] = {}
                 for snapshot_id, raw_rows in raw_rows_by_snapshot.items():
                     metadata = snapshot_metadata_by_id[snapshot_id]
                     symbol = str(metadata['symbol'])
@@ -1242,6 +1366,253 @@ class DailyPiotroskiFilterService:
                         raw_derived_ratios_by_snapshot[snapshot_id] = sorted(
                             derived_ratio_names
                         )
+
+                    if (
+                        latest_snapshot_id_by_symbol.get(symbol)
+                        != snapshot_id
+                    ):
+                        continue
+                    comparative_year = business_year - 1
+                    comparative_values: dict[str, float] = {}
+                    comparative_observed_keys: set[str] = set()
+                    comparative_fact_provenance: dict[
+                        str,
+                        dict[str, Any],
+                    ] = {}
+                    for metric_key in PIOTROSKI_COMPARATIVE_PRIOR_FACT_KEYS:
+                        highlight = derived_highlights.get(metric_key)
+                        comparative_value, amount_field = (
+                            _comparative_prior_highlight_value(highlight)
+                        )
+                        if amount_field is None:
+                            continue
+                        comparative_observed_keys.add(metric_key)
+                        numeric_comparative_value = _as_float(
+                            comparative_value
+                        )
+                        mapped_key = (metric_key, comparative_year)
+                        previous_value = highlights_by_symbol.setdefault(
+                            symbol,
+                            {},
+                        ).get(mapped_key)
+                        # A later annual filing can restate the comparative
+                        # column.  Prefer it over the value captured from the
+                        # older filing for the prior business year.
+                        highlights_by_symbol[symbol][mapped_key] = (
+                            comparative_value
+                            if numeric_comparative_value is not None
+                            else None
+                        )
+                        if numeric_comparative_value is not None:
+                            comparative_values[metric_key] = (
+                                numeric_comparative_value
+                            )
+                        matched_raw_row = next(
+                            (
+                                row
+                                for row in raw_rows
+                                if str(row.get('statement_type') or '')
+                                .strip()
+                                .upper()
+                                == str(
+                                    (highlight or {}).get(
+                                        'statement_type'
+                                    )
+                                    or ''
+                                )
+                                .strip()
+                                .upper()
+                                and str(row.get('account_id') or '')
+                                == str(
+                                    (highlight or {}).get('account_id')
+                                    or ''
+                                )
+                                and str(row.get('account_name') or '')
+                                == str(
+                                    (highlight or {}).get('account_name')
+                                    or ''
+                                )
+                            ),
+                            None,
+                        )
+                        fact_provenance = {
+                            'source': (
+                                'dart_latest_annual_filing_comparative'
+                            ),
+                            'snapshot_id': snapshot_id,
+                            'source_business_year': business_year,
+                            'business_year': comparative_year,
+                            'metric_key': metric_key,
+                            'amount_field': amount_field,
+                            'row_id': (
+                                int(matched_raw_row['row_id'])
+                                if matched_raw_row is not None
+                                else None
+                            ),
+                            'statement_type': (
+                                (highlight or {}).get('statement_type')
+                            ),
+                            'account_id': (
+                                (highlight or {}).get('account_id')
+                            ),
+                            'account_name': (
+                                (highlight or {}).get('account_name')
+                            ),
+                            'currency': str(
+                                (highlight or {}).get('currency') or ''
+                            ).strip().upper(),
+                            'value': numeric_comparative_value,
+                            'numeric_value_available': (
+                                numeric_comparative_value is not None
+                            ),
+                            'selection_precedence': (
+                                'latest_selected_annual_filing_comparative_'
+                                'over_prior_filing_current'
+                            ),
+                        }
+                        if previous_value is not None:
+                            fact_provenance['superseded_prior_filing_value'] = (
+                                _as_float(previous_value)
+                            )
+                        comparative_fact_provenance[metric_key] = (
+                            fact_provenance
+                        )
+                        highlight_fact_provenance_by_symbol.setdefault(
+                            symbol,
+                            {},
+                        )[mapped_key] = dict(fact_provenance)
+
+                    comparative_ratios: dict[str, float] = {}
+                    invalidated_derived_inputs: dict[
+                        str,
+                        list[str],
+                    ] = {}
+                    for derived_key, input_keys in (
+                        PIOTROSKI_COMPARATIVE_PRIOR_DERIVED_INPUTS.items()
+                    ):
+                        if not comparative_observed_keys.intersection(
+                            input_keys
+                        ):
+                            continue
+                        missing_input_keys = [
+                            input_key
+                            for input_key in input_keys
+                            if input_key not in comparative_values
+                        ]
+                        if not missing_input_keys:
+                            continue
+                        invalidated_derived_inputs[derived_key] = sorted(
+                            missing_input_keys
+                        )
+                        for missing_input_key in missing_input_keys:
+                            mapped_key = (
+                                missing_input_key,
+                                comparative_year,
+                            )
+                            previous_value = (
+                                highlights_by_symbol.setdefault(
+                                    symbol,
+                                    {},
+                                ).get(mapped_key)
+                            )
+                            highlights_by_symbol[symbol][mapped_key] = None
+                            invalidation_provenance = {
+                                'source': (
+                                    'dart_latest_annual_filing_'
+                                    'comparative'
+                                ),
+                                'snapshot_id': snapshot_id,
+                                'source_business_year': business_year,
+                                'business_year': comparative_year,
+                                'metric_key': missing_input_key,
+                                'amount_field': None,
+                                'row_id': None,
+                                'value': None,
+                                'numeric_value_available': False,
+                                'reason': (
+                                    'latest_comparative_derived_input_'
+                                    'incomplete'
+                                ),
+                                'selection_precedence': (
+                                    'latest_selected_annual_filing_'
+                                    'comparative_over_prior_filing_current'
+                                ),
+                            }
+                            if previous_value is not None:
+                                invalidation_provenance[
+                                    'superseded_prior_filing_value'
+                                ] = _as_float(previous_value)
+                            comparative_fact_provenance.setdefault(
+                                missing_input_key,
+                                invalidation_provenance,
+                            )
+                            highlight_fact_provenance_by_symbol.setdefault(
+                                symbol,
+                                {},
+                            )[mapped_key] = dict(invalidation_provenance)
+
+                    for ratio_key, (
+                        numerator_key,
+                        denominator_key,
+                        require_positive_denominator,
+                        stored_index_key,
+                    ) in PIOTROSKI_COMPARATIVE_PRIOR_RATIO_INPUTS.items():
+                        if not comparative_observed_keys.intersection(
+                            (numerator_key, denominator_key)
+                        ):
+                            continue
+                        symbol_ratios = ratios_by_symbol.setdefault(
+                            symbol,
+                            {},
+                        )
+                        symbol_ratios.pop(
+                            (ratio_key, comparative_year),
+                            None,
+                        )
+                        symbol_ratios.pop(
+                            (stored_index_key, comparative_year),
+                            None,
+                        )
+                        numerator = comparative_values.get(numerator_key)
+                        denominator = comparative_values.get(
+                            denominator_key
+                        )
+                        invalid_ratio_inputs: list[str] = []
+                        if numerator is None:
+                            invalid_ratio_inputs.append(numerator_key)
+                        if denominator in (None, 0) or (
+                            require_positive_denominator
+                            and denominator is not None
+                            and denominator <= 0
+                        ):
+                            invalid_ratio_inputs.append(denominator_key)
+                        if invalid_ratio_inputs:
+                            invalidated_derived_inputs[ratio_key] = sorted(
+                                {
+                                    *invalidated_derived_inputs.get(
+                                        ratio_key,
+                                        [],
+                                    ),
+                                    *invalid_ratio_inputs,
+                                }
+                            )
+                            continue
+                        ratio_value = numerator / denominator
+                        symbol_ratios[
+                            (ratio_key, comparative_year)
+                        ] = ratio_value
+                        comparative_ratios[ratio_key] = ratio_value
+
+                    if comparative_fact_provenance:
+                        comparative_prior_by_snapshot[snapshot_id] = {
+                            'business_year': comparative_year,
+                            'source_business_year': business_year,
+                            'facts': comparative_fact_provenance,
+                            'ratios': comparative_ratios,
+                            'invalidated_derived_inputs': (
+                                invalidated_derived_inputs
+                            ),
+                        }
                 for metadata in snapshot_metadata_by_id.values():
                     symbol = str(metadata['symbol'])
                     business_year = int(metadata['business_year'])
@@ -1276,6 +1647,69 @@ class DailyPiotroskiFilterService:
                     fundamentals_provenance_by_symbol.setdefault(symbol, {})[
                         business_year
                     ] = provenance
+
+                for snapshot_id, comparative in (
+                    comparative_prior_by_snapshot.items()
+                ):
+                    metadata = snapshot_metadata_by_id[snapshot_id]
+                    symbol = str(metadata['symbol'])
+                    comparative_year = int(comparative['business_year'])
+                    existing_prior_provenance = (
+                        fundamentals_provenance_by_symbol
+                        .setdefault(symbol, {})
+                        .get(comparative_year)
+                    )
+                    comparative_provenance = {
+                        'requested_symbol': symbol,
+                        'fundamentals_issuer_symbol': symbol,
+                        'source': (
+                            'dart_latest_annual_filing_comparative'
+                        ),
+                        'snapshot_id': snapshot_id,
+                        'disclosure_event_id': int(
+                            metadata['disclosure_event_id']
+                        ),
+                        'business_year': comparative_year,
+                        'source_business_year': int(
+                            metadata['business_year']
+                        ),
+                        'report_code': str(metadata['report_code']),
+                        'fs_div': str(metadata['fs_div']),
+                        'rcept_no': str(metadata['rcept_no']),
+                        'corp_code': str(metadata['corp_code']),
+                        'receipt_date': metadata[
+                            'receipt_date'
+                        ].isoformat(),
+                        'captured_at': (
+                            metadata['captured_at'].isoformat()
+                            if metadata['captured_at'] is not None
+                            else None
+                        ),
+                        'currency': str(
+                            metadata['currency'] or ''
+                        ).strip().upper(),
+                        'comparative_value_precedence': (
+                            'latest_selected_annual_filing_comparative_'
+                            'over_prior_filing_current'
+                        ),
+                        'comparative_prior_facts': comparative['facts'],
+                        'comparative_prior_derived_ratios': (
+                            comparative['ratios']
+                        ),
+                        'invalidated_derived_inputs': {
+                            str(key): list(value)
+                            for key, value in comparative[
+                                'invalidated_derived_inputs'
+                            ].items()
+                        },
+                    }
+                    if existing_prior_provenance is not None:
+                        comparative_provenance[
+                            'superseded_prior_filing_provenance'
+                        ] = dict(existing_prior_provenance)
+                    fundamentals_provenance_by_symbol[symbol][
+                        comparative_year
+                    ] = comparative_provenance
 
             for requested_symbol, issuer_symbol in (
                 fundamentals_issuer_by_symbol.items()

@@ -1,4 +1,6 @@
 import unittest
+import hashlib
+import json
 from copy import deepcopy
 from datetime import date
 from types import SimpleNamespace
@@ -30,6 +32,7 @@ from app.eod.run_stage_support import (
     select_preferred_eod_run,
     validated_nonblocking_partial_progression_marker,
 )
+from app.eod.daily_pipeline_stages import DailyPipelineStageService
 
 
 class EODRunStageSupportTests(unittest.TestCase):
@@ -57,20 +60,80 @@ class EODRunStageSupportTests(unittest.TestCase):
             'failed_items': 1,
         }
         cutoff_at = '2026-04-14T08:30:00+00:00'
+        decision_identities = [
+            {
+                'symbol': summary_completed[0],
+                'decision_agent_name': 'short-term-decider',
+                'decision_snapshot_id': 1,
+                'decision_run_id': 'short-term-decision-run',
+            },
+            {
+                'symbol': summary_completed[0],
+                'decision_agent_name': 'signal-decider',
+                'decision_snapshot_id': 2,
+                'decision_run_id': 'signal-decision-run',
+            },
+        ]
         plan_result = {
+            'status': 'completed',
             'items': [
                 {
+                    'plan_item_id': 11,
+                    'account_reference': 'paper-primary',
                     'symbol': summary_completed[0],
                     'eligibility_status': 'eligible',
                     'handoff_active': True,
                     'exec_monitoring_active': True,
                     'decision_agent_name': 'signal-decider',
-                    'decision_run_id': 'decider-run',
+                    'decision_run_id': 'signal-decision-run',
+                    'decision_snapshot_id': 2,
                 }
-            ]
+            ],
         }
         evaluation_result = {
-            'request': {'symbols': summary_completed},
+            'status': 'completed',
+            'request': {
+                'symbols': summary_completed,
+                'horizons': [1],
+                'evaluation_version': 'evaluation-v1',
+                'evaluation_rule_set_version': 'rule-set-v1',
+            },
+            'summary': {
+                'status': 'completed',
+                'decisions_considered': 1,
+                'outcomes_upserted': 1,
+                'evaluations_upserted': 1,
+            },
+            'items': [
+                {
+                    'snapshot_id': 2,
+                    'feedback_id': 22,
+                    'decision_run_id': 'signal-decision-run',
+                    'agent_name': 'signal-decider',
+                    'symbol': summary_completed[0],
+                    'market_date': '2026-04-14',
+                    'policy_version': 'policy-v1',
+                    'decision': {'action': 'buy'},
+                    'outcomes': [
+                        {
+                            'id': 31,
+                            'decision_snapshot_id': 2,
+                            'horizon_days': 1,
+                            'decision_action': 'buy',
+                        }
+                    ],
+                    'evaluations': [
+                        {
+                            'id': 41,
+                            'decision_snapshot_id': 2,
+                            'horizon_days': 1,
+                            'decision_action': 'buy',
+                            'evaluation_version': 'evaluation-v1',
+                            'evaluation_status': 'computed',
+                        }
+                    ],
+                }
+            ],
         }
         plan_scope_proof = build_nonblocking_downstream_scope_proof(
             'next_open_execution_plan',
@@ -174,8 +237,133 @@ class EODRunStageSupportTests(unittest.TestCase):
                 'knowledge_cutoff_at': cutoff_at,
                 'completed_scope_proof': scope_proof,
             },
+            'decision_identities': decision_identities,
             'progress': {'summary': decider_progress},
         }
+        parent_completion_proof = (
+            DailyPipelineStageService
+            ._terminal_decider_progression_proof(
+                {'status': 'completed', 'result': signal_result},
+                expected_decider_symbols=summary_completed,
+                feedback_cutoff_resolution={
+                    'ready': True,
+                    'source_run_id': 'summary-run',
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'knowledge_cutoff_at': cutoff_at,
+                    'requested_symbols': summary_completed,
+                    'completed_scope_proof': scope_proof,
+                },
+            )
+        )
+        assert parent_completion_proof is not None
+        plan_manifest = {
+            'schema_version': 'next_open_completion_manifest_v1',
+            'parent_run_id': 'decider-run',
+            'authority_fingerprint': 'authority-fingerprint',
+            'generation_fingerprint': 'generation-fingerprint',
+            'role_symbol_scopes': {
+                role: summary_completed
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+            'decision_partition': [
+                {
+                    'symbol': summary_completed[0],
+                    'decision_agent_name': 'short-term-decider',
+                    'decision_run_id': 'short-term-decision-run',
+                    'decision_snapshot_id': 1,
+                    'canonical_action': 'wait',
+                    'authority_fingerprint': 'authority-short',
+                    'generation_fingerprint': 'generation-short',
+                    'disposition': 'non_actionable',
+                    'included_items': [],
+                    'exclusion': {
+                        'kind': 'non_actionable',
+                        'reason_code': 'latest_snapshot_not_actionable',
+                    },
+                },
+                {
+                    'symbol': summary_completed[0],
+                    'decision_agent_name': 'signal-decider',
+                    'decision_run_id': 'signal-decision-run',
+                    'decision_snapshot_id': 2,
+                    'canonical_action': 'buy',
+                    'authority_fingerprint': 'authority-signal',
+                    'generation_fingerprint': 'generation-signal',
+                    'disposition': 'included',
+                    'included_items': [
+                        {
+                            'plan_item_id': 11,
+                            'account_reference': 'paper-primary',
+                            'eligibility_status': 'eligible',
+                            'handoff_active': True,
+                            'exec_monitoring_active': True,
+                            'row_authority_fingerprint': 'row-authority',
+                        }
+                    ],
+                    'exclusion': None,
+                },
+            ],
+            'decision_count': 2,
+            'included_decision_count': 1,
+            'excluded_decision_count': 1,
+            'incomplete_decision_count': 0,
+            'included_item_count': 1,
+        }
+        plan_manifest['decision_partition'].sort(
+            key=lambda item: (
+                item['symbol'],
+                item['decision_agent_name'],
+            )
+        )
+        plan_manifest['manifest_digest'] = hashlib.sha256(
+            json.dumps(
+                plan_manifest,
+                sort_keys=True,
+                separators=(',', ':'),
+                ensure_ascii=True,
+            ).encode('utf-8')
+        ).hexdigest()
+        plan_result['completion_manifest'] = plan_manifest
+        plan_completion_proof = (
+            DailyPipelineStageService
+            ._build_next_open_completion_scope_proof(
+                plan_result,
+                parent_scope_proof=parent_completion_proof,
+            )
+        )
+        evaluation_completion_proof = (
+            DailyPipelineStageService
+            ._build_evaluations_completion_scope_proof(
+                evaluation_result,
+                parent_scope_proof=parent_completion_proof,
+            )
+        )
+        assert plan_completion_proof is not None
+        assert evaluation_completion_proof is not None
+        marker['completion_authority'] = {
+            'schema_version': (
+                'nonblocking_strict_completion_authority_v1'
+            ),
+            'parent_run_id': 'decider-run',
+            'parent_summary_run_id': 'summary-run',
+            'completed_symbols': summary_completed,
+            'decision_identities': decision_identities,
+            'signal_decider_proof_digest': (
+                parent_completion_proof['proof_digest']
+            ),
+            'next_open_execution_plan_proof_digest': (
+                plan_completion_proof['proof_digest']
+            ),
+            'signal_decider_evaluations_proof_digest': (
+                evaluation_completion_proof['proof_digest']
+            ),
+            'next_open_manifest_digest': plan_completion_proof[
+                'manifest_digest'
+            ],
+        }
+        marker['proof_digest'] = nonblocking_partial_progression_digest(
+            marker
+        )
         metadata = {
             'reused_eod_collection_run_id': 7,
             'resolved_stages': [
@@ -214,14 +402,27 @@ class EODRunStageSupportTests(unittest.TestCase):
                 'signal_decider': {
                     'status': 'completed',
                     'result': signal_result,
+                    'details': {
+                        'completion_scope_proof': (
+                            parent_completion_proof
+                        ),
+                    },
                 },
                 'next_open_execution_plan': {
                     'status': 'completed',
                     'result': plan_result,
+                    'details': {
+                        'completion_scope_proof': plan_completion_proof,
+                    },
                 },
                 'signal_decider_evaluations': {
                     'status': 'completed',
                     'result': evaluation_result,
+                    'details': {
+                        'completion_scope_proof': (
+                            evaluation_completion_proof
+                        ),
+                    },
                 },
             },
         }
@@ -283,6 +484,119 @@ class EODRunStageSupportTests(unittest.TestCase):
         self.assertIsNone(
             validated_nonblocking_partial_progression_marker(
                 tampered_plan_scope,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        missing_strict_authority = deepcopy(recovery_result)
+        missing_marker = missing_strict_authority['pipeline_run'][
+            'run_metadata'
+        ]['nonblocking_partial_progression']
+        missing_marker.pop('completion_authority')
+        missing_marker['proof_digest'] = (
+            nonblocking_partial_progression_digest(missing_marker)
+        )
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                missing_strict_authority,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        mismatched_completion_digest = deepcopy(recovery_result)
+        mismatched_marker = mismatched_completion_digest[
+            'pipeline_run'
+        ]['run_metadata']['nonblocking_partial_progression']
+        mismatched_marker['completion_authority'][
+            'next_open_execution_plan_proof_digest'
+        ] = 'f' * 64
+        mismatched_marker['proof_digest'] = (
+            nonblocking_partial_progression_digest(mismatched_marker)
+        )
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                mismatched_completion_digest,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        mismatched_identity = deepcopy(recovery_result)
+        mismatched_identity_marker = mismatched_identity['pipeline_run'][
+            'run_metadata'
+        ]['nonblocking_partial_progression']
+        mismatched_identity_marker['completion_authority'][
+            'decision_identities'
+        ][0]['decision_snapshot_id'] = 999
+        mismatched_identity_marker['proof_digest'] = (
+            nonblocking_partial_progression_digest(
+                mismatched_identity_marker
+            )
+        )
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                mismatched_identity,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        mismatched_plan_lineage = deepcopy(recovery_result)
+        mismatched_plan_proof = mismatched_plan_lineage['stages'][
+            'next_open_execution_plan'
+        ]['details']['completion_scope_proof']
+        mismatched_plan_proof['decision_partition'][0][
+            'decision_snapshot_id'
+        ] = 999
+        mismatched_plan_proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(
+                mismatched_plan_proof
+            )
+        )
+        mismatched_plan_marker = mismatched_plan_lineage[
+            'pipeline_run'
+        ]['run_metadata']['nonblocking_partial_progression']
+        mismatched_plan_marker['completion_authority'][
+            'next_open_execution_plan_proof_digest'
+        ] = mismatched_plan_proof['proof_digest']
+        mismatched_plan_marker['proof_digest'] = (
+            nonblocking_partial_progression_digest(
+                mismatched_plan_marker
+            )
+        )
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                mismatched_plan_lineage,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        mismatched_evaluation_lineage = deepcopy(recovery_result)
+        mismatched_evaluation_proof = (
+            mismatched_evaluation_lineage['stages'][
+                'signal_decider_evaluations'
+            ]['details']['completion_scope_proof']
+        )
+        for entry in mismatched_evaluation_proof[
+            'decision_horizon_scope'
+        ]:
+            entry['snapshot_id'] = 999
+        mismatched_evaluation_proof['proof_digest'] = (
+            DailyPipelineStageService
+            ._stage_completion_scope_proof_digest(
+                mismatched_evaluation_proof
+            )
+        )
+        mismatched_evaluation_marker = (
+            mismatched_evaluation_lineage['pipeline_run'][
+                'run_metadata'
+            ]['nonblocking_partial_progression']
+        )
+        mismatched_evaluation_marker['completion_authority'][
+            'signal_decider_evaluations_proof_digest'
+        ] = mismatched_evaluation_proof['proof_digest']
+        mismatched_evaluation_marker['proof_digest'] = (
+            nonblocking_partial_progression_digest(
+                mismatched_evaluation_marker
+            )
+        )
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                mismatched_evaluation_lineage,
                 expected_eod_collection_run_id=7,
             )
         )

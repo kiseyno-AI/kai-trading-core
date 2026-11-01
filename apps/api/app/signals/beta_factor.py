@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_beta_factor_results,
     load_recent_price_bars_by_symbol,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_beta_factor_result,
     upsert_daily_beta_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.factor_coverage import (
     build_factor_coverage_contract,
     factor_stage_result_contract,
@@ -156,6 +158,7 @@ class BenchmarkContext:
 
 
 class DailyBetaFactorService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -163,6 +166,8 @@ class DailyBetaFactorService:
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = BETA_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -187,7 +192,7 @@ class DailyBetaFactorService:
                 missing_symbols=[],
                 universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
             )
-            return {
+            result = {
                 'status': 'completed',
                 'reason': 'explicit_empty_scope_noop',
                 'quality_status': summary['quality_status'],
@@ -208,6 +213,19 @@ class DailyBetaFactorService:
                 'failed_symbol_errors': [],
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='beta_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         inputs, matched_symbols, missing_symbols = self._load_inputs(
             market_date=normalized_market_date,
@@ -277,17 +295,31 @@ class DailyBetaFactorService:
         persisted_count = 0
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            upsert_daily_beta_factor_results(items)
-            persisted_count = len(items)
-        except Exception:
-            for item in items:
-                try:
-                    upsert_daily_beta_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='beta_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols = list(publication['failed_symbols'])
+            failed_symbol_errors = list(publication['failed_symbol_errors'])
+            scope_finalization = publication['scope_finalization']
+        else:
+            try:
+                upsert_daily_beta_factor_results(items)
+                persisted_count = len(items)
+            except Exception:
+                for item in items:
+                    try:
+                        upsert_daily_beta_factor_result(item)
+                        persisted_count += 1
+                    except Exception as exc:
+                        failed_symbols.append(item['symbol'])
+                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -309,7 +341,7 @@ class DailyBetaFactorService:
             )
         )
 
-        return {
+        result = {
             **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
@@ -324,6 +356,9 @@ class DailyBetaFactorService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': _sort_items(items),
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,
