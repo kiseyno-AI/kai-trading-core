@@ -68,6 +68,11 @@ REQUIRED_EXACT_FACTOR_MODELS = (
     ('quality_factors', DailyQualityFactorResult),
     ('composite_factors', DailyCompositeFactorResult),
 )
+PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE = (
+    'pending_missing_bar_repair_metadata'
+)
+FACTOR_REBUILD_METADATA_SCHEMA_VERSION = 3
+SUPPORTED_FACTOR_REBUILD_METADATA_SCHEMA_VERSIONS = frozenset({2, 3})
 
 
 class PendingPriceBarRebuildError(RuntimeError):
@@ -724,6 +729,372 @@ def resolve_pending_frozen_price_dependent_membership(
     return next(iter(scopes.values()), None)
 
 
+def _is_sha256(value: object) -> bool:
+    normalized = str(value or '').strip().lower()
+    return len(normalized) == 64 and all(
+        character in '0123456789abcdef' for character in normalized
+    )
+
+
+def _normalize_pending_provider_exclusions(
+    value: object,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError('pending provider exclusions are not a list')
+    normalized: list[dict[str, str]] = []
+    seen_codes: set[str] = set()
+    for raw_entry in value:
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError('pending provider exclusion is not an object')
+        raw_market = str(raw_entry.get('market') or '').strip()
+        raw_code = str(raw_entry.get('code') or '').strip()
+        market = raw_market.upper()
+        code = raw_code.upper()
+        if (
+            raw_market != market
+            or market not in ('KOSPI', 'KOSDAQ', 'KONEX')
+            or raw_code != code
+            or len(code) != 6
+            or not code[:4].isdigit()
+            or not code[4:].isalnum()
+            or not code.isascii()
+            or code.isdigit()
+        ):
+            raise ValueError('pending provider exclusion is not canonical')
+        if code in seen_codes:
+            raise ValueError('pending provider exclusion is duplicated')
+        seen_codes.add(code)
+        normalized.append({'market': market, 'code': code})
+    return sorted(normalized, key=lambda entry: (entry['market'], entry['code']))
+
+
+def _pending_provider_exclusions_sha256(
+    entries: Sequence[Mapping[str, str]],
+) -> str:
+    return _stable_json_sha256(
+        [
+            {
+                'market': str(entry['market']),
+                'code': str(entry['code']),
+            }
+            for entry in entries
+        ]
+    )
+
+
+def _default_exact_scope_input_fingerprint(
+    market_date: date,
+    symbols: Sequence[str],
+) -> tuple[str, int]:
+    with session_scope() as session:
+        return exact_daily_price_bar_scope_fingerprint(
+            session,
+            market_date=market_date,
+            symbols=symbols,
+        )
+
+
+def resolve_pending_exact_market_membership_evidence(
+    *,
+    market_date: str | date,
+    pending: Sequence[Mapping[str, Any]] | None = None,
+    input_fingerprint_loader: (
+        Callable[[date, Sequence[str]], tuple[str, int]] | None
+    ) = None,
+) -> dict[str, Any] | None:
+    """Resolve strict historical PyKRX authority from pending repair proof.
+
+    This is deliberately narrower than the frozen ranking-scope resolver.  It
+    accepts only provider-reviewed target membership or an exact-date PyKRX
+    fallback manifest, verifies the full market split and excluded provider
+    codes, rejects conflicting batches, and rechecks the persisted price input
+    before returning authority to an exact factor repair.
+    """
+
+    normalized_date = _normalize_date(market_date)
+    market_date_key = normalized_date.isoformat()
+    pending_batches = list(
+        load_pending_price_bar_rebuild_batches()
+        if pending is None
+        else pending
+    )
+    proofs: dict[str, dict[str, Any]] = {}
+    proof_batch_ids: dict[str, set[str]] = {}
+
+    for batch in pending_batches:
+        required_dates = {
+            _normalize_date(value)
+            for value in batch.get('required_rebuild_trade_dates') or []
+        }
+        if normalized_date not in required_dates:
+            continue
+        batch_id = str(batch.get('repair_batch_id') or '').strip()
+        if not batch_id:
+            raise RuntimeError('pending membership proof has no repair batch id')
+        recorded = dict(
+            dict(batch.get('verification_metadata') or {}).get(
+                'repair_evidence'
+            )
+            or {}
+        )
+        if recorded.get('repair_kind') != 'missing_bar_insert':
+            continue
+        if str(recorded.get('schema_version') or '') != 'missing_bar_insert_v3':
+            raise RuntimeError(
+                f'unsupported pending membership evidence: batch={batch_id}'
+            )
+        try:
+            raw_scope = dict(
+                dict(recorded['price_dependent_membership_by_date'])[
+                    market_date_key
+                ]
+            )
+            frozen_symbols = tuple(
+                sorted(str(value).strip().upper() for value in raw_scope['symbols'])
+            )
+            symbol_count = int(raw_scope['symbol_count'])
+            membership_sha256 = str(
+                raw_scope['membership_sha256']
+            ).strip().lower()
+            input_sha256 = str(
+                raw_scope['daily_price_input_sha256']
+            ).strip().lower()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                'pending membership scope is missing or invalid: '
+                f'batch={batch_id}, date={market_date_key}'
+            ) from exc
+        if (
+            not frozen_symbols
+            or len(frozen_symbols) != len(set(frozen_symbols))
+            or any(len(symbol) != 6 or not symbol.isdigit() for symbol in frozen_symbols)
+            or symbol_count != len(frozen_symbols)
+            or membership_sha256 != market_membership_sha256(frozen_symbols)
+            or not _is_sha256(input_sha256)
+        ):
+            raise RuntimeError(
+                'pending membership scope failed exact validation: '
+                f'batch={batch_id}, date={market_date_key}'
+            )
+
+        basis = str(raw_scope.get('basis') or '').strip()
+        symbols_by_market: dict[str, list[str]]
+        excluded_codes: list[dict[str, str]]
+        if basis == 'reviewed_live_provider_membership':
+            if (
+                _normalize_date(recorded.get('market_date')) != normalized_date
+                or recorded.get('provider') != 'pykrx'
+            ):
+                raise RuntimeError('target pending provider identity is invalid')
+            provider_manifest = dict(recorded.get('provider_membership_manifest') or {})
+            raw_market_entries = dict(provider_manifest.get('markets') or {})
+            all_provider_symbols = [
+                str(symbol).strip().upper()
+                for market in ('KOSPI', 'KOSDAQ', 'KONEX')
+                for symbol in dict(raw_market_entries.get(market) or {}).get(
+                    'symbols', []
+                )
+            ]
+            validated = validate_market_membership_snapshot(
+                provider_manifest,
+                requested_symbols=all_provider_symbols,
+                markets=('KOSPI', 'KOSDAQ', 'KONEX'),
+            )
+            if (
+                validated is None
+                or int(recorded.get('expected_provider_membership_count') or -1)
+                != len(all_provider_symbols)
+                or str(
+                    recorded.get('expected_provider_membership_sha256') or ''
+                ).strip().lower()
+                != market_membership_sha256(all_provider_symbols)
+                or provider_manifest.get('membership_sha256')
+                != market_membership_sha256(all_provider_symbols)
+            ):
+                raise RuntimeError('target pending provider manifest is invalid')
+            symbols_by_market = {
+                market: sorted(str(symbol) for symbol in validated[market])
+                for market in SUPPORTED_MARKETS
+            }
+            expected_ranking = tuple(
+                sorted(
+                    symbol
+                    for market in SUPPORTED_MARKETS
+                    for symbol in symbols_by_market[market]
+                )
+            )
+            if (
+                expected_ranking != frozen_symbols
+                or list(recorded.get('price_dependent_membership_symbols') or [])
+                != list(frozen_symbols)
+                or int(recorded.get('price_dependent_membership_count') or -1)
+                != len(frozen_symbols)
+                or str(
+                    recorded.get('price_dependent_membership_sha256') or ''
+                ).strip().lower()
+                != membership_sha256
+            ):
+                raise RuntimeError('target pending ranking scope is invalid')
+            excluded_codes = _normalize_pending_provider_exclusions(
+                recorded.get('provider_excluded_ohlcv_codes') or []
+            )
+            expected_exclusion_sha256 = str(
+                recorded.get('provider_excluded_ohlcv_code_sha256') or ''
+            ).strip().lower()
+        elif basis == 'reviewed_live_exact_date_pykrx_membership':
+            if (
+                raw_scope.get('eod_run_id') is not None
+                or raw_scope.get('eod_run_source') != 'pykrx'
+                or raw_scope.get('source') != 'pykrx'
+                or raw_scope.get('universe_source') != 'pykrx_market_ohlcv'
+                or raw_scope.get('market_date') != market_date_key
+                or raw_scope.get('markets') != list(SUPPORTED_MARKETS)
+                or raw_scope.get('daily_price_input_count') != len(frozen_symbols)
+            ):
+                raise RuntimeError('fallback pending provider identity is invalid')
+            membership = raw_scope.get('market_membership')
+            validated = validate_market_membership_snapshot(
+                membership,
+                requested_symbols=list(frozen_symbols),
+                markets=SUPPORTED_MARKETS,
+            )
+            if validated is None:
+                raise RuntimeError('fallback pending market manifest is invalid')
+            symbols_by_market = {
+                market: sorted(str(symbol) for symbol in validated[market])
+                for market in SUPPORTED_MARKETS
+            }
+            if tuple(
+                sorted(
+                    symbol
+                    for market in SUPPORTED_MARKETS
+                    for symbol in symbols_by_market[market]
+                )
+            ) != frozen_symbols:
+                raise RuntimeError('fallback pending ranking scope is invalid')
+            excluded_codes = _normalize_pending_provider_exclusions(
+                raw_scope.get('excluded_ohlcv_codes') or []
+            )
+            expected_exclusion_sha256 = str(
+                raw_scope.get('excluded_ohlcv_code_sha256') or ''
+            ).strip().lower()
+            fallback_manifests = {
+                str(raw_date): {
+                    key: value
+                    for key, value in dict(scope).items()
+                    if key not in {'eod_run_id', 'eod_run_source'}
+                }
+                for raw_date, scope in dict(
+                    recorded['price_dependent_membership_by_date']
+                ).items()
+                if dict(scope).get('basis')
+                == 'reviewed_live_exact_date_pykrx_membership'
+            }
+            fallback_bundle_sha256 = _stable_json_sha256(
+                {
+                    'schema_version': 'missing_bar_downstream_membership_v1',
+                    'manifests': fallback_manifests,
+                }
+            )
+            if (
+                int(recorded.get('downstream_fallback_manifest_count') or 0)
+                != len(fallback_manifests)
+                or str(
+                    recorded.get('downstream_fallback_bundle_sha256') or ''
+                ).strip().lower()
+                != fallback_bundle_sha256
+            ):
+                raise RuntimeError('fallback pending proof bundle is invalid')
+        elif basis == 'validated_eod_run_market_membership':
+            # The canonical EOD run remains the authority for this basis.  If
+            # that run is missing or invalid, callers must fail closed rather
+            # than reinterpret the repair metadata as a substitute.
+            continue
+        else:
+            raise RuntimeError(
+                f'unsupported pending membership basis: {basis or "missing"}'
+            )
+
+        if (
+            expected_exclusion_sha256
+            != _pending_provider_exclusions_sha256(excluded_codes)
+        ):
+            raise RuntimeError('pending provider exclusion hash is invalid')
+        for market in SUPPORTED_MARKETS:
+            if len(symbols_by_market[market]) < MINIMUM_MARKET_MEMBERSHIP[market]:
+                raise RuntimeError(
+                    f'{market} pending membership is below the safety floor'
+                )
+        protected_codes_by_market = {
+            market: sorted(
+                entry['code']
+                for entry in excluded_codes
+                if entry['market'] == market
+            )
+            for market in SUPPORTED_MARKETS
+        }
+        protected_codes = sorted(
+            code
+            for market in SUPPORTED_MARKETS
+            for code in protected_codes_by_market[market]
+        )
+        full_provider_membership = sorted([*frozen_symbols, *protected_codes])
+        normalized_proof = {
+            'schema_version': 1,
+            'market_date': market_date_key,
+            'source': 'pykrx',
+            'symbols_by_market': symbols_by_market,
+            'protected_provider_codes_by_market': protected_codes_by_market,
+            'ranking_membership_count': len(frozen_symbols),
+            'ranking_membership_sha256': membership_sha256,
+            'provider_membership_count': len(full_provider_membership),
+            'provider_membership_sha256': market_membership_sha256(
+                full_provider_membership
+            ),
+            'daily_price_input_count': len(frozen_symbols),
+            'daily_price_input_sha256': input_sha256,
+        }
+        proof_sha256 = _stable_json_sha256(normalized_proof)
+        proofs[proof_sha256] = normalized_proof
+        proof_batch_ids.setdefault(proof_sha256, set()).add(batch_id)
+
+    if not proofs:
+        return None
+    if len(proofs) != 1:
+        raise RuntimeError(
+            'pending repair batches have conflicting exact market proofs: '
+            f'date={market_date_key}, hashes={sorted(proofs)}'
+        )
+    proof_sha256, proof = next(iter(proofs.items()))
+    observed_sha256, observed_count = (
+        input_fingerprint_loader or _default_exact_scope_input_fingerprint
+    )(normalized_date, [
+        symbol
+        for market in SUPPORTED_MARKETS
+        for symbol in proof['symbols_by_market'][market]
+    ])
+    if (
+        observed_count != proof['daily_price_input_count']
+        or observed_sha256 != proof['daily_price_input_sha256']
+    ):
+        raise RuntimeError(
+            'pending exact market proof no longer matches stored price input: '
+            f'date={market_date_key}'
+        )
+    return {
+        **proof,
+        'membership_evidence_source': (
+            PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+        ),
+        'membership_evidence_sha256': proof_sha256,
+        'membership_evidence_repair_batch_ids': sorted(
+            proof_batch_ids[proof_sha256]
+        ),
+        'membership_evidence_run_id': None,
+        'membership_evidence_run_source': 'pykrx',
+    }
+
+
 def record_pending_exact_factor_rebuild(
     *,
     market_date: date,
@@ -734,6 +1105,8 @@ def record_pending_exact_factor_rebuild(
     membership_evidence_source: str | None = None,
     membership_evidence_run_id: int | None = None,
     membership_evidence_run_source: str | None = None,
+    membership_evidence_sha256: str | None = None,
+    membership_evidence_repair_batch_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Attach exact-scope and raw-input evidence to affected repair batches."""
 
@@ -759,11 +1132,32 @@ def record_pending_exact_factor_rebuild(
         if membership_evidence_run_source is not None
         else None
     )
+    if isinstance(membership_evidence_run_id, bool):
+        raise ValueError('membership evidence run id must not be boolean')
     normalized_run_id = (
         int(membership_evidence_run_id)
         if membership_evidence_run_id is not None
         else None
     )
+    normalized_evidence_sha256 = (
+        str(membership_evidence_sha256).strip().lower()
+        if membership_evidence_sha256 is not None
+        else None
+    )
+    normalized_evidence_batch_ids = sorted(
+        {
+            str(batch_id).strip()
+            for batch_id in membership_evidence_repair_batch_ids or ()
+            if str(batch_id).strip()
+        }
+    )
+    normalized_provider_membership_sha256 = str(
+        provider_membership_sha256
+    ).strip().lower()
+    if not _is_sha256(normalized_provider_membership_sha256):
+        raise ValueError(
+            'provider membership evidence requires a canonical SHA-256'
+        )
     if normalized_evidence_source == 'stored_eod_run_metadata':
         if (
             normalized_run_id is None
@@ -774,19 +1168,40 @@ def record_pending_exact_factor_rebuild(
                 'stored membership evidence requires a positive run id and '
                 'run source'
             )
+        if normalized_evidence_sha256 is not None or normalized_evidence_batch_ids:
+            raise ValueError(
+                'stored membership evidence must not claim pending proof lineage'
+            )
     elif normalized_evidence_source == 'live_pykrx_market_ohlcv':
         if normalized_run_id is not None or normalized_run_source is not None:
             raise ValueError(
                 'live membership evidence must not claim stored run lineage'
+            )
+        if normalized_evidence_sha256 is not None or normalized_evidence_batch_ids:
+            raise ValueError(
+                'live membership evidence must not claim pending proof lineage'
+            )
+    elif normalized_evidence_source == (
+        PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+    ):
+        if (
+            normalized_run_id is not None
+            or normalized_run_source != 'pykrx'
+            or not _is_sha256(normalized_evidence_sha256)
+            or not normalized_evidence_batch_ids
+        ):
+            raise ValueError(
+                'pending repair membership evidence requires a PyKRX source, '
+                'canonical proof hash, and repair batch lineage'
             )
     elif normalized_evidence_source is not None:
         raise ValueError(
             'unsupported membership evidence source: '
             f'{normalized_evidence_source}'
         )
-    elif normalized_run_id is not None or normalized_run_source is not None:
+    else:
         raise ValueError(
-            'membership evidence lineage requires an evidence source'
+            'factor rebuild evidence requires a membership evidence source'
         )
     market_date_key = market_date.isoformat()
     ranking_membership_sha256 = market_membership_sha256(normalized_symbols)
@@ -818,6 +1233,19 @@ def record_pending_exact_factor_rebuild(
                 'updated_batch_count': 0,
                 'ranking_membership_sha256': ranking_membership_sha256,
             }
+        if normalized_evidence_source == (
+            PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+        ):
+            affected_batch_ids = sorted(
+                str(batch.repair_batch_id) for batch in affected_batches
+            )
+            if not set(normalized_evidence_batch_ids).issubset(
+                affected_batch_ids
+            ):
+                raise RuntimeError(
+                    'pending membership proof authority is no longer part of '
+                    'the affected factor rebuild batch scope'
+                )
 
         evidence_by_symbols: dict[tuple[str, ...], dict[str, Any]] = {}
 
@@ -865,12 +1293,16 @@ def record_pending_exact_factor_rebuild(
                 'ranking_membership_sha256': (
                     market_membership_sha256(batch_symbols)
                 ),
-                'provider_membership_sha256': str(
-                    provider_membership_sha256
-                ).strip().lower(),
+                'provider_membership_sha256': (
+                    normalized_provider_membership_sha256
+                ),
                 'membership_evidence_source': normalized_evidence_source,
                 'membership_evidence_run_id': normalized_run_id,
                 'membership_evidence_run_source': normalized_run_source,
+                'membership_evidence_sha256': normalized_evidence_sha256,
+                'membership_evidence_repair_batch_ids': (
+                    normalized_evidence_batch_ids
+                ),
                 'daily_price_input_sha256': input_sha256,
                 'stage_output_fingerprints': stage_output_fingerprints,
                 'repair_started_at': repair_started_at.isoformat(),
@@ -909,7 +1341,7 @@ def record_pending_exact_factor_rebuild(
                 )
             date_map[market_date_key] = date_evidence
             batch.factor_rebuild_metadata = {
-                'schema_version': 2,
+                'schema_version': FACTOR_REBUILD_METADATA_SCHEMA_VERSION,
                 'dates': date_map,
             }
         caller_evidence = evidence_for(tuple(normalized_symbols))
@@ -1057,7 +1489,7 @@ def record_pending_trending_rebuild(
             )
             date_map[market_date_key] = date_scope
             batch.factor_rebuild_metadata = {
-                'schema_version': 2,
+                'schema_version': FACTOR_REBUILD_METADATA_SCHEMA_VERSION,
                 'dates': date_map,
             }
         return {
@@ -1350,6 +1782,9 @@ def _exact_factor_stage_evidence(
     factor_rebuild_metadata: dict[str, Any],
     raw_dependency_watermarks: dict[date, datetime],
     frozen_symbols_by_date: Mapping[date, Sequence[str]] | None = None,
+    pending_membership_authority_by_date: (
+        Mapping[date, Mapping[str, Any] | None] | None
+    ) = None,
 ) -> dict[str, Any]:
     date_scopes = dict(factor_rebuild_metadata.get('dates') or {})
     try:
@@ -1364,12 +1799,83 @@ def _exact_factor_stage_evidence(
         date_key = market_date.isoformat()
         scope = dict(date_scopes.get(date_key) or {})
         try:
-            if metadata_schema_version != 2:
-                raise ValueError('unsupported factor rebuild schema')
+            if metadata_schema_version != FACTOR_REBUILD_METADATA_SCHEMA_VERSION:
+                raise ValueError(
+                    'factor rebuild evidence requires current schema'
+                )
             expected_count = int(scope['exact_membership_count'])
             expected_membership_sha256 = str(
                 scope['ranking_membership_sha256']
             )
+            provider_membership_sha256 = str(
+                scope['provider_membership_sha256']
+            ).strip().lower()
+            if not _is_sha256(provider_membership_sha256):
+                raise ValueError('provider membership hash is invalid')
+            evidence_source = str(
+                scope['membership_evidence_source']
+            ).strip()
+            raw_run_id = scope.get('membership_evidence_run_id')
+            if raw_run_id is not None and (
+                isinstance(raw_run_id, bool)
+                or not isinstance(raw_run_id, int)
+                or raw_run_id <= 0
+            ):
+                raise ValueError('membership evidence run id is invalid')
+            evidence_run_source = (
+                str(scope.get('membership_evidence_run_source')).strip()
+                if scope.get('membership_evidence_run_source') is not None
+                else None
+            )
+            evidence_sha256 = (
+                str(scope.get('membership_evidence_sha256')).strip().lower()
+                if scope.get('membership_evidence_sha256') is not None
+                else None
+            )
+            raw_evidence_batch_ids = scope.get(
+                'membership_evidence_repair_batch_ids'
+            )
+            evidence_batch_ids = sorted(
+                {
+                    str(batch_id).strip()
+                    for batch_id in raw_evidence_batch_ids or ()
+                    if str(batch_id).strip()
+                }
+            )
+            if (
+                not isinstance(raw_evidence_batch_ids, list)
+                or raw_evidence_batch_ids != evidence_batch_ids
+            ):
+                raise ValueError(
+                    'membership evidence batch lineage is invalid'
+                )
+            if evidence_source == 'stored_eod_run_metadata':
+                lineage_valid = bool(
+                    raw_run_id is not None
+                    and evidence_run_source
+                    and evidence_sha256 is None
+                    and not evidence_batch_ids
+                )
+            elif evidence_source == 'live_pykrx_market_ohlcv':
+                lineage_valid = bool(
+                    raw_run_id is None
+                    and evidence_run_source is None
+                    and evidence_sha256 is None
+                    and not evidence_batch_ids
+                )
+            elif evidence_source == (
+                PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+            ):
+                lineage_valid = bool(
+                    raw_run_id is None
+                    and evidence_run_source == 'pykrx'
+                    and _is_sha256(evidence_sha256)
+                    and evidence_batch_ids
+                )
+            else:
+                lineage_valid = False
+            if not lineage_valid:
+                raise ValueError('membership evidence lineage is invalid')
             expected_input_sha256 = str(
                 scope['daily_price_input_sha256']
             )
@@ -1389,6 +1895,34 @@ def _exact_factor_stage_evidence(
             issues.append(issue)
             date_results.append(issue)
             continue
+
+        current_pending_authority_matches = True
+        if evidence_source == PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE:
+            current_authority = dict(
+                (pending_membership_authority_by_date or {}).get(market_date)
+                or {}
+            )
+            current_pending_authority_matches = bool(
+                current_authority.get('membership_evidence_source')
+                == PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+                and current_authority.get('membership_evidence_run_id') is None
+                and current_authority.get('membership_evidence_run_source')
+                == evidence_run_source
+                and current_authority.get('membership_evidence_sha256')
+                == evidence_sha256
+                and current_authority.get(
+                    'membership_evidence_repair_batch_ids'
+                )
+                == evidence_batch_ids
+                and current_authority.get('ranking_membership_count')
+                == expected_count
+                and current_authority.get('ranking_membership_sha256')
+                == expected_membership_sha256
+                and current_authority.get('provider_membership_sha256')
+                == provider_membership_sha256
+                and current_authority.get('daily_price_input_sha256')
+                == expected_input_sha256
+            )
 
         has_frozen_membership = bool(
             frozen_symbols_by_date is not None
@@ -1480,6 +2014,15 @@ def _exact_factor_stage_evidence(
             'input_row_count': input_row_count,
             'expected_membership_sha256': expected_membership_sha256,
             'observed_membership_sha256': observed_membership_sha256,
+            'provider_membership_sha256': provider_membership_sha256,
+            'membership_evidence_source': evidence_source,
+            'membership_evidence_run_id': raw_run_id,
+            'membership_evidence_run_source': evidence_run_source,
+            'membership_evidence_sha256': evidence_sha256,
+            'membership_evidence_repair_batch_ids': evidence_batch_ids,
+            'current_pending_authority_matches': (
+                current_pending_authority_matches
+            ),
             'expected_daily_price_input_sha256': expected_input_sha256,
             'observed_daily_price_input_sha256': observed_input_sha256,
             'expected_output_row_count': expected_output_count,
@@ -1498,6 +2041,7 @@ def _exact_factor_stage_evidence(
             and input_row_count == expected_count
             and observed_membership_sha256
             == expected_membership_sha256
+            and current_pending_authority_matches
             and observed_input_sha256 == expected_input_sha256
             and output_row_count == expected_output_count == expected_count
             and observed_output_sha256 == expected_output_sha256
@@ -1656,7 +2200,9 @@ def _trending_evidence(
             observed_output_count: int | None = None
             observed_output_sha256: str | None = None
             try:
-                if metadata_schema_version != 2:
+                if metadata_schema_version not in (
+                    SUPPORTED_FACTOR_REBUILD_METADATA_SCHEMA_VERSIONS
+                ):
                     raise ValueError('unsupported rebuild evidence schema')
                 output_scope = dict(
                     dict(
@@ -2517,7 +3063,11 @@ def _missing_bar_insert_repair_evidence(
                     'missing_bar_insert_downstream_membership_basis_invalid'
                 )
     live_fallback_manifests = {
-        scope_date.isoformat(): membership_evidence_by_date[scope_date]
+        scope_date.isoformat(): {
+            key: value
+            for key, value in membership_evidence_by_date[scope_date].items()
+            if key not in {'eod_run_id', 'eod_run_source'}
+        }
         for scope_date in sorted(membership_evidence_by_date)
         if membership_evidence_by_date[scope_date].get('basis')
         == 'reviewed_live_exact_date_pykrx_membership'
@@ -2619,6 +3169,9 @@ def _collect_batch_verification(
     batch: DailyPriceBarRepairBatch,
     evidence_cache: dict[tuple[Any, ...], Any] | None = None,
     newest_created_at_by_dates: dict[tuple[date, ...], datetime] | None = None,
+    pending_membership_authority_by_date: (
+        Mapping[date, Mapping[str, Any] | None] | None
+    ) = None,
 ) -> dict[str, Any]:
     required_dates = _normalize_required_dates(batch.required_rebuild_trade_dates)
     cache = evidence_cache if evidence_cache is not None else {}
@@ -2790,6 +3343,17 @@ def _collect_batch_verification(
         separators=(',', ':'),
         sort_keys=True,
     )
+    pending_authority_key = json.dumps(
+        {
+            market_date.isoformat(): dict(authority or {})
+            for market_date, authority in sorted(
+                (pending_membership_authority_by_date or {}).items()
+            )
+        },
+        ensure_ascii=True,
+        separators=(',', ':'),
+        sort_keys=True,
+    )
     for stage_id, model in REQUIRED_EXACT_FACTOR_MODELS:
         evidence = _cached_verification_evidence(
             cache,
@@ -2799,6 +3363,7 @@ def _collect_batch_verification(
                 model,
                 required_dates,
                 factor_metadata_key,
+                pending_authority_key,
                 watermark_key,
                 frozen_scope_key,
             ),
@@ -2810,6 +3375,9 @@ def _collect_batch_verification(
                 factor_rebuild_metadata=factor_rebuild_metadata,
                 raw_dependency_watermarks=raw_dependency_watermarks,
                 frozen_symbols_by_date=frozen_symbols_by_date,
+                pending_membership_authority_by_date=(
+                    pending_membership_authority_by_date
+                ),
             ),
         )
         stages[stage_id] = evidence
@@ -3538,6 +4106,49 @@ def _verify_pending_price_bar_rebuilds_locked(
                 'batches': [],
             }
 
+        pending_batch_snapshots = [
+            {
+                'repair_batch_id': str(batch.repair_batch_id),
+                'required_rebuild_trade_dates': list(
+                    batch.required_rebuild_trade_dates or []
+                ),
+                'verification_metadata': dict(
+                    getattr(batch, 'verification_metadata', None) or {}
+                ),
+            }
+            for batch in batches
+        ]
+        pending_membership_authority_by_date: dict[
+            date, Mapping[str, Any] | None
+        ] = {}
+        for required_date in sorted(
+            {
+                market_date
+                for batch in batches
+                for market_date in _normalize_required_dates(
+                    batch.required_rebuild_trade_dates
+                )
+            }
+        ):
+            try:
+                pending_membership_authority_by_date[required_date] = (
+                    resolve_pending_exact_market_membership_evidence(
+                        market_date=required_date,
+                        pending=pending_batch_snapshots,
+                        input_fingerprint_loader=lambda market_date, symbols: (
+                            exact_daily_price_bar_scope_fingerprint(
+                                session,
+                                market_date=market_date,
+                                symbols=symbols,
+                            )
+                        ),
+                    )
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                pending_membership_authority_by_date[required_date] = {
+                    'resolution_error': type(exc).__name__,
+                }
+
         evidence_cache: dict[tuple[Any, ...], Any] = {}
         newest_created_at_by_dates: dict[tuple[date, ...], datetime] = {}
         for batch in batches:
@@ -3556,6 +4167,9 @@ def _verify_pending_price_bar_rebuilds_locked(
                 batch=batch,
                 evidence_cache=evidence_cache,
                 newest_created_at_by_dates=newest_created_at_by_dates,
+                pending_membership_authority_by_date=(
+                    pending_membership_authority_by_date
+                ),
             )
             for batch in batches
         ]

@@ -12,6 +12,7 @@ from app.dart.service import (
 from app.dart.signals_service import (
     SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION,
     SHARE_ISSUANCE_LATE_ARRIVAL_POLICY,
+    classify_durable_audit_signal,
 )
 from app.db import session_scope
 from app.db_models import (
@@ -1749,7 +1750,7 @@ class DailyPiotroskiFilterService:
 
             expected_audit_targets_by_rcept: dict[
                 str,
-                list[tuple[str, str]],
+                list[tuple[str, str, int, str]],
             ] = {}
             for symbol in symbols:
                 provenance = fundamentals_provenance_by_symbol.get(symbol, {})
@@ -1770,7 +1771,18 @@ class DailyPiotroskiFilterService:
                     expected_audit_targets_by_rcept.setdefault(
                         rcept_no,
                         [],
-                    ).append((symbol, issuer_symbol))
+                    ).append(
+                        (
+                            symbol,
+                            issuer_symbol,
+                            int(
+                                selected_provenance[
+                                    'disclosure_event_id'
+                                ]
+                            ),
+                            str(selected_provenance['receipt_date']),
+                        )
+                    )
 
             latest_audit: dict[str, Any] = {}
             audit_provenance_by_symbol: dict[str, dict[str, Any]] = {}
@@ -1781,10 +1793,16 @@ class DailyPiotroskiFilterService:
                 audit_rows = session.execute(
                     select(
                         DartAuditSignal.id.label('id'),
+                        DartAuditSignal.disclosure_event_id.label('event_id'),
                         DartAuditSignal.stock_code.label('symbol'),
                         DartAuditSignal.rcept_no.label('rcept_no'),
                         DartAuditSignal.receipt_date.label('receipt_date'),
+                        DartAuditSignal.opinion_code.label('opinion_code'),
+                        DartAuditSignal.opinion_label.label('opinion_label'),
                         DartAuditSignal.has_audit_issue.label('has_audit_issue'),
+                        DartAuditSignal.source_section.label('source_section'),
+                        DartAuditSignal.evidence_text.label('evidence_text'),
+                        DartAuditSignal.payload.label('payload'),
                     ).where(
                         DartAuditSignal.rcept_no.in_(rcept_chunk),
                         DartAuditSignal.receipt_date.is_not(None),
@@ -1793,18 +1811,62 @@ class DailyPiotroskiFilterService:
                 ).mappings().all()
                 for row in audit_rows:
                     rcept_no = str(row['rcept_no'])
-                    for requested_symbol, issuer_symbol in (
+                    for (
+                        requested_symbol,
+                        issuer_symbol,
+                        expected_event_id,
+                        expected_receipt_date,
+                    ) in (
                         expected_audit_targets_by_rcept.get(rcept_no, [])
                     ):
                         if str(row['symbol']) != issuer_symbol:
                             continue
-                        latest_audit[requested_symbol] = row['has_audit_issue']
+                        row_receipt_date = row['receipt_date'].isoformat()
+                        identity_matches = (
+                            row['event_id'] == expected_event_id
+                            and row_receipt_date == expected_receipt_date
+                        )
+                        audit_classification = (
+                            classify_durable_audit_signal(
+                                {
+                                    'opinion_code': row['opinion_code'],
+                                    'opinion_label': row['opinion_label'],
+                                    'has_audit_issue': row[
+                                        'has_audit_issue'
+                                    ],
+                                    'source_section': row['source_section'],
+                                    'evidence_text': row['evidence_text'],
+                                    'payload': row['payload'],
+                                },
+                                event_id=expected_event_id,
+                                rcept_no=rcept_no,
+                                receipt_date=expected_receipt_date,
+                            )
+                            if identity_matches
+                            else None
+                        )
+                        latest_audit[requested_symbol] = (
+                            bool(row['has_audit_issue'])
+                            if audit_classification == 'parsed_opinion'
+                            else None
+                        )
                         audit_provenance_by_symbol[requested_symbol] = {
                             'requested_symbol': requested_symbol,
                             'fundamentals_issuer_symbol': issuer_symbol,
                             'id': int(row['id']),
                             'rcept_no': rcept_no,
-                            'receipt_date': row['receipt_date'].isoformat(),
+                            'receipt_date': row_receipt_date,
+                            'evidence_status': (
+                                'authoritative_absence'
+                                if audit_classification
+                                == 'authoritative_absence'
+                                else (
+                                    'parsed_opinion'
+                                    if audit_classification
+                                    == 'parsed_opinion'
+                                    else 'invalid'
+                                )
+                            ),
                         }
 
             latest_dilution: dict[str, Any] = {}
@@ -2099,9 +2161,7 @@ class DailyPiotroskiFilterService:
                         numerator_metric_key='revenue',
                         denominator_metric_key='total_assets',
                     ),
-                    has_audit_issue=(
-                        None if symbol not in latest_audit else bool(latest_audit.get(symbol))
-                    ),
+                    has_audit_issue=latest_audit.get(symbol),
                     has_dilution_signal=(
                         None if symbol not in latest_dilution else bool(latest_dilution.get(symbol))
                     ),

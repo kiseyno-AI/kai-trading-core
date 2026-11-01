@@ -35,7 +35,11 @@ from app.dart.service import (
     REPORT_CODE_METADATA,
     build_fundamentals_dataset,
 )
-from app.dart.signals_service import DartSignalsService, dart_signals_service
+from app.dart.signals_service import (
+    DartSignalsService,
+    classify_durable_audit_signal,
+    dart_signals_service,
+)
 from app.integrations.dart.client import DartClient, dart_client
 from app.market_data_store import load_symbols
 from app.signals.piotroski_filter import daily_piotroski_filter_service
@@ -1142,12 +1146,30 @@ class DartFundamentalsCaptureService:
                         )
                         if isinstance(raw_audit_diagnostics, dict):
                             audit_diagnostics = raw_audit_diagnostics
-                        if not signal_result.get('audit_signal'):
+                        audit_signal = signal_result.get('audit_signal')
+                        if not isinstance(audit_signal, dict):
                             raise RuntimeError(
                                 'DART annual filing audit evidence was not found; '
                                 f'keeping event retryable: rcept_no={event["rcept_no"]}'
                             )
-                        audit_signal_status = 'captured'
+                        audit_classification = classify_durable_audit_signal(
+                            audit_signal,
+                            event_id=event['id'],
+                            rcept_no=event['rcept_no'],
+                            receipt_date=event.get('receipt_date'),
+                        )
+                        if audit_classification is None:
+                            raise RuntimeError(
+                                'DART annual filing returned malformed audit '
+                                'evidence; keeping event retryable: '
+                                f'rcept_no={event["rcept_no"]}'
+                            )
+                        audit_signal_status = (
+                            'authoritative_absence'
+                            if audit_classification
+                            == 'authoritative_absence'
+                            else 'captured'
+                        )
                     request, dataset = await asyncio.wait_for(
                         self._capture_event(
                             event=event,

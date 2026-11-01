@@ -39,8 +39,11 @@ receipt date on or before the manifest market date; null or future-dated
 receipts are rejected. A DART `013`/`014` provider response stays failed
 retry debt; no synthetic audit opinion is written. A no-signal result is
 terminal only when the capture service explicitly returns
-`audit_signal_evaluated=true`, proving a complete safe negative evaluation.
-Diagnostics alone never promote an ambiguous gap to authoritative absence.
+`audit_signal_evaluated=true` and durably upserts a versioned
+`authoritative_absence` proof bound to the event, receipt, archive digest, and
+complete bounded diagnostics. That proof is not an unqualified opinion and
+remains fail-closed for Piotroski eligibility. Diagnostics alone never promote
+an ambiguous gap to authoritative absence.
 
 ```bash
 cd apps/api
@@ -60,11 +63,18 @@ DART sync, fundamentals capture, or fundamentals refresh row is active.
 Completed checkpoint batches are skipped only after the stored event identity,
 receipt date, and authoritative audit opinion/issue content are revalidated
 while the writer fence is held. Missing or changed captured rows are replayed
-idempotently. Because the
-current schema does not persist a negative audit-evaluation record, an
-authoritative-absence checkpoint is replayed unless the caller supplies a
-separate durable negative proof. Failed, blocked, or incomplete batches are
-retried with the same immutable batch hash.
+idempotently. A versioned authoritative-absence row is terminal for repair and
+retry accounting only after its payload identity and diagnostic invariants are
+revalidated; it is never reinterpreted as a clean audit opinion. Failed,
+blocked, malformed-proof, or incomplete batches are retried with the same
+immutable batch hash.
+
+DART audit repair checkpoints use
+`dart_audit_signal_exact_checkpoint_v2`. The v2 contract records terminal
+durable audit content for live revalidation, so a v1 checkpoint is explicitly
+incompatible and apply mode blocks it as `checkpoint_manifest_mismatch`.
+Resume this repair only from a checkpoint already created as v2, or provide a
+new checkpoint path; do not reuse or relabel a v1 checkpoint.
 
 ## Exact stored-data derived stages
 
@@ -152,9 +162,11 @@ Exec call.
 The factor bulk repair uses the exact frozen ranking scope from the pending
 price-bar repair state. Stored daily bars may be a superset, but every frozen
 symbol must be present and every provider-only extra must match the reviewed
-protected-provider proof. It additionally requires strict same-date completed
-EOD run metadata. Its stored-only policy never calls the live trade-date
-resolver or the PyKRX market loader.
+protected-provider proof. Membership authority must come from either strict
+same-date completed EOD run metadata or a canonical, validated pending
+missing-bar PyKRX proof bound to the frozen scope and current persisted input
+fingerprint. The pending proof is persisted evidence only: stored-only policy
+never calls the live trade-date resolver or the PyKRX market loader.
 
 Dry run writes a per-date reviewed provider count/hash proof into the dedicated
 checkpoint. Apply refuses a missing or changed proof, revalidates the manifest
@@ -184,7 +196,21 @@ history window, the DART audit/dilution writer lock, and a shared `symbols`
 table lock. Apply rejects placeholder symbol names before compute. Checkpoints
 also fingerprint price history, symbol metadata, technical inputs, valuation
 enrichment, annual DART fundamentals, audit signals, and dilution signals, and
-revalidate those inputs before and after publication.
+revalidate those inputs before and after publication. Preferred-share scopes
+include both the preferred symbol and the resolved common-share issuer. DART
+fingerprints cover the union of the exact filings selected by Piotroski and by
+Advanced/Unified/Quality, their consumed rows and highlights, the current
+Piotroski audit receipt, and its bounded dilution-evidence window. A newly
+eligible winning filing invalidates the checkpoint; historical filings that no
+factor consumer can select do not inflate the review proof.
+
+Factor bulk checkpoints use `factor_exact_date_bulk_checkpoint_v2` and bind
+each dry proof and completion result to
+`factor_exact_date_bulk_implementation_v2`. Older checkpoints must be replaced
+with a fresh v2 dry review. Pending-repair membership lineage is re-resolved
+from the currently locked pending batches during final verification; the proof
+hash, provider hash, exact membership, input hash, and batch IDs must all still
+match the recorded factor evidence.
 
 A completed checkpoint date is skipped only after a fresh stored-only dry proof
 matches the reviewed proof, all live factor table memberships and fingerprints

@@ -21,6 +21,7 @@ from app.db_models import (
     Symbol,
 )
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.dart.signals_service import build_authoritative_absence_audit_signal
 from app.signals.piotroski_filter import (
     CANONICAL_DEBT_RATIO,
     LATEST_FALLBACK_POLICY,
@@ -63,6 +64,45 @@ def _build_input(
         has_audit_issue=has_audit_issue,
         has_dilution_signal=has_dilution_signal,
     )
+
+
+def _complete_negative_audit_diagnostics() -> dict:
+    return {
+        'version': 'dart_audit_archive_diagnostics_v1',
+        'archive_sha256': 'a' * 64,
+        'archive_size_bytes': 321,
+        'member_count': 1,
+        'members': [],
+        'decoded_member_count': 1,
+        'aud_opn_table_count': 1,
+        'audit_report_label_row_count': 1,
+        'known_opinion_token_row_count': 1,
+        'positive_authority_evidence_count': 0,
+        'negative_authority_evidence_count': 1,
+        'ambiguous_authority_evidence_count': 0,
+        'truncated': False,
+    }
+
+
+def _parsed_audit_signal_fields(opinion_code: str) -> dict:
+    opinion_labels = {
+        'unqualified': '적정',
+        'qualified': '한정',
+        'adverse': '부적정',
+        'disclaimer': '의견거절',
+    }
+    opinion_label = opinion_labels[opinion_code]
+    source_section = '감사의견'
+    return {
+        'opinion_label': opinion_label,
+        'source_section': source_section,
+        'evidence_text': f'{source_section}: {opinion_label}',
+        'payload': {
+            'parser': 'semantic_audit_table_v1',
+            'opinion_cell': opinion_label,
+            'row_cells': [source_section, opinion_label],
+        },
+    }
 
 
 class DailyPiotroskiFilterServiceTests(unittest.TestCase):
@@ -1033,16 +1073,37 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         receipt_date: date | None,
         has_audit_issue: bool,
         rcept_no: str | None = None,
+        disclosure_event_id: int | None = None,
+        opinion_code: str | None = None,
+        payload: dict | None = None,
     ) -> tuple[int, str]:
         resolved_rcept_no = rcept_no or f'PAU{uuid4().hex[:16].upper()}'
+        resolved_opinion_code = (
+            opinion_code
+            if opinion_code is not None
+            else ('qualified' if has_audit_issue else 'unqualified')
+        )
+        parsed_fields = _parsed_audit_signal_fields(
+            resolved_opinion_code
+        )
         with Session(self.engine) as session:
             row = DartAuditSignal(
+                disclosure_event_id=disclosure_event_id,
                 rcept_no=resolved_rcept_no,
                 corp_code=f'C{uuid4().hex[:12].upper()}',
                 stock_code=symbol,
                 corp_name=symbol,
                 receipt_date=receipt_date,
+                opinion_code=resolved_opinion_code,
+                opinion_label=parsed_fields['opinion_label'],
                 has_audit_issue=has_audit_issue,
+                source_section=parsed_fields['source_section'],
+                evidence_text=parsed_fields['evidence_text'],
+                payload=(
+                    payload
+                    if payload is not None
+                    else parsed_fields['payload']
+                ),
             )
             session.add(row)
             session.commit()
@@ -2361,12 +2422,14 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         symbol = '005930'
         symbol_id = self._add_symbol(symbol=symbol, is_active=True)
         self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
-        _, _, selected_rcept_no = self._add_fundamentals_snapshot(
+        _, selected_event_id, selected_rcept_no = (
+            self._add_fundamentals_snapshot(
             symbol=symbol,
             business_year=2025,
             receipt_date=date(2026, 4, 10),
             net_income=20,
             rcept_no='20260410000002',
+            )
         )
 
         self._add_audit_signal(
@@ -2379,6 +2442,7 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
             receipt_date=date(2026, 4, 10),
             has_audit_issue=True,
             rcept_no=selected_rcept_no,
+            disclosure_event_id=selected_event_id,
         )
         self._add_audit_signal(
             symbol=symbol,
@@ -2671,6 +2735,180 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
         self.assertEqual(inputs[0].fundamentals_provenance[2025]['rcept_no'], current_rcept_no)
         self.assertIsNone(inputs[0].has_audit_issue)
         self.assertIsNone(inputs[0].audit_provenance)
+
+    def test_load_inputs_keeps_authoritative_absence_unknown_with_provenance(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        _, event_id, rcept_no = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': event_id,
+                'rcept_no': rcept_no,
+                'receipt_date': '2026-03-20',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        with Session(self.engine) as session:
+            session.add(
+                DartAuditSignal(
+                    disclosure_event_id=event_id,
+                    rcept_no=rcept_no,
+                    corp_code=f'C{symbol}',
+                    stock_code=symbol,
+                    corp_name=symbol,
+                    receipt_date=date(2026, 3, 20),
+                    opinion_code=None,
+                    opinion_label=None,
+                    has_audit_issue=False,
+                    payload=sentinel.payload,
+                )
+            )
+            session.commit()
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertIsNone(inputs[0].has_audit_issue)
+        self.assertEqual(
+            inputs[0].audit_provenance['evidence_status'],
+            'authoritative_absence',
+        )
+
+    def test_load_inputs_rejects_authoritative_absence_identity_drift(self) -> None:
+        market_date = date(2026, 4, 14)
+        symbol = '005930'
+        symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+        self._add_price_bar(symbol_id=symbol_id, trade_date=market_date)
+        _, event_id, rcept_no = self._add_fundamentals_snapshot(
+            symbol=symbol,
+            business_year=2025,
+            receipt_date=date(2026, 3, 20),
+            net_income=20,
+        )
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': event_id,
+                'rcept_no': rcept_no,
+                'receipt_date': '2026-03-20',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        sentinel.payload['receipt_date'] = '2026-03-21'
+        with Session(self.engine) as session:
+            session.add(
+                DartAuditSignal(
+                    disclosure_event_id=event_id,
+                    rcept_no=rcept_no,
+                    corp_code=f'C{symbol}',
+                    stock_code=symbol,
+                    corp_name=symbol,
+                    receipt_date=date(2026, 3, 21),
+                    opinion_code=None,
+                    opinion_label=None,
+                    has_audit_issue=False,
+                    payload=sentinel.payload,
+                )
+            )
+            session.commit()
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        self.assertIsNone(inputs[0].has_audit_issue)
+        self.assertEqual(
+            inputs[0].audit_provenance['evidence_status'],
+            'invalid',
+        )
+
+    def test_load_inputs_rejects_sentinel_downgrade_and_opinion_drift(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        sentinel_symbol = '005930'
+        parsed_symbol = '000660'
+        for symbol in (sentinel_symbol, parsed_symbol):
+            symbol_id = self._add_symbol(symbol=symbol, is_active=True)
+            self._add_price_bar(
+                symbol_id=symbol_id,
+                trade_date=market_date,
+            )
+
+        _, sentinel_event_id, sentinel_rcept_no = (
+            self._add_fundamentals_snapshot(
+                symbol=sentinel_symbol,
+                business_year=2025,
+                receipt_date=date(2026, 3, 20),
+                net_income=20,
+            )
+        )
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': sentinel_event_id,
+                'rcept_no': sentinel_rcept_no,
+                'receipt_date': '2026-03-20',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        corrupted_payload = dict(sentinel.payload)
+        corrupted_payload['schema_version'] = 'tampered'
+        corrupted_payload['evidence_semantics'] = 'tampered'
+        self._add_audit_signal(
+            symbol=sentinel_symbol,
+            receipt_date=date(2026, 3, 20),
+            has_audit_issue=False,
+            rcept_no=sentinel_rcept_no,
+            disclosure_event_id=sentinel_event_id,
+            opinion_code='unqualified',
+            payload=corrupted_payload,
+        )
+
+        _, parsed_event_id, parsed_rcept_no = (
+            self._add_fundamentals_snapshot(
+                symbol=parsed_symbol,
+                business_year=2025,
+                receipt_date=date(2026, 3, 20),
+                net_income=20,
+            )
+        )
+        self._add_audit_signal(
+            symbol=parsed_symbol,
+            receipt_date=date(2026, 3, 20),
+            has_audit_issue=False,
+            rcept_no=parsed_rcept_no,
+            disclosure_event_id=parsed_event_id,
+            opinion_code='qualified',
+            payload={'parser': 'semantic_audit_table_v1'},
+        )
+
+        with patch(
+            'app.signals.piotroski_filter.session_scope',
+            self._session_scope,
+        ):
+            inputs = self.service._load_inputs(market_date)
+
+        by_symbol = {item.symbol: item for item in inputs}
+        for symbol in (sentinel_symbol, parsed_symbol):
+            with self.subTest(symbol=symbol):
+                self.assertIsNone(by_symbol[symbol].has_audit_issue)
+                self.assertEqual(
+                    by_symbol[symbol].audit_provenance[
+                        'evidence_status'
+                    ],
+                    'invalid',
+                )
 
     def test_load_inputs_represents_missing_audit_signal_as_unknown(self) -> None:
         market_date = date(2026, 4, 14)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -9,11 +10,15 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.dart.exact_audit_signal_repair import (
+    CHECKPOINT_SCHEMA_VERSION,
     ExactDartAuditSignalRepair,
     MANIFEST_SCHEMA_VERSION,
     exact_dart_audit_batch_guard,
 )
-from app.dart.signals_service import DartSignalsService
+from app.dart.signals_service import (
+    DartSignalsService,
+    build_authoritative_absence_audit_signal,
+)
 from app.internal.exact_repair_manifest import canonical_json_sha256
 
 
@@ -36,6 +41,66 @@ def _entry(stock_code: str, event_id: int, rcept_no: str, **extra) -> dict:
     }
 
 
+def _complete_negative_audit_diagnostics() -> dict:
+    return {
+        'version': 'dart_audit_archive_diagnostics_v1',
+        'archive_sha256': 'a' * 64,
+        'archive_size_bytes': 321,
+        'member_count': 1,
+        'members': [],
+        'decoded_member_count': 1,
+        'aud_opn_table_count': 1,
+        'audit_report_label_row_count': 1,
+        'known_opinion_token_row_count': 1,
+        'positive_authority_evidence_count': 0,
+        'negative_authority_evidence_count': 1,
+        'ambiguous_authority_evidence_count': 0,
+        'truncated': False,
+    }
+
+
+def _authoritative_absence_signal(entry: dict) -> dict:
+    signal = build_authoritative_absence_audit_signal(
+        {
+            'id': entry['event_id'],
+            'rcept_no': entry['rcept_no'],
+            'receipt_date': '2026-10-28',
+        },
+        _complete_negative_audit_diagnostics(),
+    )
+    return {
+        'opinion_code': signal.opinion_code,
+        'opinion_label': signal.opinion_label,
+        'has_audit_issue': signal.has_audit_issue,
+        'source_section': signal.source_section,
+        'evidence_text': signal.evidence_text,
+        'payload': signal.payload,
+    }
+
+
+def _parsed_audit_signal(opinion_code: str = 'unqualified') -> dict:
+    opinion_labels = {
+        'unqualified': '적정',
+        'qualified': '한정',
+        'adverse': '부적정',
+        'disclaimer': '의견거절',
+    }
+    opinion_label = opinion_labels[opinion_code]
+    source_section = '감사의견'
+    return {
+        'opinion_code': opinion_code,
+        'opinion_label': opinion_label,
+        'has_audit_issue': opinion_code != 'unqualified',
+        'source_section': source_section,
+        'evidence_text': f'{source_section}: {opinion_label}',
+        'payload': {
+            'parser': 'semantic_audit_table_v1',
+            'opinion_cell': opinion_label,
+            'row_cells': [source_section, opinion_label],
+        },
+    }
+
+
 def _terminal_proof(entry: dict, *, status: str = 'captured') -> dict:
     proof = {
         'status': status,
@@ -45,21 +110,16 @@ def _terminal_proof(entry: dict, *, status: str = 'captured') -> dict:
         'audit_signal_evaluated': status == 'authoritative_absence',
     }
     if status == 'captured':
-        audit_content = {
-            'opinion_code': 'unqualified',
-            'opinion_label': None,
-            'has_audit_issue': False,
-            'source_section': None,
-            'evidence_text': None,
-            'payload': None,
+        audit_content = _parsed_audit_signal()
+    else:
+        audit_content = _authoritative_absence_signal(entry)
+    proof.update(
+        {
+            'receipt_date': '2026-10-28',
+            'audit_content': audit_content,
+            'audit_content_sha256': canonical_json_sha256(audit_content),
         }
-        proof.update(
-            {
-                'receipt_date': '2026-10-28',
-                'audit_content': audit_content,
-                'audit_content_sha256': canonical_json_sha256(audit_content),
-            }
-        )
+    )
     return proof
 
 
@@ -128,9 +188,25 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(acquired)
             self.assertIsNone(reason)
+            sentinel = build_authoritative_absence_audit_signal(
+                {
+                    'id': 101,
+                    'rcept_no': '20260301000001',
+                    'receipt_date': '2026-10-28',
+                },
+                _complete_negative_audit_diagnostics(),
+            )
             service._store_signals(
-                event={'rcept_no': '20260301000001'},
-                audit_signal=None,
+                event={
+                    'id': 101,
+                    'rcept_no': '20260301000001',
+                    'corp_code': '00126380',
+                    'stock_code': '005930',
+                    'corp_name': '삼성전자',
+                    'receipt_date': '2026-10-28',
+                    'report_nm': '사업보고서 (2025.12)',
+                },
+                audit_signal=sentinel,
                 dilution_signal=None,
                 audit_signal_evaluated=True,
             )
@@ -142,7 +218,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         inner_session.execute.assert_called_once()
-        self.assertTrue(inner_session.execute.call_args.args[0].is_delete)
+        self.assertTrue(inner_session.execute.call_args.args[0].is_insert)
 
     async def test_failed_batch_is_retried_while_completed_batch_is_skipped(self):
         entries = (
@@ -161,10 +237,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError('temporary provider failure')
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {
-                    'opinion_code': 'unqualified',
-                    'has_audit_issue': False,
-                },
+                'audit_signal': _parsed_audit_signal(),
             }
 
         repair = ExactDartAuditSignalRepair(
@@ -205,7 +278,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         async def capture(*, rcept_no: str):
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {'opinion_code': 'unqualified'},
+                'audit_signal': _parsed_audit_signal(),
             }
 
         first_repair = ExactDartAuditSignalRepair(
@@ -238,6 +311,56 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed['status'], 'completed')
         self.assertEqual(blocked['status'], 'blocked')
         self.assertEqual(blocked['reason'], 'checkpoint_manifest_mismatch')
+
+    async def test_checkpoint_v1_is_explicitly_incompatible_with_v2(self):
+        entry = _entry('005930', 101, '20260301000001')
+        capture = AsyncMock(
+            return_value={
+                'rcept_no': entry['rcept_no'],
+                'audit_signal': _parsed_audit_signal(),
+            }
+        )
+        repair = ExactDartAuditSignalRepair(
+            _manifest(entry),
+            capture=capture,
+            event_loader=self._event_loader(
+                {101: {**entry, 'report_nm': '사업보고서 (2025.12)'}}
+            ),
+            terminal_state_loader=lambda item: _terminal_proof(item),
+            guard_factory=_guard,
+            finality_validator=lambda _market_date: None,
+        )
+
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / 'checkpoint.json'
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        'schema_version': (
+                            'dart_audit_signal_exact_checkpoint_v1'
+                        ),
+                        'manifest_sha256': repair.manifest_sha256,
+                        'item_count': 1,
+                        'unit_size': 1,
+                        'units': {},
+                    }
+                ),
+                encoding='utf-8',
+            )
+            result = await repair.run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+        self.assertEqual(
+            CHECKPOINT_SCHEMA_VERSION,
+            'dart_audit_signal_exact_checkpoint_v2',
+        )
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'checkpoint_manifest_mismatch')
+        self.assertIn('schema_version', result['error_message'])
+        capture.assert_not_awaited()
 
     async def test_active_writer_refuses_batch_without_capture(self):
         entry = _entry('005930', 101, '20260301000001')
@@ -305,7 +428,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             captured_rcept_nos.append(rcept_no)
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {'opinion_code': 'unqualified'},
+                'audit_signal': _parsed_audit_signal(),
             }
 
         repair = ExactDartAuditSignalRepair(
@@ -437,12 +560,8 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             attempts += 1
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': None,
+                'audit_signal': _authoritative_absence_signal(entry),
                 'audit_signal_evaluated': True,
-                'audit_diagnostics': {
-                    'authority_member_count': 1,
-                    'authority_fetch_failures': [],
-                },
             }
 
         repair = ExactDartAuditSignalRepair(
@@ -478,6 +597,63 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed['skipped_batches'], 1)
         self.assertEqual(attempts, 1)
 
+    async def test_malformed_audit_envelopes_remain_retry_debt(self):
+        entry = _entry('005930', 101, '20260301000001')
+        malformed_claim = _authoritative_absence_signal(entry)
+        malformed_claim['payload']['evidence_semantics'] = 'tampered'
+        malformed_claim['opinion_code'] = 'unqualified'
+        contradictory_absence = _authoritative_absence_signal(entry)
+        contradictory_absence['opinion_code'] = 'qualified'
+        contradictory_absence['has_audit_issue'] = True
+        inconsistent_parsed = {
+            'opinion_code': 'qualified',
+            'has_audit_issue': False,
+        }
+
+        for label, audit_signal in (
+            ('schema_only_claim', malformed_claim),
+            ('contradictory_absence', contradictory_absence),
+            ('inconsistent_parsed', inconsistent_parsed),
+        ):
+            with self.subTest(label=label):
+                async def capture(*, rcept_no: str):
+                    return {
+                        'rcept_no': rcept_no,
+                        'audit_signal': audit_signal,
+                        'audit_signal_evaluated': True,
+                    }
+
+                repair = ExactDartAuditSignalRepair(
+                    _manifest(entry),
+                    capture=capture,
+                    event_loader=self._event_loader(
+                        {
+                            101: {
+                                **entry,
+                                'report_nm': '사업보고서 (2025.12)',
+                            }
+                        }
+                    ),
+                    terminal_state_loader=lambda _item: None,
+                    guard_factory=_guard,
+                    finality_validator=lambda _market_date: None,
+                )
+                with TemporaryDirectory() as directory:
+                    result = await repair.run(
+                        apply=True,
+                        expected_manifest_sha256=repair.manifest_sha256,
+                        checkpoint_path=(
+                            Path(directory) / 'checkpoint.json'
+                        ),
+                    )
+
+                self.assertEqual(result['status'], 'partial')
+                self.assertTrue(result['retry_required'])
+                self.assertEqual(
+                    result['audit_evidence_missing'],
+                    1,
+                )
+
     async def test_completed_capture_is_replayed_after_durable_row_deletion(self):
         entry = _entry('005930', 101, '20260301000001')
         durable_signal = False
@@ -489,7 +665,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             durable_signal = True
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {'opinion_code': 'unqualified'},
+                'audit_signal': _parsed_audit_signal(),
                 'audit_signal_evaluated': True,
             }
 
@@ -536,19 +712,13 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
             live_opinion = 'unqualified'
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {
-                    'opinion_code': 'unqualified',
-                    'has_audit_issue': False,
-                },
+                'audit_signal': _parsed_audit_signal(),
                 'audit_signal_evaluated': True,
             }
 
         def terminal_state(item):
             proof = _terminal_proof(item)
-            proof['audit_content']['opinion_code'] = live_opinion
-            proof['audit_content']['has_audit_issue'] = (
-                live_opinion != 'unqualified'
-            )
+            proof['audit_content'] = _parsed_audit_signal(live_opinion)
             proof['audit_content_sha256'] = canonical_json_sha256(
                 proof['audit_content']
             )
@@ -619,8 +789,8 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                 checkpoint_path=checkpoint,
             )
 
-        self.assertEqual(first['status'], 'completed')
-        self.assertEqual(resumed['status'], 'completed')
+        self.assertEqual(first['status'], 'partial')
+        self.assertEqual(resumed['status'], 'partial')
         self.assertEqual(resumed['skipped_batches'], 0)
         self.assertEqual(attempts, 2)
 
@@ -635,7 +805,7 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
         async def capture(*, rcept_no: str):
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {'opinion_code': 'unqualified'},
+                'audit_signal': _parsed_audit_signal(),
                 'audit_signal_evaluated': True,
             }
 

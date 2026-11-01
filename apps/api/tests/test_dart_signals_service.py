@@ -22,11 +22,17 @@ from app.db_models import (
     Symbol,
 )
 from app.dart.signals_service import (
+    AUDIT_ARCHIVE_DIAGNOSTICS_VERSION,
     AUDIT_SIGNAL_WRITER_LOCK_KEY,
     DartSignalsRepository,
     DartSignalsService,
     _decode_document_text,
     audit_signal_writer_lock_owner,
+    build_authoritative_absence_audit_signal,
+    claims_authoritative_absence_audit_payload,
+    classify_durable_audit_signal,
+    is_authoritative_absence_audit_payload,
+    is_authoritative_absence_audit_signal,
 )
 
 
@@ -71,6 +77,55 @@ def _semantic_audit_document(
     return (
         f'<TABLE ACLASS="{table_class}">{header}{body}</TABLE>'
     ).encode('utf-8')
+
+
+def _complete_negative_audit_diagnostics():
+    return {
+        'version': AUDIT_ARCHIVE_DIAGNOSTICS_VERSION,
+        'archive_sha256': 'a' * 64,
+        'archive_size_bytes': 123,
+        'member_count': 1,
+        'members': [],
+        'decoded_member_count': 1,
+        'aud_opn_table_count': 1,
+        'audit_report_label_row_count': 1,
+        'known_opinion_token_row_count': 1,
+        'positive_authority_evidence_count': 0,
+        'negative_authority_evidence_count': 1,
+        'ambiguous_authority_evidence_count': 0,
+        'truncated': False,
+    }
+
+
+def _audit_event(
+    *,
+    event_id: int = 99,
+    rcept_no: str = '20250325000541',
+):
+    return {
+        'id': event_id,
+        'rcept_no': rcept_no,
+        'corp_code': '00960623',
+        'stock_code': '266690',
+        'corp_name': '덕산넥코어스',
+        'receipt_date': date(2025, 3, 25),
+        'report_nm': '사업보고서 (2024.12)',
+    }
+
+
+def _durable_unqualified_audit_signal():
+    return {
+        'opinion_code': 'unqualified',
+        'opinion_label': '적정',
+        'has_audit_issue': False,
+        'source_section': 'audit.xml',
+        'evidence_text': '감사의견 | 적정의견',
+        'payload': {
+            'parser': 'semantic_audit_table_v1',
+            'opinion_cell': '적정의견',
+            'row_cells': ['감사의견', '적정의견'],
+        },
+    }
 
 
 def _share_issuance_attempt_row(
@@ -138,6 +193,400 @@ class FakeSignalsRepository:
 
 
 class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_authoritative_absence_builder_emits_strict_versioned_payload(self):
+        event = {
+            'id': 99,
+            'rcept_no': '20260319000589',
+            'receipt_date': date(2026, 3, 19),
+        }
+        diagnostics = _complete_negative_audit_diagnostics()
+
+        signal = build_authoritative_absence_audit_signal(event, diagnostics)
+
+        self.assertIsNone(signal.opinion_code)
+        self.assertIsNone(signal.opinion_label)
+        self.assertFalse(signal.has_audit_issue)
+        self.assertIsNone(signal.source_section)
+        self.assertIsNone(signal.evidence_text)
+        self.assertEqual(
+            signal.payload['schema_version'],
+            'dart_audit_authoritative_absence_v1',
+        )
+        self.assertEqual(
+            signal.payload['evidence_semantics'],
+            'authoritative_absence',
+        )
+        self.assertTrue(signal.payload['audit_signal_evaluated'])
+        self.assertEqual(signal.payload['receipt_date'], '2026-03-19')
+        self.assertTrue(
+            is_authoritative_absence_audit_payload(
+                signal.payload,
+                event_id=99,
+                rcept_no='20260319000589',
+                receipt_date=date(2026, 3, 19),
+            )
+        )
+        self.assertFalse(
+            is_authoritative_absence_audit_payload(
+                signal.payload,
+                event_id=100,
+            )
+        )
+
+    def test_authoritative_absence_validator_rejects_mutated_proof(self):
+        event = _audit_event()
+        signal = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
+
+        mutations = {
+            'extra_field': lambda payload: payload.update({'extra': True}),
+            'wrong_schema': lambda payload: payload.update(
+                {'schema_version': 'dart_audit_authoritative_absence_v2'}
+            ),
+            'wrong_semantics': lambda payload: payload.update(
+                {'evidence_semantics': 'unknown'}
+            ),
+            'noncanonical_receipt_date': lambda payload: payload.update(
+                {'receipt_date': '20250325'}
+            ),
+            'evaluated_integer': lambda payload: payload.update(
+                {'audit_signal_evaluated': 1}
+            ),
+            'wrong_diagnostic_version': lambda payload: payload[
+                'audit_diagnostics'
+            ].update({'version': 'dart_audit_archive_diagnostics_v2'}),
+            'bad_hash': lambda payload: payload['audit_diagnostics'].update(
+                {'archive_sha256': 'not-a-sha256'}
+            ),
+            'zero_archive_size': lambda payload: payload[
+                'audit_diagnostics'
+            ].update({'archive_size_bytes': 0}),
+            'incomplete_decode': lambda payload: payload[
+                'audit_diagnostics'
+            ].update({'decoded_member_count': 0}),
+            'positive_authority': lambda payload: payload[
+                'audit_diagnostics'
+            ].update({'positive_authority_evidence_count': 1}),
+            'missing_negative_authority': lambda payload: payload[
+                'audit_diagnostics'
+            ].update({'negative_authority_evidence_count': 0}),
+            'ambiguous_authority': lambda payload: payload[
+                'audit_diagnostics'
+            ].update({'ambiguous_authority_evidence_count': 1}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                payload = json.loads(json.dumps(signal.payload))
+                mutate(payload)
+                self.assertFalse(
+                    is_authoritative_absence_audit_payload(
+                        payload,
+                        event_id=event['id'],
+                        rcept_no=event['rcept_no'],
+                        receipt_date=event['receipt_date'],
+                    )
+                )
+
+        self.assertFalse(
+            is_authoritative_absence_audit_payload(
+                signal.payload,
+                receipt_date=date(2025, 3, 26),
+            )
+        )
+
+        self.assertFalse(
+            is_authoritative_absence_audit_payload(
+                {'parser': 'semantic_audit_table_v1'}
+            )
+        )
+        ambiguous_diagnostics = _complete_negative_audit_diagnostics()
+        ambiguous_diagnostics['ambiguous_authority_evidence_count'] = 1
+        with self.assertRaisesRegex(ValueError, 'complete versioned diagnostics'):
+            build_authoritative_absence_audit_signal(
+                event,
+                ambiguous_diagnostics,
+            )
+
+    def test_durable_audit_classifier_rejects_claim_and_envelope_drift(self):
+        event = _audit_event()
+        signal = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
+        identity = {
+            'event_id': event['id'],
+            'rcept_no': event['rcept_no'],
+            'receipt_date': event['receipt_date'],
+        }
+        self.assertTrue(
+            is_authoritative_absence_audit_signal(signal, **identity)
+        )
+        self.assertEqual(
+            classify_durable_audit_signal(signal, **identity),
+            'authoritative_absence',
+        )
+
+        malformed_claim = {
+            **signal.__dict__,
+            'opinion_code': 'unqualified',
+            'has_audit_issue': False,
+            'payload': json.loads(json.dumps(signal.payload)),
+        }
+        malformed_claim['payload']['evidence_semantics'] = 'tampered'
+        self.assertTrue(
+            claims_authoritative_absence_audit_payload(
+                malformed_claim['payload']
+            )
+        )
+        self.assertIsNone(
+            classify_durable_audit_signal(malformed_claim, **identity)
+        )
+
+        doubly_corrupted_claim = json.loads(json.dumps(malformed_claim))
+        doubly_corrupted_claim['payload']['schema_version'] = 'tampered'
+        self.assertTrue(
+            claims_authoritative_absence_audit_payload(
+                doubly_corrupted_claim['payload']
+            )
+        )
+        self.assertIsNone(
+            classify_durable_audit_signal(
+                doubly_corrupted_claim,
+                **identity,
+            )
+        )
+
+        envelope_mutations = {
+            'opinion_code': 'qualified',
+            'opinion_label': '한정',
+            'has_audit_issue': True,
+            'source_section': 'audit',
+            'evidence_text': 'contradiction',
+        }
+        for field, value in envelope_mutations.items():
+            with self.subTest(field=field):
+                mutated = {**signal.__dict__, field: value}
+                self.assertIsNone(
+                    classify_durable_audit_signal(mutated, **identity)
+                )
+
+        self.assertEqual(
+            classify_durable_audit_signal(
+                {
+                    'opinion_code': 'unqualified',
+                    'opinion_label': '적정',
+                    'has_audit_issue': False,
+                    'source_section': 'audit.xml',
+                    'evidence_text': '감사의견 | 적정의견',
+                    'payload': {
+                        'parser': 'semantic_audit_table_v1',
+                        'opinion_cell': '적정의견',
+                        'row_cells': ['감사의견', '적정의견'],
+                    },
+                }
+            ),
+            'parsed_opinion',
+        )
+        self.assertEqual(
+            classify_durable_audit_signal(
+                {
+                    'opinion_code': 'unqualified',
+                    'opinion_label': '적정',
+                    'has_audit_issue': False,
+                    'source_section': 'legacy.xml',
+                    'evidence_text': '감사의견 | 적정의견',
+                    'payload': {
+                        'opinion_cell': '적정의견',
+                        'row_cells': ['감사의견', '적정의견'],
+                    },
+                }
+            ),
+            'parsed_opinion',
+        )
+        malformed_parsed_signals = {
+            'missing_label': {
+                'opinion_label': None,
+            },
+            'mismatched_label': {
+                'opinion_label': '한정',
+            },
+            'blank_source': {
+                'source_section': ' ',
+            },
+            'blank_evidence': {
+                'evidence_text': '',
+            },
+            'missing_payload': {
+                'payload': None,
+            },
+            'unknown_parser': {
+                'payload': {
+                    'parser': 'unknown_v1',
+                    'opinion_cell': '적정의견',
+                    'row_cells': ['적정의견'],
+                },
+            },
+            'non_string_parser': {
+                'payload': {
+                    'parser': {'unexpected': 'mapping'},
+                    'opinion_cell': '적정의견',
+                    'row_cells': ['적정의견'],
+                },
+            },
+            'missing_parser_evidence': {
+                'payload': {'parser': 'semantic_audit_table_v1'},
+            },
+            'contradictory_opinion_cell': {
+                'payload': {
+                    'parser': 'semantic_audit_table_v1',
+                    'opinion_cell': '한정의견',
+                    'row_cells': ['감사의견', '한정의견'],
+                },
+            },
+            'unhashable_selection_opinion': {
+                'payload': {
+                    'parser': 'semantic_audit_table_v1',
+                    'opinion_cell': '적정의견',
+                    'row_cells': ['감사의견', '적정의견'],
+                    'selection_policy': (
+                        'most_conservative_audit_opinion_v1'
+                    ),
+                    'evidence_count': 1,
+                    'opinion_codes': [{'unexpected': 'mapping'}],
+                    'conflicting_opinion_codes': [],
+                    'findings_by_opinion': {'unqualified': 1},
+                    'source_sections': ['audit.xml'],
+                    'selected_source_section': 'audit.xml',
+                },
+            },
+        }
+        valid_parsed_signal = {
+            'opinion_code': 'unqualified',
+            'opinion_label': '적정',
+            'has_audit_issue': False,
+            'source_section': 'audit.xml',
+            'evidence_text': '감사의견 | 적정의견',
+            'payload': {
+                'parser': 'semantic_audit_table_v1',
+                'opinion_cell': '적정의견',
+                'row_cells': ['감사의견', '적정의견'],
+            },
+        }
+        for name, mutation in malformed_parsed_signals.items():
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    classify_durable_audit_signal(
+                        {**valid_parsed_signal, **mutation}
+                    )
+                )
+        valid_with_blank_table_cell = {
+            **valid_parsed_signal,
+            'payload': {
+                **valid_parsed_signal['payload'],
+                'row_cells': ['감사의견', '', '적정의견'],
+            },
+        }
+        self.assertEqual(
+            classify_durable_audit_signal(valid_with_blank_table_cell),
+            'parsed_opinion',
+        )
+        valid_with_selection_metadata = {
+            'opinion_code': 'qualified',
+            'opinion_label': '한정',
+            'has_audit_issue': True,
+            'source_section': 'audit-a.xml',
+            'evidence_text': '감사의견 | 한정의견',
+            'payload': {
+                'parser': 'semantic_audit_table_v1',
+                'opinion_cell': '한정의견',
+                'row_cells': ['감사의견', '한정의견'],
+                'selection_policy': (
+                    'most_conservative_audit_opinion_v1'
+                ),
+                'evidence_count': 2,
+                'opinion_codes': ['qualified', 'unqualified'],
+                'conflicting_opinion_codes': [
+                    'qualified',
+                    'unqualified',
+                ],
+                'findings_by_opinion': {
+                    'qualified': 1,
+                    'unqualified': 1,
+                },
+                'source_sections': [
+                    'audit-a.xml',
+                    'audit-b.xml',
+                ],
+                'selected_source_section': 'audit-a.xml',
+            },
+        }
+        self.assertEqual(
+            classify_durable_audit_signal(
+                valid_with_selection_metadata
+            ),
+            'parsed_opinion',
+        )
+        invalid_selection_field_values = {
+            'selection_policy': 'unknown_policy_v1',
+            'evidence_count': 3,
+            'opinion_codes': ['qualified', 'unknown'],
+            'conflicting_opinion_codes': [],
+            'findings_by_opinion': {
+                'qualified': 2,
+                'unqualified': 1,
+            },
+            'source_sections': ['audit-b.xml', 'audit-a.xml'],
+            'selected_source_section': 'audit-b.xml',
+        }
+        for field, invalid_value in invalid_selection_field_values.items():
+            with self.subTest(selection_field=field):
+                invalid_signal = json.loads(
+                    json.dumps(valid_with_selection_metadata)
+                )
+                invalid_signal['payload'][field] = invalid_value
+                self.assertIsNone(
+                    classify_durable_audit_signal(invalid_signal)
+                )
+
+        nonconservative_selection = json.loads(
+            json.dumps(valid_with_selection_metadata)
+        )
+        nonconservative_selection.update(
+            {
+                'opinion_code': 'unqualified',
+                'opinion_label': '적정',
+                'has_audit_issue': False,
+                'evidence_text': '감사의견 | 적정의견',
+            }
+        )
+        nonconservative_selection['payload'].update(
+            {
+                'opinion_cell': '적정의견',
+                'row_cells': ['감사의견', '적정의견'],
+            }
+        )
+        self.assertIsNone(
+            classify_durable_audit_signal(nonconservative_selection)
+        )
+        for opinion_code, has_audit_issue in (
+            ('unqualified', True),
+            ('qualified', False),
+            ('adverse', False),
+            ('disclaimer', False),
+        ):
+            with self.subTest(opinion_code=opinion_code):
+                self.assertIsNone(
+                    classify_durable_audit_signal(
+                        {
+                            'opinion_code': opinion_code,
+                            'has_audit_issue': has_audit_issue,
+                            'payload': None,
+                        }
+                    )
+                )
+
     def test_global_evidence_isolates_one_corporation_failure(self):
         repository = MagicMock()
         repository.list_current_share_issuance_coverage.return_value = []
@@ -462,6 +911,111 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             'dart_fundamentals_snapshots.stock_code = dart_disclosure_events.stock_code',
             compiled_sql,
         )
+
+    def test_candidate_query_filters_only_strict_durable_audit_rows(self):
+        def row(
+            *,
+            event_id: int,
+            opinion_code: str,
+            has_audit_issue: bool,
+            payload: dict,
+            opinion_label: str | None = None,
+            source_section: str | None = None,
+            evidence_text: str | None = None,
+        ) -> dict:
+            return {
+                'event_id': event_id,
+                'snapshot_id': event_id + 100,
+                'rcept_no': f'202603010000{event_id}',
+                'stock_code': f'{event_id:06d}',
+                'business_year': 2025,
+                'fs_div': 'CFS',
+                'receipt_date': date(2026, 3, 1),
+                'report_nm': '사업보고서',
+                'audit_signal_id': event_id + 200,
+                'audit_opinion_code': opinion_code,
+                'audit_opinion_label': opinion_label,
+                'audit_has_audit_issue': has_audit_issue,
+                'audit_source_section': source_section,
+                'audit_evidence_text': evidence_text,
+                'audit_payload': payload,
+            }
+
+        pages = [
+            [
+                row(
+                    event_id=11,
+                    opinion_code='unqualified',
+                    has_audit_issue=False,
+                    opinion_label='적정',
+                    source_section='audit.xml',
+                    evidence_text='감사의견 | 적정의견',
+                    payload={
+                        'parser': 'semantic_audit_table_v1',
+                        'opinion_cell': '적정의견',
+                        'row_cells': ['감사의견', '적정의견'],
+                    },
+                ),
+                row(
+                    event_id=12,
+                    opinion_code='qualified',
+                    has_audit_issue=False,
+                    payload={'parser': 'semantic_audit_table_v1'},
+                ),
+            ],
+            [
+                row(
+                    event_id=13,
+                    opinion_code='unqualified',
+                    has_audit_issue=False,
+                    payload={
+                        'schema_version': (
+                            'dart_audit_authoritative_absence_v1'
+                        ),
+                        'evidence_semantics': 'tampered',
+                    },
+                )
+            ],
+        ]
+
+        class PageResult:
+            def __init__(self, items):
+                self.items = items
+
+            def mappings(self):
+                return self
+
+            def all(self):
+                return self.items
+
+        class PagingSession:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, _statement):
+                items = pages[self.calls]
+                self.calls += 1
+                return PageResult(items)
+
+        session = PagingSession()
+
+        @contextmanager
+        def fake_session_scope():
+            yield session
+
+        repository = DartSignalsRepository()
+        with patch('app.dart.signals_service.session_scope', fake_session_scope):
+            result = repository.list_missing_annual_audit_signal_candidates(
+                market_date=date(2026, 4, 30),
+                limit=2,
+                after_event_id=10,
+            )
+
+        self.assertEqual(
+            [item['event_id'] for item in result],
+            [12, 13],
+        )
+        self.assertEqual(session.calls, 2)
 
     def test_decode_document_text_falls_back_to_cp949_without_losing_korean_keywords(self):
         document = (
@@ -997,7 +1551,14 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
                 rcept_no=event['rcept_no']
             )
 
-        self.assertIsNone(result['audit_signal'])
+        self.assertTrue(
+            is_authoritative_absence_audit_payload(
+                result['audit_signal']['payload'],
+                event_id=event['id'],
+                rcept_no=event['rcept_no'],
+                receipt_date=event['receipt_date'],
+            )
+        )
         self.assertIn('audit_diagnostics', result)
         self.assertTrue(result['audit_signal_evaluated'])
         self.assertEqual(
@@ -1006,11 +1567,54 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
             1,
         )
-        store_signals.assert_called_once_with(
-            event=event,
-            audit_signal=None,
-            dilution_signal=None,
-            audit_signal_evaluated=True,
+        stored_signal = store_signals.call_args.kwargs['audit_signal']
+        self.assertTrue(
+            is_authoritative_absence_audit_payload(
+                stored_signal.payload,
+                event_id=event['id'],
+                rcept_no=event['rcept_no'],
+                receipt_date=event['receipt_date'],
+            )
+        )
+
+    async def test_combined_capture_persists_authoritative_absence_sentinel(self):
+        document = (
+            '<TABLE-GROUP ACLASS="AUD_OPN">'
+            '<TR><TD>감사보고서(전기)</TD><TD>의견거절</TD></TR>'
+            '</TABLE-GROUP>'
+        ).encode('utf-8')
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/prior-only.xml', document)]
+            ),
+            repository=MagicMock(),
+        )
+        event = _audit_event(rcept_no='20250325000542')
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_signals_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertTrue(
+            is_authoritative_absence_audit_payload(
+                result['audit_signal']['payload'],
+                event_id=event['id'],
+                rcept_no=event['rcept_no'],
+                receipt_date=event['receipt_date'],
+            )
+        )
+        stored_signal = store_signals.call_args.kwargs['audit_signal']
+        self.assertTrue(
+            is_authoritative_absence_audit_payload(
+                stored_signal.payload,
+                event_id=event['id'],
+                rcept_no=event['rcept_no'],
+                receipt_date=event['receipt_date'],
+            )
         )
 
     async def test_explicit_current_opinion_wins_over_prior_only_document(self):
@@ -1155,7 +1759,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             audit_signal_evaluated=False,
         )
 
-    def test_store_signals_deletes_stale_audit_only_after_completed_evaluation(self):
+    def test_store_signals_rejects_completed_evaluation_without_sentinel(self):
         service = DartSignalsService(
             client=MagicMock(),
             repository=MagicMock(),
@@ -1166,9 +1770,12 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         context.__enter__.return_value = session
         context.__exit__.return_value = False
 
-        with patch(
-            'app.dart.signals_service.session_scope',
-            return_value=context,
+        with (
+            self.assertRaisesRegex(ValueError, 'authoritative absence'),
+            patch(
+                'app.dart.signals_service.session_scope',
+                return_value=context,
+            ) as session_scope,
         ):
             service._store_signals(
                 event=event,
@@ -1177,10 +1784,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
                 audit_signal_evaluated=True,
             )
 
-        session.execute.assert_called_once()
-        statement = session.execute.call_args.args[0]
-        self.assertTrue(statement.is_delete)
-        self.assertIn('dart_audit_signals', str(statement))
+        session_scope.assert_not_called()
 
         session.reset_mock()
         with patch(
@@ -1200,7 +1804,11 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             client=MagicMock(),
             repository=MagicMock(),
         )
-        event = {'rcept_no': '20250325000541'}
+        event = _audit_event()
+        audit_signal = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
         session = MagicMock()
         session.get_bind.return_value.dialect.name = 'postgresql'
         context = MagicMock()
@@ -1213,19 +1821,44 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             service._store_signals(
                 event=event,
-                audit_signal=None,
+                audit_signal=audit_signal,
                 dilution_signal=None,
                 audit_signal_evaluated=True,
             )
 
         self.assertEqual(session.execute.call_count, 2)
-        lock_call, delete_call = session.execute.call_args_list
+        lock_call, upsert_call = session.execute.call_args_list
         self.assertIn('pg_advisory_xact_lock', str(lock_call.args[0]))
         self.assertEqual(
             lock_call.args[1],
             {'audit_signal_writer_lock_key': AUDIT_SIGNAL_WRITER_LOCK_KEY},
         )
-        self.assertTrue(delete_call.args[0].is_delete)
+        self.assertTrue(upsert_call.args[0].is_insert)
+
+    def test_store_signals_rejects_malformed_authoritative_absence(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        event = _audit_event()
+        audit_signal = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
+        audit_signal.payload['schema_version'] = 'invalid'
+
+        with (
+            self.assertRaisesRegex(ValueError, 'strict validation'),
+            patch('app.dart.signals_service.session_scope') as session_scope,
+        ):
+            service._store_signals(
+                event=event,
+                audit_signal=audit_signal,
+                dilution_signal=None,
+                audit_signal_evaluated=True,
+            )
+
+        session_scope.assert_not_called()
 
     def test_guard_owned_audit_mutation_bypasses_nested_lock_without_deadlock(self):
         service = DartSignalsService(
@@ -1245,15 +1878,19 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             audit_signal_writer_lock_owner(),
         ):
+            event = _audit_event()
             service._store_signals(
-                event={'rcept_no': '20250325000541'},
-                audit_signal=None,
+                event=event,
+                audit_signal=build_authoritative_absence_audit_signal(
+                    event,
+                    _complete_negative_audit_diagnostics(),
+                ),
                 dilution_signal=None,
                 audit_signal_evaluated=True,
             )
 
         session.execute.assert_called_once()
-        self.assertTrue(session.execute.call_args.args[0].is_delete)
+        self.assertTrue(session.execute.call_args.args[0].is_insert)
 
     def test_dilution_only_mutation_uses_shared_dart_signal_writer_lock(self):
         service = DartSignalsService(
@@ -1468,11 +2105,11 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 {
                     'rcept_no': '20260422000011',
-                    'audit_signal': {'opinion_code': 'unqualified'},
+                    'audit_signal': _durable_unqualified_audit_signal(),
                 },
                 {
                     'rcept_no': '20260422000012',
-                    'audit_signal': {'opinion_code': 'unqualified'},
+                    'audit_signal': _durable_unqualified_audit_signal(),
                 },
             ]
         )
@@ -1562,6 +2199,109 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             result['results'][0]['audit_diagnostics'],
             audit_diagnostics,
         )
+
+    async def test_backfill_treats_authoritative_absence_as_terminal(self):
+        event = _audit_event(
+            event_id=31,
+            rcept_no='20260422000031',
+        )
+        sentinel = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
+        repository = FakeSignalsRepository(
+            [
+                {
+                    'event_id': event['id'],
+                    'rcept_no': event['rcept_no'],
+                    'stock_code': event['stock_code'],
+                    'receipt_date': event['receipt_date'].isoformat(),
+                    'report_nm': event['report_nm'],
+                }
+            ]
+        )
+        service = DartSignalsService(
+            client=FakeSignalsClient(members=[]),
+            repository=repository,
+        )
+        service.capture_audit_signal_for_event = AsyncMock(
+            return_value={
+                'rcept_no': event['rcept_no'],
+                'audit_signal': sentinel.__dict__,
+                'audit_signal_evaluated': True,
+            }
+        )
+
+        result = await service.backfill_missing_annual_audit_signals(
+            market_date=date(2026, 4, 30),
+            limit=1,
+            after_event_id=30,
+            dry_run=False,
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            result['results'][0]['status'],
+            'authoritative_absence',
+        )
+        self.assertEqual(result['audit_signals_captured'], 0)
+        self.assertEqual(result['audit_signals_authoritatively_absent'], 1)
+        self.assertEqual(result['audit_evidence_missing'], 0)
+        self.assertFalse(result['retry_required'])
+        self.assertEqual(result['retry_event_ids'], [])
+        self.assertEqual(result['next_after_event_id'], 31)
+
+    async def test_backfill_retries_malformed_authoritative_absence(self):
+        event = _audit_event(
+            event_id=32,
+            rcept_no='20260422000032',
+        )
+        sentinel = build_authoritative_absence_audit_signal(
+            event,
+            _complete_negative_audit_diagnostics(),
+        )
+        sentinel.payload['audit_diagnostics']['archive_size_bytes'] = 0
+        sentinel.payload['schema_version'] = 'invalid'
+        repository = FakeSignalsRepository(
+            [
+                {
+                    'event_id': event['id'],
+                    'rcept_no': event['rcept_no'],
+                    'stock_code': event['stock_code'],
+                    'receipt_date': event['receipt_date'].isoformat(),
+                    'report_nm': event['report_nm'],
+                }
+            ]
+        )
+        service = DartSignalsService(
+            client=FakeSignalsClient(members=[]),
+            repository=repository,
+        )
+        service.capture_audit_signal_for_event = AsyncMock(
+            return_value={
+                'rcept_no': event['rcept_no'],
+                'audit_signal': sentinel.__dict__,
+                'audit_signal_evaluated': True,
+            }
+        )
+
+        result = await service.backfill_missing_annual_audit_signals(
+            market_date=date(2026, 4, 30),
+            limit=1,
+            after_event_id=31,
+            dry_run=False,
+        )
+
+        self.assertEqual(result['status'], 'completed_with_gaps')
+        self.assertEqual(
+            result['results'][0]['status'],
+            'audit_evidence_missing',
+        )
+        self.assertEqual(result['audit_signals_captured'], 0)
+        self.assertEqual(result['audit_signals_authoritatively_absent'], 0)
+        self.assertEqual(result['audit_evidence_missing'], 1)
+        self.assertTrue(result['retry_required'])
+        self.assertEqual(result['retry_event_ids'], [32])
 
     async def test_backfill_gap_page_exposes_separate_forward_scan_cursor(self):
         repository = FakeSignalsRepository(
@@ -1698,7 +2438,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {'opinion_code': 'unqualified'},
+                'audit_signal': _durable_unqualified_audit_signal(),
             }
 
         service.capture_audit_signal_for_event = AsyncMock(side_effect=capture)
@@ -1812,7 +2552,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             active_count -= 1
             return {
                 'rcept_no': rcept_no,
-                'audit_signal': {'opinion_code': 'unqualified'},
+                'audit_signal': _durable_unqualified_audit_signal(),
             }
 
         service.capture_audit_signal_for_event = AsyncMock(side_effect=capture)
@@ -1883,7 +2623,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             if event_id == 64:
                 return {
                     'rcept_no': rcept_no,
-                    'audit_signal': {'opinion_code': 'unqualified'},
+                    'audit_signal': _durable_unqualified_audit_signal(),
                 }
             raise AssertionError('the circuit breaker must stop the next wave')
 
@@ -2392,7 +3132,10 @@ class DartSignalsRepositoryPostgresTests(unittest.TestCase):
                     has_audit_issue=False,
                     source_section='AUD_OPN',
                     evidence_text='적정',
-                    payload={},
+                    payload={
+                        'opinion_cell': '적정',
+                        'row_cells': ['적정'],
+                    },
                 )
             )
             session.flush()
@@ -2539,7 +3282,10 @@ class DartSignalsRepositoryPostgresTests(unittest.TestCase):
                         has_audit_issue=False,
                         source_section='AUD_OPN',
                         evidence_text='적정',
-                        payload={},
+                        payload={
+                            'opinion_cell': '적정',
+                            'row_cells': ['적정'],
+                        },
                     )
                 )
                 session.flush()

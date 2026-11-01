@@ -26,6 +26,9 @@ from app.eod.exact_factor_repair import (
     prune_stale_factor_rows,
     verify_exact_factor_rows,
 )
+from app.eod.price_bar_repair_state import (
+    PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE,
+)
 
 
 class _Index:
@@ -148,6 +151,31 @@ def _pinned_membership(exact_symbols: list[str]) -> dict[str, object]:
         'expected_membership_sha256': market_membership_sha256(
             provider_membership
         ),
+    }
+
+
+def _pending_missing_bar_membership_proof(
+    exact_symbols: list[str],
+) -> dict[str, object]:
+    membership = _membership_by_market()
+    return {
+        'symbols_by_market': {
+            market: [symbol for symbol in symbols if symbol.isdigit()]
+            for market, symbols in membership.items()
+        },
+        'protected_provider_codes_by_market': {
+            'KOSPI': ['00104K'],
+            'KOSDAQ': [],
+        },
+        'membership_evidence_source': (
+            PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+        ),
+        'membership_evidence_run_id': None,
+        'membership_evidence_run_source': 'pykrx',
+        'membership_evidence_sha256': 'b' * 64,
+        'membership_evidence_repair_batch_ids': ['missing-bar-authority'],
+        'ranking_membership_count': len(exact_symbols),
+        'ranking_membership_sha256': market_membership_sha256(exact_symbols),
     }
 
 
@@ -306,6 +334,120 @@ def test_stored_only_policy_never_calls_live_membership_providers() -> None:
     assert result['membership_policy'] == MEMBERSHIP_POLICY_STORED_ONLY
     assert result['membership_evidence_source'] == 'stored_eod_run_metadata'
     assert live_calls == []
+
+
+def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prune_calls: list[dict] = []
+    completion_calls: list[dict] = []
+    service, exact_symbols, stage_calls = _service(
+        prune_calls=prune_calls,
+        completion_calls=completion_calls,
+    )
+    pending_proof = _pending_missing_bar_membership_proof(exact_symbols)
+    resolver_calls: list[dict] = []
+    stale_calls: list[dict] = []
+
+    def no_live_provider(*_args, **_kwargs):
+        raise AssertionError('stored-only pending proof must not call live PyKRX')
+
+    def resolve_pending(**kwargs):
+        resolver_calls.append(kwargs)
+        return pending_proof
+
+    def stale_details(**kwargs):
+        stale_calls.append(kwargs)
+        return {
+            stage_id: {'count': 7, 'symbol_preview': ['999999']}
+            for stage_id in FACTOR_RESULT_MODELS
+        }
+
+    service.trade_date_resolver = no_live_provider
+    service.market_ohlcv_loader = no_live_provider
+    service.stored_eod_run_loader = lambda **_kwargs: []
+    service.pending_batch_loader = lambda: [
+        {'repair_batch_id': 'missing-bar-authority'}
+    ]
+    service.pending_membership_evidence_resolver = resolve_pending
+    service.price_bar_symbols_loader = lambda _date: [
+        *exact_symbols,
+        '00104K',
+        '999999',
+    ]
+    service.stale_details_loader = stale_details
+    monkeypatch.setattr(
+        exact_factor_repair,
+        'resolve_pending_frozen_price_dependent_membership',
+        lambda **_kwargs: tuple(exact_symbols),
+    )
+
+    dry_result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=False,
+        membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
+    )
+
+    provider_membership = [*exact_symbols, '00104K']
+    apply_kwargs = {
+        'market_date': '2026-09-23',
+        'apply': True,
+        'prune_stale': True,
+        'expected_provider_membership_count': len(provider_membership),
+        'expected_membership_sha256': market_membership_sha256(
+            provider_membership
+        ),
+        'expected_membership_evidence_source': (
+            PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+        ),
+        'expected_membership_evidence_run_id': None,
+        'expected_membership_evidence_run_source': 'pykrx',
+        'expected_membership_evidence_repair_batch_ids': [
+            'missing-bar-authority'
+        ],
+        'membership_policy': MEMBERSHIP_POLICY_STORED_ONLY,
+    }
+    mismatched = service.repair_for_market_date(
+        **apply_kwargs,
+        expected_membership_evidence_sha256='c' * 64,
+    )
+
+    assert dry_result['status'] == 'ready'
+    assert dry_result['membership_evidence_source'] == (
+        PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+    )
+    assert dry_result['membership_evidence_sha256'] == 'b' * 64
+    assert dry_result['membership_evidence_repair_batch_ids'] == [
+        'missing-bar-authority'
+    ]
+    assert dry_result['provider_excluded_from_ranking_codes'] == ['00104K']
+    assert mismatched['status'] == 'blocked'
+    assert mismatched['reason'] == 'expected_membership_lineage_mismatch'
+    assert stage_calls == []
+    assert prune_calls == []
+    assert completion_calls == []
+
+    applied = service.repair_for_market_date(
+        **apply_kwargs,
+        expected_membership_evidence_sha256='b' * 64,
+    )
+
+    assert applied['status'] == 'completed'
+    assert len(stage_calls) == len(FACTOR_RESULT_MODELS)
+    assert prune_calls[0]['protected_symbols'] == ['00104K']
+    assert completion_calls[0]['membership_evidence_source'] == (
+        PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+    )
+    assert completion_calls[0]['membership_evidence_run_id'] is None
+    assert completion_calls[0]['membership_evidence_run_source'] == 'pykrx'
+    assert completion_calls[0]['membership_evidence_sha256'] == 'b' * 64
+    assert completion_calls[0][
+        'membership_evidence_repair_batch_ids'
+    ] == ['missing-bar-authority']
+    assert len(resolver_calls) == 3
+    assert all(
+        call['protected_symbols'] == ['00104K'] for call in stale_calls
+    )
 
 
 def test_stored_fallback_skips_newer_unsuitable_retry_for_latest_valid_run() -> None:

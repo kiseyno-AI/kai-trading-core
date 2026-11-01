@@ -5,14 +5,15 @@ import hashlib
 import io
 import re
 import zipfile
+from copy import deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from html import unescape
-from typing import Any
+from typing import Any, Mapping
 
-from sqlalchemy import and_, case, delete, func, or_, select, text
+from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.settings import settings
@@ -47,6 +48,12 @@ MAX_AUDIT_DIAGNOSTIC_MEMBERS = 50
 MAX_AUDIT_DIAGNOSTIC_MEMBER_NAME_CHARS = 255
 MAX_AUDIT_DIAGNOSTIC_ENCODING_CHARS = 64
 AUDIT_ARCHIVE_DIAGNOSTICS_VERSION = 'dart_audit_archive_diagnostics_v1'
+AUDIT_AUTHORITATIVE_ABSENCE_SCHEMA_VERSION = (
+    'dart_audit_authoritative_absence_v1'
+)
+AUDIT_AUTHORITATIVE_ABSENCE_EVIDENCE_SEMANTICS = (
+    'authoritative_absence'
+)
 AUDIT_SIGNAL_WRITER_LOCK_KEY = 'dart_audit_signals_writer_v1'
 _AUDIT_SIGNAL_WRITER_LOCK_OWNED: ContextVar[bool] = ContextVar(
     'dart_audit_signal_writer_lock_owned',
@@ -176,6 +183,362 @@ class ParsedAuditSignal:
     payload: dict[str, Any] | None
 
 
+_AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS = frozenset(
+    {
+        'schema_version',
+        'evidence_semantics',
+        'audit_signal_evaluated',
+        'event_id',
+        'rcept_no',
+        'receipt_date',
+        'audit_diagnostics',
+    }
+)
+
+
+def _canonical_audit_receipt_date(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return None
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
+        return None
+    try:
+        canonical = date.fromisoformat(value).isoformat()
+    except ValueError:
+        return None
+    return canonical if value == canonical else None
+
+
+def is_authoritative_absence_audit_payload(
+    payload: Any,
+    *,
+    event_id: int | None = None,
+    rcept_no: str | None = None,
+    receipt_date: date | str | None = None,
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    if set(payload) != _AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS:
+        return False
+    if (
+        payload.get('schema_version')
+        != AUDIT_AUTHORITATIVE_ABSENCE_SCHEMA_VERSION
+        or payload.get('evidence_semantics')
+        != AUDIT_AUTHORITATIVE_ABSENCE_EVIDENCE_SEMANTICS
+        or payload.get('audit_signal_evaluated') is not True
+    ):
+        return False
+
+    stored_event_id = payload.get('event_id')
+    if (
+        isinstance(stored_event_id, bool)
+        or not isinstance(stored_event_id, int)
+        or stored_event_id <= 0
+    ):
+        return False
+    stored_rcept_no = payload.get('rcept_no')
+    if (
+        not isinstance(stored_rcept_no, str)
+        or not stored_rcept_no
+        or len(stored_rcept_no) > 32
+    ):
+        return False
+    if event_id is not None and stored_event_id != event_id:
+        return False
+    if rcept_no is not None and stored_rcept_no != rcept_no:
+        return False
+    stored_receipt_date = payload.get('receipt_date')
+    if (
+        not isinstance(stored_receipt_date, str)
+        or _canonical_audit_receipt_date(stored_receipt_date)
+        != stored_receipt_date
+    ):
+        return False
+    if receipt_date is not None:
+        expected_receipt_date = _canonical_audit_receipt_date(receipt_date)
+        if (
+            expected_receipt_date is None
+            or stored_receipt_date != expected_receipt_date
+        ):
+            return False
+
+    diagnostics = payload.get('audit_diagnostics')
+    if not _has_complete_audit_authority_evaluation(diagnostics):
+        return False
+    if diagnostics.get('version') != AUDIT_ARCHIVE_DIAGNOSTICS_VERSION:
+        return False
+    archive_sha256 = diagnostics.get('archive_sha256')
+    if (
+        not isinstance(archive_sha256, str)
+        or re.fullmatch(r'[0-9a-f]{64}', archive_sha256) is None
+    ):
+        return False
+    archive_size_bytes = diagnostics.get('archive_size_bytes')
+    if (
+        isinstance(archive_size_bytes, bool)
+        or not isinstance(archive_size_bytes, int)
+        or archive_size_bytes <= 0
+    ):
+        return False
+    return True
+
+
+def claims_authoritative_absence_audit_payload(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    # Every field in this envelope is reserved for the durable negative
+    # sentinel.  Treat even a partly corrupted envelope as a sentinel claim so
+    # it cannot downgrade into an apparently clean parsed opinion.
+    return bool(set(payload).intersection(_AUTHORITATIVE_ABSENCE_PAYLOAD_FIELDS))
+
+
+def is_authoritative_absence_audit_signal(
+    signal: ParsedAuditSignal | Mapping[str, Any] | Any,
+    *,
+    event_id: int | None = None,
+    rcept_no: str | None = None,
+    receipt_date: date | str | None = None,
+) -> bool:
+    def field(name: str) -> Any:
+        if isinstance(signal, Mapping):
+            return signal.get(name)
+        return getattr(signal, name, None)
+
+    return (
+        is_authoritative_absence_audit_payload(
+            field('payload'),
+            event_id=event_id,
+            rcept_no=rcept_no,
+            receipt_date=receipt_date,
+        )
+        and field('opinion_code') is None
+        and field('opinion_label') is None
+        and field('has_audit_issue') is False
+        and field('source_section') is None
+        and field('evidence_text') is None
+    )
+
+
+_PARSED_AUDIT_OPINION_ISSUE = {
+    'unqualified': False,
+    'qualified': True,
+    'adverse': True,
+    'disclaimer': True,
+}
+_PARSED_AUDIT_OPINION_LABEL = {
+    'unqualified': '적정',
+    'qualified': '한정',
+    'adverse': '부적정',
+    'disclaimer': '의견거절',
+}
+_PARSED_AUDIT_PAYLOAD_PARSERS = frozenset(
+    {
+        'semantic_audit_table_v1',
+        'legacy_aud_opn_explicit_current_v1',
+        'legacy_aud_opn_markerless_v1',
+    }
+)
+_PARSED_AUDIT_SELECTION_FIELDS = frozenset(
+    {
+        'selection_policy',
+        'evidence_count',
+        'opinion_codes',
+        'conflicting_opinion_codes',
+        'findings_by_opinion',
+        'source_sections',
+        'selected_source_section',
+    }
+)
+
+
+def _is_nonempty_audit_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_nonempty_audit_text_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) for item in value)
+        and any(item.strip() for item in value)
+    )
+
+
+def _has_durable_parsed_audit_payload(
+    payload: Any,
+    *,
+    opinion_code: str,
+    source_section: str,
+) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    parser = payload.get('parser')
+    if parser is not None and (
+        not isinstance(parser, str)
+        or parser not in _PARSED_AUDIT_PAYLOAD_PARSERS
+    ):
+        return False
+    opinion_cell = payload.get('opinion_cell')
+    if not _is_nonempty_audit_text(opinion_cell):
+        return False
+    evidence_cells = payload.get('row_cells')
+    if parser == 'semantic_audit_table_v1' and evidence_cells is None:
+        evidence_cells = payload.get('column_cells')
+    if (
+        not _is_nonempty_audit_text_list(evidence_cells)
+        or opinion_cell not in evidence_cells
+    ):
+        return False
+    parsed_opinion_code = next(
+        (
+            code
+            for pattern, code, _label in _SEMANTIC_AUDIT_PATTERNS
+            if pattern.search(opinion_cell)
+        ),
+        None,
+    )
+    if parsed_opinion_code != opinion_code:
+        return False
+
+    present_selection_fields = set(payload).intersection(
+        _PARSED_AUDIT_SELECTION_FIELDS
+    )
+    if not present_selection_fields:
+        return True
+    if present_selection_fields != _PARSED_AUDIT_SELECTION_FIELDS:
+        return False
+    if (
+        payload.get('selection_policy')
+        != 'most_conservative_audit_opinion_v1'
+    ):
+        return False
+    evidence_count = payload.get('evidence_count')
+    opinion_codes = payload.get('opinion_codes')
+    conflicting_codes = payload.get('conflicting_opinion_codes')
+    findings_by_opinion = payload.get('findings_by_opinion')
+    source_sections = payload.get('source_sections')
+    valid_opinion_codes = (
+        isinstance(opinion_codes, list)
+        and bool(opinion_codes)
+        and all(
+            isinstance(code, str)
+            and code in _PARSED_AUDIT_OPINION_ISSUE
+            for code in opinion_codes
+        )
+    )
+    valid_source_sections = (
+        _is_nonempty_audit_text_list(source_sections)
+        and all(section.strip() for section in source_sections)
+    )
+    canonical_opinion_codes = (
+        sorted(
+            set(opinion_codes),
+            key=lambda code: (-_AUDIT_OPINION_SEVERITY[code], code),
+        )
+        if valid_opinion_codes
+        else []
+    )
+    if (
+        isinstance(evidence_count, bool)
+        or not isinstance(evidence_count, int)
+        or evidence_count <= 0
+        or not valid_opinion_codes
+        or opinion_codes != canonical_opinion_codes
+        or opinion_code != opinion_codes[0]
+        or len(opinion_codes) != len(set(opinion_codes))
+        or conflicting_codes != (opinion_codes if len(opinion_codes) > 1 else [])
+        or not isinstance(findings_by_opinion, Mapping)
+        or set(findings_by_opinion) != set(opinion_codes)
+        or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count <= 0
+            for count in findings_by_opinion.values()
+        )
+        or sum(findings_by_opinion.values()) != evidence_count
+        or not valid_source_sections
+        or source_sections != sorted(set(source_sections))
+        or source_section not in source_sections
+        or payload.get('selected_source_section') != source_section
+    ):
+        return False
+    return True
+
+
+def classify_durable_audit_signal(
+    signal: ParsedAuditSignal | Mapping[str, Any] | Any,
+    *,
+    event_id: int | None = None,
+    rcept_no: str | None = None,
+    receipt_date: date | str | None = None,
+) -> str | None:
+    def field(name: str) -> Any:
+        if isinstance(signal, Mapping):
+            return signal.get(name)
+        return getattr(signal, name, None)
+
+    payload = field('payload')
+    if is_authoritative_absence_audit_signal(
+        signal,
+        event_id=event_id,
+        rcept_no=rcept_no,
+        receipt_date=receipt_date,
+    ):
+        return 'authoritative_absence'
+    if claims_authoritative_absence_audit_payload(payload):
+        return None
+    opinion_code = str(field('opinion_code') or '').strip()
+    expected_issue = _PARSED_AUDIT_OPINION_ISSUE.get(opinion_code)
+    if (
+        expected_issue is None
+        or field('has_audit_issue') is not expected_issue
+        or field('opinion_label')
+        != _PARSED_AUDIT_OPINION_LABEL[opinion_code]
+        or not _is_nonempty_audit_text(field('source_section'))
+        or not _is_nonempty_audit_text(field('evidence_text'))
+        or not _has_durable_parsed_audit_payload(
+            payload,
+            opinion_code=opinion_code,
+            source_section=str(field('source_section')),
+        )
+    ):
+        return None
+    return 'parsed_opinion'
+
+
+def build_authoritative_absence_audit_signal(
+    event: Mapping[str, Any],
+    diagnostics: Mapping[str, Any],
+) -> ParsedAuditSignal:
+    payload = {
+        'schema_version': AUDIT_AUTHORITATIVE_ABSENCE_SCHEMA_VERSION,
+        'evidence_semantics': (
+            AUDIT_AUTHORITATIVE_ABSENCE_EVIDENCE_SEMANTICS
+        ),
+        'audit_signal_evaluated': True,
+        'event_id': event.get('id'),
+        'rcept_no': event.get('rcept_no'),
+        'receipt_date': _canonical_audit_receipt_date(
+            event.get('receipt_date')
+        ),
+        'audit_diagnostics': deepcopy(dict(diagnostics)),
+    }
+    if not is_authoritative_absence_audit_payload(payload):
+        raise ValueError(
+            'authoritative audit absence requires exact event identity and '
+            'complete versioned diagnostics'
+        )
+    return ParsedAuditSignal(
+        opinion_code=None,
+        opinion_label=None,
+        has_audit_issue=False,
+        source_section=None,
+        evidence_text=None,
+        payload=payload,
+    )
+
+
 class DartSignalsRepository:
     def list_missing_annual_audit_signal_candidates(
         self,
@@ -254,43 +617,100 @@ class DartSignalsRepository:
             select(selected_filing_per_year, latest_business_year_rank)
             .subquery()
         )
-        consumed_audit_signal_exists = (
-            select(DartAuditSignal.id)
-            .where(
-                DartAuditSignal.rcept_no == selected_latest_annual.c.rcept_no,
-                DartAuditSignal.stock_code == selected_latest_annual.c.stock_code,
-                DartAuditSignal.receipt_date.is_not(None),
-                DartAuditSignal.receipt_date <= market_date,
-            )
-            .correlate(selected_latest_annual)
-            .exists()
-        )
         stmt = (
-            select(selected_latest_annual)
+            select(
+                selected_latest_annual,
+                DartAuditSignal.id.label('audit_signal_id'),
+                DartAuditSignal.opinion_code.label('audit_opinion_code'),
+                DartAuditSignal.opinion_label.label('audit_opinion_label'),
+                DartAuditSignal.has_audit_issue.label(
+                    'audit_has_audit_issue'
+                ),
+                DartAuditSignal.source_section.label(
+                    'audit_source_section'
+                ),
+                DartAuditSignal.evidence_text.label(
+                    'audit_evidence_text'
+                ),
+                DartAuditSignal.payload.label('audit_payload'),
+            )
+            .outerjoin(
+                DartAuditSignal,
+                and_(
+                    DartAuditSignal.disclosure_event_id
+                    == selected_latest_annual.c.event_id,
+                    DartAuditSignal.rcept_no
+                    == selected_latest_annual.c.rcept_no,
+                    DartAuditSignal.stock_code
+                    == selected_latest_annual.c.stock_code,
+                    DartAuditSignal.receipt_date
+                    == selected_latest_annual.c.receipt_date,
+                ),
+            )
             .where(
                 selected_latest_annual.c.business_year_rank == 1,
-                selected_latest_annual.c.event_id > after_event_id,
-                ~consumed_audit_signal_exists,
             )
             .order_by(selected_latest_annual.c.event_id.asc())
-            .limit(limit)
         )
 
         with session_scope() as session:
-            rows = session.execute(stmt).mappings().all()
-            return [
-                {
-                    'event_id': int(row['event_id']),
-                    'snapshot_id': int(row['snapshot_id']),
-                    'rcept_no': str(row['rcept_no']),
-                    'stock_code': str(row['stock_code']),
-                    'business_year': int(row['business_year']),
-                    'fs_div': str(row['fs_div']),
-                    'receipt_date': row['receipt_date'].isoformat(),
-                    'report_nm': str(row['report_nm']),
-                }
-                for row in rows
-            ]
+            candidates: list[dict[str, Any]] = []
+            scan_after_event_id = after_event_id
+            while len(candidates) < limit:
+                scan_limit = limit
+                rows = (
+                    session.execute(
+                        stmt.where(
+                            selected_latest_annual.c.event_id
+                            > scan_after_event_id
+                        ).limit(scan_limit)
+                    )
+                    .mappings()
+                    .all()
+                )
+                if not rows:
+                    break
+                scan_after_event_id = int(rows[-1]['event_id'])
+                for row in rows:
+                    audit_signal = None
+                    if row['audit_signal_id'] is not None:
+                        audit_signal = {
+                            'opinion_code': row['audit_opinion_code'],
+                            'opinion_label': row['audit_opinion_label'],
+                            'has_audit_issue': row[
+                                'audit_has_audit_issue'
+                            ],
+                            'source_section': row['audit_source_section'],
+                            'evidence_text': row['audit_evidence_text'],
+                            'payload': row['audit_payload'],
+                        }
+                    durable_classification = classify_durable_audit_signal(
+                        audit_signal,
+                        event_id=int(row['event_id']),
+                        rcept_no=str(row['rcept_no']),
+                        receipt_date=row['receipt_date'],
+                    )
+                    if durable_classification is not None:
+                        continue
+                    candidates.append(
+                        {
+                            'event_id': int(row['event_id']),
+                            'snapshot_id': int(row['snapshot_id']),
+                            'rcept_no': str(row['rcept_no']),
+                            'stock_code': str(row['stock_code']),
+                            'business_year': int(row['business_year']),
+                            'fs_div': str(row['fs_div']),
+                            'receipt_date': row[
+                                'receipt_date'
+                            ].isoformat(),
+                            'report_nm': str(row['report_nm']),
+                        }
+                    )
+                    if len(candidates) == limit:
+                        break
+                if len(rows) < scan_limit:
+                    break
+            return candidates
 
     def list_recent_share_issuance_scan_evidence(
         self,
@@ -426,9 +846,15 @@ class DartSignalsService:
             await self._extract_audit_signal_with_diagnostics(event)
         )
         dilution_signal = self._extract_dilution_signal(event)
-        audit_signal_evaluated = bool(audit_signal) or (
+        authoritative_absence = audit_signal is None and (
             _has_complete_audit_authority_evaluation(audit_diagnostics)
         )
+        if authoritative_absence:
+            audit_signal = build_authoritative_absence_audit_signal(
+                event,
+                audit_diagnostics,
+            )
+        audit_signal_evaluated = audit_signal is not None
         self._store_signals(
             event=event,
             audit_signal=audit_signal,
@@ -441,7 +867,10 @@ class DartSignalsService:
             'audit_signal_evaluated': audit_signal_evaluated,
             'dilution_signal': dilution_signal,
         }
-        if audit_signal is None and audit_diagnostics is not None:
+        if (
+            (audit_signal is None or authoritative_absence)
+            and audit_diagnostics is not None
+        ):
             result['audit_diagnostics'] = audit_diagnostics
         return result
 
@@ -450,9 +879,15 @@ class DartSignalsService:
         audit_signal, audit_diagnostics = (
             await self._extract_audit_signal_with_diagnostics(event)
         )
-        audit_signal_evaluated = bool(audit_signal) or (
+        authoritative_absence = audit_signal is None and (
             _has_complete_audit_authority_evaluation(audit_diagnostics)
         )
+        if authoritative_absence:
+            audit_signal = build_authoritative_absence_audit_signal(
+                event,
+                audit_diagnostics,
+            )
+        audit_signal_evaluated = audit_signal is not None
         self._store_signals(
             event=event,
             audit_signal=audit_signal,
@@ -464,7 +899,10 @@ class DartSignalsService:
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
             'audit_signal_evaluated': audit_signal_evaluated,
         }
-        if audit_signal is None and audit_diagnostics is not None:
+        if (
+            (audit_signal is None or authoritative_absence)
+            and audit_diagnostics is not None
+        ):
             result['audit_diagnostics'] = audit_diagnostics
         return result
 
@@ -521,6 +959,7 @@ class DartSignalsService:
                 'candidate_count': len(candidates),
                 'candidates_attempted': 0,
                 'audit_signals_captured': 0,
+                'audit_signals_authoritatively_absent': 0,
                 'audit_evidence_missing': 0,
                 'events_failed': 0,
                 'retry_required': False,
@@ -539,6 +978,7 @@ class DartSignalsService:
             }
 
         captured_count = 0
+        authoritative_absence_count = 0
         missing_count = 0
         failed_count = 0
         retry_event_ids: list[int] = []
@@ -623,13 +1063,47 @@ class DartSignalsService:
                     )
                 elif capture_result.get('audit_signal'):
                     audit_signal = capture_result['audit_signal']
-                    result_item.update(
-                        {
-                            'status': 'captured',
-                            'opinion_code': audit_signal.get('opinion_code'),
-                            'has_audit_issue': audit_signal.get('has_audit_issue'),
-                        }
+                    payload = (
+                        audit_signal.get('payload')
+                        if isinstance(audit_signal, Mapping)
+                        else None
                     )
+                    classification = classify_durable_audit_signal(
+                        audit_signal,
+                        event_id=int(candidate['event_id']),
+                        rcept_no=str(candidate['rcept_no']),
+                        receipt_date=candidate.get('receipt_date'),
+                    )
+                    if classification == 'authoritative_absence':
+                        result_item.update(
+                            {
+                                'status': 'authoritative_absence',
+                                'opinion_code': None,
+                                'has_audit_issue': False,
+                            }
+                        )
+                    elif classification != 'parsed_opinion':
+                        result_item['status'] = 'audit_evidence_missing'
+                        if isinstance(payload, Mapping):
+                            audit_diagnostics = payload.get(
+                                'audit_diagnostics'
+                            )
+                            if isinstance(audit_diagnostics, dict):
+                                result_item['audit_diagnostics'] = (
+                                    audit_diagnostics
+                                )
+                    else:
+                        result_item.update(
+                            {
+                                'status': 'captured',
+                                'opinion_code': audit_signal.get(
+                                    'opinion_code'
+                                ),
+                                'has_audit_issue': audit_signal.get(
+                                    'has_audit_issue'
+                                ),
+                            }
+                        )
                 else:
                     result_item['status'] = 'audit_evidence_missing'
                     audit_diagnostics = capture_result.get(
@@ -670,6 +1144,8 @@ class DartSignalsService:
                         consecutive_systemic_failures = 0
                     if status == 'captured':
                         captured_count += 1
+                    elif status == 'authoritative_absence':
+                        authoritative_absence_count += 1
                     else:
                         missing_count += 1
                         retry_event_ids.append(event_id)
@@ -714,6 +1190,9 @@ class DartSignalsService:
             'candidate_count': len(candidates),
             'candidates_attempted': len(results),
             'audit_signals_captured': captured_count,
+            'audit_signals_authoritatively_absent': (
+                authoritative_absence_count
+            ),
             'audit_evidence_missing': missing_count,
             'events_failed': failed_count,
             'retry_required': retry_required,
@@ -2394,6 +2873,27 @@ class DartSignalsService:
         dilution_signal: dict[str, Any] | None,
         audit_signal_evaluated: bool = False,
     ) -> None:
+        if audit_signal is None and audit_signal_evaluated:
+            raise ValueError(
+                'completed audit evaluation requires an opinion signal or '
+                'authoritative absence sentinel'
+            )
+        if audit_signal is not None:
+            classification = classify_durable_audit_signal(
+                audit_signal,
+                event_id=event.get('id'),
+                rcept_no=event.get('rcept_no'),
+                receipt_date=event.get('receipt_date'),
+            )
+            if classification == 'authoritative_absence':
+                if not audit_signal_evaluated:
+                    raise ValueError(
+                        'authoritative absence sentinel fields are invalid'
+                    )
+            elif classification != 'parsed_opinion':
+                raise ValueError(
+                    'audit signal failed strict validation for durable evidence'
+                )
         with session_scope() as session:
             dart_signal_mutation = (
                 audit_signal is not None
@@ -2453,16 +2953,6 @@ class DartSignalsService:
                             'evidence_text': stmt.excluded.evidence_text,
                             'payload': stmt.excluded.payload,
                         },
-                    )
-                )
-            elif audit_signal_evaluated:
-                # A successfully downloaded and parsed filing that no longer
-                # yields current-period authority must revoke any signal left
-                # by an older parser. Provider errors never reach this branch,
-                # so transient upstream failures preserve last-known-good data.
-                session.execute(
-                    delete(DartAuditSignal).where(
-                        DartAuditSignal.rcept_no == event['rcept_no']
                     )
                 )
             if dilution_signal is not None:

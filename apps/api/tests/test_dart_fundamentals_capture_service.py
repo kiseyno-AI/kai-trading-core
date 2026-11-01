@@ -12,6 +12,7 @@ from app.dart.fundamentals_capture_service import (
     infer_fundamentals_request,
     resolve_supported_dart_corp_record,
 )
+from app.dart.signals_service import build_authoritative_absence_audit_signal
 
 
 def DartFundamentalsCaptureService(**kwargs):
@@ -75,6 +76,24 @@ def _exact_fundamentals_scope_outcome(
             }
             for stock_code in selected_stock_codes
         ],
+    }
+
+
+def _complete_negative_audit_diagnostics() -> dict:
+    return {
+        'version': 'dart_audit_archive_diagnostics_v1',
+        'archive_sha256': 'a' * 64,
+        'archive_size_bytes': 321,
+        'member_count': 1,
+        'members': [],
+        'decoded_member_count': 1,
+        'aud_opn_table_count': 1,
+        'audit_report_label_row_count': 1,
+        'known_opinion_token_row_count': 1,
+        'positive_authority_evidence_count': 0,
+        'negative_authority_evidence_count': 1,
+        'ambiguous_authority_evidence_count': 0,
+        'truncated': False,
     }
 
 
@@ -432,6 +451,13 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                     'opinion_code': 'unqualified',
                     'opinion_label': '적정',
                     'has_audit_issue': False,
+                    'source_section': '감사보고서 > 감사의견',
+                    'evidence_text': '감사의견 | 적정',
+                    'payload': {
+                        'parser': 'semantic_audit_table_v1',
+                        'opinion_cell': '적정',
+                        'row_cells': ['당기', '적정'],
+                    },
                 },
                 'dilution_signal': None,
             },
@@ -613,6 +639,159 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(repository.successes, [1])
         self.assertEqual(result['results'][0]['audit_signal_status'], 'captured')
+
+    async def test_capture_annual_fundamentals_accepts_durable_authoritative_absence(self):
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': 1,
+                'rcept_no': '20260407000003',
+                'receipt_date': '2026-04-07',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        self.mock_capture_dart_signals.return_value = {
+            'rcept_no': '20260407000003',
+            'audit_signal': {
+                'opinion_code': sentinel.opinion_code,
+                'opinion_label': sentinel.opinion_label,
+                'has_audit_issue': sentinel.has_audit_issue,
+                'source_section': sentinel.source_section,
+                'evidence_text': sentinel.evidence_text,
+                'payload': sentinel.payload,
+            },
+            'audit_signal_evaluated': True,
+            'dilution_signal': None,
+        }
+        repository = FakeCaptureRepository()
+        list_candidates = repository.list_capture_candidates
+        repository.list_capture_candidates = lambda **kwargs: [
+            {**event, 'receipt_date': '2026-04-07'}
+            for event in list_candidates(**kwargs)
+        ]
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(repository.successes, [1])
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(
+            result['results'][0]['audit_signal_status'],
+            'authoritative_absence',
+        )
+
+    async def test_capture_annual_fundamentals_retries_malformed_authoritative_absence(self):
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': 1,
+                'rcept_no': '20260407000003',
+                'receipt_date': '2026-04-07',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        sentinel.payload['receipt_date'] = '2026-04-08'
+        self.mock_capture_dart_signals.return_value = {
+            'rcept_no': '20260407000003',
+            'audit_signal': {
+                'opinion_code': sentinel.opinion_code,
+                'opinion_label': sentinel.opinion_label,
+                'has_audit_issue': sentinel.has_audit_issue,
+                'source_section': sentinel.source_section,
+                'evidence_text': sentinel.evidence_text,
+                'payload': sentinel.payload,
+            },
+            'audit_signal_evaluated': True,
+            'dilution_signal': None,
+        }
+        repository = FakeCaptureRepository()
+        list_candidates = repository.list_capture_candidates
+        repository.list_capture_candidates = lambda **kwargs: [
+            {**event, 'receipt_date': '2026-04-07'}
+            for event in list_candidates(**kwargs)
+        ]
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_captured'], 0)
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(repository.successes, [])
+        self.assertEqual(repository.snapshots, [])
+        self.assertIn('malformed audit evidence', repository.failures[0][1])
+
+    async def test_capture_annual_fundamentals_retries_downgrade_and_opinion_drift(self):
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': 1,
+                'rcept_no': '20260407000003',
+                'receipt_date': '2026-04-07',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        corrupted_payload = dict(sentinel.payload)
+        corrupted_payload['schema_version'] = 'tampered'
+        corrupted_payload['evidence_semantics'] = 'tampered'
+        cases = {
+            'corrupted_sentinel_downgrade': {
+                'opinion_code': 'unqualified',
+                'has_audit_issue': False,
+                'payload': corrupted_payload,
+            },
+            'qualified_marked_clean': {
+                'opinion_code': 'qualified',
+                'has_audit_issue': False,
+                'payload': {'parser': 'semantic_audit_table_v1'},
+            },
+        }
+
+        for label, audit_signal in cases.items():
+            with self.subTest(label=label):
+                self.mock_capture_dart_signals.return_value = {
+                    'rcept_no': '20260407000003',
+                    'audit_signal': audit_signal,
+                    'audit_signal_evaluated': True,
+                    'dilution_signal': None,
+                }
+                repository = FakeCaptureRepository()
+                list_candidates = repository.list_capture_candidates
+                repository.list_capture_candidates = lambda **kwargs: [
+                    {**event, 'receipt_date': '2026-04-07'}
+                    for event in list_candidates(**kwargs)
+                ]
+                service = DartFundamentalsCaptureService(
+                    client=FakeCaptureClient(),
+                    repository=repository,
+                )
+
+                result = await service.capture_recent_fundamentals(
+                    limit=1,
+                    force=False,
+                    trigger='test',
+                    fs_div='CFS',
+                )
+
+                self.assertEqual(result['events_captured'], 0)
+                self.assertEqual(result['events_failed'], 1)
+                self.assertEqual(repository.successes, [])
+                self.assertIn(
+                    'malformed audit evidence',
+                    repository.failures[0][1],
+                )
 
     async def test_capture_annual_fundamentals_keeps_event_retryable_when_audit_evidence_is_missing(self):
         audit_diagnostics = {

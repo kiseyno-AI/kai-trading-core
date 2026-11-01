@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from datetime import date
+from datetime import date, timedelta
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from app.eod.exact_factor_repair import (
 from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import market_membership_sha256
 from app.eod.price_bar_repair_state import (
+    PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE,
     _daily_price_input_fingerprint,
     _derived_output_fingerprint,
     _stable_output_value,
@@ -51,10 +53,27 @@ from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_recent_price_bars_by_symbol,
 )
+from app.signals.preferred_share_fundamentals import (
+    resolve_preferred_fundamentals_issuer_symbols,
+)
+from app.signals.advanced_value_factor import (
+    ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
+    ADVANCED_VALUE_FUNDAMENTALS_FS_DIVS,
+    ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
+    ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
+)
+from app.signals.piotroski_filter import (
+    DILUTION_EVIDENCE_SIGNAL_TYPES,
+    DILUTION_NEGATIVE_COVERAGE_DAYS,
+)
 
 
-CHECKPOINT_SCHEMA_VERSION = 'factor_exact_date_bulk_checkpoint_v1'
+CHECKPOINT_SCHEMA_VERSION = 'factor_exact_date_bulk_checkpoint_v2'
+FACTOR_REPAIR_IMPLEMENTATION_CONTRACT = (
+    'factor_exact_date_bulk_implementation_v2'
+)
 FACTOR_PRICE_HISTORY_ROWS = 253
+FACTOR_PRICE_FINGERPRINT_SYMBOL_CHUNK_SIZE = 250
 FACTOR_SOURCE_COMPONENTS = frozenset(
     {
         'price_history',
@@ -76,6 +95,85 @@ def _fingerprint_payload(payload: Any) -> dict[str, Any]:
     return {
         'row_count': len(normalized) if isinstance(normalized, list) else 1,
         'source_sha256': canonical_json_sha256(normalized),
+    }
+
+
+def _fingerprint_mapping_rows(
+    rows: Any,
+) -> dict[str, Any]:
+    """Hash an ordered result incrementally without retaining raw DART rows."""
+
+    digest = hashlib.sha256()
+    row_count = 0
+    for row in rows:
+        payload = json.dumps(
+            _stable_output_value(dict(row)),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+        digest.update(len(payload).to_bytes(8, 'big'))
+        digest.update(payload)
+        row_count += 1
+    return {
+        'row_count': row_count,
+        'source_sha256': digest.hexdigest(),
+    }
+
+
+def _fingerprint_price_history(
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+) -> dict[str, Any]:
+    """Hash the consumer-visible 253-row histories without retaining them."""
+
+    digest = hashlib.sha256()
+    digest.update(b'[')
+    row_count = 0
+    first_symbol = True
+    for start in range(
+        0,
+        len(symbols),
+        FACTOR_PRICE_FINGERPRINT_SYMBOL_CHUNK_SIZE,
+    ):
+        symbol_chunk = list(
+            symbols[
+                start:start + FACTOR_PRICE_FINGERPRINT_SYMBOL_CHUNK_SIZE
+            ]
+        )
+        bars_by_symbol = load_recent_price_bars_by_symbol(
+            market_date=market_date,
+            symbols=symbol_chunk,
+            history_days=FACTOR_PRICE_HISTORY_ROWS,
+        )
+        for symbol in symbol_chunk:
+            normalized_bars = [
+                {
+                    key: _stable_output_value(value)
+                    for key, value in sorted(bar.items())
+                    if key != 'captured_at'
+                }
+                for bar in bars_by_symbol.get(symbol, [])
+            ]
+            item = _stable_output_value([symbol, normalized_bars])
+            if not first_symbol:
+                digest.update(b',')
+            digest.update(
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(',', ':'),
+                ).encode('utf-8')
+            )
+            first_symbol = False
+            row_count += len(normalized_bars)
+    digest.update(b']')
+    return {
+        'history_row_limit': FACTOR_PRICE_HISTORY_ROWS,
+        'row_count': row_count,
+        'source_sha256': digest.hexdigest(),
     }
 
 
@@ -106,49 +204,37 @@ def _load_factor_source_fingerprints(
 ) -> dict[str, dict[str, Any]]:
     """Fingerprint every persisted source family read by the factor chain.
 
-    The DART queries deliberately fingerprint the complete eligible annual
-    source scope instead of only today's winning row.  That conservative
-    superset makes a checkpoint stale whenever a newly eligible filing could
-    change the service's latest-row selection.
+    DART scope is the union of the exact Piotroski and Advanced/Unified/Quality
+    winner selectors. A newly eligible winner therefore invalidates the
+    checkpoint without hashing historical filings those consumers cannot use.
     """
 
     parsed_date = date.fromisoformat(market_date)
     symbols = _normalize_symbols(exact_symbols)
-    bars_by_symbol = load_recent_price_bars_by_symbol(
-        market_date=parsed_date,
-        symbols=symbols,
-        history_days=FACTOR_PRICE_HISTORY_ROWS,
-    )
-    price_payload = [
-        [
-            symbol,
-            [
-                {
-                    key: _stable_output_value(value)
-                    for key, value in sorted(bar.items())
-                    if key != 'captured_at'
-                }
-                for bar in bars_by_symbol.get(symbol, [])
-            ],
-        ]
-        for symbol in symbols
-    ]
-    price_fingerprint = _fingerprint_payload(price_payload)
-    price_fingerprint['row_count'] = sum(
-        len(rows) for _symbol, rows in price_payload
-    )
     fingerprints: dict[str, dict[str, Any]] = {
-        'price_history': {
-            'history_row_limit': FACTOR_PRICE_HISTORY_ROWS,
-            **price_fingerprint,
-        }
+        'price_history': _fingerprint_price_history(
+            market_date=parsed_date,
+            symbols=symbols,
+        )
     }
 
     with session_scope(statement_timeout_ms=30_000) as session:
+        fundamentals_issuer_by_symbol = (
+            resolve_preferred_fundamentals_issuer_symbols(
+                session,
+                symbols,
+            )
+        )
+        fundamentals_symbols = sorted(
+            {
+                *symbols,
+                *fundamentals_issuer_by_symbol.values(),
+            }
+        )
         symbol_rows = list(
             session.execute(
                 select(Symbol)
-                .where(Symbol.symbol.in_(symbols))
+                .where(Symbol.symbol.in_(fundamentals_symbols))
                 .order_by(Symbol.symbol.asc())
             ).scalars()
         )
@@ -161,12 +247,29 @@ def _load_factor_source_fingerprints(
             }
             for row in symbol_rows
         ]
-        symbol_metadata_fingerprint = _fingerprint_payload(
-            symbol_metadata_payload
+        fundamentals_issuer_aliases = dict(
+            sorted(fundamentals_issuer_by_symbol.items())
         )
+        symbol_metadata_fingerprint = {
+            'row_count': len(symbol_metadata_payload),
+            'source_sha256': canonical_json_sha256(
+                _stable_output_value(
+                    {
+                        'rows': symbol_metadata_payload,
+                        'fundamentals_scope_symbols': fundamentals_symbols,
+                        'fundamentals_issuer_aliases': (
+                            fundamentals_issuer_aliases
+                        ),
+                    }
+                )
+            ),
+        }
         symbol_metadata_fingerprint.update(
             {
-                'scope_symbol_count': len(symbols),
+                'scope_symbol_count': len(fundamentals_symbols),
+                'requested_symbol_count': len(symbols),
+                'fundamentals_scope_symbols': fundamentals_symbols,
+                'fundamentals_issuer_aliases': fundamentals_issuer_aliases,
                 'placeholder_name_count': sum(
                     not str(row.name_ko or '').strip()
                     or str(row.name_ko).strip() == str(row.symbol)
@@ -209,92 +312,304 @@ def _load_factor_source_fingerprints(
             _model_row_payload(DailyPykrxEnrichmentRow, valuation_rows)
         )
 
-        snapshot_rows = list(
+        piotroski_latest_rank = func.row_number().over(
+            partition_by=(
+                DartFundamentalsSnapshot.stock_code,
+                DartFundamentalsSnapshot.business_year,
+            ),
+            order_by=(
+                DartDisclosureEvent.receipt_date.desc(),
+                DartDisclosureEvent.rcept_no.desc(),
+                case(
+                    (
+                        DartFundamentalsSnapshot.fs_div
+                        == ADVANCED_VALUE_FUNDAMENTALS_FS_DIV,
+                        0,
+                    ),
+                    else_=1,
+                ).asc(),
+                DartFundamentalsSnapshot.id.desc(),
+            ),
+        ).label('row_rank')
+        piotroski_ranked_snapshots = (
+            select(
+                DartFundamentalsSnapshot.id.label('snapshot_id'),
+                DartFundamentalsSnapshot.stock_code.label('stock_code'),
+                DartFundamentalsSnapshot.business_year.label(
+                    'business_year'
+                ),
+                piotroski_latest_rank,
+            )
+            .join(
+                DartDisclosureEvent,
+                DartDisclosureEvent.id
+                == DartFundamentalsSnapshot.disclosure_event_id,
+            )
+            .where(
+                DartFundamentalsSnapshot.stock_code.in_(
+                    fundamentals_symbols
+                ),
+                DartFundamentalsSnapshot.business_year <= parsed_date.year,
+                DartFundamentalsSnapshot.report_code == '11011',
+                DartFundamentalsSnapshot.fs_div.in_(['CFS', 'OFS']),
+                DartFundamentalsSnapshot.source_status == '000',
+                DartDisclosureEvent.fundamentals_capture_status == 'captured',
+                DartDisclosureEvent.receipt_date.is_not(None),
+                DartDisclosureEvent.receipt_date <= parsed_date,
+            )
+            .subquery()
+        )
+        piotroski_latest_snapshot_rows = session.execute(
+            select(piotroski_ranked_snapshots).where(
+                piotroski_ranked_snapshots.c.row_rank == 1
+            )
+        ).mappings().all()
+        piotroski_snapshot_ids_by_symbol: dict[
+            str, list[tuple[int, int]]
+        ] = {}
+        for row in piotroski_latest_snapshot_rows:
+            piotroski_snapshot_ids_by_symbol.setdefault(
+                str(row['stock_code']), []
+            ).append(
+                (int(row['business_year']), int(row['snapshot_id']))
+            )
+        piotroski_selected_snapshot_ids = sorted(
+            snapshot_id
+            for rows in piotroski_snapshot_ids_by_symbol.values()
+            for _business_year, snapshot_id in sorted(
+                rows,
+                reverse=True,
+            )[:2]
+        )
+        piotroski_current_snapshot_id_by_symbol = {
+            symbol: max(rows)[1]
+            for symbol, rows in piotroski_snapshot_ids_by_symbol.items()
+        }
+
+        advanced_latest_rank = func.row_number().over(
+            partition_by=DartFundamentalsSnapshot.stock_code,
+            order_by=(
+                DartFundamentalsSnapshot.business_year.desc(),
+                DartDisclosureEvent.receipt_date.desc().nullslast(),
+                DartDisclosureEvent.rcept_no.desc(),
+                case(
+                    (DartFundamentalsSnapshot.fs_div == 'CFS', 0),
+                    else_=1,
+                ).asc(),
+                DartFundamentalsSnapshot.id.desc(),
+            ),
+        ).label('row_rank')
+        advanced_ranked_snapshots = (
+            select(
+                DartFundamentalsSnapshot.id.label('snapshot_id'),
+                advanced_latest_rank,
+            )
+            .join(
+                DartDisclosureEvent,
+                DartDisclosureEvent.id
+                == DartFundamentalsSnapshot.disclosure_event_id,
+            )
+            .where(
+                DartFundamentalsSnapshot.stock_code.in_(
+                    fundamentals_symbols
+                ),
+                DartFundamentalsSnapshot.business_year <= parsed_date.year,
+                DartFundamentalsSnapshot.report_code
+                == ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE,
+                DartFundamentalsSnapshot.fs_div.in_(
+                    ADVANCED_VALUE_FUNDAMENTALS_FS_DIVS
+                ),
+                DartFundamentalsSnapshot.period_type
+                == ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE,
+                DartFundamentalsSnapshot.source_status == '000',
+                DartDisclosureEvent.receipt_date.is_not(None),
+                DartDisclosureEvent.receipt_date <= parsed_date,
+            )
+            .subquery()
+        )
+        advanced_snapshot_ids = {
+            int(row['snapshot_id'])
+            for row in session.execute(
+                select(advanced_ranked_snapshots).where(
+                    advanced_ranked_snapshots.c.row_rank == 1
+                )
+            ).mappings()
+        }
+        snapshot_ids = sorted(
+            {
+                *piotroski_selected_snapshot_ids,
+                *advanced_snapshot_ids,
+            }
+        )
+        snapshot_rows = (
             session.execute(
-                select(DartFundamentalsSnapshot)
-                .join(
-                    DartDisclosureEvent,
-                    DartDisclosureEvent.id
-                    == DartFundamentalsSnapshot.disclosure_event_id,
+                select(
+                    DartFundamentalsSnapshot.id.label('id'),
+                    DartFundamentalsSnapshot.disclosure_event_id.label(
+                        'disclosure_event_id'
+                    ),
+                    DartFundamentalsSnapshot.rcept_no.label('rcept_no'),
+                    DartFundamentalsSnapshot.corp_code.label('corp_code'),
+                    DartFundamentalsSnapshot.stock_code.label('stock_code'),
+                    DartFundamentalsSnapshot.corp_name.label('corp_name'),
+                    DartFundamentalsSnapshot.business_year.label(
+                        'business_year'
+                    ),
+                    DartFundamentalsSnapshot.report_code.label('report_code'),
+                    DartFundamentalsSnapshot.fs_div.label('fs_div'),
+                    DartFundamentalsSnapshot.period_type.label('period_type'),
+                    DartFundamentalsSnapshot.currency.label('currency'),
+                    DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                    DartFundamentalsSnapshot.source_status.label(
+                        'source_status'
+                    ),
                 )
-                .where(
-                    DartFundamentalsSnapshot.stock_code.in_(symbols),
-                    DartFundamentalsSnapshot.business_year <= parsed_date.year,
-                    DartFundamentalsSnapshot.report_code == '11011',
-                    DartFundamentalsSnapshot.fs_div.in_(['CFS', 'OFS']),
-                    DartFundamentalsSnapshot.source_status == '000',
-                    DartDisclosureEvent.receipt_date.is_not(None),
-                    DartDisclosureEvent.receipt_date <= parsed_date,
-                )
+                .where(DartFundamentalsSnapshot.id.in_(snapshot_ids))
                 .order_by(
                     DartFundamentalsSnapshot.stock_code.asc(),
                     DartFundamentalsSnapshot.business_year.asc(),
                     DartFundamentalsSnapshot.id.asc(),
                 )
-            ).scalars()
+            ).mappings().all()
+            if snapshot_ids
+            else []
         )
-        snapshot_ids = [row.id for row in snapshot_rows]
-        event_ids = sorted({row.disclosure_event_id for row in snapshot_rows})
+        event_ids = sorted(
+            {int(row['disclosure_event_id']) for row in snapshot_rows}
+        )
         event_rows = (
-            list(
-                session.execute(
-                    select(DartDisclosureEvent)
-                    .where(DartDisclosureEvent.id.in_(event_ids))
-                    .order_by(DartDisclosureEvent.id.asc())
-                ).scalars()
-            )
+            session.execute(
+                select(
+                    DartDisclosureEvent.id.label('id'),
+                    DartDisclosureEvent.rcept_no.label('rcept_no'),
+                    DartDisclosureEvent.corp_code.label('corp_code'),
+                    DartDisclosureEvent.stock_code.label('stock_code'),
+                    DartDisclosureEvent.receipt_date.label('receipt_date'),
+                    DartDisclosureEvent.fundamentals_capture_status.label(
+                        'fundamentals_capture_status'
+                    ),
+                )
+                .where(DartDisclosureEvent.id.in_(event_ids))
+                .order_by(DartDisclosureEvent.id.asc())
+            ).mappings().all()
             if event_ids
             else []
         )
-        fundamental_rows = (
-            list(
-                session.execute(
-                    select(DartFundamentalsRow)
-                    .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
-                    .order_by(
-                        DartFundamentalsRow.snapshot_id.asc(),
-                        DartFundamentalsRow.row_order.asc().nulls_last(),
-                        DartFundamentalsRow.id.asc(),
-                    )
-                ).scalars()
-            )
-            if snapshot_ids
-            else []
-        )
-        highlight_rows = (
-            list(
-                session.execute(
-                    select(DartFundamentalsHighlight)
-                    .where(
-                        DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids)
-                    )
-                    .order_by(
-                        DartFundamentalsHighlight.snapshot_id.asc(),
-                        DartFundamentalsHighlight.metric_key.asc(),
-                    )
-                ).scalars()
-            )
-            if snapshot_ids
-            else []
-        )
         fingerprints['dart_disclosure_events'] = _fingerprint_payload(
-            _model_row_payload(DartDisclosureEvent, event_rows)
+            [dict(row) for row in event_rows]
         )
         fingerprints['dart_fundamentals_snapshots'] = _fingerprint_payload(
-            _model_row_payload(
-                DartFundamentalsSnapshot,
-                snapshot_rows,
-                excluded_columns=('request_payload', 'response_payload'),
+            [dict(row) for row in snapshot_rows]
+        )
+        if snapshot_ids:
+            fundamental_statement = (
+                select(
+                    DartFundamentalsRow.id.label('id'),
+                    DartFundamentalsRow.snapshot_id.label('snapshot_id'),
+                    DartFundamentalsRow.row_key.label('row_key'),
+                    DartFundamentalsRow.statement_type.label(
+                        'statement_type'
+                    ),
+                    DartFundamentalsRow.statement_name.label(
+                        'statement_name'
+                    ),
+                    DartFundamentalsRow.account_id.label('account_id'),
+                    DartFundamentalsRow.account_name.label('account_name'),
+                    DartFundamentalsRow.account_detail.label(
+                        'account_detail'
+                    ),
+                    DartFundamentalsRow.current_amount.label(
+                        'current_amount'
+                    ),
+                    DartFundamentalsRow.current_cumulative_amount.label(
+                        'current_cumulative_amount'
+                    ),
+                    DartFundamentalsRow.prior_amount.label('prior_amount'),
+                    DartFundamentalsRow.prior_cumulative_amount.label(
+                        'prior_cumulative_amount'
+                    ),
+                    DartFundamentalsRow.pre_prior_amount.label(
+                        'pre_prior_amount'
+                    ),
+                    DartFundamentalsRow.row_order.label('row_order'),
+                    DartFundamentalsRow.currency.label('currency'),
+                )
+                .where(DartFundamentalsRow.snapshot_id.in_(snapshot_ids))
+                .order_by(
+                    DartFundamentalsRow.snapshot_id.asc(),
+                    DartFundamentalsRow.row_order.asc().nulls_last(),
+                    DartFundamentalsRow.id.asc(),
+                )
+                .execution_options(yield_per=1_000)
             )
-        )
-        fingerprints['dart_fundamentals_rows'] = _fingerprint_payload(
-            _model_row_payload(DartFundamentalsRow, fundamental_rows)
-        )
-        fingerprints['dart_fundamentals_highlights'] = _fingerprint_payload(
-            _model_row_payload(DartFundamentalsHighlight, highlight_rows)
-        )
+            fingerprints['dart_fundamentals_rows'] = (
+                _fingerprint_mapping_rows(
+                    session.execute(fundamental_statement).mappings()
+                )
+            )
+            highlight_statement = (
+                select(
+                    DartFundamentalsHighlight.id.label('id'),
+                    DartFundamentalsHighlight.snapshot_id.label(
+                        'snapshot_id'
+                    ),
+                    DartFundamentalsHighlight.metric_key.label('metric_key'),
+                    DartFundamentalsHighlight.statement_type.label(
+                        'statement_type'
+                    ),
+                    DartFundamentalsHighlight.statement_name.label(
+                        'statement_name'
+                    ),
+                    DartFundamentalsHighlight.account_id.label('account_id'),
+                    DartFundamentalsHighlight.account_name.label(
+                        'account_name'
+                    ),
+                    DartFundamentalsHighlight.current_amount.label(
+                        'current_amount'
+                    ),
+                    DartFundamentalsHighlight.current_cumulative_amount.label(
+                        'current_cumulative_amount'
+                    ),
+                    DartFundamentalsHighlight.ratio_value.label('ratio_value'),
+                    DartFundamentalsHighlight.currency.label('currency'),
+                )
+                .where(
+                    DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids)
+                )
+                .order_by(
+                    DartFundamentalsHighlight.snapshot_id.asc(),
+                    DartFundamentalsHighlight.metric_key.asc(),
+                    DartFundamentalsHighlight.id.asc(),
+                )
+                .execution_options(yield_per=1_000)
+            )
+            fingerprints['dart_fundamentals_highlights'] = (
+                _fingerprint_mapping_rows(
+                    session.execute(highlight_statement).mappings()
+                )
+            )
+        else:
+            fingerprints['dart_fundamentals_rows'] = (
+                _fingerprint_mapping_rows(())
+            )
+            fingerprints['dart_fundamentals_highlights'] = (
+                _fingerprint_mapping_rows(())
+            )
 
-        eligible_rcept_nos = sorted({row.rcept_no for row in snapshot_rows})
+        snapshot_by_id = {int(row['id']): row for row in snapshot_rows}
+        current_snapshot_by_symbol = {
+            symbol: snapshot_by_id[snapshot_id]
+            for symbol, snapshot_id in (
+                piotroski_current_snapshot_id_by_symbol.items()
+            )
+            if snapshot_id in snapshot_by_id
+        }
+        eligible_rcept_nos = sorted(
+            {
+                str(row['rcept_no'])
+                for row in current_snapshot_by_symbol.values()
+            }
+        )
         audit_rows = (
             list(
                 session.execute(
@@ -318,14 +633,31 @@ def _load_factor_source_fingerprints(
             _model_row_payload(DartAuditSignal, audit_rows)
         )
 
-        eligible_corp_codes = sorted({row.corp_code for row in event_rows})
+        event_by_id = {int(row['id']): row for row in event_rows}
+        eligible_corp_codes = sorted(
+            {
+                str(
+                    event_by_id[int(row['disclosure_event_id'])][
+                        'corp_code'
+                    ]
+                )
+                for row in current_snapshot_by_symbol.values()
+                if int(row['disclosure_event_id']) in event_by_id
+            }
+        )
         dilution_rows = (
             list(
                 session.execute(
                     select(DartDilutionSignal)
                     .where(
                         DartDilutionSignal.corp_code.in_(eligible_corp_codes),
+                        DartDilutionSignal.signal_type.in_(
+                            DILUTION_EVIDENCE_SIGNAL_TYPES
+                        ),
                         DartDilutionSignal.receipt_date.is_not(None),
+                        DartDilutionSignal.receipt_date
+                        >= parsed_date
+                        - timedelta(days=DILUTION_NEGATIVE_COVERAGE_DAYS),
                         DartDilutionSignal.receipt_date <= parsed_date,
                     )
                     .order_by(
@@ -425,22 +757,84 @@ def _load_factor_completion_state(
     ]
     metadata_verified = bool(affected)
     provider_membership_hashes: set[str] = set()
-    evidence_lineages: set[tuple[str, int, str]] = set()
+    evidence_lineages: set[
+        tuple[str, int | None, str | None, str | None, tuple[str, ...]]
+    ] = set()
     for batch in affected:
         try:
             metadata = dict(batch['factor_rebuild_metadata'])
-            if int(metadata['schema_version']) != 2:
+            if int(metadata['schema_version']) not in {2, 3}:
                 raise ValueError('unsupported factor rebuild schema')
             recorded = dict(dict(metadata['dates'])[market_date])
+            evidence_source = str(
+                recorded['membership_evidence_source']
+            ).strip()
+            raw_run_id = recorded.get('membership_evidence_run_id')
+            if raw_run_id is not None and (
+                isinstance(raw_run_id, bool)
+                or not isinstance(raw_run_id, int)
+            ):
+                raise ValueError('membership evidence run id is invalid')
+            run_id = raw_run_id
+            run_source = (
+                str(recorded.get('membership_evidence_run_source')).strip()
+                if recorded.get('membership_evidence_run_source') is not None
+                else None
+            )
+            evidence_sha256 = (
+                str(recorded.get('membership_evidence_sha256')).strip().lower()
+                if recorded.get('membership_evidence_sha256') is not None
+                else None
+            )
+            raw_batch_ids = recorded.get(
+                'membership_evidence_repair_batch_ids'
+            )
+            evidence_batch_ids = tuple(
+                sorted(
+                    {
+                        str(batch_id).strip()
+                        for batch_id in raw_batch_ids or ()
+                        if str(batch_id).strip()
+                    }
+                )
+            )
+            if raw_batch_ids is not None and (
+                not isinstance(raw_batch_ids, list)
+                or raw_batch_ids != list(evidence_batch_ids)
+            ):
+                raise ValueError(
+                    'membership evidence repair batch lineage is invalid'
+                )
+            if evidence_source == 'stored_eod_run_metadata':
+                lineage_valid = (
+                    run_id is not None
+                    and run_id > 0
+                    and bool(run_source)
+                    and evidence_sha256 is None
+                    and not evidence_batch_ids
+                )
+            elif evidence_source == (
+                PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+            ):
+                lineage_valid = (
+                    run_id is None
+                    and run_source == 'pykrx'
+                    and evidence_sha256 is not None
+                    and len(evidence_sha256) == 64
+                    and all(
+                        character in '0123456789abcdef'
+                        for character in evidence_sha256
+                    )
+                    and bool(evidence_batch_ids)
+                )
+            else:
+                lineage_valid = False
             if (
                 int(recorded['exact_membership_count'])
                 != len(normalized_symbols)
                 or recorded['ranking_membership_sha256'] != exact_hash
                 or recorded['daily_price_input_sha256'] != input_sha256
-                or recorded['membership_evidence_source']
-                != 'stored_eod_run_metadata'
-                or int(recorded['membership_evidence_run_id']) <= 0
-                or not str(recorded['membership_evidence_run_source']).strip()
+                or not lineage_valid
             ):
                 raise ValueError('factor rebuild evidence scope drift')
             provider_membership_hashes.add(
@@ -448,9 +842,11 @@ def _load_factor_completion_state(
             )
             evidence_lineages.add(
                 (
-                    str(recorded['membership_evidence_source']).strip(),
-                    int(recorded['membership_evidence_run_id']),
-                    str(recorded['membership_evidence_run_source']).strip(),
+                    evidence_source,
+                    run_id,
+                    run_source,
+                    evidence_sha256,
+                    evidence_batch_ids,
                 )
             )
             recorded_outputs = dict(recorded['stage_output_fingerprints'])
@@ -462,7 +858,17 @@ def _load_factor_completion_state(
             break
     if len(provider_membership_hashes) > 1 or len(evidence_lineages) > 1:
         metadata_verified = False
-    lineage = next(iter(evidence_lineages), (None, None, None))
+    if evidence_lineages:
+        authority_batch_ids = set(next(iter(evidence_lineages))[4])
+        affected_batch_ids = {
+            str(batch['repair_batch_id']) for batch in affected
+        }
+        if not authority_batch_ids.issubset(affected_batch_ids):
+            metadata_verified = False
+    lineage = next(
+        iter(evidence_lineages),
+        (None, None, None, None, ()),
+    )
     return {
         'source_fingerprints': _load_factor_source_fingerprints(
             market_date,
@@ -480,6 +886,8 @@ def _load_factor_completion_state(
         'membership_evidence_source': lineage[0],
         'membership_evidence_run_id': lineage[1],
         'membership_evidence_run_source': lineage[2],
+        'membership_evidence_sha256': lineage[3],
+        'membership_evidence_repair_batch_ids': list(lineage[4]),
     }
 
 
@@ -558,7 +966,6 @@ class ExactFactorBulkRepair:
             'status': 'ready',
             'mode': 'dry_run',
             'membership_policy': MEMBERSHIP_POLICY_STORED_ONLY,
-            'membership_evidence_source': 'stored_eod_run_metadata',
             'pending_frozen_membership': True,
             'exact_membership_count': item['symbol_count'],
             'ranking_membership_sha256': item['membership_sha256'],
@@ -575,6 +982,24 @@ class ExactFactorBulkRepair:
         run_source = str(
             result.get('membership_evidence_run_source') or ''
         ).strip()
+        evidence_source = str(
+            result.get('membership_evidence_source') or ''
+        ).strip()
+        evidence_sha256 = (
+            str(result.get('membership_evidence_sha256')).strip().lower()
+            if result.get('membership_evidence_sha256') is not None
+            else None
+        )
+        raw_evidence_batch_ids = result.get(
+            'membership_evidence_repair_batch_ids'
+        )
+        evidence_batch_ids = sorted(
+            {
+                str(batch_id).strip()
+                for batch_id in raw_evidence_batch_ids or ()
+                if str(batch_id).strip()
+            }
+        )
         if (
             isinstance(provider_count, bool)
             or not isinstance(provider_count, int)
@@ -612,10 +1037,41 @@ class ExactFactorBulkRepair:
             valid_provider_hash = False
         if not valid_provider_hash:
             mismatches.append('membership_sha256')
-        if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
-            mismatches.append('membership_evidence_run_id')
-        if not run_source:
-            mismatches.append('membership_evidence_run_source')
+        if evidence_source == 'stored_eod_run_metadata':
+            if (
+                isinstance(run_id, bool)
+                or not isinstance(run_id, int)
+                or run_id <= 0
+            ):
+                mismatches.append('membership_evidence_run_id')
+            if not run_source:
+                mismatches.append('membership_evidence_run_source')
+            if evidence_sha256 is not None or evidence_batch_ids:
+                mismatches.append('membership_evidence_pending_lineage')
+        elif evidence_source == PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE:
+            if run_id is not None:
+                mismatches.append('membership_evidence_run_id')
+            if run_source != 'pykrx':
+                mismatches.append('membership_evidence_run_source')
+            if (
+                evidence_sha256 is None
+                or len(evidence_sha256) != 64
+                or any(
+                    character not in '0123456789abcdef'
+                    for character in evidence_sha256
+                )
+            ):
+                mismatches.append('membership_evidence_sha256')
+            if (
+                not isinstance(raw_evidence_batch_ids, list)
+                or raw_evidence_batch_ids != evidence_batch_ids
+                or not evidence_batch_ids
+            ):
+                mismatches.append(
+                    'membership_evidence_repair_batch_ids'
+                )
+        else:
+            mismatches.append('membership_evidence_source')
         if mismatches:
             repair_reason = str(result.get('reason') or '').strip()
             raise RuntimeError(
@@ -624,15 +1080,18 @@ class ExactFactorBulkRepair:
                 + (f'; reason={repair_reason}' if repair_reason else '')
             )
         return {
+            'implementation_contract': FACTOR_REPAIR_IMPLEMENTATION_CONTRACT,
             'market_date': item['market_date'],
             'exact_symbol_count': item['symbol_count'],
             'ranking_membership_sha256': item['membership_sha256'],
             'provider_membership_count': provider_count,
             'provider_membership_sha256': provider_hash,
             'protected_provider_codes': normalized_protected_codes,
-            'membership_evidence_source': 'stored_eod_run_metadata',
+            'membership_evidence_source': evidence_source,
             'membership_evidence_run_id': run_id,
             'membership_evidence_run_source': run_source,
+            'membership_evidence_sha256': evidence_sha256,
+            'membership_evidence_repair_batch_ids': evidence_batch_ids,
         }
 
     @staticmethod
@@ -698,10 +1157,23 @@ class ExactFactorBulkRepair:
         if not isinstance(proof, Mapping) or not isinstance(result, Mapping):
             return False
         if (
+            proof.get('implementation_contract')
+            != FACTOR_REPAIR_IMPLEMENTATION_CONTRACT
+            or result.get('implementation_contract')
+            != FACTOR_REPAIR_IMPLEMENTATION_CONTRACT
+        ):
+            return False
+        if (
             ExactFactorBulkRepair._validated_source_fingerprints(
                 result.get('source_fingerprints')
             )
             is None
+            or ExactFactorBulkRepair._validated_source_fingerprints(
+                proof.get('source_fingerprints')
+            )
+            != ExactFactorBulkRepair._validated_source_fingerprints(
+                result.get('source_fingerprints')
+            )
         ):
             return False
         if (
@@ -720,6 +1192,10 @@ class ExactFactorBulkRepair:
             != proof.get('membership_evidence_run_id')
             or result.get('membership_evidence_run_source')
             != proof.get('membership_evidence_run_source')
+            or result.get('membership_evidence_sha256')
+            != proof.get('membership_evidence_sha256')
+            or result.get('membership_evidence_repair_batch_ids')
+            != proof.get('membership_evidence_repair_batch_ids')
         ):
             return False
         stage_results = result.get('stage_results')
@@ -773,6 +1249,12 @@ class ExactFactorBulkRepair:
             != proof.get('membership_evidence_run_id')
             or completion.get('membership_evidence_run_source')
             != proof.get('membership_evidence_run_source')
+            or completion.get('membership_evidence_sha256')
+            != proof.get('membership_evidence_sha256')
+            or completion.get('membership_evidence_repair_batch_ids')
+            != proof.get('membership_evidence_repair_batch_ids')
+            or completion.get('daily_price_input_sha256')
+            != proof.get('daily_price_input_sha256')
             or not isinstance(fingerprints, Mapping)
             or set(fingerprints) != set(FACTOR_RESULT_MODELS)
         ):
@@ -783,10 +1265,16 @@ class ExactFactorBulkRepair:
         self,
         unit: Mapping[str, Any],
         item: Mapping[str, Any],
+        *,
+        live_state: Mapping[str, Any] | None = None,
     ) -> bool:
-        live = self.completion_state_loader(
-            str(item['market_date']),
-            list(item['symbols']),
+        live = (
+            live_state
+            if live_state is not None
+            else self.completion_state_loader(
+                str(item['market_date']),
+                list(item['symbols']),
+            )
         )
         if not isinstance(live, Mapping) or live.get('metadata_verified') is not True:
             return False
@@ -800,6 +1288,12 @@ class ExactFactorBulkRepair:
             != unit['dry_proof']['membership_evidence_run_id']
             or live.get('membership_evidence_run_source')
             != unit['dry_proof']['membership_evidence_run_source']
+            or live.get('membership_evidence_sha256')
+            != unit['dry_proof']['membership_evidence_sha256']
+            or live.get('membership_evidence_repair_batch_ids')
+            != unit['dry_proof'][
+                'membership_evidence_repair_batch_ids'
+            ]
         ):
             return False
         expected_completion = unit['result']['completion_evidence']
@@ -810,6 +1304,18 @@ class ExactFactorBulkRepair:
             live.get('source_fingerprints')
         )
         if expected_sources is None or live_sources != expected_sources:
+            return False
+        reviewed_sources = self._validated_source_fingerprints(
+            unit['dry_proof'].get('source_fingerprints')
+        )
+        if reviewed_sources is None or live_sources != reviewed_sources:
+            return False
+        if (
+            live.get('input_row_count')
+            != unit['dry_proof'].get('daily_price_input_count')
+            or live.get('input_sha256')
+            != unit['dry_proof'].get('daily_price_input_sha256')
+        ):
             return False
         if live.get('input_sha256') != expected_completion.get(
             'daily_price_input_sha256'
@@ -845,24 +1351,76 @@ class ExactFactorBulkRepair:
                 return False
         return True
 
-    def _review_date(self, item: Mapping[str, Any]) -> dict[str, Any]:
+    def _review_date_with_state(
+        self,
+        item: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
         self._validate_manifest_scope(item)
         result = self.repair_service.repair_for_market_date(
             market_date=str(item['market_date']),
             apply=False,
             membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
         )
-        return self._dry_proof(result, item)
+        proof = self._dry_proof(result, item)
+        source_state = self.completion_state_loader(
+            str(item['market_date']),
+            list(item['symbols']),
+        )
+        source_fingerprints = self._validated_source_fingerprints(
+            source_state.get('source_fingerprints')
+            if isinstance(source_state, Mapping)
+            else None
+        )
+        input_row_count = (
+            source_state.get('input_row_count')
+            if isinstance(source_state, Mapping)
+            else None
+        )
+        input_sha256 = str(
+            source_state.get('input_sha256') or ''
+            if isinstance(source_state, Mapping)
+            else ''
+        ).strip().lower()
+        if (
+            source_fingerprints is None
+            or input_row_count != item['symbol_count']
+            or len(input_sha256) != 64
+            or any(
+                character not in '0123456789abcdef'
+                for character in input_sha256
+            )
+        ):
+            raise RuntimeError(
+                'factor dry proof source dependency fingerprint is invalid'
+            )
+        proof['source_fingerprints'] = source_fingerprints
+        proof['daily_price_input_count'] = input_row_count
+        proof['daily_price_input_sha256'] = input_sha256
+        return proof, source_state
+
+    def _review_date(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        proof, _source_state = self._review_date_with_state(item)
+        return proof
 
     def _apply_date(
         self,
         item: Mapping[str, Any],
         dry_proof: Mapping[str, Any],
+        *,
+        before_state: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        before_state = self.completion_state_loader(
-            str(item['market_date']),
-            list(item['symbols']),
-        )
+        if (
+            dry_proof.get('implementation_contract')
+            != FACTOR_REPAIR_IMPLEMENTATION_CONTRACT
+        ):
+            raise RuntimeError(
+                'factor dry proof implementation contract is stale'
+            )
+        if before_state is None:
+            before_state = self.completion_state_loader(
+                str(item['market_date']),
+                list(item['symbols']),
+            )
         before_sources = self._validated_source_fingerprints(
             before_state.get('source_fingerprints')
             if isinstance(before_state, Mapping)
@@ -870,6 +1428,20 @@ class ExactFactorBulkRepair:
         )
         if before_sources is None:
             raise RuntimeError('factor source dependency fingerprint is invalid')
+        reviewed_sources = self._validated_source_fingerprints(
+            dry_proof.get('source_fingerprints')
+        )
+        if reviewed_sources is None or before_sources != reviewed_sources:
+            raise RuntimeError(
+                'factor source dependency changed after dry review'
+            )
+        if (
+            before_state.get('input_row_count')
+            != dry_proof.get('daily_price_input_count')
+            or before_state.get('input_sha256')
+            != dry_proof.get('daily_price_input_sha256')
+        ):
+            raise RuntimeError('factor price input changed after dry review')
         result = dict(
             self.repair_service.repair_for_market_date(
                 market_date=str(item['market_date']),
@@ -880,6 +1452,23 @@ class ExactFactorBulkRepair:
                 ),
                 expected_membership_sha256=(
                     dry_proof['provider_membership_sha256']
+                ),
+                expected_membership_evidence_source=(
+                    dry_proof['membership_evidence_source']
+                ),
+                expected_membership_evidence_run_id=(
+                    dry_proof['membership_evidence_run_id']
+                ),
+                expected_membership_evidence_run_source=(
+                    dry_proof['membership_evidence_run_source']
+                ),
+                expected_membership_evidence_sha256=(
+                    dry_proof['membership_evidence_sha256']
+                ),
+                expected_membership_evidence_repair_batch_ids=(
+                    dry_proof[
+                        'membership_evidence_repair_batch_ids'
+                    ]
                 ),
                 membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
             )
@@ -898,6 +1487,9 @@ class ExactFactorBulkRepair:
         if after_sources != before_sources:
             raise RuntimeError('factor source dependency changed during repair')
         result['source_fingerprints'] = after_sources
+        result['implementation_contract'] = (
+            FACTOR_REPAIR_IMPLEMENTATION_CONTRACT
+        )
         completed_unit = {'dry_proof': dry_proof, 'result': result}
         if not self._completed_checkpoint_is_valid(completed_unit, item):
             raise RuntimeError(
@@ -905,7 +1497,11 @@ class ExactFactorBulkRepair:
                 f"status={result.get('status')}, "
                 f"reason={result.get('reason')}"
             )
-        if not self._completed_live_state_is_valid(completed_unit, item):
+        if not self._completed_live_state_is_valid(
+            completed_unit,
+            item,
+            live_state=after_state,
+        ):
             raise RuntimeError(
                 'factor apply live output/source evidence does not match result'
             )
@@ -923,6 +1519,9 @@ class ExactFactorBulkRepair:
             'date_count': self.manifest['date_count'],
             'mode': 'apply' if apply else 'dry_run',
             'membership_policy': MEMBERSHIP_POLICY_STORED_ONLY,
+            'implementation_contract': (
+                FACTOR_REPAIR_IMPLEMENTATION_CONTRACT
+            ),
         }
         if checkpoint_path is None:
             return {
@@ -1031,7 +1630,9 @@ class ExactFactorBulkRepair:
                         'market_date': market_date,
                     }
                 try:
-                    current_proof = self._review_date(item)
+                    current_proof, current_state = (
+                        self._review_date_with_state(item)
+                    )
                 except Exception as exc:  # noqa: BLE001
                     checkpoint['units'][market_date] = {
                         'status': 'failed',
@@ -1056,6 +1657,7 @@ class ExactFactorBulkRepair:
                                 self._completed_live_state_is_valid(
                                     previous,
                                     item,
+                                    live_state=current_state,
                                 )
                             )
                         except Exception as exc:  # noqa: BLE001
@@ -1101,6 +1703,7 @@ class ExactFactorBulkRepair:
                         completed_valid = self._completed_live_state_is_valid(
                             previous,
                             item,
+                            live_state=current_state,
                         )
                     except Exception as exc:  # noqa: BLE001
                         return {
@@ -1117,7 +1720,11 @@ class ExactFactorBulkRepair:
                     skipped_dates += 1
                     continue
                 try:
-                    result = self._apply_date(item, reviewed_proof)
+                    result = self._apply_date(
+                        item,
+                        reviewed_proof,
+                        before_state=current_state,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     checkpoint['units'][market_date] = {
                         'status': 'failed',

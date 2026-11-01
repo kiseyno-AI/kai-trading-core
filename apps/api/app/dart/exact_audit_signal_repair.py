@@ -16,6 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.dart.signals_service import (
     AUDIT_SIGNAL_WRITER_LOCK_KEY,
     audit_signal_writer_lock_owner,
+    classify_durable_audit_signal,
     dart_signals_service,
 )
 from app.db import session_scope
@@ -39,7 +40,7 @@ from app.repositories.eod_run_repository import advisory_eod_collection_lock
 
 
 MANIFEST_SCHEMA_VERSION = 'dart_audit_signal_exact_manifest_v1'
-CHECKPOINT_SCHEMA_VERSION = 'dart_audit_signal_exact_checkpoint_v1'
+CHECKPOINT_SCHEMA_VERSION = 'dart_audit_signal_exact_checkpoint_v2'
 REPLACEMENT_SOURCE_ERROR_CODE = '014'
 MAX_BATCH_SIZE = 100
 MAX_CONCURRENCY = 8
@@ -102,11 +103,31 @@ def _normalize_audit_content(raw: Mapping[str, Any]) -> dict[str, Any]:
     return {
         'opinion_code': raw.get('opinion_code'),
         'opinion_label': raw.get('opinion_label'),
-        'has_audit_issue': bool(raw.get('has_audit_issue')),
+        'has_audit_issue': raw.get('has_audit_issue'),
         'source_section': raw.get('source_section'),
         'evidence_text': raw.get('evidence_text'),
         'payload': raw.get('payload'),
     }
+
+
+def _classify_durable_audit_content(
+    audit_content: Mapping[str, Any],
+    *,
+    event_id: int,
+    rcept_no: str,
+    receipt_date: date | str,
+) -> str | None:
+    classification = classify_durable_audit_signal(
+        audit_content,
+        event_id=event_id,
+        rcept_no=rcept_no,
+        receipt_date=receipt_date,
+    )
+    if classification == 'authoritative_absence':
+        return 'authoritative_absence'
+    if classification == 'parsed_opinion':
+        return 'captured'
+    return None
 
 
 def normalize_manifest(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -210,9 +231,10 @@ def _load_audit_terminal_state(
 ) -> dict[str, Any] | None:
     """Return only terminal state that is durably represented in storage.
 
-    A missing ``DartAuditSignal`` row is deliberately ambiguous. The current
-    schema has no durable negative-evaluation record, so absence must be
-    replayed unless a caller supplies a loader backed by an explicit proof.
+    A missing ``DartAuditSignal`` row remains ambiguous.  A validated,
+    versioned authoritative-absence payload is the only durable negative
+    proof; its required boolean placeholder must never be interpreted as a
+    clean parsed opinion.
     """
 
     with session_scope(statement_timeout_ms=5_000) as session:
@@ -232,12 +254,28 @@ def _load_audit_terminal_state(
         ).mappings().one_or_none()
         if row is None:
             return None
+        stored_event_id = row['event_id']
+        if (
+            isinstance(stored_event_id, bool)
+            or not isinstance(stored_event_id, int)
+            or stored_event_id <= 0
+        ):
+            return None
         audit_content = _normalize_audit_content(row)
+        status = _classify_durable_audit_content(
+            audit_content,
+            event_id=stored_event_id,
+            rcept_no=str(row['rcept_no']),
+            receipt_date=row['receipt_date'],
+        )
+        if status is None:
+            return None
         return {
-            'status': 'captured',
+            'status': status,
             'event_id': row['event_id'],
             'stock_code': str(row['stock_code'] or ''),
             'rcept_no': str(row['rcept_no']),
+            'audit_signal_evaluated': status == 'authoritative_absence',
             'receipt_date': (
                 row['receipt_date'].isoformat()
                 if row['receipt_date'] is not None
@@ -457,19 +495,41 @@ class ExactDartAuditSignalRepair:
         audit_signal = result.get('audit_signal')
         if isinstance(audit_signal, Mapping):
             audit_content = _normalize_audit_content(audit_signal)
+            audit_status = _classify_durable_audit_content(
+                audit_content,
+                event_id=entry['event_id'],
+                rcept_no=str(entry['rcept_no']),
+                receipt_date=lineage['persisted_receipt_date'],
+            )
+            if audit_status is None:
+                return {
+                    **lineage,
+                    'status': 'audit_evidence_missing',
+                    'error_type': 'RuntimeError',
+                    'error_message': (
+                        'audit capture returned malformed durable evidence'
+                    ),
+                }
             return {
                 **lineage,
-                'status': 'captured',
+                'status': audit_status,
                 'opinion_code': audit_content['opinion_code'],
                 'has_audit_issue': audit_content['has_audit_issue'],
+                'audit_signal_evaluated': (
+                    audit_status == 'authoritative_absence'
+                ),
                 'audit_content': audit_content,
                 'audit_content_sha256': canonical_json_sha256(audit_content),
             }
         if result.get('audit_signal_evaluated') is True:
             return {
                 **lineage,
-                'status': 'authoritative_absence',
-                'audit_signal_evaluated': True,
+                'status': 'audit_evidence_missing',
+                'error_type': 'RuntimeError',
+                'error_message': (
+                    'authoritative absence was evaluated but no durable '
+                    'audit proof was returned'
+                ),
                 'audit_diagnostics': result.get('audit_diagnostics'),
             }
         return {
@@ -497,7 +557,7 @@ class ExactDartAuditSignalRepair:
                 and result.get('audit_signal_evaluated') is not True
             ):
                 return False
-            if result.get('status') == 'captured':
+            if result.get('status') in _TERMINAL_AUDIT_STATUSES:
                 audit_content = result.get('audit_content')
                 if (
                     not isinstance(audit_content, Mapping)
@@ -556,7 +616,7 @@ class ExactDartAuditSignalRepair:
                 and proof.get('audit_signal_evaluated') is not True
             ):
                 return False
-            if result.get('status') == 'captured':
+            if result.get('status') in _TERMINAL_AUDIT_STATUSES:
                 expected_content = result.get('audit_content')
                 observed_content = proof.get('audit_content')
                 if (
