@@ -223,3 +223,46 @@ Direct publication through `python -m app.eod.exact_factor_repair --apply` is
 intentionally blocked. That lower-level service remains an implementation
 dependency of the guarded bulk driver, but its executable cannot bypass the
 bulk checkpoint, full-source fingerprint, or writer-admission contract.
+
+## Exact stored-data signal features
+
+The signal-feature repair accepts the same reviewed
+`derived_stage_exact_date_manifest_v1` used by the factor bulk repair. It
+rebuilds `daily_signal_features` only from stored bars, factor rows, symbol
+metadata, and each row's already persisted KIS ranking and historical quote
+evidence. It never calls KIS, an agent, a decider, a plan builder, an order
+path, or Exec.
+
+```bash
+cd apps/api
+.venv/bin/python -m app.eod.exact_signal_feature_repair \
+  --manifest /reviewed/factor-date-manifest.json \
+  --checkpoint /durable/signal-feature-checkpoint.json --dry-run
+
+.venv/bin/python -m app.eod.exact_signal_feature_repair \
+  --manifest /reviewed/factor-date-manifest.json \
+  --checkpoint /durable/signal-feature-checkpoint.json \
+  --expected-manifest-sha256 SHA_FROM_DRY_RUN --apply
+```
+
+Dry run is the default and writes the date-scoped source fingerprints plus the
+reviewed stale-extra proof into a dedicated checkpoint. Apply requires that
+fresh proof and the printed manifest SHA-256. For every date it revalidates
+market finality, the pending frozen factor membership, stored-bar coverage,
+all factor source fingerprints, and the stale-extra count/membership/content
+hash while holding exclusive daily/EOD writer admission. It first persists
+and freshness-verifies every manifest member. Only then does it lock
+`daily_signal_features`, compare the reviewed stale proof, remove outside
+rows, and verify that the remaining date membership is exactly the manifest.
+
+A completed date is skipped only after live source, membership, and output
+fingerprints still match its checkpoint. Missing or changed exact output is
+rebuilt idempotently. A new outside row or any source drift requires another
+dry review; it is never silently pruned under an older proof. The legacy
+factor checkpoint is not a signal checkpoint and cannot be reused.
+
+This command owns only `daily_signal_features`; it does not mark a pending
+price-bar repair batch complete. After a successful apply, continue the
+documented `app.eod.price_bar_repair_state --rebuild-evaluations`, verify, and
+`--complete` sequence so stored market-participation, evaluation, calendar,
+and closeout fingerprints are refreshed from the repaired signal scope.
