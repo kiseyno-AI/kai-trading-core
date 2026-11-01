@@ -89,7 +89,7 @@ def _iter_snapshot_atomic_bulk_upsert_chunks(
     *,
     chunk_size: int | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Chunk evaluation rows without splitting a decision snapshot."""
+    """Chunk snapshot-scoped rows without splitting a decision snapshot."""
 
     if chunk_size is None:
         chunk_size = SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE
@@ -2302,7 +2302,7 @@ class SignalDeciderLoopRepository:
         item_list = list(items)
         if len(item_list) > SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE:
             results: list[dict[str, Any]] = []
-            for chunk in _iter_bulk_upsert_chunks(item_list):
+            for chunk in _iter_snapshot_atomic_bulk_upsert_chunks(item_list):
                 results.extend(self.bulk_upsert_realized_outcomes(items=chunk))
             return results
         with session_scope() as session:
@@ -3872,6 +3872,40 @@ class SignalDeciderLoopService:
         }
 
     @staticmethod
+    def _build_failed_decision_snapshot_identity(
+        row: SignalDeciderDecisionSnapshotRow,
+    ) -> dict[str, Any]:
+        """Keep malformed input visible without parsing the failing payload."""
+
+        return {
+            'snapshot_id': int(row.id),
+            'feedback_id': row.feedback_id,
+            'decision_run_id': row.decision_run_id,
+            'agent_name': row.agent_name,
+            'market_date': row.market_date.isoformat(),
+            'symbol': row.symbol,
+            'policy_version': row.policy_version,
+            'decision_provenance': {},
+            'decision': {},
+            'summary': '',
+            'wait_reason': None,
+            'decision_delta': {},
+            'supporting_evidence': [],
+            'decision_risks': [],
+            'invalidation_conditions': [],
+            'data_quality_warnings': [],
+            'specialist_disagreement': [],
+            'traceability': {},
+            'feature_snapshot': {},
+            'received_at': (
+                row.feedback_received_at.isoformat()
+                if row.feedback_received_at
+                else None
+            ),
+            'created_at': row.created_at.isoformat() if row.created_at else None,
+        }
+
+    @staticmethod
     def _evaluation_failure_evidence(
         *,
         snapshot_row: SignalDeciderDecisionSnapshotRow,
@@ -3951,6 +3985,69 @@ class SignalDeciderLoopService:
                             horizons=horizons,
                             reason=(
                                 'signal_decider_evaluation_row_persistence_failed'
+                            ),
+                            exc=exc,
+                        )
+                    )
+        return persisted, failures
+
+    def _bulk_upsert_realized_outcomes_with_snapshot_isolation(
+        self,
+        *,
+        snapshot_groups: Sequence[
+            tuple[SignalDeciderDecisionSnapshotRow, Sequence[dict[str, Any]]]
+        ],
+        horizons: Sequence[int],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not snapshot_groups:
+            return [], []
+        all_items = [
+            item
+            for _snapshot_row, snapshot_items in snapshot_groups
+            for item in snapshot_items
+        ]
+        snapshot_rows_by_id = {
+            int(snapshot_row.id): snapshot_row
+            for snapshot_row, _snapshot_items in snapshot_groups
+        }
+        snapshot_items_by_id = {
+            int(snapshot_row.id): snapshot_items
+            for snapshot_row, snapshot_items in snapshot_groups
+        }
+        persisted: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for chunk_items in _iter_snapshot_atomic_bulk_upsert_chunks(all_items):
+            try:
+                persisted.extend(
+                    self.repository.bulk_upsert_realized_outcomes(
+                        items=chunk_items,
+                    )
+                )
+                continue
+            except Exception:
+                pass
+            chunk_snapshot_ids = list(
+                dict.fromkeys(
+                    int(item['decision_snapshot_id'])
+                    for item in chunk_items
+                )
+            )
+            for snapshot_id in chunk_snapshot_ids:
+                snapshot_row = snapshot_rows_by_id[snapshot_id]
+                snapshot_items = snapshot_items_by_id[snapshot_id]
+                try:
+                    persisted.extend(
+                        self.repository.bulk_upsert_realized_outcomes(
+                            items=snapshot_items,
+                        )
+                    )
+                except Exception as exc:
+                    failures.append(
+                        self._evaluation_failure_evidence(
+                            snapshot_row=snapshot_row,
+                            horizons=horizons,
+                            reason=(
+                                'signal_decider_outcome_row_persistence_failed'
                             ),
                             exc=exc,
                         )
@@ -4094,32 +4191,57 @@ class SignalDeciderLoopService:
             }
 
         max_horizon = max(normalized_horizons)
-        outcome_items: list[dict[str, Any]] = []
+        outcome_groups: list[
+            tuple[SignalDeciderDecisionSnapshotRow, list[dict[str, Any]]]
+        ] = []
         decision_snapshots: dict[int, dict[str, Any]] = {}
+        evaluation_failures: list[dict[str, Any]] = []
         for row in rows:
-            decision = self._build_decision_snapshot(row)
-            decision_snapshots[row.id] = decision
-            future_bars = self._load_future_price_bars(
-                symbol=row.symbol,
-                market_date=row.market_date,
-                max_horizon=max_horizon,
-            )
-            latest_available_trade_date = self._load_latest_available_trade_date(
-                symbol=row.symbol,
-                market_date=row.market_date,
-            )
-            for horizon_days in normalized_horizons:
-                outcome_items.append(
-                    self._build_realized_outcome_item(
+            snapshot_items: list[dict[str, Any]] = []
+            try:
+                decision = self._build_decision_snapshot(row)
+                decision_snapshots[row.id] = decision
+                future_bars = self._load_future_price_bars(
+                    symbol=row.symbol,
+                    market_date=row.market_date,
+                    max_horizon=max_horizon,
+                )
+                latest_available_trade_date = self._load_latest_available_trade_date(
+                    symbol=row.symbol,
+                    market_date=row.market_date,
+                )
+                for horizon_days in normalized_horizons:
+                    snapshot_items.append(
+                        self._build_realized_outcome_item(
+                            snapshot_row=row,
+                            decision=decision,
+                            future_bars=future_bars,
+                            latest_available_trade_date=latest_available_trade_date,
+                            horizon_days=horizon_days,
+                        )
+                    )
+            except Exception as exc:
+                evaluation_failures.append(
+                    self._evaluation_failure_evidence(
                         snapshot_row=row,
-                        decision=decision,
-                        future_bars=future_bars,
-                        latest_available_trade_date=latest_available_trade_date,
-                        horizon_days=horizon_days,
+                        horizons=normalized_horizons,
+                        reason=(
+                            'signal_decider_outcome_row_construction_failed'
+                        ),
+                        exc=exc,
                     )
                 )
+                continue
+            outcome_groups.append((row, snapshot_items))
 
-        persisted_outcomes = self.repository.bulk_upsert_realized_outcomes(items=outcome_items)
+        (
+            persisted_outcomes,
+            outcome_persistence_failures,
+        ) = self._bulk_upsert_realized_outcomes_with_snapshot_isolation(
+            snapshot_groups=outcome_groups,
+            horizons=normalized_horizons,
+        )
+        evaluation_failures.extend(outcome_persistence_failures)
         outcomes_by_key = {
             (item['decision_snapshot_id'], item['horizon_days']): item
             for item in persisted_outcomes
@@ -4127,8 +4249,13 @@ class SignalDeciderLoopService:
         evaluation_groups: list[
             tuple[SignalDeciderDecisionSnapshotRow, list[dict[str, Any]]]
         ] = []
-        evaluation_failures: list[dict[str, Any]] = []
+        failed_snapshot_ids = {
+            int(failure['decision_snapshot_id'])
+            for failure in evaluation_failures
+        }
         for row in rows:
+            if int(row.id) in failed_snapshot_ids:
+                continue
             decision = decision_snapshots[row.id]
             snapshot_items: list[dict[str, Any]] = []
             try:
@@ -4176,8 +4303,13 @@ class SignalDeciderLoopService:
         evaluations_by_snapshot = self._group_by_snapshot_id(persisted_evaluations)
         items: list[dict[str, Any]] = []
         for row in rows:
+            decision_snapshot = decision_snapshots.get(row.id)
+            if decision_snapshot is None:
+                decision_snapshot = self._build_failed_decision_snapshot_identity(
+                    row
+                )
             item = {
-                **decision_snapshots[row.id],
+                **decision_snapshot,
                 'outcomes': outcomes_by_snapshot.get(row.id, []),
                 'evaluations': evaluations_by_snapshot.get(row.id, []),
             }
