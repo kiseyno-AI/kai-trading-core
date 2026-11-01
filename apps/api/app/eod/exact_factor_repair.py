@@ -250,10 +250,7 @@ def _build_factor_symbols_for_date_query(
         select(Symbol.symbol)
         .select_from(model)
         .join(Symbol, Symbol.id == model.symbol_id)
-        .where(
-            model.market_date == market_date,
-            Symbol.market.in_(EXACT_FACTOR_REPAIR_MARKETS),
-        )
+        .where(model.market_date == market_date)
     )
 
 

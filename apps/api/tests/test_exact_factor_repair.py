@@ -750,12 +750,12 @@ def test_stale_scope_query_is_factor_date_index_driven() -> None:
     compiled = str(query.compile(compile_kwargs={'literal_binds': True}))
 
     assert 'FROM daily_advanced_value_factor_results JOIN symbols' in compiled
-    assert "symbols.market IN ('KOSPI', 'KOSDAQ')" in compiled
     assert 'symbols.id = daily_advanced_value_factor_results.symbol_id' in compiled
     assert (
         "daily_advanced_value_factor_results.market_date = '2026-09-23'"
         in compiled
     )
+    assert 'symbols.market' not in compiled
     assert 'NOT IN' not in compiled
 
 
@@ -813,7 +813,7 @@ def _cleanup_symbols(symbols: list[str]) -> None:
         session.execute(delete(Symbol).where(Symbol.symbol.in_(symbols)))
 
 
-def test_stale_scope_loader_reports_only_symbols_outside_membership(
+def test_stale_scope_loader_includes_all_date_local_rows_outside_membership(
     monkeypatch,
 ) -> None:
     market_date = date(2099, 1, 9)
@@ -825,6 +825,7 @@ def test_stale_scope_loader_reports_only_symbols_outside_membership(
     while non_krx_symbol in {exact_symbol, stale_symbol}:
         non_krx_symbol = _unique_numeric_symbol()
     symbols = [exact_symbol, stale_symbol, non_krx_symbol]
+    repair_started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     _insert_value_factor_rows(
         market_date=market_date,
         exact_symbol=exact_symbol,
@@ -866,10 +867,19 @@ def test_stale_scope_loader_reports_only_symbols_outside_membership(
 
         assert result == {
             'value_factors': {
-                'count': 1,
-                'symbol_preview': [stale_symbol],
+                'count': 2,
+                'symbol_preview': sorted([stale_symbol, non_krx_symbol]),
             }
         }
+        assert prune_stale_factor_rows(
+            market_date=market_date,
+            exact_symbols=[exact_symbol],
+            repair_started_at=repair_started_at,
+            expected_stale_counts={
+                stage_id: details['count']
+                for stage_id, details in result.items()
+            },
+        ) == {'value_factors': 2}
     finally:
         _cleanup_symbols(symbols)
 
