@@ -16,6 +16,7 @@ from app.eod.derived_stage_repair import MANIFEST_SCHEMA_VERSION
 from app.eod.exact_trending_repair import (
     ExactTrendingRankRepair,
     PERIODS,
+    _load_completion_state,
     main,
 )
 from app.eod.market_membership import market_membership_sha256
@@ -89,6 +90,72 @@ def _guard(**_kwargs):
 
 
 class ExactTrendingRankRepairTests(unittest.TestCase):
+    def test_completion_state_accepts_supported_rebuild_evidence_schemas(self):
+        scope_hash = market_membership_sha256(SYMBOLS)
+
+        @contextmanager
+        def fake_session_scope(**_kwargs):
+            yield Mock()
+
+        def pending_batch(schema_version):
+            return {
+                'required_rebuild_trade_dates': ['2026-10-28'],
+                'factor_rebuild_metadata': {
+                    'schema_version': schema_version,
+                    'dates': {
+                        '2026-10-28': {
+                            'trending_output_fingerprints': {
+                                '1d': {
+                                    'row_count': 2,
+                                    'output_sha256': '1d-output-sha256',
+                                    'exact_scope': True,
+                                    'scope_symbol_count': len(SYMBOLS),
+                                    'scope_membership_sha256': scope_hash,
+                                }
+                            }
+                        }
+                    },
+                },
+            }
+
+        for schema_version, expected_verified in (
+            (2, True),
+            (3, True),
+            (4, False),
+        ):
+            with (
+                self.subTest(schema_version=schema_version),
+                patch(
+                    'app.eod.exact_trending_repair.'
+                    '_load_source_fingerprints',
+                    return_value={},
+                ),
+                patch(
+                    'app.eod.exact_trending_repair.session_scope',
+                    fake_session_scope,
+                ),
+                patch(
+                    'app.eod.exact_trending_repair.'
+                    '_derived_output_fingerprint',
+                    return_value=('1d-output-sha256', 2),
+                ),
+                patch(
+                    'app.eod.exact_trending_repair.'
+                    'load_pending_price_bar_rebuild_batches',
+                    return_value=[pending_batch(schema_version)],
+                ),
+            ):
+                state = _load_completion_state(
+                    '2026-10-28',
+                    ('1d',),
+                    SYMBOLS,
+                )
+
+            self.assertIs(
+                state['metadata_verified'],
+                expected_verified,
+            )
+
     def _repair(self, **overrides):
         defaults = {
             'trending_runner': Mock(return_value=_trending_result()),

@@ -3271,9 +3271,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result['market_date'], '2026-04-21')
         self.assertEqual(result['status'], 'pending')
-        self.assertEqual(result['total_stages'], 26)
+        self.assertEqual(result['total_stages'], 27)
         self.assertEqual(result['completed_stages'], 0)
-        self.assertEqual(result['pending_stages'], 26)
+        self.assertEqual(result['pending_stages'], 27)
         self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
         self.assertEqual(result['stages']['price_collection']['order'], 3)
@@ -3414,7 +3414,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'running')
-        self.assertEqual(result['total_stages'], 26)
+        self.assertEqual(result['total_stages'], 27)
         self.assertEqual(result['running_stages'], 1)
         self.assertEqual(result['current_stage'], 'market_risk_filter')
         self.assertEqual(result['official_run']['id'], 501)
@@ -4468,6 +4468,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: {},
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -4537,6 +4538,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             pykrx_stage_counts_loader=lambda *_: stage_counts,
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -4571,6 +4573,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'external_news_collect',
                 'external_news_enrich',
                 'macro_context_refresh',
+                'intraday_snapshots',
                 'agent_feedback_summaries',
                 'signal_decider',
                 'next_open_execution_plan',
@@ -4717,6 +4720,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             live_symbol_count_loader=lambda: 3579,
             fundamentals_refresh_loader=lambda **_: fundamentals_run,
             factor_stage_counts_loader=lambda **_: factor_stage_counts,
+            official_run_loader=lambda **_: None,
         )
 
         result = service.read()
@@ -5610,11 +5614,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['total_stages'], 26)
+        self.assertEqual(result['total_stages'], 27)
         self.assertEqual(result['stage_status_counts']['completed'], 16)
         self.assertEqual(result['skipped_stages'], 2)
         self.assertEqual(result['partial_stages'], 0)
-        self.assertEqual(result['pending_stages'], 8)
+        self.assertEqual(result['pending_stages'], 9)
         self.assertEqual(result['current_stage'], 'signal_features')
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(result['stages']['pykrx_universe_refresh']['status'], 'skipped')
@@ -5772,11 +5776,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['total_stages'], 26)
+        self.assertEqual(result['total_stages'], 27)
         self.assertEqual(result['completed_stages'], 17)
         self.assertEqual(result['skipped_stages'], 2)
         self.assertEqual(result['display_completed_stages'], 19)
-        self.assertEqual(result['pending_stages'], 5)
+        self.assertEqual(result['pending_stages'], 6)
         self.assertEqual(result['partial_stages'], 1)
         self.assertEqual(result['running_stages'], 0)
         self.assertEqual(result['current_stage'], 'signal_decider_evaluations')

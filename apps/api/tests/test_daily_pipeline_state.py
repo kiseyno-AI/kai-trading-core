@@ -15,6 +15,9 @@ from app.agent_context.lease_loss_evidence import (
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.market_membership import market_membership_sha256
+from app.eod.scope_outcomes import (
+    build_exact_scope_partition_identity_proof,
+)
 from app.eod.daily_pipeline_state import (
     DailyPipelineRunStateService,
     _expired_decision_skip_evidence_is_valid,
@@ -27,8 +30,24 @@ def _factor_exact_scope_outcome_proof() -> dict:
     selected = [str(index).zfill(6) for index in range(1, 101)]
     retry_debt = [selected[-1]]
     successful = selected[:-1]
+    market_date = '2026-09-14'
+    scope_finalization = {
+        'stage': 'momentum_factors',
+        'market_date': market_date,
+        'exact_symbol_count': len(selected),
+        'exact_membership_sha256': market_membership_sha256(selected),
+        'successful_symbol_count': len(successful),
+        'successful_membership_sha256': market_membership_sha256(
+            successful
+        ),
+        'deleted_stale_row_count': 0,
+        'ready': True,
+    }
     return {
-        'schema_version': 'exact_scope_outcome_proof_v1',
+        'schema_version': 'exact_scope_outcome_proof_v2',
+        'stage_id': 'momentum_factors',
+        'market_date': market_date,
+        'outcome_status': 'partial',
         'manifest_version': 'factor_scope_outcomes_v1',
         'selected_stock_codes': selected,
         'selected_symbol_count': len(selected),
@@ -37,6 +56,25 @@ def _factor_exact_scope_outcome_proof() -> dict:
         'successful_symbol_sha256': market_membership_sha256(successful),
         'retry_debt_stock_codes': retry_debt,
         'terminal_not_applicable_stock_codes': [],
+        **build_exact_scope_partition_identity_proof(
+            retry_debt_symbols=retry_debt,
+            terminal_not_applicable_symbols=[],
+        ),
+        'finalization_stage_id': scope_finalization['stage'],
+        'finalization_market_date': scope_finalization['market_date'],
+        'finalization_exact_symbol_count': scope_finalization[
+            'exact_symbol_count'
+        ],
+        'finalization_exact_membership_sha256': scope_finalization[
+            'exact_membership_sha256'
+        ],
+        'finalization_successful_symbol_count': scope_finalization[
+            'successful_symbol_count'
+        ],
+        'finalization_successful_membership_sha256': scope_finalization[
+            'successful_membership_sha256'
+        ],
+        'scope_finalization': scope_finalization,
     }
 
 
@@ -771,6 +809,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
     ) -> None:
         stage = SimpleNamespace(
             stage_id='momentum_factors',
+            market_date=date(2026, 9, 14),
             status='partial',
             processed=100,
             total=100,
@@ -1244,6 +1283,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         )
         stage = SimpleNamespace(
             stage_id='momentum_factors',
+            market_date=date(2026, 9, 14),
             status='partial',
             processed=100,
             total=100,
@@ -1253,6 +1293,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'result_summary': {'remaining_retryable_events': 0},
                 'exact_scope_outcome_proof': (
                     _factor_exact_scope_outcome_proof()
+                ),
+                'scope_finalization': (
+                    _factor_exact_scope_outcome_proof()[
+                        'scope_finalization'
+                    ]
                 ),
             },
         )
@@ -1381,6 +1426,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         )
         stage = SimpleNamespace(
             stage_id='momentum_factors',
+            market_date=date(2026, 9, 14),
             status='partial',
             processed=100,
             total=100,
@@ -1391,6 +1437,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'result_summary': {'remaining_retryable_events': 0},
                 'exact_scope_outcome_proof': (
                     _factor_exact_scope_outcome_proof()
+                ),
+                'scope_finalization': (
+                    _factor_exact_scope_outcome_proof()[
+                        'scope_finalization'
+                    ]
                 ),
             },
         )
@@ -3380,6 +3431,33 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'ORDER BY daily_pipeline_runs.started_at DESC, '
             'daily_pipeline_runs.id DESC',
             compiled_sql,
+        )
+
+    def test_list_prior_followups_supports_id_cursor_order(self) -> None:
+        runs_result = MagicMock()
+        runs_result.scalars.return_value = []
+        session = MagicMock()
+        session.execute.return_value = runs_result
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+        service = DailyPipelineRunStateService()
+
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=session_context,
+        ):
+            service.list_prior_followup_runs_for_lineage(
+                market_date='2026-10-23',
+                reused_eod_collection_run_id=579,
+                before_pipeline_run_id=580,
+                limit=8,
+                order_by_id_desc=True,
+            )
+
+        statement = session.execute.call_args.args[0]
+        self.assertIn(
+            'ORDER BY daily_pipeline_runs.id DESC',
+            str(statement.compile()),
         )
 
     def test_claim_terminal_continuation_accepts_ready_enrichment_warning(

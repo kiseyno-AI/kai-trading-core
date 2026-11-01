@@ -1231,6 +1231,10 @@ class PriceBarRepairFactorEvidenceTests(unittest.TestCase):
         self.assertEqual(result['updated_batch_count'], 1)
         self.assertEqual(result['periods'], ['1d', '5d', '20d'])
         self.assertEqual(fingerprint.call_count, 3)
+        self.assertEqual(
+            batch.factor_rebuild_metadata['schema_version'],
+            3,
+        )
         date_scope = batch.factor_rebuild_metadata['dates'][
             MARKET_DATE.isoformat()
         ]

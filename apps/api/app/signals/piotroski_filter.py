@@ -949,8 +949,14 @@ class DailyPiotroskiFilterService:
         if ranking_dependency_failed_symbols and scope_status != 'failed':
             status = 'partial'
             evidence_reason = 'ranking_dependency_incomplete'
+        # Symbol-exhaustive retry debt is recoverable without discarding the
+        # cohort that was computed and persisted successfully.  Ranking
+        # dependency failures are different: they can change percentile
+        # thresholds for every selected symbol, so they remain globally
+        # blocking.  A zero-success result also has no safe cohort to advance.
         has_blocking_retry_debt = bool(
-            retry_debt_symbols or ranking_dependency_failed_symbols
+            ranking_dependency_failed_symbols
+            or (retry_debt_symbols and not successful_symbols)
         )
 
         result = {

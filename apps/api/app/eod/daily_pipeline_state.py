@@ -418,6 +418,7 @@ def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
     outcome = {
         'stage': stage_id,
         'stage_id': stage_id,
+        'market_date': _iso(getattr(stage_row, 'market_date', None)),
         'status': raw_status,
         'processed': _as_int(getattr(stage_row, 'processed', 0)),
         'total': _as_int(getattr(stage_row, 'total', 0)),
@@ -1528,6 +1529,7 @@ class DailyPipelineRunStateService:
         reused_eod_collection_run_id: int,
         before_pipeline_run_id: int,
         limit: int = 8,
+        order_by_id_desc: bool = False,
     ) -> list[dict[str, Any]]:
         """Load a bounded prior recovery chain for one exact EOD lineage."""
 
@@ -1538,6 +1540,14 @@ class DailyPipelineRunStateService:
             raise ValueError('lineage and pipeline run ids must be positive')
 
         with session_scope() as session:
+            ordering = (
+                (DailyPipelineRun.id.desc(),)
+                if order_by_id_desc
+                else (
+                    DailyPipelineRun.started_at.desc(),
+                    DailyPipelineRun.id.desc(),
+                )
+            )
             rows = list(
                 session.execute(
                     select(DailyPipelineRun)
@@ -1552,10 +1562,7 @@ class DailyPipelineRunStateService:
                         ].as_integer()
                         == normalized_eod_run_id,
                     )
-                    .order_by(
-                        DailyPipelineRun.started_at.desc(),
-                        DailyPipelineRun.id.desc(),
-                    )
+                    .order_by(*ordering)
                     .limit(max(1, min(int(limit), 8)))
                 ).scalars()
             )

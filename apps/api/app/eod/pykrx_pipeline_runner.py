@@ -42,6 +42,7 @@ from app.eod.run_stage_support import (
 from app.eod.scope_outcomes import (
     EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
     build_exact_symbol_scope_outcome,
+    validate_stage_bound_scope_outcome,
 )
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.market.clock import get_market_state
@@ -82,6 +83,44 @@ FACTOR_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'quality_factors',
     'composite_factors',
 )
+FACTOR_FOLLOWUP_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    'composite_factors': (
+        'momentum_factors',
+        'value_factors',
+        'low_risk_factors',
+        'beta_factors',
+        'advanced_value_factors',
+    ),
+}
+SUCCESS_COHORT_MANIFEST_VERSIONS: dict[str, frozenset[str]] = {
+    'price_collection': frozenset({'price_contexts_scope_outcomes_v1'}),
+    'pykrx_enrichment': frozenset(
+        {'pykrx_enrichment_scope_outcomes_v1'}
+    ),
+    'technical_snapshots': frozenset(
+        {'technical_snapshots_scope_outcomes_v1'}
+    ),
+    'action_summaries': frozenset(
+        {'action_summaries_scope_outcomes_v1'}
+    ),
+    'market_risk_filter': frozenset(
+        {'market_risk_filter_scope_outcomes_v1'}
+    ),
+    'fundamentals_daily_refresh': frozenset(
+        {
+            'dart_daily_data_scope_outcomes_v1',
+            'dart_fundamentals_scope_outcomes_v1',
+        }
+    ),
+    'piotroski_filter': frozenset({'piotroski_scope_outcomes_v1'}),
+    **{
+        stage_id: frozenset({'factor_scope_outcomes_v1'})
+        for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+    },
+    'signal_features': frozenset(
+        {'signal_features_scope_outcomes_v1'}
+    ),
+}
 AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'fundamentals_daily_refresh',
     'piotroski_filter',
@@ -90,6 +129,7 @@ AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'external_news_collect',
     'external_news_enrich',
     'macro_context_refresh',
+    'intraday_snapshots',
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
@@ -268,6 +308,28 @@ def _build_point_in_time_current_only_skip(
         'market_date': market_date,
         'stage': stage_id,
     }
+
+
+def _is_canonical_point_in_time_current_only_skip(
+    result: Mapping[str, Any],
+    *,
+    stage_id: str,
+    market_date: str,
+) -> bool:
+    """Recognize only the orchestrator's admission-neutral PITR skip."""
+
+    return bool(
+        stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+        and result.get('triggered') is False
+        and result.get('skipped') is True
+        and result.get('safe_skip') is True
+        and str(result.get('status') or '').strip().lower() == 'skipped'
+        and str(result.get('reason') or '').strip()
+        == 'point_in_time_recovery_current_only_stage'
+        and str(result.get('market_date') or '').strip()
+        == str(market_date).strip()
+        and str(result.get('stage') or '').strip() == stage_id
+    )
 
 
 @dataclass(frozen=True)
@@ -629,6 +691,7 @@ def _validated_exact_scope_outcome(
     result: Mapping[str, Any],
     invocation_symbols: Sequence[str],
     status: str | None = None,
+    allow_failed_all: bool = False,
 ) -> dict[str, Any] | None:
     """Validate a per-symbol outcome partition against its invocation.
 
@@ -640,8 +703,16 @@ def _validated_exact_scope_outcome(
     normalized_status = str(
         status if status is not None else result.get('status') or ''
     ).strip().lower()
-    if normalized_status not in {'completed', 'partial'}:
+    failed_all_candidate = bool(
+        allow_failed_all and normalized_status == 'failed'
+    )
+    if normalized_status not in {'completed', 'partial'} and not (
+        failed_all_candidate
+    ):
         return None
+    structural_status = (
+        'partial' if failed_all_candidate else normalized_status
+    )
     version = str(
         result.get('scope_outcome_manifest_version') or ''
     ).strip()
@@ -708,7 +779,13 @@ def _validated_exact_scope_outcome(
         or retry_debt_set & terminal_set
         or selected_set
         != successful_set | retry_debt_set | terminal_set
-        or (normalized_status == 'completed' and retry_debt_set)
+        or (structural_status == 'completed' and retry_debt_set)
+    ):
+        return None
+    if failed_all_candidate and (
+        successful_set
+        or terminal_set
+        or retry_debt_set != selected_set
     ):
         return None
 
@@ -751,6 +828,198 @@ def _validated_exact_scope_outcome(
         'retry_debt_stock_codes': retry_debt,
         'terminal_not_applicable_stock_codes': terminal_not_applicable,
     }
+
+
+def _validated_successful_cohort(
+    *,
+    stage_result: Mapping[str, Any],
+    invocation_symbols: Sequence[str],
+    stage_id: str,
+    expected_manifest_versions: frozenset[str] | None = None,
+) -> list[str] | None:
+    """Return only a current-attempt cohort proven safe for progression."""
+
+    stage_status = _resolve_result_status(
+        dict(stage_result),
+        stage_id=stage_id,
+    )
+    partition = _validated_exact_scope_outcome(
+        result=stage_result,
+        invocation_symbols=invocation_symbols,
+        status=stage_status,
+    )
+    if partition is not None:
+        expected_manifest_versions = (
+            expected_manifest_versions
+            if expected_manifest_versions is not None
+            else SUCCESS_COHORT_MANIFEST_VERSIONS.get(stage_id)
+        )
+        if (
+            expected_manifest_versions is None
+            or partition['manifest_version']
+            not in expected_manifest_versions
+        ):
+            return None
+        successful_symbols = list(partition['successful_stock_codes'])
+        retry_debt_symbols = list(partition['retry_debt_stock_codes'])
+        if not successful_symbols:
+            return None
+        # A symbol-exhaustive debt partition may advance only its proven
+        # success subset. A partial result without symbol debt represents a
+        # shared/global quality failure and remains fail-closed.
+        if (
+            stage_status == 'partial'
+            and not retry_debt_symbols
+            and str(stage_result.get('gate_status') or '').lower()
+            != 'ready'
+        ):
+            return None
+        if str(stage_result.get('gate_status') or '').lower() == 'blocked':
+            return None
+        ranking_dependency_status = str(
+            stage_result.get('ranking_dependency_status') or ''
+        ).strip().lower()
+        if ranking_dependency_status and ranking_dependency_status not in {
+            'complete',
+            'completed',
+            'ready',
+        }:
+            return None
+        if (
+            str(stage_result.get('reason') or '').startswith(
+                'piotroski_evidence_'
+            )
+            and not retry_debt_symbols
+        ):
+            return None
+        return successful_symbols
+    if stage_result.get('scope_outcome_manifest_version') is not None:
+        return None
+    # Evidence-derived stages are symbol-sensitive. A bare completed status
+    # cannot prove which frozen members produced usable evidence, so these
+    # stages must not inherit the legacy all-symbol fallback.
+    if stage_id in {
+        'piotroski_filter',
+        *FACTOR_FOLLOWUP_STAGE_ORDER,
+        'signal_features',
+    }:
+        return None
+    if stage_status == 'completed' and invocation_symbols:
+        return list(invocation_symbols)
+    return None
+
+
+def _validated_atomic_successful_cohort(
+    *,
+    stage_result: Mapping[str, Any],
+    invocation_symbols: Sequence[str],
+    stage_id: str,
+    finalization_stage_id: str,
+    market_date: str,
+    exact_publication_symbols: Sequence[str],
+) -> list[str] | None:
+    """Validate both the outcome partition and its atomic publication."""
+
+    partition = _validated_atomic_scope_partition(
+        stage_result=stage_result,
+        invocation_symbols=invocation_symbols,
+        stage_id=stage_id,
+        finalization_stage_id=finalization_stage_id,
+        market_date=market_date,
+        exact_publication_symbols=exact_publication_symbols,
+    )
+    if partition is None:
+        return None
+    successful_symbols = list(partition['successful_stock_codes'])
+    retry_debt_symbols = list(partition['retry_debt_stock_codes'])
+    if not successful_symbols:
+        return None
+    stage_status = _resolve_result_status(
+        dict(stage_result),
+        stage_id=stage_id,
+    )
+    if (
+        stage_status == 'partial'
+        and not retry_debt_symbols
+        and str(stage_result.get('gate_status') or '').lower() != 'ready'
+    ):
+        return None
+    if str(stage_result.get('gate_status') or '').lower() == 'blocked':
+        return None
+    ranking_dependency_status = str(
+        stage_result.get('ranking_dependency_status') or ''
+    ).strip().lower()
+    if ranking_dependency_status and ranking_dependency_status not in {
+        'complete',
+        'completed',
+        'ready',
+    }:
+        return None
+    if (
+        str(stage_result.get('reason') or '').startswith(
+            'piotroski_evidence_'
+        )
+        and not retry_debt_symbols
+    ):
+        return None
+    return successful_symbols
+
+
+def _validated_atomic_scope_partition(
+    *,
+    stage_result: Mapping[str, Any],
+    invocation_symbols: Sequence[str],
+    stage_id: str,
+    finalization_stage_id: str,
+    market_date: str,
+    exact_publication_symbols: Sequence[str],
+) -> dict[str, Any] | None:
+    """Validate a stage-bound exhaustive partition and atomic publication.
+
+    Unlike the progression helper, this accepts a valid failed-all attempt so
+    its retry debt remains durable.  Callers that want to advance a child stage
+    must still use ``_validated_atomic_successful_cohort``.
+    """
+
+    normalized_publication = list(
+        dict.fromkeys(
+            str(symbol or '').strip().upper().zfill(6)
+            for symbol in exact_publication_symbols
+            if str(symbol or '').strip()
+        )
+    )
+    if not normalized_publication:
+        return None
+    canonical_stage_id = (
+        'price_collection'
+        if stage_id == 'price_contexts'
+        else stage_id
+    )
+    partition = validate_stage_bound_scope_outcome(
+        result=stage_result,
+        expected_stage_id=canonical_stage_id,
+        invocation_symbols=invocation_symbols,
+        status=_resolve_result_status(
+            dict(stage_result),
+            stage_id=stage_id,
+        ),
+        allow_failed_all=True,
+        expected_market_date=market_date,
+        publication_symbols=normalized_publication,
+    )
+    if (
+        partition is None
+        or finalization_stage_id
+        != str(
+            (partition.get('scope_finalization') or {}).get('stage')
+            or ''
+        )
+        or not set(partition['selected_stock_codes']).issubset(
+            set(normalized_publication)
+        )
+    ):
+        return None
+    return partition
 
 
 def _clear_exact_scope_outcome(result: dict[str, Any]) -> None:
@@ -1773,18 +2042,19 @@ def _run_daily_piotroski_filter_followup(
         symbols=normalized_admitted_symbols,
         ranking_symbols=normalized_symbols,
         exact_scope_symbols=normalized_symbols,
-        authoritative_market_scope=(
-            authoritative_market_scope
-            if set(normalized_admitted_symbols) == set(normalized_symbols)
-            else None
-        ),
+        authoritative_market_scope=authoritative_market_scope,
     )
-    if not (
-        isinstance(result.get('scope_finalization'), Mapping)
-        and result['scope_finalization'].get('ready') is True
-    ):
+    if _validated_atomic_scope_partition(
+        stage_result=result,
+        invocation_symbols=normalized_admitted_symbols,
+        stage_id='piotroski_filter',
+        finalization_stage_id='piotroski_filter',
+        market_date=market_date,
+        exact_publication_symbols=normalized_symbols,
+    ) is None:
         raise RuntimeError(
-            'Piotroski atomic exact-scope finalization proof is unavailable.'
+            'Piotroski atomic exact-scope proof does not match its stage, '
+            'date, publication scope, or successful partition.'
         )
     return result
 
@@ -1944,6 +2214,84 @@ def _execute_factor_stage_with_heartbeat(
     return result, not pulse.ownership_lost
 
 
+def _build_daily_fundamentals_refresh_kwargs(
+    *,
+    market_date: str,
+    admitted_symbols: Sequence[str],
+    progress_callback: Callable[..., None],
+) -> dict[str, Any]:
+    frozen_symbols = list(
+        dict.fromkeys(
+            str(symbol or '').strip().upper().zfill(6)
+            for symbol in admitted_symbols
+            if str(symbol or '').strip()
+        )
+    )
+    if not frozen_symbols:
+        raise RuntimeError(
+            'DART fundamentals follow-up requires a nonempty frozen '
+            'admission scope.'
+        )
+    return {
+        'market_date': market_date,
+        'symbols': frozen_symbols,
+        'capture_limit': 500,
+        'trigger': 'eod_pykrx_followup',
+        'run_piotroski_followup': False,
+        'run_feedback_followup': False,
+        'progress_callback': progress_callback,
+    }
+
+
+def _required_provider_blocked_result(
+    *,
+    stage_id: str,
+    market_date: str,
+    symbols: Sequence[str],
+) -> dict[str, Any] | None:
+    """Preflight one required provider without starting a stage attempt."""
+
+    # daily_pipeline_stages imports this runner, so this import must remain
+    # lazy. Production calls occur only after module initialization.
+    from app.eod.daily_pipeline_stages import (
+        inspect_daily_pipeline_required_provider_readiness,
+    )
+    from app.signals.market_risk_snapshot import (
+        build_required_provider_blocked_result,
+    )
+
+    readiness = dict(
+        inspect_daily_pipeline_required_provider_readiness([stage_id])
+    )
+    if readiness.get('ready') is True:
+        return None
+    blockers = readiness.get('blockers')
+    if not isinstance(blockers, list):
+        raise RuntimeError(
+            f'{stage_id} required-provider readiness omitted blockers.'
+        )
+    provider_admission = next(
+        (
+            dict(blocker)
+            for blocker in blockers
+            if isinstance(blocker, Mapping)
+            and stage_id
+            in list(blocker.get('required_stage_ids') or [])
+        ),
+        None,
+    )
+    if provider_admission is None:
+        raise RuntimeError(
+            f'{stage_id} required-provider readiness omitted its blocker.'
+        )
+    return build_required_provider_blocked_result(
+        stage_id=stage_id,
+        market_date=market_date,
+        provider_admission=provider_admission,
+        symbols=symbols,
+    )
+
+
 def _run_daily_factor_followup(
     *,
     market_date: str,
@@ -2010,12 +2358,14 @@ def _run_daily_factor_followup(
             'market_date': market_date,
             'symbols': list(stage_symbols),
             'ranking_symbols': normalized_symbols,
+            # An initial daily follow-up owns the full frozen membership.
+            # Rows excluded by an upstream evidence partition are not valid
+            # current-attempt successes, so atomic publication must remove
+            # their stale same-date factor rows. Exact stage-debt recovery is
+            # routed through DailyPipelineStageService, which publishes only
+            # its retry subset while retaining this full ranking scope.
             'exact_scope_symbols': normalized_symbols,
-            'authoritative_market_scope': (
-                authoritative_market_scope
-                if set(stage_symbols) == set(normalized_symbols)
-                else None
-            ),
+            'authoritative_market_scope': authoritative_market_scope,
         }
         if stage_id == 'momentum_factors':
             return lambda: daily_momentum_factor_service.rebuild_for_market_date(
@@ -2056,9 +2406,42 @@ def _run_daily_factor_followup(
 
     stages: dict[str, dict[str, Any]] = {}
     overall_status = 'completed'
-    current_admitted_symbols = list(initial_admitted_symbols)
+    successful_symbols_by_stage: dict[str, list[str]] = {}
     for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
-        stage_invocation_symbols = list(current_admitted_symbols)
+        dependency_stage_ids = FACTOR_FOLLOWUP_STAGE_DEPENDENCIES.get(
+            stage_id,
+            (),
+        )
+        if dependency_stage_ids:
+            dependency_success_sets = [
+                set(successful_symbols_by_stage.get(dependency_id, ()))
+                for dependency_id in dependency_stage_ids
+            ]
+            stage_invocation_symbols = [
+                symbol
+                for symbol in initial_admitted_symbols
+                if all(
+                    symbol in successful_set
+                    for successful_set in dependency_success_sets
+                )
+            ]
+        else:
+            # Component factors are siblings. A per-symbol failure in one
+            # component must not suppress an independent component attempt.
+            stage_invocation_symbols = list(initial_admitted_symbols)
+        if not stage_invocation_symbols:
+            overall_status = 'partial'
+            successful_symbols_by_stage[stage_id] = []
+            stage_result = {
+                'status': 'blocked',
+                'reason': 'factor_dependencies_incomplete',
+                'dependency_stages': list(dependency_stage_ids),
+                'market_date': market_date,
+            }
+            stages[stage_id] = stage_result
+            if stage_result_callback is not None:
+                stage_result_callback(stage_id, stage_result)
+            continue
         stage_call = build_stage_call(stage_id, stage_invocation_symbols)
         try:
             if stage_executor is None:
@@ -2081,49 +2464,38 @@ def _run_daily_factor_followup(
                     'status': 'interrupted',
                     'stages': stages,
                 }
-            if not (
-                isinstance(result.get('scope_finalization'), Mapping)
-                and result['scope_finalization'].get('ready') is True
-            ):
-                raise RuntimeError(
-                    f'{stage_id} atomic exact-scope finalization proof '
-                    'is unavailable'
-                )
             stage_status = _resolve_result_status(
                 result,
                 stage_id=stage_id,
             )
-            exact_partition = _validated_exact_scope_outcome(
-                result=result,
+            partition = _validated_atomic_scope_partition(
+                stage_result=result,
                 invocation_symbols=stage_invocation_symbols,
-                status=stage_status,
+                stage_id=stage_id,
+                finalization_stage_id=stage_id,
+                market_date=market_date,
+                exact_publication_symbols=normalized_symbols,
             )
-            if str(result.get('gate_status') or '').strip().lower() == 'blocked':
+            if partition is None:
                 raise RuntimeError(
-                    'factor stage coverage gate is blocked: '
+                    'factor stage lacks a valid stage-bound atomic exact '
+                    'current-attempt outcome manifest: '
                     f'stage={stage_id}'
                 )
-            if exact_partition is None:
-                if stage_status != 'completed':
-                    raise RuntimeError(
-                        'factor stage partial result lacks an exact current-attempt '
-                        f'scope manifest: stage={stage_id}'
-                    )
-                successful_symbols = _successful_symbols_from_stage_result(
-                    stage_id=stage_id,
-                    exact_symbols=stage_invocation_symbols,
-                    result=result,
-                )
-            else:
-                successful_symbols = exact_partition[
-                    'successful_stock_codes'
-                ]
-            current_admitted_symbols = [
+            progression_symbols = _validated_atomic_successful_cohort(
+                stage_result=result,
+                invocation_symbols=stage_invocation_symbols,
+                stage_id=stage_id,
+                finalization_stage_id=stage_id,
+                market_date=market_date,
+                exact_publication_symbols=normalized_symbols,
+            )
+            successful_symbols_by_stage[stage_id] = [
                 symbol
                 for symbol in stage_invocation_symbols
-                if symbol in set(successful_symbols)
+                if symbol in set(progression_symbols or ())
             ]
-            if stage_status != 'completed':
+            if stage_status != 'completed' or not progression_symbols:
                 overall_status = 'partial'
             stage_result = {
                 'status': stage_status,
@@ -2137,7 +2509,7 @@ def _run_daily_factor_followup(
         except Exception as exc:  # pragma: no cover - defensive production guard
             logger.exception('Daily factor follow-up failed for %s on %s', stage_id, market_date)
             overall_status = 'partial'
-            current_admitted_symbols = []
+            successful_symbols_by_stage[stage_id] = []
             stage_result = {
                 'status': 'failed',
                 'error_type': type(exc).__name__,
@@ -2147,7 +2519,14 @@ def _run_daily_factor_followup(
             stages[stage_id] = stage_result
             if stage_result_callback is not None:
                 stage_result_callback(stage_id, stage_result)
-            break
+    current_admitted_symbols = [
+        symbol
+        for symbol in initial_admitted_symbols
+        if all(
+            symbol in set(successful_symbols_by_stage.get(stage_id, ()))
+            for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+        )
+    ]
     retry_debt_symbols = [
         symbol
         for symbol in initial_admitted_symbols
@@ -2487,13 +2866,95 @@ def _run_daily_intraday_snapshot_followup(*, market_date: str, enabled: bool) ->
     )
     if result.get('reason') == 'non_trading_day':
         return {
-            'market_date': market_date,
             **result,
+            'market_date': market_date,
             'triggered': False,
             'safe_skip': True,
             'status': 'skipped',
         }
-    return {'triggered': True, 'market_date': market_date, **result}
+    return {**result, 'triggered': True, 'market_date': market_date}
+
+
+def _terminalize_optional_intraday_snapshot_result(
+    *,
+    market_date: str,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Make optional intraday degradation terminal without hiding evidence."""
+
+    raw_result = dict(result)
+    raw_status = str(raw_result.get('status') or '').strip().lower()
+    raw_reason = str(raw_result.get('reason') or '').strip()
+    normal_nonexecution = bool(
+        raw_result.get('safe_skip') is True
+        or raw_reason
+        in {
+            'followup_disabled',
+            'kis_credentials_missing',
+            'kis_intraday_snapshot_disabled',
+            'no_agent_feedback_eligible_symbols',
+            'non_trading_day',
+        }
+        or raw_status == 'empty_universe'
+    )
+    if normal_nonexecution:
+        return {
+            **raw_result,
+            'triggered': False,
+            'status': 'skipped',
+            'safe_skip': True,
+            'optional_context': True,
+            'market_date': market_date,
+        }
+    resolved_status = _resolve_result_status(
+        raw_result,
+        stage_id='intraday_snapshots',
+    )
+    if resolved_status == 'completed':
+        return {
+            **raw_result,
+            'market_date': market_date,
+            'optional_context': True,
+        }
+    if resolved_status == 'partial':
+        return {
+            'triggered': True,
+            'status': 'partial',
+            'safe_skip': False,
+            'optional_context': True,
+            'terminal': True,
+            'retry_required': False,
+            'retry_pending': False,
+            'remaining_retry_count': 0,
+            'reason': raw_reason or 'optional_intraday_snapshot_degraded',
+            'market_date': market_date,
+            'collection_status': resolved_status,
+            'collection_reason': raw_result.get('reason'),
+            'snapshots_persisted': raw_result.get('snapshots_persisted'),
+            'snapshots_failed': raw_result.get('snapshots_failed'),
+            'failed_symbols': raw_result.get('failed_symbols'),
+            'collection': _compact_result_summary(raw_result),
+        }
+    return {
+        **raw_result,
+        'market_date': market_date,
+        'optional_context': True,
+    }
+
+
+def _run_terminalized_daily_intraday_snapshot_followup(
+    *,
+    market_date: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    raw_result = _run_daily_intraday_snapshot_followup(
+        market_date=market_date,
+        enabled=enabled,
+    )
+    return _terminalize_optional_intraday_snapshot_result(
+        market_date=market_date,
+        result=raw_result,
+    )
 
 
 def _run_daily_feedback_followup(
@@ -3742,26 +4203,17 @@ def run_market_data_pipeline(
         }
 
     if requested_symbol_codes:
-        context_partition = _validated_exact_scope_outcome(
-            result=price_context_result,
+        context_successful_symbols = _validated_atomic_successful_cohort(
+            stage_result=price_context_result,
             invocation_symbols=requested_symbol_codes,
-            status=_resolve_result_status(
-                price_context_result,
-                stage_id='technical_snapshots',
-            ),
+            stage_id='price_collection',
+            finalization_stage_id='price_contexts',
+            market_date=latest_trade_date,
+            exact_publication_symbols=requested_symbol_codes,
         )
-        context_finalization = price_context_result.get(
-            'scope_finalization'
-        )
-        context_scope_is_exact = bool(
-            context_partition is not None
-            and context_partition['manifest_version']
-            == 'price_contexts_scope_outcomes_v1'
-            and isinstance(context_finalization, Mapping)
-            and context_finalization.get('ready') is True
-        )
+        context_scope_is_exact = context_successful_symbols is not None
         current_context_successes = (
-            context_partition['successful_stock_codes']
+            context_successful_symbols
             if context_scope_is_exact
             else []
         )
@@ -4130,31 +4582,24 @@ def run_market_data_pipeline(
     technical_retry_symbols: list[str] = list(requested_symbol_codes)
     technical_scope_is_exact = False
     if 'technical_snapshots' in requested_stage_set:
-        technical_partition = _validated_exact_scope_outcome(
-            result=technical_snapshot_result,
+        technical_successful_cohort = _validated_atomic_successful_cohort(
+            stage_result=technical_snapshot_result,
             invocation_symbols=requested_symbol_codes,
-            status=_resolve_result_status(
-                technical_snapshot_result,
-                stage_id='technical_snapshots',
-            ),
+            stage_id='technical_snapshots',
+            finalization_stage_id='technical_snapshots',
+            market_date=latest_trade_date,
+            exact_publication_symbols=requested_symbol_codes,
         )
-        technical_finalization = technical_snapshot_result.get(
-            'scope_finalization'
-        )
-        technical_scope_is_exact = bool(
-            technical_partition is not None
-            and technical_partition['manifest_version']
-            == 'technical_snapshots_scope_outcomes_v1'
-            and isinstance(technical_finalization, Mapping)
-            and technical_finalization.get('ready') is True
-        )
+        technical_scope_is_exact = technical_successful_cohort is not None
         if technical_scope_is_exact:
             technical_successful_symbols = list(
-                technical_partition['successful_stock_codes']
+                technical_successful_cohort
             )
-            technical_retry_symbols = list(
-                technical_partition['retry_debt_stock_codes']
-            )
+            technical_retry_symbols = [
+                symbol
+                for symbol in requested_symbol_codes
+                if symbol not in set(technical_successful_symbols)
+            ]
         elif snapshot_error_message is None:
             snapshot_error_message = (
                 'Technical snapshot persistence did not return an exact '
@@ -4278,24 +4723,15 @@ def run_market_data_pipeline(
         }
 
     if 'action_summaries' in requested_stage_set:
-        action_partition = _validated_exact_scope_outcome(
-            result=action_summary_result,
+        action_partition = _validated_atomic_scope_partition(
+            stage_result=action_summary_result,
             invocation_symbols=requested_symbol_codes,
-            status=_resolve_result_status(
-                action_summary_result,
-                stage_id='action_summaries',
-            ),
+            stage_id='action_summaries',
+            finalization_stage_id='action_summaries',
+            market_date=latest_trade_date,
+            exact_publication_symbols=requested_symbol_codes,
         )
-        action_finalization = action_summary_result.get(
-            'scope_finalization'
-        )
-        action_scope_is_exact = bool(
-            action_partition is not None
-            and action_partition['manifest_version']
-            == 'action_summaries_scope_outcomes_v1'
-            and isinstance(action_finalization, Mapping)
-            and action_finalization.get('ready') is True
-        )
+        action_scope_is_exact = action_partition is not None
         if not action_scope_is_exact and action_summary_error_message is None:
             action_summary_error_message = (
                 'Action summary persistence did not return an exact '
@@ -4598,6 +5034,39 @@ def run_market_data_pipeline(
             failed=0,
             extra={'result_summary': market_risk_filter_result},
         )
+    elif (
+        'market_risk_filter' in requested_stage_set
+        and (
+            market_risk_provider_block := (
+                _required_provider_blocked_result(
+                    stage_id='market_risk_filter',
+                    market_date=latest_trade_date,
+                    symbols=price_context_symbols,
+                )
+            )
+        )
+        is not None
+    ):
+        market_risk_filter_result = {
+            **market_risk_provider_block,
+            'results_persisted': 0,
+            'results_failed': 0,
+            'failed_symbols': [],
+            'failed_symbol_errors': [],
+        }
+        persist_stage_progress(
+            stage='market_risk_filter',
+            status='blocked',
+            current_step='market_risk_filter_blocked_missing_credential',
+            current_activity=(
+                'Waiting for required KIS market-risk credentials'
+            ),
+            processed=0,
+            total=0,
+            succeeded=0,
+            failed=0,
+            extra={'result_summary': market_risk_filter_result},
+        )
     elif 'market_risk_filter' in requested_stage_set:
         try:
             persist_stage_progress(
@@ -4621,9 +5090,6 @@ def run_market_data_pipeline(
                     ),
                     authoritative_market_scope=(
                         daily_derived_market_scope_authority
-                        if set(price_context_symbols)
-                        == set(exact_piotroski_membership_symbols or [])
-                        else None
                     ),
                 )
             )
@@ -4632,36 +5098,20 @@ def run_market_data_pipeline(
                     'Market-risk filter requires validated exact EOD '
                     'membership proof.'
                 )
-            if not (
-                isinstance(
-                    market_risk_filter_result.get('scope_finalization'),
-                    Mapping,
-                )
-                and market_risk_filter_result['scope_finalization'].get(
-                    'ready'
-                )
-                is True
-            ):
-                raise RuntimeError(
-                    'market_risk_filter atomic exact-scope finalization '
-                    'proof is unavailable'
-                )
-            market_risk_partition = _validated_exact_scope_outcome(
-                result=market_risk_filter_result,
+            market_risk_partition = _validated_atomic_scope_partition(
+                stage_result=market_risk_filter_result,
                 invocation_symbols=exact_piotroski_membership_symbols,
-                status=_resolve_result_status(
-                    market_risk_filter_result,
-                    stage_id='market_risk_filter',
+                stage_id='market_risk_filter',
+                finalization_stage_id='market_risk_filter',
+                market_date=latest_trade_date,
+                exact_publication_symbols=(
+                    exact_piotroski_membership_symbols
                 ),
             )
-            if (
-                market_risk_partition is None
-                or market_risk_partition['manifest_version']
-                != 'market_risk_filter_scope_outcomes_v1'
-            ):
+            if market_risk_partition is None:
                 raise RuntimeError(
-                    'market_risk_filter did not return an exact full-scope '
-                    'outcome manifest'
+                    'market_risk_filter did not return a stage-, date-, '
+                    'scope-, and success-bound atomic outcome proof'
                 )
             market_risk_total = len(exact_piotroski_membership_symbols)
             market_risk_failed = len(
@@ -4858,6 +5308,7 @@ def run_market_data_pipeline(
     )
     price_retry_symbol_set = set(price_retry_symbol_codes)
     price_scope_outcome = _build_exact_scope_outcome(
+        manifest_version='price_contexts_scope_outcomes_v1',
         selected_symbols=requested_symbol_codes,
         successful_symbols=[
             stock_code
@@ -4974,6 +5425,9 @@ def run_market_data_pipeline(
         'turnover_invalid_symbols': turnover_invalid_symbols[:50],
         'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
         **price_scope_outcome,
+        'scope_finalization': price_context_result.get(
+            'scope_finalization'
+        ),
         'price_contexts': price_context_result,
         'pykrx_enrichment': pykrx_enrichment_result,
         'technical_snapshots': technical_snapshot_result,
@@ -5287,11 +5741,10 @@ def run_market_data_pipeline(
             refresh_kwargs['admitted_symbols'] = list(
                 signal_feature_admitted_symbols
             )
-        else:
-            if daily_derived_market_scope_authority is not None:
-                refresh_kwargs['authoritative_market_scope'] = (
-                    daily_derived_market_scope_authority
-                )
+        elif daily_derived_market_scope_authority is not None:
+            refresh_kwargs['authoritative_market_scope'] = (
+                daily_derived_market_scope_authority
+            )
         stage_result = dict(
             asyncio.run(
                 dependencies.signal_feature_service.refresh_for_market_date(
@@ -5307,6 +5760,24 @@ def run_market_data_pipeline(
                 'reason',
                 'signal_feature_sources_incomplete',
             )
+        signal_invocation_symbols = (
+            list(signal_feature_admitted_symbols)
+            if signal_feature_admitted_symbols is not None
+            else list(exact_piotroski_membership_symbols or [])
+        )
+        if _validated_atomic_scope_partition(
+            stage_result=stage_result,
+            invocation_symbols=signal_invocation_symbols,
+            stage_id='signal_features',
+            finalization_stage_id='signal_features',
+            market_date=latest_trade_date,
+            exact_publication_symbols=signal_invocation_symbols,
+        ) is None:
+            raise RuntimeError(
+                'signal_features atomic exact-scope proof does not match '
+                'its stage, date, publication scope, or successful '
+                'partition'
+            )
         return stage_result
 
     def run_signal_feature_followup() -> dict[str, Any]:
@@ -5321,7 +5792,7 @@ def run_market_data_pipeline(
         return run_followup_stage(
             'intraday_snapshots',
             activity='Collecting KIS intraday snapshot follow-up',
-            call=lambda: _run_daily_intraday_snapshot_followup(
+            call=lambda: _run_terminalized_daily_intraday_snapshot_followup(
                 market_date=latest_trade_date,
                 enabled=bool(
                     dependencies.settings.kis_intraday_snapshot_enabled
@@ -5329,47 +5800,6 @@ def run_market_data_pipeline(
             ),
             default_total=len(requested_symbol_codes),
         )
-
-    dart_auto_followup_enabled = bool((dependencies.settings.dart_api_key or '').strip())
-
-    def validated_successful_cohort(
-        *,
-        stage_result: Mapping[str, Any],
-        invocation_symbols: Sequence[str],
-        stage_id: str,
-    ) -> list[str] | None:
-        stage_status = _resolve_result_status(
-            dict(stage_result),
-            stage_id=stage_id,
-        )
-        partition = _validated_exact_scope_outcome(
-            result=stage_result,
-            invocation_symbols=invocation_symbols,
-            status=stage_status,
-        )
-        if partition is not None:
-            # A symbol-exhaustive debt partition can advance its successful
-            # cohort.  A partial result without symbol debt represents a
-            # shared/global quality failure and remains fail-closed.
-            if (
-                stage_status == 'partial'
-                and not partition['retry_debt_stock_codes']
-                and str(stage_result.get('gate_status') or '').lower()
-                != 'ready'
-            ):
-                return None
-            if str(stage_result.get('gate_status') or '').lower() == 'blocked':
-                return None
-            if str(stage_result.get('reason') or '').startswith(
-                'piotroski_evidence_'
-            ):
-                return None
-            return list(partition['successful_stock_codes'])
-        if stage_result.get('scope_outcome_manifest_version') is not None:
-            return None
-        if stage_status == 'completed':
-            return list(invocation_symbols)
-        return None
 
     exact_followup_symbols = list(
         dict.fromkeys(exact_piotroski_membership_symbols or [])
@@ -5380,14 +5810,7 @@ def run_market_data_pipeline(
     ] = [
         (
             'price_collection',
-            {
-                **price_scope_outcome,
-                'status': (
-                    'partial'
-                    if price_retry_symbol_codes
-                    else 'completed'
-                ),
-            },
+            price_context_result,
             requested_symbol_codes,
         )
     ]
@@ -5425,13 +5848,63 @@ def run_market_data_pipeline(
 
     early_scope_proof_valid = bool(daily_followup_admitted_symbols)
     early_scope_validation_results: list[dict[str, Any]] = []
+    atomic_finalization_stage_ids = {
+        'price_collection': 'price_contexts',
+        'technical_snapshots': 'technical_snapshots',
+        'action_summaries': 'action_summaries',
+        'signal_features': 'signal_features',
+        'market_risk_filter': 'market_risk_filter',
+    }
     for early_stage_id, early_stage_result, invocation_scope in (
         early_scope_results
     ):
-        successful_cohort = validated_successful_cohort(
-            stage_result=early_stage_result,
-            invocation_symbols=invocation_scope,
+        if _is_canonical_point_in_time_current_only_skip(
+            early_stage_result,
             stage_id=early_stage_id,
+            market_date=latest_trade_date,
+        ):
+            # Current-only KIS stages cannot be replayed for an older
+            # session.  Their canonical safety skip is deliberately neutral:
+            # it neither proves new symbols nor erases the exact successful
+            # cohort already established by replayable upstream stages.
+            early_scope_validation_results.append(
+                {
+                    'stage_id': early_stage_id,
+                    'proof_valid': True,
+                    'admission_neutral': True,
+                    'successful_symbols_count': len(
+                        daily_followup_admitted_symbols
+                    ),
+                }
+            )
+            continue
+        finalization_stage_id = atomic_finalization_stage_ids.get(
+            early_stage_id
+        )
+        successful_cohort = (
+            _validated_atomic_successful_cohort(
+                stage_result=early_stage_result,
+                invocation_symbols=invocation_scope,
+                stage_id=early_stage_id,
+                finalization_stage_id=finalization_stage_id,
+                market_date=latest_trade_date,
+                exact_publication_symbols=(
+                    requested_symbol_codes
+                    if early_stage_id
+                    in {
+                        'price_collection',
+                        'technical_snapshots',
+                        'action_summaries',
+                    }
+                    else exact_followup_symbols
+                ),
+            )
+            if finalization_stage_id is not None
+            else _validated_successful_cohort(
+                stage_result=early_stage_result,
+                invocation_symbols=invocation_scope,
+                stage_id=early_stage_id,
+            )
         )
         early_scope_validation_results.append(
             {
@@ -5532,6 +6005,16 @@ def run_market_data_pipeline(
                 error_message=str(checkpoint_error)
             )
             raise checkpoint_error from exc
+    dart_provider_block = (
+        _required_provider_blocked_result(
+            stage_id='fundamentals_daily_refresh',
+            market_date=latest_trade_date,
+            symbols=daily_followup_admitted_symbols,
+        )
+        if chain_fundamentals_followup and mode == 'daily_auto'
+        else None
+    )
+    dart_auto_followup_enabled = dart_provider_block is None
     should_chain_fundamentals = (
         chain_fundamentals_followup
         and 'market_risk_filter' in requested_stage_set
@@ -5626,8 +6109,11 @@ def run_market_data_pipeline(
                 result['macro_context_followup'],
             )
             result['intraday_snapshot_followup'] = (
-                build_downstream_recovery_pending_result(
-                    'intraday_snapshots'
+                _terminalize_optional_intraday_snapshot_result(
+                    market_date=latest_trade_date,
+                    result=build_downstream_recovery_pending_result(
+                        'intraday_snapshots'
+                    ),
                 )
             )
             record_followup_result(
@@ -5737,7 +6223,7 @@ def run_market_data_pipeline(
                     'error_type': type(exc).__name__,
                     'error_message': str(exc),
                 }
-            pitr_piotroski_admitted_symbols = validated_successful_cohort(
+            pitr_piotroski_admitted_symbols = _validated_successful_cohort(
                 stage_result=result['piotroski_filter_followup'],
                 invocation_symbols=pitr_piotroski_invocation_symbols,
                 stage_id='piotroski_filter',
@@ -5761,12 +6247,15 @@ def run_market_data_pipeline(
                     result['reason'] = 'pipeline_run_ownership_lost'
                     return result
                 pitr_factor_admitted_symbols = (
-                    validated_successful_cohort(
+                    _validated_successful_cohort(
                         stage_result=result['factor_scoring_followup'],
                         invocation_symbols=(
                             pitr_piotroski_admitted_symbols
                         ),
                         stage_id='composite_factors',
+                        expected_manifest_versions=frozenset(
+                            {'factor_followup_scope_outcomes_v1'}
+                        ),
                     )
                 )
             else:
@@ -5888,20 +6377,13 @@ def run_market_data_pipeline(
                     result[result_key] = stage_result
                     record_followup_result(stage_id, stage_result)
         elif should_chain_fundamentals:
-            fundamentals_refresh_kwargs: dict[str, Any] = {
-                'market_date': latest_trade_date,
-                'capture_limit': 500,
-                'trigger': 'eod_pykrx_followup',
-                'run_piotroski_followup': False,
-                'run_feedback_followup': False,
-                'progress_callback': fundamentals_progress_callback,
-            }
-            if set(daily_followup_admitted_symbols) != set(
-                exact_followup_symbols
-            ):
-                fundamentals_refresh_kwargs['symbols'] = list(
-                    daily_followup_admitted_symbols
+            fundamentals_refresh_kwargs = (
+                _build_daily_fundamentals_refresh_kwargs(
+                    market_date=latest_trade_date,
+                    admitted_symbols=daily_followup_admitted_symbols,
+                    progress_callback=fundamentals_progress_callback,
                 )
+            )
             result['fundamentals_followup'] = run_followup_stage(
                 'fundamentals_daily_refresh',
                 activity='Running DART fundamentals daily refresh follow-up',
@@ -5912,7 +6394,7 @@ def run_market_data_pipeline(
                 ),
             )
             fundamentals_status = _resolve_result_status(result['fundamentals_followup'])
-            fundamentals_admitted_symbols = validated_successful_cohort(
+            fundamentals_admitted_symbols = _validated_successful_cohort(
                 stage_result=result['fundamentals_followup'],
                 invocation_symbols=daily_followup_admitted_symbols,
                 stage_id='fundamentals_daily_refresh',
@@ -5974,7 +6456,7 @@ def run_market_data_pipeline(
                 result['piotroski_filter_followup']
             )
             piotroski_admitted_symbols = (
-                validated_successful_cohort(
+                _validated_successful_cohort(
                     stage_result=result['piotroski_filter_followup'],
                     invocation_symbols=fundamentals_admitted_symbols or [],
                     stage_id='piotroski_filter',
@@ -6004,10 +6486,13 @@ def run_market_data_pipeline(
                 factor_status = _resolve_result_status(
                     result['factor_scoring_followup']
                 )
-                factor_admitted_symbols = validated_successful_cohort(
+                factor_admitted_symbols = _validated_successful_cohort(
                     stage_result=result['factor_scoring_followup'],
                     invocation_symbols=piotroski_admitted_symbols or [],
                     stage_id='composite_factors',
+                    expected_manifest_versions=frozenset(
+                        {'factor_followup_scope_outcomes_v1'}
+                    ),
                 )
                 if factor_admitted_symbols:
                     signal_feature_admitted_symbols = (
@@ -6036,7 +6521,7 @@ def run_market_data_pipeline(
                     factor_admitted_symbols or []
                 )
                 signal_feature_successful_symbols = (
-                    validated_successful_cohort(
+                    _validated_successful_cohort(
                         stage_result=result['signal_feature_followup'],
                         invocation_symbols=(
                             signal_feature_invocation_symbols
@@ -6262,18 +6747,21 @@ def run_market_data_pipeline(
                     'signal_decider_evaluations',
                     result['signal_decider_evaluation_followup'],
                 )
-        elif chain_fundamentals_followup and mode == 'daily_auto' and status in {'completed', 'completed_with_errors'}:
-            result['fundamentals_followup'] = {
-                'triggered': False,
-                'reason': 'dart_api_key_not_configured',
-                'market_date': latest_trade_date,
-            }
+        elif (
+            chain_fundamentals_followup
+            and mode == 'daily_auto'
+            and status in {'completed', 'completed_with_errors'}
+            and dart_provider_block is not None
+        ):
+            result['fundamentals_followup'] = dict(
+                dart_provider_block
+            )
             record_followup_result('fundamentals_daily_refresh', result['fundamentals_followup'])
             result['piotroski_filter_followup'] = (
                 build_blocked_followup_result(
                     'piotroski_filter',
-                    'dart_api_key_not_configured',
-                    upstream_status='skipped',
+                    'required_provider_not_ready',
+                    upstream_status='blocked',
                 )
             )
             record_followup_result(
@@ -6283,7 +6771,7 @@ def run_market_data_pipeline(
             result['factor_scoring_followup'] = {
                 'triggered': False,
                 'status': 'blocked',
-                'reason': 'dart_api_key_not_configured',
+                'reason': 'required_provider_not_ready',
                 'market_date': latest_trade_date,
             }
             record_factor_followup_result(result['factor_scoring_followup'])

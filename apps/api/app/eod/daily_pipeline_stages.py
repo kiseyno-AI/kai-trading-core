@@ -68,6 +68,7 @@ from app.eod.pykrx_pipeline_runner import (
     resolve_point_in_time_recovery,
     should_skip_point_in_time_current_only_stage,
     _finalize_daily_stage_scope,
+    _run_terminalized_daily_intraday_snapshot_followup,
     _validated_exact_scope_outcome,
     _validated_exact_piotroski_membership_symbols,
 )
@@ -85,8 +86,14 @@ from app.eod.run_stage_support import (
     nonblocking_partial_progression_digest,
 )
 from app.eod.scope_outcomes import (
-    EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
+    FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION,
+    STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
+    STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
+    build_exact_scope_partition_identity_proof,
     build_exact_symbol_scope_outcome,
+    exact_scope_partition_identity_proof_matches,
+    validate_atomic_scope_finalization,
+    validate_stage_bound_scope_outcome,
 )
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.eod.technical_snapshots import daily_technical_snapshot_service
@@ -110,8 +117,13 @@ from app.signals.market_risk_filter import (
     daily_market_risk_filter_service,
 )
 from app.signals.market_risk_snapshot import (
+    BLOCKED_MISSING_CREDENTIAL_CLASSIFICATION,
     MARKET_RISK_SNAPSHOT_SOURCE,
+    REQUIRED_PROVIDER_ADMISSION_SCHEMA_VERSION,
+    build_required_provider_admission,
+    build_required_provider_blocked_result,
     daily_market_risk_snapshot_service,
+    kis_market_risk_provider_readiness,
 )
 from app.signals.momentum_factor import daily_momentum_factor_service
 from app.signals.piotroski_filter import daily_piotroski_filter_service
@@ -161,6 +173,20 @@ EXACT_FINALIZATION_STAGE_IDS = frozenset(
         'signal_features',
     }
 )
+EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS = {
+    'fundamentals_daily_refresh': frozenset(
+        {
+            'dart_daily_data_scope_outcomes_v1',
+            'dart_fundamentals_scope_outcomes_v1',
+        }
+    ),
+    'piotroski_filter': frozenset({'piotroski_scope_outcomes_v1'}),
+    **{
+        stage_id: frozenset({'factor_scope_outcomes_v1'})
+        for stage_id in FACTOR_STAGE_ORDER
+    },
+    'signal_features': frozenset({'signal_features_scope_outcomes_v1'}),
+}
 DAILY_STAGE_ORDER: tuple[str, ...] = (
     'master_refresh',
     'pykrx_universe_refresh',
@@ -175,6 +201,7 @@ DAILY_STAGE_ORDER: tuple[str, ...] = (
     'external_news_collect',
     'external_news_enrich',
     'macro_context_refresh',
+    'intraday_snapshots',
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
@@ -193,6 +220,7 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'external_news_collect',
     'external_news_enrich',
     'macro_context_refresh',
+    'intraday_snapshots',
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
@@ -208,7 +236,7 @@ DEFAULT_FEEDBACK_MAX_CYCLES = 3
 DEFAULT_FEEDBACK_OUTER_BATCH_SIZE = 20
 FACTOR_STAGE_HEARTBEAT_INTERVAL_SECONDS = 60.0
 DAILY_PIPELINE_FINALIZATION_ATTEMPTS = 3
-EXACT_SCOPE_OUTCOME_PROOF_SCHEMA_VERSION = 'exact_scope_outcome_proof_v1'
+EXACT_SCOPE_OUTCOME_PROOF_SCHEMA_VERSION = 'exact_scope_outcome_proof_v2'
 STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION = (
     'stage_completion_scope_v1'
 )
@@ -219,11 +247,110 @@ CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER: tuple[str, ...] = (
     *FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
     'signal_features',
 )
+DART_FUNDAMENTALS_REQUIRED_STAGE_IDS = (
+    'fundamentals_daily_refresh',
+)
+KIS_MARKET_RISK_REQUIRED_STAGE_IDS = (
+    'market_risk_snapshots',
+    'market_risk_filter',
+)
 # External news collect/enrich and macro refresh are deliberately absent from
 # the hard gate. daily_pipeline_outcomes classifies them as ordering-only
 # optional context whose terminal degradation may lower confidence but must
 # not block feedback. Historical point-in-time recovery also excludes current-
 # only signal features and retains the date-bounded numeric prerequisite set.
+
+
+def dart_fundamentals_provider_readiness() -> dict[str, Any]:
+    return build_required_provider_admission(
+        provider='dart',
+        missing_credentials=(
+            [] if settings.dart_api_key.strip() else ['DART_API_KEY']
+        ),
+        required_stage_ids=DART_FUNDAMENTALS_REQUIRED_STAGE_IDS,
+    )
+
+
+def inspect_daily_pipeline_required_provider_readiness(
+    stage_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Return required-provider admission without starting a run attempt.
+
+    Naver and FRED are intentionally absent: external news and macro context
+    remain optional, nonblocking context providers.
+    """
+
+    selected_stage_ids = list(
+        dict.fromkeys(
+            str(stage_id).strip()
+            for stage_id in (
+                DEFAULT_DAILY_STAGE_ORDER
+                if stage_ids is None
+                else stage_ids
+            )
+            if str(stage_id).strip()
+        )
+    )
+    selected_stage_set = set(selected_stage_ids)
+    providers: dict[str, dict[str, Any]] = {}
+    if selected_stage_set.intersection(
+        DART_FUNDAMENTALS_REQUIRED_STAGE_IDS
+    ):
+        dart_readiness = dart_fundamentals_provider_readiness()
+        dart_readiness['required_stage_ids'] = [
+            stage_id
+            for stage_id in DART_FUNDAMENTALS_REQUIRED_STAGE_IDS
+            if stage_id in selected_stage_set
+        ]
+        providers['dart'] = dart_readiness
+    if selected_stage_set.intersection(
+        KIS_MARKET_RISK_REQUIRED_STAGE_IDS
+    ):
+        kis_readiness = kis_market_risk_provider_readiness()
+        kis_readiness['required_stage_ids'] = [
+            stage_id
+            for stage_id in KIS_MARKET_RISK_REQUIRED_STAGE_IDS
+            if stage_id in selected_stage_set
+        ]
+        providers['kis'] = kis_readiness
+
+    blockers = [
+        dict(provider_readiness)
+        for provider_readiness in providers.values()
+        if provider_readiness.get('ready') is not True
+    ]
+    ready = not blockers
+    classification = (
+        'ready'
+        if ready
+        else BLOCKED_MISSING_CREDENTIAL_CLASSIFICATION
+    )
+    return {
+        'schema_version': REQUIRED_PROVIDER_ADMISSION_SCHEMA_VERSION,
+        'status': classification,
+        'classification': classification,
+        'ready': ready,
+        'requested_stage_ids': selected_stage_ids,
+        'required_stage_ids': [
+            stage_id
+            for stage_id in selected_stage_ids
+            if any(
+                stage_id in provider_readiness['required_stage_ids']
+                for provider_readiness in providers.values()
+            )
+        ],
+        'providers': providers,
+        'blockers': blockers,
+        'missing_credentials': list(
+            dict.fromkeys(
+                credential
+                for blocker in blockers
+                for credential in blocker['missing_credentials']
+            )
+        ),
+        'attempt_started': False,
+        'consumes_retry_budget': False,
+    }
 
 
 class DailyPipelineStageCheckpointError(RuntimeError):
@@ -553,6 +680,18 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         output_tables=('macro_context_observations',),
         default_selected=True,
     ),
+    'intraday_snapshots': DailyStageDefinition(
+        id='intraday_snapshots',
+        label='KIS intraday snapshot collect',
+        group='external_data',
+        description=(
+            'Collect optional current-session KIS context for the same '
+            'strategy-eligible symbol scope used by agent feedback.'
+        ),
+        inspect_routes=('/broker/kis/intraday-snapshots',),
+        output_tables=('kis_intraday_snapshots',),
+        default_selected=True,
+    ),
     'agent_feedback_summaries': DailyStageDefinition(
         id='agent_feedback_summaries',
         label='agent feedback summarizer dispatch',
@@ -566,6 +705,7 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
             'external_news_collect',
             'external_news_enrich',
             'macro_context_refresh',
+            'intraday_snapshots',
         ),
         supports_symbols=True,
         supports_capture_limit=True,
@@ -624,12 +764,72 @@ class DailyPipelineStageService:
         feedback_retry_service=agent_feedback_retry_service,
         decision_loop_service=signal_decider_loop_service,
         run_state_service=None,
+        required_provider_readiness: Callable[
+            [Sequence[str]], Mapping[str, Any]
+        ] | None = None,
     ) -> None:
         self.pykrx_service = pykrx_service
         self.pykrx_enrichment_service = pykrx_enrichment_service_ref
         self.feedback_retry_service = feedback_retry_service
         self.decision_loop_service = decision_loop_service
         self.run_state_service = run_state_service or daily_pipeline_run_state_service
+        self.required_provider_readiness = required_provider_readiness
+
+    def _required_provider_blocked_stage_result(
+        self,
+        *,
+        stage_id: str,
+        market_date: str,
+        symbols: Sequence[str] | None,
+    ) -> dict[str, Any] | None:
+        if self.required_provider_readiness is None:
+            return None
+        readiness = dict(
+            self.required_provider_readiness([stage_id])
+        )
+        if readiness.get('ready') is True:
+            return None
+        blockers = readiness.get('blockers')
+        if not isinstance(blockers, list):
+            return None
+        provider_admission = next(
+            (
+                dict(blocker)
+                for blocker in blockers
+                if isinstance(blocker, Mapping)
+                and stage_id
+                in list(blocker.get('required_stage_ids') or [])
+            ),
+            None,
+        )
+        if provider_admission is None:
+            return None
+        result = build_required_provider_blocked_result(
+            stage_id=stage_id,
+            market_date=market_date,
+            provider_admission=provider_admission,
+            symbols=symbols,
+        )
+        if stage_id == 'market_risk_snapshots':
+            result.update(
+                snapshots_persisted=0,
+                snapshots_failed=0,
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+        elif stage_id == 'market_risk_filter':
+            result.update(
+                results_persisted=0,
+                results_failed=0,
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+        elif stage_id == 'fundamentals_daily_refresh':
+            result.update(
+                events_captured=0,
+                events_failed=0,
+            )
+        return result
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -726,6 +926,7 @@ class DailyPipelineStageService:
         inherited_feedback_retry_config: Mapping[str, Any] | None = None,
         provider_admission_fence_owned: bool = False,
         recovery_parent_scope_outcome: Mapping[str, Any] | None = None,
+        recovery_stage_scope_outcome: Mapping[str, Any] | None = None,
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
         same_day_intraday_watch_rearm_resume: bool = False,
@@ -758,16 +959,31 @@ class DailyPipelineStageService:
             exact_membership_symbols
         )
         recovery_parent_partition: dict[str, Any] | None = None
+        recovery_stage_partition: dict[str, Any] | None = None
+        recovery_stage_id: str | None = None
         resolved_markets = self._normalize_markets(markets)
         if exact_membership_symbols is not None:
+            linked_exact_stage_recovery = bool(
+                recovery_stage_scope_outcome is not None
+                and trigger == 'auto_eod_followup_resume'
+                and reused_eod_collection_run_id is not None
+            )
             if (
                 resolved_exact_membership_symbols is None
-                or not point_in_time_recovery
+                or (
+                    not point_in_time_recovery
+                    and not linked_exact_stage_recovery
+                )
                 or reused_eod_collection_run_id is None
             ):
                 raise ValueError(
                     'exact_membership_symbols requires a validated '
                     'point-in-time recovery parent'
+                )
+            if recovery_parent_scope_outcome is None:
+                raise ValueError(
+                    'exact_membership_symbols requires a validated '
+                    'auto-EOD parent admission partition'
                 )
             outside_membership = sorted(
                 set(resolved_symbols or ())
@@ -778,30 +994,118 @@ class DailyPipelineStageService:
                     'requested recovery symbols must be contained in exact '
                     'membership: ' + ','.join(outside_membership[:20])
                 )
-            if recovery_parent_scope_outcome is not None:
-                parent_retry_debt = recovery_parent_scope_outcome.get(
-                    'retry_debt_stock_codes'
+            parent_selected_symbols = (
+                recovery_parent_scope_outcome.get(
+                    'selected_stock_codes'
                 )
-                parent_status = (
-                    'partial'
-                    if isinstance(parent_retry_debt, list)
-                    and parent_retry_debt
-                    else 'completed'
+            )
+            parent_retry_debt = recovery_parent_scope_outcome.get(
+                'retry_debt_stock_codes'
+            )
+            parent_status = (
+                'partial'
+                if isinstance(parent_retry_debt, list)
+                and parent_retry_debt
+                else 'completed'
+            )
+            recovery_parent_partition = (
+                _validated_exact_scope_outcome(
+                    result=recovery_parent_scope_outcome,
+                    invocation_symbols=parent_selected_symbols,
+                    status=parent_status,
                 )
-                recovery_parent_partition = (
-                    _validated_exact_scope_outcome(
-                        result=recovery_parent_scope_outcome,
-                        invocation_symbols=(
-                            resolved_exact_membership_symbols
-                        ),
-                        status=parent_status,
-                    )
+                if isinstance(parent_selected_symbols, list)
+                else None
+            )
+            if recovery_parent_partition is None:
+                raise ValueError(
+                    'recovery parent scope outcome is not an exact '
+                    'membership-bound partition'
                 )
+            if (
+                recovery_parent_partition['manifest_version']
+                != 'auto_eod_followup_admission_scope_outcomes_v1'
+            ):
+                raise ValueError(
+                    'recovery parent scope outcome is not an auto-EOD '
+                    'follow-up admission partition'
+                )
+            expected_parent_membership = (
+                recovery_parent_partition['successful_stock_codes']
+                if recovery_stage_scope_outcome is not None
+                else recovery_parent_partition['selected_stock_codes']
+            )
+            if set(resolved_exact_membership_symbols) != set(
+                expected_parent_membership
+            ):
+                raise ValueError(
+                    'exact recovery membership does not match the '
+                    'required parent cohort'
+                )
+            if recovery_stage_scope_outcome is not None:
                 if recovery_parent_partition is None:
                     raise ValueError(
-                        'recovery parent scope outcome is not an exact '
-                        'membership-bound partition'
+                        'exact stage recovery requires a validated auto-EOD '
+                        'parent admission partition'
                     )
+                if len(requested_stages) != 1 or not resolved_symbols:
+                    raise ValueError(
+                        'recovery stage scope outcome requires one exact '
+                        'stage and a non-empty retry scope'
+                    )
+                recovery_stage_id = requested_stages[0]
+                allowed_versions = (
+                    EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS.get(
+                        recovery_stage_id
+                    )
+                )
+                selected_stage_symbols = (
+                    recovery_stage_scope_outcome.get(
+                        'selected_stock_codes'
+                    )
+                )
+                if (
+                    allowed_versions is None
+                    or not isinstance(selected_stage_symbols, list)
+                    or recovery_stage_scope_outcome.get('schema_version')
+                    != FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION
+                    or str(
+                        recovery_stage_scope_outcome.get('stage_id') or ''
+                    ).strip()
+                    != recovery_stage_id
+                ):
+                    raise ValueError(
+                        'recovery stage scope outcome is unsupported'
+                    )
+                recovery_stage_partition = (
+                    _validated_exact_scope_outcome(
+                        result=recovery_stage_scope_outcome,
+                        invocation_symbols=selected_stage_symbols,
+                        status='partial',
+                    )
+                )
+                if (
+                    recovery_stage_partition is None
+                    or recovery_stage_partition['manifest_version']
+                    not in allowed_versions
+                    or not set(
+                        recovery_stage_partition['selected_stock_codes']
+                    ).issubset(set(resolved_exact_membership_symbols))
+                    or set(resolved_symbols)
+                    != set(
+                        recovery_stage_partition[
+                            'retry_debt_stock_codes'
+                        ]
+                    )
+                ):
+                    raise ValueError(
+                        'recovery stage scope outcome is not a valid '
+                        'stage-debt-bound partition'
+                    )
+        elif recovery_stage_scope_outcome is not None:
+            raise ValueError(
+                'recovery stage scope outcome requires exact membership'
+            )
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         feedback_knowledge_cutoff_at: datetime | None = None
         feedback_cutoff_resolution: dict[str, Any] | None = None
@@ -1322,6 +1626,8 @@ class DailyPipelineStageService:
                 ) = self._restore_persisted_stage_outcome(
                     stage_id=stage_id,
                     persisted_outcome=persisted_outcome,
+                    expected_market_date=resolved_market_date,
+                    publication_symbols=resolved_exact_membership_symbols,
                 )
                 stage_outcomes[stage_id] = restored_outcome
                 if restored_invocation is not None:
@@ -1714,6 +2020,8 @@ class DailyPipelineStageService:
                     ) = self._restore_persisted_stage_outcome(
                         stage_id=stage_id,
                         persisted_outcome=persisted_outcome,
+                        expected_market_date=resolved_market_date,
+                        publication_symbols=resolved_exact_membership_symbols,
                     )
                 except RuntimeError as exc:
                     self._finish_run_preserving_primary_error(
@@ -2209,6 +2517,9 @@ class DailyPipelineStageService:
                 exact_stage_scope = self._exact_partial_success_scope(
                     outcome=stage_outcomes[stage_id],
                     invocation_symbols=bound_invocation_symbols,
+                    expected_stage_id=stage_id,
+                    expected_market_date=resolved_market_date,
+                    publication_symbols=official_membership_symbols,
                 )
                 has_scope_outcome_claim = any(
                     key in stage_result
@@ -2245,6 +2556,7 @@ class DailyPipelineStageService:
                     invocation_symbols=stage_invocation_symbols.get(
                         stage_id
                     ),
+                    publication_symbols=official_membership_symbols,
                 )
                 handled.add(stage_id)
 
@@ -2261,6 +2573,7 @@ class DailyPipelineStageService:
                         point_in_time_recovery
                         and resolved_exact_membership_symbols is not None
                         and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                        and stage_id != recovery_stage_id
                     )
                 )
             ):
@@ -2437,6 +2750,13 @@ class DailyPipelineStageService:
                         invocation_symbols=stage_invocation_symbols.get(
                             dependency
                         ),
+                        expected_stage_id=dependency,
+                        expected_market_date=resolved_market_date,
+                        publication_symbols=(
+                            stage_invocation_symbols.get(dependency)
+                            if dependency == 'signal_features'
+                            else official_membership_symbols
+                        ),
                     )
                     if exact_scope is None:
                         continue
@@ -2489,6 +2809,7 @@ class DailyPipelineStageService:
                 and resolved_symbols is not None
                 and set(resolved_symbols)
                 != set(official_membership_symbols)
+                and stage_id != recovery_stage_id
             ):
                 recovery_scope = set(resolved_symbols or ())
                 parent_retry_debt = set(
@@ -2964,6 +3285,17 @@ class DailyPipelineStageService:
                             market_date=resolved_market_date,
                             symbols=stage_symbols,
                             exact_scope_symbols=official_membership_symbols,
+                            ranking_scope_symbols=(
+                                official_membership_symbols
+                                if stage_id == recovery_stage_id
+                                else None
+                            ),
+                            publication_scope_symbols=(
+                                list(stage_symbols or [])
+                                if stage_id == recovery_stage_id
+                                and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                                else None
+                            ),
                             markets=resolved_markets,
                             force=force,
                             bypass_prerequisite_gate=(
@@ -3014,6 +3346,10 @@ class DailyPipelineStageService:
                             point_in_time_recovery=(
                                 point_in_time_recovery
                             ),
+                            exact_stage_recovery_authorized=(
+                                stage_id == recovery_stage_id
+                                and recovery_stage_partition is not None
+                            ),
                             allow_same_day_intraday_watch_continuation=(
                                 allow_same_day_intraday_watch_continuation
                             ),
@@ -3044,6 +3380,9 @@ class DailyPipelineStageService:
                                         stage_invocation_symbols.get(
                                             'price_collection'
                                         )
+                                    ),
+                                    expected_market_date=(
+                                        resolved_market_date
                                     ),
                                 )
                                 if stage_id == 'trending_ranks'
@@ -3177,6 +3516,16 @@ class DailyPipelineStageService:
                     result=stage_result,
                     invocation_symbols=stage_invocation_symbols.get(
                         stage_id
+                    ),
+                    publication_symbols=(
+                        list(
+                            stage_invocation_symbols.get(stage_id) or []
+                        )
+                        if stage_id == 'signal_features'
+                        else list(stage_symbols or [])
+                        if stage_id == recovery_stage_id
+                        and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                        else official_membership_symbols
                     ),
                     completion_parent_proof=(
                         stage_completion_authority
@@ -3865,6 +4214,7 @@ class DailyPipelineStageService:
         outcome: dict[str, Any],
         result: dict[str, Any],
         invocation_symbols: Sequence[str] | None = None,
+        publication_symbols: Sequence[str] | None = None,
         completion_parent_proof: Mapping[str, Any] | None = None,
     ) -> None:
         counts = self._extract_stage_counts(stage_id=stage_id, result=result)
@@ -3873,6 +4223,8 @@ class DailyPipelineStageService:
             stage_id=stage_id,
             result=result,
             invocation_symbols=invocation_symbols,
+            market_date=market_date,
+            publication_symbols=publication_symbols,
             completion_parent_proof=completion_parent_proof,
         )
         stage_reason = self._extract_stage_reason(result)
@@ -4801,7 +5153,10 @@ class DailyPipelineStageService:
     def _build_exact_scope_outcome_proof(
         result: Mapping[str, Any],
         *,
+        stage_id: str,
         invocation_symbols: Sequence[str] | None,
+        expected_market_date: str | None = None,
+        publication_symbols: Sequence[str] | None = None,
     ) -> dict[str, Any] | None:
         selected = result.get('selected_stock_codes')
         if not isinstance(selected, list) or invocation_symbols is None:
@@ -4821,16 +5176,40 @@ class DailyPipelineStageService:
             status = DailyPipelineStageService._resolve_result_status(
                 dict(result)
             )
-        partition = _validated_exact_scope_outcome(
+        partition = validate_stage_bound_scope_outcome(
             result=result,
+            expected_stage_id=stage_id,
             invocation_symbols=selected,
             status=status,
+            allow_failed_all=status == 'failed',
+            expected_market_date=expected_market_date,
+            publication_symbols=publication_symbols,
         )
         if partition is None:
             return None
+        expected_manifest_versions = (
+            STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(stage_id)
+        )
+        if (
+            expected_manifest_versions is None
+            or partition['manifest_version']
+            not in expected_manifest_versions
+        ):
+            return None
+        proof_market_date = str(expected_market_date or '').strip()
+        if not proof_market_date:
+            return None
         successful = partition['successful_stock_codes']
-        return {
+        proof = {
             'schema_version': EXACT_SCOPE_OUTCOME_PROOF_SCHEMA_VERSION,
+            'stage_id': stage_id,
+            # Persist the date for every exact-scope stage, including
+            # non-atomic providers such as DART.  Otherwise a compact proof
+            # restored after restart could authorize a same-shaped result
+            # from a different trading date even though the raw validator
+            # correctly rejects it.
+            'market_date': proof_market_date,
+            'outcome_status': status,
             'manifest_version': partition['manifest_version'],
             # Keep the invocation identities outside the compact result
             # summary.  The count/hash binds the list to the invocation that
@@ -4851,7 +5230,38 @@ class DailyPipelineStageService:
             'terminal_not_applicable_stock_codes': list(
                 partition['terminal_not_applicable_stock_codes']
             ),
+            **build_exact_scope_partition_identity_proof(
+                retry_debt_symbols=partition[
+                    'retry_debt_stock_codes'
+                ],
+                terminal_not_applicable_symbols=partition[
+                    'terminal_not_applicable_stock_codes'
+                ],
+            ),
         }
+        finalization = partition.get('scope_finalization')
+        if isinstance(finalization, Mapping):
+            proof.update(
+                {
+                    'finalization_stage_id': finalization['stage'],
+                    'finalization_market_date': finalization[
+                        'market_date'
+                    ],
+                    'finalization_exact_symbol_count': finalization[
+                        'exact_symbol_count'
+                    ],
+                    'finalization_exact_membership_sha256': (
+                        finalization['exact_membership_sha256']
+                    ),
+                    'finalization_successful_symbol_count': (
+                        finalization['successful_symbol_count']
+                    ),
+                    'finalization_successful_membership_sha256': (
+                        finalization['successful_membership_sha256']
+                    ),
+                }
+            )
+        return proof
 
     @staticmethod
     def _stage_completion_scope_proof_digest(
@@ -6523,6 +6933,8 @@ class DailyPipelineStageService:
         stage_id: str,
         result: dict[str, Any],
         invocation_symbols: Sequence[str] | None = None,
+        market_date: str | None = None,
+        publication_symbols: Sequence[str] | None = None,
         completion_parent_proof: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         definition = STAGE_DEFINITIONS[stage_id]
@@ -6542,7 +6954,10 @@ class DailyPipelineStageService:
         exact_scope_outcome_proof = (
             DailyPipelineStageService._build_exact_scope_outcome_proof(
                 result,
+                stage_id=stage_id,
                 invocation_symbols=invocation_symbols,
+                expected_market_date=market_date,
+                publication_symbols=publication_symbols,
             )
         )
         if exact_scope_outcome_proof is not None:
@@ -6614,15 +7029,69 @@ class DailyPipelineStageService:
                 )
             raise
         if atomic_finalization:
-            finalization = result.get('scope_finalization')
-            if exact_scope_symbols is not None and not (
-                isinstance(finalization, Mapping)
-                and finalization.get('ready') is True
-            ):
-                raise DailyPipelineScopeFinalizationError(
-                    f'{stage_id} atomic exact-scope finalization proof '
-                    'is unavailable'
+            if exact_scope_symbols is not None:
+                expected_manifest_versions = (
+                    STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(
+                        stage_id
+                    )
                 )
+                successful_symbols: list[str] | None = None
+                if expected_manifest_versions is not None:
+                    selected_symbols = result.get(
+                        'selected_stock_codes'
+                    )
+                    partition = (
+                        validate_stage_bound_scope_outcome(
+                            result=result,
+                            expected_stage_id=stage_id,
+                            invocation_symbols=selected_symbols,
+                            status=(
+                                DailyPipelineStageService
+                                ._resolve_result_status(result)
+                            ),
+                            allow_failed_all=True,
+                            expected_market_date=market_date,
+                            publication_symbols=exact_scope_symbols,
+                        )
+                        if isinstance(selected_symbols, list)
+                        else None
+                    )
+                    if (
+                        partition is not None
+                        and partition['manifest_version']
+                        in expected_manifest_versions
+                        and set(partition['selected_stock_codes'])
+                        <= set(normalize_symbol_codes(exact_scope_symbols))
+                    ):
+                        successful_symbols = list(
+                            partition['successful_stock_codes']
+                        )
+                elif stage_id == 'market_risk_snapshots':
+                    raw_items = result.get('items')
+                    if isinstance(raw_items, list):
+                        successful_symbols = normalize_symbol_codes(
+                            [
+                                item.get('symbol')
+                                for item in raw_items
+                                if isinstance(item, Mapping)
+                            ]
+                        )
+                if successful_symbols is None or (
+                    stage_id == 'market_risk_snapshots'
+                    and validate_atomic_scope_finalization(
+                        result=result,
+                        stage_id=stage_id,
+                        market_date=market_date,
+                        exact_symbols=exact_scope_symbols,
+                        successful_symbols=successful_symbols,
+                    )
+                    is None
+                ):
+                    raise DailyPipelineScopeFinalizationError(
+                        f'{stage_id} atomic exact-scope finalization proof '
+                        'does not match its stage, date, publication scope, '
+                        'or successful partition'
+                    )
             return result
         if exact_scope_symbols is not None:
             result['scope_finalization'] = (
@@ -7013,11 +7482,28 @@ class DailyPipelineStageService:
         progress_callback: Callable[..., Any] | None = None,
         allow_expired_analysis_replay: bool = False,
         exact_scope_symbols: list[str] | None = None,
+        ranking_scope_symbols: list[str] | None = None,
+        publication_scope_symbols: list[str] | None = None,
+        exact_stage_recovery_authorized: bool = False,
         complete_price_scope_proven: bool = False,
     ) -> dict[str, Any]:
+        derived_ranking_scope_symbols = (
+            ranking_scope_symbols
+            if ranking_scope_symbols is not None
+            else exact_scope_symbols
+        )
+        derived_publication_scope_symbols = (
+            publication_scope_symbols
+            if publication_scope_symbols is not None
+            else exact_scope_symbols
+        )
         if (
             point_in_time_recovery
             and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+            and not (
+                exact_stage_recovery_authorized
+                and stage_id == 'fundamentals_daily_refresh'
+            )
             and should_skip_point_in_time_current_only_stage(
                 stage_id=stage_id,
                 market_date=market_date,
@@ -7050,6 +7536,19 @@ class DailyPipelineStageService:
             )
             if expired_decision_result is not None:
                 return expired_decision_result
+        required_provider_blocked_result = (
+            self._required_provider_blocked_stage_result(
+                stage_id=stage_id,
+                market_date=market_date,
+                symbols=(
+                    exact_scope_symbols
+                    if exact_scope_symbols is not None
+                    else symbols
+                ),
+            )
+        )
+        if required_provider_blocked_result is not None:
+            return required_provider_blocked_result
         if stage_id == 'master_refresh':
             symbols_refreshed = refresh_master_if_due(force=force)
             return {
@@ -7383,16 +7882,19 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_piotroski_filter_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7402,16 +7904,19 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_momentum_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7421,17 +7926,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_value_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=VALUE_FACTOR_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7441,17 +7949,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_low_risk_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=LOW_RISK_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7461,17 +7972,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_beta_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=BETA_FACTOR_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7481,17 +7995,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_advanced_value_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=ADVANCED_VALUE_FACTOR_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7501,17 +8018,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_unified_value_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=UNIFIED_VALUE_FACTOR_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7521,17 +8041,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_quality_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=QUALITY_FACTOR_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7541,17 +8064,20 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: daily_composite_factor_service.rebuild_for_market_date(
                     market_date=market_date,
                     symbols=symbols,
                     source=COMPOSITE_FACTOR_SOURCE,
                     **(
                         {
-                            'ranking_symbols': exact_scope_symbols,
-                            'exact_scope_symbols': exact_scope_symbols,
+                            'ranking_symbols': derived_ranking_scope_symbols,
+                            'exact_scope_symbols': (
+                                derived_publication_scope_symbols
+                            ),
                         }
-                        if exact_scope_symbols is not None
+                        if derived_ranking_scope_symbols is not None
+                        and derived_publication_scope_symbols is not None
                         else {}
                     ),
                 ),
@@ -7587,6 +8113,18 @@ class DailyPipelineStageService:
                 call=lambda: macro_context_service.refresh_context(
                     force=force,
                     trigger='daily_pipeline_stage',
+                ),
+            )
+        if stage_id == 'intraday_snapshots':
+            return self._execute_optional_context_stage(
+                stage_id=stage_id,
+                call=lambda: (
+                    _run_terminalized_daily_intraday_snapshot_followup(
+                        market_date=market_date,
+                        enabled=bool(
+                            settings.kis_intraday_snapshot_enabled
+                        ),
+                    )
                 ),
             )
         if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
@@ -8009,6 +8547,7 @@ class DailyPipelineStageService:
                 'scope_outcome_manifest': result.get(
                     'scope_outcome_manifest'
                 ),
+                'scope_finalization': result.get('scope_finalization'),
             }
         payload = dict(result.get(stage_id) or {})
         if stage_id == 'technical_snapshots':
@@ -8055,6 +8594,8 @@ class DailyPipelineStageService:
         *,
         stage_id: str,
         persisted_outcome: Mapping[str, Any],
+        expected_market_date: str,
+        publication_symbols: Sequence[str] | None,
     ) -> tuple[dict[str, Any], list[str] | None]:
         persisted_details = persisted_outcome.get('details')
         persisted_result = (
@@ -8082,6 +8623,15 @@ class DailyPipelineStageService:
         if isinstance(persisted_details, Mapping):
             restored_outcome['details'] = dict(persisted_details)
             if 'exact_scope_outcome_proof' in persisted_details:
+                persisted_exact_proof = persisted_details.get(
+                    'exact_scope_outcome_proof'
+                )
+                proof_publication_symbols = (
+                    persisted_exact_proof.get('selected_stock_codes')
+                    if stage_id == 'signal_features'
+                    and isinstance(persisted_exact_proof, Mapping)
+                    else publication_symbols
+                )
                 proof_only_outcome = {
                     'status': persisted_status,
                     'result': {'status': persisted_status},
@@ -8090,6 +8640,9 @@ class DailyPipelineStageService:
                 restored_scope = self._exact_partial_success_scope(
                     outcome=proof_only_outcome,
                     invocation_symbols=None,
+                    expected_stage_id=stage_id,
+                    expected_market_date=expected_market_date,
+                    publication_symbols=proof_publication_symbols,
                 )
                 if restored_scope is None:
                     raise RuntimeError(
@@ -8113,6 +8666,7 @@ class DailyPipelineStageService:
         admitted_symbols: Sequence[str] | None,
         price_outcome: dict[str, Any] | None,
         price_invocation_symbols: Sequence[str] | None,
+        expected_market_date: str,
     ) -> bool:
         """Require an exhaustive same-run price partition for global ranks."""
 
@@ -8128,6 +8682,9 @@ class DailyPipelineStageService:
         price_scope = cls._exact_partial_success_scope(
             outcome=price_outcome,
             invocation_symbols=price_invocation_symbols,
+            expected_stage_id='price_collection',
+            expected_market_date=expected_market_date,
+            publication_symbols=exact_scope_symbols,
         )
         return bool(
             price_scope is not None
@@ -8147,6 +8704,9 @@ class DailyPipelineStageService:
         *,
         outcome: dict[str, Any] | None,
         invocation_symbols: Sequence[str] | None,
+        expected_stage_id: str,
+        expected_market_date: str | None = None,
+        publication_symbols: Sequence[str] | None = None,
     ) -> dict[str, Any] | None:
         """Return a partial-success partition bound to its exact invocation.
 
@@ -8165,11 +8725,54 @@ class DailyPipelineStageService:
         if not isinstance(result, dict):
             return None
         details = outcome.get('details')
+        persisted_result_summary = (
+            details.get('result_summary')
+            if isinstance(details, Mapping)
+            and isinstance(details.get('result_summary'), Mapping)
+            else {}
+        )
         proof = (
             details.get('exact_scope_outcome_proof')
             if isinstance(details, Mapping)
             else None
         )
+
+        def progression_gate_allows(
+            payload: Mapping[str, Any],
+            *,
+            status: str,
+            retry_symbols: Sequence[str],
+        ) -> bool:
+            gate_status = str(
+                payload.get('gate_status') or ''
+            ).strip().lower()
+            ranking_status = str(
+                payload.get('ranking_dependency_status') or ''
+            ).strip().lower()
+            reason = str(payload.get('reason') or '').strip()
+            return bool(
+                not (
+                    status == 'partial'
+                    and not retry_symbols
+                    and gate_status != 'ready'
+                )
+                and gate_status != 'blocked'
+                and not (
+                    reason.startswith('piotroski_evidence_')
+                    and not retry_symbols
+                )
+                and (
+                    not ranking_status
+                    or ranking_status in {'complete', 'completed', 'ready'}
+                )
+            )
+        expected_manifest_versions = (
+            STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(
+                expected_stage_id
+            )
+        )
+        if expected_manifest_versions is None:
+            return None
         if (
             not isinstance(result.get('selected_stock_codes'), list)
             and isinstance(proof, Mapping)
@@ -8210,8 +8813,16 @@ class DailyPipelineStageService:
             if (
                 proof.get('schema_version')
                 != EXACT_SCOPE_OUTCOME_PROOF_SCHEMA_VERSION
+                or str(proof.get('stage_id') or '').strip()
+                != expected_stage_id
+                or not str(proof.get('market_date') or '').strip()
+                or (
+                    expected_market_date is not None
+                    and str(proof.get('market_date') or '').strip()
+                    != str(expected_market_date).strip()
+                )
                 or str(proof.get('manifest_version') or '').strip()
-                not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS
+                not in expected_manifest_versions
                 or any(not value for value in normalized_invocation)
                 or len(normalized_invocation)
                 != len(invocation_set)
@@ -8226,6 +8837,13 @@ class DailyPipelineStageService:
                 )
                 or retry_set & terminal_set
                 or not (retry_set | terminal_set) <= invocation_set
+                or not exact_scope_partition_identity_proof_matches(
+                    proof=proof,
+                    retry_debt_symbols=retry_debt,
+                    terminal_not_applicable_symbols=(
+                        terminal_not_applicable
+                    ),
+                )
                 or proof.get('selected_symbol_count')
                 != len(normalized_invocation)
                 or str(proof.get('selected_symbol_sha256') or '')
@@ -8243,10 +8861,54 @@ class DailyPipelineStageService:
                 != market_membership_sha256(successful)
             ):
                 return None
+            finalization_stage_id = (
+                STAGE_ATOMIC_FINALIZATION_STAGE_IDS.get(
+                    expected_stage_id
+                )
+            )
+            if finalization_stage_id is not None:
+                normalized_publication = normalize_symbol_codes(
+                    publication_symbols or []
+                )
+                if (
+                    expected_market_date is None
+                    or not normalized_publication
+                    or len(normalized_publication)
+                    != len(publication_symbols or [])
+                    or not invocation_set
+                    <= set(normalized_publication)
+                    or proof.get('finalization_stage_id')
+                    != finalization_stage_id
+                    or proof.get('finalization_market_date')
+                    != str(expected_market_date)
+                    or proof.get('finalization_exact_symbol_count')
+                    != len(normalized_publication)
+                    or proof.get(
+                        'finalization_exact_membership_sha256'
+                    )
+                    != market_membership_sha256(
+                        normalized_publication
+                    )
+                    or proof.get(
+                        'finalization_successful_symbol_count'
+                    )
+                    != len(successful)
+                    or proof.get(
+                        'finalization_successful_membership_sha256'
+                    )
+                    != market_membership_sha256(successful)
+                ):
+                    return None
             outcome_status = str(
                 outcome.get('status') or ''
             ).strip().lower()
             if outcome_status == 'completed' and retry_debt:
+                return None
+            if not progression_gate_allows(
+                persisted_result_summary,
+                status=outcome_status,
+                retry_symbols=retry_debt,
+            ):
                 return None
             return {
                 'manifest_version': proof['manifest_version'],
@@ -8260,7 +8922,7 @@ class DailyPipelineStageService:
         version = str(
             result.get('scope_outcome_manifest_version') or ''
         ).strip()
-        if version not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS:
+        if version not in expected_manifest_versions:
             return None
 
         def normalize_list(key: str) -> list[str] | None:
@@ -8356,13 +9018,21 @@ class DailyPipelineStageService:
         }
         if manifest_outcomes != expected_manifest_outcomes:
             return None
-        return {
-            'manifest_version': version,
-            'selected_stock_codes': selected,
-            'successful_stock_codes': successful,
-            'retry_debt_stock_codes': retry_debt,
-            'terminal_not_applicable_stock_codes': terminal_not_applicable,
-        }
+        partition = validate_stage_bound_scope_outcome(
+            result=result,
+            expected_stage_id=expected_stage_id,
+            invocation_symbols=normalized_invocation,
+            status=outcome_status,
+            expected_market_date=expected_market_date,
+            publication_symbols=publication_symbols,
+        )
+        if partition is None or not progression_gate_allows(
+            result,
+            status=outcome_status,
+            retry_symbols=retry_debt,
+        ):
+            return None
+        return partition
 
     @staticmethod
     def _validated_pykrx_invocation_scope(
@@ -9357,4 +10027,8 @@ class DailyPipelineStageService:
         return 'partial'
 
 
-daily_pipeline_stage_service = DailyPipelineStageService()
+daily_pipeline_stage_service = DailyPipelineStageService(
+    required_provider_readiness=(
+        inspect_daily_pipeline_required_provider_readiness
+    ),
+)

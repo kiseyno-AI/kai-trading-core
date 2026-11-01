@@ -16,6 +16,7 @@ from app.agent_context.run_modes import (
 )
 from app.core.settings import settings
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.market_membership import market_membership_sha256
 from app.eod.daily_pipeline_state import _build_stage_duration_details
 from app.eod.daily_pipeline_stages import (
     CURRENT_FEEDBACK_PREREQUISITE_STAGE_ORDER,
@@ -30,6 +31,30 @@ from app.eod.pykrx_pipeline_runner import (
     _build_exact_scope_outcome,
     _build_pykrx_invocation_scope_proof,
 )
+
+
+def _atomic_scope_finalization(
+    *,
+    stage_id: str,
+    exact_symbols: list[str],
+    successful_symbols: list[str],
+    market_date: str = '2026-04-24',
+    deleted_stale_row_count: int = 0,
+) -> dict:
+    return {
+        'stage': stage_id,
+        'market_date': market_date,
+        'exact_symbol_count': len(exact_symbols),
+        'exact_membership_sha256': market_membership_sha256(
+            exact_symbols
+        ),
+        'successful_symbol_count': len(successful_symbols),
+        'successful_membership_sha256': market_membership_sha256(
+            successful_symbols
+        ),
+        'deleted_stale_row_count': deleted_stale_row_count,
+        'ready': True,
+    }
 
 
 def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
@@ -557,6 +582,7 @@ class _FakePykrxStageRunner:
             ),
             **_build_pykrx_invocation_scope_proof(symbols),
             **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
                 selected_symbols=symbols,
                 successful_symbols=symbols,
                 retry_debt_symbols=[],
@@ -1039,8 +1065,20 @@ class _FakePartiallySuccessfulPykrxStageRunner:
             'symbols_succeeded': 2,
             'symbols_failed': 0,
             'bars_upserted': 2,
+            'universe_snapshot': _complete_pykrx_universe_snapshot(
+                market_date=kwargs['market_date'],
+                markets=['KOSPI', 'KOSDAQ'],
+                symbols=symbols,
+            ),
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=symbols,
+                successful_symbols=symbols,
+                market_date=kwargs['market_date'],
+            ),
             **_build_pykrx_invocation_scope_proof(symbols),
             **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
                 selected_symbols=symbols,
                 successful_symbols=symbols,
                 retry_debt_symbols=[],
@@ -1086,7 +1124,19 @@ class _FakeExactScopePykrxStageRunner:
             'symbols_failed': len(self.retry_debt_symbols),
             'failed_symbols': list(self.retry_debt_symbols),
             'bars_upserted': len(self.successful_symbols),
+            'universe_snapshot': _complete_pykrx_universe_snapshot(
+                market_date=kwargs['market_date'],
+                markets=['KOSPI', 'KOSDAQ'],
+                symbols=self.selected_symbols,
+            ),
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=self.selected_symbols,
+                successful_symbols=self.successful_symbols,
+                market_date=kwargs['market_date'],
+            ),
             **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
                 selected_symbols=self.selected_symbols,
                 successful_symbols=self.successful_symbols,
                 retry_debt_symbols=self.retry_debt_symbols,
@@ -1337,6 +1387,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'external_news_collect',
                 'external_news_enrich',
                 'macro_context_refresh',
+                'intraday_snapshots',
             ],
         )
         signal_decider_stage = next(
@@ -1401,7 +1452,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'contexts_persisted': 2,
                     'contexts_failed': 0,
                     'items': [],
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='price_contexts',
+                        exact_symbols=['005930', '000660'],
+                        successful_symbols=['005930', '000660'],
+                    ),
                     **_build_exact_scope_outcome(
                         manifest_version=(
                             'price_contexts_scope_outcomes_v1'
@@ -1418,7 +1473,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return_value={
                     'snapshots_persisted': 2,
                     'snapshots_failed': 0,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='technical_snapshots',
+                        exact_symbols=['005930', '000660'],
+                        successful_symbols=['005930', '000660'],
+                    ),
                     **_build_exact_scope_outcome(
                         manifest_version=(
                             'technical_snapshots_scope_outcomes_v1'
@@ -1435,7 +1494,19 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return_value={
                     'action_summaries_persisted': 2,
                     'action_summaries_failed': 0,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='action_summaries',
+                        exact_symbols=['005930', '000660'],
+                        successful_symbols=['005930', '000660'],
+                    ),
+                    **_build_exact_scope_outcome(
+                        manifest_version=(
+                            'action_summaries_scope_outcomes_v1'
+                        ),
+                        selected_symbols=['005930', '000660'],
+                        successful_symbols=['005930', '000660'],
+                        retry_debt_symbols=[],
+                    ),
                 },
             ) as rebuild_action_summaries,
             patch(
@@ -1633,7 +1704,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         symbols = ['005930', '000660']
         complete_price_result = {
             'status': 'completed',
+            'market_date': '2026-04-14',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=symbols,
+                successful_symbols=symbols,
+                market_date='2026-04-14',
+            ),
             **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
                 selected_symbols=symbols,
                 successful_symbols=symbols,
                 retry_debt_symbols=[],
@@ -1650,6 +1729,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 admitted_symbols=symbols,
                 price_outcome=price_outcome,
                 price_invocation_symbols=symbols,
+                expected_market_date='2026-04-14',
             )
         )
         self.assertFalse(
@@ -1658,6 +1738,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 admitted_symbols=['005930'],
                 price_outcome=price_outcome,
                 price_invocation_symbols=symbols,
+                expected_market_date='2026-04-14',
             )
         )
 
@@ -1825,18 +1906,42 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'app.eod.daily_pipeline_stages.daily_piotroski_filter_service.'
                 'rebuild_for_market_date',
                 return_value={
+                    'status': 'completed',
                     'results_persisted': 1,
                     'results_failed': 0,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='piotroski_filter',
+                        market_date='2026-09-11',
+                        exact_symbols=['099999'],
+                        successful_symbols=['099999'],
+                    ),
+                    **_build_exact_scope_outcome(
+                        manifest_version='piotroski_scope_outcomes_v1',
+                        selected_symbols=['099999'],
+                        successful_symbols=['099999'],
+                        retry_debt_symbols=[],
+                    ),
                 },
             ) as rebuild_piotroski,
             patch(
                 'app.eod.daily_pipeline_stages.daily_momentum_factor_service.'
                 'rebuild_for_market_date',
                 return_value={
+                    'status': 'completed',
                     'results_persisted': 1,
                     'results_failed': 0,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='momentum_factors',
+                        market_date='2026-09-11',
+                        exact_symbols=['099999'],
+                        successful_symbols=['099999'],
+                    ),
+                    **_build_exact_scope_outcome(
+                        manifest_version='factor_scope_outcomes_v1',
+                        selected_symbols=['099999'],
+                        successful_symbols=['099999'],
+                        retry_debt_symbols=[],
+                    ),
                 },
             ) as rebuild_momentum,
         ):
@@ -4349,7 +4454,23 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'symbols_succeeded': len(selected_symbols),
                     'symbols_failed': 0,
                     'bars_upserted': len(selected_symbols),
+                    'universe_snapshot': (
+                        _complete_pykrx_universe_snapshot(
+                            market_date=kwargs['market_date'],
+                            markets=['KOSPI', 'KOSDAQ'],
+                            symbols=selected_symbols,
+                        )
+                    ),
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='price_contexts',
+                        exact_symbols=selected_symbols,
+                        successful_symbols=selected_symbols,
+                        market_date=kwargs['market_date'],
+                    ),
                     **_build_exact_scope_outcome(
+                        manifest_version=(
+                            'price_contexts_scope_outcomes_v1'
+                        ),
                         selected_symbols=selected_symbols,
                         successful_symbols=selected_symbols,
                         retry_debt_symbols=[],
@@ -4359,10 +4480,17 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     ),
                     'market_risk_filter': {
                         'status': 'partial',
+                        'market_date': kwargs['market_date'],
                         'results_persisted': len(successful_symbols),
                         'results_failed': 1,
                         'failed_symbols': [retry_symbol],
                         'matched_symbols': selected_symbols,
+                        'scope_finalization': _atomic_scope_finalization(
+                            stage_id='market_risk_filter',
+                            exact_symbols=selected_symbols,
+                            successful_symbols=successful_symbols,
+                            market_date=kwargs['market_date'],
+                        ),
                         **_build_exact_scope_outcome(
                             manifest_version=(
                                 'market_risk_filter_scope_outcomes_v1'
@@ -4397,7 +4525,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'market_risk_filter',
                     'external_news_collect',
                 ],
-                symbols=selected_symbols,
+                symbols=None,
             )
 
         self.assertEqual(
@@ -4437,9 +4565,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 self.assertEqual(kwargs['symbols'], selected_symbols)
                 return {
                     'status': 'partial',
+                    'market_date': '2026-04-14',
                     'results_persisted': len(successful_symbols),
                     'results_failed': 1,
                     'failed_symbols': [retry_symbol],
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='momentum_factors',
+                        exact_symbols=selected_symbols,
+                        successful_symbols=successful_symbols,
+                        market_date='2026-04-14',
+                    ),
                     **_build_exact_scope_outcome(
                         manifest_version='factor_scope_outcomes_v1',
                         selected_symbols=selected_symbols,
@@ -4497,6 +4632,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'successful_stock_codes': successful_symbols,
                     'retry_debt_stock_codes': [retry_symbol],
                     'terminal_not_applicable_stock_codes': [],
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='momentum_factors',
+                        exact_symbols=selected_symbols,
+                        successful_symbols=successful_symbols,
+                        market_date='2026-04-14',
+                    ),
                     'admitted_stock_codes': successful_symbols,
                 }
             ],
@@ -4557,12 +4698,18 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 {
                     'dependency': 'price_collection',
                     'manifest_version': (
-                        'pykrx_enrichment_scope_outcomes_v1'
+                        'price_contexts_scope_outcomes_v1'
                     ),
                     'selected_stock_codes': ['005930', '000660'],
                     'successful_stock_codes': ['005930'],
                     'retry_debt_stock_codes': ['000660'],
                     'terminal_not_applicable_stock_codes': [],
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='price_contexts',
+                        exact_symbols=['005930', '000660'],
+                        successful_symbols=['005930'],
+                        market_date='2026-04-14',
+                    ),
                     'admitted_stock_codes': ['005930'],
                 }
             ],
@@ -4693,7 +4840,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'symbols_failed': 0,
                     'failed_symbols': [],
                     'bars_upserted': 1,
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='price_contexts',
+                        exact_symbols=exact_membership,
+                        successful_symbols=retry_subset,
+                        market_date=kwargs['market_date'],
+                    ),
                     **_build_exact_scope_outcome(
+                        manifest_version=(
+                            'price_contexts_scope_outcomes_v1'
+                        ),
                         selected_symbols=retry_subset,
                         successful_symbols=retry_subset,
                         retry_debt_symbols=[],
@@ -4755,6 +4911,92 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             exact_membership,
         )
 
+    def test_stage_debt_retry_keeps_full_ranking_and_subset_publication(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        exact_membership = ['005930', '000660', '035420']
+        retry_subset = ['035420']
+        recovery_stage_scope = {
+            'schema_version': 'followup_stage_recovery_scope_v1',
+            'stage_id': 'piotroski_filter',
+            **_build_exact_scope_outcome(
+                manifest_version='piotroski_scope_outcomes_v1',
+                selected_symbols=exact_membership,
+                successful_symbols=['005930', '000660'],
+                retry_debt_symbols=retry_subset,
+            ),
+        }
+
+        def execute(stage_id, **kwargs):
+            self.assertEqual(stage_id, 'piotroski_filter')
+            self.assertEqual(kwargs['symbols'], retry_subset)
+            self.assertEqual(
+                kwargs['exact_scope_symbols'],
+                exact_membership,
+            )
+            self.assertEqual(
+                kwargs['ranking_scope_symbols'],
+                exact_membership,
+            )
+            self.assertEqual(
+                kwargs['publication_scope_symbols'],
+                retry_subset,
+            )
+            self.assertTrue(kwargs['exact_stage_recovery_authorized'])
+            return {
+                'status': 'completed',
+                'scope_finalization': {'ready': True},
+                **_build_exact_scope_outcome(
+                    manifest_version='piotroski_scope_outcomes_v1',
+                    selected_symbols=retry_subset,
+                    successful_symbols=retry_subset,
+                    retry_debt_symbols=[],
+                ),
+            }
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['piotroski_filter'],
+                symbols=retry_subset,
+                exact_membership_symbols=exact_membership,
+                markets=['KOSPI', 'KOSDAQ'],
+                reused_eod_collection_run_id=905,
+                point_in_time_recovery=True,
+                trigger='auto_eod_followup_resume',
+                recovery_parent_scope_outcome=(
+                    _build_exact_scope_outcome(
+                        manifest_version=(
+                            'auto_eod_followup_admission_scope_outcomes_v1'
+                        ),
+                        selected_symbols=exact_membership,
+                        successful_symbols=exact_membership,
+                        retry_debt_symbols=[],
+                    )
+                ),
+                recovery_stage_scope_outcome=recovery_stage_scope,
+            )
+
+        execute_stage.assert_called_once()
+        self.assertEqual(
+            result['stages']['piotroski_filter']['result'][
+                'selected_stock_codes'
+            ],
+            retry_subset,
+        )
+
     def test_pitr_rejects_conflicting_complete_membership_snapshot(
         self,
     ) -> None:
@@ -4796,20 +5038,30 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ),
             patch.object(service, '_execute_stage') as execute_stage,
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                'conflicts with the frozen point-in-time recovery membership',
-            ):
-                service.run(
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    'conflicts with the frozen point-in-time recovery membership',
+                ):
+                    service.run(
                     market_date='2026-04-14',
                     stages=['price_collection', 'momentum_factors'],
                     symbols=retry_subset,
                     exact_membership_symbols=exact_membership,
                     markets=['KOSPI', 'KOSDAQ'],
                     reused_eod_collection_run_id=906,
-                    point_in_time_recovery=True,
-                    trigger='exact_price_bar_repair',
-                )
+                        point_in_time_recovery=True,
+                        trigger='exact_price_bar_repair',
+                        recovery_parent_scope_outcome=(
+                            _build_exact_scope_outcome(
+                                manifest_version=(
+                                    'auto_eod_followup_admission_scope_outcomes_v1'
+                                ),
+                                selected_symbols=exact_membership,
+                                successful_symbols=['005930', '000660'],
+                                retry_debt_symbols=retry_subset,
+                            )
+                        ),
+                    )
 
         execute_stage.assert_not_called()
         self.assertEqual(
@@ -4823,6 +5075,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         service = DailyPipelineStageService()
         dart_result = {
             'status': 'partial',
+            'market_date': '2026-04-14',
             'scope_outcome_manifest_version': (
                 'dart_daily_data_scope_outcomes_v1'
             ),
@@ -4915,7 +5168,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             if stage_id == 'fundamentals_daily_refresh':
                 self.assertEqual(kwargs['symbols'], retry_subset)
                 return {
-                    'status': 'partial',
+                    'status': 'completed',
+                    'market_date': '2026-04-14',
                     'scope_outcome_manifest_version': (
                         'dart_daily_data_scope_outcomes_v1'
                     ),
@@ -5015,6 +5269,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 self.assertEqual(kwargs['symbols'], retry_subset)
                 return {
                     'status': 'partial',
+                    'market_date': '2026-04-14',
                     'scope_outcome_manifest_version': (
                         'dart_daily_data_scope_outcomes_v1'
                     ),
@@ -5138,27 +5393,25 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 side_effect=execute,
             ) as execute_stage,
         ):
-            result = service.run(
-                market_date='2026-04-14',
-                stages=[
-                    'fundamentals_daily_refresh',
-                    'piotroski_filter',
-                ],
-                symbols=retry_subset,
-                exact_membership_symbols=exact_membership,
-                markets=['KOSPI'],
-                reused_eod_collection_run_id=904,
-                point_in_time_recovery=True,
-                trigger='exact_price_bar_repair',
-            )
+            with self.assertRaisesRegex(
+                ValueError,
+                'auto-EOD parent admission partition',
+            ):
+                service.run(
+                    market_date='2026-04-14',
+                    stages=[
+                        'fundamentals_daily_refresh',
+                        'piotroski_filter',
+                    ],
+                    symbols=retry_subset,
+                    exact_membership_symbols=exact_membership,
+                    markets=['KOSPI'],
+                    reused_eod_collection_run_id=904,
+                    point_in_time_recovery=True,
+                    trigger='exact_price_bar_repair',
+                )
 
-        self.assertEqual(execute_stage.call_count, 1)
-        blocked = result['stages']['piotroski_filter']
-        self.assertEqual(blocked['status'], 'blocked')
-        self.assertIn(
-            'recovery_parent_scope_outcome',
-            blocked['result']['incomplete_dependencies'],
-        )
+        execute_stage.assert_not_called()
 
     def test_pitr_full_retry_scope_does_not_reintroduce_current_debt(
         self,
@@ -5171,6 +5424,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 self.assertEqual(kwargs['symbols'], exact_membership)
                 return {
                     'status': 'partial',
+                    'market_date': '2026-04-14',
                     'scope_outcome_manifest_version': (
                         'dart_daily_data_scope_outcomes_v1'
                     ),
@@ -5227,6 +5481,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 reused_eod_collection_run_id=904,
                 point_in_time_recovery=True,
                 trigger='exact_price_bar_repair',
+                recovery_parent_scope_outcome=(
+                    _build_exact_scope_outcome(
+                        manifest_version=(
+                            'auto_eod_followup_admission_scope_outcomes_v1'
+                        ),
+                        selected_symbols=exact_membership,
+                        successful_symbols=exact_membership,
+                        retry_debt_symbols=[],
+                    )
+                ),
             )
 
         piotroski_call = next(
@@ -5262,6 +5526,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         service = DailyPipelineStageService(pykrx_service=pykrx_runner)
         fundamentals_result = {
             'status': 'partial',
+            'market_date': '2026-04-14',
             'scope_outcome_manifest_version': (
                 'dart_daily_data_scope_outcomes_v1'
             ),
@@ -5307,7 +5572,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'fundamentals_daily_refresh',
                     'quality_factors',
                 ],
-                symbols=selected_symbols,
+                symbols=None,
             )
 
         quality_call = next(
@@ -5333,6 +5598,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
     ) -> None:
         valid_result = {
             'status': 'partial',
+            'market_date': '2026-04-14',
             'scope_outcome_manifest_version': (
                 'dart_daily_data_scope_outcomes_v1'
             ),
@@ -5457,6 +5723,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         exact_scope = DailyPipelineStageService._exact_partial_success_scope(
             outcome=outcome,
             invocation_symbols=['005930', '000660'],
+            expected_stage_id='fundamentals_daily_refresh',
         )
 
         self.assertIsNotNone(exact_scope)
@@ -5468,12 +5735,14 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             DailyPipelineStageService._exact_partial_success_scope(
                 outcome=outcome,
                 invocation_symbols=['005930', '000660', '035420'],
+                expected_stage_id='fundamentals_daily_refresh',
             )
         )
         self.assertIsNone(
             DailyPipelineStageService._exact_partial_success_scope(
                 outcome=outcome,
                 invocation_symbols=None,
+                expected_stage_id='fundamentals_daily_refresh',
             )
         )
 
@@ -7523,9 +7792,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         retry_symbol = selected_symbols[-1]
         result = {
             'status': 'partial',
+            'market_date': '2026-04-24',
             'results_persisted': 999,
             'results_failed': 1,
             'remaining_retryable_events': 0,
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='momentum_factors',
+                exact_symbols=selected_symbols,
+                successful_symbols=selected_symbols[:-1],
+            ),
             **_build_exact_scope_outcome(
                 manifest_version='factor_scope_outcomes_v1',
                 selected_symbols=selected_symbols,
@@ -7537,6 +7812,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             stage_id='momentum_factors',
             result=result,
             invocation_symbols=selected_symbols,
+            market_date='2026-04-24',
+            publication_symbols=selected_symbols,
         )
 
         self.assertNotIn(
@@ -7564,11 +7841,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'status': 'partial',
                     'details': details,
                 },
+                expected_market_date='2026-04-24',
+                publication_symbols=selected_symbols,
             )
         )
         restored_scope = service._exact_partial_success_scope(
             outcome=restored_outcome,
             invocation_symbols=restored_invocation,
+            expected_stage_id='momentum_factors',
+            expected_market_date='2026-04-24',
+            publication_symbols=selected_symbols,
         )
 
         self.assertIsNotNone(restored_scope)
@@ -7595,6 +7877,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'status': 'partial',
                     'details': tampered_details,
                 },
+                expected_market_date='2026-04-24',
+                publication_symbols=selected_symbols,
             )
 
     def test_exact_scope_proof_canonicalizes_valid_order_variance(
@@ -7604,6 +7888,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         result_symbols = list(reversed(invocation_symbols))
         result = {
             'status': 'partial',
+            'market_date': '2026-04-24',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='momentum_factors',
+                exact_symbols=invocation_symbols,
+                successful_symbols=['005930', '000660'],
+            ),
             **_build_exact_scope_outcome(
                 manifest_version='factor_scope_outcomes_v1',
                 selected_symbols=result_symbols,
@@ -7616,6 +7906,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             stage_id='momentum_factors',
             result=result,
             invocation_symbols=invocation_symbols,
+            market_date='2026-04-24',
+            publication_symbols=invocation_symbols,
         )
 
         self.assertEqual(
@@ -8562,7 +8854,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return_value={
                     'contexts_persisted': 2,
                     'contexts_failed': 1,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='price_contexts',
+                        exact_symbols=symbols,
+                        successful_symbols=['005930', '035420'],
+                    ),
                     **_build_exact_scope_outcome(
                         manifest_version=(
                             'price_contexts_scope_outcomes_v1'
@@ -8579,7 +8875,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return_value={
                     'snapshots_persisted': 1,
                     'snapshots_failed': 2,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='technical_snapshots',
+                        exact_symbols=symbols,
+                        successful_symbols=['005930'],
+                    ),
                     **_build_exact_scope_outcome(
                         manifest_version=(
                             'technical_snapshots_scope_outcomes_v1'
@@ -8596,7 +8896,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return_value={
                     'action_summaries_persisted': 1,
                     'action_summaries_failed': 2,
-                    'scope_finalization': {'ready': True},
+                    'scope_finalization': _atomic_scope_finalization(
+                        stage_id='action_summaries',
+                        exact_symbols=symbols,
+                        successful_symbols=['005930'],
+                    ),
                     **_build_exact_scope_outcome(
                         manifest_version=(
                             'action_summaries_scope_outcomes_v1'
@@ -8662,10 +8966,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         action_result = {
             'action_summaries_persisted': 1,
             'action_summaries_failed': 1,
-            'scope_finalization': {
-                'ready': True,
-                'deleted_stale_row_count': 1,
-            },
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='action_summaries',
+                exact_symbols=['005930', '000660'],
+                successful_symbols=['005930'],
+                deleted_stale_row_count=1,
+            ),
             **_build_exact_scope_outcome(
                 manifest_version='action_summaries_scope_outcomes_v1',
                 selected_symbols=['005930', '000660'],
@@ -8832,43 +9138,20 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'app.eod.daily_pipeline_stages.'
                 'daily_action_summary_service.rebuild_for_market_date',
             ) as rebuild_action_summaries,
+            self.assertRaisesRegex(
+                DailyPipelineScopeFinalizationError,
+                'price_contexts atomic exact-scope finalization proof '
+                'does not match',
+            ),
         ):
-            result = service.run(
+            service.run(
                 market_date='2026-04-24',
                 stages=['technical_snapshots', 'action_summaries'],
                 symbols=symbols,
                 resume_from_stage='technical_snapshots',
             )
 
-        technical = result['stages']['technical_snapshots']
-        self.assertEqual(technical['status'], 'partial')
-        self.assertEqual(
-            technical['result']['reason'],
-            'technical_scope_outcome_contract_invalid',
-        )
-        self.assertEqual(
-            technical['result']['retryable_symbols'],
-            symbols,
-        )
-        self.assertEqual(
-            technical['result']['_retry_metadata']['failed_symbols'],
-            symbols,
-        )
-        action_summaries = result['stages']['action_summaries']
-        self.assertEqual(action_summaries['status'], 'blocked')
-        self.assertEqual(
-            action_summaries['result']['incomplete_dependencies'],
-            ['technical_snapshots'],
-        )
         rebuild_action_summaries.assert_not_called()
-        technical_finish = next(
-            event
-            for event in self.run_state_service.stage_events
-            if event['event'] == 'finish_stage'
-            and event['stage_id'] == 'technical_snapshots'
-        )
-        self.assertEqual(technical_finish['succeeded'], 0)
-        self.assertEqual(technical_finish['failed'], 2)
 
     def test_underreported_context_count_blocks_full_invocation(
         self,
@@ -9277,18 +9560,40 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         }
 
         for stage_id, target, is_async, uses_ranking_scope in stage_targets:
+            manifest_versions = {
+                'market_risk_filter': (
+                    'market_risk_filter_scope_outcomes_v1'
+                ),
+                'piotroski_filter': 'piotroski_scope_outcomes_v1',
+            }
+            atomic_result = {
+                'status': 'completed',
+                'scope_finalization': _atomic_scope_finalization(
+                    stage_id=stage_id,
+                    exact_symbols=exact_scope,
+                    successful_symbols=exact_scope,
+                ),
+            }
+            if stage_id == 'market_risk_snapshots':
+                atomic_result['items'] = [
+                    {'symbol': symbol} for symbol in exact_scope
+                ]
+            else:
+                atomic_result.update(
+                    _build_exact_scope_outcome(
+                        manifest_version=manifest_versions.get(
+                            stage_id,
+                            'factor_scope_outcomes_v1',
+                        ),
+                        selected_symbols=exact_scope,
+                        successful_symbols=exact_scope,
+                        retry_debt_symbols=[],
+                    )
+                )
             stage_mock = (
-                AsyncMock(
-                    return_value={
-                        'scope_finalization': {'ready': True},
-                    }
-                )
+                AsyncMock(return_value=atomic_result)
                 if is_async
-                else MagicMock(
-                    return_value={
-                        'scope_finalization': {'ready': True},
-                    }
-                )
+                else MagicMock(return_value=atomic_result)
             )
             with self.subTest(stage_id=stage_id), patch(
                 target,
@@ -9367,7 +9672,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             self.assertRaisesRegex(
                 DailyPipelineScopeFinalizationError,
                 'value_factors atomic exact-scope finalization proof '
-                'is unavailable',
+                'does not match its stage, date, publication scope, or '
+                'successful partition',
             ),
         ):
             service.run(
@@ -10261,8 +10567,8 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'coverage': {
                 'categories': {
                     category: {
-                        'expected_scope_keys': [],
-                        'complete_scope_keys': [],
+                        'expected_scope_keys': ['005930', '000660'],
+                        'complete_scope_keys': ['005930', '000660'],
                     }
                     for category in (
                         'sector_classification',
@@ -10343,8 +10649,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 symbols=selected_symbols,
             ),
             **_build_pykrx_invocation_scope_proof(selected_symbols),
-            **_build_exact_scope_outcome(
-                selected_symbols=selected_symbols,
+                    **_build_exact_scope_outcome(
+                        manifest_version=(
+                            'price_contexts_scope_outcomes_v1'
+                        ),
+                        selected_symbols=selected_symbols,
                 successful_symbols=selected_symbols,
                 retry_debt_symbols=[],
             ),

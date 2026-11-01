@@ -25,25 +25,49 @@ def _partial_outcome(
     total: int,
     details: dict | None = None,
 ) -> dict:
-    return {
+    outcome = {
         'stage': 'momentum_factors',
         'status': 'partial',
         'succeeded': succeeded,
         'total': total,
         'details': details or {},
     }
+    if isinstance(details, dict) and details.get('market_date'):
+        outcome['market_date'] = details['market_date']
+    return outcome
 
 
-def _exact_scope_outcome(*, total: int, succeeded: int) -> dict:
+def _exact_scope_outcome(
+    *,
+    total: int,
+    succeeded: int,
+    manifest_version: str = 'factor_scope_outcomes_v1',
+    stage_id: str = 'momentum_factors',
+    market_date: str = '2026-04-03',
+) -> dict:
     selected = [f'{index:06d}' for index in range(1, total + 1)]
     successful = selected[:succeeded]
     retry_debt = selected[succeeded:]
-    return build_exact_symbol_scope_outcome(
-        manifest_version='factor_scope_outcomes_v1',
+    outcome = build_exact_symbol_scope_outcome(
+        manifest_version=manifest_version,
         selected_symbols=selected,
         successful_symbols=successful,
         retry_debt_symbols=retry_debt,
     )
+    outcome['market_date'] = market_date
+    outcome['scope_finalization'] = {
+        'stage': stage_id,
+        'market_date': market_date,
+        'exact_symbol_count': len(selected),
+        'exact_membership_sha256': market_membership_sha256(selected),
+        'successful_symbol_count': len(successful),
+        'successful_membership_sha256': market_membership_sha256(
+            successful
+        ),
+        'deleted_stale_row_count': 0,
+        'ready': True,
+    }
+    return outcome
 
 
 def _ready_enrichment_warning_outcome() -> dict:
@@ -235,6 +259,7 @@ def test_explicit_ready_partial_without_exact_identity_is_blocking() -> None:
     outcome = {
         'stage': 'market_risk_filter',
         'status': 'partial',
+        'market_date': '2026-04-03',
         'details': {
             'gate_status': 'ready',
             'blocking_status': 'non_blocking',
@@ -248,11 +273,19 @@ def test_explicit_ready_partial_with_exact_identity_is_satisfied() -> None:
     outcome = {
         'stage': 'market_risk_filter',
         'status': 'partial',
+        'market_date': '2026-04-03',
         'details': {
             'gate_status': 'ready',
             'blocking_status': 'non_blocking',
             'requested_symbol_count': 2,
-            **_exact_scope_outcome(total=2, succeeded=1),
+            **_exact_scope_outcome(
+                total=2,
+                succeeded=1,
+                manifest_version=(
+                    'market_risk_filter_scope_outcomes_v1'
+                ),
+                stage_id='market_risk_filter',
+            ),
         },
     }
 
@@ -263,11 +296,19 @@ def test_exact_identity_manifest_must_match_declared_invocation_count() -> None:
     outcome = {
         'stage': 'market_risk_filter',
         'status': 'partial',
+        'market_date': '2026-04-03',
         'details': {
             'gate_status': 'ready',
             'blocking_status': 'non_blocking',
             'requested_symbol_count': 100,
-            **_exact_scope_outcome(total=99, succeeded=98),
+            **_exact_scope_outcome(
+                total=99,
+                succeeded=98,
+                manifest_version=(
+                    'market_risk_filter_scope_outcomes_v1'
+                ),
+                stage_id='market_risk_filter',
+            ),
         },
     }
 
@@ -275,7 +316,12 @@ def test_exact_identity_manifest_must_match_declared_invocation_count() -> None:
 
 
 def test_unknown_exact_identity_manifest_version_is_blocking() -> None:
-    manifest = _exact_scope_outcome(total=2, succeeded=1)
+    manifest = _exact_scope_outcome(
+        total=2,
+        succeeded=1,
+        manifest_version='market_risk_filter_scope_outcomes_v1',
+        stage_id='market_risk_filter',
+    )
     manifest['scope_outcome_manifest_version'] = (
         'unknown_scope_outcomes_v1'
     )
@@ -607,7 +653,11 @@ def test_low_coverage_factor_partial_with_usable_rows_is_nonblocking() -> None:
             'blocking_status': 'non_blocking',
             'results_persisted': 2_675,
             'results_failed': 0,
-            **_exact_scope_outcome(total=2_675, succeeded=2_675),
+            **_exact_scope_outcome(
+                total=2_675,
+                succeeded=2_675,
+                stage_id='advanced_value_factors',
+            ),
             'summary': {
                 'universe_count': 2_675,
                 'persisted_count': 2_675,
@@ -772,6 +822,7 @@ def test_safe_partial_recovery_clears_retry_scope_without_losing_partial_audit(
     recovery_result = {
         'status': 'partial',
         'pipeline_run_id': 92,
+        '_proven_resolved_downstream_symbols': ['005930'],
         'stages': {
             'momentum_factors': {
                     'status': 'partial',

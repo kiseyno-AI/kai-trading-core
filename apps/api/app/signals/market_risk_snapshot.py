@@ -6,6 +6,7 @@ from datetime import date
 from typing import Any, Callable, Mapping, Sequence
 
 from app.brokers.kis.provider import kis_client
+from app.core.settings import settings
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_market_risk_snapshots,
@@ -26,6 +27,83 @@ RATE_LIMIT_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 LATEST_FALLBACK_POLICY = 'latest_on_or_before_requested_market_date'
 ACTIVE_VI_CODES = frozenset({'Y', '1', '01'})
 INACTIVE_VI_CODES = frozenset({'N', '0', '00'})
+REQUIRED_PROVIDER_ADMISSION_SCHEMA_VERSION = (
+    'required_provider_admission_v1'
+)
+BLOCKED_MISSING_CREDENTIAL_CLASSIFICATION = (
+    'blocked_missing_credential'
+)
+KIS_MARKET_RISK_REQUIRED_STAGE_IDS = (
+    'market_risk_snapshots',
+    'market_risk_filter',
+)
+
+
+def build_required_provider_admission(
+    *,
+    provider: str,
+    missing_credentials: Sequence[str],
+    required_stage_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Build a non-attempt provider-readiness result.
+
+    Missing credentials are an admission condition, not a provider attempt.
+    Consumers must not turn this payload into per-symbol failure debt or spend
+    an automatic-recovery attempt while it remains blocked.
+    """
+
+    normalized_missing_credentials = list(
+        dict.fromkeys(
+            str(name).strip()
+            for name in missing_credentials
+            if str(name).strip()
+        )
+    )
+    normalized_stage_ids = list(
+        dict.fromkeys(
+            str(stage_id).strip()
+            for stage_id in required_stage_ids
+            if str(stage_id).strip()
+        )
+    )
+    ready = not normalized_missing_credentials
+    classification = (
+        'ready'
+        if ready
+        else BLOCKED_MISSING_CREDENTIAL_CLASSIFICATION
+    )
+    result: dict[str, Any] = {
+        'schema_version': REQUIRED_PROVIDER_ADMISSION_SCHEMA_VERSION,
+        'provider': str(provider).strip().lower(),
+        'required': True,
+        'required_stage_ids': normalized_stage_ids,
+        'ready': ready,
+        'status': classification,
+        'classification': classification,
+        'missing_credentials': normalized_missing_credentials,
+        'attempt_started': False,
+        'consumes_retry_budget': False,
+        'recoverable': True,
+    }
+    if not ready:
+        result['recovery'] = {
+            'action': 'configure_credentials',
+            'recheck_required': True,
+        }
+    return result
+
+
+def kis_market_risk_provider_readiness() -> dict[str, Any]:
+    missing_credentials: list[str] = []
+    if not settings.kis_app_key.strip():
+        missing_credentials.append('KIS_APP_KEY')
+    if not settings.kis_app_secret.strip():
+        missing_credentials.append('KIS_APP_SECRET')
+    return build_required_provider_admission(
+        provider='kis',
+        missing_credentials=missing_credentials,
+        required_stage_ids=KIS_MARKET_RISK_REQUIRED_STAGE_IDS,
+    )
 
 
 def normalize_market_date(value: str | date) -> date:
@@ -63,6 +141,31 @@ def normalize_market_code(value: str) -> str:
     if not normalized:
         raise ValueError('market_code must not be blank')
     return normalized
+
+
+def build_required_provider_blocked_result(
+    *,
+    stage_id: str,
+    market_date: str | date,
+    provider_admission: Mapping[str, Any],
+    symbols: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    deferred_symbols = normalize_symbols(symbols) or []
+    provider = str(provider_admission.get('provider') or '').strip().lower()
+    return {
+        'triggered': False,
+        'status': 'blocked',
+        'classification': BLOCKED_MISSING_CREDENTIAL_CLASSIFICATION,
+        'reason': f'{provider}_credentials_not_configured',
+        'stage': str(stage_id).strip(),
+        'market_date': normalize_market_date(market_date).isoformat(),
+        'provider': provider,
+        'provider_admission': dict(provider_admission),
+        'attempt_started': False,
+        'consumes_retry_budget': False,
+        'deferred_symbols': deferred_symbols,
+        'deferred_symbol_count': len(deferred_symbols),
+    }
 
 
 def _normalize_code(value: Any) -> str | None:
@@ -171,9 +274,16 @@ def build_market_risk_snapshot(
 
 
 class DailyMarketRiskSnapshotService:
-    def __init__(self, *, client=None, fetch_concurrency: int = DEFAULT_FETCH_CONCURRENCY) -> None:
-        self.client = client or kis_client
+    def __init__(
+        self,
+        *,
+        client=None,
+        fetch_concurrency: int = DEFAULT_FETCH_CONCURRENCY,
+        provider_readiness: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.client = client if client is not None else kis_client
         self.fetch_concurrency = max(int(fetch_concurrency or DEFAULT_FETCH_CONCURRENCY), 1)
+        self.provider_readiness = provider_readiness
 
     def _load_symbol_rows(
         self,
@@ -232,6 +342,41 @@ class DailyMarketRiskSnapshotService:
         normalized_market_date = normalize_market_date(market_date)
         normalized_symbols = normalize_symbols(symbols)
         normalized_market_code = normalize_market_code(market_code)
+        if self.provider_readiness is not None:
+            provider_admission = dict(self.provider_readiness())
+            if provider_admission.get('ready') is not True:
+                deferred_scope = (
+                    exact_scope_symbols
+                    if exact_scope_symbols is not None
+                    else normalized_symbols
+                )
+                return {
+                    **build_required_provider_blocked_result(
+                        stage_id='market_risk_snapshots',
+                        market_date=normalized_market_date,
+                        provider_admission=provider_admission,
+                        symbols=deferred_scope,
+                    ),
+                    'source': source,
+                    'feature_version': source,
+                    'matched_symbols': [],
+                    'missing_symbols': [],
+                    'summary': {
+                        'matched_symbol_count': 0,
+                        'collected_count': 0,
+                        'management_item_count': 0,
+                        'warning_count': 0,
+                        'trade_halted_count': 0,
+                        'deferred_symbol_count': len(
+                            normalize_symbols(deferred_scope) or []
+                        ),
+                    },
+                    'snapshots_persisted': 0,
+                    'snapshots_failed': 0,
+                    'failed_symbols': [],
+                    'failed_symbol_errors': [],
+                    'items': [],
+                }
         loaded_symbol_rows = self._load_symbol_rows(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
@@ -556,4 +701,6 @@ class DailyMarketRiskSnapshotService:
         return payload
 
 
-daily_market_risk_snapshot_service = DailyMarketRiskSnapshotService()
+daily_market_risk_snapshot_service = DailyMarketRiskSnapshotService(
+    provider_readiness=kis_market_risk_provider_readiness,
+)

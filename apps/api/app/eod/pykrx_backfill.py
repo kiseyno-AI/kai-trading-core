@@ -45,6 +45,7 @@ from app.eod.master import get_master_symbols
 from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import (
     build_market_membership_snapshot,
+    market_membership_sha256,
     validate_market_membership_snapshot,
 )
 from app.eod.pykrx_pipeline_support import (
@@ -64,6 +65,13 @@ from app.eod.run_stage_support import (
     outcome_contains_reason,
     pending_same_day_intraday_watch_rearm_marker,
     validated_nonblocking_partial_progression_marker,
+)
+from app.eod.scope_outcomes import (
+    FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION,
+    STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
+    build_exact_symbol_scope_outcome,
+    exact_scope_partition_identity_proof_matches,
+    validate_stage_bound_scope_outcome,
 )
 from app.eod.summary_cutoff_contract import (
     completed_summary_scope_matches_parent,
@@ -87,9 +95,12 @@ from app.eod.action_summaries import daily_action_summary_service
 from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
     AUTO_DAILY_TRACKED_STAGE_ORDER,
+    FACTOR_FOLLOWUP_STAGE_DEPENDENCIES,
+    FACTOR_FOLLOWUP_STAGE_ORDER,
     HISTORICAL_BACKFILL_STAGE_ORDER,
     POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
     PykrxPipelineDependencies,
+    _validated_exact_scope_outcome,
     resolve_point_in_time_recovery,
     run_market_data_pipeline,
 )
@@ -145,6 +156,61 @@ AUTO_FOLLOWUP_RECOVERY_MIN_INTERVAL_SECONDS = 5 * 60
 AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS = 60 * 60
 AUTO_FOLLOWUP_RECOVERY_TRIGGER = 'auto_eod_followup_resume'
 AUTO_EOD_PIPELINE_ENTRYPOINT = 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+REQUIRED_PROVIDER_CREDENTIAL_SETTINGS = {
+    'dart': {'DART_API_KEY': 'dart_api_key'},
+    'kis': {
+        'KIS_APP_KEY': 'kis_app_key',
+        'KIS_APP_SECRET': 'kis_app_secret',
+    },
+}
+REQUIRED_PROVIDER_STAGE_IDS = {
+    'dart': frozenset({'fundamentals_daily_refresh'}),
+    'kis': frozenset({'market_risk_snapshots', 'market_risk_filter'}),
+}
+FOLLOWUP_STAGE_DEBT_METADATA_KEY = 'followup_stage_debt'
+FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION = 'followup_stage_debt_v3'
+FOLLOWUP_STAGE_PROOF_PUBLICATION_SCOPE_KEY = (
+    '_validated_publication_stock_codes'
+)
+FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER = (
+    'fundamentals_daily_refresh',
+    'piotroski_filter',
+    *FACTOR_FOLLOWUP_STAGE_ORDER,
+    'signal_features',
+)
+FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS = {
+    'fundamentals_daily_refresh': frozenset(
+        {
+            'dart_daily_data_scope_outcomes_v1',
+            'dart_fundamentals_scope_outcomes_v1',
+        }
+    ),
+    'piotroski_filter': frozenset({'piotroski_scope_outcomes_v1'}),
+    **{
+        stage_id: frozenset({'factor_scope_outcomes_v1'})
+        for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+    },
+    'signal_features': frozenset({'signal_features_scope_outcomes_v1'}),
+}
+FOLLOWUP_EXACT_STAGE_RECOVERY_MANIFEST_VERSION = {
+    'fundamentals_daily_refresh': 'dart_fundamentals_scope_outcomes_v1',
+    'piotroski_filter': 'piotroski_scope_outcomes_v1',
+    **{
+        stage_id: 'factor_scope_outcomes_v1'
+        for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+    },
+    'signal_features': 'signal_features_scope_outcomes_v1',
+}
+FOLLOWUP_EXACT_STAGE_DEPENDENCIES = {
+    'piotroski_filter': ('fundamentals_daily_refresh',),
+    **{
+        stage_id: ('piotroski_filter',)
+        for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+        if stage_id != 'composite_factors'
+    },
+    **FACTOR_FOLLOWUP_STAGE_DEPENDENCIES,
+    'signal_features': FACTOR_FOLLOWUP_STAGE_ORDER,
+}
 TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
     'agent_feedback_summaries',
     'signal_decider',
@@ -1822,6 +1888,1892 @@ def _parse_aware_activity_datetime(value: object) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _validated_required_provider_admission(
+    stage: object,
+    *,
+    expected_stage_id: str,
+) -> dict[str, Any] | None:
+    """Validate a zero-attempt required-provider credential block."""
+
+    if not isinstance(stage, Mapping):
+        return None
+    result_summary = _stage_result_summary(stage)
+    provider_admission = result_summary.get('provider_admission')
+    if not isinstance(provider_admission, Mapping):
+        return None
+    missing_credentials = provider_admission.get('missing_credentials')
+    normalized_missing_credentials = (
+        [
+            str(value or '').strip().upper()
+            for value in missing_credentials
+        ]
+        if isinstance(missing_credentials, list)
+        else []
+    )
+    provider = str(provider_admission.get('provider') or '').strip().lower()
+    allowed_credentials = REQUIRED_PROVIDER_CREDENTIAL_SETTINGS.get(
+        provider
+    )
+    allowed_stage_ids = REQUIRED_PROVIDER_STAGE_IDS.get(provider)
+    required_stage_ids = provider_admission.get('required_stage_ids')
+    normalized_required_stage_ids = (
+        [str(value or '').strip() for value in required_stage_ids]
+        if isinstance(required_stage_ids, list)
+        else []
+    )
+    classification = 'blocked_missing_credential'
+    if not (
+        str(stage.get('status') or '').strip().lower() == 'blocked'
+        and str(result_summary.get('status') or '').strip().lower()
+        == 'blocked'
+        and str(result_summary.get('classification') or '').strip().lower()
+        == classification
+        and result_summary.get('triggered') is False
+        and str(result_summary.get('stage') or '').strip()
+        == expected_stage_id
+        and str(result_summary.get('provider') or '').strip().lower()
+        == provider
+        and result_summary.get('attempt_started') is False
+        and result_summary.get('consumes_retry_budget') is False
+        and provider_admission.get('schema_version')
+        == 'required_provider_admission_v1'
+        and allowed_credentials is not None
+        and allowed_stage_ids is not None
+        and provider_admission.get('required') is True
+        and provider_admission.get('ready') is False
+        and str(provider_admission.get('status') or '').strip().lower()
+        == classification
+        and str(
+            provider_admission.get('classification') or ''
+        ).strip().lower()
+        == classification
+        and provider_admission.get('attempt_started') is False
+        and provider_admission.get('consumes_retry_budget') is False
+        and provider_admission.get('recoverable') is True
+        and normalized_required_stage_ids
+        and all(normalized_required_stage_ids)
+        and required_stage_ids == normalized_required_stage_ids
+        and len(normalized_required_stage_ids)
+        == len(set(normalized_required_stage_ids))
+        and set(normalized_required_stage_ids).issubset(allowed_stage_ids)
+        and expected_stage_id in normalized_required_stage_ids
+        and provider_admission.get('recovery')
+        == {
+            'action': 'configure_credentials',
+            'recheck_required': True,
+        }
+        and normalized_missing_credentials
+        and all(normalized_missing_credentials)
+        and missing_credentials == normalized_missing_credentials
+        and len(normalized_missing_credentials)
+        == len(set(normalized_missing_credentials))
+        and set(normalized_missing_credentials).issubset(
+            allowed_credentials
+        )
+    ):
+        return None
+    return {
+        **dict(provider_admission),
+        'provider': provider,
+        'classification': classification,
+        'missing_credentials': normalized_missing_credentials,
+    }
+
+
+def _required_provider_credentials_are_ready(
+    provider_admission: Mapping[str, Any],
+) -> bool:
+    missing_credentials = provider_admission.get('missing_credentials')
+    if not isinstance(missing_credentials, list) or not missing_credentials:
+        return False
+    provider = str(provider_admission.get('provider') or '').strip().lower()
+    credential_settings = REQUIRED_PROVIDER_CREDENTIAL_SETTINGS.get(
+        provider
+    )
+    if credential_settings is None:
+        return False
+    return all(
+        bool(
+            str(
+                getattr(
+                    settings,
+                    credential_settings.get(
+                        str(env_name or '').strip().upper(),
+                        '',
+                    ),
+                    '',
+                )
+                or ''
+            ).strip()
+        )
+        for env_name in missing_credentials
+    )
+
+
+def _validated_followup_admission_partition(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    raw_outcome = metadata.get('followup_admission_scope_outcome')
+    if not isinstance(raw_outcome, Mapping):
+        return None
+    selected = raw_outcome.get('selected_stock_codes')
+    retry_debt = raw_outcome.get('retry_debt_stock_codes')
+    if not isinstance(selected, list) or not isinstance(retry_debt, list):
+        return None
+    partition = _validated_exact_scope_outcome(
+        result=raw_outcome,
+        invocation_symbols=selected,
+        status='partial' if retry_debt else 'completed',
+    )
+    if (
+        partition is None
+        or partition['manifest_version']
+        != 'auto_eod_followup_admission_scope_outcomes_v1'
+    ):
+        return None
+    return partition
+
+
+def _validated_followup_admitted_symbols(
+    metadata: Mapping[str, Any],
+) -> list[str] | None:
+    partition = _validated_followup_admission_partition(metadata)
+    if partition is None:
+        return None
+    successful_symbols = list(partition['successful_stock_codes'])
+    return successful_symbols or None
+
+
+def _followup_exact_evidence_present(stage: object) -> bool:
+    """Return whether a stage row carries raw or compact exact-scope proof."""
+
+    if not isinstance(stage, Mapping):
+        return False
+    result = stage.get('result')
+    result_summary = _stage_result_summary(stage)
+    details = stage.get('details')
+    candidates = (stage, result, result_summary)
+    if any(
+        isinstance(candidate, Mapping)
+        and candidate.get('scope_outcome_manifest_version') is not None
+        for candidate in candidates
+    ):
+        return True
+    return bool(
+        (
+            isinstance(details, Mapping)
+            and isinstance(
+                details.get('exact_scope_outcome_proof'), Mapping
+            )
+        )
+        or isinstance(stage.get('exact_scope_outcome_proof'), Mapping)
+        or isinstance(
+            result_summary.get('exact_scope_outcome_proof'), Mapping
+        )
+    )
+
+
+def _followup_exact_result_authority(
+    *,
+    stage_id: str,
+    stage: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve raw and persisted compact stage proofs to one exact result.
+
+    Persisted pipeline rows compact list-heavy result summaries once a stage
+    exceeds the summary cutoff.  The separately persisted v2 proof remains
+    authoritative, but it must be rebound to the retained atomic finalization
+    before it can advance durable recovery debt.
+    """
+
+    def complete_raw_result(candidate: object) -> bool:
+        return bool(
+            isinstance(candidate, Mapping)
+            and candidate.get('scope_outcome_manifest_version') is not None
+            and all(
+                isinstance(candidate.get(key), list)
+                for key in (
+                    'selected_stock_codes',
+                    'successful_stock_codes',
+                    'retry_debt_stock_codes',
+                    'scope_outcome_manifest',
+                )
+            )
+        )
+
+    result = stage.get('result')
+    result_summary = _stage_result_summary(stage)
+    # A live stage outcome still carries its full raw partition and is the
+    # immediate authority. Persisted rows lose the large lists, so a retained
+    # compact proof must be validated before considering their summary.
+    for candidate in (result, stage):
+        if complete_raw_result(candidate):
+            return dict(candidate)
+    details = stage.get('details')
+    proof_candidates = (
+        (
+            details.get('exact_scope_outcome_proof')
+            if isinstance(details, Mapping)
+            else None
+        ),
+        stage.get('exact_scope_outcome_proof'),
+        result_summary.get('exact_scope_outcome_proof'),
+    )
+    proof = next(
+        (
+            candidate
+            for candidate in proof_candidates
+            if isinstance(candidate, Mapping)
+        ),
+        None,
+    )
+    if proof is None:
+        return (
+            dict(result_summary)
+            if complete_raw_result(result_summary)
+            else None
+        )
+
+    selected_raw = proof.get('selected_stock_codes')
+    retry_raw = proof.get('retry_debt_stock_codes')
+    terminal_raw = proof.get('terminal_not_applicable_stock_codes')
+    if not all(
+        isinstance(value, list)
+        for value in (selected_raw, retry_raw, terminal_raw)
+    ):
+        return None
+    selected = _dedupe_symbol_codes(selected_raw)
+    retry_debt = _dedupe_symbol_codes(retry_raw)
+    terminal = _dedupe_symbol_codes(terminal_raw)
+    if (
+        selected != selected_raw
+        or retry_debt != retry_raw
+        or terminal != terminal_raw
+        or selected != sorted(selected)
+        or not selected
+    ):
+        return None
+    selected_set = set(selected)
+    retry_set = set(retry_debt)
+    terminal_set = set(terminal)
+    if retry_set & terminal_set or not (
+        retry_set | terminal_set
+    ).issubset(selected_set):
+        return None
+    successful = [
+        symbol
+        for symbol in selected
+        if symbol not in retry_set | terminal_set
+    ]
+    market_date = str(proof.get('market_date') or '').strip()
+    manifest_version = str(proof.get('manifest_version') or '').strip()
+    if (
+        proof.get('schema_version') != 'exact_scope_outcome_proof_v2'
+        or str(proof.get('stage_id') or '').strip() != stage_id
+        or not market_date
+        or manifest_version
+        not in FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS.get(
+            stage_id, frozenset()
+        )
+        or proof.get('selected_symbol_count') != len(selected)
+        or proof.get('selected_symbol_sha256')
+        != market_membership_sha256(selected)
+        or proof.get('successful_symbol_count') != len(successful)
+        or proof.get('successful_symbol_sha256')
+        != market_membership_sha256(successful)
+        or not exact_scope_partition_identity_proof_matches(
+            proof=proof,
+            retry_debt_symbols=retry_debt,
+            terminal_not_applicable_symbols=terminal,
+        )
+    ):
+        return None
+
+    failed_all = bool(
+        retry_set == selected_set
+        and not successful
+        and not terminal
+        and str(proof.get('outcome_status') or '').strip().lower()
+        == 'failed'
+    )
+    proof_status = (
+        'failed'
+        if failed_all
+        else 'partial'
+        if retry_debt
+        else 'completed'
+    )
+    persisted_status = str(
+        stage.get('status') or result_summary.get('status') or proof_status
+    ).strip().lower()
+    if persisted_status != proof_status:
+        return None
+    reconstructed = {
+        'status': proof_status,
+        'market_date': market_date,
+        **build_exact_symbol_scope_outcome(
+            manifest_version=manifest_version,
+            selected_symbols=selected,
+            successful_symbols=successful,
+            retry_debt_symbols=retry_debt,
+            terminal_not_applicable_symbols=terminal,
+        ),
+    }
+    for scalar_key in (
+        'gate_status',
+        'ranking_dependency_status',
+        'reason',
+    ):
+        if scalar_key in result_summary:
+            reconstructed[scalar_key] = result_summary[scalar_key]
+    finalization_stage_id = STAGE_ATOMIC_FINALIZATION_STAGE_IDS.get(
+        stage_id
+    )
+    if finalization_stage_id is not None:
+        finalization = result_summary.get('scope_finalization')
+        if not isinstance(finalization, Mapping):
+            return None
+        proof_finalization_fields = (
+            ('finalization_stage_id', 'stage'),
+            ('finalization_market_date', 'market_date'),
+            ('finalization_exact_symbol_count', 'exact_symbol_count'),
+            (
+                'finalization_exact_membership_sha256',
+                'exact_membership_sha256',
+            ),
+            (
+                'finalization_successful_symbol_count',
+                'successful_symbol_count',
+            ),
+            (
+                'finalization_successful_membership_sha256',
+                'successful_membership_sha256',
+            ),
+        )
+        if any(
+            proof.get(proof_key) != finalization.get(finalization_key)
+            for proof_key, finalization_key in proof_finalization_fields
+        ):
+            return None
+        reconstructed['scope_finalization'] = dict(finalization)
+    return reconstructed
+
+
+def _validated_followup_exact_partition(
+    *,
+    stage_id: str,
+    stage: object,
+    expected_market_date: str,
+    expected_publication_symbols: Sequence[str],
+    allowed_partition_symbols: Sequence[str],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if stage_id not in FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS:
+        return None
+    if not isinstance(stage, Mapping):
+        return None
+    exact_result = _followup_exact_result_authority(
+        stage_id=stage_id,
+        stage=stage,
+    )
+    if exact_result is None:
+        return None
+    selected_symbols = exact_result.get('selected_stock_codes')
+    if not isinstance(selected_symbols, list):
+        return None
+    normalized_status = str(
+        exact_result.get('status') or stage.get('status') or ''
+    ).strip().lower()
+    partition = validate_stage_bound_scope_outcome(
+        result=exact_result,
+        expected_stage_id=stage_id,
+        invocation_symbols=selected_symbols,
+        status=normalized_status,
+        allow_failed_all=True,
+        expected_market_date=expected_market_date,
+        publication_symbols=expected_publication_symbols,
+    )
+    if (
+        partition is None
+        or partition['manifest_version']
+        not in FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS[stage_id]
+        or not set(partition['selected_stock_codes']).issubset(
+            set(_dedupe_symbol_codes(allowed_partition_symbols))
+        )
+    ):
+        return None
+    if stage_id != 'fundamentals_daily_refresh':
+        gate_status = str(
+            exact_result.get('gate_status') or ''
+        ).strip().lower()
+        if (
+            normalized_status == 'partial'
+            and not partition['retry_debt_stock_codes']
+            and gate_status != 'ready'
+        ):
+            return None
+        if gate_status == 'blocked':
+            return None
+        if (
+            str(exact_result.get('reason') or '').startswith(
+                'piotroski_evidence_'
+            )
+            and not partition['retry_debt_stock_codes']
+        ):
+            return None
+        ranking_dependency_status = str(
+            exact_result.get('ranking_dependency_status') or ''
+        ).strip().lower()
+        if ranking_dependency_status and ranking_dependency_status not in {
+            'complete',
+            'completed',
+            'ready',
+        }:
+            return None
+    elif str(exact_result.get('market_date') or '').strip() != str(
+        expected_market_date
+    ).strip():
+        return None
+    proof = dict(exact_result)
+    proof[FOLLOWUP_STAGE_PROOF_PUBLICATION_SCOPE_KEY] = (
+        _dedupe_symbol_codes(expected_publication_symbols)
+    )
+    return partition, proof
+
+
+def _normalize_stage_symbol_map(
+    value: object,
+    *,
+    parent_symbols: Sequence[str],
+) -> dict[str, list[str]] | None:
+    if not isinstance(value, Mapping):
+        return None
+    parent_set = set(parent_symbols)
+    normalized: dict[str, list[str]] = {}
+    for raw_stage_id, raw_symbols in value.items():
+        stage_id = str(raw_stage_id or '').strip()
+        if (
+            stage_id not in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+            or not isinstance(raw_symbols, list)
+        ):
+            return None
+        symbols = _dedupe_symbol_codes(raw_symbols)
+        if (
+            symbols != raw_symbols
+            or len(symbols) != len(raw_symbols)
+            or not set(symbols).issubset(parent_set)
+        ):
+            return None
+        if symbols:
+            normalized[stage_id] = symbols
+    return normalized
+
+
+def _validated_followup_stage_debt_state(
+    value: object,
+    *,
+    market_date: str,
+    eod_collection_run_id: int,
+    parent_symbols: Sequence[str],
+    publication_symbols: Sequence[str],
+    require_pending: bool = True,
+) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    if not set(_dedupe_symbol_codes(parent_symbols)).issubset(
+        set(_dedupe_symbol_codes(publication_symbols))
+    ):
+        return None
+    if not (
+        value.get('schema_version')
+        == FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION
+        and str(value.get('market_date') or '').strip() == market_date
+        and value.get('eod_collection_run_id') == eod_collection_run_id
+    ):
+        return None
+    pending = _normalize_stage_symbol_map(
+        value.get('pending_by_stage'),
+        parent_symbols=parent_symbols,
+    )
+    successful = _normalize_stage_symbol_map(
+        value.get('successful_by_stage'),
+        parent_symbols=parent_symbols,
+    )
+    terminal = _normalize_stage_symbol_map(
+        value.get('terminal_by_stage'),
+        parent_symbols=parent_symbols,
+    )
+    proofs = value.get('proofs_by_stage')
+    recovery_progress_count = value.get('recovery_progress_count', 0)
+    raw_recovery_attempts = value.get('recovery_attempts_by_stage', {})
+    raw_applied_run_ids = value.get(
+        'applied_recovery_pipeline_run_ids',
+        [],
+    )
+    if (
+        pending is None
+        or successful is None
+        or terminal is None
+        or not isinstance(proofs, Mapping)
+        or not isinstance(raw_recovery_attempts, Mapping)
+        or not isinstance(raw_applied_run_ids, list)
+        or isinstance(recovery_progress_count, bool)
+        or not isinstance(recovery_progress_count, int)
+        or recovery_progress_count < 0
+    ):
+        return None
+    recovery_attempts: dict[str, int] = {}
+    for raw_stage_id, raw_attempt_count in raw_recovery_attempts.items():
+        stage_id = str(raw_stage_id or '').strip()
+        if (
+            stage_id not in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+            or isinstance(raw_attempt_count, bool)
+            or not isinstance(raw_attempt_count, int)
+            or raw_attempt_count < 0
+        ):
+            return None
+        if raw_attempt_count:
+            recovery_attempts[stage_id] = raw_attempt_count
+    applied_run_ids: list[int] = []
+    for raw_run_id in raw_applied_run_ids:
+        if (
+            isinstance(raw_run_id, bool)
+            or not isinstance(raw_run_id, int)
+            or raw_run_id <= 0
+            or raw_run_id in applied_run_ids
+        ):
+            return None
+        applied_run_ids.append(raw_run_id)
+    if sum(recovery_attempts.values()) != len(applied_run_ids):
+        return None
+    if recovery_progress_count > len(applied_run_ids):
+        return None
+    normalized_proofs: dict[str, list[dict[str, Any]]] = {}
+    proof_classifications: dict[str, dict[str, set[str]]] = {}
+    for raw_stage_id, raw_proofs in proofs.items():
+        stage_id = str(raw_stage_id or '').strip()
+        if (
+            stage_id not in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+            or not isinstance(raw_proofs, list)
+        ):
+            return None
+        stage_proofs: list[dict[str, Any]] = []
+        replayed_successful: set[str] = set()
+        replayed_pending: set[str] = set()
+        replayed_terminal: set[str] = set()
+        for raw_proof in raw_proofs:
+            if not isinstance(raw_proof, Mapping):
+                return None
+            proof_publication_symbols = raw_proof.get(
+                FOLLOWUP_STAGE_PROOF_PUBLICATION_SCOPE_KEY
+            )
+            if not isinstance(proof_publication_symbols, list):
+                return None
+            normalized_publication_symbols = _dedupe_symbol_codes(
+                proof_publication_symbols
+            )
+            if (
+                normalized_publication_symbols
+                != proof_publication_symbols
+                or not normalized_publication_symbols
+                or not set(normalized_publication_symbols).issubset(
+                    set(publication_symbols)
+                )
+            ):
+                return None
+            validated_proof = _validated_followup_exact_partition(
+                stage_id=stage_id,
+                stage=raw_proof,
+                expected_market_date=market_date,
+                expected_publication_symbols=(
+                    normalized_publication_symbols
+                ),
+                allowed_partition_symbols=parent_symbols,
+            )
+            if validated_proof is None:
+                return None
+            partition, _proof = validated_proof
+            selected_set = set(partition['selected_stock_codes'])
+            if selected_set & (replayed_successful | replayed_terminal):
+                return None
+            replayed_pending.difference_update(selected_set)
+            replayed_successful.update(
+                partition['successful_stock_codes']
+            )
+            replayed_pending.update(partition['retry_debt_stock_codes'])
+            replayed_terminal.update(
+                partition['terminal_not_applicable_stock_codes']
+            )
+            stage_proofs.append(dict(raw_proof))
+        if stage_proofs:
+            normalized_proofs[stage_id] = stage_proofs
+            proof_classifications[stage_id] = {
+                'successful': replayed_successful,
+                'pending': replayed_pending,
+                'terminal': replayed_terminal,
+            }
+    if recovery_progress_count > sum(
+        len(stage_proofs) for stage_proofs in normalized_proofs.values()
+    ):
+        return None
+    parent_set = set(_dedupe_symbol_codes(parent_symbols))
+    pending_sets = {
+        stage_id: set(symbols) for stage_id, symbols in pending.items()
+    }
+    successful_sets = {
+        stage_id: set(symbols)
+        for stage_id, symbols in successful.items()
+    }
+    terminal_sets = {
+        stage_id: set(symbols) for stage_id, symbols in terminal.items()
+    }
+    for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER:
+        stage_pending = pending_sets.get(stage_id, set())
+        stage_successful = successful_sets.get(stage_id, set())
+        stage_terminal = terminal_sets.get(stage_id, set())
+        if (
+            stage_pending & stage_successful
+            or stage_pending & stage_terminal
+            or stage_successful & stage_terminal
+        ):
+            return None
+
+    provider_admission = value.get('provider_admission')
+    normalized_provider_admission: dict[str, Any] | None = None
+    if provider_admission is not None:
+        provider_stage = {
+            'status': 'blocked',
+            'details': {'result_summary': provider_admission},
+        }
+        validated_admission = _validated_required_provider_admission(
+            provider_stage,
+            expected_stage_id='fundamentals_daily_refresh',
+        )
+        if validated_admission is None:
+            return None
+        normalized_provider_admission = dict(provider_admission)
+
+    root_stage_id = FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER[0]
+    root_accounted = {
+        *pending_sets.get(root_stage_id, set()),
+        *successful_sets.get(root_stage_id, set()),
+        *terminal_sets.get(root_stage_id, set()),
+    }
+    if root_accounted != parent_set:
+        return None
+    root_proof = proof_classifications.get(root_stage_id)
+    if root_proof is not None:
+        if (
+            pending_sets.get(root_stage_id, set())
+            != root_proof['pending']
+            or successful_sets.get(root_stage_id, set())
+            != root_proof['successful']
+            or terminal_sets.get(root_stage_id, set())
+            != root_proof['terminal']
+        ):
+            return None
+    elif (
+        normalized_provider_admission is None
+        or pending_sets.get(root_stage_id, set()) != parent_set
+        or successful_sets.get(root_stage_id, set())
+        or terminal_sets.get(root_stage_id, set())
+    ):
+        return None
+    for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER[1:]:
+        stage_present = bool(
+            stage_id in pending_sets
+            or stage_id in successful_sets
+            or stage_id in terminal_sets
+            or stage_id in normalized_proofs
+        )
+        if not stage_present:
+            continue
+        dependencies = FOLLOWUP_EXACT_STAGE_DEPENDENCIES.get(stage_id, ())
+        if not dependencies:
+            return None
+        eligible = set(successful_sets.get(dependencies[0], set()))
+        for dependency in dependencies[1:]:
+            eligible.intersection_update(
+                successful_sets.get(dependency, set())
+            )
+        stage_pending = pending_sets.get(stage_id, set())
+        stage_successful = successful_sets.get(stage_id, set())
+        stage_terminal = terminal_sets.get(stage_id, set())
+        inherited_terminal = set().union(
+            *(terminal_sets.get(dependency, set()) for dependency in dependencies)
+        )
+        proof_classification = proof_classifications.get(
+            stage_id,
+            {'successful': set(), 'pending': set(), 'terminal': set()},
+        )
+        proof_classified = set().union(
+            proof_classification['successful'],
+            proof_classification['pending'],
+            proof_classification['terminal'],
+        )
+        expected_pending = proof_classification['pending'] | (
+            eligible - proof_classified - inherited_terminal
+        )
+        expected_terminal = (
+            proof_classification['terminal'] | inherited_terminal
+        )
+        if (
+            not (stage_pending | stage_successful).issubset(eligible)
+            or not eligible.issubset(
+                stage_pending | stage_successful | stage_terminal
+            )
+            or not stage_terminal.issubset(
+                eligible | inherited_terminal
+            )
+            or stage_successful != proof_classification['successful']
+            or stage_pending != expected_pending
+            or stage_terminal != expected_terminal
+        ):
+            return None
+    if require_pending and not pending:
+        return None
+    return {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': market_date,
+        'eod_collection_run_id': eod_collection_run_id,
+        'pending_by_stage': pending,
+        'successful_by_stage': successful,
+        'terminal_by_stage': terminal,
+        'proofs_by_stage': normalized_proofs,
+        'recovery_progress_count': recovery_progress_count,
+        'recovery_attempts_by_stage': recovery_attempts,
+        'applied_recovery_pipeline_run_ids': applied_run_ids,
+        **(
+            {'provider_admission': normalized_provider_admission}
+            if normalized_provider_admission is not None
+            else {}
+        ),
+    }
+
+
+def _canonicalize_followup_stage_debt_graph(
+    *,
+    pending: dict[str, list[str]],
+    successful: dict[str, list[str]],
+    terminal: dict[str, list[str]],
+    admit_newly_eligible: bool,
+) -> None:
+    """Propagate dependency closure without inventing successful output."""
+
+    changed = True
+    while changed:
+        changed = False
+        for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER[1:]:
+            dependencies = FOLLOWUP_EXACT_STAGE_DEPENDENCIES.get(stage_id)
+            if not dependencies:
+                continue
+            eligible = set(successful.get(dependencies[0]) or [])
+            for dependency in dependencies[1:]:
+                eligible.intersection_update(
+                    successful.get(dependency) or []
+                )
+            inherited_terminal = set().union(
+                *(set(terminal.get(dependency) or []) for dependency in dependencies)
+            )
+            stage_present = bool(
+                pending.get(stage_id)
+                or successful.get(stage_id)
+                or terminal.get(stage_id)
+            )
+            if not stage_present and not admit_newly_eligible:
+                continue
+
+            stage_pending = set(pending.get(stage_id) or [])
+            stage_successful = set(successful.get(stage_id) or [])
+            stage_terminal = set(terminal.get(stage_id) or [])
+            new_terminal = inherited_terminal - stage_terminal
+            if new_terminal:
+                stage_pending.difference_update(new_terminal)
+                stage_successful.difference_update(new_terminal)
+                stage_terminal.update(new_terminal)
+                changed = True
+
+            if admit_newly_eligible:
+                newly_eligible = eligible - (
+                    stage_pending | stage_successful | stage_terminal
+                )
+                if newly_eligible:
+                    stage_pending.update(newly_eligible)
+                    changed = True
+
+            pending[stage_id] = sorted(stage_pending)
+            successful[stage_id] = sorted(stage_successful)
+            terminal[stage_id] = sorted(stage_terminal)
+
+
+def _record_followup_stage_debt_attempt(
+    state: Mapping[str, Any],
+    *,
+    stage_id: str,
+    invocation_symbols: Sequence[str],
+    recovery_pipeline_run_id: int,
+) -> dict[str, Any] | None:
+    """Record one lineage-bound stage attempt without accepting its output."""
+
+    pending = deepcopy(state.get('pending_by_stage') or {})
+    expected_symbols = _dedupe_symbol_codes(pending.get(stage_id) or [])
+    normalized_invocation = _dedupe_symbol_codes(invocation_symbols)
+    applied_run_ids = list(
+        state.get('applied_recovery_pipeline_run_ids') or []
+    )
+    recovery_attempts = deepcopy(
+        state.get('recovery_attempts_by_stage') or {}
+    )
+    if (
+        not expected_symbols
+        or set(expected_symbols) != set(normalized_invocation)
+        or isinstance(recovery_pipeline_run_id, bool)
+        or not isinstance(recovery_pipeline_run_id, int)
+        or recovery_pipeline_run_id <= 0
+        or recovery_pipeline_run_id in applied_run_ids
+    ):
+        return None
+    current_attempts = recovery_attempts.get(stage_id, 0)
+    if (
+        isinstance(current_attempts, bool)
+        or not isinstance(current_attempts, int)
+        or current_attempts < 0
+    ):
+        return None
+    recovery_attempts[stage_id] = current_attempts + 1
+    applied_run_ids.append(recovery_pipeline_run_id)
+    return {
+        **dict(state),
+        'recovery_attempts_by_stage': recovery_attempts,
+        'applied_recovery_pipeline_run_ids': applied_run_ids,
+    }
+
+
+def _followup_recovery_stage_attempt_finished(
+    stage: object,
+    *,
+    expected_stage_id: str,
+) -> bool:
+    """Require durable start and terminal evidence before rotating debt."""
+
+    if not isinstance(stage, Mapping):
+        return False
+    if _validated_required_provider_admission(
+        stage,
+        expected_stage_id=expected_stage_id,
+    ) is not None:
+        return False
+    result_summary = _stage_result_summary(stage)
+    if result_summary.get('attempt_started') is False:
+        return False
+    status = str(
+        stage.get('status') or result_summary.get('status') or ''
+    ).strip().lower()
+    return bool(
+        stage.get('started_at')
+        and stage.get('completed_at')
+        and status
+        in {
+            'blocked',
+            'completed',
+            'completed_with_errors',
+            'failed',
+            'interrupted',
+            'partial',
+            'skipped',
+        }
+    )
+
+
+def _advance_followup_stage_debt_state(
+    state: Mapping[str, Any],
+    *,
+    stage_id: str,
+    invocation_symbols: Sequence[str],
+    stage_result: Mapping[str, Any],
+    recovery_pipeline_run_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Apply one exhaustive stage proof without touching sibling debt."""
+
+    pending = deepcopy(state.get('pending_by_stage') or {})
+    expected_symbols = _dedupe_symbol_codes(pending.get(stage_id) or [])
+    normalized_invocation = _dedupe_symbol_codes(invocation_symbols)
+    if not expected_symbols or set(expected_symbols) != set(
+        normalized_invocation
+    ):
+        return None
+    validated = _validated_followup_exact_partition(
+        stage_id=stage_id,
+        stage=stage_result,
+        expected_market_date=str(state.get('market_date') or ''),
+        expected_publication_symbols=normalized_invocation,
+        allowed_partition_symbols=normalized_invocation,
+    )
+    if validated is None:
+        return None
+    partition, proof = validated
+    if set(partition['selected_stock_codes']) != set(expected_symbols):
+        return None
+
+    successful = deepcopy(state.get('successful_by_stage') or {})
+    terminal = deepcopy(state.get('terminal_by_stage') or {})
+    proofs = deepcopy(state.get('proofs_by_stage') or {})
+    recovery_attempts = deepcopy(
+        state.get('recovery_attempts_by_stage') or {}
+    )
+    applied_run_ids = list(
+        state.get('applied_recovery_pipeline_run_ids') or []
+    )
+    if recovery_pipeline_run_id is not None:
+        if (
+            isinstance(recovery_pipeline_run_id, bool)
+            or not isinstance(recovery_pipeline_run_id, int)
+            or recovery_pipeline_run_id <= 0
+            or recovery_pipeline_run_id in applied_run_ids
+        ):
+            return None
+        current_attempts = recovery_attempts.get(stage_id, 0)
+        if (
+            isinstance(current_attempts, bool)
+            or not isinstance(current_attempts, int)
+            or current_attempts < 0
+        ):
+            return None
+        recovery_attempts[stage_id] = current_attempts + 1
+        applied_run_ids.append(recovery_pipeline_run_id)
+    recovery_progress_count = state.get('recovery_progress_count', 0)
+    if (
+        isinstance(recovery_progress_count, bool)
+        or not isinstance(recovery_progress_count, int)
+        or recovery_progress_count < 0
+    ):
+        return None
+    successful_set = set(successful.get(stage_id) or [])
+    terminal_set = set(terminal.get(stage_id) or [])
+    invocation_set = set(normalized_invocation)
+    successful_set.difference_update(invocation_set)
+    successful_set.update(partition['successful_stock_codes'])
+    terminal_set.difference_update(invocation_set)
+    terminal_set.update(partition['terminal_not_applicable_stock_codes'])
+    pending[stage_id] = list(partition['retry_debt_stock_codes'])
+    successful[stage_id] = sorted(successful_set)
+    terminal[stage_id] = sorted(terminal_set)
+    proofs.setdefault(stage_id, []).append(proof)
+    if (
+        partition['successful_stock_codes']
+        or partition['terminal_not_applicable_stock_codes']
+    ):
+        recovery_progress_count += 1
+
+    _canonicalize_followup_stage_debt_graph(
+        pending=pending,
+        successful=successful,
+        terminal=terminal,
+        admit_newly_eligible=True,
+    )
+
+    normalized_pending = {
+        key: list(value)
+        for key, value in pending.items()
+        if value
+    }
+    return {
+        **dict(state),
+        'pending_by_stage': normalized_pending,
+        'successful_by_stage': {
+            key: list(value)
+            for key, value in successful.items()
+            if value
+        },
+        'terminal_by_stage': {
+            key: list(value)
+            for key, value in terminal.items()
+            if value
+        },
+        'proofs_by_stage': proofs,
+        'recovery_progress_count': recovery_progress_count,
+        'recovery_attempts_by_stage': recovery_attempts,
+        'applied_recovery_pipeline_run_ids': applied_run_ids,
+    }
+
+
+def _build_followup_stage_recovery_scope_outcome(
+    state: Mapping[str, Any],
+    *,
+    stage_id: str,
+) -> dict[str, Any] | None:
+    """Bind one debt retry to the durable stage-local partition.
+
+    The selected stage universe is deliberately not inferred as the full EOD
+    membership.  Upstream debt may still be ineligible for this stage; only
+    symbols already classified as success, retry debt, or terminal by the
+    durable stage-debt state may authorize a recovery write.
+    """
+
+    manifest_version = FOLLOWUP_EXACT_STAGE_RECOVERY_MANIFEST_VERSION.get(
+        stage_id
+    )
+    if manifest_version is None:
+        return None
+    pending = _dedupe_symbol_codes(
+        (state.get('pending_by_stage') or {}).get(stage_id) or []
+    )
+    successful = _dedupe_symbol_codes(
+        (state.get('successful_by_stage') or {}).get(stage_id) or []
+    )
+    terminal = _dedupe_symbol_codes(
+        (state.get('terminal_by_stage') or {}).get(stage_id) or []
+    )
+    if not pending:
+        return None
+    selected = _dedupe_symbol_codes([*successful, *pending, *terminal])
+    try:
+        return {
+            'schema_version': (
+                FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION
+            ),
+            'stage_id': stage_id,
+            **build_exact_symbol_scope_outcome(
+                manifest_version=manifest_version,
+                selected_symbols=selected,
+                successful_symbols=successful,
+                retry_debt_symbols=pending,
+                terminal_not_applicable_symbols=terminal,
+            ),
+        }
+    except ValueError:
+        return None
+
+
+def _next_followup_stage_debt_request(
+    state: Mapping[str, Any],
+) -> tuple[str, list[str]] | None:
+    pending = state.get('pending_by_stage')
+    if not isinstance(pending, Mapping):
+        return None
+    raw_attempts = state.get('recovery_attempts_by_stage')
+    attempts = raw_attempts if isinstance(raw_attempts, Mapping) else {}
+    candidates: list[tuple[int, int, str, list[str]]] = []
+    for stage_order, stage_id in enumerate(
+        FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+    ):
+        symbols = _dedupe_symbol_codes(pending.get(stage_id) or [])
+        if symbols:
+            raw_attempt_count = attempts.get(stage_id, 0)
+            attempt_count = (
+                raw_attempt_count
+                if isinstance(raw_attempt_count, int)
+                and not isinstance(raw_attempt_count, bool)
+                and raw_attempt_count >= 0
+                else 0
+            )
+            candidates.append(
+                (attempt_count, stage_order, stage_id, symbols)
+            )
+    if not candidates:
+        return None
+    _, _, stage_id, symbols = min(candidates)
+    return stage_id, symbols
+
+
+def _resolve_followup_stage_debt_state(
+    *,
+    market_date: str,
+    eod_collection_run_id: int,
+    latest_eod_metadata: Mapping[str, Any],
+    stage_rows: Mapping[str, Any],
+    incomplete_stages: Sequence[str],
+    latest_pipeline_run: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve only manifest-backed follow-up debt into per-stage scopes."""
+
+    admission_partition = _validated_followup_admission_partition(
+        latest_eod_metadata
+    )
+    parent_symbols = (
+        list(admission_partition['successful_stock_codes'])
+        if admission_partition is not None
+        else []
+    )
+    publication_symbols = (
+        list(admission_partition['selected_stock_codes'])
+        if admission_partition is not None
+        else []
+    )
+    raw_persisted_state = latest_eod_metadata.get(
+        FOLLOWUP_STAGE_DEBT_METADATA_KEY
+    )
+    if raw_persisted_state is not None:
+        if not parent_symbols:
+            return {
+                'required': True,
+                'ready': False,
+                'reason': 'followup_stage_debt_parent_scope_unavailable',
+            }
+        persisted_state = _validated_followup_stage_debt_state(
+            raw_persisted_state,
+            market_date=market_date,
+            eod_collection_run_id=eod_collection_run_id,
+            parent_symbols=parent_symbols,
+            publication_symbols=publication_symbols,
+            require_pending=False,
+        )
+        if persisted_state is None:
+            return {
+                'required': True,
+                'ready': False,
+                'reason': 'followup_stage_debt_state_invalid',
+            }
+        next_request = _next_followup_stage_debt_request(persisted_state)
+        pipeline_metadata = (
+            latest_pipeline_run.get('run_metadata')
+            if isinstance(latest_pipeline_run, Mapping)
+            else None
+        )
+        linked_recovery_stage = (
+            next_request[0]
+            if next_request is not None
+            and isinstance(pipeline_metadata, Mapping)
+            and str(latest_pipeline_run.get('trigger') or '').strip()
+            == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            and pipeline_metadata.get('reused_eod_collection_run_id')
+            == eod_collection_run_id
+            and pipeline_metadata.get('resolved_stages')
+            == [next_request[0]]
+            else None
+        )
+        linked_recovery_run_id = (
+            latest_pipeline_run.get('id')
+            if linked_recovery_stage is not None
+            and isinstance(latest_pipeline_run, Mapping)
+            and isinstance(latest_pipeline_run.get('id'), int)
+            and not isinstance(latest_pipeline_run.get('id'), bool)
+            and int(latest_pipeline_run['id']) > 0
+            else None
+        )
+        reconciled = False
+        reconciliation_error: str | None = None
+        if (
+            linked_recovery_stage is not None
+            and linked_recovery_run_id is not None
+        ):
+            candidate = stage_rows.get(linked_recovery_stage)
+            exact_evidence_present = _followup_exact_evidence_present(
+                candidate
+            )
+            proof_already_applied = linked_recovery_run_id in set(
+                persisted_state.get(
+                    'applied_recovery_pipeline_run_ids'
+                )
+                or []
+            )
+            attempt_finished = _followup_recovery_stage_attempt_finished(
+                candidate,
+                expected_stage_id=linked_recovery_stage,
+            )
+            if not proof_already_applied and exact_evidence_present:
+                validated = _validated_followup_exact_partition(
+                    stage_id=linked_recovery_stage,
+                    stage=candidate,
+                    expected_market_date=market_date,
+                    expected_publication_symbols=next_request[1],
+                    allowed_partition_symbols=next_request[1],
+                )
+                if validated is None:
+                    advanced_state = (
+                        _record_followup_stage_debt_attempt(
+                            persisted_state,
+                            stage_id=linked_recovery_stage,
+                            invocation_symbols=next_request[1],
+                            recovery_pipeline_run_id=(
+                                linked_recovery_run_id
+                            ),
+                        )
+                        if attempt_finished
+                        else None
+                    )
+                    if advanced_state is None:
+                        return {
+                            'required': True,
+                            'ready': False,
+                            'reason': (
+                                f'{linked_recovery_stage}_recovery_manifest_invalid'
+                            ),
+                        }
+                    reconciliation_error = (
+                        f'{linked_recovery_stage}_recovery_manifest_invalid'
+                    )
+                else:
+                    partition, _proof = validated
+                    if set(partition['selected_stock_codes']) != set(
+                        next_request[1]
+                    ):
+                        advanced_state = (
+                            _record_followup_stage_debt_attempt(
+                                persisted_state,
+                                stage_id=linked_recovery_stage,
+                                invocation_symbols=next_request[1],
+                                recovery_pipeline_run_id=(
+                                    linked_recovery_run_id
+                                ),
+                            )
+                            if attempt_finished
+                            else None
+                        )
+                        if advanced_state is None:
+                            return {
+                                'required': True,
+                                'ready': False,
+                                'reason': (
+                                    f'{linked_recovery_stage}_recovery_scope_mismatch'
+                                ),
+                            }
+                        reconciliation_error = (
+                            f'{linked_recovery_stage}_recovery_scope_mismatch'
+                        )
+                    else:
+                        advanced_state = _advance_followup_stage_debt_state(
+                            persisted_state,
+                            stage_id=linked_recovery_stage,
+                            invocation_symbols=next_request[1],
+                            stage_result=candidate,
+                            recovery_pipeline_run_id=(
+                                linked_recovery_run_id
+                            ),
+                        )
+                if advanced_state is None:
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'reason': (
+                            f'{linked_recovery_stage}_recovery_transition_invalid'
+                        ),
+                    }
+                persisted_state = advanced_state
+                reconciled = True
+            elif not proof_already_applied and attempt_finished:
+                advanced_state = _record_followup_stage_debt_attempt(
+                    persisted_state,
+                    stage_id=linked_recovery_stage,
+                    invocation_symbols=next_request[1],
+                    recovery_pipeline_run_id=linked_recovery_run_id,
+                )
+                if advanced_state is None:
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'reason': (
+                            f'{linked_recovery_stage}_recovery_transition_invalid'
+                        ),
+                    }
+                persisted_state = advanced_state
+                reconciled = True
+                reconciliation_error = (
+                    f'{linked_recovery_stage}_recovery_manifest_missing'
+                )
+        return {
+            'required': True,
+            'ready': True,
+            'state': persisted_state,
+            'source': (
+                'persisted_stage_debt_reconciled'
+                if reconciled
+                else 'persisted_stage_debt'
+            ),
+            **(
+                {'reconciliation_error': reconciliation_error}
+                if reconciliation_error is not None
+                else {}
+            ),
+        }
+
+    eod_stage_rows = latest_eod_metadata.get('stage_progress')
+    if not isinstance(eod_stage_rows, Mapping):
+        eod_stage_rows = {}
+    incomplete_exact_stages = [
+        stage_id
+        for stage_id in incomplete_stages
+        if stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+    ]
+    partitions: dict[str, dict[str, Any]] = {}
+    proofs_by_stage: dict[str, list[dict[str, Any]]] = {}
+    provider_result_summary: dict[str, Any] | None = None
+    exact_evidence_seen = False
+    for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER:
+        candidates = [
+            eod_stage_rows.get(stage_id),
+            stage_rows.get(stage_id),
+        ]
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            result_summary = _stage_result_summary(candidate)
+            exact_evidence_present = _followup_exact_evidence_present(
+                candidate
+            )
+            exact_result = (
+                _followup_exact_result_authority(
+                    stage_id=stage_id,
+                    stage=candidate,
+                )
+                if exact_evidence_present
+                else None
+            )
+            if exact_evidence_present and exact_result is None:
+                return {
+                    'required': True,
+                    'ready': False,
+                    'reason': f'{stage_id}_stage_debt_manifest_invalid',
+                }
+            expected_stage_publication_symbols = publication_symbols
+            if stage_id == 'signal_features' and exact_evidence_present:
+                signal_selected = exact_result.get(
+                    'selected_stock_codes'
+                ) if isinstance(exact_result, Mapping) else None
+                normalized_signal_selected = (
+                    _dedupe_symbol_codes(signal_selected)
+                    if isinstance(signal_selected, list)
+                    else []
+                )
+                dependency_partitions = [
+                    partitions.get(dependency_stage_id)
+                    for dependency_stage_id in (
+                        FOLLOWUP_EXACT_STAGE_DEPENDENCIES[stage_id]
+                    )
+                ]
+                if (
+                    not normalized_signal_selected
+                    or normalized_signal_selected != signal_selected
+                    or any(
+                        partition is None
+                        for partition in dependency_partitions
+                    )
+                ):
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'reason': (
+                            'signal_features_stage_debt_manifest_invalid'
+                        ),
+                    }
+                eligible_signal_symbols = set(parent_symbols)
+                for dependency_partition in dependency_partitions:
+                    eligible_signal_symbols.intersection_update(
+                        dependency_partition['successful_stock_codes']
+                    )
+                if set(normalized_signal_selected) != (
+                    eligible_signal_symbols
+                ):
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'reason': (
+                            'signal_features_stage_debt_scope_mismatch'
+                        ),
+                    }
+                # Signal features are published only for the factor-admitted
+                # intersection, not the full frozen EOD universe.  The
+                # selected list is authority only after the dependency
+                # intersection above proves that exact invocation.
+                expected_stage_publication_symbols = (
+                    normalized_signal_selected
+                )
+            validated = _validated_followup_exact_partition(
+                stage_id=stage_id,
+                stage=candidate,
+                expected_market_date=market_date,
+                expected_publication_symbols=(
+                    expected_stage_publication_symbols
+                ),
+                allowed_partition_symbols=parent_symbols,
+            )
+            if exact_evidence_present and validated is None:
+                return {
+                    'required': True,
+                    'ready': False,
+                    'reason': (
+                        f'{stage_id}_stage_debt_manifest_invalid'
+                    ),
+                }
+            if validated is not None:
+                exact_evidence_seen = True
+                partition, proof = validated
+                dependencies = FOLLOWUP_EXACT_STAGE_DEPENDENCIES.get(
+                    stage_id,
+                    (),
+                )
+                if dependencies:
+                    dependency_partitions = [
+                        partitions.get(dependency_stage_id)
+                        for dependency_stage_id in dependencies
+                    ]
+                    if any(
+                        dependency_partition is None
+                        for dependency_partition in dependency_partitions
+                    ):
+                        return {
+                            'required': True,
+                            'ready': False,
+                            'reason': (
+                                f'{stage_id}_stage_debt_scope_mismatch'
+                            ),
+                        }
+                    expected_selected = set(
+                        dependency_partitions[0][
+                            'successful_stock_codes'
+                        ]
+                    )
+                    for dependency_partition in dependency_partitions[1:]:
+                        expected_selected.intersection_update(
+                            dependency_partition[
+                                'successful_stock_codes'
+                            ]
+                        )
+                else:
+                    expected_selected = set(parent_symbols)
+                if set(partition['selected_stock_codes']) != expected_selected:
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'reason': f'{stage_id}_stage_debt_scope_mismatch',
+                    }
+                partitions[stage_id] = partition
+                stage_proofs = proofs_by_stage.setdefault(stage_id, [])
+                if proof not in stage_proofs:
+                    stage_proofs.append(proof)
+            if stage_id == 'fundamentals_daily_refresh':
+                provider_admission = _validated_required_provider_admission(
+                    candidate,
+                    expected_stage_id=stage_id,
+                )
+                if provider_admission is not None:
+                    exact_evidence_seen = True
+                    provider_result_summary = dict(result_summary)
+
+    if not exact_evidence_seen:
+        return {'required': False, 'ready': False}
+    if not parent_symbols:
+        return {
+            'required': True,
+            'ready': False,
+            'reason': 'followup_stage_debt_parent_scope_unavailable',
+        }
+
+    pending_by_stage: dict[str, list[str]] = {}
+    successful_by_stage: dict[str, list[str]] = {}
+    terminal_by_stage: dict[str, list[str]] = {}
+    for stage_id, partition in partitions.items():
+        retry_debt = list(partition['retry_debt_stock_codes'])
+        if retry_debt:
+            pending_by_stage[stage_id] = retry_debt
+        successful = list(partition['successful_stock_codes'])
+        if successful:
+            successful_by_stage[stage_id] = successful
+        terminal = list(partition['terminal_not_applicable_stock_codes'])
+        if terminal:
+            terminal_by_stage[stage_id] = terminal
+    _canonicalize_followup_stage_debt_graph(
+        pending=pending_by_stage,
+        successful=successful_by_stage,
+        terminal=terminal_by_stage,
+        admit_newly_eligible=False,
+    )
+    pending_by_stage = {
+        stage_id: symbols
+        for stage_id, symbols in pending_by_stage.items()
+        if symbols
+    }
+    successful_by_stage = {
+        stage_id: symbols
+        for stage_id, symbols in successful_by_stage.items()
+        if symbols
+    }
+    terminal_by_stage = {
+        stage_id: symbols
+        for stage_id, symbols in terminal_by_stage.items()
+        if symbols
+    }
+    if (
+        provider_result_summary is not None
+        and 'fundamentals_daily_refresh' not in partitions
+    ):
+        pending_by_stage['fundamentals_daily_refresh'] = list(
+            parent_symbols
+        )
+
+    # A blocked downstream stage without its own manifest is not guessed into
+    # debt. Its exact scope is admitted only after the upstream proof succeeds.
+    # Conversely, a directly failed/partial exact stage must carry a manifest.
+    for stage_id in incomplete_exact_stages:
+        if stage_id in pending_by_stage:
+            continue
+        stage = stage_rows.get(stage_id) or eod_stage_rows.get(stage_id)
+        result_summary = _stage_result_summary(stage)
+        reason = str(result_summary.get('reason') or '').strip()
+        status = str(
+            result_summary.get('status')
+            or (stage.get('status') if isinstance(stage, Mapping) else '')
+            or ''
+        ).strip().lower()
+        upstream_block = bool(
+            status == 'blocked'
+            and (
+                reason.endswith('_incomplete')
+                or reason
+                in {
+                    'declared_dependencies_incomplete',
+                    'required_provider_not_ready',
+                    'stored_recovery_inputs_incomplete',
+                }
+            )
+        )
+        if (
+            stage_id == 'fundamentals_daily_refresh'
+            and provider_result_summary is not None
+        ):
+            continue
+        if not upstream_block and stage_id not in partitions:
+            return {
+                'required': True,
+                'ready': False,
+                'reason': f'{stage_id}_stage_debt_manifest_unavailable',
+            }
+
+    if not pending_by_stage:
+        return {'required': False, 'ready': False}
+    state = {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': market_date,
+        'eod_collection_run_id': eod_collection_run_id,
+        'pending_by_stage': pending_by_stage,
+        'successful_by_stage': successful_by_stage,
+        'terminal_by_stage': terminal_by_stage,
+        'proofs_by_stage': proofs_by_stage,
+        'recovery_progress_count': 0,
+        'recovery_attempts_by_stage': {},
+        'applied_recovery_pipeline_run_ids': [],
+        **(
+            {'provider_admission': provider_result_summary}
+            if provider_result_summary is not None
+            else {}
+        ),
+    }
+    return {
+        'required': True,
+        'ready': True,
+        'state': state,
+        'source': 'exact_stage_manifests',
+    }
+
+
+def _resolve_dart_followup_recovery_scope(
+    *,
+    incomplete_stages: Sequence[str],
+    stage_rows: Mapping[str, Any],
+    run_metadata: Mapping[str, Any],
+    latest_eod_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a narrow DART replay scope or explicitly fail closed."""
+
+    if not incomplete_stages or incomplete_stages[0] != (
+        'fundamentals_daily_refresh'
+    ):
+        return {'required': False, 'ready': False, 'symbols': []}
+    stage = stage_rows.get('fundamentals_daily_refresh')
+    if not isinstance(stage, Mapping):
+        return {
+            'required': True,
+            'ready': False,
+            'symbols': [],
+            'reason': 'dart_recovery_stage_evidence_unavailable',
+        }
+    result_summary = _stage_result_summary(stage)
+    exact_evidence_present = _followup_exact_evidence_present(stage)
+    exact_result = (
+        _followup_exact_result_authority(
+            stage_id='fundamentals_daily_refresh',
+            stage=stage,
+        )
+        if exact_evidence_present
+        else None
+    )
+    selected_symbols = (
+        exact_result.get('selected_stock_codes')
+        if isinstance(exact_result, Mapping)
+        else None
+    )
+    if exact_evidence_present:
+        if exact_result is None or not isinstance(selected_symbols, list):
+            return {
+                'required': True,
+                'ready': False,
+                'symbols': [],
+                'reason': 'dart_recovery_exact_manifest_invalid',
+            }
+        if exact_result.get('scope_outcome_manifest_version') not in (
+            FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS[
+                'fundamentals_daily_refresh'
+            ]
+        ):
+            return {
+                'required': True,
+                'ready': False,
+                'symbols': [],
+                'reason': 'dart_recovery_manifest_version_invalid',
+            }
+        validated_dart_partition = _validated_followup_exact_partition(
+            stage_id='fundamentals_daily_refresh',
+            stage=stage,
+            expected_market_date=str(
+                run_metadata.get('market_date')
+                or result_summary.get('market_date')
+                or exact_result.get('market_date')
+                or ''
+            ),
+            expected_publication_symbols=selected_symbols,
+            allowed_partition_symbols=selected_symbols,
+        )
+        partition = (
+            validated_dart_partition[0]
+            if validated_dart_partition is not None
+            else None
+        )
+        if partition is not None:
+            if partition['manifest_version'] not in {
+                'dart_daily_data_scope_outcomes_v1',
+                'dart_fundamentals_scope_outcomes_v1',
+            }:
+                return {
+                    'required': True,
+                    'ready': False,
+                    'symbols': [],
+                    'reason': 'dart_recovery_manifest_version_invalid',
+                }
+            retry_debt_symbols = list(
+                partition['retry_debt_stock_codes']
+            )
+            if retry_debt_symbols:
+                persisted_run_symbols = _dedupe_symbol_codes(
+                    run_metadata.get('symbols') or []
+                )
+                parent_symbols = _validated_followup_admitted_symbols(
+                    latest_eod_metadata
+                )
+                if not persisted_run_symbols and not parent_symbols:
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'symbols': [],
+                        'reason': (
+                            'dart_recovery_scope_authority_unavailable'
+                        ),
+                    }
+                if persisted_run_symbols and set(
+                    partition['selected_stock_codes']
+                ) != set(persisted_run_symbols):
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'symbols': [],
+                        'reason': 'dart_recovery_manifest_run_scope_mismatch',
+                    }
+                if parent_symbols and not set(
+                    partition['selected_stock_codes']
+                ).issubset(parent_symbols):
+                    return {
+                        'required': True,
+                        'ready': False,
+                        'symbols': [],
+                        'reason': 'dart_recovery_manifest_parent_scope_mismatch',
+                    }
+                return {
+                    'required': True,
+                    'ready': True,
+                    'symbols': retry_debt_symbols,
+                    'source': 'first_incomplete_exact_manifest',
+                    'manifest_version': partition['manifest_version'],
+                }
+    if exact_evidence_present:
+        return {
+            'required': True,
+            'ready': False,
+            'symbols': [],
+            'reason': 'dart_recovery_exact_manifest_invalid',
+        }
+
+    provider_admission = _validated_required_provider_admission(
+        stage,
+        expected_stage_id='fundamentals_daily_refresh',
+    )
+    if provider_admission is None:
+        return {
+            'required': True,
+            'ready': False,
+            'symbols': [],
+            'reason': 'dart_recovery_exact_manifest_unavailable',
+        }
+    parent_symbols = _validated_followup_admitted_symbols(
+        latest_eod_metadata
+    )
+    persisted_run_symbols = _dedupe_symbol_codes(
+        run_metadata.get('symbols') or []
+    )
+    provider_scope = persisted_run_symbols or parent_symbols or []
+    if (
+        not provider_scope
+        or (
+            parent_symbols
+            and not set(provider_scope).issubset(parent_symbols)
+        )
+    ):
+        return {
+            'required': True,
+            'ready': False,
+            'symbols': [],
+            'reason': 'dart_provider_admission_scope_unavailable',
+        }
+    return {
+        'required': True,
+        'ready': True,
+        'symbols': provider_scope,
+        'source': 'required_provider_admission_frozen_scope',
+        'provider_admission': provider_admission,
+    }
+
+
+def _count_nonconsuming_provider_admission_runs(
+    runs: Sequence[Mapping[str, Any]],
+) -> int:
+    seen_run_ids: set[int] = set()
+    count = 0
+    for run in runs:
+        raw_run_id = run.get('id')
+        if isinstance(raw_run_id, bool):
+            continue
+        try:
+            run_id = int(raw_run_id)
+        except (TypeError, ValueError):
+            continue
+        if run_id <= 0 or run_id in seen_run_ids:
+            continue
+        seen_run_ids.add(run_id)
+        if str(run.get('trigger') or '').strip() != (
+            AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        ):
+            continue
+        run_metadata = run.get('run_metadata')
+        resolved_stages = (
+            run_metadata.get('resolved_stages')
+            if isinstance(run_metadata, Mapping)
+            else None
+        )
+        if not isinstance(resolved_stages, list) or not resolved_stages:
+            continue
+        first_resolved_stage = str(resolved_stages[0] or '').strip()
+        if not first_resolved_stage:
+            continue
+        stages = run.get('stages')
+        if not isinstance(stages, Mapping):
+            continue
+        # Exempt only a recovery whose first admitted stage was rejected
+        # before an attempt. A later provider block cannot erase budget spent
+        # by a real failure earlier in the same recovery run.
+        if _validated_required_provider_admission(
+            stages.get(first_resolved_stage),
+            expected_stage_id=first_resolved_stage,
+        ) is not None:
+            count += 1
+    return count
+
+
+def _count_nonconsuming_stage_debt_progress_runs(
+    state: Mapping[str, Any] | None,
+) -> int:
+    """Return the explicit count of retries that durably reduced debt.
+
+    Proof order cannot distinguish a source-run baseline from the first
+    recovery proof of a stage admitted later by dependency propagation.  The
+    counter is therefore initialized with the source state and incremented
+    only by ``_advance_followup_stage_debt_state`` when a recovery classifies
+    at least one invoked symbol as success or terminal. Failed-all retries
+    continue to consume the bounded failure budget.
+    """
+
+    if not isinstance(state, Mapping):
+        return 0
+    progress_count = state.get('recovery_progress_count', 0)
+    if (
+        isinstance(progress_count, bool)
+        or not isinstance(progress_count, int)
+        or progress_count < 0
+    ):
+        return 0
+    return progress_count
+
+
+def _count_all_nonconsuming_provider_admission_runs(
+    *,
+    current_run: Mapping[str, Any],
+    raw_recovery_attempts: int,
+    market_date: str,
+    reused_eod_collection_run_id: int,
+) -> int:
+    """Count every exact zero-attempt provider block in one lineage."""
+
+    if (
+        str(current_run.get('trigger') or '').strip()
+        != AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        or type(current_run.get('id')) is not int
+        or int(current_run['id']) <= 0
+        or raw_recovery_attempts <= 0
+    ):
+        return 0
+
+    collected_runs: list[Mapping[str, Any]] = [current_run]
+    seen_run_ids = {int(current_run['id'])}
+    before_pipeline_run_id = int(current_run['id'])
+    remaining = max(int(raw_recovery_attempts) - 1, 0)
+    while remaining > 0:
+        page = (
+            daily_pipeline_run_state_service
+            .list_prior_followup_runs_for_lineage(
+                market_date=market_date,
+                reused_eod_collection_run_id=(
+                    reused_eod_collection_run_id
+                ),
+                before_pipeline_run_id=before_pipeline_run_id,
+                limit=min(remaining, 8),
+                order_by_id_desc=True,
+            )
+        )
+        if not page:
+            break
+        new_runs: list[Mapping[str, Any]] = []
+        new_run_ids: list[int] = []
+        for run in page:
+            raw_run_id = run.get('id') if isinstance(run, Mapping) else None
+            if isinstance(raw_run_id, bool):
+                continue
+            try:
+                run_id = int(raw_run_id)
+            except (TypeError, ValueError):
+                continue
+            if (
+                run_id <= 0
+                or run_id >= before_pipeline_run_id
+                or run_id in seen_run_ids
+            ):
+                continue
+            seen_run_ids.add(run_id)
+            new_run_ids.append(run_id)
+            new_runs.append(run)
+        if not new_runs:
+            break
+        collected_runs.extend(new_runs)
+        remaining = max(remaining - len(new_runs), 0)
+        before_pipeline_run_id = min(new_run_ids)
+    return _count_nonconsuming_provider_admission_runs(collected_runs)
 
 
 def _is_dart_provider_outage_rearm_candidate(
@@ -4334,6 +6286,175 @@ class PykrxBackfillService:
             # its proof is copied to the EOD ancestor. Reconcile that exact
             # durable proof instead of rerunning a partial decider.
             incomplete_stages.clear()
+        stage_debt_resolution = _resolve_followup_stage_debt_state(
+            market_date=market_date,
+            eod_collection_run_id=int(latest_eod_run['id']),
+            latest_eod_metadata=latest_eod_metadata,
+            stage_rows=stage_rows,
+            incomplete_stages=incomplete_stages,
+            latest_pipeline_run=pipeline_run,
+        )
+        if (
+            stage_debt_resolution.get('required') is True
+            and stage_debt_resolution.get('ready') is not True
+        ):
+            result = build_daily_skip_result(
+                reason='followup_stage_debt_scope_unavailable',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'blocked',
+                'retry_scheduled': False,
+                'blocker': stage_debt_resolution.get('reason'),
+            }
+            return result
+        stage_debt_state = (
+            dict(stage_debt_resolution['state'])
+            if stage_debt_resolution.get('ready') is True
+            and isinstance(stage_debt_resolution.get('state'), Mapping)
+            else None
+        )
+        reconciled_stage_debt_persisted = False
+        if (
+            stage_debt_state is not None
+            and stage_debt_resolution.get('source')
+            == 'persisted_stage_debt_reconciled'
+        ):
+            # A recovery may commit its exact stage result immediately before
+            # the scheduler crashes, leaving the EOD ancestor with the old
+            # pending ledger. Persist the reconciled tombstone before any
+            # early return or convergence decision, including when this proof
+            # resolves the final pending stage.
+            reconciled_persistence = (
+                self._persist_followup_stage_debt_state(
+                    latest_eod_run=latest_eod_run,
+                    state=stage_debt_state,
+                )
+            )
+            if not reconciled_persistence.get('updated'):
+                result = build_daily_skip_result(
+                    reason='followup_stage_debt_state_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'state_unavailable',
+                    'retry_scheduled': False,
+                    'blocker': reconciled_persistence.get('reason'),
+                }
+                return result
+            reconciled_stage_debt_persisted = True
+            persisted_metadata = latest_eod_run.get('run_metadata')
+            if isinstance(persisted_metadata, Mapping):
+                latest_eod_metadata = dict(persisted_metadata)
+        stage_debt_request = (
+            _next_followup_stage_debt_request(stage_debt_state)
+            if stage_debt_state is not None
+            else None
+        )
+        stage_debt_scope_outcome: dict[str, Any] | None = None
+        if stage_debt_request is not None:
+            debt_stage_id, debt_symbols = stage_debt_request
+            if (
+                debt_stage_id == 'signal_features'
+                and date.fromisoformat(market_date)
+                < current_krx_calendar_date
+            ):
+                result = build_daily_skip_result(
+                    reason='followup_stage_debt_current_only_expired',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked',
+                    'retry_scheduled': False,
+                    'attempt_started': False,
+                    'consumes_retry_budget': False,
+                    'resume_from_stage': debt_stage_id,
+                    'symbols': debt_symbols,
+                    'blocker': 'historical_current_only_stage_debt',
+                    'stage_debt_preserved': True,
+                }
+                return result
+            point_in_time_recovery = debt_stage_id != 'signal_features'
+            point_in_time_membership_symbols = (
+                _validated_followup_admitted_symbols(latest_eod_metadata)
+            )
+            if not point_in_time_membership_symbols:
+                result = build_daily_skip_result(
+                    reason='followup_stage_debt_scope_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked',
+                    'retry_scheduled': False,
+                    'resume_from_stage': debt_stage_id,
+                    'symbols': debt_symbols,
+                    'blocker': 'frozen_stage_membership_unavailable',
+                    'stage_debt_preserved': True,
+                }
+                return result
+            stage_debt_scope_outcome = (
+                _build_followup_stage_recovery_scope_outcome(
+                    stage_debt_state,
+                    stage_id=debt_stage_id,
+                )
+            )
+            if stage_debt_scope_outcome is None:
+                result = build_daily_skip_result(
+                    reason='followup_stage_debt_scope_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked',
+                    'retry_scheduled': False,
+                    'resume_from_stage': debt_stage_id,
+                    'symbols': debt_symbols,
+                    'blocker': 'stage_debt_partition_invalid',
+                    'stage_debt_preserved': True,
+                }
+                return result
+            if not reconciled_stage_debt_persisted:
+                debt_persistence = (
+                    self._persist_followup_stage_debt_state(
+                        latest_eod_run=latest_eod_run,
+                        state=stage_debt_state,
+                    )
+                )
+                if not debt_persistence.get('updated'):
+                    result = build_daily_skip_result(
+                        reason='followup_stage_debt_state_unavailable',
+                        market_date=market_date,
+                        latest_available_trade_date=(
+                            latest_available_trade_date
+                        ),
+                        existing_run=latest_eod_run,
+                    )
+                    result['followup_recovery'] = {
+                        'status': 'state_unavailable',
+                        'retry_scheduled': False,
+                        'blocker': debt_persistence.get('reason'),
+                    }
+                    return result
+            incomplete_stages = [debt_stage_id]
+            if debt_stage_id not in recovery_scope:
+                recovery_scope.append(debt_stage_id)
         if not incomplete_stages:
             is_followup_recovery_parent = bool(
                 pipeline_run.get('trigger')
@@ -4386,6 +6507,13 @@ class PykrxBackfillService:
                         'pipeline_status': pipeline_status,
                     }
                 )
+                persisted_recovery_symbols = _dedupe_symbol_codes(
+                    run_metadata.get('symbols') or []
+                )
+                if persisted_recovery_symbols:
+                    convergence_result[
+                        '_proven_resolved_downstream_symbols'
+                    ] = persisted_recovery_symbols
                 if pending_same_day_rearm is not None:
                     convergence_result.update(
                         {
@@ -4447,7 +6575,11 @@ class PykrxBackfillService:
 
         resume_from_stage = incomplete_stages[0]
         resume_index = recovery_scope.index(resume_from_stage)
-        recovery_stages = recovery_scope[resume_index:]
+        recovery_stages = (
+            [resume_from_stage]
+            if stage_debt_request is not None
+            else recovery_scope[resume_index:]
+        )
         proven_partial_summary_downstream_continuation = bool(
             partial_summary_prefix_proven
             and resume_from_stage == 'signal_decider'
@@ -4458,6 +6590,85 @@ class PykrxBackfillService:
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in recovery_stages
         )
+        first_incomplete_stage = incomplete_stages[0]
+        required_provider_admission = (
+            _validated_required_provider_admission(
+                stage_rows.get(first_incomplete_stage),
+                expected_stage_id=first_incomplete_stage,
+            )
+        )
+        provider_admission_rearm = bool(
+            required_provider_admission is not None
+            and _required_provider_credentials_are_ready(
+                required_provider_admission
+            )
+        )
+        if (
+            required_provider_admission is not None
+            and not provider_admission_rearm
+        ):
+            result = build_daily_skip_result(
+                reason='followup_recovery_provider_not_ready',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'blocked_missing_credential',
+                'retry_scheduled': True,
+                'resume_from_stage': first_incomplete_stage,
+                'attempt_started': False,
+                'consumes_retry_budget': False,
+                'provider_admission': required_provider_admission,
+            }
+            return result
+        dart_recovery_scope = _resolve_dart_followup_recovery_scope(
+            incomplete_stages=incomplete_stages,
+            stage_rows=stage_rows,
+            run_metadata=run_metadata,
+            latest_eod_metadata=latest_eod_metadata,
+        )
+        if (
+            dart_recovery_scope.get('required') is True
+            and dart_recovery_scope.get('ready') is not True
+        ):
+            result = build_daily_skip_result(
+                reason='followup_recovery_exact_scope_unavailable',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'blocked',
+                'retry_scheduled': False,
+                'resume_from_stage': first_incomplete_stage,
+                'blocker': dart_recovery_scope.get('reason'),
+            }
+            return result
+        if (
+            stage_debt_request is not None
+            and stage_debt_request[0]
+            == 'fundamentals_daily_refresh'
+            and (
+                dart_recovery_scope.get('ready') is not True
+                or set(dart_recovery_scope.get('symbols') or [])
+                != set(stage_debt_request[1])
+            )
+        ):
+            result = build_daily_skip_result(
+                reason='followup_stage_debt_scope_mismatch',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'blocked',
+                'retry_scheduled': False,
+                'resume_from_stage': 'fundamentals_daily_refresh',
+                'blocker': 'dart_stage_debt_scope_mismatch',
+                'stage_debt_preserved': True,
+            }
+            return result
         recovering_safe_downstream_scope = bool(
             allow_safe_downstream_scope_with_price_failures
             and price_retry_symbols
@@ -4492,11 +6703,34 @@ class PykrxBackfillService:
                 }
                 return result
 
+        nonconsuming_provider_admission_runs = 0
+        nonconsuming_stage_debt_progress_runs = (
+            _count_nonconsuming_stage_debt_progress_runs(
+                stage_debt_state
+            )
+        )
         try:
-            recovery_attempts = daily_pipeline_run_state_service.count_runs(
+            raw_recovery_attempts = daily_pipeline_run_state_service.count_runs(
                 market_date=market_date,
                 trigger=AUTO_FOLLOWUP_RECOVERY_TRIGGER,
                 reused_eod_collection_run_id=int(latest_eod_run['id']),
+            )
+            if raw_recovery_attempts > 0:
+                nonconsuming_provider_admission_runs = (
+                    _count_all_nonconsuming_provider_admission_runs(
+                        current_run=pipeline_run,
+                        raw_recovery_attempts=raw_recovery_attempts,
+                        market_date=market_date,
+                        reused_eod_collection_run_id=int(
+                            latest_eod_run['id']
+                        ),
+                    )
+                )
+            recovery_attempts = max(
+                raw_recovery_attempts
+                - nonconsuming_provider_admission_runs
+                - nonconsuming_stage_debt_progress_runs,
+                0,
             )
             repair_checkpoint: dict[str, Any] | None = None
             repair_checkpoint_after = (
@@ -4917,7 +7151,10 @@ class PykrxBackfillService:
                 )
             return result
 
-        if pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER:
+        if (
+            pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            and not provider_admission_rearm
+        ):
             completed_at = _parse_activity_datetime(
                 pipeline_run.get('completed_at') or pipeline_run.get('updated_at')
             )
@@ -5178,7 +7415,9 @@ class PykrxBackfillService:
         persisted_point_in_time_recovery = bool(
             run_metadata.get('point_in_time_recovery')
         )
-        if point_in_time_recovery or (
+        if stage_debt_request is not None and point_in_time_recovery:
+            recovery_kwargs['point_in_time_recovery'] = True
+        elif point_in_time_recovery or (
             persisted_point_in_time_recovery
             and (
                 terminal_continuation_in_place
@@ -5187,7 +7426,44 @@ class PykrxBackfillService:
             )
         ):
             recovery_kwargs['point_in_time_recovery'] = True
-        if point_in_time_recovery and point_in_time_membership_symbols:
+        stage_debt_membership_symbols = (
+            _validated_followup_admitted_symbols(latest_eod_metadata)
+            if stage_debt_request is not None
+            else None
+        )
+        if stage_debt_request is not None:
+            if not stage_debt_membership_symbols:
+                result = build_daily_skip_result(
+                    reason='followup_stage_debt_scope_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked',
+                    'retry_scheduled': False,
+                    'resume_from_stage': stage_debt_request[0],
+                    'blocker': 'frozen_stage_membership_unavailable',
+                    'stage_debt_preserved': True,
+                }
+                return result
+            recovery_kwargs['exact_membership_symbols'] = sorted(
+                stage_debt_membership_symbols
+            )
+            parent_scope_outcome = latest_eod_metadata.get(
+                'followup_admission_scope_outcome'
+            )
+            if isinstance(parent_scope_outcome, Mapping):
+                recovery_kwargs['recovery_parent_scope_outcome'] = dict(
+                    parent_scope_outcome
+                )
+            if stage_debt_scope_outcome is not None:
+                recovery_kwargs['recovery_stage_scope_outcome'] = dict(
+                    stage_debt_scope_outcome
+                )
+        elif point_in_time_recovery and point_in_time_membership_symbols:
             recovery_kwargs['exact_membership_symbols'] = sorted(
                 point_in_time_membership_symbols
             )
@@ -5206,7 +7482,9 @@ class PykrxBackfillService:
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in incomplete_stages
         )
-        if terminal_continuation_in_place:
+        if stage_debt_request is not None:
+            recovery_symbols = list(stage_debt_request[1])
+        elif terminal_continuation_in_place:
             recovery_symbols = _dedupe_symbol_codes(
                 run_metadata.get('symbols') or []
             )
@@ -5235,6 +7513,11 @@ class PykrxBackfillService:
             # summary scope. Rebuilding a historical market membership here
             # can neither strengthen that proof nor safely broaden it.
             recovery_symbols = []
+        elif (
+            dart_recovery_scope.get('required') is True
+            and dart_recovery_scope.get('ready') is True
+        ):
+            recovery_symbols = list(dart_recovery_scope['symbols'])
         elif point_in_time_recovery and downstream_retry_symbols:
             recovery_symbols = downstream_retry_symbols
         elif recovering_safe_downstream_scope:
@@ -5350,6 +7633,107 @@ class PykrxBackfillService:
                     'pipeline_run_id': pipeline_run.get('id'),
                 }
             )
+        stage_debt_convergence: dict[str, Any] | None = None
+        stage_debt_transition_error: str | None = None
+        if stage_debt_request is not None:
+            debt_stage_id, debt_symbols = stage_debt_request
+            recovery_stage_rows = recovery_result.get('stages')
+            recovery_stage = (
+                recovery_stage_rows.get(debt_stage_id)
+                if isinstance(recovery_stage_rows, Mapping)
+                else None
+            )
+            recovery_pipeline_run_id = recovery_result.get(
+                'pipeline_run_id'
+            )
+            recovery_pipeline_run = recovery_result.get('pipeline_run')
+            recovery_run_metadata = (
+                recovery_pipeline_run.get('run_metadata')
+                if isinstance(recovery_pipeline_run, Mapping)
+                and isinstance(
+                    recovery_pipeline_run.get('run_metadata'), Mapping
+                )
+                else {}
+            )
+            resolved_recovery_stages = recovery_result.get(
+                'resolved_stages'
+            )
+            if (
+                isinstance(recovery_pipeline_run_id, bool)
+                or not isinstance(recovery_pipeline_run_id, int)
+                or recovery_pipeline_run_id <= 0
+                or not isinstance(recovery_pipeline_run, Mapping)
+                or recovery_pipeline_run.get('id')
+                != recovery_pipeline_run_id
+                or recovery_run_metadata.get(
+                    'reused_eod_collection_run_id'
+                )
+                != latest_eod_run.get('id')
+                or str(recovery_result.get('market_date') or '')
+                != str(market_date)
+                or resolved_recovery_stages != [debt_stage_id]
+                or recovery_run_metadata.get('resolved_stages')
+                != [debt_stage_id]
+            ):
+                advanced_stage_debt = None
+                stage_debt_transition_error = (
+                    'recovery_pipeline_run_lineage_invalid'
+                )
+            else:
+                advanced_stage_debt = _advance_followup_stage_debt_state(
+                    stage_debt_state or {},
+                    stage_id=debt_stage_id,
+                    invocation_symbols=debt_symbols,
+                    stage_result=(
+                        recovery_stage
+                        if isinstance(recovery_stage, Mapping)
+                        else {}
+                    ),
+                    recovery_pipeline_run_id=recovery_pipeline_run_id,
+                )
+                if advanced_stage_debt is None and (
+                    _followup_recovery_stage_attempt_finished(
+                        recovery_stage,
+                        expected_stage_id=debt_stage_id,
+                    )
+                ):
+                    advanced_stage_debt = (
+                        _record_followup_stage_debt_attempt(
+                            stage_debt_state or {},
+                            stage_id=debt_stage_id,
+                            invocation_symbols=debt_symbols,
+                            recovery_pipeline_run_id=(
+                                recovery_pipeline_run_id
+                            ),
+                        )
+                    )
+                    if advanced_stage_debt is not None:
+                        stage_debt_transition_error = (
+                            'recovery_stage_exact_manifest_invalid'
+                        )
+            if advanced_stage_debt is None:
+                stage_debt_transition_error = (
+                    stage_debt_transition_error
+                    or 'recovery_stage_exact_manifest_invalid'
+                )
+            else:
+                stage_debt_convergence = (
+                    self._persist_followup_stage_debt_state(
+                        latest_eod_run=latest_eod_run,
+                        state=advanced_stage_debt,
+                    )
+                )
+                if not stage_debt_convergence.get('updated'):
+                    stage_debt_transition_error = str(
+                        stage_debt_convergence.get('reason')
+                        or 'followup_stage_debt_persist_failed'
+                    )
+        elif recovery_symbols and daily_pipeline_outcome_is_satisfied(
+            recovery_result
+        ):
+            recovery_result[
+                '_proven_resolved_downstream_symbols'
+            ] = list(recovery_symbols)
         pending_rearm_after_recovery = (
             pending_same_day_intraday_watch_rearm_marker(
                 (
@@ -5440,6 +7824,18 @@ class PykrxBackfillService:
                     terminal_rearm_expiry_block
                 ),
             }
+        elif stage_debt_request is not None:
+            convergence = (
+                dict(stage_debt_convergence)
+                if stage_debt_convergence is not None
+                else {
+                    'updated': False,
+                    'reason': (
+                        stage_debt_transition_error
+                        or 'followup_stage_debt_not_advanced'
+                    ),
+                }
+            )
         elif pipeline_parent_finalized:
             convergence = self._persist_successful_followup_recovery(
                 latest_eod_run=latest_eod_run,
@@ -5451,6 +7847,10 @@ class PykrxBackfillService:
                 'reason': 'recovery_parent_not_finalized',
             }
         convergence['pipeline_run'] = pipeline_convergence
+        recovery_result.pop(
+            '_proven_resolved_downstream_symbols',
+            None,
+        )
         recovery_result.setdefault('triggered', True)
         recovery_result.setdefault(
             'reason',
@@ -5508,6 +7908,27 @@ class PykrxBackfillService:
             'symbols': recovery_symbols,
             'state_convergence': convergence,
         }
+        if stage_debt_request is not None:
+            next_stage_debt_request = (
+                stage_debt_convergence.get('next_request')
+                if stage_debt_convergence is not None
+                else stage_debt_request
+            )
+            recovery_result['followup_recovery'].update(
+                {
+                    'stage_specific_recovery': True,
+                    'stage_debt_preserved': bool(
+                        next_stage_debt_request
+                    ),
+                    'next_stage_debt_request': (
+                        next_stage_debt_request
+                    ),
+                }
+            )
+            if stage_debt_transition_error is not None:
+                recovery_result['followup_recovery'][
+                    'stage_debt_transition_error'
+                ] = stage_debt_transition_error
         if provider_outage_rearm_due:
             recovery_result['followup_recovery'].update(
                 {
@@ -5519,6 +7940,21 @@ class PykrxBackfillService:
                     ),
                 }
             )
+        if provider_admission_rearm:
+            recovery_result['followup_recovery'].update(
+                {
+                    'provider_admission_rearm': True,
+                    'provider': required_provider_admission['provider'],
+                    'nonconsuming_provider_admission_runs': (
+                        nonconsuming_provider_admission_runs
+                    ),
+                    'provider_admission': required_provider_admission,
+                }
+            )
+        if dart_recovery_scope.get('required') is True:
+            recovery_result['followup_recovery'][
+                'symbol_scope_source'
+            ] = dart_recovery_scope.get('source')
         if retryable_feedback_rearm_candidate:
             recovery_result['followup_recovery'][
                 'retryable_feedback_rearm'
@@ -5709,6 +8145,93 @@ class PykrxBackfillService:
             'marker': blocked_marker,
         }
 
+    def _persist_followup_stage_debt_state(
+        self,
+        *,
+        latest_eod_run: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist exact per-stage debt without clearing unrelated debt."""
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        admission_partition = _validated_followup_admission_partition(
+            metadata
+        )
+        parent_symbols = (
+            list(admission_partition['successful_stock_codes'])
+            if admission_partition is not None
+            else []
+        )
+        publication_symbols = (
+            list(admission_partition['selected_stock_codes'])
+            if admission_partition is not None
+            else []
+        )
+        if not parent_symbols or type(latest_eod_run.get('id')) is not int:
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_parent_scope_unavailable',
+            }
+        validated_state = _validated_followup_stage_debt_state(
+            state,
+            market_date=str(latest_eod_run.get('trade_date') or ''),
+            eod_collection_run_id=int(latest_eod_run['id']),
+            parent_symbols=parent_symbols,
+            publication_symbols=publication_symbols,
+            require_pending=False,
+        )
+        if validated_state is None:
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_state_invalid',
+            }
+        # Keep the resolved proof ledger as a tombstone.  The original EOD
+        # stage_progress remains immutable; deleting this state would let a
+        # later scheduler tick re-seed already-resolved debt from that older
+        # partial manifest.
+        metadata[FOLLOWUP_STAGE_DEBT_METADATA_KEY] = validated_state
+        metadata['followup_recovery_required'] = bool(
+            _next_followup_stage_debt_request(validated_state)
+            or metadata.get('downstream_retry_symbols')
+            or metadata.get('inherited_downstream_retry_symbols')
+        )
+        try:
+            update_eod_collection_run_progress(
+                int(latest_eod_run['id']),
+                symbols_succeeded=max(
+                    int(latest_eod_run.get('symbols_succeeded') or 0),
+                    0,
+                ),
+                symbols_failed=max(
+                    int(latest_eod_run.get('symbols_failed') or 0),
+                    0,
+                ),
+                run_metadata=metadata,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception(
+                'Unable to persist follow-up stage debt for EOD %s',
+                latest_eod_run.get('id'),
+            )
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_persist_failed',
+                'error_type': type(exc).__name__,
+            }
+        if isinstance(latest_eod_run, dict):
+            latest_eod_run['run_metadata'] = metadata
+        return {
+            'updated': True,
+            'reason': 'followup_stage_debt_persisted',
+            'next_request': _next_followup_stage_debt_request(
+                validated_state
+            ),
+        }
+
     def _persist_successful_followup_recovery(
         self,
         *,
@@ -5762,6 +8285,32 @@ class PykrxBackfillService:
         downstream_retry_symbols = _dedupe_symbol_codes(
             metadata.get('downstream_retry_symbols') or []
         )
+        inherited_downstream_retry_symbols = _dedupe_symbol_codes(
+            metadata.get('inherited_downstream_retry_symbols') or []
+        )
+        proven_resolved_symbols = _dedupe_symbol_codes(
+            recovery_result.get('_proven_resolved_downstream_symbols')
+            or []
+        )
+        if (
+            (downstream_retry_symbols or inherited_downstream_retry_symbols)
+            and not proven_resolved_symbols
+        ):
+            return {
+                'updated': False,
+                'reason': 'resolved_downstream_scope_unavailable',
+            }
+        proven_resolved_set = set(proven_resolved_symbols)
+        remaining_downstream_retry_symbols = [
+            symbol
+            for symbol in downstream_retry_symbols
+            if symbol not in proven_resolved_set
+        ]
+        remaining_inherited_downstream_retry_symbols = [
+            symbol
+            for symbol in inherited_downstream_retry_symbols
+            if symbol not in proven_resolved_set
+        ]
         if (
             latest_eod_run.get('symbols_total') is None
             or latest_eod_run.get('symbols_succeeded') is None
@@ -5772,11 +8321,13 @@ class PykrxBackfillService:
             dict(latest_eod_run)
         )
         completed_at = _utcnow_iso()
-        metadata.pop('downstream_retry_resume_from_stage', None)
-        metadata.pop(
-            'inherited_downstream_retry_resume_from_stage',
-            None,
-        )
+        if not remaining_downstream_retry_symbols:
+            metadata.pop('downstream_retry_resume_from_stage', None)
+        if not remaining_inherited_downstream_retry_symbols:
+            metadata.pop(
+                'inherited_downstream_retry_resume_from_stage',
+                None,
+            )
         if rearm_marker is not None:
             metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY] = {
                 **rearm_marker,
@@ -5788,18 +8339,39 @@ class PykrxBackfillService:
             }
         metadata.update(
             {
-                'downstream_retry_symbols': [],
-                'downstream_retry_symbols_count': 0,
-                'inherited_downstream_retry_symbols': [],
-                'inherited_downstream_retry_symbols_count': 0,
+                'downstream_retry_symbols': (
+                    remaining_downstream_retry_symbols
+                ),
+                'downstream_retry_symbols_count': len(
+                    remaining_downstream_retry_symbols
+                ),
+                'inherited_downstream_retry_symbols': (
+                    remaining_inherited_downstream_retry_symbols
+                ),
+                'inherited_downstream_retry_symbols_count': len(
+                    remaining_inherited_downstream_retry_symbols
+                ),
                 'downstream_recovery_symbols_count': len(
-                    downstream_retry_symbols
+                    proven_resolved_set
+                    & set(
+                        [
+                            *downstream_retry_symbols,
+                            *inherited_downstream_retry_symbols,
+                        ]
+                    )
                 ),
                 'downstream_recovery_completed_at': completed_at,
                 'downstream_recovery_pipeline_run_id': recovery_result.get(
                     'pipeline_run_id'
                 ),
-                'followup_recovery_required': False,
+                'followup_recovery_required': bool(
+                    remaining_downstream_retry_symbols
+                    or remaining_inherited_downstream_retry_symbols
+                    or _next_followup_stage_debt_request(
+                        metadata.get(FOLLOWUP_STAGE_DEBT_METADATA_KEY)
+                        or {}
+                    )
+                ),
             }
         )
         if nonblocking_partial_marker is not None:

@@ -21,6 +21,7 @@ from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import market_membership_sha256
 from app.eod.price_bar_repair_state import (
     REQUIRED_TRENDING_PERIODS,
+    SUPPORTED_FACTOR_REBUILD_METADATA_SCHEMA_VERSIONS,
     _derived_output_fingerprint,
     load_pending_price_bar_rebuild_batches,
     record_pending_trending_rebuild,
@@ -133,7 +134,9 @@ def _load_completion_state(
     for batch in affected:
         try:
             metadata = dict(batch['factor_rebuild_metadata'])
-            if int(metadata['schema_version']) != 2:
+            if int(metadata['schema_version']) not in (
+                SUPPORTED_FACTOR_REBUILD_METADATA_SCHEMA_VERSIONS
+            ):
                 raise ValueError('unsupported rebuild evidence schema')
             recorded = dict(
                 dict(metadata['dates'])[market_date][

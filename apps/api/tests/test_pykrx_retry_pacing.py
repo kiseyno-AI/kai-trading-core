@@ -311,7 +311,10 @@ class PykrxAutomaticRetryPacingTests(TestCase):
             persisted_metadata['failed_symbols'],
             ['472220', '121850'],
         )
-        self.assertEqual(persisted_metadata['downstream_retry_symbols'], [])
+        self.assertEqual(
+            persisted_metadata['downstream_retry_symbols'],
+            ['472220', '121850'],
+        )
         self.assertEqual(update_eod_run.call_args.kwargs['symbols_failed'], 2)
         self.assertTrue(
             result['followup_recovery']['state_convergence'][

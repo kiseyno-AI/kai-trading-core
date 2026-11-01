@@ -137,7 +137,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         item.prior_asset_turnover = None
         return item
 
-    def test_zero_full_signal_usable_rows_are_partial_but_nonblocking(self):
+    def test_zero_full_signal_usable_rows_block_downstream_progression(self):
         service = DailyPiotroskiFilterService()
         inputs = [
             self._remove_all_required_financial_evidence(
@@ -216,7 +216,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             ],
             ['missing_net_income', 'missing_total_assets'],
         )
-        self.assertTrue(
+        self.assertFalse(
             daily_pipeline_outcome_is_satisfied(
                 {'stage': 'piotroski_filter', **result}
             )
@@ -264,7 +264,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 'improving_asset_turnover': 2,
             },
         )
-        self.assertTrue(
+        self.assertFalse(
             daily_pipeline_outcome_is_satisfied(
                 {'stage': 'piotroski_filter', **result}
             )
@@ -570,6 +570,8 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             ['000660', '005930'],
         )
         self.assertEqual(result['retry_debt_stock_codes'], ['035420'])
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['blocking_status'], 'non_blocking')
         self.assertEqual(
             result['scope_outcome_manifest'],
             [
@@ -684,6 +686,42 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         self.assertEqual(result['results_persisted'], 1)
         self.assertEqual(result['results_failed'], 1)
         self.assertEqual(result['failed_symbols'], ['000660'])
+        self.assertEqual(result['successful_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['blocking_status'], 'non_blocking')
+
+    def test_all_symbol_writes_failing_keeps_exact_scope_blocked(self):
+        service = DailyPiotroskiFilterService()
+        inputs = [
+            _build_input(symbol='005930', pbr=0.4, return_20d=8.0),
+            _build_input(symbol='000660', pbr=2.0, return_20d=-8.0),
+        ]
+
+        with (
+            patch.object(service, '_load_inputs', return_value=inputs),
+            patch(
+                'app.signals.piotroski_filter.'
+                'upsert_daily_piotroski_filter_results',
+                side_effect=ValueError('batch contains malformed rows'),
+            ),
+            patch(
+                'app.signals.piotroski_filter.'
+                'upsert_daily_piotroski_filter_result',
+                side_effect=ValueError('malformed persisted row'),
+            ),
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-14',
+            )
+
+        self.assertEqual(result['successful_stock_codes'], [])
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(result['gate_status'], 'blocked')
+        self.assertEqual(result['blocking_status'], 'blocking')
 
     def test_inspect_returns_exact_market_date_when_requested_date_is_available(self):
         service = DailyPiotroskiFilterService()

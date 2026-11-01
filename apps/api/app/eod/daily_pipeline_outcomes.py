@@ -5,7 +5,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from app.eod.market_membership import market_membership_sha256
-from app.eod.scope_outcomes import EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS
+from app.eod.scope_outcomes import (
+    STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
+    STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
+    exact_scope_partition_identity_proof_matches,
+)
 
 
 GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
@@ -32,6 +36,7 @@ ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS: frozenset[str] = frozenset(
         'external_news_collect',
         'external_news_enrich',
         'macro_context_refresh',
+        'intraday_snapshots',
     }
 )
 SATISFIED_DEPENDENCY_SKIP_REASONS: frozenset[str] = frozenset(
@@ -547,6 +552,45 @@ def _partial_has_blocking_evidence(
 def _partial_retries_are_terminal(
     payloads: tuple[Mapping[str, Any], ...],
 ) -> bool:
+    retry_pending_flags = (
+        'has_pending_retry',
+        'retry_pending',
+        'retry_required',
+        'retry_scheduled',
+    )
+    retry_pending_counts = (
+        'pending_retry_count',
+        'remaining_retry_count',
+        'retry_pending_count',
+        'retry_symbols_count',
+    )
+    if any(
+        payload.get(key) is True
+        for payload in payloads
+        for key in retry_pending_flags
+    ) or any(
+        (_optional_int(payload.get(key)) or 0) > 0
+        for payload in payloads
+        for key in retry_pending_counts
+    ):
+        return False
+    if any(
+        isinstance(payload.get('retry_symbols'), (list, tuple, set))
+        and bool(payload.get('retry_symbols'))
+        for payload in payloads
+    ):
+        return False
+    for payload in payloads:
+        retry_metadata = payload.get('_retry_metadata')
+        if not isinstance(retry_metadata, Mapping):
+            continue
+        if any(
+            isinstance(retry_metadata.get(key), (list, tuple, set))
+            and bool(retry_metadata.get(key))
+            for key in ('failed_symbols', 'unattempted_symbols')
+        ):
+            return False
+
     remaining_values = [
         parsed
         for payload in payloads
@@ -809,13 +853,99 @@ def _partial_has_high_coverage(
 
 def _has_exact_scope_outcome_manifest(
     payloads: tuple[Mapping[str, Any], ...],
+    *,
+    expected_stage_id: str,
+    expected_market_date: str | None,
 ) -> bool:
     """Return whether a payload contains an exhaustive identity partition."""
+
+    expected_manifest_versions = (
+        STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(expected_stage_id)
+    )
+    if expected_manifest_versions is None:
+        return False
+    normalized_market_date = str(expected_market_date or '').strip()
+    if not normalized_market_date:
+        return False
+    finalization_stage_id = STAGE_ATOMIC_FINALIZATION_STAGE_IDS.get(
+        expected_stage_id
+    )
+
+    def matching_atomic_finalization(
+        *,
+        selected_codes: list[str],
+        successful_codes: list[str],
+        compact_proof: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if finalization_stage_id is None:
+            return True
+        successful_hash = market_membership_sha256(successful_codes)
+        for scope_payload in payloads:
+            finalization = scope_payload.get('scope_finalization')
+            if not isinstance(finalization, Mapping):
+                continue
+            exact_count = finalization.get('exact_symbol_count')
+            successful_count = finalization.get(
+                'successful_symbol_count'
+            )
+            deleted_count = finalization.get('deleted_stale_row_count')
+            exact_hash = str(
+                finalization.get('exact_membership_sha256') or ''
+            ).strip().lower()
+            if (
+                finalization.get('ready') is not True
+                or finalization.get('stage') != finalization_stage_id
+                or str(finalization.get('market_date') or '').strip()
+                != normalized_market_date
+                or isinstance(exact_count, bool)
+                or not isinstance(exact_count, int)
+                or exact_count < len(selected_codes)
+                or re.fullmatch(r'[0-9a-f]{64}', exact_hash) is None
+                or isinstance(successful_count, bool)
+                or successful_count != len(successful_codes)
+                or finalization.get(
+                    'successful_membership_sha256'
+                )
+                != successful_hash
+                or isinstance(deleted_count, bool)
+                or not isinstance(deleted_count, int)
+                or deleted_count < 0
+            ):
+                continue
+            if compact_proof is not None and any(
+                compact_proof.get(proof_key)
+                != finalization.get(finalization_key)
+                for proof_key, finalization_key in (
+                    ('finalization_stage_id', 'stage'),
+                    ('finalization_market_date', 'market_date'),
+                    (
+                        'finalization_exact_symbol_count',
+                        'exact_symbol_count',
+                    ),
+                    (
+                        'finalization_exact_membership_sha256',
+                        'exact_membership_sha256',
+                    ),
+                    (
+                        'finalization_successful_symbol_count',
+                        'successful_symbol_count',
+                    ),
+                    (
+                        'finalization_successful_membership_sha256',
+                        'successful_membership_sha256',
+                    ),
+                )
+            ):
+                continue
+            return True
+        return False
+    proof_present = False
 
     for payload in payloads:
         proof = payload.get('exact_scope_outcome_proof')
         if not isinstance(proof, Mapping):
             continue
+        proof_present = True
         selected = proof.get('selected_stock_codes')
         retry_debt = proof.get('retry_debt_stock_codes')
         terminal = proof.get('terminal_not_applicable_stock_codes')
@@ -865,13 +995,22 @@ def _has_exact_scope_outcome_manifest(
         ]
         if (
             proof.get('schema_version')
-            != 'exact_scope_outcome_proof_v1'
+            != 'exact_scope_outcome_proof_v2'
+            or str(proof.get('stage_id') or '').strip()
+            != expected_stage_id
+            or str(proof.get('market_date') or '').strip()
+            != normalized_market_date
             or str(proof.get('manifest_version') or '').strip()
-            not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS
+            not in expected_manifest_versions
             or not selected_codes
             or selected_codes != sorted(selected_codes)
             or retry_set & terminal_set
             or not (retry_set | terminal_set) <= selected_set
+            or not exact_scope_partition_identity_proof_matches(
+                proof=proof,
+                retry_debt_symbols=retry_codes,
+                terminal_not_applicable_symbols=terminal_codes,
+            )
             or isinstance(proof.get('selected_symbol_count'), bool)
             or proof.get('selected_symbol_count') != len(selected_codes)
             or proof.get('selected_symbol_sha256')
@@ -883,13 +1022,25 @@ def _has_exact_scope_outcome_manifest(
             != market_membership_sha256(successful_codes)
         ):
             continue
+        if not matching_atomic_finalization(
+            selected_codes=selected_codes,
+            successful_codes=successful_codes,
+            compact_proof=proof,
+        ):
+            continue
         return True
+
+    # A persisted compact proof is the stage-bound authority.  Never let an
+    # invalid or swapped proof fall through to the less expressive in-memory
+    # raw manifest carried beside it.
+    if proof_present:
+        return False
 
     for payload in payloads:
         version = str(
             payload.get('scope_outcome_manifest_version') or ''
         ).strip()
-        if version not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS:
+        if version not in expected_manifest_versions:
             continue
         selected = payload.get('selected_stock_codes')
         successful = payload.get('successful_stock_codes')
@@ -949,6 +1100,22 @@ def _has_exact_scope_outcome_manifest(
             or retry_set & terminal_set
             or selected_set
             != successful_set | retry_set | terminal_set
+        ):
+            continue
+        successful_list = selected_codes or []
+        successful_list = [
+            code
+            for code in successful_list
+            if code in successful_set
+        ]
+        if finalization_stage_id is None:
+            if str(payload.get('market_date') or '').strip() != (
+                normalized_market_date
+            ):
+                continue
+        elif not matching_atomic_finalization(
+            selected_codes=selected_codes or [],
+            successful_codes=successful_list,
         ):
             continue
         authoritative_scope_counts = [
@@ -1114,7 +1281,35 @@ def _partial_outcome_is_satisfied(outcome: Mapping[str, Any]) -> bool:
     high_coverage_stage = bool(
         _stage_ids(payloads) & HIGH_COVERAGE_PARTIAL_STAGE_IDS
     )
-    exact_scope_proven = _has_exact_scope_outcome_manifest(payloads)
+    expected_stage_id = str(
+        outcome.get('stage') or outcome.get('stage_id') or ''
+    ).strip()
+    if not expected_stage_id:
+        payload_stage_ids = _stage_ids(payloads)
+        if len(payload_stage_ids) == 1:
+            expected_stage_id = next(iter(payload_stage_ids))
+    result = _mapping(outcome.get('result'))
+    details = _mapping(outcome.get('details'))
+    result_summary = _mapping(details.get('result_summary'))
+    market_date_candidates = {
+        str(value).strip()
+        for value in (
+            outcome.get('market_date'),
+            result.get('market_date'),
+            result_summary.get('market_date'),
+        )
+        if str(value or '').strip()
+    }
+    expected_market_date = (
+        next(iter(market_date_candidates))
+        if len(market_date_candidates) == 1
+        else None
+    )
+    exact_scope_proven = _has_exact_scope_outcome_manifest(
+        payloads,
+        expected_stage_id=expected_stage_id,
+        expected_market_date=expected_market_date,
+    )
     if gate_statuses == {'ready'}:
         return not high_coverage_stage or exact_scope_proven
     return (
