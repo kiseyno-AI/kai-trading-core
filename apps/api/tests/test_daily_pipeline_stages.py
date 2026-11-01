@@ -7293,7 +7293,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'symbols_checked': 4,
                 'symbols_fresh': 2,
                 'symbols_refreshed': 0,
-                'symbols_failed': 0,
+                'symbols_failed': 1,
                 'successful_stock_codes': ['000660', '005930'],
                 'retry_debt_stock_codes': ['035420', '035720'],
                 'retry_debt_count': 2,

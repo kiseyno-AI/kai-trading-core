@@ -4432,7 +4432,6 @@ class DailyPipelineStageService:
                     else _int(result.get('symbols_fresh'))
                     + _int(result.get('symbols_refreshed'))
                 )
-                failed = _int(result.get('symbols_failed'))
                 retry_debt_count = _int(result.get('retry_debt_count'))
                 if retry_debt_count <= 0 and isinstance(
                     result.get('retry_debt_stock_codes'),
@@ -4441,14 +4440,22 @@ class DailyPipelineStageService:
                     retry_debt_count = len(
                         result['retry_debt_stock_codes']
                     )
-                total = _int(
-                    result.get('symbols_checked')
-                    or result.get('symbols_selected')
+                selected_stock_codes = result.get('selected_stock_codes')
+                total = (
+                    len(selected_stock_codes)
+                    if isinstance(selected_stock_codes, list)
+                    else _int(
+                        result.get('symbols_checked')
+                        or result.get('symbols_selected')
+                    )
                 )
-                total = max(
-                    total,
-                    succeeded + failed + retry_debt_count,
+                failed = (
+                    0
+                    if retry_debt_count > 0
+                    else _int(result.get('symbols_failed'))
                 )
+                if total <= 0:
+                    total = succeeded + retry_debt_count + failed
             else:
                 succeeded = _int(result.get('events_captured'))
                 failed = _int(result.get('events_failed'))
