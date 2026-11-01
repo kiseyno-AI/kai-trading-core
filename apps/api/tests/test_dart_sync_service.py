@@ -41,7 +41,7 @@ class FakeSyncClient:
                         'corp_name': '삼성전자',
                         'stock_code': '005930',
                         'corp_cls': 'Y',
-                        'report_nm': '감사보고서 제출',
+                        'report_nm': '임원ㆍ주요주주특정증권등소유상황보고서',
                         'flr_nm': '삼성전자',
                         'rcept_dt': '20260407',
                         'rm': '',
@@ -788,7 +788,7 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         positive_persister.assert_called_once()
         incomplete_persister.assert_called_once()
 
-    async def test_sync_recent_disclosures_paginates_and_classifies_financial_reports(self):
+    async def test_sync_recent_disclosures_persists_all_events_and_classifies_financial_reports(self):
         client = FakeSyncClient()
         repository = FakeSyncRepository()
         service = DartDisclosureSyncService(client=client, repository=repository)
@@ -804,18 +804,23 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['run_id'], 41)
         self.assertEqual(result['pages_fetched'], 2)
         self.assertEqual(result['events_seen'], 3)
-        self.assertEqual(result['events_inserted'], 2)
+        self.assertEqual(result['events_inserted'], 3)
         self.assertEqual(result['financial_report_events'], 2)
         self.assertEqual(client.calls[0]['last_reprt_at'], 'N')
         self.assertEqual(repository.created_runs[0]['trigger'], 'test')
         first_batch = repository.upserted_batches[0][1]
         self.assertTrue(first_batch[0]['is_financial_report'])
         self.assertEqual(first_batch[0]['filing_category'], 'annual_report')
-        self.assertEqual(len(first_batch), 1)
+        self.assertEqual(len(first_batch), 2)
+        self.assertFalse(first_batch[1]['is_financial_report'])
+        self.assertEqual(
+            first_batch[1]['report_nm'],
+            '임원ㆍ주요주주특정증권등소유상황보고서',
+        )
         self.assertEqual(repository.upserted_batches[1][1][0]['filing_category'], 'semiannual_report')
         self.assertEqual(repository.completed_runs[-1][1]['status'], 'completed')
 
-    async def test_sync_disclosures_for_corporations_only_persists_financial_reports(self):
+    async def test_sync_disclosures_for_corporations_persists_nonfinancial_events_too(self):
         client = FakeSyncClient()
         repository = FakeSyncRepository()
         service = DartDisclosureSyncService(client=client, repository=repository)
@@ -856,7 +861,20 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             ['005930', '000660'],
         )
         self.assertEqual(result['financial_report_events'], 2)
-        self.assertEqual(sum(len(batch) for _, batch in repository.upserted_batches), 2)
+        persisted_events = [
+            event
+            for _, batch in repository.upserted_batches
+            for event in batch
+        ]
+        self.assertEqual(len(persisted_events), 3)
+        self.assertEqual(
+            [
+                event['report_nm']
+                for event in persisted_events
+                if not event['is_financial_report']
+            ],
+            ['임원ㆍ주요주주특정증권등소유상황보고서'],
+        )
 
     async def test_targeted_corp_scan_rejects_blank_stock_code_before_provider_call(self):
         client = FakeSyncClient()

@@ -1313,10 +1313,8 @@ class DartDisclosureSyncService:
 
                 page_items = []
                 for raw_item in raw_items:
-                    rcept_no = (raw_item.get('rcept_no') or '').strip()
                     event_record = self._build_event_record(raw_item, run_id=run_id)
-                    if event_record['is_financial_report']:
-                        page_items.append(event_record)
+                    page_items.append(event_record)
 
                 counts = self.repository.upsert_events(page_items, run_id=run_id)
                 log_fetch_event(
@@ -1468,8 +1466,7 @@ class DartDisclosureSyncService:
                         raw_item,
                         run_id=run_id,
                     )
-                    if event_record['is_financial_report']:
-                        page_items.append(event_record)
+                    page_items.append(event_record)
                 counts = self.repository.upsert_events(
                     page_items,
                     run_id=run_id,
