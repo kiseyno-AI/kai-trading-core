@@ -189,13 +189,18 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 'app.market.kis_intraday_snapshots.async_get_market_state',
-                return_value=SimpleNamespace(state='OPEN', server_time='2026-05-07T10:15:35+09:00'),
+                return_value=SimpleNamespace(
+                    state='CLOSED',
+                    is_trading_day=True,
+                    server_time='2026-05-07T16:15:35+09:00',
+                ),
             ),
             patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot') as persist_snapshot,
         ):
             result = await service.collect_snapshots(symbols=['005930'], max_ranking_pages=1, max_news_items=2)
 
         self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['market_state'], 'CLOSED')
         self.assertEqual(result['snapshots_persisted'], 1)
         self.assertEqual(result['summary']['available_count'], 1)
         persist_snapshot.assert_called_once()
@@ -218,6 +223,53 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['news_hints']['event_tags'], ['contract', 'earnings'])
         self.assertEqual(payload['coverage']['status'], 'available')
         self.assertEqual(payload['freshness_status'], 'fresh')
+
+    async def test_collect_snapshots_skips_non_trading_day_before_external_calls(self) -> None:
+        service = KISIntradaySnapshotService(client=FakeKISIntradayClient())
+
+        with (
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                return_value=SimpleNamespace(
+                    state='WEEKEND',
+                    is_trading_day=False,
+                    server_time='2026-05-09T10:15:35+09:00',
+                ),
+            ),
+            patch.object(
+                service,
+                '_capture_universe',
+                side_effect=AssertionError('should not load universe'),
+            ) as capture_universe,
+            patch.object(
+                service,
+                '_load_shared_rankings',
+                new=AsyncMock(side_effect=AssertionError('should not load rankings')),
+            ) as load_rankings,
+            patch.object(
+                service,
+                '_collect_symbol_snapshot',
+                new=AsyncMock(side_effect=AssertionError('should not load symbol surfaces')),
+            ) as collect_symbol,
+            patch(
+                'app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot',
+                side_effect=AssertionError('should not persist snapshot'),
+            ) as persist_snapshot,
+        ):
+            result = await service.collect_snapshots(symbols=['005930'])
+
+        self.assertEqual(result['status'], 'market_closed')
+        self.assertEqual(result['reason'], 'non_trading_day')
+        self.assertEqual(result['market_state'], 'WEEKEND')
+        self.assertEqual(result['market_date'], '2026-05-09')
+        self.assertEqual(result['requested_symbols'], ['005930'])
+        self.assertEqual(result['summary']['matched_symbol_count'], 1)
+        self.assertEqual(result['snapshots_persisted'], 0)
+        self.assertFalse(result['items'])
+        capture_universe.assert_not_called()
+        load_rankings.assert_not_awaited()
+        collect_symbol.assert_not_awaited()
+        persist_snapshot.assert_not_called()
 
     async def test_collect_snapshots_treats_successful_empty_rankings_as_not_ranked(self) -> None:
         client = FakeKISIntradayClient()
@@ -255,6 +307,7 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(
                     state='OPEN',
+                    is_trading_day=True,
                     server_time='2026-05-07T10:15:35+09:00',
                 ),
             ),
@@ -348,6 +401,7 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(
                     state='OPEN',
+                    is_trading_day=True,
                     server_time='2026-05-07T10:15:35+09:00',
                 ),
             ),
@@ -405,6 +459,7 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(
                     state='OPEN',
+                    is_trading_day=True,
                     server_time='2026-05-07T10:15:35+09:00',
                 ),
             ),
@@ -463,6 +518,7 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(
                     state='OPEN',
+                    is_trading_day=True,
                     server_time='2026-05-07T10:15:35+09:00',
                 ),
             ),
@@ -511,6 +567,7 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
                 'app.market.kis_intraday_snapshots.async_get_market_state',
                 return_value=SimpleNamespace(
                     state='OPEN',
+                    is_trading_day=True,
                     server_time='2026-05-07T10:15:35+09:00',
                 ),
             ),

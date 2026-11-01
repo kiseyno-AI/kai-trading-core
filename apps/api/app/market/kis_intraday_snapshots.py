@@ -868,6 +868,29 @@ class KISIntradaySnapshotService:
                 'failed_symbol_errors': [],
                 'items': [],
             }
+        market_state = await async_get_market_state()
+        market_date = market_state.server_time[:10]
+        if not market_state.is_trading_day:
+            return {
+                'status': 'market_closed',
+                'reason': 'non_trading_day',
+                'runtime': runtime,
+                'market_state': market_state.state,
+                'market_date': market_date,
+                'requested_symbols': requested_symbols,
+                'summary': {
+                    'matched_symbol_count': len(requested_symbols),
+                    'collected_count': 0,
+                    'available_count': 0,
+                    'partial_count': 0,
+                    'unavailable_count': 0,
+                },
+                'snapshots_persisted': 0,
+                'snapshots_failed': 0,
+                'failed_symbols': [],
+                'failed_symbol_errors': [],
+                'items': [],
+            }
         symbol_inputs = self._capture_universe(symbols)
         requested_symbols = [item.symbol for item in symbol_inputs]
         if not symbol_inputs:
@@ -890,8 +913,6 @@ class KISIntradaySnapshotService:
             }
 
         normalized_market_code = _normalize_market_code(market_code or settings.kis_intraday_snapshot_market_code or DEFAULT_MARKET_CODE)
-        market_state = await async_get_market_state()
-        market_date = market_state.server_time[:10]
         ranking_pages = max(1, int(max_ranking_pages or settings.kis_intraday_snapshot_max_ranking_pages or DEFAULT_MAX_RANKING_PAGES))
         news_limit = max(0, int(max_news_items or settings.kis_intraday_snapshot_news_limit or DEFAULT_MAX_NEWS_ITEMS))
 
