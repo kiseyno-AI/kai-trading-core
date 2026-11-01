@@ -45,7 +45,7 @@ class StaleDartSyncRunReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(
             FROZEN_RECONCILIATION_MANIFEST_SHA256,
-            '8bf109497496c493e2cab3b2cee9977718938e7d337b80514c258a636f738424',
+            '7ecc5cefaf5d776f98073f3343e6fe40a39c7534c6d467143da6e267c39bdf4d',
         )
         self.assertEqual(NEVER_TARGET_RUN_IDS, (5594,))
         self.assertNotIn(

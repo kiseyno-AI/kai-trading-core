@@ -194,6 +194,10 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         ]
 
         with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=['000001', '000002', '000003'],
+            ),
             patch('app.signals.composite_factor.load_daily_momentum_factor_results', return_value=momentum_rows),
             patch('app.signals.composite_factor.load_daily_value_factor_results', return_value=value_rows),
             patch('app.signals.composite_factor.load_daily_advanced_value_factor_results', return_value=advanced_rows),
@@ -240,9 +244,28 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['watchlist_count'], 1)
         self.assertEqual(result['summary']['ineligible_count'], 1)
         self.assertEqual(result['summary']['input_universe_counts']['composite_score'], 3)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['summary']['persisted_count'], 3)
+        self.assertEqual(result['summary']['ready_count'], 3)
+        self.assertEqual(result['summary']['complete_count'], 3)
+        self.assertEqual(result['summary']['partial_count'], 0)
+        self.assertEqual(result['summary']['unusable_count'], 0)
+        self.assertEqual(result['summary']['common_complete_cohort_count'], 3)
+        self.assertEqual(result['summary']['renormalized_partial_cohort_count'], 0)
+        self.assertEqual(
+            result['summary']['input_family_cohort_coverage']['advanced_value'][
+                'available_count'
+            ],
+            3,
+        )
+        self.assertEqual(result['summary']['quality_status'], 'complete')
 
     def test_rebuild_renormalizes_weights_across_available_inputs(self) -> None:
         with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
             patch(
                 'app.signals.composite_factor.load_daily_momentum_factor_results',
                 return_value=[_momentum_row('005930', self.market_date, percentile=0.80, rank=1)],
@@ -284,9 +307,119 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         self.assertIsNone(persisted['contributions']['advanced_value'])
         self.assertAlmostEqual(persisted['composite_score'], 0.5125, places=6)
         self.assertEqual(persisted['composite_classification'], 'watchlist')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['summary']['complete_count'], 0)
+        self.assertEqual(result['summary']['partial_count'], 1)
+        self.assertEqual(result['summary']['unusable_count'], 0)
+        self.assertEqual(result['summary']['common_complete_cohort_count'], 0)
+        self.assertEqual(result['summary']['renormalized_partial_cohort_count'], 1)
+        self.assertEqual(result['summary']['quality_status'], 'degraded')
+        self.assertEqual(result['summary']['quality_warning'], 'partial_input_factor_cohort')
+        advanced_coverage = result['summary']['input_family_cohort_coverage']['advanced_value']
+        self.assertEqual(advanced_coverage['available_count'], 0)
+        self.assertEqual(advanced_coverage['unavailable_count'], 1)
+        self.assertEqual(advanced_coverage['missing_reason_counts'], {'missing_factor_row': 1})
+
+    def test_rebuild_excludes_stale_factor_union_symbol_outside_exact_price_universe(self) -> None:
+        authoritative_symbol = '000001'
+        stale_symbol = '000002'
+        symbols = [authoritative_symbol, stale_symbol]
+        with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=[authoritative_symbol],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_momentum_factor_results',
+                return_value=[
+                    _momentum_row(symbol, self.market_date, percentile=0.90)
+                    for symbol in symbols
+                ],
+            ) as momentum_loader,
+            patch(
+                'app.signals.composite_factor.load_daily_value_factor_results',
+                return_value=[
+                    _value_row(symbol, self.market_date, score=0.80)
+                    for symbol in symbols
+                ],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_advanced_value_factor_results',
+                return_value=[
+                    _advanced_value_row(symbol, self.market_date, score=0.70)
+                    for symbol in symbols
+                ],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_low_risk_factor_results',
+                return_value=[
+                    _low_risk_row(symbol, self.market_date, score=0.60)
+                    for symbol in symbols
+                ],
+            ),
+            patch(
+                'app.signals.composite_factor.load_daily_beta_factor_results',
+                return_value=[
+                    _beta_row(symbol, self.market_date, score=0.50)
+                    for symbol in symbols
+                ],
+            ),
+            patch(
+                'app.signals.composite_factor.load_symbols',
+                return_value=_symbol_rows(symbols),
+            ),
+            patch(
+                'app.signals.composite_factor.upsert_daily_composite_factor_results',
+                return_value=1,
+            ) as upsert,
+        ):
+            result = self.service.rebuild_for_market_date(market_date=self.market_date)
+
+        momentum_loader.assert_called_once_with(
+            market_date=self.market_date,
+            symbols=[authoritative_symbol],
+            limit=None,
+        )
+        persisted_symbols = [item['symbol'] for item in upsert.call_args.args[0]]
+        self.assertEqual(persisted_symbols, [authoritative_symbol])
+        self.assertEqual(upsert.call_args.kwargs['replace_market_date'], self.market_date)
+        self.assertEqual(result['matched_symbols'], [authoritative_symbol])
+        self.assertEqual(result['summary']['universe_count'], 1)
+        self.assertNotIn(stale_symbol, persisted_symbols)
+
+    def test_full_scope_zero_universe_prunes_stale_rows_but_explicit_empty_is_noop(self) -> None:
+        with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=[],
+            ),
+            patch(
+                'app.signals.composite_factor.upsert_daily_composite_factor_results',
+                return_value=0,
+            ) as upsert,
+        ):
+            full_scope = self.service.rebuild_for_market_date(
+                market_date=self.market_date,
+            )
+            explicit_empty = self.service.rebuild_for_market_date(
+                market_date=self.market_date,
+                symbols=[],
+            )
+
+        upsert.assert_called_once_with([], replace_market_date=self.market_date)
+        self.assertEqual(full_scope['status'], 'partial')
+        self.assertEqual(full_scope['reason'], 'no_usable_factor_rows')
+        self.assertEqual(full_scope['gate_status'], 'blocked')
+        self.assertEqual(explicit_empty['status'], 'completed')
+        self.assertEqual(explicit_empty['reason'], 'explicit_empty_scope_noop')
+        self.assertEqual(explicit_empty['gate_status'], 'ready')
 
     def test_rebuild_marks_insufficient_inputs_when_no_valuation_family_is_available(self) -> None:
         with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
             patch(
                 'app.signals.composite_factor.load_daily_momentum_factor_results',
                 return_value=[_momentum_row('005930', self.market_date, percentile=0.90, rank=1)],
@@ -315,9 +448,24 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['insufficient_inputs_count'], 1)
         self.assertEqual(result['summary']['ready_count'], 0)
         self.assertEqual(result['summary']['unready_count'], 1)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'no_usable_factor_rows')
+        self.assertEqual(result['gate_status'], 'blocked')
+        self.assertEqual(result['summary']['complete_count'], 0)
+        self.assertEqual(result['summary']['partial_count'], 0)
+        self.assertEqual(result['summary']['unusable_count'], 1)
+        self.assertEqual(
+            result['summary']['missing_reason_counts'],
+            {'insufficient_inputs': 1},
+        )
+        self.assertEqual(result['summary']['quality_status'], 'unavailable')
 
     def test_rebuild_marks_hard_excluded_but_preserves_score_when_gate_fails(self) -> None:
         with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=['000001', '000002'],
+            ),
             patch(
                 'app.signals.composite_factor.load_daily_momentum_factor_results',
                 return_value=[
@@ -360,7 +508,10 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
             ),
             patch('app.signals.composite_factor.upsert_daily_composite_factor_result') as upsert,
         ):
-            result = self.service.rebuild_for_market_date(market_date=self.market_date)
+            result = self.service.rebuild_for_market_date(
+                market_date=self.market_date,
+                symbols=['000001', '000002'],
+            )
 
         persisted_by_symbol = {call.args[0]['symbol']: call.args[0] for call in upsert.call_args_list}
 
@@ -383,9 +534,80 @@ class DailyCompositeFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['results_failed'], 0)
 
+    def test_persistence_failure_is_counted_as_unusable_without_blocking_survivors(
+        self,
+    ) -> None:
+        symbols = ['000001', '000002']
+        factor_rows = {
+            'momentum': {
+                symbol: _momentum_row(symbol, self.market_date, percentile=0.90)
+                for symbol in symbols
+            },
+            'value_v1': {
+                symbol: _value_row(symbol, self.market_date, score=0.80)
+                for symbol in symbols
+            },
+            'advanced_value': {
+                symbol: _advanced_value_row(symbol, self.market_date, score=0.70)
+                for symbol in symbols
+            },
+            'low_risk': {
+                symbol: _low_risk_row(symbol, self.market_date, score=0.60)
+                for symbol in symbols
+            },
+            'beta': {
+                symbol: _beta_row(symbol, self.market_date, score=0.50)
+                for symbol in symbols
+            },
+        }
+
+        def persist_one(item: dict) -> None:
+            if item['symbol'] == '000002':
+                raise RuntimeError('row unavailable')
+
+        with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=symbols,
+            ),
+            patch.object(self.service, '_load_factor_rows', return_value=factor_rows),
+            patch('app.signals.composite_factor.load_symbols', return_value=_symbol_rows(symbols)),
+            patch(
+                'app.signals.composite_factor.upsert_daily_composite_factor_results',
+                side_effect=RuntimeError('batch unavailable'),
+            ),
+            patch(
+                'app.signals.composite_factor.upsert_daily_composite_factor_result',
+                side_effect=persist_one,
+            ),
+        ):
+            result = self.service.rebuild_for_market_date(
+                market_date=self.market_date,
+                symbols=symbols,
+            )
+
+        self.assertEqual(result['results_persisted'], 1)
+        self.assertEqual(result['results_failed'], 1)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['blocking_status'], 'non_blocking')
+        self.assertEqual(result['summary']['persisted_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 1)
+        self.assertEqual(result['summary']['complete_count'], 1)
+        self.assertEqual(result['summary']['partial_count'], 0)
+        self.assertEqual(result['summary']['unusable_count'], 1)
+        self.assertEqual(
+            result['summary']['missing_reason_counts'],
+            {'persistence_failed': 1},
+        )
+
     def test_rebuild_preserves_analytic_score_but_fails_live_eligibility_without_low_risk_evidence(self) -> None:
         symbols = ['000001', '000002']
         with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=symbols,
+            ),
             patch(
                 'app.signals.composite_factor.load_daily_momentum_factor_results',
                 return_value=[_momentum_row(symbol, self.market_date, percentile=0.95) for symbol in symbols],
@@ -473,6 +695,10 @@ class DailyCompositeFactorPersistenceIntegrationTests(unittest.TestCase):
 
     def test_rebuild_persists_and_inspect_reads_single_symbol(self) -> None:
         with (
+            patch(
+                'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+                return_value=self.symbols,
+            ),
             patch(
                 'app.signals.composite_factor.load_daily_momentum_factor_results',
                 return_value=[

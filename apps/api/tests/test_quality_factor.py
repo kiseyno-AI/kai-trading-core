@@ -187,6 +187,19 @@ def _input(
 
 
 class DailyQualityFactorServiceTests(unittest.TestCase):
+    def test_explicit_empty_scope_is_completed_noop(self) -> None:
+        result = DailyQualityFactorService().rebuild_for_market_date(
+            market_date='2026-04-24',
+            symbols=[],
+            ranking_symbols=[],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['reason'], 'explicit_empty_scope_noop')
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['blocking_status'], 'non_blocking')
+        self.assertEqual(result['selected_stock_codes'], [])
+
     def test_negative_equity_cannot_rank_as_low_leverage(self) -> None:
         service = DailyQualityFactorService()
         market_date = date(2026, 4, 24)
@@ -439,6 +452,21 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
         self.assertFalse(persisted['is_quality_score_complete'])
         self.assertIsNotNone(persisted['quality_score'])
         self.assertEqual(result['summary']['scored_partial_count'], 1)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['summary']['coverage_status'], 'completed')
+        self.assertEqual(result['summary']['persisted_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 1)
+        self.assertEqual(result['summary']['complete_count'], 0)
+        self.assertEqual(result['summary']['partial_count'], 1)
+        self.assertEqual(result['summary']['unusable_count'], 0)
+        self.assertEqual(result['summary']['quality_status'], 'degraded')
+        self.assertEqual(result['summary']['quality_warning'], 'partial_input_factor_cohort')
+        self.assertEqual(
+            result['summary']['input_family_cohort_coverage']['gross_profit_to_assets'][
+                'unavailable_count'
+            ],
+            1,
+        )
 
     def test_rebuild_marks_missing_fundamentals_as_insufficient_fundamentals(self) -> None:
         service = DailyQualityFactorService()

@@ -26,10 +26,54 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
-from app.market_data_store import load_daily_market_participation_context
-from app.market_data_store import load_daily_market_participation_context_history
+from app.market_data_store import (
+    daily_signal_feature_order_by,
+    load_daily_market_participation_context,
+    load_daily_market_participation_context_history,
+    sanitize_daily_signal_feature_payload,
+    sanitize_daily_signal_feature_metrics,
+)
 
 PARTICIPATION_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
+
+
+def _build_market_signal_rows_query(*, market_date: date):
+    return (
+        select(DailySignalFeature, Symbol)
+        .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+        .join(
+            DailyPriceBar,
+            and_(
+                DailyPriceBar.symbol_id == DailySignalFeature.symbol_id,
+                DailyPriceBar.trade_date == DailySignalFeature.market_date,
+            ),
+        )
+        .where(DailySignalFeature.market_date == market_date)
+        .order_by(
+            *daily_signal_feature_order_by(),
+            Symbol.symbol.asc(),
+        )
+    )
+
+
+def _serialize_market_signal_feature(feature: Any, symbol: Symbol) -> dict[str, Any]:
+    return {
+        'symbol': symbol.symbol,
+        'name_ko': symbol.name_ko,
+        'market': symbol.market,
+        **sanitize_daily_signal_feature_metrics(
+            signal_count=feature.signal_count,
+            volume_power_rank=feature.volume_power_rank,
+            volume_power=feature.volume_power,
+            overtime_volume_rank=feature.overtime_volume_rank,
+            overtime_volume=feature.overtime_volume,
+            overtime_fluctuation_rank=feature.overtime_fluctuation_rank,
+        ),
+        'overtime_fluctuation_rate': _to_float(feature.overtime_fluctuation_rate),
+        'feature_payload': sanitize_daily_signal_feature_payload(
+            feature.feature_payload
+        ),
+    }
 
 
 def _to_float(value: Any) -> float | None:
@@ -191,30 +235,9 @@ class AgentPayloadBuilder:
             ]
 
             market_signal_rows = [
-                {
-                    'symbol': symbol.symbol,
-                    'name_ko': symbol.name_ko,
-                    'market': symbol.market,
-                    'signal_count': feature.signal_count,
-                    'volume_power_rank': feature.volume_power_rank,
-                    'volume_power': _to_float(feature.volume_power),
-                    'overtime_volume_rank': feature.overtime_volume_rank,
-                    'overtime_volume': feature.overtime_volume,
-                    'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
-                    'overtime_fluctuation_rate': _to_float(feature.overtime_fluctuation_rate),
-                    'feature_payload': feature.feature_payload or {},
-                }
+                _serialize_market_signal_feature(feature, symbol)
                 for feature, symbol in session.execute(
-                    select(DailySignalFeature, Symbol)
-                    .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
-                    .where(DailySignalFeature.market_date == run.trade_date)
-                    .order_by(
-                        DailySignalFeature.signal_count.desc(),
-                        DailySignalFeature.volume_power_rank.asc().nullslast(),
-                        DailySignalFeature.overtime_volume_rank.asc().nullslast(),
-                        DailySignalFeature.overtime_fluctuation_rank.asc().nullslast(),
-                        Symbol.symbol.asc(),
-                    )
+                    _build_market_signal_rows_query(market_date=run.trade_date)
                 ).all()
             ]
 

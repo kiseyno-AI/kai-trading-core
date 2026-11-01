@@ -1,11 +1,12 @@
 import unittest
 from datetime import date
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_scanner
+from app.internal import ops
 from app.market_data_store import (
     build_daily_trending_rank_items,
     compute_and_persist_daily_trending_ranks,
@@ -146,6 +147,57 @@ class TrendingRankBuilderTests(unittest.TestCase):
 
 
 class DailyTrendingRankPersistenceTests(unittest.TestCase):
+    def test_scoped_replacement_requires_authoritative_membership_proof(self):
+        with patch(
+            'app.market_data_store.replace_daily_trending_ranks'
+        ) as replace_mock:
+            with self.assertRaisesRegex(
+                ValueError,
+                'authoritative full membership proof',
+            ):
+                compute_and_persist_daily_trending_ranks(
+                    market_date='2026-04-29',
+                    periods=['1d'],
+                    symbols=['005930'],
+                )
+
+        replace_mock.assert_not_called()
+
+    def test_compute_marks_empty_source_period_unavailable_and_partial(self):
+        progress_updates: list[dict] = []
+
+        with (
+            patch(
+                'app.market_data_store.'
+                '_load_trending_stocks_from_daily_price_bars',
+                return_value=[],
+            ),
+            patch(
+                'app.market_data_store.replace_daily_trending_ranks',
+                return_value=0,
+            ) as replace_mock,
+        ):
+            result = compute_and_persist_daily_trending_ranks(
+                market_date='2026-04-29',
+                periods=['1d'],
+                symbols=['005930'],
+                authoritative_scope=True,
+                progress_callback=progress_updates.append,
+            )
+
+        replace_mock.assert_called_once()
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['reason'],
+            'trending_source_periods_unavailable',
+        )
+        self.assertEqual(result['periods_persisted'], 0)
+        self.assertEqual(result['periods_unavailable'], 1)
+        self.assertEqual(result['unavailable_periods'], ['1d'])
+        self.assertEqual(result['periods'][0]['status'], 'unavailable')
+        self.assertEqual(progress_updates[-1]['status'], 'partial')
+        self.assertEqual(progress_updates[-1]['failed'], 1)
+
     def test_compute_and_persist_rebuilds_ranks_without_loader_limit(self):
         with (
             patch(
@@ -164,6 +216,8 @@ class DailyTrendingRankPersistenceTests(unittest.TestCase):
             compute_and_persist_daily_trending_ranks(
                 market_date='2026-04-29',
                 periods=['1d', '5d', '20d'],
+                symbols=['005930'],
+                authoritative_scope=True,
             )
 
         self.assertIsNone(daily_loader.call_args.kwargs['limit'])
@@ -193,6 +247,8 @@ class DailyTrendingRankPersistenceTests(unittest.TestCase):
             result = compute_and_persist_daily_trending_ranks(
                 market_date='2026-04-29',
                 periods=['1d', '5d'],
+                symbols=['000660', '005930'],
+                authoritative_scope=True,
                 progress_callback=_failing_progress_callback,
             )
 
@@ -278,6 +334,55 @@ class DailyTrendingRankPersistenceTests(unittest.TestCase):
         self.assertFalse(scopes[0].committed)
         self.assertTrue(scopes[0].rolled_back)
         self.assertEqual(scopes[0].session.statements, ['Delete', 'Select', 'Insert', 'Insert'])
+
+
+class TrendingRankInternalOpsTests(unittest.TestCase):
+    def test_pending_repair_records_completed_trending_outputs(self):
+        result_payload = {
+            'market_date': '2026-04-29',
+            'status': 'completed',
+            'periods': [
+                {'period': period, 'status': 'completed'}
+                for period in ('1d', '5d', '20d')
+            ],
+        }
+        frozen_symbols = ('000660', '005930')
+
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch(
+                'app.internal.ops.'
+                'resolve_pending_frozen_price_dependent_membership',
+                return_value=frozen_symbols,
+            ),
+            patch(
+                'app.internal.ops.'
+                'compute_and_persist_daily_trending_ranks',
+                return_value=result_payload,
+            ) as compute,
+            patch(
+                'app.internal.ops.record_pending_trending_rebuild'
+            ) as record,
+        ):
+            result = ops.compute_trending_ranks(
+                market_date='2026-04-29'
+            )
+
+        self.assertEqual(result, result_payload)
+        self.assertEqual(
+            compute.call_args.kwargs['symbols'],
+            list(frozen_symbols),
+        )
+        self.assertTrue(
+            compute.call_args.kwargs['authoritative_scope']
+        )
+        record.assert_called_once_with(
+            market_date='2026-04-29',
+            periods=('1d', '5d', '20d'),
+            repair_started_at=ANY,
+            rebuild_completed_at=ANY,
+            exact_symbols=list(frozen_symbols),
+        )
 
 
 class FakeTrendingStocksService:

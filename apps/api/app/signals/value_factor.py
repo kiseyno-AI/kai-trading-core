@@ -13,6 +13,10 @@ from app.market_data_store import (
     upsert_daily_value_factor_result,
     upsert_daily_value_factor_results,
 )
+from app.signals.factor_coverage import (
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+)
 
 VALUE_FACTOR_VERSION = 'value_factor_v1'
 VALUE_FACTOR_SOURCE = VALUE_FACTOR_VERSION
@@ -132,20 +136,28 @@ class DailyValueFactorService:
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
             return {
+                'status': 'completed',
+                'reason': 'explicit_empty_scope_noop',
+                'quality_status': summary['quality_status'],
+                'quality_warning': summary['quality_warning'],
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'remaining_retryable_events': 0,
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
@@ -239,8 +251,17 @@ class DailyValueFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+            )
+        )
 
         return {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -593,7 +614,7 @@ class DailyValueFactorService:
         ready_count = sum(
             1 for item in items if item.get('value_status') == VALUE_STATUS_SCORED
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -608,6 +629,49 @@ class DailyValueFactorService:
             'unready_count': len(missing_symbols) + len(items) - ready_count,
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+    ) -> dict[str, Any]:
+        def metric_status(item: dict[str, Any], metric: str) -> str | None:
+            if metric == 'per' and item.get('per_status') is not None:
+                return str(item['per_status'])
+            payload = item.get('factor_payload')
+            statuses = payload.get('metric_statuses') if isinstance(payload, dict) else None
+            value = statuses.get(metric) if isinstance(statuses, dict) else None
+            return str(value) if value is not None else None
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            is_ready=lambda item: item.get('value_score') is not None,
+            is_complete=lambda item: item.get('value_status') == VALUE_STATUS_SCORED,
+            unusable_reason=lambda item: item.get('value_status'),
+            input_families={
+                metric: (
+                    lambda item, metric=metric: metric_status(item, metric)
+                    == METRIC_STATUS_AVAILABLE,
+                    lambda item, metric=metric: metric_status(item, metric),
+                )
+                for metric in ('per', 'pbr', 'dividend_yield')
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

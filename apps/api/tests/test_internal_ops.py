@@ -2080,6 +2080,11 @@ class InternalOpsTests(unittest.TestCase):
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
             patch(
+                'app.internal.ops.'
+                'resolve_pending_frozen_price_dependent_membership',
+                return_value=('000660', '005930'),
+            ),
+            patch(
                 'app.internal.ops.compute_and_persist_daily_trending_ranks',
                 return_value={'trending_ranks_persisted': 3},
             ) as compute_ranks,
@@ -2091,6 +2096,36 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(compute_ranks.call_args.kwargs['market_date'], '2026-04-10')
         self.assertEqual(compute_ranks.call_args.kwargs['periods'], ['1d', '20d'])
         self.assertEqual(compute_ranks.call_args.kwargs['source'], 'internal_ops_cli')
+        self.assertEqual(
+            compute_ranks.call_args.kwargs['symbols'],
+            ['000660', '005930'],
+        )
+        self.assertTrue(
+            compute_ranks.call_args.kwargs['authoritative_scope']
+        )
+
+    def test_compute_trending_ranks_rejects_unproven_explicit_scope(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch(
+                'app.internal.ops.'
+                'resolve_pending_frozen_price_dependent_membership',
+                return_value=None,
+            ),
+            patch(
+                'app.internal.ops.compute_and_persist_daily_trending_ranks'
+            ) as compute_ranks,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                'pending frozen',
+            ):
+                ops.compute_trending_ranks(
+                    market_date='2026-04-10',
+                    symbols='005930',
+                )
+
+        compute_ranks.assert_not_called()
 
     def test_collect_kis_daily_signal_features_uses_direct_service_call(self) -> None:
         with (

@@ -725,7 +725,10 @@ class EODBackgroundRunner:
                         )
                         market_snapshot_refreshed = True
                 elif market.state in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
-                    if runtime_background_enabled:
+                    if (
+                        runtime_background_enabled
+                        and market.state == 'CLOSED'
+                    ):
                         await self._run_async_step(
                             'market_snapshot_refresh_if_due',
                             market_snapshot_service.refresh_market_snapshot_if_due(
@@ -900,20 +903,21 @@ class EODBackgroundRunner:
                         'trading_order_reconciliation_periodic',
                         trading_order_reconciliation_service.run_periodic_if_due(),
                     )
-                    if not market_snapshot_refreshed:
+                    if market.state not in {'WEEKEND', 'HOLIDAY'}:
+                        if not market_snapshot_refreshed:
+                            await self._run_async_step(
+                                'market_snapshot_refresh_if_due',
+                                market_snapshot_service.refresh_market_snapshot_if_due(
+                                    trigger=f'background_runner:{market.state.lower()}',
+                                    force_index=False,
+                                ),
+                            )
                         await self._run_async_step(
-                            'market_snapshot_refresh_if_due',
-                            market_snapshot_service.refresh_market_snapshot_if_due(
-                                trigger=f'background_runner:{market.state.lower()}',
-                                force_index=False,
+                            'portfolio_summary_refresh_if_due',
+                            portfolio_summary_service.refresh_portfolio_summary_if_due(
+                                trigger=f'background_runner:{market.state.lower()}'
                             ),
                         )
-                    await self._run_async_step(
-                        'portfolio_summary_refresh_if_due',
-                        portfolio_summary_service.refresh_portfolio_summary_if_due(
-                            trigger=f'background_runner:{market.state.lower()}'
-                        ),
-                    )
             except Exception as exc:
                 tick_failed = True
                 self._last_tick_error = {

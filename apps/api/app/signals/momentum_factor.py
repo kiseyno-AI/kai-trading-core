@@ -14,6 +14,10 @@ from app.market_data_store import (
     upsert_daily_momentum_factor_result,
     upsert_daily_momentum_factor_results,
 )
+from app.signals.factor_coverage import (
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+)
 
 MOMENTUM_FACTOR_VERSION = 'price_momentum_v1'
 MOMENTUM_FACTOR_SOURCE = 'daily_price_bars'
@@ -765,6 +769,10 @@ class DailyMomentumFactorService:
             if requested_symbols is not None
             else ranking_population
         )
+        explicit_empty_scope = (
+            (symbols is not None and requested_symbols == [])
+            or (ranking_symbols is not None and normalized_ranking_symbols == [])
+        )
         if ranking_symbols is not None:
             outside_ranking_scope = sorted(
                 set(target_symbols).difference(ranking_population)
@@ -775,7 +783,27 @@ class DailyMomentumFactorService:
                     + ','.join(outside_ranking_scope[:20])
                 )
         if not target_symbols:
+            summary = self._build_coverage_contract(
+                items=[],
+                persisted_items=[],
+                missing_symbols=[],
+                failed_symbols=[],
+            )
+            stage_contract = (
+                {
+                    'status': 'completed',
+                    'reason': 'explicit_empty_scope_noop',
+                    'quality_status': summary['quality_status'],
+                    'quality_warning': summary['quality_warning'],
+                    'gate_status': 'ready',
+                    'blocking_status': 'non_blocking',
+                    'remaining_retryable_events': 0,
+                }
+                if explicit_empty_scope
+                else factor_stage_result_contract(summary)
+            )
             return {
+                **stage_contract,
                 'market_date': normalized_market_date,
                 'source': MOMENTUM_FACTOR_SOURCE,
                 'feature_version': MOMENTUM_FACTOR_VERSION,
@@ -796,6 +824,7 @@ class DailyMomentumFactorService:
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
+                'summary': summary,
                 'items': [],
             }
 
@@ -838,9 +867,16 @@ class DailyMomentumFactorService:
 
         combined_failed_symbols = list(dict.fromkeys([*failed_symbols, *write_failed_symbols]))
         persisted_ready_count = sum(
-            1 for row in persisted_items if row.get('has_sufficient_history')
+            1 for row in persisted_items if row.get('momentum_percentile') is not None
+        )
+        summary = self._build_coverage_contract(
+            items=rows,
+            persisted_items=persisted_items,
+            missing_symbols=failed_symbols,
+            failed_symbols=write_failed_symbols,
         )
         return {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date,
             'source': MOMENTUM_FACTOR_SOURCE,
             'feature_version': MOMENTUM_FACTOR_VERSION,
@@ -849,10 +885,10 @@ class DailyMomentumFactorService:
             'requested_symbols': len(target_symbols),
             'requested_symbol_count': len(target_symbols),
             'symbols_evaluated': len(rows),
-            'ready_count': sum(1 for row in rows if row.get('has_sufficient_history')),
+            'ready_count': sum(1 for row in rows if row.get('momentum_percentile') is not None),
             'unready_count': (
                 len(failed_symbols)
-                + sum(1 for row in rows if not row.get('has_sufficient_history'))
+                + sum(1 for row in rows if row.get('momentum_percentile') is None)
             ),
             'persisted_ready_count': persisted_ready_count,
             'persisted_unready_count': len(persisted_items) - persisted_ready_count,
@@ -866,6 +902,7 @@ class DailyMomentumFactorService:
             'results_persisted': len(persisted_items),
             'results_failed': len(combined_failed_symbols),
             'failed_symbols': combined_failed_symbols[:50],
+            'summary': summary,
             'items': [enrich_momentum_audit_fields(item) for item in persisted_items],
         }
 
@@ -921,6 +958,75 @@ class DailyMomentumFactorService:
                 continue
             valid_histories[symbol] = bars
         return valid_histories
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+    ) -> dict[str, Any]:
+        def momentum_available(item: dict[str, Any]) -> bool:
+            return item.get('momentum_12_1') is not None
+
+        def trend_available(item: dict[str, Any]) -> bool:
+            return item.get('ma_60') is not None and item.get('ma_120') is not None
+
+        def overheat_available(item: dict[str, Any]) -> bool:
+            return all(
+                item.get(key) is not None
+                for key in (
+                    'return_5d',
+                    'return_5d_realized_volatility_20d',
+                    'return_5d_vol_adjusted',
+                )
+            )
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            is_ready=lambda item: item.get('momentum_percentile') is not None,
+            is_complete=lambda item: (
+                momentum_available(item)
+                and trend_available(item)
+                and overheat_available(item)
+            ),
+            unusable_reason=lambda item: item.get('momentum_eligibility_status')
+            or (
+                MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY
+                if not item.get('has_sufficient_history')
+                else 'unusable_momentum_row'
+            ),
+            input_families={
+                'momentum_12_1': (
+                    momentum_available,
+                    lambda item: (
+                        None
+                        if momentum_available(item)
+                        else MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY
+                    ),
+                ),
+                'trend_confirmation': (
+                    trend_available,
+                    lambda item: (
+                        None
+                        if trend_available(item)
+                        else 'trend_input_unavailable'
+                    ),
+                ),
+                'overheat_evidence': (
+                    overheat_available,
+                    lambda item: (
+                        None
+                        if overheat_available(item)
+                        else 'overheat_evidence_unavailable'
+                    ),
+                ),
+            },
+        )
 
 
 daily_momentum_factor_service = DailyMomentumFactorService()

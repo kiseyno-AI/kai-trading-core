@@ -1,6 +1,8 @@
 import asyncio
 import unittest
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from app.core.settings import settings
 from app.orders.account_inquiry_service import TradingAccountInquiryUpstreamError
@@ -71,12 +73,16 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         *,
         portfolio_account_references: str = 'Main=KIS:12345678-01',
         cache_ttl_seconds: int = 60,
+        market_state: str = 'OPEN',
     ) -> PortfolioSummaryService:
         return PortfolioSummaryService(
             account_inquiry_service=self.inquiry_service,
             order_service=self.order_service,
             portfolio_account_references=portfolio_account_references,
             cache_ttl_seconds=cache_ttl_seconds,
+            market_state_loader=AsyncMock(
+                return_value=SimpleNamespace(state=market_state)
+            ),
         )
 
     def _seed_synced_account(
@@ -358,6 +364,129 @@ class PortfolioSummaryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.inquiry_service.summary_calls), 2)
         self.assertEqual(len(self.inquiry_service.positions_calls), 2)
         self.assertEqual(len(self.order_service.list_calls), 2)
+
+    async def test_stale_cache_on_non_trading_day_never_refreshes_upstream(self) -> None:
+        for market_state in ('WEEKEND', 'HOLIDAY'):
+            with self.subTest(market_state=market_state):
+                account_reference = 'KIS:12345678-01'
+                self._seed_synced_account(account_reference=account_reference)
+                service = self._build_service(
+                    cache_ttl_seconds=60,
+                    market_state='OPEN',
+                )
+                await service.get_portfolio_summary()
+                service.market_state_loader = AsyncMock(
+                    return_value=SimpleNamespace(state=market_state)
+                )
+                summary_call_count = len(self.inquiry_service.summary_calls)
+                positions_call_count = len(self.inquiry_service.positions_calls)
+                order_call_count = len(self.order_service.list_calls)
+                assert service._cache is not None
+                service._cache.cached_at -= timedelta(minutes=5)
+                service._cache.last_refresh_attempted_at = service._cache.cached_at
+                service._cache.last_refresh_succeeded_at = service._cache.cached_at
+
+                cached = await service.get_portfolio_summary()
+
+                self.assertTrue(cached['freshness']['servedFromCache'])
+                self.assertTrue(cached['freshness']['isStale'])
+                self.assertEqual(
+                    cached['freshness']['staleReason'],
+                    'market_closed_cache',
+                )
+                self.assertEqual(
+                    cached['freshness']['marketState'],
+                    market_state,
+                )
+                self.assertFalse(cached['freshness']['refreshInFlight'])
+                self.assertIsNone(service._refresh_task)
+                self.assertEqual(
+                    len(self.inquiry_service.summary_calls),
+                    summary_call_count,
+                )
+                self.assertEqual(
+                    len(self.inquiry_service.positions_calls),
+                    positions_call_count,
+                )
+                self.assertEqual(
+                    len(self.order_service.list_calls),
+                    order_call_count,
+                )
+
+    async def test_non_trading_cache_miss_and_startup_never_refresh_upstream(
+        self,
+    ) -> None:
+        self._seed_synced_account()
+        for market_state in ('WEEKEND', 'HOLIDAY'):
+            with self.subTest(market_state=market_state):
+                service = self._build_service(market_state=market_state)
+                summary_call_count = len(self.inquiry_service.summary_calls)
+                positions_call_count = len(self.inquiry_service.positions_calls)
+                order_call_count = len(self.order_service.list_calls)
+
+                cache_miss = await service.get_portfolio_summary()
+                startup = await service.refresh_portfolio_summary_if_due(
+                    trigger='startup',
+                    force=True,
+                )
+
+                for result in (cache_miss, startup):
+                    self.assertEqual(result['sync']['status'], 'unavailable')
+                    self.assertEqual(
+                        result['freshness']['marketState'],
+                        market_state,
+                    )
+                    self.assertFalse(result['freshness']['hasCachedSnapshot'])
+                    self.assertFalse(result['freshness']['refreshInFlight'])
+                self.assertIsNone(service._cache)
+                self.assertEqual(
+                    len(self.inquiry_service.summary_calls),
+                    summary_call_count,
+                )
+                self.assertEqual(
+                    len(self.inquiry_service.positions_calls),
+                    positions_call_count,
+                )
+                self.assertEqual(
+                    len(self.order_service.list_calls),
+                    order_call_count,
+                )
+
+    async def test_stale_cache_fails_closed_when_market_state_is_unavailable(
+        self,
+    ) -> None:
+        self._seed_synced_account()
+        service = self._build_service(cache_ttl_seconds=60)
+        await service.get_portfolio_summary()
+        assert service._cache is not None
+        service._cache.cached_at -= timedelta(minutes=5)
+        service._cache.last_refresh_attempted_at = service._cache.cached_at
+        service._cache.last_refresh_succeeded_at = service._cache.cached_at
+        summary_call_count = len(self.inquiry_service.summary_calls)
+        positions_call_count = len(self.inquiry_service.positions_calls)
+        order_call_count = len(self.order_service.list_calls)
+        service.market_state_loader = AsyncMock(
+            side_effect=RuntimeError('calendar unavailable')
+        )
+
+        cached = await service.get_portfolio_summary()
+
+        self.assertEqual(
+            cached['freshness']['staleReason'],
+            'market_state_unavailable_cache',
+        )
+        self.assertEqual(cached['freshness']['marketState'], 'UNKNOWN')
+        self.assertFalse(cached['freshness']['refreshInFlight'])
+        self.assertIsNone(service._refresh_task)
+        self.assertEqual(
+            len(self.inquiry_service.summary_calls),
+            summary_call_count,
+        )
+        self.assertEqual(
+            len(self.inquiry_service.positions_calls),
+            positions_call_count,
+        )
+        self.assertEqual(len(self.order_service.list_calls), order_call_count)
 
     async def test_refresh_failure_with_existing_cache_returns_stale_cached_summary(self) -> None:
         account_reference = 'KIS:12345678-01'

@@ -14,12 +14,30 @@ from app.agent_context.lease_loss_evidence import (
 )
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.market_membership import market_membership_sha256
 from app.eod.daily_pipeline_state import (
     DailyPipelineRunStateService,
     _expired_decision_skip_evidence_is_valid,
     _summary_cutoff_contract_repair_execution_context_error,
     _stage_row_outcome,
 )
+
+
+def _factor_exact_scope_outcome_proof() -> dict:
+    selected = [str(index).zfill(6) for index in range(1, 101)]
+    retry_debt = [selected[-1]]
+    successful = selected[:-1]
+    return {
+        'schema_version': 'exact_scope_outcome_proof_v1',
+        'manifest_version': 'factor_scope_outcomes_v1',
+        'selected_stock_codes': selected,
+        'selected_symbol_count': len(selected),
+        'selected_symbol_sha256': market_membership_sha256(selected),
+        'successful_symbol_count': len(successful),
+        'successful_symbol_sha256': market_membership_sha256(successful),
+        'retry_debt_stock_codes': retry_debt,
+        'terminal_not_applicable_stock_codes': [],
+    }
 
 
 def _completed_feedback_summary_stage(proof: dict) -> dict:
@@ -748,7 +766,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         session.get.return_value = eod_run
         return current, current_stage_rows, eod_run, session, proof
 
-    def test_startup_stage_adapter_preserves_safe_partial_evidence(self) -> None:
+    def test_startup_stage_adapter_rejects_count_only_partial_evidence(
+        self,
+    ) -> None:
         stage = SimpleNamespace(
             stage_id='momentum_factors',
             status='partial',
@@ -765,7 +785,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(outcome['stage'], 'momentum_factors')
         self.assertEqual(outcome['succeeded'], 99)
         self.assertEqual(outcome['total'], 100)
-        self.assertTrue(daily_pipeline_outcome_is_satisfied(outcome))
+        self.assertFalse(daily_pipeline_outcome_is_satisfied(outcome))
 
     def test_same_day_rearm_claim_preserves_completed_signal_lazy_tail(
         self,
@@ -1229,7 +1249,12 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             total=100,
             succeeded=99,
             failed=1,
-            details={'result_summary': {'remaining_retryable_events': 0}},
+            details={
+                'result_summary': {'remaining_retryable_events': 0},
+                'exact_scope_outcome_proof': (
+                    _factor_exact_scope_outcome_proof()
+                ),
+            },
         )
         run_result = MagicMock()
         run_result.scalar_one_or_none.return_value = run
@@ -1362,7 +1387,12 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             succeeded=99,
             failed=1,
             error_message=None,
-            details={'result_summary': {'remaining_retryable_events': 0}},
+            details={
+                'result_summary': {'remaining_retryable_events': 0},
+                'exact_scope_outcome_proof': (
+                    _factor_exact_scope_outcome_proof()
+                ),
+            },
         )
         run_result = MagicMock()
         run_result.scalar_one_or_none.return_value = run
@@ -2536,6 +2566,10 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(run.status, 'running')
         self.assertEqual(stage.status, 'running')
         lock_call = session.execute.call_args_list[2]
+        self.assertIn(
+            'pg_try_advisory_xact_lock_shared',
+            str(lock_call.args[0]),
+        )
         self.assertIn('pg_try_advisory_xact_lock', str(lock_call.args[0]))
         self.assertEqual(
             lock_call.args[1],
@@ -7073,9 +7107,15 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             )
 
         advisory_lock_call = session.execute.call_args_list[0]
-        self.assertEqual(
-            str(advisory_lock_call.args[0]),
-            'SELECT pg_advisory_xact_lock(:source_key, :trade_key)',
+        rendered_lock = str(advisory_lock_call.args[0])
+        self.assertIn('WITH admission AS MATERIALIZED', rendered_lock)
+        self.assertIn(
+            'pg_advisory_xact_lock_shared(10003, 0)',
+            rendered_lock,
+        )
+        self.assertIn(
+            'pg_advisory_xact_lock(:source_key, :trade_key)',
+            rendered_lock,
         )
         self.assertEqual(
             advisory_lock_call.args[1],

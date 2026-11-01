@@ -1998,12 +1998,32 @@ class KISRealtimePriceService:
             limited = normalized in self._limited_symbols
             enabled = settings.kis_realtime_price_enabled
             configured, _ = self._is_configured()
+            market_state = str(
+                self._health.get('market_state') or ''
+            ).strip().upper()
+            market_session_active = bool(
+                self._health.get('market_session_active')
+            )
             subscription_fields = self._subscription_fields_for_symbol_locked(
                 desired=desired,
                 subscribed=subscribed,
                 limited=limited,
                 enabled=enabled,
                 configured=configured,
+            )
+
+        if (
+            not market_session_active
+            and market_state in {'PREOPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}
+        ):
+            return self._empty_price_fields(
+                'market_closed',
+                subscription_fields={
+                    'realtime_subscribed': False,
+                    'realtime_subscription_reason': (
+                        f'market_{market_state.lower()}'
+                    ),
+                },
             )
 
         if tick is not None:
@@ -2097,8 +2117,12 @@ class KISRealtimePriceService:
             'as_of': _isoformat(now),
             'summary': {
                 'items_total': len(items),
-                'subscribed_count': len(health.get('subscribed_symbols') or []),
-                'limited_count': len(health.get('limited_symbols') or []),
+                'desired_count': len(health.get('desired_symbols') or []),
+                'subscribed_count': sum(
+                    1 for item in items if item.get('realtime_subscribed')
+                ),
+                'pending_count': price_status_counts.get('pending', 0),
+                'limited_count': price_status_counts.get('limited', 0),
                 'price_status_counts': dict(sorted(price_status_counts.items())),
             },
             'items': items,

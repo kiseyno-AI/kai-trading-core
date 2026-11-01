@@ -501,6 +501,47 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health['reconnect_attempts'], 0)
         clear_candidate_cache.assert_called_once_with()
 
+    def test_closed_market_snapshot_preserves_desired_membership_without_pending_or_limited_items(
+        self,
+    ) -> None:
+        with (
+            patch.object(settings, 'kis_realtime_price_enabled', True),
+            patch.object(settings, 'kis_app_key', 'test-key'),
+            patch.object(settings, 'kis_app_secret', 'test-secret'),
+        ):
+            service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+            service.observe_monitored_symbols(
+                ['005930', '000660', '035420'],
+                trigger='test',
+            )
+            service._set_market_idle(_market_state('WEEKEND'))
+
+            closed = service.monitored_snapshot()
+
+            self.assertEqual(closed['summary']['desired_count'], 3)
+            self.assertEqual(closed['summary']['pending_count'], 0)
+            self.assertEqual(closed['summary']['limited_count'], 0)
+            self.assertEqual(
+                {item['price_status'] for item in closed['items']},
+                {'market_closed'},
+            )
+            self.assertEqual(
+                {item['realtime_subscription_reason'] for item in closed['items']},
+                {'market_weekend'},
+            )
+
+            _record_open_market_session(service)
+            service.subscription_snapshot()
+            reopened = service.monitored_snapshot()
+
+            self.assertEqual(reopened['summary']['desired_count'], 3)
+            self.assertEqual(reopened['summary']['pending_count'], 2)
+            self.assertEqual(reopened['summary']['limited_count'], 1)
+            self.assertEqual(
+                {item['price_status'] for item in reopened['items']},
+                {'pending', 'limited'},
+            )
+
     async def test_background_stream_fails_closed_when_calendar_is_unverified(
         self,
     ) -> None:

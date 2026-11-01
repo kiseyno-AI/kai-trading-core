@@ -6,13 +6,18 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Callable, Iterable, Sequence
 
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
+    list_symbols_with_daily_bar_on_date,
     load_daily_action_summaries,
     load_daily_technical_snapshot_inputs,
     upsert_daily_action_summary,
 )
 
 SUMMARY_VERSION = 'mvp_v1'
+ACTION_SUMMARY_SCOPE_MANIFEST_VERSION = (
+    'action_summaries_scope_outcomes_v1'
+)
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:
@@ -363,15 +368,19 @@ class DailyActionSummaryService:
         progress_callback: Callable[[dict], None] | None = None,
         include_retry_metadata: bool = False,
     ) -> dict:
-        requested_symbols = list(symbols or [])
+        requested_symbols = list(dict.fromkeys(symbols or []))
+        if not requested_symbols:
+            requested_symbols = list_symbols_with_daily_bar_on_date(
+                market_date
+            )
         snapshots = load_daily_technical_snapshot_inputs(
             market_date=market_date,
             symbols=requested_symbols or None,
-            limit=max(len(requested_symbols), 100) if requested_symbols else 10000,
+            limit=max(len(requested_symbols), 100)
+            if requested_symbols
+            else 10000,
         )
         available_symbols = {item['symbol'] for item in snapshots}
-        if not requested_symbols:
-            requested_symbols = [item['symbol'] for item in snapshots]
 
         items: list[dict] = []
         failed_symbols: list[str] = [symbol for symbol in requested_symbols if symbol not in available_symbols]
@@ -449,6 +458,13 @@ class DailyActionSummaryService:
             'action_summaries_failed': len(deduped_failed),
             'failed_symbols': deduped_failed[:50],
             'items': items,
+            'denominator_source': 'same_day_daily_price_bars',
+            **build_exact_symbol_scope_outcome(
+                manifest_version=ACTION_SUMMARY_SCOPE_MANIFEST_VERSION,
+                selected_symbols=requested_symbols,
+                successful_symbols=[item['symbol'] for item in items],
+                retry_debt_symbols=deduped_failed,
+            ),
         }
         if include_retry_metadata:
             result['_retry_metadata'] = {'failed_symbols': deduped_failed}

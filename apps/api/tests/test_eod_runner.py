@@ -2776,6 +2776,67 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             expected_market_state='WEEKEND'
         )
 
+    async def test_non_trading_loop_preserves_recovery_and_order_safety_without_provider_refreshes(
+        self,
+    ) -> None:
+        for state in ('WEEKEND', 'HOLIDAY'):
+            with self.subTest(state=state):
+                runner = EODBackgroundRunner(interval_seconds=0)
+                market_state = MarketState(
+                    market='KRX',
+                    state=state,
+                    is_trading_day=False,
+                    is_open=False,
+                    server_time='2026-09-13T14:00:00+09:00',
+                    session_open_at=None,
+                    session_close_at=None,
+                    latest_valid_trading_date='2026-09-11',
+                )
+
+                async def stop_after_tick(_seconds: int) -> None:
+                    runner._running = False
+
+                with (
+                    patch('app.eod.runner.settings.background_runner_enabled', True),
+                    patch(
+                        'app.eod.runner.async_get_market_state',
+                        return_value=market_state,
+                    ),
+                    patch(
+                        'app.eod.runner.auto_pykrx_eod_scheduler.'
+                        'schedule_daily_pipeline_if_due',
+                        new=AsyncMock(),
+                    ) as schedule_daily,
+                    patch(
+                        'app.eod.runner.trading_order_reconciliation_service.'
+                        'run_periodic_if_due',
+                        new=AsyncMock(),
+                    ) as reconcile,
+                    patch(
+                        'app.eod.runner.market_snapshot_service.'
+                        'refresh_market_snapshot_if_due',
+                        new=AsyncMock(),
+                    ) as refresh_snapshot,
+                    patch(
+                        'app.eod.runner.portfolio_summary_service.'
+                        'refresh_portfolio_summary_if_due',
+                        new=AsyncMock(),
+                    ) as refresh_portfolio,
+                    patch(
+                        'app.eod.runner.asyncio.sleep',
+                        side_effect=stop_after_tick,
+                    ),
+                ):
+                    runner._running = True
+                    await runner._run_loop()
+
+                schedule_daily.assert_awaited_once_with(
+                    expected_market_state=state
+                )
+                reconcile.assert_awaited_once_with()
+                refresh_snapshot.assert_not_awaited()
+                refresh_portfolio.assert_not_awaited()
+
     async def test_closed_loop_preflights_snapshot_but_skips_other_background_work_when_daily_pipeline_starts(
         self,
     ) -> None:

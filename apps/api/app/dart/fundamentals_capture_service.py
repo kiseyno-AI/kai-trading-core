@@ -1124,6 +1124,7 @@ class DartFundamentalsCaptureService:
                     fs_div=resolved_fs_div,
                     timeout_seconds=self.event_timeout_seconds,
                 )
+                audit_diagnostics: dict[str, Any] | None = None
                 try:
                     audit_signal_status = 'not_required'
                     if (
@@ -1136,6 +1137,11 @@ class DartFundamentalsCaptureService:
                             ),
                             timeout=self.event_timeout_seconds,
                         )
+                        raw_audit_diagnostics = signal_result.get(
+                            'audit_diagnostics'
+                        )
+                        if isinstance(raw_audit_diagnostics, dict):
+                            audit_diagnostics = raw_audit_diagnostics
                         if not signal_result.get('audit_signal'):
                             raise RuntimeError(
                                 'DART annual filing audit evidence was not found; '
@@ -1355,15 +1361,28 @@ class DartFundamentalsCaptureService:
 
                     self.repository.mark_event_capture_failed(event['id'], error_message=error_message)
                     events_failed += 1
+                    failed_event_metadata = {
+                        'event_id': event['id'],
+                        'rcept_no': event['rcept_no'],
+                        'status': 'failed',
+                        'error': error_message,
+                    }
+                    failed_result = {
+                        'event_id': event['id'],
+                        'rcept_no': event['rcept_no'],
+                        'stock_code': event['stock_code'],
+                        'status': 'failed',
+                        'error': error_message,
+                    }
+                    if audit_diagnostics is not None:
+                        failed_event_metadata['audit_diagnostics'] = (
+                            audit_diagnostics
+                        )
+                        failed_result['audit_diagnostics'] = audit_diagnostics
                     run_metadata_with_progress = {
                         **run_metadata,
                         'candidate_count': len(events),
-                        'last_event': {
-                            'event_id': event['id'],
-                            'rcept_no': event['rcept_no'],
-                            'status': 'failed',
-                            'error': error_message,
-                        },
+                        'last_event': failed_event_metadata,
                         'last_progress_at': _utcnow().isoformat(),
                     }
                     self.repository.update_capture_run_progress(
@@ -1387,15 +1406,7 @@ class DartFundamentalsCaptureService:
                         error_type=type(exc).__name__,
                         error_message=error_message,
                     )
-                    results.append(
-                        {
-                            'event_id': event['id'],
-                            'rcept_no': event['rcept_no'],
-                            'stock_code': event['stock_code'],
-                            'status': 'failed',
-                            'error': error_message,
-                        }
-                    )
+                    results.append(failed_result)
 
             operator_buckets = _build_operator_buckets(
                 lookup_errors=[],

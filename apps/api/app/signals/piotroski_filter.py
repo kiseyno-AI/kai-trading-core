@@ -33,6 +33,9 @@ from app.market_data_store import (
     upsert_daily_piotroski_filter_result,
     upsert_daily_piotroski_filter_results,
 )
+from app.signals.preferred_share_fundamentals import (
+    resolve_preferred_fundamentals_issuer_symbols,
+)
 
 FILTER_SOURCE = 'strategy_piotroski_v1'
 LOW_PBR_PERCENTILE = 0.30
@@ -111,6 +114,7 @@ class PiotroskiInputs:
     audit_provenance: dict[str, Any] | None = None
     dilution_provenance: dict[str, Any] | None = None
     valuation_source: str = 'daily_price_bars'
+    valuation_provenance: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -326,6 +330,74 @@ def _compute_signals(item: PiotroskiInputs) -> tuple[dict[str, PiotroskiSignalRe
     return signals, score, available_count
 
 
+def _required_financial_signal_missing_reasons(
+    item: PiotroskiInputs,
+    signals: dict[str, PiotroskiSignalResult],
+) -> dict[str, list[str]]:
+    candidate_reasons = {
+        'positive_roa': [
+            ('missing_net_income', item.net_income is None),
+            ('missing_total_assets', item.total_assets is None),
+            ('zero_total_assets', item.total_assets == 0),
+        ],
+        'positive_operating_cash_flow': [
+            (
+                'missing_operating_cash_flow',
+                item.operating_cash_flow is None,
+            ),
+        ],
+        'improving_roa': [
+            ('missing_net_income', item.net_income is None),
+            ('missing_total_assets', item.total_assets is None),
+            ('zero_total_assets', item.total_assets == 0),
+            ('missing_prior_net_income', item.prior_net_income is None),
+            ('missing_prior_total_assets', item.prior_total_assets is None),
+            ('zero_prior_total_assets', item.prior_total_assets == 0),
+        ],
+        'accrual_quality': [
+            (
+                'missing_operating_cash_flow',
+                item.operating_cash_flow is None,
+            ),
+            ('missing_net_income', item.net_income is None),
+        ],
+        'lower_leverage': [
+            ('missing_debt_ratio', item.debt_ratio is None),
+            ('missing_prior_debt_ratio', item.prior_debt_ratio is None),
+        ],
+        'improving_current_ratio': [
+            ('missing_current_ratio', item.current_ratio is None),
+            (
+                'missing_prior_current_ratio',
+                item.prior_current_ratio is None,
+            ),
+        ],
+        'improving_gross_margin': [
+            ('missing_gross_margin', item.gross_margin is None),
+            (
+                'missing_prior_gross_margin',
+                item.prior_gross_margin is None,
+            ),
+        ],
+        'improving_asset_turnover': [
+            ('missing_asset_turnover', item.asset_turnover is None),
+            (
+                'missing_prior_asset_turnover',
+                item.prior_asset_turnover is None,
+            ),
+        ],
+    }
+    return {
+        signal_name: [
+            reason
+            for reason, is_missing in candidate_reasons[signal_name]
+            if is_missing
+        ]
+        for signal_name in PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
+        if not signals[signal_name].available
+    }
+
+
 class DailyPiotroskiFilterService:
     def rebuild_for_market_date(
         self,
@@ -368,6 +440,11 @@ class DailyPiotroskiFilterService:
         result_payloads: list[dict[str, Any]] = []
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
+        full_signal_usable_count = 0
+        full_signal_incomplete_count = 0
+        full_signal_unusable_count = 0
+        required_signal_missing_counts: dict[str, int] = {}
+        required_input_missing_counts: dict[str, int] = {}
 
         for item in ranking_inputs:
             annual_year = item.annual_year if item.annual_year is not None else default_annual_year
@@ -385,6 +462,22 @@ class DailyPiotroskiFilterService:
                 1
                 for signal_name in PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
                 if signals[signal_name].available
+            )
+            missing_required_financial_signal_reasons = (
+                _required_financial_signal_missing_reasons(item, signals)
+            )
+            missing_required_financial_signal_names = list(
+                missing_required_financial_signal_reasons
+            )
+            full_signal_coverage_status = (
+                'usable'
+                if required_financial_signals_available
+                == len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
+                else (
+                    'unusable'
+                    if required_financial_signals_available == 0
+                    else 'incomplete'
+                )
             )
             missing_optional_signal_names = [
                 signal_name
@@ -484,7 +577,10 @@ class DailyPiotroskiFilterService:
                         'available_signal_count': available_signal_count,
                         'score_ratio': score_ratio,
                         'signal_coverage_ratio': signal_coverage_ratio,
-                        'full_signal_coverage_required': False,
+                        'full_signal_coverage_required': True,
+                        'full_signal_coverage_status': (
+                            full_signal_coverage_status
+                        ),
                         'required_financial_signal_count': len(
                             PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
                         ),
@@ -494,6 +590,12 @@ class DailyPiotroskiFilterService:
                         'required_financial_signal_coverage_ratio': (
                             required_financial_signals_available
                             / len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
+                        ),
+                        'missing_required_financial_signal_names': (
+                            missing_required_financial_signal_names
+                        ),
+                        'missing_required_financial_signal_reasons': (
+                            missing_required_financial_signal_reasons
                         ),
                         'missing_optional_signal_names': (
                             missing_optional_signal_names
@@ -529,6 +631,7 @@ class DailyPiotroskiFilterService:
                         'available': valuation_available,
                         'source_status': valuation_source_status,
                         'source': item.valuation_source,
+                        'provenance': item.valuation_provenance,
                         'excluded_from_filter_universe': not valuation_available,
                     },
                     'inputs': {
@@ -552,6 +655,24 @@ class DailyPiotroskiFilterService:
             }
             if target_symbol_set is not None and item.symbol not in target_symbol_set:
                 continue
+            if full_signal_coverage_status == 'usable':
+                full_signal_usable_count += 1
+            elif full_signal_coverage_status == 'incomplete':
+                full_signal_incomplete_count += 1
+            else:
+                full_signal_unusable_count += 1
+            missing_input_reasons: set[str] = set()
+            for signal_name, reasons in (
+                missing_required_financial_signal_reasons.items()
+            ):
+                required_signal_missing_counts[signal_name] = (
+                    required_signal_missing_counts.get(signal_name, 0) + 1
+                )
+                missing_input_reasons.update(reasons)
+            for reason in missing_input_reasons:
+                required_input_missing_counts[reason] = (
+                    required_input_missing_counts.get(reason, 0) + 1
+                )
             if passed_filter:
                 passed_count += 1
             result_payloads.append(payload)
@@ -578,6 +699,24 @@ class DailyPiotroskiFilterService:
             if normalized_symbols is not None
             else sorted(evaluated_symbols)
         )
+        missing_input_symbols = sorted(
+            set(selected_scope_symbols) - evaluated_symbols
+        )
+        if missing_input_symbols:
+            missing_input_count = len(missing_input_symbols)
+            full_signal_unusable_count += missing_input_count
+            for signal_name in PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES:
+                required_signal_missing_counts[signal_name] = (
+                    required_signal_missing_counts.get(signal_name, 0)
+                    + missing_input_count
+                )
+            required_input_missing_counts['missing_piotroski_input_row'] = (
+                required_input_missing_counts.get(
+                    'missing_piotroski_input_row',
+                    0,
+                )
+                + missing_input_count
+            )
         successful_symbols = sorted(
             evaluated_symbols - set(failed_symbols)
         )
@@ -589,11 +728,37 @@ class DailyPiotroskiFilterService:
             if not retry_debt_symbols
             else ('partial' if successful_symbols else 'failed')
         )
+        full_signal_total_count = len(selected_scope_symbols)
+        full_signal_coverage_ratio = (
+            full_signal_usable_count / full_signal_total_count
+            if full_signal_total_count > 0
+            else 0.0
+        )
+        full_signal_coverage_status = (
+            'usable'
+            if full_signal_total_count > 0
+            and full_signal_usable_count == full_signal_total_count
+            else (
+                'unusable'
+                if full_signal_usable_count == 0
+                else 'incomplete'
+            )
+        )
+        status = scope_status
+        evidence_reason: str | None = None
+        if scope_status != 'failed':
+            if full_signal_coverage_status == 'unusable':
+                status = 'partial'
+                evidence_reason = 'piotroski_evidence_unusable'
+            elif full_signal_coverage_status == 'incomplete':
+                status = 'partial'
+                evidence_reason = 'piotroski_evidence_incomplete'
 
-        return {
-            'status': scope_status,
+        result = {
+            'status': status,
             'market_date': normalized_market_date.isoformat(),
             'source': FILTER_SOURCE,
+            'requested_symbol_count': full_signal_total_count,
             'symbols_evaluated': len(result_payloads),
             'symbols_excluded_missing_valuation': sum(
                 1
@@ -607,6 +772,22 @@ class DailyPiotroskiFilterService:
             'results_failed': len(failed_symbols),
             'failed_symbols': failed_symbols,
             'failed_symbol_errors': failed_symbol_errors,
+            'full_signal_required_signal_count': len(
+                PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
+            ),
+            'full_signal_usable_count': full_signal_usable_count,
+            'full_signal_incomplete_count': full_signal_incomplete_count,
+            'full_signal_unusable_count': full_signal_unusable_count,
+            'full_signal_coverage_ratio': full_signal_coverage_ratio,
+            'full_signal_coverage_status': full_signal_coverage_status,
+            'required_financial_signal_missing_counts': {
+                signal_name: required_signal_missing_counts[signal_name]
+                for signal_name in PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES
+                if signal_name in required_signal_missing_counts
+            },
+            'required_financial_input_missing_counts': dict(
+                sorted(required_input_missing_counts.items())
+            ),
             'scope_outcome_manifest_version': (
                 'piotroski_scope_outcomes_v1'
             ),
@@ -625,6 +806,10 @@ class DailyPiotroskiFilterService:
                 for symbol in selected_scope_symbols
             ],
         }
+        if evidence_reason is not None:
+            result['reason'] = evidence_reason
+            result['quality_warning'] = evidence_reason
+        return result
 
     def inspect(
         self,
@@ -740,8 +925,23 @@ class DailyPiotroskiFilterService:
             symbols = [row.symbol for row in base_rows]
             if not symbols:
                 return []
+            fundamentals_issuer_by_symbol = (
+                resolve_preferred_fundamentals_issuer_symbols(
+                    session,
+                    symbols,
+                )
+            )
+            fundamentals_query_symbols = list(
+                dict.fromkeys(
+                    [
+                        *symbols,
+                        *fundamentals_issuer_by_symbol.values(),
+                    ]
+                )
+            )
 
             valuation_pbr_by_symbol: dict[str, float] = {}
+            valuation_market_cap_by_symbol: dict[str, float] = {}
             valuation_rows = session.execute(
                 select(
                     Symbol.symbol,
@@ -762,8 +962,13 @@ class DailyPiotroskiFilterService:
             for valuation_row in valuation_rows:
                 payload = dict(valuation_row.payload or {})
                 pbr = _as_float(payload.get('pbr'))
-                if pbr is not None:
+                if pbr is not None and pbr > 0:
                     valuation_pbr_by_symbol[str(valuation_row.symbol)] = pbr
+                market_cap = _as_float(payload.get('market_cap'))
+                if market_cap is not None and market_cap > 0:
+                    valuation_market_cap_by_symbol[
+                        str(valuation_row.symbol)
+                    ] = market_cap
 
             metric_keys = {
                 'total_equity',
@@ -786,8 +991,15 @@ class DailyPiotroskiFilterService:
             }
             highlights_by_symbol: dict[str, dict[tuple[str, int], Any]] = {}
             ratios_by_symbol: dict[str, dict[tuple[str, int], Any]] = {}
+            highlight_fact_provenance_by_symbol: dict[
+                str,
+                dict[tuple[str, int], dict[str, Any]],
+            ] = {}
             fundamentals_provenance_by_symbol: dict[str, dict[int, dict[str, Any]]] = {}
-            for symbol_chunk in _chunks(symbols, PIOTROSKI_INPUT_QUERY_CHUNK_SIZE):
+            for symbol_chunk in _chunks(
+                fundamentals_query_symbols,
+                PIOTROSKI_INPUT_QUERY_CHUNK_SIZE,
+            ):
                 latest_rank = func.row_number().over(
                     partition_by=(
                         DartFundamentalsSnapshot.stock_code,
@@ -813,6 +1025,7 @@ class DailyPiotroskiFilterService:
                         DartFundamentalsSnapshot.fs_div.label('fs_div'),
                         DartFundamentalsSnapshot.rcept_no.label('rcept_no'),
                         DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                        DartFundamentalsSnapshot.currency.label('currency'),
                         DartDisclosureEvent.corp_code.label('corp_code'),
                         DartDisclosureEvent.receipt_date.label('receipt_date'),
                         latest_rank,
@@ -859,6 +1072,7 @@ class DailyPiotroskiFilterService:
                 stored_ratios_by_snapshot: dict[int, dict[str, Any]] = {}
                 highlight_rows = session.execute(
                     select(
+                        DartFundamentalsHighlight.id.label('highlight_id'),
                         DartFundamentalsHighlight.snapshot_id.label('snapshot_id'),
                         DartFundamentalsHighlight.metric_key.label('metric_key'),
                         DartFundamentalsHighlight.current_amount.label('current_amount'),
@@ -866,6 +1080,7 @@ class DailyPiotroskiFilterService:
                             'current_cumulative_amount'
                         ),
                         DartFundamentalsHighlight.ratio_value.label('ratio_value'),
+                        DartFundamentalsHighlight.currency.label('currency'),
                     )
                     .where(
                         DartFundamentalsHighlight.snapshot_id.in_(snapshot_ids),
@@ -878,8 +1093,10 @@ class DailyPiotroskiFilterService:
                     symbol = str(metadata['symbol'])
                     business_year = int(metadata['business_year'])
                     current_amount = row['current_amount']
+                    amount_field = 'current_amount'
                     if current_amount is None:
                         current_amount = row['current_cumulative_amount']
+                        amount_field = 'current_cumulative_amount'
                     stored_highlights_by_snapshot.setdefault(snapshot_id, {})[
                         str(row['metric_key'])
                     ] = current_amount
@@ -889,6 +1106,18 @@ class DailyPiotroskiFilterService:
                     highlights_by_symbol.setdefault(symbol, {})[
                         (row['metric_key'], business_year)
                     ] = current_amount
+                    if current_amount is not None:
+                        highlight_fact_provenance_by_symbol.setdefault(
+                            symbol,
+                            {},
+                        )[(str(row['metric_key']), business_year)] = {
+                            'source': 'dart_fundamentals_highlight',
+                            'highlight_id': int(row['highlight_id']),
+                            'snapshot_id': snapshot_id,
+                            'metric_key': str(row['metric_key']),
+                            'amount_field': amount_field,
+                            'currency': str(row['currency'] or '').strip().upper(),
+                        }
                     ratios_by_symbol.setdefault(symbol, {})[
                         (row['metric_key'], business_year)
                     ] = row['ratio_value']
@@ -1017,6 +1246,8 @@ class DailyPiotroskiFilterService:
                     symbol = str(metadata['symbol'])
                     business_year = int(metadata['business_year'])
                     provenance = {
+                        'requested_symbol': symbol,
+                        'fundamentals_issuer_symbol': symbol,
                         'snapshot_id': int(metadata['snapshot_id']),
                         'disclosure_event_id': int(metadata['disclosure_event_id']),
                         'business_year': business_year,
@@ -1030,6 +1261,7 @@ class DailyPiotroskiFilterService:
                             if metadata['captured_at'] is not None
                             else None
                         ),
+                        'currency': str(metadata['currency'] or '').strip().upper(),
                     }
                     raw_fallback_metrics = raw_fallback_metrics_by_snapshot.get(
                         int(metadata['snapshot_id'])
@@ -1045,23 +1277,71 @@ class DailyPiotroskiFilterService:
                         business_year
                     ] = provenance
 
-            selected_audit_rcept_by_symbol: dict[str, str] = {}
-            for symbol, provenance in fundamentals_provenance_by_symbol.items():
+            for requested_symbol, issuer_symbol in (
+                fundamentals_issuer_by_symbol.items()
+            ):
+                if fundamentals_provenance_by_symbol.get(requested_symbol):
+                    continue
+                issuer_provenance = fundamentals_provenance_by_symbol.get(
+                    issuer_symbol
+                )
+                if not issuer_provenance:
+                    continue
+                highlights_by_symbol[requested_symbol] = dict(
+                    highlights_by_symbol.get(issuer_symbol, {})
+                )
+                ratios_by_symbol[requested_symbol] = dict(
+                    ratios_by_symbol.get(issuer_symbol, {})
+                )
+                issuer_fact_provenance = (
+                    highlight_fact_provenance_by_symbol.get(issuer_symbol, {})
+                )
+                highlight_fact_provenance_by_symbol[requested_symbol] = {
+                    key: {
+                        **metadata,
+                        'requested_symbol': requested_symbol,
+                        'fundamentals_issuer_symbol': issuer_symbol,
+                    }
+                    for key, metadata in issuer_fact_provenance.items()
+                }
+                fundamentals_provenance_by_symbol[requested_symbol] = {
+                    business_year: {
+                        **metadata,
+                        'requested_symbol': requested_symbol,
+                        'fundamentals_issuer_symbol': issuer_symbol,
+                    }
+                    for business_year, metadata in issuer_provenance.items()
+                }
+
+            expected_audit_targets_by_rcept: dict[
+                str,
+                list[tuple[str, str]],
+            ] = {}
+            for symbol in symbols:
+                provenance = fundamentals_provenance_by_symbol.get(symbol, {})
                 if not provenance:
                     continue
                 selected_year = max(provenance)
-                rcept_no = str(provenance[selected_year].get('rcept_no') or '').strip()
+                selected_provenance = provenance[selected_year]
+                rcept_no = str(
+                    selected_provenance.get('rcept_no') or ''
+                ).strip()
                 if rcept_no:
-                    selected_audit_rcept_by_symbol[symbol] = rcept_no
+                    issuer_symbol = str(
+                        selected_provenance.get(
+                            'fundamentals_issuer_symbol',
+                            symbol,
+                        )
+                    )
+                    expected_audit_targets_by_rcept.setdefault(
+                        rcept_no,
+                        [],
+                    ).append((symbol, issuer_symbol))
 
             latest_audit: dict[str, Any] = {}
             audit_provenance_by_symbol: dict[str, dict[str, Any]] = {}
-            expected_symbol_by_audit_rcept = {
-                rcept_no: symbol
-                for symbol, rcept_no in selected_audit_rcept_by_symbol.items()
-            }
             for rcept_chunk in _chunks(
-                list(expected_symbol_by_audit_rcept),
+                list(expected_audit_targets_by_rcept),
                 PIOTROSKI_INPUT_QUERY_CHUNK_SIZE,
             ):
                 audit_rows = session.execute(
@@ -1079,20 +1359,34 @@ class DailyPiotroskiFilterService:
                 ).mappings().all()
                 for row in audit_rows:
                     rcept_no = str(row['rcept_no'])
-                    symbol = expected_symbol_by_audit_rcept.get(rcept_no)
-                    if symbol is None or str(row['symbol']) != symbol:
-                        continue
-                    latest_audit[symbol] = row['has_audit_issue']
-                    audit_provenance_by_symbol[symbol] = {
-                        'id': int(row['id']),
-                        'rcept_no': rcept_no,
-                        'receipt_date': row['receipt_date'].isoformat(),
-                    }
+                    for requested_symbol, issuer_symbol in (
+                        expected_audit_targets_by_rcept.get(rcept_no, [])
+                    ):
+                        if str(row['symbol']) != issuer_symbol:
+                            continue
+                        latest_audit[requested_symbol] = row['has_audit_issue']
+                        audit_provenance_by_symbol[requested_symbol] = {
+                            'requested_symbol': requested_symbol,
+                            'fundamentals_issuer_symbol': issuer_symbol,
+                            'id': int(row['id']),
+                            'rcept_no': rcept_no,
+                            'receipt_date': row['receipt_date'].isoformat(),
+                        }
 
             latest_dilution: dict[str, Any] = {}
             dilution_provenance_by_symbol: dict[str, dict[str, Any]] = {}
             current_corp_code_by_symbol = {
                 symbol: str(provenance[max(provenance)]['corp_code'])
+                for symbol, provenance in fundamentals_provenance_by_symbol.items()
+                if provenance
+            }
+            current_fundamentals_issuer_by_symbol = {
+                symbol: str(
+                    provenance[max(provenance)].get(
+                        'fundamentals_issuer_symbol',
+                        symbol,
+                    )
+                )
                 for symbol, provenance in fundamentals_provenance_by_symbol.items()
                 if provenance
             }
@@ -1189,7 +1483,16 @@ class DailyPiotroskiFilterService:
                     has_dilution_signal = bool(selected_row['has_dilution_signal'])
                     latest_dilution[symbol] = has_dilution_signal
                     dilution_provenance = {
+                        'requested_symbol': symbol,
+                        'fundamentals_issuer_symbol': (
+                            current_fundamentals_issuer_by_symbol.get(
+                                symbol,
+                                symbol,
+                            )
+                        ),
                         'id': int(selected_row['id']),
+                        'signal_stock_code': str(selected_row['symbol']),
+                        'corp_code': str(selected_row['corp_code']),
                         'rcept_no': str(selected_row['rcept_no']),
                         'receipt_date': selected_row['receipt_date'].isoformat(),
                         'evidence_status': (
@@ -1209,6 +1512,58 @@ class DailyPiotroskiFilterService:
             available_years = sorted(provenance, reverse=True)
             selected_annual_year = available_years[0] if available_years else None
             selected_prior_annual_year = available_years[1] if len(available_years) > 1 else None
+            total_equity = _mapped_float(
+                highlights_by_symbol,
+                symbol=symbol,
+                business_year=selected_annual_year,
+                metric_keys=('total_equity',),
+            )
+            valuation_provenance: dict[str, Any] | None = None
+            if symbol in valuation_pbr_by_symbol:
+                pbr = valuation_pbr_by_symbol[symbol]
+                valuation_source = 'pykrx_valuation_snapshot'
+            else:
+                daily_price_pbr = _as_float(row.pbr)
+                if daily_price_pbr is not None and daily_price_pbr > 0:
+                    pbr = daily_price_pbr
+                    valuation_source = 'daily_price_bars'
+                else:
+                    total_equity_fact = highlight_fact_provenance_by_symbol.get(
+                        symbol,
+                        {},
+                    ).get(('total_equity', selected_annual_year or -1))
+                    market_cap = valuation_market_cap_by_symbol.get(symbol)
+                    currency = str(
+                        (total_equity_fact or {}).get('currency') or ''
+                    ).upper()
+                    if (
+                        market_cap is not None
+                        and market_cap > 0
+                        and total_equity is not None
+                        and total_equity > 0
+                        and total_equity_fact is not None
+                        and currency == 'KRW'
+                    ):
+                        pbr = market_cap / total_equity
+                        valuation_source = 'dart_annual_equity_market_cap_derived'
+                        valuation_provenance = {
+                            'source': valuation_source,
+                            'formula': 'same_day_market_cap / annual_total_equity',
+                            'market_cap': market_cap,
+                            'total_equity': total_equity,
+                            'currency': currency,
+                            'business_year': selected_annual_year,
+                            'market_date': market_date.isoformat(),
+                            'market_cap_source': 'pykrx_valuation_snapshot',
+                            'total_equity_source': 'dart_annual_fundamentals',
+                            'fundamentals_snapshot_id': total_equity_fact.get(
+                                'snapshot_id'
+                            ),
+                            'total_equity_fact': dict(total_equity_fact),
+                        }
+                    else:
+                        pbr = None
+                        valuation_source = 'unavailable'
             ratio_arguments = {
                 'symbol': symbol,
                 'ratios_by_symbol': ratios_by_symbol,
@@ -1219,18 +1574,9 @@ class DailyPiotroskiFilterService:
                     symbol=symbol,
                     name_ko=row.name_ko,
                     market_date=market_date,
-                    pbr=(
-                        valuation_pbr_by_symbol[symbol]
-                        if symbol in valuation_pbr_by_symbol
-                        else _as_float(row.pbr)
-                    ),
+                    pbr=pbr,
                     return_20d=_as_float(row.return_20d),
-                    total_equity=_mapped_float(
-                        highlights_by_symbol,
-                        symbol=symbol,
-                        business_year=selected_annual_year,
-                        metric_keys=('total_equity',),
-                    ),
+                    total_equity=total_equity,
                     net_income=_mapped_float(
                         highlights_by_symbol,
                         symbol=symbol,
@@ -1330,11 +1676,8 @@ class DailyPiotroskiFilterService:
                     fundamentals_provenance=provenance,
                     audit_provenance=audit_provenance_by_symbol.get(symbol),
                     dilution_provenance=dilution_provenance_by_symbol.get(symbol),
-                    valuation_source=(
-                        'pykrx_valuation_snapshot'
-                        if symbol in valuation_pbr_by_symbol
-                        else 'daily_price_bars'
-                    ),
+                    valuation_source=valuation_source,
+                    valuation_provenance=valuation_provenance,
                 )
             )
         return inputs

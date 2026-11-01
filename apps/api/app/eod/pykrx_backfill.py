@@ -50,6 +50,7 @@ from app.eod.market_membership import (
 from app.eod.pykrx_pipeline_support import (
     build_daily_retry_context,
     build_daily_skip_result,
+    compact_daily_pipeline_result,
 )
 from app.eod.run_stage_support import (
     AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
@@ -167,7 +168,20 @@ PYKRX_STAGE_SEQUENCE = (
 
 
 def _log_pykrx_fetch(operation: str, status: str, **fields) -> None:
-    log_fetch_event(service='pykrx', operation=operation, status=status, **fields)
+    bounded_fields = (
+        compact_daily_pipeline_result(fields)
+        if operation in {
+            'run_daily_pipeline_if_due',
+            'run_daily_pipeline_stages',
+        }
+        else fields
+    )
+    log_fetch_event(
+        service='pykrx',
+        operation=operation,
+        status=status,
+        **(bounded_fields or {}),
+    )
 
 
 @dataclass
@@ -5170,6 +5184,17 @@ class PykrxBackfillService:
             )
         ):
             recovery_kwargs['point_in_time_recovery'] = True
+        if point_in_time_recovery and point_in_time_membership_symbols:
+            recovery_kwargs['exact_membership_symbols'] = sorted(
+                point_in_time_membership_symbols
+            )
+            parent_scope_outcome = latest_eod_metadata.get(
+                'followup_admission_scope_outcome'
+            )
+            if isinstance(parent_scope_outcome, Mapping):
+                recovery_kwargs['recovery_parent_scope_outcome'] = dict(
+                    parent_scope_outcome
+                )
         # A later follow-up can fail independently of the immediate PyKRX
         # stages, so a healthy collection resumes the full universe. When a
         # price failure coexists, however, an unscoped resume would include a

@@ -12,6 +12,7 @@ from app.market_data_store import (
     upsert_daily_market_participation_context,
     upsert_daily_price_context,
 )
+from app.eod.market_membership import market_membership_sha256
 
 
 SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
@@ -474,16 +475,45 @@ class DailyMarketParticipationContextService:
         market: str = 'KRX',
         source: str = 'kis_ranking',
         leader_limit: int = PARTICIPATION_CONTEXT_LEADER_LIMIT,
+        exact_symbols: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
-        rows = load_daily_signal_feature_context_rows(market_date=normalized_market_date)
-        return self.rebuild_from_rows(
+        normalized_exact_symbols = (
+            sorted(
+                {
+                    str(symbol).strip().upper().zfill(6)
+                    for symbol in exact_symbols
+                    if str(symbol).strip()
+                }
+            )
+            if exact_symbols is not None
+            else None
+        )
+        if exact_symbols is not None and not normalized_exact_symbols:
+            raise ValueError('participation exact scope must not be empty')
+        rows = load_daily_signal_feature_context_rows(
+            market_date=normalized_market_date,
+            symbols=normalized_exact_symbols,
+        )
+        result = self.rebuild_from_rows(
             market_date=normalized_market_date,
             rows=rows,
             market=market,
             source=source,
             leader_limit=leader_limit,
         )
+        result.update(
+            {
+                'exact_scope': normalized_exact_symbols is not None,
+                'scope_symbol_count': len(normalized_exact_symbols or rows),
+                'scope_membership_sha256': market_membership_sha256(
+                    normalized_exact_symbols
+                    if normalized_exact_symbols is not None
+                    else [str(row.get('symbol') or '') for row in rows]
+                ),
+            }
+        )
+        return result
 
 
 class DerivedContextBackfillService:

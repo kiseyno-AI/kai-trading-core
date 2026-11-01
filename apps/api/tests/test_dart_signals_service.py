@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import io
+import json
 import unittest
 import zipfile
 from contextlib import contextmanager
@@ -82,10 +84,12 @@ class FakeSignalsClient:
     def __init__(self, *, members):
         self.members = members
         self.download_args = None
+        self.download_content = None
 
     async def download_document(self, *, rcept_no):
         self.download_args = {'rcept_no': rcept_no}
         content = _build_archive(self.members)
+        self.download_content = content
         return {
             'content': content,
             'content_type': 'application/zip',
@@ -535,6 +539,168 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             {'disclaimer': 1, 'qualified': 1, 'unqualified': 1},
         )
 
+    async def test_missing_audit_signal_reports_bounded_non_content_archive_diagnostics(self):
+        secret_body = 'SECRET-AUDIT-BODY-MUST-NOT-BE-PERSISTED'
+        members = [
+            (
+                'reports/non-authoritative-table.xml',
+                (
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<TABLE-GROUP ACLASS="OTHER">'
+                    '<TR><TD>감사보고서</TD><TD>적정의견</TD>'
+                    f'<TD>{secret_body}</TD></TR>'
+                    '</TABLE-GROUP>'
+                ).encode('utf-8'),
+            ),
+            ('reports/undecodable.xml', b'\x81'),
+            ('reports/plain.xml', b'<DOCUMENT>plain</DOCUMENT>'),
+        ]
+        client = FakeSignalsClient(members=members)
+        repository = MagicMock()
+        service = DartSignalsService(client=client, repository=repository)
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000540',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with patch.object(service, '_load_event', return_value=event):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        archive = client.download_content
+        self.assertIsNotNone(archive)
+        diagnostics = result['audit_diagnostics']
+        self.assertIsNone(result['audit_signal'])
+        self.assertEqual(diagnostics['version'], 'dart_audit_archive_diagnostics_v1')
+        self.assertEqual(
+            diagnostics['archive_sha256'],
+            hashlib.sha256(archive).hexdigest(),
+        )
+        self.assertEqual(diagnostics['archive_size_bytes'], len(archive))
+        self.assertEqual(diagnostics['member_count'], 3)
+        self.assertEqual(diagnostics['decoded_member_count'], 2)
+        self.assertEqual(diagnostics['aud_opn_table_count'], 0)
+        self.assertEqual(diagnostics['audit_report_label_row_count'], 1)
+        self.assertEqual(diagnostics['known_opinion_token_row_count'], 1)
+        self.assertFalse(diagnostics['truncated'])
+        self.assertEqual(
+            [item['decode_success'] for item in diagnostics['members']],
+            [True, False, True],
+        )
+        self.assertEqual(
+            diagnostics['members'][0]['declared_encoding'],
+            'utf-8',
+        )
+        persisted_shape = json.dumps(diagnostics, ensure_ascii=False)
+        self.assertNotIn(secret_body, persisted_shape)
+        self.assertNotIn('감사보고서', persisted_shape)
+        self.assertNotIn('적정의견', persisted_shape)
+
+    async def test_missing_audit_signal_diagnostics_bound_member_metadata_and_names(self):
+        members = [
+            (f'reports/{index}-' + ('x' * 100) + '.xml', b'<DOCUMENT>plain</DOCUMENT>')
+            for index in range(4)
+        ]
+        service = DartSignalsService(
+            client=FakeSignalsClient(members=members),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000540',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch(
+                'app.dart.signals_service.MAX_AUDIT_DIAGNOSTIC_MEMBERS',
+                2,
+            ),
+            patch(
+                'app.dart.signals_service.MAX_AUDIT_DIAGNOSTIC_MEMBER_NAME_CHARS',
+                24,
+            ),
+        ):
+            result = await service.capture_signals_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        diagnostics = result['audit_diagnostics']
+        self.assertIsNone(result['audit_signal'])
+        self.assertEqual(diagnostics['member_count'], 4)
+        self.assertEqual(diagnostics['decoded_member_count'], 4)
+        self.assertEqual(len(diagnostics['members']), 2)
+        self.assertTrue(diagnostics['truncated'])
+        self.assertTrue(all(len(item['name']) <= 24 for item in diagnostics['members']))
+        self.assertTrue(all(item['name_truncated'] for item in diagnostics['members']))
+
+    async def test_successful_audit_capture_preserves_response_shape_without_diagnostics(self):
+        service = DartSignalsService(
+            client=FakeSignalsClient(
+                members=[('reports/audit.xml', _audit_document('적정의견'))]
+            ),
+            repository=MagicMock(),
+        )
+        event = {
+            'id': 99,
+            'rcept_no': '20260327000781',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2026, 3, 27),
+            'report_nm': '사업보고서 (2025.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            result = await service.capture_audit_signal_for_event(
+                rcept_no=event['rcept_no']
+            )
+
+        self.assertEqual(result['audit_signal']['opinion_code'], 'unqualified')
+        self.assertNotIn('audit_diagnostics', result)
+        store_signals.assert_called_once()
+
+    async def test_audit_capture_preserves_provider_error_semantics(self):
+        provider_error = RuntimeError('provider error envelope')
+        client = MagicMock()
+        client.download_document = AsyncMock(side_effect=provider_error)
+        service = DartSignalsService(client=client, repository=MagicMock())
+        event = {
+            'id': 99,
+            'rcept_no': '20250325000540',
+            'corp_code': '00960623',
+            'stock_code': '266690',
+            'corp_name': '덕산넥코어스',
+            'receipt_date': date(2025, 3, 25),
+            'report_nm': '사업보고서 (2024.12)',
+        }
+
+        with (
+            patch.object(service, '_load_event', return_value=event),
+            patch.object(service, '_store_signals') as store_signals,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                await service.capture_audit_signal_for_event(
+                    rcept_no=event['rcept_no']
+                )
+
+        self.assertIs(raised.exception, provider_error)
+        store_signals.assert_not_called()
+
     async def test_extract_audit_signal_rejects_oversized_compressed_input(self):
         service = DartSignalsService(client=FakeSignalsClient(members=[]))
         with patch(
@@ -652,6 +818,18 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.capture_audit_signal_for_event.await_count, 2)
 
     async def test_backfill_missing_audit_signals_reports_retryable_evidence_gap(self):
+        audit_diagnostics = {
+            'version': 'dart_audit_archive_diagnostics_v1',
+            'archive_sha256': 'b' * 64,
+            'archive_size_bytes': 456,
+            'member_count': 1,
+            'members': [],
+            'decoded_member_count': 0,
+            'aud_opn_table_count': 0,
+            'audit_report_label_row_count': 0,
+            'known_opinion_token_row_count': 0,
+            'truncated': True,
+        }
         repository = FakeSignalsRepository(
             [
                 {
@@ -671,6 +849,7 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             return_value={
                 'rcept_no': '20260422000018',
                 'audit_signal': None,
+                'audit_diagnostics': audit_diagnostics,
             }
         )
 
@@ -690,6 +869,10 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['next_after_event_id'], 17)
         self.assertEqual(result['next_forward_after_event_id'], 18)
         self.assertFalse(result['forward_scan_has_more'])
+        self.assertEqual(
+            result['results'][0]['audit_diagnostics'],
+            audit_diagnostics,
+        )
 
     async def test_backfill_gap_page_exposes_separate_forward_scan_cursor(self):
         repository = FakeSignalsRepository(
@@ -799,6 +982,63 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['failed_event_ids'], [31])
         self.assertEqual(result['results'][0]['status'], 'failed')
         self.assertIn('provider unavailable', result['results'][0]['error'])
+
+    async def test_backfill_event_deadline_is_retry_debt_and_preserves_forward_progress(self):
+        event_ids = list(range(31, 36))
+        repository = FakeSignalsRepository(
+            [
+                {
+                    'event_id': event_id,
+                    'rcept_no': f'202604220000{event_id}',
+                    'stock_code': f'{event_id:06d}',
+                    'receipt_date': '2026-04-22',
+                    'report_nm': '사업보고서',
+                }
+                for event_id in event_ids
+            ]
+        )
+        service = DartSignalsService(
+            client=FakeSignalsClient(members=[]),
+            repository=repository,
+            event_timeout_seconds=0.001,
+        )
+
+        async def capture(*, rcept_no):
+            event_id = int(rcept_no[-2:])
+            if event_id == 32:
+                await asyncio.Event().wait()
+            return {
+                'rcept_no': rcept_no,
+                'audit_signal': {'opinion_code': 'unqualified'},
+            }
+
+        service.capture_audit_signal_for_event = AsyncMock(side_effect=capture)
+
+        result = await service.backfill_missing_annual_audit_signals(
+            market_date=date(2026, 4, 30),
+            limit=5,
+            after_event_id=30,
+            dry_run=False,
+        )
+
+        self.assertEqual(result['status'], 'completed_with_gaps')
+        self.assertEqual(result['candidates_attempted'], 5)
+        self.assertEqual(result['audit_signals_captured'], 4)
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(result['retry_event_ids'], [32])
+        self.assertEqual(result['next_after_event_id'], 30)
+        self.assertEqual(result['next_forward_after_event_id'], 35)
+        self.assertFalse(result['circuit_breaker']['tripped'])
+        self.assertEqual(
+            result['circuit_breaker']['consecutive_systemic_failures'],
+            0,
+        )
+        failed = result['results'][1]
+        self.assertEqual(failed['status'], 'failed')
+        self.assertTrue(failed['event_timeout'])
+        self.assertFalse(failed['systemic_provider_failure'])
+        self.assertIn('audit event processing exceeded', failed['error'])
+        self.assertEqual(service.capture_audit_signal_for_event.await_count, 5)
 
     async def test_backfill_missing_audit_signals_trips_systemic_failure_circuit_breaker(self):
         repository = FakeSignalsRepository(

@@ -115,6 +115,7 @@ def _service(
         applied_scope_verifier=verify,
         stale_pruner=prune,
         completion_recorder=record_completion,
+        pending_batch_loader=lambda: [],
         lock_factory=_acquired_lock,
         stage_runners={
             stage_id: stage_runner(stage_id)
@@ -557,6 +558,41 @@ def test_apply_requires_reviewed_membership_count_and_hash() -> None:
     assert mismatched['status'] == 'blocked'
     assert mismatched['reason'] == 'expected_membership_evidence_mismatch'
     assert calls == []
+
+
+def test_apply_rejects_provider_membership_that_differs_from_pending_frozen_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_calls: list[tuple[str, dict]] = []
+    prune_calls: list[dict] = []
+    completion_calls: list[dict] = []
+    service, exact_symbols, _ = _service(
+        apply_results=stage_calls,
+        prune_calls=prune_calls,
+        completion_calls=completion_calls,
+    )
+    service.pending_batch_loader = lambda: [object()]
+    monkeypatch.setattr(
+        exact_factor_repair,
+        'resolve_pending_frozen_price_dependent_membership',
+        lambda **_kwargs: tuple(exact_symbols[:-1]),
+    )
+
+    result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=True,
+        **_pinned_membership(exact_symbols),
+    )
+
+    assert result['status'] == 'blocked'
+    assert result['reason'] == (
+        'provider_membership_mismatch_pending_frozen_scope'
+    )
+    assert result['provider_ranking_membership_count'] == len(exact_symbols)
+    assert result['frozen_membership_count'] == len(exact_symbols) - 1
+    assert stage_calls == []
+    assert prune_calls == []
+    assert completion_calls == []
 
 
 def test_apply_stops_partial_when_stage_does_not_persist_exact_membership() -> None:

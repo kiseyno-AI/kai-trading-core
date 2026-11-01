@@ -52,6 +52,7 @@ from app.eod.run_stage_support import (
 )
 from app.repositories.eod_run_repository import (
     daily_price_bar_has_current_eod_run_provenance,
+    eod_collection_admission_advisory_lock_keys,
     eod_collection_advisory_lock_keys,
 )
 
@@ -378,13 +379,23 @@ def _build_counts(
     failed: Any = None,
     remaining: Any = None,
 ) -> dict[str, int]:
-    total_value = _as_int(total)
-    succeeded_value = _as_int(succeeded)
-    failed_value = _as_int(failed)
-    processed_value = _as_int(processed, succeeded_value + failed_value)
-    if processed is None:
-        processed_value = succeeded_value + failed_value
-    remaining_value = _as_int(remaining, max(total_value - processed_value, 0) if total_value else 0)
+    total_value = max(_as_int(total), 0)
+    succeeded_value = max(_as_int(succeeded), 0)
+    failed_value = max(_as_int(failed), 0)
+    processed_value = max(
+        _as_int(processed, succeeded_value + failed_value),
+        succeeded_value + failed_value,
+        0,
+    )
+    total_value = max(total_value, processed_value)
+    maximum_remaining = max(total_value - processed_value, 0)
+    remaining_value = min(
+        max(
+            _as_int(remaining, maximum_remaining),
+            0,
+        ),
+        maximum_remaining,
+    )
     return {
         'processed': processed_value,
         'total': total_value,
@@ -558,6 +569,15 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
+        admission_keys = eod_collection_admission_advisory_lock_keys(
+            market='KRX',
+            source='daily_price_bars',
+        )
+        if admission_keys is None:
+            raise RuntimeError(
+                'daily price-bar admission lock is unavailable'
+            )
+        admission_source_key, admission_trade_key = admission_keys
         metadata = {
             'requested_stages': list(requested_stages),
             'resolved_stages': list(resolved_stages),
@@ -567,8 +587,17 @@ class DailyPipelineRunStateService:
             # Serialize admission for every entry point. HTTP clients can time
             # out while the worker thread continues, so limiting this guard to
             # monitor-triggered runs still permits duplicate manual/API runs.
+            # The global shared fence is acquired first so a broad missing-bar
+            # repair can exclude creation of a future/no-bar active run while
+            # it holds the exclusive form of the same fence.
             session.execute(
-                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                text(
+                    'WITH admission AS MATERIALIZED ('
+                    'SELECT pg_advisory_xact_lock_shared('
+                    f'{admission_source_key}, {admission_trade_key})'
+                    ') SELECT pg_advisory_xact_lock('
+                    ':source_key, :trade_key) FROM admission'
+                ),
                 {
                     'source_key': 20_001,
                     'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
@@ -892,6 +921,44 @@ class DailyPipelineRunStateService:
                 failed=row.failed if failed is None else failed,
                 remaining=resolved_remaining,
             )
+            if normalized_status == 'completed':
+                counts['processed'] = counts['total']
+                counts['remaining'] = 0
+
+            if (
+                terminal
+                and normalized_details.get('terminal_count_authority')
+                == 'result'
+            ):
+                previous_counts = {
+                    'processed': max(_as_int(row.processed), 0),
+                    'total': max(_as_int(row.total), 0),
+                    'succeeded': max(_as_int(row.succeeded), 0),
+                    'failed': max(_as_int(row.failed), 0),
+                    'remaining': max(_as_int(row.remaining), 0),
+                }
+                count_fields = (
+                    'processed',
+                    'total',
+                    'succeeded',
+                    'failed',
+                    'remaining',
+                )
+                mismatch_fields = [
+                    field
+                    for field in count_fields
+                    if previous_counts[field] != counts[field]
+                ]
+                if mismatch_fields:
+                    normalized_details['terminal_count_reconciliation'] = {
+                        'schema_version': (
+                            'daily_pipeline_terminal_count_reconciliation_v1'
+                        ),
+                        'authority': 'result',
+                        'mismatch_fields': mismatch_fields,
+                        'previous': previous_counts,
+                        'result': dict(counts),
+                    }
 
             row.status = normalized_status
             row.processed = counts['processed']
@@ -4557,6 +4624,19 @@ class DailyPipelineRunStateService:
                     is_auto_pykrx_parent or is_internal_pykrx_parent
                 )
                 if has_eod_reference or is_pykrx_parent:
+                    admission_keys = (
+                        eod_collection_admission_advisory_lock_keys(
+                            market='KRX',
+                            source='daily_price_bars',
+                        )
+                    )
+                    if admission_keys is None:
+                        raise RuntimeError(
+                            'daily price-bar admission lock is unavailable'
+                        )
+                    admission_source_key, admission_trade_key = (
+                        admission_keys
+                    )
                     source_key, trade_key = eod_collection_advisory_lock_keys(
                         market='KRX',
                         trade_date=expected_market_date,
@@ -4565,8 +4645,12 @@ class DailyPipelineRunStateService:
                     lock_acquired = bool(
                         session.execute(
                             text(
-                                'SELECT pg_try_advisory_xact_lock('
-                                ':source_key, :trade_key)'
+                                'SELECT CASE WHEN '
+                                'pg_try_advisory_xact_lock_shared('
+                                f'{admission_source_key}, '
+                                f'{admission_trade_key}) '
+                                'THEN pg_try_advisory_xact_lock('
+                                ':source_key, :trade_key) ELSE FALSE END'
                             ),
                             {
                                 'source_key': source_key,

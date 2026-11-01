@@ -12,6 +12,7 @@ from app.agent_context.read_service import (
     PERSISTED_FACTOR_FAMILIES,
     _build_compact_liquidity_context,
     _build_decider_data_quality_context,
+    _build_decider_flow_short_selling_quality_context,
     _build_decider_intraday_quality_context,
     _build_factor_summary_entry,
     _build_intraday_execution_context,
@@ -101,6 +102,47 @@ class ShortSellingContextQualityTests(unittest.TestCase):
 
         self.assertEqual(context['status'], 'partial')
         self.assertEqual(context['missing_fields'], ['short_value', 'short_balance'])
+
+    def test_all_none_short_balance_metrics_are_not_reported_as_available(
+        self,
+    ) -> None:
+        quality = _build_decider_flow_short_selling_quality_context(
+            investor_flow_context={
+                'status': 'available',
+                'symbol_flow': {'net_value': 10},
+                'market_flow': {'net_value': 20},
+            },
+            investor_flow_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'provider_sourced',
+            },
+            short_selling_context={
+                'status': 'partial',
+                'short_volume': {
+                    'short_volume': 100,
+                    'total_volume': 1000,
+                    'short_volume_ratio_pct': 10.0,
+                },
+                'short_balance': {
+                    'as_of_date': '2026-10-28',
+                    'availability_lag_trading_days': 2,
+                    'availability_contract': 'krx_t_plus_2',
+                    'short_balance_qty': None,
+                    'listed_shares': None,
+                    'short_balance_amount': None,
+                    'market_cap': None,
+                    'short_balance_ratio_pct': None,
+                },
+                'missing_fields': ['short_balance'],
+            },
+            short_selling_provenance={
+                'freshness_status': 'fresh',
+                'provenance_status': 'provider_sourced',
+            },
+        )
+
+        self.assertTrue(quality['short_selling']['has_short_volume'])
+        self.assertFalse(quality['short_selling']['has_short_balance'])
 
 
 def _fresh_provenance() -> dict[str, object]:

@@ -65,6 +65,49 @@ def _normalize_symbols(symbols: Sequence[str] | str | None) -> list[str]:
     return [str(item).strip() for item in values if str(item).strip()]
 
 
+def _news_freshness_cutoff(
+    market_date: date,
+    *,
+    lookback_days: int,
+) -> datetime:
+    return datetime.combine(
+        market_date - timedelta(days=max(int(lookback_days), 0)),
+        time.min,
+        tzinfo=SEOUL_TZ,
+    ).astimezone(timezone.utc)
+
+
+def _news_freshness_published_before(
+    market_date: date,
+    *,
+    captured_at: datetime | None = None,
+) -> datetime:
+    next_midnight = datetime.combine(
+        market_date + timedelta(days=1),
+        time.min,
+        tzinfo=SEOUL_TZ,
+    ).astimezone(timezone.utc)
+    captured = captured_at or _utcnow()
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=timezone.utc)
+    return min(next_midnight, captured.astimezone(timezone.utc))
+
+
+def _is_recent_news_item(
+    item: Any,
+    *,
+    cutoff: datetime,
+    published_before: datetime,
+) -> bool:
+    published_at = getattr(item, 'published_at', None)
+    if not isinstance(published_at, datetime):
+        return False
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    published_at = published_at.astimezone(timezone.utc)
+    return cutoff <= published_at < published_before
+
+
 class ExternalNewsService:
     def __init__(self, *, provider: ExternalNewsProvider | None = None) -> None:
         self.provider = provider or NaverNewsSearchProvider()
@@ -77,9 +120,42 @@ class ExternalNewsService:
         *,
         symbols: Sequence[str] | str,
         display: int | None = None,
+        freshness_cutoff: datetime | None = None,
+        freshness_published_before: datetime | None = None,
+        freshness_lookback_days: int | None = None,
     ) -> dict[str, Any]:
         requested_symbols = _normalize_symbols(symbols)
         provider_status = self.provider.status()
+        resolved_lookback_days = max(
+            int(
+                freshness_lookback_days
+                if freshness_lookback_days is not None
+                else settings.external_news_context_lookback_days
+            ),
+            0,
+        )
+        resolved_freshness_cutoff = freshness_cutoff or (
+            _utcnow() - timedelta(days=resolved_lookback_days)
+        )
+        if resolved_freshness_cutoff.tzinfo is None:
+            resolved_freshness_cutoff = resolved_freshness_cutoff.replace(
+                tzinfo=timezone.utc
+            )
+        resolved_freshness_cutoff = resolved_freshness_cutoff.astimezone(
+            timezone.utc
+        )
+        resolved_freshness_published_before = (
+            freshness_published_before or _utcnow()
+        )
+        if resolved_freshness_published_before.tzinfo is None:
+            resolved_freshness_published_before = (
+                resolved_freshness_published_before.replace(
+                    tzinfo=timezone.utc
+                )
+            )
+        resolved_freshness_published_before = (
+            resolved_freshness_published_before.astimezone(timezone.utc)
+        )
         summary = {
             'requested_symbol_count': len(requested_symbols),
             'matched_symbol_count': 0,
@@ -88,6 +164,15 @@ class ExternalNewsService:
             'skipped_symbol_count': 0,
             'provider_circuit_open': False,
             'symbols_with_news': 0,
+            'symbols_with_any_news': 0,
+            'recent_news_symbol_count': 0,
+            'stale_news_symbol_count': 0,
+            'no_result_symbol_count': 0,
+            'freshness_lookback_days': resolved_lookback_days,
+            'freshness_cutoff_at': resolved_freshness_cutoff.isoformat(),
+            'freshness_published_before': (
+                resolved_freshness_published_before.isoformat()
+            ),
             'items_fetched': 0,
             'items_inserted': 0,
             'items_updated': 0,
@@ -206,7 +291,21 @@ class ExternalNewsService:
             summary['items_updated'] += int(persist_result.get('updated', 0))
             summary['items_skipped'] += int(persist_result.get('skipped', 0))
             if fetched:
-                summary['symbols_with_news'] += 1
+                summary['symbols_with_any_news'] += 1
+                if any(
+                    _is_recent_news_item(
+                        item,
+                        cutoff=resolved_freshness_cutoff,
+                        published_before=resolved_freshness_published_before,
+                    )
+                    for item in fetched
+                ):
+                    summary['recent_news_symbol_count'] += 1
+                    summary['symbols_with_news'] += 1
+                else:
+                    summary['stale_news_symbol_count'] += 1
+            else:
+                summary['no_result_symbol_count'] += 1
             items_out.append(
                 {
                     'symbol': symbol,
@@ -244,6 +343,29 @@ class ExternalNewsService:
     ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(str(market_date)) if not isinstance(market_date, date) else market_date
         requested_symbols = _normalize_symbols(symbols)
+        freshness_lookback_days = max(
+            int(settings.external_news_context_lookback_days),
+            0,
+        )
+        freshness_cutoff = _news_freshness_cutoff(
+            normalized_market_date,
+            lookback_days=freshness_lookback_days,
+        )
+        freshness_published_before = _news_freshness_published_before(
+            normalized_market_date
+        )
+        empty_freshness_summary = {
+            'freshness_lookback_days': freshness_lookback_days,
+            'freshness_cutoff_at': freshness_cutoff.isoformat(),
+            'freshness_published_before': (
+                freshness_published_before.isoformat()
+            ),
+            'recent_news_symbol_count': 0,
+            'stale_news_symbol_count': 0,
+            'no_result_symbol_count': 0,
+            'symbols_with_news': 0,
+            'symbols_with_any_news': 0,
+        }
         provider_status = self.provider.status()
         if not provider_status.enabled:
             return {
@@ -257,6 +379,7 @@ class ExternalNewsService:
                     'requested_symbol_count': len(requested_symbols),
                     'eligible_symbol_count': 0,
                     'collected_symbol_count': 0,
+                    **empty_freshness_summary,
                 },
             }
         eligible_symbols = load_agent_feedback_eligible_symbols(
@@ -277,9 +400,16 @@ class ExternalNewsService:
                     'requested_symbol_count': len(requested_symbols),
                     'eligible_symbol_count': 0,
                     'collected_symbol_count': 0,
+                    **empty_freshness_summary,
                 },
             }
-        result = await self.collect_for_symbols(symbols=eligible_symbols, display=display)
+        result = await self.collect_for_symbols(
+            symbols=eligible_symbols,
+            display=display,
+            freshness_cutoff=freshness_cutoff,
+            freshness_published_before=freshness_published_before,
+            freshness_lookback_days=freshness_lookback_days,
+        )
         result.update(
             {
                 'trigger': 'agent_feedback_candidates',

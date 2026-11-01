@@ -34,6 +34,10 @@ from app.signals.advanced_value_factor import (
     compute_market_cap_proxy,
     derive_annual_financial_context,
 )
+from app.signals.factor_coverage import (
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+)
 
 UNIFIED_VALUE_FACTOR_VERSION = 'unified_value_v1'
 UNIFIED_VALUE_FACTOR_SOURCE = UNIFIED_VALUE_FACTOR_VERSION
@@ -170,20 +174,25 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
             return {
+                **factor_stage_result_contract(
+                    summary,
+                    explicit_empty_scope=True,
+                ),
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
@@ -194,20 +203,22 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         if normalized_symbols is not None:
             resolved_symbols = [item['symbol'] for item in load_symbols(symbols=normalized_symbols)]
             if not resolved_symbols:
+                summary = self._build_summary(
+                    [],
+                    requested_symbols=requested_symbols,
+                    matched_symbols=[],
+                    missing_symbols=requested_symbols,
+                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+                )
                 return {
+                    **factor_stage_result_contract(summary),
                     'market_date': normalized_market_date.isoformat(),
                     'source': source,
                     'feature_version': source,
                     'requested_symbols': requested_symbols,
                     'matched_symbols': [],
                     'missing_symbols': requested_symbols,
-                    'summary': self._build_summary(
-                        [],
-                        requested_symbols=requested_symbols,
-                        matched_symbols=[],
-                        missing_symbols=requested_symbols,
-                        universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                    ),
+                    'summary': summary,
                     'results_persisted': 0,
                     'results_failed': 0,
                     'failed_symbols': [],
@@ -305,8 +316,17 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+            )
+        )
 
         return {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -808,7 +828,7 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
         ready_count = sum(
             1 for item in items if item.get('unified_value_score') is not None
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -849,6 +869,49 @@ class DailyUnifiedValueFactorService(DailyAdvancedValueFactorService):
             ),
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+    ) -> dict[str, Any]:
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            is_ready=lambda item: item.get('unified_value_status')
+            == UNIFIED_VALUE_STATUS_SCORED,
+            is_complete=lambda item: item.get('components_used')
+            == len(UNIFIED_VALUE_COMPONENT_PERCENTILES),
+            unusable_reason=lambda item: item.get('unified_value_status'),
+            input_families={
+                family: (
+                    lambda item, status_key=f'{family}_status': item.get(status_key)
+                    == METRIC_STATUS_AVAILABLE,
+                    lambda item, status_key=f'{family}_status': item.get(status_key),
+                )
+                for family in (
+                    'per',
+                    'pbr',
+                    'dividend_yield',
+                    'fcf_yield',
+                    'ev_to_ebitda',
+                )
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

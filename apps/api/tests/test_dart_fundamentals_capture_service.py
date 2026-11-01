@@ -615,9 +615,30 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['results'][0]['audit_signal_status'], 'captured')
 
     async def test_capture_annual_fundamentals_keeps_event_retryable_when_audit_evidence_is_missing(self):
+        audit_diagnostics = {
+            'version': 'dart_audit_archive_diagnostics_v1',
+            'archive_sha256': 'a' * 64,
+            'archive_size_bytes': 321,
+            'member_count': 2,
+            'members': [
+                {
+                    'name': '20260407000003.xml',
+                    'name_truncated': False,
+                    'size_bytes': 123,
+                    'declared_encoding': 'utf-8',
+                    'decode_success': True,
+                }
+            ],
+            'decoded_member_count': 1,
+            'aud_opn_table_count': 0,
+            'audit_report_label_row_count': 0,
+            'known_opinion_token_row_count': 0,
+            'truncated': True,
+        }
         self.mock_capture_dart_signals.return_value = {
             'rcept_no': '20260407000003',
             'audit_signal': None,
+            'audit_diagnostics': audit_diagnostics,
             'dilution_signal': None,
         }
         repository = FakeCaptureRepository()
@@ -640,6 +661,18 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('audit evidence', repository.failures[0][1])
         self.assertEqual(repository.snapshots, [])
         self.assertEqual(result['results'][0]['status'], 'failed')
+        self.assertEqual(
+            result['results'][0]['audit_diagnostics'],
+            audit_diagnostics,
+        )
+        completed_run_metadata = repository.completed_runs[-1][1]['run_metadata']
+        persisted_failure = completed_run_metadata['operator_buckets'][
+            'retryable_capture_failures'
+        ]['items_sample'][0]
+        self.assertEqual(
+            persisted_failure['audit_diagnostics'],
+            audit_diagnostics,
+        )
 
     async def test_capture_recent_fundamentals_persists_snapshots_and_marks_event_status(self):
         client = FakeCaptureClient()

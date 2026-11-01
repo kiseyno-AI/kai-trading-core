@@ -46,6 +46,28 @@ _SENSITIVE_KEYS = {
 _SAFE_HEADERS = {'accept', 'content-length', 'content-type', 'host', 'user-agent', 'x-request-id'}
 _MAX_AUDIT_STRING_LENGTH = 300
 _MAX_AUDIT_COLLECTION_ITEMS = 25
+_MAX_AUDIT_MAPPING_ITEMS = 25
+_MAX_AUDIT_MAPPING_DEPTH = 6
+_AUDIT_DIAGNOSTIC_KEYS = frozenset(
+    {
+        'status',
+        'reason',
+        'error',
+        'error_message',
+        'id',
+        'run_id',
+        'eod_run_id',
+        'pipeline_run_id',
+        'market_date',
+        'trade_date',
+        'started_at',
+        'completed_at',
+        'updated_at',
+        'symbols_total',
+        'symbols_succeeded',
+        'symbols_failed',
+    }
+)
 _IDEMPOTENT_READ_METHODS = frozenset({'GET', 'HEAD'})
 _TRANSIENT_READ_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _MAX_READ_ATTEMPTS = 3
@@ -93,7 +115,12 @@ def _truncate_string(value: str, *, limit: int = _MAX_AUDIT_STRING_LENGTH) -> st
     return f'{value[: limit - 3]}...'
 
 
-def _sanitize_audit_value(value: Any, *, key: str | None = None) -> Any:
+def _sanitize_audit_value(
+    value: Any,
+    *,
+    key: str | None = None,
+    depth: int = 0,
+) -> Any:
     if key and _is_sensitive_key(key):
         return '[REDACTED]'
     if value is None or isinstance(value, (bool, int, float)):
@@ -101,13 +128,39 @@ def _sanitize_audit_value(value: Any, *, key: str | None = None) -> Any:
     if isinstance(value, str):
         return _truncate_string(value)
     if isinstance(value, Mapping):
-        return {
-            str(item_key): _sanitize_audit_value(item_value, key=str(item_key))
-            for item_key, item_value in value.items()
+        if depth >= _MAX_AUDIT_MAPPING_DEPTH:
+            return {
+                '_truncated': 'max_mapping_depth',
+                'field_count': len(value),
+            }
+        ordered_items = sorted(
+            enumerate(value.items()),
+            key=lambda indexed_item: (
+                0
+                if str(indexed_item[1][0]) in _AUDIT_DIAGNOSTIC_KEYS
+                else 1,
+                indexed_item[0],
+            ),
+        )
+        selected_items = ordered_items[:_MAX_AUDIT_MAPPING_ITEMS]
+        sanitized = {
+            str(item_key): _sanitize_audit_value(
+                item_value,
+                key=str(item_key),
+                depth=depth + 1,
+            )
+            for _, (item_key, item_value) in selected_items
         }
+        omitted = len(ordered_items) - len(selected_items)
+        if omitted:
+            sanitized['_omitted_field_count'] = omitted
+        return sanitized
     if isinstance(value, (list, tuple, set)):
         items = list(value)
-        sanitized = [_sanitize_audit_value(item) for item in items[:_MAX_AUDIT_COLLECTION_ITEMS]]
+        sanitized = [
+            _sanitize_audit_value(item, depth=depth + 1)
+            for item in items[:_MAX_AUDIT_COLLECTION_ITEMS]
+        ]
         if len(items) > _MAX_AUDIT_COLLECTION_ITEMS:
             sanitized.append(f'... ({len(items) - _MAX_AUDIT_COLLECTION_ITEMS} more)')
         return sanitized

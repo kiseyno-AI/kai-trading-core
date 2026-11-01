@@ -8,12 +8,14 @@ from app.db import engine, session_scope
 from app.db_models import (
     DailyMarketRiskFilterResult,
     DailyMarketRiskSnapshot,
+    DailyPriceBar,
     EODCollectionRun,
     Symbol,
 )
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
     load_daily_market_risk_snapshots,
+    persist_daily_price_bar,
 )
 from app.repositories.eod_run_repository import create_eod_collection_run
 from app.signals.market_risk_evaluators import (
@@ -219,7 +221,24 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['matched_symbol_count'], 3)
         self.assertEqual(result['summary']['evaluated_count'], 2)
         self.assertEqual(result['summary']['watchlist_count'], 1)
+        self.assertEqual(
+            result['summary']['screening_rejected_count'],
+            0,
+        )
+        self.assertNotIn('failed_count', result['summary'])
         self.assertEqual(result['failed_symbols'], ['051910', '000660'])
+        self.assertEqual(
+            result['scope_outcome_manifest_version'],
+            'market_risk_filter_scope_outcomes_v1',
+        )
+        self.assertEqual(
+            result['successful_stock_codes'],
+            ['005930'],
+        )
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['000660', '051910'],
+        )
         bulk_upsert.assert_called_once()
         self.assertEqual(upsert.call_count, 2)
         self.assertEqual([item['symbol'] for item in result['items']], ['005930'])
@@ -316,6 +335,22 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
             symbols_total=2,
             run_metadata={'mode': 'daily_auto'},
         )
+        for symbol in self.symbols:
+            persist_daily_price_bar(
+                {
+                    'symbol': symbol,
+                    'market': 'KRX',
+                    'business_date': self.market_date.isoformat(),
+                    'open_price': 100,
+                    'high_price': 110,
+                    'low_price': 90,
+                    'close_price': 105,
+                    'volume': 1_000,
+                    'turnover': 105_000,
+                    'source': 'test',
+                },
+                run_id=self.run_id,
+            )
 
     def tearDown(self) -> None:
         with session_scope() as session:
@@ -323,6 +358,7 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
             if symbol_ids:
                 session.execute(delete(DailyMarketRiskFilterResult).where(DailyMarketRiskFilterResult.symbol_id.in_(symbol_ids)))
                 session.execute(delete(DailyMarketRiskSnapshot).where(DailyMarketRiskSnapshot.symbol_id.in_(symbol_ids)))
+                session.execute(delete(DailyPriceBar).where(DailyPriceBar.symbol_id.in_(symbol_ids)))
             session.execute(delete(Symbol).where(Symbol.symbol.in_(self.symbols)))
             session.execute(delete(EODCollectionRun).where(EODCollectionRun.id == self.run_id))
 
@@ -352,10 +388,28 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result['snapshot_collection']['snapshots_persisted'], 2)
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['summary']['watchlist_count'], 1)
-        self.assertEqual(result['summary']['failed_count'], 1)
+        self.assertEqual(
+            result['summary']['screening_rejected_count'],
+            1,
+        )
+        self.assertNotIn('failed_count', result['summary'])
+        self.assertEqual(
+            result['selected_stock_codes'],
+            self.symbols,
+        )
+        self.assertEqual(
+            result['successful_stock_codes'],
+            self.symbols,
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], [])
         self.assertEqual(snapshot_inspection['item']['market_warning_code'], '01')
         self.assertEqual(filter_inspection['item']['risk_state'], 'watchlist')
         self.assertTrue(filter_inspection['item']['watchlist_flagged'])
+        self.assertEqual(
+            filter_inspection['summary']['screening_rejected_count'],
+            0,
+        )
+        self.assertNotIn('failed_count', filter_inspection['summary'])
         self.assertTrue(stored_snapshots)
         self.assertTrue(stored_filters)
         self.assertEqual(stored_snapshots[0]['eod_run_id'], self.run_id)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 import logging
 import re
@@ -25,6 +25,13 @@ from app.market_data_store import (
     load_symbols,
     upsert_daily_advanced_value_factor_result,
     upsert_daily_advanced_value_factor_results,
+)
+from app.signals.factor_coverage import (
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+)
+from app.signals.preferred_share_fundamentals import (
+    resolve_preferred_fundamentals_issuer_symbols,
 )
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
@@ -550,6 +557,8 @@ class AnnualFundamentalsSnapshot:
     currency: str | None
     highlights_by_key: dict[str, dict[str, Any]]
     statement_rows: list[dict[str, Any]]
+    requested_symbol: str | None = None
+    fundamentals_issuer_symbol: str | None = None
 
 
 @dataclass(slots=True)
@@ -683,6 +692,10 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         'depreciation_and_amortization': depreciation_and_amortization,
         'audit': {
             'annual_snapshot': {
+                'requested_symbol': snapshot.requested_symbol or snapshot.symbol,
+                'fundamentals_issuer_symbol': (
+                    snapshot.fundamentals_issuer_symbol or snapshot.symbol
+                ),
                 'snapshot_id': snapshot.snapshot_id,
                 'corp_name': snapshot.corp_name,
                 'business_year': snapshot.business_year,
@@ -799,20 +812,25 @@ class DailyAdvancedValueFactorService:
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
             return {
+                **factor_stage_result_contract(
+                    summary,
+                    explicit_empty_scope=True,
+                ),
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
@@ -825,20 +843,22 @@ class DailyAdvancedValueFactorService:
             symbols=normalized_symbols,
         )
         if normalized_symbols is not None and not matched_symbols:
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=missing_symbols,
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
             return {
+                **factor_stage_result_contract(summary),
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': missing_symbols,
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=missing_symbols,
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
@@ -931,8 +951,17 @@ class DailyAdvancedValueFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+            )
+        )
 
         return {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -1085,9 +1114,24 @@ class DailyAdvancedValueFactorService:
             return {}
 
         normalized_symbols = list(dict.fromkeys(symbols))
+        with session_scope() as session:
+            fundamentals_issuer_by_symbol = (
+                resolve_preferred_fundamentals_issuer_symbols(
+                    session,
+                    normalized_symbols,
+                )
+            )
+        query_symbols = list(
+            dict.fromkeys(
+                [
+                    *normalized_symbols,
+                    *fundamentals_issuer_by_symbol.values(),
+                ]
+            )
+        )
         snapshot_rows = []
-        for start in range(0, len(normalized_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
-            symbol_chunk = normalized_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
+        for start in range(0, len(query_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
+            symbol_chunk = query_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
             snapshot_rows.extend(
                 self._load_latest_annual_snapshot_chunk_with_retry(
                     market_date=market_date,
@@ -1153,10 +1197,10 @@ class DailyAdvancedValueFactorService:
                 for row in statement_rows:
                     rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
 
-            result: dict[str, AnnualFundamentalsSnapshot] = {}
+            snapshot_by_stock_code: dict[str, AnnualFundamentalsSnapshot] = {}
             for symbol, snapshot_id in snapshot_id_by_symbol.items():
                 metadata = snapshot_metadata_by_id[snapshot_id]
-                result[symbol] = AnnualFundamentalsSnapshot(
+                snapshot_by_stock_code[symbol] = AnnualFundamentalsSnapshot(
                     symbol=symbol,
                     snapshot_id=snapshot_id,
                     corp_name=str(metadata['corp_name']),
@@ -1170,6 +1214,24 @@ class DailyAdvancedValueFactorService:
                     currency=metadata['currency'],
                     highlights_by_key=highlights_by_snapshot.get(snapshot_id, {}),
                     statement_rows=rows_by_snapshot.get(snapshot_id, []),
+                    requested_symbol=symbol,
+                    fundamentals_issuer_symbol=symbol,
+                )
+
+            result: dict[str, AnnualFundamentalsSnapshot] = {}
+            for requested_symbol in normalized_symbols:
+                direct_snapshot = snapshot_by_stock_code.get(requested_symbol)
+                if direct_snapshot is not None:
+                    result[requested_symbol] = direct_snapshot
+                    continue
+                issuer_symbol = fundamentals_issuer_by_symbol.get(requested_symbol)
+                issuer_snapshot = snapshot_by_stock_code.get(issuer_symbol or '')
+                if issuer_snapshot is None or issuer_symbol is None:
+                    continue
+                result[requested_symbol] = replace(
+                    issuer_snapshot,
+                    requested_symbol=requested_symbol,
+                    fundamentals_issuer_symbol=issuer_symbol,
                 )
             return result
 
@@ -1620,7 +1682,7 @@ class DailyAdvancedValueFactorService:
         ready_count = sum(
             1 for item in items if item.get('advanced_value_score') is not None
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -1657,6 +1719,44 @@ class DailyAdvancedValueFactorService:
             ),
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+    ) -> dict[str, Any]:
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            is_ready=lambda item: item.get('advanced_value_score') is not None,
+            is_complete=lambda item: item.get('advanced_value_components_used')
+            == len(ADVANCED_VALUE_SCORE_WEIGHTS),
+            unusable_reason=lambda item: item.get('advanced_value_classification'),
+            input_families={
+                'fcf_yield': (
+                    lambda item: item.get('fcf_yield_valid_for_scoring') is True,
+                    lambda item: item.get('fcf_yield_status'),
+                ),
+                'ev_to_ebitda': (
+                    lambda item: item.get('ev_to_ebitda_valid_for_scoring') is True,
+                    lambda item: item.get('ev_to_ebitda_status'),
+                ),
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

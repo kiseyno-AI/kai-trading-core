@@ -9,9 +9,14 @@ from enum import StrEnum
 
 from app.core.settings import settings
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_pipeline_support import (
+    build_daily_skip_result,
+    compact_daily_pipeline_result,
+)
 from app.market.clock import KST, async_get_market_state
 from app.market.session import async_previous_krx_trading_date
 from app.repositories.eod_run_repository import (
+    load_latest_eod_collection_run,
     load_oldest_outstanding_auto_eod_recovery_target,
 )
 
@@ -74,6 +79,34 @@ def _parse_markets(raw: str | None) -> tuple[str, ...]:
     return markets or DEFAULT_MARKETS
 
 
+def _terminal_run_skip_reason(run: dict | None) -> str | None:
+    if not isinstance(run, dict) or int(run.get('symbols_failed') or 0) != 0:
+        return None
+    status = str(run.get('status') or '').strip().lower()
+    if status == 'completed':
+        return 'already_completed'
+    if status != 'completed_with_errors':
+        return None
+    metadata = (
+        run.get('run_metadata')
+        if isinstance(run.get('run_metadata'), dict)
+        else {}
+    )
+    retry_symbols = {
+        str(symbol).strip()
+        for key in (
+            'failed_symbols',
+            'unattempted_symbols',
+            'price_retry_symbols',
+            'downstream_retry_symbols',
+            'inherited_downstream_retry_symbols',
+        )
+        for symbol in (metadata.get(key) or [])
+        if str(symbol).strip()
+    }
+    return 'already_completed_with_errors' if not retry_symbols else None
+
+
 async def _oldest_recovery_window_date(latest_session_date: str) -> str:
     oldest_session_date = date.fromisoformat(latest_session_date)
     for _ in range(_RECOVERY_WINDOW_SESSION_COUNT - 1):
@@ -115,7 +148,7 @@ class AutoPykrxEODState:
             'last_completed_at': self.last_completed_at,
             'last_status': self.last_status,
             'last_reason': self.last_reason,
-            'last_result': self.last_result,
+            'last_result': compact_daily_pipeline_result(self.last_result),
             'preflight_failure_market_date': self.preflight_failure_market_date,
             'preflight_failure_markets': list(self.preflight_failure_markets),
             'preflight_failure_count': self.preflight_failure_count,
@@ -299,6 +332,47 @@ class AutoPykrxEODScheduler:
             target_market_date = None
         self._state.last_market_date = target_market_date or current_market_date
 
+        if (
+            recovery_target is None
+            and target_market_date is not None
+            and market.state in {'WEEKEND', 'HOLIDAY'}
+        ):
+            try:
+                latest_terminal_run = await asyncio.to_thread(
+                    load_latest_eod_collection_run,
+                    market='KRX',
+                    trade_date=target_market_date,
+                    source='pykrx',
+                )
+            except Exception as exc:
+                logger.exception(
+                    'Could not inspect terminal EOD proof for %s: %s',
+                    target_market_date,
+                    exc,
+                )
+                self._state.last_status = 'blocked'
+                self._state.last_reason = 'terminal_state_unavailable'
+                return None
+            terminal_skip_reason = _terminal_run_skip_reason(
+                latest_terminal_run
+            )
+            if terminal_skip_reason is not None:
+                result = build_daily_skip_result(
+                    reason=terminal_skip_reason,
+                    market_date=target_market_date,
+                    latest_available_trade_date=target_market_date,
+                    existing_run=latest_terminal_run,
+                )
+                self._clear_preflight_backoff()
+                self._state.last_result = compact_daily_pipeline_result(result)
+                self._state.last_status = (
+                    'completed'
+                    if terminal_skip_reason == 'already_completed'
+                    else 'partial'
+                )
+                self._state.last_reason = terminal_skip_reason
+                return None
+
         configured_markets = _parse_markets(settings.eod_auto_pykrx_markets)
         same_preflight_failure = (
             self._state.preflight_failure_market_date == target_market_date
@@ -420,7 +494,7 @@ class AutoPykrxEODScheduler:
                 **run_kwargs,
             )
             self._clear_preflight_backoff()
-            self._state.last_result = result
+            self._state.last_result = compact_daily_pipeline_result(result)
             self._state.last_status = _scheduled_pipeline_result_status(result)
             self._state.last_reason = result.get('reason') or result.get('status')
         except Exception as exc:

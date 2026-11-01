@@ -21,6 +21,8 @@ DEFAULT_MARKET_CODE = 'J'
 DEFAULT_MAX_RANKING_PAGES = 2
 DEFAULT_MAX_NEWS_ITEMS = 5
 DEFAULT_FETCH_CONCURRENCY = 5
+RESULT_SYMBOL_PREVIEW_LIMIT = 50
+RESULT_ERROR_MESSAGE_LIMIT = 1000
 KST = timezone(timedelta(hours=9))
 SURFACE_NAMES: tuple[str, ...] = (
     'quote',
@@ -234,6 +236,11 @@ def _has_any_content(value: Any) -> bool:
     return True
 
 
+def _bounded_exception_message(exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    return message[:RESULT_ERROR_MESSAGE_LIMIT]
+
+
 class KISIntradaySnapshotService:
     def __init__(self, *, client=None, fetch_concurrency: int = DEFAULT_FETCH_CONCURRENCY) -> None:
         self.client = client or kis_client
@@ -303,7 +310,7 @@ class KISIntradaySnapshotService:
 
         for name, response in zip(requests.keys(), responses, strict=True):
             if isinstance(response, Exception):
-                errors[name] = str(response)
+                errors[name] = _bounded_exception_message(response)
                 continue
             rows = _extract_list(response, 'output', 'output1', 'output2')
             symbol_key = 'stck_shrn_iscd' if name == 'volume_power' else 'mksc_shrn_iscd'
@@ -448,6 +455,7 @@ class KISIntradaySnapshotService:
         symbol: str,
         shared_maps: dict[str, dict[str, dict[str, Any]]],
         shared_errors: dict[str, str],
+        shared_metadata: dict[str, Any],
     ) -> dict[str, Any] | None:
         volume_power_row = (shared_maps.get('volume_power') or {}).get(symbol)
         volume_rank_row = (shared_maps.get('volume_rank') or {}).get(symbol)
@@ -462,6 +470,34 @@ class KISIntradaySnapshotService:
             )
             if row is not None
         ]
+        source_rows = {
+            'volume_power': volume_power_row,
+            'volume_rank': volume_rank_row,
+            'quote_balance': quote_balance_row,
+        }
+        source_statuses: dict[str, str] = {}
+        for name, row in source_rows.items():
+            if row is not None:
+                source_statuses[name] = 'ranked'
+                continue
+            if name in shared_errors:
+                source_statuses[name] = 'unavailable'
+                continue
+            metadata = shared_metadata.get(name)
+            if not isinstance(metadata, dict):
+                source_statuses[name] = 'unavailable'
+                continue
+            source_statuses[name] = (
+                'unknown_due_to_truncation'
+                if metadata.get('max_pages_reached') is True
+                else 'not_ranked'
+            )
+        incomplete_source_count = sum(
+            1
+            for status in source_statuses.values()
+            if status in {'unavailable', 'unknown_due_to_truncation'}
+        )
+        successful_source_count = len(source_statuses) - incomplete_source_count
         total_bid_depth = _to_int((quote_balance_row or {}).get('total_bidp_rsqn'))
         total_ask_depth = _to_int((quote_balance_row or {}).get('total_askp_rsqn'))
         net_bid_depth = _to_int((quote_balance_row or {}).get('total_ntsl_bidp_rsqn'))
@@ -472,12 +508,13 @@ class KISIntradaySnapshotService:
             {
                 'status': (
                     'available'
-                    if len(available_sources) == 3
+                    if successful_source_count == len(source_statuses)
                     else 'partial'
-                    if available_sources
+                    if successful_source_count > 0 or available_sources
                     else 'unavailable'
                 ),
                 'available_sources': available_sources,
+                'source_statuses': source_statuses,
                 'volume_power_rank': _to_int((volume_power_row or {}).get('data_rank')),
                 'volume_power': _round_float((volume_power_row or {}).get('tday_rltv')),
                 'volume_power_buy_execution': _to_int((volume_power_row or {}).get('shnu_cnqn_smtn')),
@@ -613,6 +650,7 @@ class KISIntradaySnapshotService:
         market_date: str,
         shared_maps: dict[str, dict[str, dict[str, Any]]],
         shared_errors: dict[str, str],
+        shared_metadata: dict[str, Any],
         max_news_items: int,
         include_news: bool,
         source: str,
@@ -657,6 +695,7 @@ class KISIntradaySnapshotService:
             symbol=symbol_input.symbol,
             shared_maps=shared_maps,
             shared_errors=shared_errors,
+            shared_metadata=shared_metadata,
         )
         investor_program_activity = self._normalize_investor_program_activity_block(
             investor_response=surface_responses.get('investor_trend_estimate'),
@@ -681,15 +720,27 @@ class KISIntradaySnapshotService:
             'investor_program_activity': (investor_program_activity or {}).get('status') or 'unavailable',
             'news_hints': (news_hints or {}).get('status') or 'unavailable',
         }
-        available_block_count = sum(1 for status in block_statuses.values() if status in {'available', 'empty'})
-        partial_block_count = sum(1 for status in block_statuses.values() if status == 'partial')
+        enabled_surface_names = [
+            name for name in SURFACE_NAMES if name != 'news_hints' or include_news
+        ]
+        enabled_block_statuses = {
+            name: block_statuses[name] for name in enabled_surface_names
+        }
+        available_block_count = sum(
+            1
+            for status in enabled_block_statuses.values()
+            if status in {'available', 'empty'}
+        )
+        partial_block_count = sum(
+            1 for status in enabled_block_statuses.values() if status == 'partial'
+        )
         coverage_status = _status_from_counts(
             available_count=available_block_count + partial_block_count,
-            total_count=len(SURFACE_NAMES),
+            total_count=len(enabled_surface_names),
         )
         availability_status = (
             'available'
-            if available_block_count == len(SURFACE_NAMES)
+            if available_block_count == len(enabled_surface_names)
             else 'partial'
             if (available_block_count + partial_block_count) > 0
             else 'unavailable'
@@ -715,11 +766,15 @@ class KISIntradaySnapshotService:
                     'status': coverage_status,
                     'available_blocks': available_block_count,
                     'partial_blocks': partial_block_count,
-                    'total_blocks': len(SURFACE_NAMES),
+                    'total_blocks': len(enabled_surface_names),
                     'coverage_ratio': _round_float(
-                        (available_block_count + partial_block_count) / float(len(SURFACE_NAMES))
+                        (available_block_count + partial_block_count)
+                        / float(len(enabled_surface_names))
                     ),
                     'block_statuses': block_statuses,
+                    'excluded_blocks': (
+                        ['news_hints'] if not include_news else []
+                    ),
                 },
                 'availability': {
                     'quote': {'status': block_statuses['quote'], 'error': surface_errors.get('quote')},
@@ -858,6 +913,7 @@ class KISIntradaySnapshotService:
                             market_date=market_date,
                             shared_maps=shared_maps,
                             shared_errors=shared_errors,
+                            shared_metadata=shared_metadata,
                             max_news_items=news_limit,
                             include_news=include_news,
                             source=source,
@@ -866,7 +922,7 @@ class KISIntradaySnapshotService:
                 except Exception as exc:
                     return {
                         'symbol': item.symbol,
-                        'error': str(exc),
+                        'error': _bounded_exception_message(exc),
                     }
 
         collected = await asyncio.gather(*[_collect(item) for item in symbol_inputs])
@@ -887,14 +943,101 @@ class KISIntradaySnapshotService:
                 persisted_items.append(item['snapshot_payload'])
             except Exception as exc:
                 failed_symbols.append(item['symbol'])
-                failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+                failed_symbol_errors.append(
+                    {
+                        'symbol': item['symbol'],
+                        'error': _bounded_exception_message(exc),
+                    }
+                )
 
         available_count = sum(1 for item in items if item.get('availability_status') == 'available')
         partial_count = sum(1 for item in items if item.get('availability_status') == 'partial')
         unavailable_count = sum(1 for item in items if item.get('availability_status') == 'unavailable')
 
+        failed_symbols = list(dict.fromkeys(failed_symbols))
+        partial_symbols = list(
+            dict.fromkeys(
+                item['symbol']
+                for item in items
+                if item.get('availability_status') == 'partial'
+            )
+        )
+        unavailable_symbols = list(
+            dict.fromkeys(
+                item['symbol']
+                for item in items
+                if item.get('availability_status') == 'unavailable'
+            )
+        )
+        pagination_truncated_sources = sorted(
+            name
+            for name, metadata in shared_metadata.items()
+            if isinstance(metadata, dict)
+            and metadata.get('max_pages_reached') is True
+        )
+        shared_source_incomplete = bool(
+            shared_errors or pagination_truncated_sources
+        )
+
+        partial_reasons: list[str] = []
+        if shared_errors:
+            partial_reasons.append('shared_source_errors')
+        if pagination_truncated_sources:
+            partial_reasons.append('shared_source_pagination_truncated')
+        if partial_symbols:
+            partial_reasons.append('partial_items')
+        if unavailable_symbols:
+            partial_reasons.append('unavailable_items')
+        if failed_symbols:
+            partial_reasons.append('snapshot_failures')
+
+        affected_symbols = list(
+            dict.fromkeys(
+                [*partial_symbols, *unavailable_symbols, *failed_symbols]
+            )
+        )
+        affected_symbol_set = set(affected_symbols)
+        if shared_source_incomplete:
+            retry_symbols = list(requested_symbols)
+            retry_scope_mode = 'all_requested_symbols'
+        else:
+            retry_symbols = [
+                symbol
+                for symbol in requested_symbols
+                if symbol in affected_symbol_set
+            ]
+            retry_symbols.extend(
+                symbol
+                for symbol in affected_symbols
+                if symbol not in set(requested_symbols)
+            )
+            retry_scope_mode = 'affected_symbols' if retry_symbols else 'none'
+
+        status = 'partial' if partial_reasons else 'ok'
+        reason = None
+        if shared_source_incomplete:
+            reason = 'shared_source_incomplete'
+        elif partial_symbols or unavailable_symbols:
+            reason = 'snapshot_items_incomplete'
+        elif failed_symbols:
+            reason = 'snapshot_failures'
+
         return {
-            'status': 'ok',
+            'status': status,
+            'reason': reason,
+            'partial_reasons': partial_reasons,
+            'partial_details': {
+                'shared_error_sources': sorted(shared_errors),
+                'pagination_truncated_sources': pagination_truncated_sources,
+                'partial_symbol_count': len(partial_symbols),
+                'partial_symbols': partial_symbols[:RESULT_SYMBOL_PREVIEW_LIMIT],
+                'unavailable_symbol_count': len(unavailable_symbols),
+                'unavailable_symbols': unavailable_symbols[
+                    :RESULT_SYMBOL_PREVIEW_LIMIT
+                ],
+                'failed_symbol_count': len(failed_symbols),
+                'failed_symbols': failed_symbols[:RESULT_SYMBOL_PREVIEW_LIMIT],
+            },
             'runtime': runtime,
             'market_state': market_state.state,
             'market_date': market_date,
@@ -913,8 +1056,22 @@ class KISIntradaySnapshotService:
             },
             'snapshots_persisted': len(persisted_items),
             'snapshots_failed': len(failed_symbols),
-            'failed_symbols': failed_symbols,
-            'failed_symbol_errors': failed_symbol_errors,
+            'failed_symbols': failed_symbols[:RESULT_SYMBOL_PREVIEW_LIMIT],
+            'failed_symbol_errors': failed_symbol_errors[
+                :RESULT_SYMBOL_PREVIEW_LIMIT
+            ],
+            'retry_required': bool(retry_symbols),
+            'retry_symbols': retry_symbols[:RESULT_SYMBOL_PREVIEW_LIMIT],
+            'retry_symbols_count': len(retry_symbols),
+            'retry_scope': {
+                'mode': retry_scope_mode,
+                'symbol_count': len(retry_symbols),
+                'symbols': retry_symbols[:RESULT_SYMBOL_PREVIEW_LIMIT],
+                'symbols_truncated': (
+                    len(retry_symbols) > RESULT_SYMBOL_PREVIEW_LIMIT
+                ),
+            },
+            '_retry_metadata': {'failed_symbols': retry_symbols},
             'items': persisted_items,
         }
 

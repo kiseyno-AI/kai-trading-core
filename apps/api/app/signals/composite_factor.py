@@ -5,6 +5,7 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.market_data_store import (
+    list_symbols_with_daily_bar_on_date,
     load_daily_advanced_value_factor_results,
     load_daily_beta_factor_results,
     load_daily_composite_factor_results,
@@ -16,6 +17,10 @@ from app.market_data_store import (
     upsert_daily_composite_factor_results,
 )
 from app.signals.momentum_factor import enrich_momentum_audit_fields
+from app.signals.factor_coverage import (
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+)
 
 COMPOSITE_FACTOR_VERSION = 'composite_v1'
 COMPOSITE_FACTOR_SOURCE = COMPOSITE_FACTOR_VERSION
@@ -174,6 +179,7 @@ class DailyCompositeFactorService:
                     + ','.join(outside_ranking_scope[:20])
                 )
         requested_symbols = list(normalized_symbols or [])
+        full_scope_replacement = symbols is None and ranking_symbols is None
         if normalized_symbols == []:
             return self._empty_rebuild_result(
                 market_date=normalized_market_date,
@@ -181,25 +187,38 @@ class DailyCompositeFactorService:
                 requested_symbols=requested_symbols,
                 matched_symbols=[],
                 missing_symbols=[],
+                explicit_empty_scope=True,
             )
 
+        authoritative_universe = list_symbols_with_daily_bar_on_date(
+            normalized_market_date.isoformat()
+        )
+        authoritative_symbol_set = set(authoritative_universe)
+        authoritative_ranking_symbols = (
+            [
+                symbol
+                for symbol in (normalized_ranking_symbols or [])
+                if symbol in authoritative_symbol_set
+            ]
+            if ranking_symbols is not None
+            else list(authoritative_universe)
+        )
         ranking_rows_by_family = self._load_factor_rows(
             market_date=normalized_market_date,
-            symbols=(
-                normalized_ranking_symbols
-                if ranking_symbols is not None
-                else None
-            ),
+            symbols=authoritative_ranking_symbols,
         )
-        ranking_symbols = self._collect_symbol_universe(ranking_rows_by_family)
+        ranking_symbols = authoritative_ranking_symbols
 
         if normalized_symbols is None:
             matched_symbols = ranking_symbols
             missing_symbols: list[str] = []
             target_symbols = ranking_symbols
         else:
-            symbol_rows = load_symbols(symbols=normalized_symbols)
-            matched_symbols = [item['symbol'] for item in symbol_rows]
+            matched_symbols = [
+                symbol
+                for symbol in normalized_symbols
+                if symbol in authoritative_symbol_set
+            ]
             matched_symbol_set = set(matched_symbols)
             missing_symbols = [symbol for symbol in normalized_symbols if symbol not in matched_symbol_set]
             target_symbols = matched_symbols
@@ -269,20 +288,37 @@ class DailyCompositeFactorService:
         failed_symbols: list[str] = []
         failed_symbol_errors: list[dict[str, str]] = []
         try:
-            persisted_count = upsert_daily_composite_factor_results(items)
+            persisted_count = (
+                upsert_daily_composite_factor_results(
+                    items,
+                    replace_market_date=normalized_market_date,
+                )
+                if full_scope_replacement
+                else upsert_daily_composite_factor_results(items)
+            )
             if persisted_count != len(items):
                 raise RuntimeError(
                     f'composite batch upsert persisted {persisted_count} of {len(items)} results'
                 )
-        except Exception:
+        except Exception as batch_exc:
             persisted_count = 0
-            for item in items:
-                try:
-                    upsert_daily_composite_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+            if full_scope_replacement:
+                failed_symbols = [item['symbol'] for item in items]
+                failed_symbol_errors = [
+                    {
+                        'symbol': item['symbol'],
+                        'error': f'atomic_full_scope_replace_failed: {batch_exc}',
+                    }
+                    for item in items
+                ]
+            else:
+                for item in items:
+                    try:
+                        upsert_daily_composite_factor_result(item)
+                        persisted_count += 1
+                    except Exception as exc:
+                        failed_symbols.append(item['symbol'])
+                        failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -295,8 +331,19 @@ class DailyCompositeFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+            )
+        )
+        summary['common_complete_cohort_count'] = summary['complete_count']
+        summary['renormalized_partial_cohort_count'] = summary['partial_count']
 
         return {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -380,6 +427,8 @@ class DailyCompositeFactorService:
         market_date: date,
         symbols: list[str] | None,
     ) -> dict[str, dict[str, dict[str, Any]]]:
+        if symbols == []:
+            return {family: {} for family in FACTOR_DEFINITION_BY_FAMILY}
         return {
             'momentum': {
                 item['symbol']: item
@@ -886,7 +935,7 @@ class DailyCompositeFactorService:
         input_universe_counts: dict[str, int],
     ) -> dict[str, Any]:
         ready_count = sum(1 for item in items if item.get('composite_score') is not None)
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -927,6 +976,50 @@ class DailyCompositeFactorService:
             },
             'input_universe_counts': input_universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+            )
+        )
+        summary['common_complete_cohort_count'] = summary['complete_count']
+        summary['renormalized_partial_cohort_count'] = summary['partial_count']
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+    ) -> dict[str, Any]:
+        def snapshot(item: dict[str, Any], family: str) -> dict[str, Any]:
+            payload = item.get('factor_payload')
+            inputs = payload.get('inputs') if isinstance(payload, dict) else None
+            family_payload = inputs.get(family) if isinstance(inputs, dict) else None
+            return family_payload if isinstance(family_payload, dict) else {}
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            is_ready=lambda item: item.get('composite_score') is not None,
+            is_complete=lambda item: int(item.get('valid_factor_count') or 0)
+            == len(FACTOR_DEFINITIONS),
+            unusable_reason=lambda item: item.get('composite_classification'),
+            input_families={
+                family: (
+                    lambda item, family=family: snapshot(item, family).get('available')
+                    is True,
+                    lambda item, family=family: snapshot(item, family).get('status'),
+                )
+                for family in FACTOR_DEFINITION_BY_FAMILY
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:
@@ -943,21 +1036,37 @@ class DailyCompositeFactorService:
         requested_symbols: list[str],
         matched_symbols: list[str],
         missing_symbols: list[str],
+        explicit_empty_scope: bool = False,
     ) -> dict[str, Any]:
+        summary = self._build_summary(
+            [],
+            requested_symbols=requested_symbols,
+            matched_symbols=matched_symbols,
+            missing_symbols=missing_symbols,
+            input_universe_counts=dict(EMPTY_INPUT_UNIVERSE_COUNTS),
+        )
+        stage_contract = (
+            {
+                'status': 'completed',
+                'reason': 'explicit_empty_scope_noop',
+                'quality_status': summary['quality_status'],
+                'quality_warning': summary['quality_warning'],
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'remaining_retryable_events': 0,
+            }
+            if explicit_empty_scope
+            else factor_stage_result_contract(summary)
+        )
         return {
+            **stage_contract,
             'market_date': market_date.isoformat(),
             'source': source,
             'feature_version': source,
             'requested_symbols': requested_symbols,
             'matched_symbols': matched_symbols,
             'missing_symbols': missing_symbols,
-            'summary': self._build_summary(
-                [],
-                requested_symbols=requested_symbols,
-                matched_symbols=matched_symbols,
-                missing_symbols=missing_symbols,
-                input_universe_counts=dict(EMPTY_INPUT_UNIVERSE_COUNTS),
-            ),
+            'summary': summary,
             'results_persisted': 0,
             'results_failed': 0,
             'failed_symbols': [],

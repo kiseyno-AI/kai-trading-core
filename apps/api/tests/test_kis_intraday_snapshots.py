@@ -3,7 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.core.settings import settings
-from app.market.kis_intraday_snapshots import KISIntradaySnapshotService
+from app.market.kis_intraday_snapshots import (
+    KIS_INTRADAY_SNAPSHOT_SOURCE,
+    IntradaySymbolInput,
+    KISIntradaySnapshotService,
+)
 
 
 class FakeKISIntradayClient:
@@ -142,6 +146,29 @@ class FakeKISIntradayClient:
         }
 
 
+def _collected_item(
+    symbol: str,
+    *,
+    availability_status: str = 'available',
+) -> dict:
+    return {
+        'symbol': symbol,
+        'name_ko': None,
+        'market': 'KRX',
+        'market_code': 'J',
+        'source': KIS_INTRADAY_SNAPSHOT_SOURCE,
+        'feature_version': KIS_INTRADAY_SNAPSHOT_SOURCE,
+        'availability_status': availability_status,
+        'freshness_status': 'fresh',
+        'as_of_market_date': '2026-05-07',
+        'as_of_timestamp': '2026-05-07T10:15:30+09:00',
+        'snapshot_payload': {
+            'symbol': symbol,
+            'availability_status': availability_status,
+        },
+    }
+
+
 class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.original_app_key = settings.kis_app_key
@@ -192,6 +219,70 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['coverage']['status'], 'available')
         self.assertEqual(payload['freshness_status'], 'fresh')
 
+    async def test_collect_snapshots_treats_successful_empty_rankings_as_not_ranked(self) -> None:
+        client = FakeKISIntradayClient()
+        service = KISIntradaySnapshotService(client=client)
+
+        with (
+            patch.object(
+                client,
+                'fetch_domestic_ranking_volume_power',
+                new=AsyncMock(
+                    return_value={
+                        'output': [],
+                        'page_count': 1,
+                        'max_pages_reached': False,
+                    }
+                ),
+            ),
+            patch.object(
+                client,
+                'fetch_domestic_volume_rank',
+                new=AsyncMock(return_value={'output': []}),
+            ),
+            patch.object(
+                client,
+                'fetch_domestic_quote_balance_ranking',
+                new=AsyncMock(
+                    return_value={
+                        'output': [],
+                        'page_count': 1,
+                        'max_pages_reached': False,
+                    }
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                return_value=SimpleNamespace(
+                    state='OPEN',
+                    server_time='2026-05-07T10:15:35+09:00',
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot'
+            ),
+        ):
+            result = await service.collect_snapshots(
+                symbols=['005930'],
+                include_news=False,
+            )
+
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['summary']['available_count'], 1)
+        payload = result['items'][0]
+        self.assertEqual(payload['availability_status'], 'available')
+        self.assertEqual(payload['liquidity']['status'], 'available')
+        self.assertEqual(
+            payload['liquidity']['source_statuses'],
+            {
+                'volume_power': 'not_ranked',
+                'volume_rank': 'not_ranked',
+                'quote_balance': 'not_ranked',
+            },
+        )
+        self.assertEqual(payload['coverage']['total_blocks'], 4)
+        self.assertEqual(payload['coverage']['excluded_blocks'], ['news_hints'])
+
     async def test_collect_snapshots_is_disabled_without_credentials_before_universe_lookup(self) -> None:
         settings.kis_app_key = ''
         settings.kis_app_secret = ''
@@ -228,6 +319,222 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['matched_symbol_count'], 1)
         self.assertEqual(result['snapshots_persisted'], 0)
         self.assertFalse(result['items'])
+
+    async def test_collect_snapshots_shared_source_failure_is_partial_for_full_scope(self) -> None:
+        client = FakeKISIntradayClient()
+        service = KISIntradaySnapshotService(client=client)
+        symbol_inputs = [
+            IntradaySymbolInput(symbol='005930', name_ko=None, market='KRX'),
+            IntradaySymbolInput(symbol='000660', name_ko=None, market='KRX'),
+        ]
+
+        with (
+            patch.object(service, '_capture_universe', return_value=symbol_inputs),
+            patch.object(
+                client,
+                'fetch_domestic_ranking_volume_power',
+                new=AsyncMock(side_effect=RuntimeError('x' * 1200)),
+            ),
+            patch.object(
+                service,
+                '_collect_symbol_snapshot',
+                new=AsyncMock(
+                    side_effect=lambda **kwargs: _collected_item(
+                        kwargs['symbol_input'].symbol
+                    )
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                return_value=SimpleNamespace(
+                    state='OPEN',
+                    server_time='2026-05-07T10:15:35+09:00',
+                ),
+            ),
+            patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot'),
+        ):
+            result = await service.collect_snapshots(
+                symbols=['005930', '000660'],
+                include_news=False,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'shared_source_incomplete')
+        self.assertEqual(result['partial_reasons'], ['shared_source_errors'])
+        self.assertEqual(
+            result['partial_details']['shared_error_sources'],
+            ['volume_power'],
+        )
+        self.assertEqual(len(result['shared_source_errors']['volume_power']), 1000)
+        self.assertEqual(result['summary']['available_count'], 2)
+        self.assertEqual(result['retry_scope']['mode'], 'all_requested_symbols')
+        self.assertEqual(result['retry_symbols'], ['005930', '000660'])
+        self.assertEqual(result['retry_symbols_count'], 2)
+        self.assertEqual(
+            result['_retry_metadata']['failed_symbols'],
+            ['005930', '000660'],
+        )
+
+    async def test_collect_snapshots_pagination_truncation_is_partial_for_full_scope(self) -> None:
+        client = FakeKISIntradayClient()
+        service = KISIntradaySnapshotService(client=client)
+        symbol_inputs = [
+            IntradaySymbolInput(symbol='005930', name_ko=None, market='KRX'),
+            IntradaySymbolInput(symbol='000660', name_ko=None, market='KRX'),
+        ]
+        truncated_response = await client.fetch_domestic_ranking_volume_power()
+        truncated_response['max_pages_reached'] = True
+
+        with (
+            patch.object(service, '_capture_universe', return_value=symbol_inputs),
+            patch.object(
+                client,
+                'fetch_domestic_ranking_volume_power',
+                new=AsyncMock(return_value=truncated_response),
+            ),
+            patch.object(
+                service,
+                '_collect_symbol_snapshot',
+                new=AsyncMock(
+                    side_effect=lambda **kwargs: _collected_item(
+                        kwargs['symbol_input'].symbol
+                    )
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                return_value=SimpleNamespace(
+                    state='OPEN',
+                    server_time='2026-05-07T10:15:35+09:00',
+                ),
+            ),
+            patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot'),
+        ):
+            result = await service.collect_snapshots(
+                symbols=['005930', '000660'],
+                include_news=False,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'shared_source_incomplete')
+        self.assertEqual(
+            result['partial_reasons'],
+            ['shared_source_pagination_truncated'],
+        )
+        self.assertEqual(
+            result['partial_details']['pagination_truncated_sources'],
+            ['volume_power'],
+        )
+        self.assertEqual(result['retry_scope']['mode'], 'all_requested_symbols')
+        self.assertEqual(
+            result['_retry_metadata']['failed_symbols'],
+            ['005930', '000660'],
+        )
+
+    async def test_collect_snapshots_item_gap_retries_only_affected_symbol(self) -> None:
+        service = KISIntradaySnapshotService(client=FakeKISIntradayClient())
+        symbol_inputs = [
+            IntradaySymbolInput(symbol='005930', name_ko=None, market='KRX'),
+            IntradaySymbolInput(symbol='000660', name_ko=None, market='KRX'),
+        ]
+
+        with (
+            patch.object(service, '_capture_universe', return_value=symbol_inputs),
+            patch.object(
+                service,
+                '_load_shared_rankings',
+                new=AsyncMock(return_value=({}, {}, {})),
+            ),
+            patch.object(
+                service,
+                '_collect_symbol_snapshot',
+                new=AsyncMock(
+                    side_effect=lambda **kwargs: _collected_item(
+                        kwargs['symbol_input'].symbol,
+                        availability_status=(
+                            'partial'
+                            if kwargs['symbol_input'].symbol == '000660'
+                            else 'available'
+                        ),
+                    )
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                return_value=SimpleNamespace(
+                    state='OPEN',
+                    server_time='2026-05-07T10:15:35+09:00',
+                ),
+            ),
+            patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot'),
+        ):
+            result = await service.collect_snapshots(
+                symbols=['005930', '000660'],
+                include_news=False,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'snapshot_items_incomplete')
+        self.assertEqual(result['partial_reasons'], ['partial_items'])
+        self.assertEqual(result['retry_scope']['mode'], 'affected_symbols')
+        self.assertEqual(result['retry_symbols'], ['000660'])
+        self.assertEqual(
+            result['_retry_metadata']['failed_symbols'],
+            ['000660'],
+        )
+
+    async def test_collect_snapshots_persistence_failure_is_partial(self) -> None:
+        service = KISIntradaySnapshotService(client=FakeKISIntradayClient())
+        symbol_input = IntradaySymbolInput(
+            symbol='005930',
+            name_ko=None,
+            market='KRX',
+        )
+
+        with (
+            patch.object(
+                service,
+                '_capture_universe',
+                return_value=[symbol_input],
+            ),
+            patch.object(
+                service,
+                '_load_shared_rankings',
+                new=AsyncMock(return_value=({}, {}, {})),
+            ),
+            patch.object(
+                service,
+                '_collect_symbol_snapshot',
+                new=AsyncMock(return_value=_collected_item('005930')),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.async_get_market_state',
+                return_value=SimpleNamespace(
+                    state='OPEN',
+                    server_time='2026-05-07T10:15:35+09:00',
+                ),
+            ),
+            patch(
+                'app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot',
+                side_effect=RuntimeError('p' * 1200),
+            ),
+        ):
+            result = await service.collect_snapshots(
+                symbols=['005930'],
+                include_news=False,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'snapshot_failures')
+        self.assertEqual(result['partial_reasons'], ['snapshot_failures'])
+        self.assertEqual(result['snapshots_failed'], 1)
+        self.assertEqual(result['failed_symbols'], ['005930'])
+        self.assertEqual(len(result['failed_symbol_errors'][0]['error']), 1000)
+        self.assertEqual(result['retry_scope']['mode'], 'affected_symbols')
+        self.assertEqual(
+            result['_retry_metadata']['failed_symbols'],
+            ['005930'],
+        )
 
     def test_inspect_summarizes_current_rows(self) -> None:
         service = KISIntradaySnapshotService(client=FakeKISIntradayClient())

@@ -6,11 +6,17 @@ from datetime import date
 from typing import Callable, Iterable, Sequence
 
 from app.agent_context.derived_contexts import build_price_context
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_bars_for_symbol,
     load_daily_technical_snapshots,
     upsert_daily_technical_snapshot,
+)
+
+
+TECHNICAL_SNAPSHOT_SCOPE_MANIFEST_VERSION = (
+    'technical_snapshots_scope_outcomes_v1'
 )
 
 
@@ -221,7 +227,13 @@ class DailyTechnicalSnapshotService:
         progress_callback: Callable[[dict], None] | None = None,
         include_retry_metadata: bool = False,
     ) -> dict:
-        target_symbols = list(symbols) if symbols else list_symbols_with_daily_bar_on_date(market_date)
+        target_symbols = list(
+            dict.fromkeys(
+                symbols
+                if symbols
+                else list_symbols_with_daily_bar_on_date(market_date)
+            )
+        )
         snapshots: list[dict] = []
         failed_symbols: list[str] = []
 
@@ -296,6 +308,16 @@ class DailyTechnicalSnapshotService:
             'snapshots_failed': len(failed_symbols),
             'failed_symbols': failed_symbols[:50],
             'items': snapshots,
+            **build_exact_symbol_scope_outcome(
+                manifest_version=(
+                    TECHNICAL_SNAPSHOT_SCOPE_MANIFEST_VERSION
+                ),
+                selected_symbols=target_symbols,
+                successful_symbols=[
+                    snapshot['symbol'] for snapshot in snapshots
+                ],
+                retry_debt_symbols=failed_symbols,
+            ),
         }
         if include_retry_metadata:
             result['_retry_metadata'] = {'failed_symbols': failed_symbols}

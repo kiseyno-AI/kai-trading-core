@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 import hashlib
 import json
 import sys
@@ -33,6 +34,7 @@ from app.db_models import (
     DailyTrendingRank,
     DailyUnifiedValueFactorResult,
     DailyValueFactorResult,
+    EODCollectionRun,
     SignalDeciderCalendarReviewItem,
     SignalDeciderCalendarReviewRun,
     SignalDeciderDecisionSnapshot,
@@ -40,11 +42,15 @@ from app.db_models import (
     SignalDeciderRealizedOutcome,
     Symbol,
 )
-from app.eod.market_membership import market_membership_sha256
+from app.eod.market_membership import (
+    market_membership_sha256,
+    validate_market_membership_snapshot,
+)
 from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
 
 SUPPORTED_MARKETS = ('KOSPI', 'KOSDAQ')
+MINIMUM_MARKET_MEMBERSHIP = {'KOSPI': 700, 'KOSDAQ': 1200}
 REQUIRED_TRENDING_PERIODS = ('1d', '5d', '20d')
 REQUIRED_PRICE_COVERAGE_MODELS = (
     ('price_contexts', DailyPriceContext),
@@ -113,6 +119,7 @@ def _serialize_batch(row: DailyPriceBarRepairBatch) -> dict[str, Any]:
             else None
         ),
         'factor_rebuild_metadata': dict(row.factor_rebuild_metadata or {}),
+        'verification_metadata': dict(row.verification_metadata or {}),
         'repaired_row_count': int(row.repaired_row_count),
         'created_at': row.created_at.isoformat(),
         'completed_at': (
@@ -176,10 +183,7 @@ def _daily_price_input_fingerprint(
             DailyPriceBar.dps,
         )
         .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-        .where(
-            DailyPriceBar.trade_date == market_date,
-            Symbol.market.in_(SUPPORTED_MARKETS),
-        )
+        .where(DailyPriceBar.trade_date == market_date)
         .order_by(Symbol.symbol.asc())
     )
     normalized_symbols = sorted(
@@ -191,6 +195,8 @@ def _daily_price_input_fingerprint(
     )
     if symbols is not None:
         statement = statement.where(Symbol.symbol.in_(normalized_symbols))
+    else:
+        statement = statement.where(Symbol.market.in_(SUPPORTED_MARKETS))
     rows = session.execute(statement).all()
     payload = [
         [str(row[0]), *(_stable_numeric(value) for value in row[1:])]
@@ -206,6 +212,58 @@ def _daily_price_input_fingerprint(
     return digest, len(payload)
 
 
+def exact_daily_price_bar_scope_fingerprint(
+    session: Any,
+    *,
+    market_date: date,
+    symbols: Sequence[str],
+) -> tuple[str, int]:
+    """Hash an exact historical date/symbol scope without current classification.
+
+    Point-in-time repair evidence must remain valid when a symbol is later
+    reclassified in ``symbols.market``.  The provider-reviewed symbol set is
+    therefore the only membership authority for this fingerprint.
+    """
+
+    normalized_symbols = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in symbols
+            if str(symbol).strip()
+        }
+    )
+    if not normalized_symbols:
+        return _stable_json_sha256([]), 0
+    rows = session.execute(
+        select(
+            Symbol.symbol,
+            DailyPriceBar.open_price,
+            DailyPriceBar.high_price,
+            DailyPriceBar.low_price,
+            DailyPriceBar.close_price,
+            DailyPriceBar.volume,
+            DailyPriceBar.turnover,
+            DailyPriceBar.per,
+            DailyPriceBar.pbr,
+            DailyPriceBar.bps,
+            DailyPriceBar.eps,
+            DailyPriceBar.dividend_yield,
+            DailyPriceBar.dps,
+        )
+        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+        .where(
+            DailyPriceBar.trade_date == market_date,
+            Symbol.symbol.in_(normalized_symbols),
+        )
+        .order_by(Symbol.symbol.asc())
+    ).all()
+    payload = [
+        [str(row[0]), *(_stable_numeric(value) for value in row[1:])]
+        for row in rows
+    ]
+    return _stable_json_sha256(payload), len(payload)
+
+
 def _stable_json_sha256(payload: object) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -217,12 +275,115 @@ def _stable_json_sha256(payload: object) -> str:
     ).hexdigest()
 
 
+def _stable_output_value(value: object) -> object:
+    """Normalize persisted derived values for deterministic fingerprints."""
+
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_output_value(item)
+            for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_output_value(item) for item in value]
+    return str(value)
+
+
+def _derived_output_fingerprint(
+    session: Any,
+    *,
+    model: Any,
+    market_date: date,
+    symbols: Sequence[str] | None,
+    periods: Sequence[str] | None = None,
+) -> tuple[str, int]:
+    """Hash all non-identity output columns for one derived scope."""
+
+    normalized_symbols = (
+        tuple(
+            sorted(
+                {
+                    str(symbol).strip().upper()
+                    for symbol in symbols
+                    if str(symbol).strip()
+                }
+            )
+        )
+        if symbols is not None
+        else None
+    )
+    if symbols is not None and not normalized_symbols:
+        raise ValueError('derived output fingerprint scope must not be empty')
+    excluded_columns = {
+        'id',
+        'symbol_id',
+        'market_date',
+        'created_at',
+        'updated_at',
+        'captured_at',
+    }
+    output_columns = tuple(
+        column.name
+        for column in model.__table__.columns
+        if column.name not in excluded_columns
+    )
+    statement = (
+        select(
+            Symbol.symbol,
+            *(getattr(model, name) for name in output_columns),
+        )
+        .join(model, model.symbol_id == Symbol.id)
+        .where(model.market_date == market_date)
+        .order_by(
+            Symbol.symbol.asc(),
+            *(
+                (model.period.asc(),)
+                if hasattr(model, 'period')
+                else ()
+            ),
+        )
+    )
+    if normalized_symbols is not None:
+        statement = statement.where(
+            Symbol.symbol.in_(normalized_symbols)
+        )
+    if periods is not None:
+        if not hasattr(model, 'period'):
+            raise ValueError('period scope is unsupported for this model')
+        normalized_periods = tuple(
+            sorted({str(period).strip().lower() for period in periods})
+        )
+        if not normalized_periods:
+            raise ValueError('derived output period scope must not be empty')
+        statement = statement.where(model.period.in_(normalized_periods))
+    rows = session.execute(statement).all()
+    payload = [
+        [
+            str(row[0]),
+            {
+                name: _stable_output_value(value)
+                for name, value in zip(output_columns, row[1:], strict=True)
+            },
+        ]
+        for row in rows
+    ]
+    return _stable_json_sha256(payload), len(payload)
+
+
 def _signal_feature_fingerprint(
     session: Any,
     *,
     market_date: date,
+    symbols: Sequence[str] | None = None,
 ) -> tuple[str, int, datetime | None, datetime | None]:
-    rows = session.execute(
+    statement = (
         select(
             Symbol.symbol,
             DailySignalFeature.source,
@@ -239,7 +400,25 @@ def _signal_feature_fingerprint(
         .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
         .where(DailySignalFeature.market_date == market_date)
         .order_by(Symbol.symbol.asc())
-    ).all()
+    )
+    if symbols is not None:
+        normalized_symbols = tuple(
+            sorted(
+                {
+                    str(symbol).strip().upper()
+                    for symbol in symbols
+                    if str(symbol).strip()
+                }
+            )
+        )
+        if not normalized_symbols:
+            raise ValueError(
+                'signal-feature fingerprint scope must not be empty'
+            )
+        statement = statement.where(
+            Symbol.symbol.in_(normalized_symbols)
+        )
+    rows = session.execute(statement).all()
     payload = [
         [
             str(row[0]),
@@ -310,6 +489,239 @@ def _signal_feature_dependency_watermark(
     )
     present = [item for item in timestamps if item is not None]
     return max(present) if present else None
+
+
+def _factor_evidence_symbols_for_batch(
+    *,
+    batch: DailyPriceBarRepairBatch,
+    market_date: date,
+    rebuilt_symbols: Sequence[str],
+) -> tuple[str, ...]:
+    """Resolve the exact historical scope that this batch must verify.
+
+    Missing-bar batches freeze a separate point-in-time membership manifest.
+    The rebuild and evidence must use that exact ranking population; a live or
+    stored superset would change every cross-sectional rank.  Conflicting
+    pending manifests for one date must therefore block before any rewrite.
+    """
+
+    rebuilt = tuple(sorted(set(rebuilt_symbols)))
+    metadata = dict(getattr(batch, 'verification_metadata', None) or {})
+    recorded = dict(metadata.get('repair_evidence') or {})
+    if recorded.get('repair_kind') != 'missing_bar_insert':
+        return rebuilt
+    try:
+        if str(recorded['schema_version']) != 'missing_bar_insert_v3':
+            raise ValueError('unsupported missing-bar evidence version')
+        raw_scope = dict(
+            dict(recorded['price_dependent_membership_by_date'])[
+                market_date.isoformat()
+            ]
+        )
+        raw_symbols = [
+            str(symbol).strip().upper()
+            for symbol in raw_scope['symbols']
+            if str(symbol).strip()
+        ]
+        frozen_symbols = tuple(sorted(set(raw_symbols)))
+        frozen_count = int(raw_scope['symbol_count'])
+        frozen_sha256 = str(raw_scope['membership_sha256']).strip().lower()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            'pending missing-bar batch has invalid frozen factor scope: '
+            f'batch={batch.repair_batch_id}, date={market_date.isoformat()}'
+        ) from exc
+    if (
+        not frozen_symbols
+        or len(raw_symbols) != len(frozen_symbols)
+        or frozen_count != len(frozen_symbols)
+        or frozen_sha256 != market_membership_sha256(frozen_symbols)
+    ):
+        raise RuntimeError(
+            'pending missing-bar batch has invalid frozen factor scope: '
+            f'batch={batch.repair_batch_id}, date={market_date.isoformat()}'
+        )
+    if frozen_symbols != rebuilt:
+        raise RuntimeError(
+            'exact factor rebuild ranking scope does not exactly match '
+            'pending frozen membership: '
+            f'batch={batch.repair_batch_id}, date={market_date.isoformat()}, '
+            f'rebuilt_count={len(rebuilt)}, '
+            f'frozen_count={len(frozen_symbols)}, '
+            f'rebuilt_sha256={market_membership_sha256(rebuilt)}, '
+            f'frozen_sha256={market_membership_sha256(frozen_symbols)}'
+        )
+    return frozen_symbols
+
+
+def _frozen_signal_feature_symbols_for_batch(
+    *,
+    batch: Mapping[str, Any] | DailyPriceBarRepairBatch,
+    market_date: date,
+) -> tuple[str, ...] | None:
+    """Return one batch's validated point-in-time signal-feature scope."""
+
+    if isinstance(batch, Mapping):
+        metadata = dict(batch.get('verification_metadata') or {})
+        repair_batch_id = str(batch.get('repair_batch_id') or '')
+    else:
+        metadata = dict(
+            getattr(batch, 'verification_metadata', None) or {}
+        )
+        repair_batch_id = str(
+            getattr(batch, 'repair_batch_id', '') or ''
+        )
+    recorded = dict(metadata.get('repair_evidence') or {})
+    if recorded.get('repair_kind') != 'missing_bar_insert':
+        return None
+    try:
+        if str(recorded['schema_version']) != 'missing_bar_insert_v3':
+            raise ValueError('unsupported missing-bar evidence version')
+        raw_scope = dict(
+            dict(recorded['price_dependent_membership_by_date'])[
+                market_date.isoformat()
+            ]
+        )
+        raw_symbols = [
+            str(symbol).strip().upper()
+            for symbol in raw_scope['symbols']
+            if str(symbol).strip()
+        ]
+        frozen_symbols = tuple(sorted(set(raw_symbols)))
+        frozen_count = int(raw_scope['symbol_count'])
+        frozen_sha256 = str(
+            raw_scope['membership_sha256']
+        ).strip().lower()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            'pending missing-bar batch has invalid frozen signal-feature '
+            f'scope: batch={repair_batch_id}, '
+            f'date={market_date.isoformat()}'
+        ) from exc
+    if (
+        not frozen_symbols
+        or len(raw_symbols) != len(frozen_symbols)
+        or frozen_count != len(frozen_symbols)
+        or frozen_sha256 != market_membership_sha256(frozen_symbols)
+    ):
+        raise RuntimeError(
+            'pending missing-bar batch has invalid frozen signal-feature '
+            f'scope: batch={repair_batch_id}, '
+            f'date={market_date.isoformat()}'
+        )
+    return frozen_symbols
+
+
+def _pending_frozen_signal_feature_scopes(
+    *,
+    pending: Sequence[Mapping[str, Any]],
+    required_dates: Sequence[date],
+) -> tuple[
+    dict[date, tuple[str, ...]],
+    dict[date, dict[str, tuple[str, ...]]],
+]:
+    """Build union write scopes and every distinct batch verification scope."""
+
+    union_symbols_by_date: dict[date, set[str]] = {
+        market_date: set() for market_date in required_dates
+    }
+    distinct_scopes_by_date: dict[
+        date,
+        dict[str, tuple[str, ...]],
+    ] = {market_date: {} for market_date in required_dates}
+    required_date_set = set(required_dates)
+    for batch in pending:
+        batch_dates = {
+            _normalize_date(value)
+            for value in batch.get('required_rebuild_trade_dates') or []
+        }
+        for market_date in sorted(batch_dates.intersection(required_date_set)):
+            frozen_symbols = _frozen_signal_feature_symbols_for_batch(
+                batch=batch,
+                market_date=market_date,
+            )
+            if frozen_symbols is None:
+                continue
+            membership_sha256 = market_membership_sha256(
+                frozen_symbols
+            )
+            union_symbols_by_date[market_date].update(frozen_symbols)
+            distinct_scopes_by_date[market_date][
+                membership_sha256
+            ] = frozen_symbols
+    conflicting_dates = {
+        market_date: sorted(scopes)
+        for market_date, scopes in distinct_scopes_by_date.items()
+        if len(scopes) > 1
+    }
+    if conflicting_dates:
+        conflict_preview = {
+            market_date.isoformat(): scope_hashes
+            for market_date, scope_hashes in sorted(
+                conflicting_dates.items()
+            )
+        }
+        raise RuntimeError(
+            'pending missing-bar batches have conflicting frozen signal '
+            f'membership scopes: {conflict_preview}'
+        )
+    return (
+        {
+            market_date: tuple(sorted(symbols))
+            for market_date, symbols in union_symbols_by_date.items()
+            if symbols
+        },
+        {
+            market_date: scopes
+            for market_date, scopes in distinct_scopes_by_date.items()
+            if scopes
+        },
+    )
+
+
+def resolve_pending_frozen_price_dependent_membership(
+    *,
+    market_date: str | date,
+    pending: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[str, ...] | None:
+    """Return the sole durable frozen scope for a pending repair date.
+
+    Exact factor and trending rebuilds must establish this authority before
+    any mutation.  Live provider membership is corroboration only once a
+    missing-bar batch has frozen its point-in-time ranking population.
+    """
+
+    normalized_date = _normalize_date(market_date)
+    pending_batches = list(
+        load_pending_price_bar_rebuild_batches()
+        if pending is None
+        else pending
+    )
+    scopes: dict[str, tuple[str, ...]] = {}
+    for batch in pending_batches:
+        required_dates = {
+            _normalize_date(value)
+            for value in batch.get('required_rebuild_trade_dates') or []
+        }
+        if normalized_date not in required_dates:
+            continue
+        frozen_symbols = _frozen_signal_feature_symbols_for_batch(
+            batch=batch,
+            market_date=normalized_date,
+        )
+        if frozen_symbols is None:
+            continue
+        scopes[
+            market_membership_sha256(frozen_symbols)
+        ] = frozen_symbols
+    if len(scopes) > 1:
+        raise RuntimeError(
+            'pending price-bar batches have conflicting frozen '
+            'price-dependent memberships: '
+            f'date={normalized_date.isoformat()}, '
+            f'hashes={sorted(scopes)}'
+        )
+    return next(iter(scopes.values()), None)
 
 
 def record_pending_exact_factor_rebuild(
@@ -407,63 +819,331 @@ def record_pending_exact_factor_rebuild(
                 'ranking_membership_sha256': ranking_membership_sha256,
             }
 
-        input_sha256, input_row_count = _daily_price_input_fingerprint(
-            session,
-            market_date=market_date,
-            symbols=normalized_symbols,
-        )
-        if input_row_count != len(normalized_symbols):
-            raise RuntimeError(
-                'exact factor rebuild input coverage changed before evidence '
-                f'was recorded: rows={input_row_count}, '
-                f'expected={len(normalized_symbols)}'
+        evidence_by_symbols: dict[tuple[str, ...], dict[str, Any]] = {}
+
+        def evidence_for(
+            batch_symbols: tuple[str, ...],
+        ) -> dict[str, Any]:
+            if batch_symbols in evidence_by_symbols:
+                return evidence_by_symbols[batch_symbols]
+            input_sha256, input_row_count = _daily_price_input_fingerprint(
+                session,
+                market_date=market_date,
+                symbols=list(batch_symbols),
             )
-        date_evidence = {
-            'market_date': market_date_key,
-            'exact_membership_count': len(normalized_symbols),
-            'ranking_membership_sha256': ranking_membership_sha256,
-            'provider_membership_sha256': str(
-                provider_membership_sha256
-            ).strip().lower(),
-            'membership_evidence_source': normalized_evidence_source,
-            'membership_evidence_run_id': normalized_run_id,
-            'membership_evidence_run_source': normalized_run_source,
-            'daily_price_input_sha256': input_sha256,
-            'repair_started_at': repair_started_at.isoformat(),
-            'rebuild_completed_at': completed_at.isoformat(),
-            'stage_ids': [item[0] for item in REQUIRED_EXACT_FACTOR_MODELS],
+            if input_row_count != len(batch_symbols):
+                raise RuntimeError(
+                    'exact factor rebuild input coverage changed before '
+                    'evidence was recorded: '
+                    f'rows={input_row_count}, '
+                    f'expected={len(batch_symbols)}'
+                )
+            stage_output_fingerprints: dict[str, dict[str, Any]] = {}
+            for stage_id, model in REQUIRED_EXACT_FACTOR_MODELS:
+                output_sha256, output_row_count = (
+                    _derived_output_fingerprint(
+                        session,
+                        model=model,
+                        market_date=market_date,
+                        symbols=batch_symbols,
+                    )
+                )
+                if output_row_count != len(batch_symbols):
+                    raise RuntimeError(
+                        'exact factor output coverage changed before '
+                        'evidence was recorded: '
+                        f'stage={stage_id}, rows={output_row_count}, '
+                        f'expected={len(batch_symbols)}'
+                    )
+                stage_output_fingerprints[stage_id] = {
+                    'row_count': output_row_count,
+                    'output_sha256': output_sha256,
+                }
+            evidence = {
+                'market_date': market_date_key,
+                'exact_membership_count': len(batch_symbols),
+                'ranking_membership_sha256': (
+                    market_membership_sha256(batch_symbols)
+                ),
+                'provider_membership_sha256': str(
+                    provider_membership_sha256
+                ).strip().lower(),
+                'membership_evidence_source': normalized_evidence_source,
+                'membership_evidence_run_id': normalized_run_id,
+                'membership_evidence_run_source': normalized_run_source,
+                'daily_price_input_sha256': input_sha256,
+                'stage_output_fingerprints': stage_output_fingerprints,
+                'repair_started_at': repair_started_at.isoformat(),
+                'rebuild_completed_at': completed_at.isoformat(),
+                'stage_ids': [
+                    item[0] for item in REQUIRED_EXACT_FACTOR_MODELS
+                ],
+            }
+            evidence_by_symbols[batch_symbols] = evidence
+            return evidence
+
+        batch_scopes = [
+            (
+                batch,
+                _factor_evidence_symbols_for_batch(
+                    batch=batch,
+                    market_date=market_date,
+                    rebuilt_symbols=normalized_symbols,
+                ),
+            )
+            for batch in affected_batches
+        ]
+        recorded_batch_scopes = {
+            batch_symbols for _, batch_symbols in batch_scopes
         }
+        for batch, batch_symbols in batch_scopes:
+            metadata = dict(batch.factor_rebuild_metadata or {})
+            date_map = dict(metadata.get('dates') or {})
+            existing_date_scope = dict(
+                date_map.get(market_date_key) or {}
+            )
+            date_evidence = dict(evidence_for(batch_symbols))
+            if 'trending_output_fingerprints' in existing_date_scope:
+                date_evidence['trending_output_fingerprints'] = dict(
+                    existing_date_scope['trending_output_fingerprints']
+                )
+            date_map[market_date_key] = date_evidence
+            batch.factor_rebuild_metadata = {
+                'schema_version': 2,
+                'dates': date_map,
+            }
+        caller_evidence = evidence_for(tuple(normalized_symbols))
+        return {
+            **caller_evidence,
+            'updated_batch_count': len(affected_batches),
+            'recorded_membership_scope_count': len(recorded_batch_scopes),
+        }
+
+
+def record_pending_trending_rebuild(
+    *,
+    market_date: str | date,
+    periods: Sequence[str],
+    repair_started_at: datetime,
+    rebuild_completed_at: datetime | None = None,
+    exact_symbols: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Freeze exact trending outputs for every affected pending batch."""
+
+    normalized_date = _normalize_date(market_date)
+    market_date_key = normalized_date.isoformat()
+    requested_periods = {
+        str(period).strip().lower()
+        for period in periods
+        if str(period).strip()
+    }
+    if not requested_periods:
+        raise ValueError('trending rebuild evidence requires periods')
+    unsupported_periods = sorted(
+        requested_periods.difference(REQUIRED_TRENDING_PERIODS)
+    )
+    if unsupported_periods:
+        raise ValueError(
+            'unsupported trending rebuild evidence periods: '
+            f'{unsupported_periods}'
+        )
+    normalized_periods = tuple(
+        period
+        for period in REQUIRED_TRENDING_PERIODS
+        if period in requested_periods
+    )
+    normalized_symbols = (
+        tuple(
+            sorted(
+                {
+                    str(symbol).strip().upper()
+                    for symbol in exact_symbols
+                    if str(symbol).strip()
+                }
+            )
+        )
+        if exact_symbols is not None
+        else None
+    )
+    if exact_symbols is not None and not normalized_symbols:
+        raise ValueError('exact trending rebuild scope must not be empty')
+    completed_at = rebuild_completed_at or datetime.now(timezone.utc)
+    if repair_started_at.tzinfo is None or completed_at.tzinfo is None:
+        raise ValueError(
+            'trending rebuild evidence timestamps must include timezone'
+        )
+
+    with session_scope(
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
+    ) as session:
+        pending_batches = session.scalars(
+            select(DailyPriceBarRepairBatch)
+            .where(DailyPriceBarRepairBatch.status == 'pending')
+            .order_by(DailyPriceBarRepairBatch.created_at.asc())
+            .with_for_update()
+        ).all()
+        affected_batches = [
+            batch
+            for batch in pending_batches
+            if batch.created_at <= repair_started_at
+            and market_date_key
+            in {
+                str(value)
+                for value in batch.required_rebuild_trade_dates or []
+            }
+        ]
+        if not affected_batches:
+            return {
+                'market_date': market_date_key,
+                'periods': list(normalized_periods),
+                'updated_batch_count': 0,
+            }
+
+        for batch in affected_batches:
+            frozen_symbols = _frozen_signal_feature_symbols_for_batch(
+                batch=batch,
+                market_date=normalized_date,
+            )
+            if frozen_symbols is None:
+                continue
+            if normalized_symbols != frozen_symbols:
+                raise RuntimeError(
+                    'exact trending rebuild scope does not exactly match '
+                    'pending frozen membership: '
+                    f'batch={batch.repair_batch_id}, '
+                    f'date={market_date_key}, '
+                    f'rebuilt_count={len(normalized_symbols or ())}, '
+                    f'frozen_count={len(frozen_symbols)}'
+                )
+
+        period_evidence: dict[str, dict[str, Any]] = {}
+        for period in normalized_periods:
+            output_sha256, output_row_count = _derived_output_fingerprint(
+                session,
+                model=DailyTrendingRank,
+                market_date=normalized_date,
+                symbols=None,
+                periods=(period,),
+            )
+            if output_row_count <= 0:
+                raise RuntimeError(
+                    'trending output coverage is empty before evidence was '
+                    f'recorded: period={period}'
+                )
+            period_evidence[period] = {
+                'row_count': output_row_count,
+                'output_sha256': output_sha256,
+                'repair_started_at': repair_started_at.isoformat(),
+                'rebuild_completed_at': completed_at.isoformat(),
+                'exact_scope': normalized_symbols is not None,
+                'scope_symbol_count': len(normalized_symbols or ()),
+                'scope_membership_sha256': (
+                    market_membership_sha256(normalized_symbols or ())
+                ),
+            }
+
         for batch in affected_batches:
             metadata = dict(batch.factor_rebuild_metadata or {})
             date_map = dict(metadata.get('dates') or {})
-            date_map[market_date_key] = date_evidence
+            date_scope = dict(date_map.get(market_date_key) or {})
+            output_fingerprints = dict(
+                date_scope.get('trending_output_fingerprints') or {}
+            )
+            output_fingerprints.update(period_evidence)
+            date_scope['trending_output_fingerprints'] = (
+                output_fingerprints
+            )
+            date_map[market_date_key] = date_scope
             batch.factor_rebuild_metadata = {
-                'schema_version': 1,
+                'schema_version': 2,
                 'dates': date_map,
             }
         return {
-            **date_evidence,
+            'market_date': market_date_key,
+            'periods': list(normalized_periods),
+            'output_fingerprints': period_evidence,
             'updated_batch_count': len(affected_batches),
         }
+
+
+def _historical_membership_scopes(
+    *,
+    market_date_column: Any,
+    required_dates: Sequence[date],
+    frozen_symbols_by_date: Mapping[date, Sequence[str]] | None,
+) -> tuple[tuple[tuple[date, ...], Any], ...]:
+    """Return disjoint query scopes without combining every frozen manifest.
+
+    SQLAlchemy expands ``IN`` membership values into one bind parameter per
+    symbol at execution time.  Combining a few dozen full KRX manifests in a
+    single OR expression can therefore exceed PostgreSQL's 65,535 parameter
+    limit.  Each frozen date is deliberately emitted as its own query scope;
+    dates without a frozen manifest can still share the current-market query.
+    """
+
+    required = tuple(sorted(set(required_dates)))
+    required_set = set(required)
+    frozen = {
+        market_date: tuple(sorted(set(symbols)))
+        for market_date, symbols in (frozen_symbols_by_date or {}).items()
+        if market_date in required_set
+    }
+    scopes: list[tuple[tuple[date, ...], Any]] = []
+    ordinary_dates = tuple(
+        sorted(required_set.difference(frozen))
+    )
+    if ordinary_dates:
+        scopes.append(
+            (
+                ordinary_dates,
+                and_(
+                    market_date_column.in_(ordinary_dates),
+                    Symbol.market.in_(SUPPORTED_MARKETS),
+                ),
+            )
+        )
+    for market_date, symbols in sorted(frozen.items()):
+        scopes.append(
+            (
+                (market_date,),
+                (
+                    and_(
+                        market_date_column == market_date,
+                        Symbol.symbol.in_(symbols),
+                    )
+                    if symbols
+                    else false()
+                ),
+            )
+        )
+    return tuple(scopes)
 
 
 def _expected_price_counts(
     session: Any,
     *,
     required_dates: Sequence[date],
+    frozen_symbols_by_date: Mapping[date, Sequence[str]] | None = None,
 ) -> dict[date, int]:
-    rows = session.execute(
-        select(
-            DailyPriceBar.trade_date,
-            func.count(DailyPriceBar.id),
+    rows = []
+    for _, membership_condition in _historical_membership_scopes(
+        market_date_column=DailyPriceBar.trade_date,
+        required_dates=required_dates,
+        frozen_symbols_by_date=frozen_symbols_by_date,
+    ):
+        rows.extend(
+            session.execute(
+                select(
+                    DailyPriceBar.trade_date,
+                    func.count(DailyPriceBar.id),
+                )
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(membership_condition)
+                .group_by(DailyPriceBar.trade_date)
+            ).all()
         )
-        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-        .where(
-            DailyPriceBar.trade_date.in_(required_dates),
-            Symbol.market.in_(SUPPORTED_MARKETS),
-        )
-        .group_by(DailyPriceBar.trade_date)
-    ).all()
     return {row[0]: int(row[1]) for row in rows}
 
 
@@ -471,6 +1151,7 @@ def _causal_raw_dependency_watermarks(
     session: Any,
     *,
     required_dates: Sequence[date],
+    frozen_symbols_by_date: Mapping[date, Sequence[str]] | None = None,
 ) -> dict[date, datetime]:
     """Return the latest repaired raw input that can affect each output date.
 
@@ -481,18 +1162,23 @@ def _causal_raw_dependency_watermarks(
     unrelated historical dates.
     """
 
-    rows = session.execute(
-        select(
-            DailyPriceBar.trade_date,
-            func.max(DailyPriceBar.captured_at),
+    rows = []
+    for _, membership_condition in _historical_membership_scopes(
+        market_date_column=DailyPriceBar.trade_date,
+        required_dates=required_dates,
+        frozen_symbols_by_date=frozen_symbols_by_date,
+    ):
+        rows.extend(
+            session.execute(
+                select(
+                    DailyPriceBar.trade_date,
+                    func.max(DailyPriceBar.captured_at),
+                )
+                .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
+                .where(membership_condition)
+                .group_by(DailyPriceBar.trade_date)
+            ).all()
         )
-        .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
-        .where(
-            DailyPriceBar.trade_date.in_(required_dates),
-            Symbol.market.in_(SUPPORTED_MARKETS),
-        )
-        .group_by(DailyPriceBar.trade_date)
-    ).all()
     per_date = {
         market_date: captured_at
         for market_date, captured_at in rows
@@ -535,6 +1221,7 @@ def _full_coverage_stage_evidence(
     expected_counts: dict[date, int],
     rebuilt_after: datetime,
     raw_dependency_watermarks: dict[date, datetime],
+    frozen_symbols_by_date: Mapping[date, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     fresh_row = case((model.updated_at >= rebuilt_after, 1))
     fresh_after_raw_row = case(
@@ -546,40 +1233,50 @@ def _full_coverage_stage_evidence(
             1,
         )
     )
-    fresh_after_dependency_row = case(
-        (
-            _fresh_after_causal_dependency_condition(
-                market_date_column=model.market_date,
-                updated_at_column=model.updated_at,
-                raw_dependency_watermarks=raw_dependency_watermarks,
-            ),
-            1,
+    rows = []
+    for scope_dates, membership_condition in _historical_membership_scopes(
+        market_date_column=model.market_date,
+        required_dates=required_dates,
+        frozen_symbols_by_date=frozen_symbols_by_date,
+    ):
+        scoped_watermarks = {
+            market_date: raw_dependency_watermarks[market_date]
+            for market_date in scope_dates
+            if market_date in raw_dependency_watermarks
+        }
+        fresh_after_dependency_row = case(
+            (
+                _fresh_after_causal_dependency_condition(
+                    market_date_column=model.market_date,
+                    updated_at_column=model.updated_at,
+                    raw_dependency_watermarks=scoped_watermarks,
+                ),
+                1,
+            )
         )
-    )
-    rows = session.execute(
-        select(
-            model.market_date,
-            func.count(model.id),
-            func.count(DailyPriceBar.id),
-            func.count(fresh_row),
-            func.count(fresh_after_raw_row),
-            func.count(fresh_after_dependency_row),
+        rows.extend(
+            session.execute(
+                select(
+                    model.market_date,
+                    func.count(model.id),
+                    func.count(DailyPriceBar.id),
+                    func.count(fresh_row),
+                    func.count(fresh_after_raw_row),
+                    func.count(fresh_after_dependency_row),
+                )
+                .select_from(model)
+                .join(Symbol, Symbol.id == model.symbol_id)
+                .outerjoin(
+                    DailyPriceBar,
+                    and_(
+                        DailyPriceBar.symbol_id == model.symbol_id,
+                        DailyPriceBar.trade_date == model.market_date,
+                    ),
+                )
+                .where(membership_condition)
+                .group_by(model.market_date)
+            ).all()
         )
-        .select_from(model)
-        .join(Symbol, Symbol.id == model.symbol_id)
-        .outerjoin(
-            DailyPriceBar,
-            and_(
-                DailyPriceBar.symbol_id == model.symbol_id,
-                DailyPriceBar.trade_date == model.market_date,
-            ),
-        )
-        .where(
-            model.market_date.in_(required_dates),
-            Symbol.market.in_(SUPPORTED_MARKETS),
-        )
-        .group_by(model.market_date)
-    ).all()
     observed = {
         row[0]: {
             'observed': int(row[1]),
@@ -647,18 +1344,28 @@ def _full_coverage_stage_evidence(
 def _exact_factor_stage_evidence(
     session: Any,
     *,
+    stage_id: str,
     model: Any,
     required_dates: Sequence[date],
     factor_rebuild_metadata: dict[str, Any],
     raw_dependency_watermarks: dict[date, datetime],
+    frozen_symbols_by_date: Mapping[date, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     date_scopes = dict(factor_rebuild_metadata.get('dates') or {})
+    try:
+        metadata_schema_version = int(
+            factor_rebuild_metadata['schema_version']
+        )
+    except (KeyError, TypeError, ValueError):
+        metadata_schema_version = 0
     issues: list[dict[str, Any]] = []
     date_results: list[dict[str, Any]] = []
     for market_date in required_dates:
         date_key = market_date.isoformat()
         scope = dict(date_scopes.get(date_key) or {})
         try:
+            if metadata_schema_version != 2:
+                raise ValueError('unsupported factor rebuild schema')
             expected_count = int(scope['exact_membership_count'])
             expected_membership_sha256 = str(
                 scope['ranking_membership_sha256']
@@ -666,6 +1373,11 @@ def _exact_factor_stage_evidence(
             expected_input_sha256 = str(
                 scope['daily_price_input_sha256']
             )
+            output_scope = dict(
+                dict(scope['stage_output_fingerprints'])[stage_id]
+            )
+            expected_output_count = int(output_scope['row_count'])
+            expected_output_sha256 = str(output_scope['output_sha256'])
             rebuild_started_at = _normalize_datetime(
                 scope['repair_started_at']
             )
@@ -678,6 +1390,18 @@ def _exact_factor_stage_evidence(
             date_results.append(issue)
             continue
 
+        has_frozen_membership = bool(
+            frozen_symbols_by_date is not None
+            and market_date in frozen_symbols_by_date
+        )
+        frozen_symbols = tuple(
+            (frozen_symbols_by_date or {}).get(market_date) or ()
+        )
+        membership_condition = (
+            Symbol.symbol.in_(frozen_symbols)
+            if has_frozen_membership
+            else Symbol.market.in_(SUPPORTED_MARKETS)
+        )
         rows = session.execute(
             select(
                 Symbol.symbol,
@@ -696,7 +1420,7 @@ def _exact_factor_stage_evidence(
             )
             .where(
                 model.market_date == market_date,
-                Symbol.market.in_(SUPPORTED_MARKETS),
+                membership_condition,
             )
             .order_by(Symbol.symbol.asc())
         ).all()
@@ -732,6 +1456,14 @@ def _exact_factor_stage_evidence(
                 symbols=observed_symbols,
             )
         )
+        observed_output_sha256, output_row_count = (
+            _derived_output_fingerprint(
+                session,
+                model=model,
+                market_date=market_date,
+                symbols=observed_symbols,
+            )
+        )
         result = {
             'market_date': date_key,
             'expected': expected_count,
@@ -750,6 +1482,10 @@ def _exact_factor_stage_evidence(
             'observed_membership_sha256': observed_membership_sha256,
             'expected_daily_price_input_sha256': expected_input_sha256,
             'observed_daily_price_input_sha256': observed_input_sha256,
+            'expected_output_row_count': expected_output_count,
+            'observed_output_row_count': output_row_count,
+            'expected_output_sha256': expected_output_sha256,
+            'observed_output_sha256': observed_output_sha256,
         }
         ready = bool(
             expected_count > 0
@@ -763,6 +1499,8 @@ def _exact_factor_stage_evidence(
             and observed_membership_sha256
             == expected_membership_sha256
             and observed_input_sha256 == expected_input_sha256
+            and output_row_count == expected_output_count == expected_count
+            and observed_output_sha256 == expected_output_sha256
         )
         result['ready'] = ready
         date_results.append(result)
@@ -783,7 +1521,15 @@ def _trending_evidence(
     required_dates: Sequence[date],
     rebuilt_after: datetime,
     raw_dependency_watermarks: dict[date, datetime],
+    frozen_symbols_by_date: Mapping[date, Sequence[str]] | None = None,
+    factor_rebuild_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    rebuild_metadata = dict(factor_rebuild_metadata or {})
+    try:
+        metadata_schema_version = int(rebuild_metadata['schema_version'])
+    except (KeyError, TypeError, ValueError):
+        metadata_schema_version = 0
+    date_scopes = dict(rebuild_metadata.get('dates') or {})
     fresh_row = case((DailyTrendingRank.updated_at >= rebuilt_after, 1))
     fresh_after_raw_row = case(
         (
@@ -794,53 +1540,72 @@ def _trending_evidence(
             1,
         )
     )
-    fresh_after_dependency_row = case(
-        (
-            _fresh_after_causal_dependency_condition(
-                market_date_column=DailyTrendingRank.market_date,
-                updated_at_column=DailyTrendingRank.updated_at,
-                raw_dependency_watermarks=raw_dependency_watermarks,
-            ),
-            1,
-        )
-    )
     top_absolute_rank = case(
         (
             DailyTrendingRank.absolute_rank <= 250,
             DailyTrendingRank.absolute_rank,
         )
     )
-    rows = session.execute(
-        select(
-            DailyTrendingRank.market_date,
-            DailyTrendingRank.period,
-            func.count(DailyTrendingRank.id),
-            func.count(DailyPriceBar.id),
-            func.count(fresh_row),
-            func.count(fresh_after_raw_row),
-            func.count(fresh_after_dependency_row),
-            func.count(top_absolute_rank),
-            func.count(func.distinct(top_absolute_rank)),
-            func.min(top_absolute_rank),
-            func.max(top_absolute_rank),
-            func.max(DailyTrendingRank.absolute_rank),
+    rows = []
+    for scope_dates, membership_condition in _historical_membership_scopes(
+        market_date_column=DailyTrendingRank.market_date,
+        required_dates=required_dates,
+        frozen_symbols_by_date=frozen_symbols_by_date,
+    ):
+        scoped_watermarks = {
+            market_date: raw_dependency_watermarks[market_date]
+            for market_date in scope_dates
+            if market_date in raw_dependency_watermarks
+        }
+        fresh_after_dependency_row = case(
+            (
+                _fresh_after_causal_dependency_condition(
+                    market_date_column=DailyTrendingRank.market_date,
+                    updated_at_column=DailyTrendingRank.updated_at,
+                    raw_dependency_watermarks=scoped_watermarks,
+                ),
+                1,
+            )
         )
-        .select_from(DailyTrendingRank)
-        .join(Symbol, Symbol.id == DailyTrendingRank.symbol_id)
-        .outerjoin(
-            DailyPriceBar,
-            and_(
-                DailyPriceBar.symbol_id == DailyTrendingRank.symbol_id,
-                DailyPriceBar.trade_date == DailyTrendingRank.market_date,
-            ),
+        rows.extend(
+            session.execute(
+                select(
+                    DailyTrendingRank.market_date,
+                    DailyTrendingRank.period,
+                    func.count(DailyTrendingRank.id),
+                    func.count(DailyPriceBar.id),
+                    func.count(fresh_row),
+                    func.count(fresh_after_raw_row),
+                    func.count(fresh_after_dependency_row),
+                    func.count(top_absolute_rank),
+                    func.count(func.distinct(top_absolute_rank)),
+                    func.min(top_absolute_rank),
+                    func.max(top_absolute_rank),
+                    func.max(DailyTrendingRank.absolute_rank),
+                )
+                .select_from(DailyTrendingRank)
+                .join(Symbol, Symbol.id == DailyTrendingRank.symbol_id)
+                .outerjoin(
+                    DailyPriceBar,
+                    and_(
+                        DailyPriceBar.symbol_id
+                        == DailyTrendingRank.symbol_id,
+                        DailyPriceBar.trade_date
+                        == DailyTrendingRank.market_date,
+                    ),
+                )
+                .where(
+                    membership_condition,
+                    DailyTrendingRank.period.in_(
+                        REQUIRED_TRENDING_PERIODS
+                    ),
+                )
+                .group_by(
+                    DailyTrendingRank.market_date,
+                    DailyTrendingRank.period,
+                )
+            ).all()
         )
-        .where(
-            DailyTrendingRank.market_date.in_(required_dates),
-            DailyTrendingRank.period.in_(REQUIRED_TRENDING_PERIODS),
-            Symbol.market.in_(SUPPORTED_MARKETS),
-        )
-        .group_by(DailyTrendingRank.market_date, DailyTrendingRank.period)
-    ).all()
     observed = {
         (row[0], str(row[1])): {
             'observed': int(row[2]),
@@ -865,22 +1630,73 @@ def _trending_evidence(
     issues: list[dict[str, Any]] = []
     total_rows = 0
     total_fresh = 0
+    output_fingerprints_verified = 0
     for market_date in required_dates:
         for period in REQUIRED_TRENDING_PERIODS:
-            counts = observed.get(
-                (market_date, period),
+            counts = dict(
+                observed.get(
+                    (market_date, period),
+                    {
+                        'observed': 0,
+                        'matched_price_rows': 0,
+                        'fresh': 0,
+                        'fresh_after_raw': 0,
+                        'fresh_after_dependency': 0,
+                        'top_absolute_rank_rows': 0,
+                        'distinct_top_absolute_ranks': 0,
+                        'minimum_absolute_rank': None,
+                        'maximum_top_absolute_rank': None,
+                        'maximum_absolute_rank': None,
+                    },
+                )
+            )
+            output_fingerprint_valid = False
+            expected_output_count: int | None = None
+            expected_output_sha256: str | None = None
+            observed_output_count: int | None = None
+            observed_output_sha256: str | None = None
+            try:
+                if metadata_schema_version != 2:
+                    raise ValueError('unsupported rebuild evidence schema')
+                output_scope = dict(
+                    dict(
+                        dict(date_scopes[market_date.isoformat()])[
+                            'trending_output_fingerprints'
+                        ]
+                    )[period]
+                )
+                expected_output_count = int(output_scope['row_count'])
+                expected_output_sha256 = str(
+                    output_scope['output_sha256']
+                )
+                if expected_output_count <= 0 or not expected_output_sha256:
+                    raise ValueError('invalid trending output fingerprint')
+                (
+                    observed_output_sha256,
+                    observed_output_count,
+                ) = _derived_output_fingerprint(
+                    session,
+                    model=DailyTrendingRank,
+                    market_date=market_date,
+                    symbols=None,
+                    periods=(period,),
+                )
+                output_fingerprint_valid = bool(
+                    observed_output_count == expected_output_count
+                    and observed_output_sha256 == expected_output_sha256
+                )
+            except (KeyError, TypeError, ValueError):
+                output_fingerprint_valid = False
+            if output_fingerprint_valid:
+                output_fingerprints_verified += 1
+            counts.update(
                 {
-                    'observed': 0,
-                    'matched_price_rows': 0,
-                    'fresh': 0,
-                    'fresh_after_raw': 0,
-                    'fresh_after_dependency': 0,
-                    'top_absolute_rank_rows': 0,
-                    'distinct_top_absolute_ranks': 0,
-                    'minimum_absolute_rank': None,
-                    'maximum_top_absolute_rank': None,
-                    'maximum_absolute_rank': None,
-                },
+                    'output_fingerprint_valid': output_fingerprint_valid,
+                    'expected_output_row_count': expected_output_count,
+                    'observed_output_row_count': observed_output_count,
+                    'expected_output_sha256': expected_output_sha256,
+                    'observed_output_sha256': observed_output_sha256,
+                }
             )
             total_rows += int(counts['observed'])
             total_fresh += int(counts['fresh'])
@@ -902,6 +1718,7 @@ def _trending_evidence(
                 or counts['minimum_absolute_rank'] != 1
                 or counts['maximum_top_absolute_rank']
                 != required_top_rank_count
+                or not output_fingerprint_valid
             ):
                 issues.append(
                     {
@@ -921,6 +1738,7 @@ def _trending_evidence(
         'periods_required': list(REQUIRED_TRENDING_PERIODS),
         'observed': total_rows,
         'fresh': total_fresh,
+        'output_fingerprints_verified': output_fingerprints_verified,
         'issues': issues[:20],
     }
 
@@ -932,9 +1750,14 @@ def _signal_context_rebuild_evidence(
     required_dates: Sequence[date],
 ) -> dict[str, Any]:
     metadata = dict(batch.evaluation_rebuild_metadata or {})
-    date_scopes = dict(
-        (metadata.get('deterministic_signal_contexts') or {}).get('dates') or {}
+    context_metadata = dict(
+        metadata.get('deterministic_signal_contexts') or {}
     )
+    date_scopes = dict(context_metadata.get('dates') or {})
+    try:
+        context_schema_version = int(context_metadata['schema_version'])
+    except (KeyError, TypeError, ValueError):
+        context_schema_version = 0
     try:
         rebuild_started_at = _normalize_datetime(metadata['run_started_at'])
     except (KeyError, TypeError, ValueError):
@@ -948,6 +1771,15 @@ def _signal_context_rebuild_evidence(
     for market_date in required_dates:
         date_key = market_date.isoformat()
         scope = dict(date_scopes.get(date_key) or {})
+        frozen_symbols = _frozen_signal_feature_symbols_for_batch(
+            batch=batch,
+            market_date=market_date,
+        )
+        frozen_membership_sha256 = (
+            market_membership_sha256(frozen_symbols)
+            if frozen_symbols is not None
+            else None
+        )
         try:
             expected_signal_count = int(scope['signal_feature_count'])
             expected_signal_sha256 = str(scope['signal_feature_sha256'])
@@ -963,12 +1795,65 @@ def _signal_context_rebuild_evidence(
             date_results.append(issue)
             continue
 
+        frozen_scope = {}
+        expected_scoped_signal_count: int | None = None
+        expected_scoped_signal_sha256: str | None = None
+        frozen_scope_metadata_valid = frozen_symbols is None
+        if frozen_symbols is not None:
+            frozen_scope = dict(
+                dict(scope.get('frozen_membership_scopes') or {}).get(
+                    frozen_membership_sha256,
+                )
+                or {}
+            )
+            try:
+                recorded_membership_count = int(
+                    frozen_scope['membership_count']
+                )
+                recorded_membership_sha256 = str(
+                    frozen_scope['membership_sha256']
+                )
+                expected_scoped_signal_count = int(
+                    frozen_scope['signal_feature_count']
+                )
+                expected_scoped_signal_sha256 = str(
+                    frozen_scope['signal_feature_sha256']
+                )
+            except (KeyError, TypeError, ValueError):
+                recorded_membership_count = 0
+                recorded_membership_sha256 = ''
+            frozen_scope_metadata_valid = bool(
+                context_schema_version == 2
+                and recorded_membership_count == len(frozen_symbols)
+                and recorded_membership_sha256
+                == frozen_membership_sha256
+                and expected_scoped_signal_count == len(frozen_symbols)
+                and expected_scoped_signal_count > 0
+                and expected_scoped_signal_sha256
+            )
+
         (
             observed_signal_sha256,
             observed_signal_count,
             minimum_signal_updated_at,
             maximum_signal_updated_at,
         ) = _signal_feature_fingerprint(session, market_date=market_date)
+        if frozen_symbols is not None:
+            (
+                observed_scoped_signal_sha256,
+                observed_scoped_signal_count,
+                minimum_scoped_signal_updated_at,
+                maximum_scoped_signal_updated_at,
+            ) = _signal_feature_fingerprint(
+                session,
+                market_date=market_date,
+                symbols=frozen_symbols,
+            )
+        else:
+            observed_scoped_signal_sha256 = observed_signal_sha256
+            observed_scoped_signal_count = observed_signal_count
+            minimum_scoped_signal_updated_at = minimum_signal_updated_at
+            maximum_scoped_signal_updated_at = maximum_signal_updated_at
         (
             observed_participation_sha256,
             observed_participation_count,
@@ -982,13 +1867,11 @@ def _signal_context_rebuild_evidence(
             market_date=market_date,
         )
         signal_fresh = bool(
-            observed_signal_count == 0
-            or (
-                minimum_signal_updated_at is not None
-                and minimum_signal_updated_at >= rebuild_started_at
-                and dependency_watermark is not None
-                and minimum_signal_updated_at >= dependency_watermark
-            )
+            observed_scoped_signal_count > 0
+            and minimum_scoped_signal_updated_at is not None
+            and minimum_scoped_signal_updated_at >= rebuild_started_at
+            and dependency_watermark is not None
+            and minimum_scoped_signal_updated_at >= dependency_watermark
         )
         participation_fresh = bool(
             participation_updated_at is not None
@@ -1006,6 +1889,16 @@ def _signal_context_rebuild_evidence(
             and observed_signal_count == expected_signal_count
             and observed_signal_sha256 == expected_signal_sha256
             and signal_fresh
+            and frozen_scope_metadata_valid
+            and (
+                frozen_symbols is None
+                or (
+                    observed_scoped_signal_count
+                    == expected_scoped_signal_count
+                    and observed_scoped_signal_sha256
+                    == expected_scoped_signal_sha256
+                )
+            )
             and observed_participation_count == 1
             and observed_participation_sha256
             == expected_participation_sha256
@@ -1019,6 +1912,28 @@ def _signal_context_rebuild_evidence(
             'expected_signal_feature_sha256': expected_signal_sha256,
             'observed_signal_feature_sha256': observed_signal_sha256,
             'signal_features_fresh': signal_fresh,
+            'frozen_scope_required': frozen_symbols is not None,
+            'frozen_scope_metadata_valid': frozen_scope_metadata_valid,
+            'expected_frozen_membership_count': (
+                len(frozen_symbols)
+                if frozen_symbols is not None
+                else None
+            ),
+            'expected_frozen_membership_sha256': (
+                frozen_membership_sha256
+            ),
+            'expected_scoped_signal_feature_count': (
+                expected_scoped_signal_count
+            ),
+            'observed_scoped_signal_feature_count': (
+                observed_scoped_signal_count
+            ),
+            'expected_scoped_signal_feature_sha256': (
+                expected_scoped_signal_sha256
+            ),
+            'observed_scoped_signal_feature_sha256': (
+                observed_scoped_signal_sha256
+            ),
             'observed_market_participation_count': (
                 observed_participation_count
             ),
@@ -1303,6 +2218,401 @@ def _cached_verification_evidence(
     return deepcopy(cache[key])
 
 
+def _missing_bar_insert_repair_evidence(
+    session: Any,
+    *,
+    batch: DailyPriceBarRepairBatch,
+) -> dict[str, Any]:
+    """Verify the durable raw-input evidence for a missing-row insertion.
+
+    ``daily_price_bar_repair_audits`` is intentionally limited by schema to
+    KIS before/after corrections.  Missing PyKRX rows have no truthful
+    before-image, so their exact insert scope is retained on the existing
+    repair batch instead of fabricating a KIS audit record.
+    """
+
+    metadata = dict(batch.verification_metadata or {})
+    recorded = dict(metadata.get('repair_evidence') or {})
+    issues: list[str] = []
+    try:
+        market_date = _normalize_date(recorded['market_date'])
+        inserted_symbols = sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in recorded['inserted_symbols']
+                if str(symbol).strip()
+            }
+        )
+        inserted_symbol_count = int(recorded['inserted_symbol_count'])
+        expected_scope_sha256 = str(
+            recorded['inserted_price_input_sha256']
+        ).strip().lower()
+        expected_provider_count = int(
+            recorded['expected_provider_membership_count']
+        )
+        expected_provider_sha256 = str(
+            recorded['expected_provider_membership_sha256']
+        ).strip().lower()
+        expected_provider_payload_sha256 = str(
+            recorded['expected_provider_payload_sha256']
+        ).strip().lower()
+        provider_price_input_sha256 = str(
+            recorded['provider_price_input_sha256']
+        ).strip().lower()
+        provider_manifest = dict(recorded['provider_membership_manifest'])
+        raw_markets = dict(provider_manifest['markets'])
+        provider_symbols = sorted(
+            str(symbol).strip().upper()
+            for market_entry in raw_markets.values()
+            for symbol in dict(market_entry).get('symbols') or []
+            if str(symbol).strip()
+        )
+        price_dependent_symbols = sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in recorded['price_dependent_membership_symbols']
+                if str(symbol).strip()
+            }
+        )
+        price_dependent_count = int(
+            recorded['price_dependent_membership_count']
+        )
+        price_dependent_sha256 = str(
+            recorded['price_dependent_membership_sha256']
+        ).strip().lower()
+        reviewed_missing_count = int(
+            recorded['reviewed_missing_symbol_count']
+        )
+        reviewed_missing_sha256 = str(
+            recorded['reviewed_missing_membership_sha256']
+        ).strip().lower()
+        raw_membership_by_date = dict(
+            recorded['price_dependent_membership_by_date']
+        )
+        fallback_manifest_count = int(
+            recorded.get('downstream_fallback_manifest_count', 0)
+        )
+        fallback_bundle_sha256 = str(
+            recorded.get('downstream_fallback_bundle_sha256')
+            or _stable_json_sha256(
+                {
+                    'schema_version': (
+                        'missing_bar_downstream_membership_v1'
+                    ),
+                    'manifests': {},
+                }
+            )
+        ).strip().lower()
+        membership_by_date: dict[date, tuple[str, ...]] = {}
+        membership_evidence_by_date: dict[date, dict[str, Any]] = {}
+        for raw_market_date, raw_scope in raw_membership_by_date.items():
+            scope_market_date = _normalize_date(raw_market_date)
+            if scope_market_date in membership_by_date:
+                raise ValueError('duplicate frozen date membership scope')
+            scope = dict(raw_scope)
+            raw_scope_symbols = [
+                str(symbol).strip().upper()
+                for symbol in scope['symbols']
+                if str(symbol).strip()
+            ]
+            scope_symbols = tuple(sorted(set(raw_scope_symbols)))
+            scope_count = int(scope['symbol_count'])
+            scope_membership_sha256 = str(
+                scope['membership_sha256']
+            ).strip().lower()
+            scope_input_sha256 = str(
+                scope['daily_price_input_sha256']
+            ).strip().lower()
+            if (
+                len(raw_scope_symbols) != len(scope_symbols)
+                or scope_count != len(scope_symbols)
+                or scope_count <= 0
+                or scope_membership_sha256
+                != market_membership_sha256(scope_symbols)
+                or len(scope_input_sha256) != 64
+                or any(
+                    character not in '0123456789abcdef'
+                    for character in scope_input_sha256
+                )
+            ):
+                raise ValueError('invalid frozen date membership scope')
+            membership_by_date[scope_market_date] = scope_symbols
+            membership_evidence_by_date[scope_market_date] = scope
+    except (KeyError, TypeError, ValueError):
+        return {
+            'ready': False,
+            'repair_kind': 'missing_bar_insert',
+            'issues': ['missing_bar_insert_evidence_missing_or_invalid'],
+            'recorded': recorded,
+        }
+
+    affected_symbols = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in batch.affected_symbols or []
+            if str(symbol).strip()
+        }
+    )
+    affected_dates = sorted(
+        {
+            _normalize_date(value)
+            for value in batch.affected_trade_dates or []
+        }
+    )
+    if str(recorded.get('schema_version') or '') != 'missing_bar_insert_v3':
+        issues.append('missing_bar_insert_schema_version_invalid')
+    if str(recorded.get('provider') or '') != 'pykrx':
+        issues.append('missing_bar_insert_provider_invalid')
+    if inserted_symbol_count <= 0 or inserted_symbol_count != len(
+        inserted_symbols
+    ):
+        issues.append('missing_bar_insert_symbol_count_invalid')
+    if inserted_symbol_count != int(batch.repaired_row_count):
+        issues.append('missing_bar_insert_repaired_row_count_mismatch')
+    if inserted_symbols != affected_symbols:
+        issues.append('missing_bar_insert_affected_symbols_mismatch')
+    if affected_dates != [market_date]:
+        issues.append('missing_bar_insert_affected_trade_dates_mismatch')
+    if expected_provider_count < inserted_symbol_count:
+        issues.append('missing_bar_insert_provider_membership_count_invalid')
+    if len(expected_provider_sha256) != 64 or any(
+        character not in '0123456789abcdef'
+        for character in expected_provider_sha256
+    ):
+        issues.append('missing_bar_insert_provider_membership_sha256_invalid')
+    if len(expected_provider_payload_sha256) != 64 or any(
+        character not in '0123456789abcdef'
+        for character in expected_provider_payload_sha256
+    ):
+        issues.append('missing_bar_insert_provider_payload_sha256_invalid')
+    manifest_symbols_by_market = validate_market_membership_snapshot(
+        provider_manifest,
+        requested_symbols=provider_symbols,
+        markets=('KOSPI', 'KOSDAQ', 'KONEX'),
+    )
+    if (
+        manifest_symbols_by_market is None
+        or expected_provider_count != len(provider_symbols)
+        or expected_provider_sha256
+        != market_membership_sha256(provider_symbols)
+        or provider_manifest.get('membership_sha256')
+        != expected_provider_sha256
+    ):
+        issues.append('missing_bar_insert_provider_manifest_invalid')
+    expected_price_dependent_symbols = sorted(
+        symbol
+        for market in ('KOSPI', 'KOSDAQ')
+        for symbol in (
+            (manifest_symbols_by_market or {}).get(market) or []
+        )
+    )
+    if (
+        price_dependent_symbols != expected_price_dependent_symbols
+        or price_dependent_count != len(price_dependent_symbols)
+        or price_dependent_sha256
+        != market_membership_sha256(price_dependent_symbols)
+    ):
+        issues.append(
+            'missing_bar_insert_price_dependent_manifest_invalid'
+        )
+    required_dates = _normalize_required_dates(
+        batch.required_rebuild_trade_dates
+    )
+    if set(membership_by_date) != set(required_dates):
+        issues.append('missing_bar_insert_frozen_membership_dates_mismatch')
+    if tuple(price_dependent_symbols) != membership_by_date.get(
+        market_date,
+        (),
+    ):
+        issues.append('missing_bar_insert_target_frozen_membership_mismatch')
+    for required_date in required_dates:
+        scope = membership_evidence_by_date.get(required_date, {})
+        basis = str(scope.get('basis') or '')
+        if required_date == market_date:
+            if basis != 'reviewed_live_provider_membership':
+                issues.append(
+                    'missing_bar_insert_target_membership_basis_invalid'
+                )
+        else:
+            run_id = scope.get('eod_run_id')
+            stored_proof_valid = (
+                basis == 'validated_eod_run_market_membership'
+                and not isinstance(run_id, bool)
+                and isinstance(run_id, int)
+                and run_id > 0
+                and str(scope.get('eod_run_source') or '') == 'pykrx'
+            )
+            if stored_proof_valid:
+                stored_run = session.get(EODCollectionRun, run_id)
+                if stored_run is None:
+                    stored_proof_valid = False
+                    issues.append(
+                        'missing_bar_insert_stored_membership_run_missing'
+                    )
+                else:
+                    # Import locally because missing_bar_repair owns the
+                    # canonical stored-run validator and imports this module's
+                    # price fingerprint helper.  Reusing it here keeps the
+                    # preparation and completion gates identical without a
+                    # module-import cycle.
+                    from app.eod.missing_bar_repair import (
+                        _strict_stored_price_dependent_membership,
+                    )
+
+                    try:
+                        strict_symbols = tuple(
+                            _strict_stored_price_dependent_membership(
+                                stored_run,
+                                market_date=required_date,
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        stored_proof_valid = False
+                        issues.append(
+                            'missing_bar_insert_stored_membership_lineage_invalid'
+                        )
+                    else:
+                        if strict_symbols != membership_by_date.get(
+                            required_date,
+                            (),
+                        ):
+                            stored_proof_valid = False
+                            issues.append(
+                                'missing_bar_insert_stored_membership_scope_mismatch'
+                            )
+            live_membership = scope.get('market_membership')
+            live_membership_valid = (
+                basis == 'reviewed_live_exact_date_pykrx_membership'
+                and run_id is None
+                and str(scope.get('eod_run_source') or '') == 'pykrx'
+                and str(scope.get('source') or '') == 'pykrx'
+                and str(scope.get('universe_source') or '')
+                == 'pykrx_market_ohlcv'
+                and str(scope.get('market_date') or '')
+                == required_date.isoformat()
+                and scope.get('markets') == list(SUPPORTED_MARKETS)
+                and scope.get('daily_price_input_count')
+                == len(membership_by_date.get(required_date, ()))
+                and validate_market_membership_snapshot(
+                    live_membership,
+                    requested_symbols=list(
+                        membership_by_date.get(required_date, ())
+                    ),
+                    markets=SUPPORTED_MARKETS,
+                )
+                is not None
+                and all(
+                    len(
+                        dict(live_membership or {})
+                        .get('markets', {})
+                        .get(market, {})
+                        .get('symbols', [])
+                    )
+                    >= MINIMUM_MARKET_MEMBERSHIP[market]
+                    for market in SUPPORTED_MARKETS
+                )
+            )
+            if not stored_proof_valid and not live_membership_valid:
+                issues.append(
+                    'missing_bar_insert_downstream_membership_basis_invalid'
+                )
+    live_fallback_manifests = {
+        scope_date.isoformat(): membership_evidence_by_date[scope_date]
+        for scope_date in sorted(membership_evidence_by_date)
+        if membership_evidence_by_date[scope_date].get('basis')
+        == 'reviewed_live_exact_date_pykrx_membership'
+    }
+    observed_fallback_bundle_sha256 = _stable_json_sha256(
+        {
+            'schema_version': 'missing_bar_downstream_membership_v1',
+            'manifests': live_fallback_manifests,
+        }
+    )
+    if (
+        fallback_manifest_count != len(live_fallback_manifests)
+        or fallback_bundle_sha256 != observed_fallback_bundle_sha256
+    ):
+        issues.append('missing_bar_insert_downstream_fallback_bundle_invalid')
+    if (
+        reviewed_missing_count != inserted_symbol_count
+        or reviewed_missing_sha256
+        != market_membership_sha256(inserted_symbols)
+    ):
+        issues.append('missing_bar_insert_reviewed_missing_scope_invalid')
+
+    observed_scope_sha256, observed_scope_count = (
+        exact_daily_price_bar_scope_fingerprint(
+            session,
+            market_date=market_date,
+            symbols=inserted_symbols,
+        )
+    )
+    if observed_scope_count != inserted_symbol_count:
+        issues.append('missing_bar_insert_scope_count_mismatch')
+    if observed_scope_sha256 != expected_scope_sha256:
+        issues.append('missing_bar_insert_scope_sha256_mismatch')
+    observed_provider_sha256, observed_provider_count = (
+        exact_daily_price_bar_scope_fingerprint(
+            session,
+            market_date=market_date,
+            symbols=provider_symbols,
+        )
+    )
+    if observed_provider_count != expected_provider_count:
+        issues.append('missing_bar_insert_provider_scope_count_mismatch')
+    if observed_provider_sha256 != provider_price_input_sha256:
+        issues.append('missing_bar_insert_provider_scope_sha256_mismatch')
+    observed_membership_counts: dict[str, int] = {}
+    for scope_date, scope_symbols in membership_by_date.items():
+        observed_membership_sha256, scope_count = (
+            exact_daily_price_bar_scope_fingerprint(
+                session,
+                market_date=scope_date,
+                symbols=scope_symbols,
+            )
+        )
+        expected_membership_input_sha256 = str(
+            membership_evidence_by_date[scope_date][
+                'daily_price_input_sha256'
+            ]
+        ).strip().lower()
+        observed_membership_counts[scope_date.isoformat()] = scope_count
+        if scope_count != len(scope_symbols):
+            issues.append(
+                'missing_bar_insert_frozen_membership_price_scope_missing'
+            )
+        if observed_membership_sha256 != expected_membership_input_sha256:
+            issues.append(
+                'missing_bar_insert_frozen_membership_input_sha256_mismatch'
+            )
+    return {
+        'ready': not issues,
+        'repair_kind': 'missing_bar_insert',
+        'market_date': market_date.isoformat(),
+        'inserted_symbol_count': inserted_symbol_count,
+        'observed_scope_count': observed_scope_count,
+        'expected_scope_sha256': expected_scope_sha256,
+        'observed_scope_sha256': observed_scope_sha256,
+        'provider_membership_count': expected_provider_count,
+        'observed_provider_scope_count': observed_provider_count,
+        'expected_provider_scope_sha256': provider_price_input_sha256,
+        'observed_provider_scope_sha256': observed_provider_sha256,
+        'expected_provider_payload_sha256': (
+            expected_provider_payload_sha256
+        ),
+        'price_dependent_membership_symbols': price_dependent_symbols,
+        'price_dependent_membership_count': price_dependent_count,
+        'price_dependent_membership_sha256': price_dependent_sha256,
+        'price_dependent_membership_by_date': {
+            scope_date.isoformat(): list(scope_symbols)
+            for scope_date, scope_symbols in membership_by_date.items()
+        },
+        'observed_membership_counts_by_date': observed_membership_counts,
+        'issues': issues,
+        'recorded': recorded,
+    }
+
+
 def _collect_batch_verification(
     session: Any,
     *,
@@ -1330,15 +2640,64 @@ def _collect_batch_verification(
         )
         or 0
     )
-    if audit_count != int(batch.repaired_row_count):
-        issues.append('repair_audit_count_mismatch')
+    repair_metadata = dict(
+        getattr(batch, 'verification_metadata', None) or {}
+    )
+    repair_evidence_payload = dict(
+        repair_metadata.get('repair_evidence') or {}
+    )
+    if (
+        repair_evidence_payload.get('repair_kind')
+        == 'missing_bar_insert'
+    ):
+        repair_evidence = _missing_bar_insert_repair_evidence(
+            session,
+            batch=batch,
+        )
+        issues.extend(repair_evidence['issues'])
+    else:
+        repair_evidence = {
+            'ready': audit_count == int(batch.repaired_row_count),
+            'repair_kind': 'kis_final_bar_update',
+            'issues': (
+                []
+                if audit_count == int(batch.repaired_row_count)
+                else ['repair_audit_count_mismatch']
+            ),
+        }
+        if not repair_evidence['ready']:
+            issues.append('repair_audit_count_mismatch')
+
+    frozen_symbols_by_date: dict[date, tuple[str, ...]] = {}
+    if repair_evidence_payload.get('repair_kind') == 'missing_bar_insert':
+        raw_frozen_by_date = dict(
+            repair_evidence.get('price_dependent_membership_by_date') or {}
+        )
+        for required_date in required_dates:
+            frozen_symbols_by_date[required_date] = tuple(
+                raw_frozen_by_date.get(required_date.isoformat()) or ()
+            )
+        if any(
+            not frozen_symbols_by_date[required_date]
+            for required_date in required_dates
+        ):
+            issues.append('missing_bar_insert_frozen_membership_invalid')
+    frozen_scope_key = tuple(
+        (
+            market_date,
+            len(symbols),
+            market_membership_sha256(symbols),
+        )
+        for market_date, symbols in sorted(frozen_symbols_by_date.items())
+    )
 
     expected_counts = _cached_verification_evidence(
         cache,
-        ('expected_price_counts', required_dates),
+        ('expected_price_counts', required_dates, frozen_scope_key),
         lambda: _expected_price_counts(
             session,
             required_dates=required_dates,
+            frozen_symbols_by_date=frozen_symbols_by_date,
         ),
     )
     missing_price_dates = [
@@ -1351,10 +2710,11 @@ def _collect_batch_verification(
 
     raw_dependency_watermarks = _cached_verification_evidence(
         cache,
-        ('raw_dependency_watermarks', required_dates),
+        ('raw_dependency_watermarks', required_dates, frozen_scope_key),
         lambda: _causal_raw_dependency_watermarks(
             session,
             required_dates=required_dates,
+            frozen_symbols_by_date=frozen_symbols_by_date,
         ),
     )
     raw_dependency_watermark = (
@@ -1377,6 +2737,7 @@ def _collect_batch_verification(
             required_dates,
             expected_count_key,
             watermark_key,
+            frozen_scope_key,
             newest_created_at,
         )
         evidence = _cached_verification_evidence(
@@ -1389,6 +2750,7 @@ def _collect_batch_verification(
                 expected_counts=expected_counts,
                 rebuilt_after=newest_created_at,
                 raw_dependency_watermarks=raw_dependency_watermarks,
+                frozen_symbols_by_date=frozen_symbols_by_date,
             ),
         )
         # A ready result at the newest threshold has every row fresh, so the
@@ -1404,6 +2766,7 @@ def _collect_batch_verification(
                     required_dates,
                     expected_count_key,
                     watermark_key,
+                    frozen_scope_key,
                     batch.created_at,
                 ),
                 lambda: _full_coverage_stage_evidence(
@@ -1413,6 +2776,7 @@ def _collect_batch_verification(
                     expected_counts=expected_counts,
                     rebuilt_after=batch.created_at,
                     raw_dependency_watermarks=raw_dependency_watermarks,
+                    frozen_symbols_by_date=frozen_symbols_by_date,
                 ),
             )
         stages[stage_id] = evidence
@@ -1436,13 +2800,16 @@ def _collect_batch_verification(
                 required_dates,
                 factor_metadata_key,
                 watermark_key,
+                frozen_scope_key,
             ),
             lambda: _exact_factor_stage_evidence(
                 session,
+                stage_id=stage_id,
                 model=model,
                 required_dates=required_dates,
                 factor_rebuild_metadata=factor_rebuild_metadata,
                 raw_dependency_watermarks=raw_dependency_watermarks,
+                frozen_symbols_by_date=frozen_symbols_by_date,
             ),
         )
         stages[stage_id] = evidence
@@ -1451,12 +2818,21 @@ def _collect_batch_verification(
 
     trending = _cached_verification_evidence(
         cache,
-        ('trending', required_dates, watermark_key, newest_created_at),
+        (
+            'trending',
+            required_dates,
+            factor_metadata_key,
+            watermark_key,
+            frozen_scope_key,
+            newest_created_at,
+        ),
         lambda: _trending_evidence(
             session,
             required_dates=required_dates,
             rebuilt_after=newest_created_at,
             raw_dependency_watermarks=raw_dependency_watermarks,
+            frozen_symbols_by_date=frozen_symbols_by_date,
+            factor_rebuild_metadata=factor_rebuild_metadata,
         ),
     )
     # Trending freshness has the same monotonic threshold property above.
@@ -1466,7 +2842,9 @@ def _collect_batch_verification(
             (
                 'trending',
                 required_dates,
+                factor_metadata_key,
                 watermark_key,
+                frozen_scope_key,
                 batch.created_at,
             ),
             lambda: _trending_evidence(
@@ -1474,6 +2852,8 @@ def _collect_batch_verification(
                 required_dates=required_dates,
                 rebuilt_after=batch.created_at,
                 raw_dependency_watermarks=raw_dependency_watermarks,
+                frozen_symbols_by_date=frozen_symbols_by_date,
+                factor_rebuild_metadata=factor_rebuild_metadata,
             ),
         )
     stages['trending_ranks'] = trending
@@ -1500,7 +2880,7 @@ def _collect_batch_verification(
     if not evaluations['ready']:
         issues.append('price_dependent_decision_evaluations_incomplete_or_stale')
 
-    return {
+    result = {
         'repair_batch_id': batch.repair_batch_id,
         'ready': not issues,
         'repaired_row_count': int(batch.repaired_row_count),
@@ -1522,6 +2902,9 @@ def _collect_batch_verification(
         'issues': issues,
         'verified_at': datetime.now(timezone.utc).isoformat(),
     }
+    if repair_evidence_payload.get('repair_kind') == 'missing_bar_insert':
+        result['repair_evidence'] = repair_evidence
+    return result
 
 
 def _slim_rebuild_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -1603,6 +2986,13 @@ def _rebuild_pending_price_dependent_evaluations_locked(
     )
     if not required_rebuild_dates:
         raise RuntimeError('pending repair batches have no rebuild dates')
+    (
+        frozen_signal_union_by_date,
+        frozen_signal_scopes_by_date,
+    ) = _pending_frozen_signal_feature_scopes(
+        pending=pending,
+        required_dates=required_rebuild_dates,
+    )
     run_started_at = datetime.now(timezone.utc)
 
     # These services read already persisted feedback/decision snapshots only.
@@ -1661,9 +3051,16 @@ def _rebuild_pending_price_dependent_evaluations_locked(
 
     deterministic_signal_dates: dict[str, dict[str, Any]] = {}
     for rebuild_date in required_rebuild_dates:
+        exact_symbols = frozen_signal_union_by_date.get(rebuild_date)
+        signal_rebuild_kwargs: dict[str, Any] = {
+            'market_date': rebuild_date,
+        }
+        if exact_symbols is not None:
+            signal_rebuild_kwargs['exact_symbols'] = exact_symbols
         signal_result = (
-            daily_signal_feature_service.rebuild_stored_owned_fallback_for_market_date(
-                market_date=rebuild_date
+            daily_signal_feature_service.
+            rebuild_stored_owned_fallback_for_market_date(
+                **signal_rebuild_kwargs
             )
         )
         participation_result = (
@@ -1671,8 +3068,10 @@ def _rebuild_pending_price_dependent_evaluations_locked(
                 market_date=rebuild_date,
                 market='KRX',
                 source=SIGNAL_FEATURE_SOURCE,
+                exact_symbols=exact_symbols,
             )
         )
+        frozen_scope_evidence: dict[str, dict[str, Any]] = {}
         with session_scope(
             statement_timeout_ms=(
                 settings.price_bar_repair_db_statement_timeout_ms
@@ -1695,22 +3094,115 @@ def _rebuild_pending_price_dependent_evaluations_locked(
                 session,
                 market_date=rebuild_date,
             )
+            for (
+                membership_sha256,
+                scope_symbols,
+            ) in sorted(
+                (
+                    frozen_signal_scopes_by_date.get(rebuild_date)
+                    or {}
+                ).items()
+            ):
+                (
+                    scope_signal_sha256,
+                    scope_signal_count,
+                    scope_minimum_updated_at,
+                    scope_maximum_updated_at,
+                ) = _signal_feature_fingerprint(
+                    session,
+                    market_date=rebuild_date,
+                    symbols=scope_symbols,
+                )
+                if scope_signal_count != len(scope_symbols):
+                    raise RuntimeError(
+                        'deterministic signal-context rebuild did not cover '
+                        'frozen membership for '
+                        f'{rebuild_date.isoformat()}: expected='
+                        f'{len(scope_symbols)}, observed={scope_signal_count}, '
+                        f'membership_sha256={membership_sha256}'
+                    )
+                frozen_scope_evidence[membership_sha256] = {
+                    'membership_count': len(scope_symbols),
+                    'membership_sha256': membership_sha256,
+                    'signal_feature_count': scope_signal_count,
+                    'signal_feature_sha256': scope_signal_sha256,
+                    'minimum_signal_feature_updated_at': (
+                        scope_minimum_updated_at.isoformat()
+                        if scope_minimum_updated_at is not None
+                        else None
+                    ),
+                    'maximum_signal_feature_updated_at': (
+                        scope_maximum_updated_at.isoformat()
+                        if scope_maximum_updated_at is not None
+                        else None
+                    ),
+                }
         persisted_signal_count = int(
             signal_result.get('features_persisted') or 0
         )
         captured_symbol_count = int(
             participation_result.get('captured_symbol_count') or 0
         )
+        expected_persisted_count = (
+            len(exact_symbols)
+            if exact_symbols is not None
+            else signal_count
+        )
+        expected_participation_count = expected_persisted_count
+        if exact_symbols is not None:
+            returned_scope_count = int(
+                signal_result.get('scope_symbol_count') or 0
+            )
+            returned_scope_sha256 = str(
+                signal_result.get('scope_membership_sha256') or ''
+            )
+            expected_scope_sha256 = market_membership_sha256(
+                exact_symbols
+            )
+            if (
+                signal_result.get('exact_scope') is not True
+                or returned_scope_count != len(exact_symbols)
+                or returned_scope_sha256 != expected_scope_sha256
+            ):
+                raise RuntimeError(
+                    'deterministic signal-context rebuild scope mismatch for '
+                    f'{rebuild_date.isoformat()}: expected_count='
+                    f'{len(exact_symbols)}, returned_count='
+                    f'{returned_scope_count}, expected_sha256='
+                    f'{expected_scope_sha256}, returned_sha256='
+                    f'{returned_scope_sha256}'
+                )
+            participation_scope_count = int(
+                participation_result.get('scope_symbol_count') or 0
+            )
+            participation_scope_sha256 = str(
+                participation_result.get('scope_membership_sha256') or ''
+            )
+            if (
+                participation_result.get('exact_scope') is not True
+                or participation_scope_count != len(exact_symbols)
+                or participation_scope_sha256 != expected_scope_sha256
+            ):
+                raise RuntimeError(
+                    'deterministic participation-context scope mismatch for '
+                    f'{rebuild_date.isoformat()}: expected_count='
+                    f'{len(exact_symbols)}, returned_count='
+                    f'{participation_scope_count}, expected_sha256='
+                    f'{expected_scope_sha256}, returned_sha256='
+                    f'{participation_scope_sha256}'
+                )
         if not (
-            persisted_signal_count == signal_count
-            and captured_symbol_count == signal_count
+            persisted_signal_count == expected_persisted_count
+            and captured_symbol_count == expected_participation_count
             and participation_count == 1
             and participation_updated_at is not None
         ):
             raise RuntimeError(
                 'deterministic signal-context rebuild count mismatch for '
                 f'{rebuild_date.isoformat()}: persisted={persisted_signal_count}, '
-                f'observed={signal_count}, participation_symbols='
+                f'expected_persisted={expected_persisted_count}, '
+                f'observed={signal_count}, expected_participation='
+                f'{expected_participation_count}, participation_symbols='
                 f'{captured_symbol_count}, participation_rows='
                 f'{participation_count}'
             )
@@ -1734,6 +3226,17 @@ def _rebuild_pending_price_dependent_evaluations_locked(
             'preserved_direct_source_rows': int(
                 signal_result.get('preserved_direct_source_rows') or 0
             ),
+            'exact_scope_union_count': (
+                len(exact_symbols)
+                if exact_symbols is not None
+                else None
+            ),
+            'exact_scope_union_sha256': (
+                market_membership_sha256(exact_symbols)
+                if exact_symbols is not None
+                else None
+            ),
+            'frozen_membership_scopes': frozen_scope_evidence,
         }
 
     post_decision_result = (
@@ -1883,7 +3386,7 @@ def _rebuild_pending_price_dependent_evaluations_locked(
         'run_started_at': run_started_at.isoformat(),
         'rebuilt_at': rebuilt_at.isoformat(),
         'deterministic_signal_contexts': {
-            'schema_version': 1,
+            'schema_version': 2,
             'dates': deterministic_signal_dates,
         },
         'post_decision': _slim_rebuild_result(post_decision_result),
@@ -1948,6 +3451,24 @@ def verify_pending_price_bar_rebuilds(*, apply: bool = False) -> dict[str, Any]:
             'completed_batch_count': 0,
             'batches': [],
         }
+    pending_batch_ids = tuple(
+        sorted(
+            {
+                str(batch.get('repair_batch_id') or '').strip()
+                for batch in pending
+                if str(batch.get('repair_batch_id') or '').strip()
+            }
+        )
+    )
+    if len(pending_batch_ids) != len(pending):
+        return {
+            'status': 'blocked',
+            'applied': False,
+            'reason': 'pending_repair_batch_identity_invalid',
+            'pending_batch_count': len(pending),
+            'completed_batch_count': 0,
+            'batches': [],
+        }
     with advisory_eod_collection_locks(
         market='KRX',
         trade_dates=lock_dates,
@@ -1963,13 +3484,25 @@ def verify_pending_price_bar_rebuilds(*, apply: bool = False) -> dict[str, Any]:
                 'completed_batch_count': 0,
                 'batches': [],
             }
-        return _verify_pending_price_bar_rebuilds_locked(apply=apply)
+        return _verify_pending_price_bar_rebuilds_locked(
+            apply=apply,
+            expected_batch_ids=pending_batch_ids,
+        )
 
 
 def _verify_pending_price_bar_rebuilds_locked(
     *,
     apply: bool,
+    expected_batch_ids: Sequence[str],
 ) -> dict[str, Any]:
+    normalized_batch_ids = tuple(
+        sorted({str(batch_id).strip() for batch_id in expected_batch_ids})
+    )
+    if (
+        len(normalized_batch_ids) != len(expected_batch_ids)
+        or any(not batch_id for batch_id in normalized_batch_ids)
+    ):
+        raise ValueError('expected pending repair batch ids must be unique')
     completed_at = datetime.now(timezone.utc)
     with session_scope(
         statement_timeout_ms=(
@@ -1978,7 +3511,12 @@ def _verify_pending_price_bar_rebuilds_locked(
     ) as session:
         statement = (
             select(DailyPriceBarRepairBatch)
-            .where(DailyPriceBarRepairBatch.status == 'pending')
+            .where(
+                DailyPriceBarRepairBatch.status == 'pending',
+                DailyPriceBarRepairBatch.repair_batch_id.in_(
+                    normalized_batch_ids
+                ),
+            )
             .order_by(
                 DailyPriceBarRepairBatch.created_at.asc(),
                 DailyPriceBarRepairBatch.repair_batch_id.asc(),
@@ -1987,12 +3525,15 @@ def _verify_pending_price_bar_rebuilds_locked(
         if apply:
             statement = statement.with_for_update()
         batches = session.scalars(statement).all()
-        if not batches:
+        loaded_batch_ids = tuple(
+            sorted(str(batch.repair_batch_id) for batch in batches)
+        )
+        if loaded_batch_ids != normalized_batch_ids:
             return {
-                'status': 'completed' if apply else 'ready',
-                'applied': apply,
-                'reason': 'no_pending_repair_batches',
-                'pending_batch_count': 0,
+                'status': 'blocked',
+                'applied': False,
+                'reason': 'pending_repair_batches_changed',
+                'pending_batch_count': len(batches),
                 'completed_batch_count': 0,
                 'batches': [],
             }

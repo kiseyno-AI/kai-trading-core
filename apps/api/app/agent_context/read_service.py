@@ -5941,6 +5941,17 @@ def _build_decider_flow_short_selling_quality_context(
         status = _summarize_overall_decider_quality_status([investor_flow_state, short_selling_state])
     investor_flow_payload = _maybe_dict(investor_flow_context)
     short_payload = _maybe_dict(short_selling_context)
+    short_balance_payload = _maybe_dict(short_payload.get('short_balance'))
+    has_short_balance = all(
+        _finite_float(short_balance_payload.get(key)) is not None
+        for key in (
+            'short_balance_qty',
+            'listed_shares',
+            'short_balance_amount',
+            'market_cap',
+            'short_balance_ratio_pct',
+        )
+    )
     return {
         'status': status,
         'investor_flow': {
@@ -5955,7 +5966,7 @@ def _build_decider_flow_short_selling_quality_context(
             'status': short_selling_state,
             'source_status': short_payload.get('status'),
             'has_short_volume': bool(_maybe_dict(short_payload.get('short_volume'))),
-            'has_short_balance': bool(_maybe_dict(short_payload.get('short_balance'))),
+            'has_short_balance': has_short_balance,
             'missing_fields': list(short_payload.get('missing_fields') or []),
             'freshness': _compact_provenance_summary(short_selling_provenance),
         },

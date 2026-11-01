@@ -319,6 +319,36 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event['failed_symbols'][-1].startswith('... ('))
         self.assertTrue(event['error_message'].endswith('...'))
 
+    async def test_fetch_operation_logging_bounds_nested_mappings_without_hiding_diagnostics(
+        self,
+    ):
+        nested = {f'field_{index:03d}': index for index in range(60)}
+        nested.update(
+            {
+                'error_message': 'provider response was incomplete',
+                'pipeline_run_id': 596,
+                'symbols_failed': 3,
+            }
+        )
+
+        audit_logging.log_fetch_event(
+            service='pykrx',
+            operation='run_daily_pipeline_if_due',
+            status='failed',
+            result=nested,
+        )
+
+        event = self._read_log_lines('upstream-http.log')[-1]
+        result = event['result']
+        self.assertLessEqual(len(result), 26)
+        self.assertEqual(
+            result['error_message'],
+            'provider response was incomplete',
+        )
+        self.assertEqual(result['pipeline_run_id'], 596)
+        self.assertEqual(result['symbols_failed'], 3)
+        self.assertEqual(result['_omitted_field_count'], 38)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -4301,27 +4301,31 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
             isolation_level='AUTOCOMMIT'
         )
         calls = connection.execute.call_args_list
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 8)
         self.assertEqual(
-            [call.args[1] for call in calls[:3]],
+            [call.args[1] for call in calls[:4]],
             [
+                {'source_key': 10_003, 'trade_key': 0},
                 {'source_key': 10_003, 'trade_key': 20_260_921},
                 {'source_key': 10_003, 'trade_key': 20_260_922},
                 {'source_key': 10_003, 'trade_key': 20_260_923},
             ],
         )
         self.assertEqual(
-            [call.args[1] for call in calls[3:]],
+            [call.args[1] for call in calls[4:]],
             [
                 {'source_key': 10_003, 'trade_key': 20_260_923},
                 {'source_key': 10_003, 'trade_key': 20_260_922},
                 {'source_key': 10_003, 'trade_key': 20_260_921},
+                {'source_key': 10_003, 'trade_key': 0},
             ],
         )
-        for call in calls[:3]:
+        self.assertIn('pg_try_advisory_lock_shared', str(calls[0].args[0]))
+        for call in calls[1:4]:
             self.assertIn('pg_try_advisory_lock', str(call.args[0]))
-        for call in calls[3:]:
+        for call in calls[4:7]:
             self.assertIn('pg_advisory_unlock', str(call.args[0]))
+        self.assertIn('pg_advisory_unlock_shared', str(calls[7].args[0]))
 
     @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_reports_blocked_date_and_releases_prefix(
@@ -4338,7 +4342,9 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         blocked_lock.scalar.return_value = False
         connection.execute.side_effect = [
             first_lock,
+            first_lock,
             blocked_lock,
+            MagicMock(),
             MagicMock(),
         ]
 
@@ -4350,10 +4356,10 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
             self.assertEqual(lock_result, (False, '2026-09-22'))
 
         calls = connection.execute.call_args_list
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 5)
         self.assertEqual(
             [call.args[1]['trade_key'] for call in calls],
-            [20_260_921, 20_260_922, 20_260_921],
+            [0, 20_260_921, 20_260_922, 20_260_921, 0],
         )
         self.assertIn('pg_advisory_unlock', str(calls[-1].args[0]))
 
@@ -4370,7 +4376,9 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         first_lock.scalar.return_value = True
         connection.execute.side_effect = [
             first_lock,
+            first_lock,
             RuntimeError('database connection interrupted'),
+            MagicMock(),
             MagicMock(),
         ]
 
@@ -4383,12 +4391,12 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
                 self.fail('failed acquisition must not enter its context')
 
         calls = connection.execute.call_args_list
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 5)
         self.assertIn('pg_try_advisory_lock', str(calls[0].args[0]))
-        self.assertIn('pg_try_advisory_lock', str(calls[1].args[0]))
-        self.assertIn('pg_advisory_unlock', str(calls[2].args[0]))
+        self.assertIn('pg_try_advisory_lock', str(calls[2].args[0]))
+        self.assertIn('pg_advisory_unlock', str(calls[3].args[0]))
         self.assertEqual(
-            calls[2].args[1],
+            calls[3].args[1],
             {'source_key': 10_003, 'trade_key': 20_260_921},
         )
 
@@ -4407,6 +4415,7 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         second_lock.scalar.return_value = True
         connection.execute.side_effect = [
             first_lock,
+            first_lock,
             second_lock,
             RuntimeError('unlock statement interrupted'),
         ]
@@ -4419,7 +4428,7 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
             self.assertEqual(lock_result, (True, None))
 
         connection.invalidate.assert_called_once_with()
-        self.assertEqual(connection.execute.call_count, 3)
+        self.assertEqual(connection.execute.call_count, 4)
 
     @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_rejects_empty_date_set_without_connecting(
@@ -4435,6 +4444,62 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
                 self.fail('empty lock set must not enter its context')
 
         engine.connect.assert_not_called()
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_exclusive_admission_reports_global_contention_before_date_locks(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = False
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2099-12-30',),
+            source='daily_price_bars',
+            exclusive_admission=True,
+        ) as lock_result:
+            self.assertEqual(lock_result, (False, 'all_dates'))
+
+        self.assertEqual(connection.execute.call_count, 1)
+        call = connection.execute.call_args
+        self.assertEqual(
+            call.args[1],
+            {'source_key': 10_003, 'trade_key': 0},
+        )
+        self.assertIn('pg_try_advisory_lock(', str(call.args[0]))
+
+    def test_no_bar_cross_date_writer_blocks_exclusive_repair_admission(self):
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2099-12-29',
+            source='daily_price_bars',
+        ) as writer_acquired:
+            self.assertTrue(writer_acquired)
+            with advisory_eod_collection_locks(
+                market='KRX',
+                trade_dates=('2099-12-30',),
+                source='daily_price_bars',
+                exclusive_admission=True,
+            ) as repair_result:
+                self.assertEqual(repair_result, (False, 'all_dates'))
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2099-12-30',),
+            source='daily_price_bars',
+            exclusive_admission=True,
+        ) as repair_result:
+            self.assertEqual(repair_result, (True, None))
+            with advisory_eod_collection_lock(
+                market='KRX',
+                trade_date='2099-12-31',
+                source='daily_price_bars',
+            ) as writer_acquired:
+                self.assertFalse(writer_acquired)
 
     def test_daily_price_bar_lock_uses_shared_writer_key(self) -> None:
         self.assertEqual(

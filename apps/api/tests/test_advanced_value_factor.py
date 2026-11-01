@@ -434,6 +434,19 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
 
 
 class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
+    def test_explicit_empty_scope_is_completed_noop(self) -> None:
+        result = DailyAdvancedValueFactorService().rebuild_for_market_date(
+            market_date='2026-04-24',
+            symbols=[],
+            ranking_symbols=[],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['reason'], 'explicit_empty_scope_noop')
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['blocking_status'], 'non_blocking')
+        self.assertEqual(result['selected_stock_codes'], [])
+
     def test_observed_market_cap_keeps_advanced_metrics_available_without_pbr(self) -> None:
         service = DailyAdvancedValueFactorService()
         market_date = date(2026, 4, 24)
@@ -578,6 +591,20 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertFalse(worst['is_advanced_value_eligible'])
         self.assertEqual(result['summary']['eligible_count'], 1)
         self.assertEqual(result['summary']['watchlist_count'], 1)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['summary']['coverage_status'], 'completed')
+        self.assertEqual(result['summary']['persisted_count'], 3)
+        self.assertEqual(result['summary']['ready_count'], 3)
+        self.assertEqual(result['summary']['complete_count'], 3)
+        self.assertEqual(result['summary']['partial_count'], 0)
+        self.assertEqual(result['summary']['unusable_count'], 0)
+        self.assertEqual(result['summary']['missing_reason_counts'], {})
+        self.assertEqual(
+            result['summary']['input_family_cohort_coverage']['fcf_yield']['available_count'],
+            3,
+        )
+        self.assertEqual(result['summary']['quality_status'], 'complete')
+        self.assertIsNone(result['summary']['quality_warning'])
 
     def test_rebuild_treats_negative_fcf_yield_as_valid_but_unattractive(self) -> None:
         service = DailyAdvancedValueFactorService()
@@ -693,6 +720,18 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['insufficient_fundamentals_count'], 1)
         self.assertEqual(result['summary']['ready_count'], 0)
         self.assertEqual(result['summary']['unready_count'], 1)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'no_usable_factor_rows')
+        self.assertEqual(result['gate_status'], 'blocked')
+        self.assertEqual(result['summary']['persisted_count'], 1)
+        self.assertEqual(result['summary']['complete_count'], 0)
+        self.assertEqual(result['summary']['partial_count'], 0)
+        self.assertEqual(result['summary']['unusable_count'], 1)
+        self.assertEqual(
+            result['summary']['missing_reason_counts'],
+            {'insufficient_fundamentals': 1},
+        )
+        self.assertEqual(result['summary']['quality_status'], 'unavailable')
 
     def test_load_inputs_attaches_positive_same_day_observed_market_cap(self) -> None:
         service = DailyAdvancedValueFactorService()
@@ -925,9 +964,7 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['results_persisted'], 0)
         self.assertEqual(result['results_failed'], 0)
         self.assertEqual(result['items'], [])
-        self.assertEqual(
-            result['summary'],
-            {
+        expected_legacy_summary = {
                 'requested_symbol_count': 1,
                 'matched_symbol_count': 0,
                 'missing_symbol_count': 1,
@@ -949,7 +986,21 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
                     'ev_to_ebitda': 0,
                     'advanced_value_score': 0,
                 },
+            }
+        self.assertEqual(
+            {
+                key: result['summary'][key]
+                for key in expected_legacy_summary
             },
+            expected_legacy_summary,
+        )
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'no_usable_factor_rows')
+        self.assertEqual(result['summary']['persisted_count'], 0)
+        self.assertEqual(result['summary']['unusable_count'], 1)
+        self.assertEqual(
+            result['summary']['missing_reason_counts'],
+            {'missing_symbol': 1},
         )
 
     def test_inspect_returns_single_item_for_symbol(self) -> None:
@@ -1226,6 +1277,81 @@ class DailyAdvancedValueFactorFundamentalsLoaderTests(unittest.TestCase):
         last_context = derive_annual_financial_context(result[symbols[-1]])
         self.assertEqual(last_context['capital_expenditure'], 80.0)
         self.assertEqual(last_context['depreciation_and_amortization'], 35.0)
+
+    def test_load_latest_annual_fundamentals_reuses_issuer_snapshot_with_provenance(
+        self,
+    ) -> None:
+        preferred_symbol = '005935'
+        issuer_symbol = '005930'
+        service = DailyAdvancedValueFactorService()
+        fake_session = _FakeFundamentalsLoaderSession([issuer_symbol])
+
+        with (
+            patch(
+                'app.signals.advanced_value_factor.session_scope',
+                return_value=_FakeSessionScope(fake_session),
+            ),
+            patch(
+                'app.signals.advanced_value_factor.'
+                'resolve_preferred_fundamentals_issuer_symbols',
+                return_value={preferred_symbol: issuer_symbol},
+            ),
+        ):
+            result = service._load_latest_annual_fundamentals(
+                market_date=date(2026, 4, 24),
+                symbols=[preferred_symbol],
+            )
+
+        snapshot = result[preferred_symbol]
+        self.assertEqual(snapshot.symbol, issuer_symbol)
+        self.assertEqual(snapshot.requested_symbol, preferred_symbol)
+        self.assertEqual(snapshot.fundamentals_issuer_symbol, issuer_symbol)
+        annual_audit = derive_annual_financial_context(snapshot)['audit'][
+            'annual_snapshot'
+        ]
+        self.assertEqual(annual_audit['requested_symbol'], preferred_symbol)
+        self.assertEqual(
+            annual_audit['fundamentals_issuer_symbol'],
+            issuer_symbol,
+        )
+        self.assertEqual(annual_audit['snapshot_id'], 1)
+        self.assertEqual(annual_audit['corp_name'], f'Test Corp {issuer_symbol}')
+        self.assertEqual(annual_audit['rcept_no'], 'TAV000000000001')
+
+    def test_load_latest_annual_fundamentals_prefers_direct_preferred_snapshot(
+        self,
+    ) -> None:
+        preferred_symbol = '005935'
+        issuer_symbol = '005930'
+        service = DailyAdvancedValueFactorService()
+        fake_session = _FakeFundamentalsLoaderSession(
+            [issuer_symbol, preferred_symbol]
+        )
+
+        with (
+            patch(
+                'app.signals.advanced_value_factor.session_scope',
+                return_value=_FakeSessionScope(fake_session),
+            ),
+            patch(
+                'app.signals.advanced_value_factor.'
+                'resolve_preferred_fundamentals_issuer_symbols',
+                return_value={preferred_symbol: issuer_symbol},
+            ),
+        ):
+            result = service._load_latest_annual_fundamentals(
+                market_date=date(2026, 4, 24),
+                symbols=[preferred_symbol],
+            )
+
+        snapshot = result[preferred_symbol]
+        self.assertEqual(snapshot.symbol, preferred_symbol)
+        self.assertEqual(snapshot.snapshot_id, 2)
+        self.assertEqual(snapshot.requested_symbol, preferred_symbol)
+        self.assertEqual(
+            snapshot.fundamentals_issuer_symbol,
+            preferred_symbol,
+        )
 
 
 class DailyAdvancedValueFactorFundamentalsLoaderIntegrationTests(unittest.TestCase):

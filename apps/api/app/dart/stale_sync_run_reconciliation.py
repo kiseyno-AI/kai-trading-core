@@ -261,7 +261,7 @@ FROZEN_RECONCILIATION_MANIFEST: dict[str, Any] = {
             },
             'event_references': {
                 'first_seen_run_id_count': 0,
-                'last_seen_run_id_count': 65323,
+                'last_seen_run_id_count': 64108,
                 'both_first_and_last_count': 0,
             },
         },
@@ -322,7 +322,7 @@ FROZEN_RECONCILIATION_MANIFEST: dict[str, Any] = {
     ],
 }
 FROZEN_RECONCILIATION_MANIFEST_SHA256 = (
-    '8bf109497496c493e2cab3b2cee9977718938e7d337b80514c258a636f738424'
+    '7ecc5cefaf5d776f98073f3343e6fe40a39c7534c6d467143da6e267c39bdf4d'
 )
 if (
     _sha256(FROZEN_RECONCILIATION_MANIFEST)

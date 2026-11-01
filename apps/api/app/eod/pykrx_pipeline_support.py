@@ -1,6 +1,195 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any, Callable, Iterable, Mapping, Sequence
+
+
+_STATUS_RESULT_MAX_DEPTH = 3
+_STATUS_RESULT_MAX_MAPPING_ITEMS = 40
+_STATUS_RESULT_MAX_SEQUENCE_ITEMS = 10
+_STATUS_RESULT_MAX_STRING_LENGTH = 512
+_EOD_RUN_SUMMARY_KEYS = (
+    'id',
+    'market',
+    'trade_date',
+    'source',
+    'trigger',
+    'status',
+    'symbols_total',
+    'symbols_succeeded',
+    'symbols_failed',
+    'error_message',
+    'started_at',
+    'completed_at',
+    'updated_at',
+)
+_RUN_METADATA_SUMMARY_KEYS = (
+    'daily_pipeline_run_id',
+    'pipeline_run_id',
+    'current_stage',
+    'current_step',
+    'current_activity',
+    'mode',
+    'point_in_time_recovery',
+    'updated_at',
+    'completed_at',
+)
+_RUN_METADATA_SYMBOL_LIST_KEYS = (
+    'failed_symbols',
+    'unattempted_symbols',
+    'price_retry_symbols',
+    'downstream_retry_symbols',
+    'inherited_downstream_retry_symbols',
+)
+
+
+def _compact_status_string(value: str) -> str:
+    if len(value) <= _STATUS_RESULT_MAX_STRING_LENGTH:
+        return value
+    return f'{value[: _STATUS_RESULT_MAX_STRING_LENGTH - 3]}...'
+
+
+def _compact_status_value(value: Any, *, depth: int = 0) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _compact_status_string(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        if (
+            set(value) == {'field_count'}
+            and type(value.get('field_count')) is int
+            and value['field_count'] >= 0
+        ):
+            return {'field_count': value['field_count']}
+        if (
+            set(value) == {'item_count', 'sample'}
+            and type(value.get('item_count')) is int
+            and value['item_count'] >= 0
+            and isinstance(value.get('sample'), list)
+            and value['item_count'] > len(value['sample'])
+        ):
+            return {
+                'item_count': value['item_count'],
+                'sample': [
+                    _compact_status_value(item, depth=depth + 1)
+                    for item in value['sample']
+                ],
+            }
+        if depth >= _STATUS_RESULT_MAX_DEPTH:
+            return {'field_count': len(value)}
+        compacted: dict[str, Any] = {}
+        existing_omitted = value.get('_omitted_field_count')
+        omitted = (
+            existing_omitted
+            if type(existing_omitted) is int and existing_omitted >= 0
+            else 0
+        )
+        for item_key, item_value in value.items():
+            normalized_key = str(item_key)
+            if normalized_key == '_omitted_field_count':
+                continue
+            if normalized_key == 'run_metadata':
+                omitted += 1
+                continue
+            if len(compacted) >= _STATUS_RESULT_MAX_MAPPING_ITEMS:
+                omitted += 1
+                continue
+            compacted[normalized_key] = _compact_status_value(
+                item_value,
+                depth=depth + 1,
+            )
+        if omitted:
+            compacted['_omitted_field_count'] = omitted
+        return compacted
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        sample = [
+            _compact_status_value(item, depth=depth + 1)
+            for item in items[:_STATUS_RESULT_MAX_SEQUENCE_ITEMS]
+        ]
+        if len(items) <= _STATUS_RESULT_MAX_SEQUENCE_ITEMS:
+            return sample
+        return {
+            'item_count': len(items),
+            'sample': sample,
+        }
+    return _compact_status_string(str(value))
+
+
+def compact_eod_run_summary(run: Mapping[str, Any]) -> dict[str, Any]:
+    summary = {
+        key: _compact_status_value(run.get(key))
+        for key in _EOD_RUN_SUMMARY_KEYS
+        if key in run
+    }
+    metadata = run.get('run_metadata')
+    if not isinstance(metadata, Mapping):
+        metadata_summary = run.get('metadata_summary')
+        if isinstance(metadata_summary, Mapping):
+            summary['metadata_summary'] = {
+                str(key): _compact_status_value(value)
+                for key, value in metadata_summary.items()
+            }
+        return summary
+
+    metadata_summary = {
+        key: _compact_status_value(metadata.get(key))
+        for key in _RUN_METADATA_SUMMARY_KEYS
+        if key in metadata
+    }
+    for key in _RUN_METADATA_SYMBOL_LIST_KEYS:
+        values = metadata.get(key)
+        if isinstance(values, (list, tuple, set)):
+            metadata_summary[f'{key}_count'] = len(values)
+    stage_progress = metadata.get('stage_progress')
+    if isinstance(stage_progress, Mapping):
+        metadata_summary['stage_statuses'] = {
+            str(stage): _compact_status_value(
+                progress.get('status')
+                if isinstance(progress, Mapping)
+                else progress
+            )
+            for stage, progress in list(stage_progress.items())[
+                :_STATUS_RESULT_MAX_SEQUENCE_ITEMS
+            ]
+        }
+        metadata_summary['stage_count'] = len(stage_progress)
+    if metadata_summary:
+        summary['metadata_summary'] = metadata_summary
+    return summary
+
+
+def compact_daily_pipeline_result(
+    result: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    compacted: dict[str, Any] = {}
+    existing_omitted = result.get('_omitted_field_count')
+    omitted = (
+        existing_omitted
+        if type(existing_omitted) is int and existing_omitted >= 0
+        else 0
+    )
+    for key, value in result.items():
+        normalized_key = str(key)
+        if normalized_key == '_omitted_field_count':
+            continue
+        if normalized_key == 'run_metadata':
+            omitted += 1
+            continue
+        if len(compacted) >= _STATUS_RESULT_MAX_MAPPING_ITEMS:
+            omitted += 1
+            continue
+        if normalized_key == 'existing_run' and isinstance(value, Mapping):
+            compacted[normalized_key] = compact_eod_run_summary(value)
+        else:
+            compacted[normalized_key] = _compact_status_value(value, depth=1)
+    if omitted:
+        compacted['_omitted_field_count'] = omitted
+    return compacted
 
 
 def build_daily_skip_result(

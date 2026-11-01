@@ -34,7 +34,9 @@ from app.eod.pykrx_backfill import (
     _get_market_ohlcv_by_ticker,
 )
 from app.eod.price_bar_repair_state import (
+    load_pending_price_bar_rebuild_batches,
     record_pending_exact_factor_rebuild,
+    resolve_pending_frozen_price_dependent_membership,
 )
 from app.market_data_store import (
     advisory_eod_collection_lock,
@@ -486,6 +488,9 @@ class ExactFactorRepairService:
         applied_scope_verifier: Callable[..., dict[str, dict[str, int]]] | None = None,
         stale_pruner: Callable[..., dict[str, int]] | None = None,
         completion_recorder: Callable[..., dict[str, Any]] | None = None,
+        pending_batch_loader: (
+            Callable[[], Sequence[Mapping[str, Any]]] | None
+        ) = None,
         lock_factory: Callable[..., AbstractContextManager[bool]] | None = None,
         stage_runners: Mapping[str, Callable[..., dict[str, Any]]] | None = None,
     ) -> None:
@@ -510,6 +515,10 @@ class ExactFactorRepairService:
         self.stale_pruner = stale_pruner or prune_stale_factor_rows
         self.completion_recorder = (
             completion_recorder or record_pending_exact_factor_rebuild
+        )
+        self.pending_batch_loader = (
+            pending_batch_loader
+            or load_pending_price_bar_rebuild_batches
         )
         self.lock_factory = lock_factory or advisory_eod_collection_lock
         self.stage_runners = dict(stage_runners or _default_stage_runners())
@@ -576,6 +585,24 @@ class ExactFactorRepairService:
                     apply=apply,
                     status='blocked',
                     reason='advisory_lock_unavailable',
+                )
+
+            try:
+                pending_batches = list(self.pending_batch_loader())
+                frozen_membership = (
+                    resolve_pending_frozen_price_dependent_membership(
+                        market_date=normalized_date,
+                        pending=pending_batches,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                return self._result(
+                    market_date=normalized_date,
+                    apply=apply,
+                    status='blocked',
+                    reason='pending_frozen_membership_invalid',
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
                 )
 
             live_trade_date_error: Exception | None = None
@@ -720,6 +747,31 @@ class ExactFactorRepairService:
                 [*exact_symbols, *protected_provider_codes]
             )
             membership_hash = market_membership_sha256(full_provider_membership)
+            provider_ranking_membership_hash = market_membership_sha256(
+                exact_symbols
+            )
+            if (
+                frozen_membership is not None
+                and tuple(exact_symbols) != frozen_membership
+            ):
+                return self._result(
+                    market_date=normalized_date,
+                    apply=apply,
+                    status='blocked',
+                    reason=(
+                        'provider_membership_mismatch_pending_frozen_scope'
+                    ),
+                    provider_ranking_membership_count=len(exact_symbols),
+                    provider_ranking_membership_sha256=(
+                        provider_ranking_membership_hash
+                    ),
+                    frozen_membership_count=len(frozen_membership),
+                    frozen_membership_sha256=market_membership_sha256(
+                        frozen_membership
+                    ),
+                )
+            if frozen_membership is not None:
+                exact_symbols = list(frozen_membership)
             ranking_membership_hash = market_membership_sha256(exact_symbols)
             exact_symbol_set = set(exact_symbols)
             full_provider_membership_set = set(full_provider_membership)
@@ -775,6 +827,14 @@ class ExactFactorRepairService:
                 'membership_evidence_run_source': membership_evidence_run_source,
                 'membership_sha256': membership_hash,
                 'ranking_membership_sha256': ranking_membership_hash,
+                'ranking_membership_authority': (
+                    'pending_price_bar_repair_frozen_manifest'
+                    if frozen_membership is not None
+                    else membership_evidence_source
+                ),
+                'pending_frozen_membership': (
+                    frozen_membership is not None
+                ),
                 'exact_provider_membership_count': len(full_provider_membership),
                 'exact_membership_count': len(exact_symbols),
                 'market_symbol_counts': market_symbol_counts,

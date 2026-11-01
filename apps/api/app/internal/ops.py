@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -74,6 +74,10 @@ from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.eod.price_bar_repair_state import (
+    record_pending_trending_rebuild,
+    resolve_pending_frozen_price_dependent_membership,
+)
 from app.eod.stale_collection_run_repair import (
     stale_eod_collection_run_repair,
 )
@@ -1896,14 +1900,63 @@ def compute_action_summaries(*, market_date: str, symbols: str | None = None) ->
     )
 
 
-def compute_trending_ranks(*, market_date: str, periods: str | None = None) -> dict[str, Any]:
+def compute_trending_ranks(
+    *,
+    market_date: str,
+    periods: str | None = None,
+    symbols: str | None = None,
+) -> dict[str, Any]:
     bootstrap_runtime()
+    repair_started_at = datetime.now(timezone.utc)
     parsed_periods = [item.strip().lower() for item in periods.split(',') if item.strip()] if periods else None
-    return compute_and_persist_daily_trending_ranks(
+    parsed_symbols = (
+        [item.strip().upper() for item in symbols.split(',') if item.strip()]
+        if symbols
+        else None
+    )
+    frozen_symbols = resolve_pending_frozen_price_dependent_membership(
+        market_date=market_date
+    )
+    authoritative_scope = False
+    if frozen_symbols is not None:
+        if (
+            parsed_symbols is not None
+            and tuple(sorted(parsed_symbols)) != frozen_symbols
+        ):
+            raise ValueError(
+                'explicit trending scope does not match the pending frozen '
+                'price-dependent membership'
+            )
+        parsed_symbols = list(frozen_symbols)
+        authoritative_scope = True
+    else:
+        raise ValueError(
+            'trending rank replacement requires pending frozen '
+            'price-dependent membership; an unproven global or explicit '
+            'scope is destructive and is refused'
+        )
+    result = compute_and_persist_daily_trending_ranks(
         market_date=market_date,
         periods=parsed_periods,
         source='internal_ops_cli',
+        symbols=parsed_symbols,
+        authoritative_scope=authoritative_scope,
     )
+    completed_periods = tuple(
+        str(item.get('period') or '').strip().lower()
+        for item in result.get('periods') or []
+        if item.get('status') == 'completed'
+        and str(item.get('period') or '').strip()
+    )
+    if completed_periods:
+        record_pending_trending_rebuild(
+            market_date=market_date,
+            periods=completed_periods,
+            repair_started_at=repair_started_at,
+            rebuild_completed_at=datetime.now(timezone.utc),
+            exact_symbols=parsed_symbols,
+        )
+    return result
 
 
 def run_agent_feedback_retry_cycles(
@@ -2499,6 +2552,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     trending_parser.add_argument('--market-date', required=True)
     trending_parser.add_argument('--periods')
+    trending_parser.add_argument('--symbols')
 
     feedback_retry_parser = subparsers.add_parser(
         'agent-feedback-retry-cycles',
@@ -2954,7 +3008,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == 'eod-composite-factors-compute':
         payload = compute_composite_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':
-        payload = compute_trending_ranks(market_date=args.market_date, periods=args.periods)
+        payload = compute_trending_ranks(
+            market_date=args.market_date,
+            periods=args.periods,
+            symbols=args.symbols,
+        )
     elif args.command == 'agent-feedback-retry-cycles':
         payload = run_agent_feedback_retry_cycles(
             market_date=args.market_date,

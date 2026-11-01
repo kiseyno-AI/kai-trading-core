@@ -85,6 +85,8 @@ _EOD_COLLECTION_LOCK_SOURCE_KEYS = {
     ('KRX', 'daily_price_bars'): 10_003,
     ('KRX', 'dart_share_issuance'): 10_004,
 }
+_DAILY_PRICE_BAR_LOCK_IDENTITY = ('KRX', 'daily_price_bars')
+_GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY = 0
 _AUTO_DAILY_PIPELINE_ENTRYPOINT = (
     'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
 )
@@ -181,6 +183,21 @@ def eod_collection_advisory_lock_keys(
     return source_key, int(normalized_trade_date.strftime('%Y%m%d'))
 
 
+def eod_collection_admission_advisory_lock_keys(
+    *,
+    market: str,
+    source: str,
+) -> tuple[int, int] | None:
+    """Return the global admission key shared by all price-bar writers."""
+
+    if (market, source) != _DAILY_PRICE_BAR_LOCK_IDENTITY:
+        return None
+    return (
+        _EOD_COLLECTION_LOCK_SOURCE_KEYS[_DAILY_PRICE_BAR_LOCK_IDENTITY],
+        _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY,
+    )
+
+
 def _invalidate_advisory_lock_connection(connection: Any) -> None:
     """Discard a pooled session whose advisory-lock cleanup failed."""
 
@@ -200,8 +217,14 @@ def advisory_eod_collection_locks(
     market: str,
     trade_dates: Sequence[str | date],
     source: str,
+    exclusive_admission: bool = False,
 ):
-    """Hold a sorted set of EOD date locks on one dedicated connection."""
+    """Hold admission plus a sorted set of EOD date locks.
+
+    Daily-price writers take a shared global admission lock before their
+    exact-date locks. Broad repairs can request the exclusive form to close
+    the race with a writer for a date that has no persisted price row yet.
+    """
 
     normalized_dates = tuple(
         sorted({_normalize_trade_date(item) for item in trade_dates})
@@ -212,11 +235,38 @@ def advisory_eod_collection_locks(
         (market, source),
         19_999,
     )
+    uses_global_admission = (market, source) == _DAILY_PRICE_BAR_LOCK_IDENTITY
+    admission_acquired = False
+    admission_shared = uses_global_admission and not exclusive_admission
     acquired_trade_keys: list[int] = []
     blocked_date: date | None = None
+    cleanup_failed = False
     with engine.connect() as raw_connection:
         connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
         try:
+            if uses_global_admission:
+                admission_function = (
+                    'pg_try_advisory_lock_shared'
+                    if admission_shared
+                    else 'pg_try_advisory_lock'
+                )
+                admission_acquired = bool(
+                    connection.execute(
+                        text(
+                            f'SELECT {admission_function}('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    ).scalar()
+                )
+                if not admission_acquired:
+                    yield False, 'all_dates'
+                    return
             for trade_date in normalized_dates:
                 trade_key = int(trade_date.strftime('%Y%m%d'))
                 acquired = bool(
@@ -258,12 +308,39 @@ def advisory_eod_collection_locks(
                     # Invalidating it closes the PostgreSQL session and
                     # releases this lock plus any remaining locks in the set.
                     _invalidate_advisory_lock_connection(connection)
+                    cleanup_failed = True
                     logger.warning(
                         'Failed to explicitly release EOD advisory locks; '
                         'discarded the dedicated connection.',
                         exc_info=True,
                     )
                     break
+            if admission_acquired and not cleanup_failed:
+                admission_unlock_function = (
+                    'pg_advisory_unlock_shared'
+                    if admission_shared
+                    else 'pg_advisory_unlock'
+                )
+                try:
+                    connection.execute(
+                        text(
+                            f'SELECT {admission_unlock_function}('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    )
+                except Exception:
+                    _invalidate_advisory_lock_connection(connection)
+                    logger.warning(
+                        'Failed to explicitly release the EOD admission '
+                        'lock; discarded the dedicated connection.',
+                        exc_info=True,
+                    )
 
 
 def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
@@ -2990,16 +3067,44 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
     # it via idle_in_transaction_session_timeout before the unlock statement.
     with engine.connect() as raw_connection:
         connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
-        acquired = bool(
-            connection.execute(
-                text('SELECT pg_try_advisory_lock(:source_key, :trade_key)'),
-                {
-                    'source_key': source_key,
-                    'trade_key': trade_key,
-                },
-            ).scalar()
-        )
+        uses_global_admission = (
+            market,
+            source,
+        ) == _DAILY_PRICE_BAR_LOCK_IDENTITY
+        admission_acquired = False
+        acquired = False
+        cleanup_failed = False
         try:
+            if uses_global_admission:
+                admission_acquired = bool(
+                    connection.execute(
+                        text(
+                            'SELECT pg_try_advisory_lock_shared('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    ).scalar()
+                )
+                if not admission_acquired:
+                    yield False
+                    return
+            acquired = bool(
+                connection.execute(
+                    text(
+                        'SELECT pg_try_advisory_lock('
+                        ':source_key, :trade_key)'
+                    ),
+                    {
+                        'source_key': source_key,
+                        'trade_key': trade_key,
+                    },
+                ).scalar()
+            )
             yield acquired
         finally:
             if acquired:
@@ -3017,9 +3122,31 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
                     # session-level lock after a failed unlock. Invalidate the
                     # connection without replacing a pipeline result/error.
                     _invalidate_advisory_lock_connection(connection)
+                    cleanup_failed = True
                     logger.warning(
                         'Failed to explicitly release EOD advisory lock; '
                         'discarded the dedicated connection.',
+                        exc_info=True,
+                    )
+            if admission_acquired and not cleanup_failed:
+                try:
+                    connection.execute(
+                        text(
+                            'SELECT pg_advisory_unlock_shared('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    )
+                except Exception:
+                    _invalidate_advisory_lock_connection(connection)
+                    logger.warning(
+                        'Failed to explicitly release the EOD admission '
+                        'lock; discarded the dedicated connection.',
                         exc_info=True,
                     )
 

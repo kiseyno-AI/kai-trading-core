@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import re
 import zipfile
@@ -40,6 +41,10 @@ MAX_AUDIT_ARCHIVE_COMPRESSED_BYTES = 50 * 1024 * 1024
 MAX_AUDIT_ARCHIVE_MEMBERS = 2_000
 MAX_AUDIT_ARCHIVE_MEMBER_BYTES = 25 * 1024 * 1024
 MAX_AUDIT_ARCHIVE_EXPANDED_BYTES = 100 * 1024 * 1024
+MAX_AUDIT_DIAGNOSTIC_MEMBERS = 50
+MAX_AUDIT_DIAGNOSTIC_MEMBER_NAME_CHARS = 255
+MAX_AUDIT_DIAGNOSTIC_ENCODING_CHARS = 64
+AUDIT_ARCHIVE_DIAGNOSTICS_VERSION = 'dart_audit_archive_diagnostics_v1'
 
 _AUDIT_PATTERNS = [
     (re.compile(r'의견거절'), 'disclaimer', '의견거절'),
@@ -356,23 +361,33 @@ class DartSignalsService:
 
     async def capture_signals_for_event(self, *, rcept_no: str) -> dict[str, Any]:
         event = self._load_event(rcept_no)
-        audit_signal = await self._extract_audit_signal(event)
+        audit_signal, audit_diagnostics = (
+            await self._extract_audit_signal_with_diagnostics(event)
+        )
         dilution_signal = self._extract_dilution_signal(event)
         self._store_signals(event=event, audit_signal=audit_signal, dilution_signal=dilution_signal)
-        return {
+        result = {
             'rcept_no': rcept_no,
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
             'dilution_signal': dilution_signal,
         }
+        if audit_signal is None and audit_diagnostics is not None:
+            result['audit_diagnostics'] = audit_diagnostics
+        return result
 
     async def capture_audit_signal_for_event(self, *, rcept_no: str) -> dict[str, Any]:
         event = self._load_event(rcept_no)
-        audit_signal = await self._extract_audit_signal(event)
+        audit_signal, audit_diagnostics = (
+            await self._extract_audit_signal_with_diagnostics(event)
+        )
         self._store_signals(event=event, audit_signal=audit_signal, dilution_signal=None)
-        return {
+        result = {
             'rcept_no': rcept_no,
             'audit_signal': audit_signal.__dict__ if audit_signal else None,
         }
+        if audit_signal is None and audit_diagnostics is not None:
+            result['audit_diagnostics'] = audit_diagnostics
+        return result
 
     async def backfill_missing_annual_audit_signals(
         self,
@@ -458,25 +473,77 @@ class DartSignalsService:
 
         async def attempt_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
             result_item = dict(candidate)
+
+            async def capture_with_origin() -> tuple[
+                dict[str, Any] | None,
+                Exception | None,
+            ]:
+                """Keep provider failures distinct from our per-event deadline."""
+                try:
+                    return (
+                        await self.capture_audit_signal_for_event(
+                            rcept_no=str(candidate['rcept_no']),
+                        ),
+                        None,
+                    )
+                except Exception as exc:
+                    # DartClient transport timeouts and provider error
+                    # envelopes are systemic candidates.  Returning the
+                    # original exception lets the outer wait_for TimeoutError
+                    # mean only that this one event exhausted its bounded
+                    # processing deadline.
+                    return None, exc
+
             try:
-                capture_result = await asyncio.wait_for(
-                    self.capture_audit_signal_for_event(
-                        rcept_no=str(candidate['rcept_no']),
-                    ),
+                capture_result, capture_error = await asyncio.wait_for(
+                    capture_with_origin(),
                     timeout=self.event_timeout_seconds,
                 )
-            except Exception as exc:
-                systemic_failure = _is_systemic_provider_failure(exc)
+            except TimeoutError:
                 result_item.update(
                     {
                         'status': 'failed',
-                        'systemic_provider_failure': systemic_failure,
-                        'error': f'{type(exc).__name__}: {exc}'[:500],
+                        # The provider client has its own shorter transport
+                        # timeout and retry policy.  Reaching this outer
+                        # deadline is therefore event-local retry debt (for
+                        # example, one unusually large document), not proof
+                        # that DART is unavailable for every event.
+                        'systemic_provider_failure': False,
+                        'event_timeout': True,
+                        'error': (
+                            'TimeoutError: audit event processing exceeded '
+                            f'{self.event_timeout_seconds}s deadline'
+                        )[:500],
                     }
                 )
             else:
-                audit_signal = capture_result.get('audit_signal')
-                if audit_signal:
+                if capture_error is not None:
+                    result_item.update(
+                        {
+                            'status': 'failed',
+                            'systemic_provider_failure': (
+                                _is_systemic_provider_failure(capture_error)
+                            ),
+                            'event_timeout': False,
+                            'error': (
+                                f'{type(capture_error).__name__}: '
+                                f'{capture_error}'
+                            )[:500],
+                        }
+                    )
+                elif capture_result is None:
+                    result_item.update(
+                        {
+                            'status': 'failed',
+                            'systemic_provider_failure': False,
+                            'event_timeout': False,
+                            'error': (
+                                'RuntimeError: audit capture returned no result'
+                            ),
+                        }
+                    )
+                elif capture_result.get('audit_signal'):
+                    audit_signal = capture_result['audit_signal']
                     result_item.update(
                         {
                             'status': 'captured',
@@ -486,6 +553,11 @@ class DartSignalsService:
                     )
                 else:
                     result_item['status'] = 'audit_evidence_missing'
+                    audit_diagnostics = capture_result.get(
+                        'audit_diagnostics'
+                    )
+                    if isinstance(audit_diagnostics, dict):
+                        result_item['audit_diagnostics'] = audit_diagnostics
             return result_item
 
         for wave_start in range(0, len(candidates), concurrency):
@@ -596,14 +668,23 @@ class DartSignalsService:
             }
 
     async def _extract_audit_signal(self, event: dict[str, Any]) -> ParsedAuditSignal | None:
+        audit_signal, _diagnostics = (
+            await self._extract_audit_signal_with_diagnostics(event)
+        )
+        return audit_signal
+
+    async def _extract_audit_signal_with_diagnostics(
+        self,
+        event: dict[str, Any],
+    ) -> tuple[ParsedAuditSignal | None, dict[str, Any] | None]:
         if not any(token in (event.get('report_nm') or '') for token in ('사업보고서', '반기보고서', '분기보고서', '감사보고서')):
-            return None
+            return None, None
         artifact = await self.client.download_document(rcept_no=event['rcept_no'])
         content = artifact.get('content')
         if not isinstance(content, bytes):
             raise ValueError('DART document archive content must be bytes')
         return await asyncio.to_thread(
-            self._extract_audit_signal_from_archive,
+            self._extract_audit_signal_from_archive_with_diagnostics,
             content,
         )
 
@@ -611,11 +692,28 @@ class DartSignalsService:
         self,
         archive_bytes: bytes,
     ) -> ParsedAuditSignal | None:
+        audit_signal, _diagnostics = (
+            self._extract_audit_signal_from_archive_with_diagnostics(
+                archive_bytes
+            )
+        )
+        return audit_signal
+
+    def _extract_audit_signal_from_archive_with_diagnostics(
+        self,
+        archive_bytes: bytes,
+    ) -> tuple[ParsedAuditSignal | None, dict[str, Any]]:
         if len(archive_bytes) > MAX_AUDIT_ARCHIVE_COMPRESSED_BYTES:
             raise ValueError('DART document archive exceeds compressed size limit')
 
         findings: list[ParsedAuditSignal] = []
         expanded_bytes = 0
+        decoded_member_count = 0
+        aud_opn_table_count = 0
+        audit_report_label_row_count = 0
+        known_opinion_token_row_count = 0
+        member_diagnostics: list[dict[str, Any]] = []
+        diagnostics_truncated = False
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
             members = [info for info in archive.infolist() if not info.is_dir()]
             if len(members) > MAX_AUDIT_ARCHIVE_MEMBERS:
@@ -633,16 +731,76 @@ class DartSignalsService:
                 expanded_bytes += len(raw_content)
                 if expanded_bytes > MAX_AUDIT_ARCHIVE_EXPANDED_BYTES:
                     raise ValueError('DART document archive exceeds expanded size limit')
+                declared_encoding = _detect_declared_encoding(raw_content)
                 document = _decode_document_text(raw_content)
+                if len(member_diagnostics) < MAX_AUDIT_DIAGNOSTIC_MEMBERS:
+                    member_name = str(info.filename)
+                    name_truncated = (
+                        len(member_name)
+                        > MAX_AUDIT_DIAGNOSTIC_MEMBER_NAME_CHARS
+                    )
+                    declared_encoding_truncated = bool(
+                        declared_encoding
+                        and len(declared_encoding)
+                        > MAX_AUDIT_DIAGNOSTIC_ENCODING_CHARS
+                    )
+                    member_diagnostics.append(
+                        {
+                            'name': member_name[
+                                :MAX_AUDIT_DIAGNOSTIC_MEMBER_NAME_CHARS
+                            ],
+                            'name_truncated': name_truncated,
+                            'size_bytes': int(info.file_size),
+                            'declared_encoding': (
+                                declared_encoding[
+                                    :MAX_AUDIT_DIAGNOSTIC_ENCODING_CHARS
+                                ]
+                                if declared_encoding
+                                else None
+                            ),
+                            'declared_encoding_truncated': (
+                                declared_encoding_truncated
+                            ),
+                            'decode_success': document is not None,
+                        }
+                    )
+                    diagnostics_truncated = (
+                        diagnostics_truncated
+                        or name_truncated
+                        or declared_encoding_truncated
+                    )
+                else:
+                    diagnostics_truncated = True
                 if document is None:
                     continue
+                decoded_member_count += 1
+                document_counts = _audit_document_diagnostic_counts(document)
+                aud_opn_table_count += document_counts['aud_opn_table_count']
+                audit_report_label_row_count += document_counts[
+                    'audit_report_label_row_count'
+                ]
+                known_opinion_token_row_count += document_counts[
+                    'known_opinion_token_row_count'
+                ]
                 findings.extend(
                     self._parse_audit_findings_from_document(
                         document,
                         source_section=info.filename,
                     )
                 )
-        return self._select_conservative_audit_signal(findings)
+        diagnostics = {
+            'version': AUDIT_ARCHIVE_DIAGNOSTICS_VERSION,
+            'archive_sha256': hashlib.sha256(archive_bytes).hexdigest(),
+            'archive_size_bytes': len(archive_bytes),
+            'member_count': len(members),
+            'members': member_diagnostics,
+            'decoded_member_count': decoded_member_count,
+            'aud_opn_table_count': aud_opn_table_count,
+            'audit_report_label_row_count': audit_report_label_row_count,
+            'known_opinion_token_row_count': known_opinion_token_row_count,
+            'truncated': diagnostics_truncated,
+        }
+        return self._select_conservative_audit_signal(findings), diagnostics
 
     def _parse_audit_from_document(self, text: str) -> ParsedAuditSignal | None:
         return self._select_conservative_audit_signal(
@@ -1853,6 +2011,22 @@ def _clean_html_text(value: str) -> str:
     text = unescape(text)
     text = _WS_PATTERN.sub(' ', text)
     return text.strip()
+
+
+def _audit_document_diagnostic_counts(document: str) -> dict[str, int]:
+    audit_report_label_row_count = 0
+    known_opinion_token_row_count = 0
+    for row_html in _AUDIT_ROW_PATTERN.findall(document):
+        row_text = _clean_html_text(row_html)
+        if '감사보고서' in row_text or '연결감사보고서' in row_text:
+            audit_report_label_row_count += 1
+        if any(pattern.search(row_text) for pattern, _, _ in _AUDIT_PATTERNS):
+            known_opinion_token_row_count += 1
+    return {
+        'aud_opn_table_count': len(_AUDIT_TABLE_PATTERN.findall(document)),
+        'audit_report_label_row_count': audit_report_label_row_count,
+        'known_opinion_token_row_count': known_opinion_token_row_count,
+    }
 
 
 def _decode_document_text(raw_bytes: bytes) -> str | None:

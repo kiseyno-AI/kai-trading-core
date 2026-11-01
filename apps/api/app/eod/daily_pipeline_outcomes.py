@@ -4,6 +4,9 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
+from app.eod.market_membership import market_membership_sha256
+from app.eod.scope_outcomes import EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS
+
 
 GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
 HIGH_COVERAGE_PARTIAL_STAGE_IDS: frozenset[str] = frozenset(
@@ -780,6 +783,247 @@ def _partial_has_high_coverage(
     )
 
 
+def _has_exact_scope_outcome_manifest(
+    payloads: tuple[Mapping[str, Any], ...],
+) -> bool:
+    """Return whether a payload contains an exhaustive identity partition."""
+
+    for payload in payloads:
+        proof = payload.get('exact_scope_outcome_proof')
+        if not isinstance(proof, Mapping):
+            continue
+        selected = proof.get('selected_stock_codes')
+        retry_debt = proof.get('retry_debt_stock_codes')
+        terminal = proof.get('terminal_not_applicable_stock_codes')
+        if not all(
+            isinstance(value, list)
+            for value in (selected, retry_debt, terminal)
+        ):
+            continue
+
+        def normalize_proof_codes(
+            values: list[Any],
+        ) -> list[str] | None:
+            normalized = [
+                (
+                    str(value or '').strip().zfill(6)
+                    if str(value or '').strip().isdigit()
+                    else str(value or '').strip().upper()
+                )
+                for value in values
+            ]
+            if (
+                any(not value for value in normalized)
+                or len(normalized) != len(set(normalized))
+                or normalized != values
+            ):
+                return None
+            return normalized
+
+        selected_codes = normalize_proof_codes(selected)
+        retry_codes = normalize_proof_codes(retry_debt)
+        terminal_codes = normalize_proof_codes(terminal)
+        if any(
+            value is None
+            for value in (selected_codes, retry_codes, terminal_codes)
+        ):
+            continue
+        selected_codes = selected_codes or []
+        retry_codes = retry_codes or []
+        terminal_codes = terminal_codes or []
+        selected_set = set(selected_codes)
+        retry_set = set(retry_codes)
+        terminal_set = set(terminal_codes)
+        successful_codes = [
+            code
+            for code in selected_codes
+            if code not in retry_set | terminal_set
+        ]
+        if (
+            proof.get('schema_version')
+            != 'exact_scope_outcome_proof_v1'
+            or str(proof.get('manifest_version') or '').strip()
+            not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS
+            or not selected_codes
+            or selected_codes != sorted(selected_codes)
+            or retry_set & terminal_set
+            or not (retry_set | terminal_set) <= selected_set
+            or isinstance(proof.get('selected_symbol_count'), bool)
+            or proof.get('selected_symbol_count') != len(selected_codes)
+            or proof.get('selected_symbol_sha256')
+            != market_membership_sha256(selected_codes)
+            or isinstance(proof.get('successful_symbol_count'), bool)
+            or proof.get('successful_symbol_count')
+            != len(successful_codes)
+            or proof.get('successful_symbol_sha256')
+            != market_membership_sha256(successful_codes)
+        ):
+            continue
+        return True
+
+    for payload in payloads:
+        version = str(
+            payload.get('scope_outcome_manifest_version') or ''
+        ).strip()
+        if version not in EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS:
+            continue
+        selected = payload.get('selected_stock_codes')
+        successful = payload.get('successful_stock_codes')
+        retry_debt = payload.get('retry_debt_stock_codes')
+        terminal = payload.get('terminal_not_applicable_stock_codes', [])
+        manifest = payload.get('scope_outcome_manifest')
+        if not all(
+            isinstance(value, list)
+            for value in (
+                selected,
+                successful,
+                retry_debt,
+                terminal,
+                manifest,
+            )
+        ):
+            continue
+
+        def normalize(values: list[Any]) -> list[str] | None:
+            normalized = [
+                (
+                    str(value or '').strip().zfill(6)
+                    if str(value or '').strip().isdigit()
+                    else str(value or '').strip().upper()
+                )
+                for value in values
+            ]
+            if (
+                any(not value for value in normalized)
+                or len(normalized) != len(set(normalized))
+            ):
+                return None
+            return normalized
+
+        selected_codes = normalize(selected)
+        successful_codes = normalize(successful)
+        retry_codes = normalize(retry_debt)
+        terminal_codes = normalize(terminal)
+        if any(
+            value is None
+            for value in (
+                selected_codes,
+                successful_codes,
+                retry_codes,
+                terminal_codes,
+            )
+        ):
+            continue
+        selected_set = set(selected_codes or [])
+        successful_set = set(successful_codes or [])
+        retry_set = set(retry_codes or [])
+        terminal_set = set(terminal_codes or [])
+        if (
+            not selected_set
+            or successful_set & retry_set
+            or successful_set & terminal_set
+            or retry_set & terminal_set
+            or selected_set
+            != successful_set | retry_set | terminal_set
+        ):
+            continue
+        authoritative_scope_counts = [
+            parsed
+            for scope_payload in payloads
+            for key in (
+                'selected_symbol_count',
+                'requested_symbol_count',
+                'symbols_selected',
+                'symbols_total',
+                'features_total',
+                'universe_count',
+                'cohort_count',
+            )
+            if (parsed := _optional_int(scope_payload.get(key)))
+            is not None
+            and parsed >= 0
+        ]
+        if not authoritative_scope_counts:
+            for scope_payload in payloads:
+                for succeeded_key, failed_key in (
+                    ('results_persisted', 'results_failed'),
+                    ('features_persisted', 'features_failed'),
+                    ('snapshots_persisted', 'snapshots_failed'),
+                    ('contexts_persisted', 'contexts_failed'),
+                    (
+                        'action_summaries_persisted',
+                        'action_summaries_failed',
+                    ),
+                    ('symbols_succeeded', 'symbols_failed'),
+                    ('succeeded', 'failed'),
+                ):
+                    succeeded_count = _optional_int(
+                        scope_payload.get(succeeded_key)
+                    )
+                    failed_count = _optional_int(
+                        scope_payload.get(failed_key)
+                    )
+                    if (
+                        succeeded_count is not None
+                        and succeeded_count >= 0
+                        and failed_count is not None
+                        and failed_count >= 0
+                    ):
+                        authoritative_scope_counts.append(
+                            succeeded_count + failed_count
+                        )
+        if not authoritative_scope_counts:
+            authoritative_scope_counts = [
+                parsed
+                for scope_payload in payloads
+                if (parsed := _optional_int(scope_payload.get('total')))
+                is not None
+                and parsed >= 0
+            ]
+        if (
+            not authoritative_scope_counts
+            or any(
+                count != len(selected_set)
+                for count in authoritative_scope_counts
+            )
+        ):
+            continue
+        manifest_outcomes: dict[str, str] = {}
+        malformed = False
+        for item in manifest:
+            if not isinstance(item, Mapping):
+                malformed = True
+                break
+            raw_stock_code = str(item.get('stock_code') or '').strip()
+            stock_code = (
+                raw_stock_code.zfill(6)
+                if raw_stock_code.isdigit()
+                else raw_stock_code.upper()
+            )
+            outcome = str(item.get('outcome') or '').strip()
+            if (
+                not stock_code
+                or stock_code in manifest_outcomes
+                or outcome
+                not in {
+                    'success',
+                    'retry_debt',
+                    'terminal_not_applicable',
+                }
+            ):
+                malformed = True
+                break
+            manifest_outcomes[stock_code] = outcome
+        expected = {
+            **{code: 'success' for code in successful_set},
+            **{code: 'retry_debt' for code in retry_set},
+            **{code: 'terminal_not_applicable' for code in terminal_set},
+        }
+        if not malformed and manifest_outcomes == expected:
+            return True
+    return False
+
+
 def _partial_is_piotroski_only_fundamentals_gap(
     outcome: Mapping[str, Any],
     payloads: tuple[Mapping[str, Any], ...],
@@ -843,10 +1087,15 @@ def _partial_outcome_is_satisfied(outcome: Mapping[str, Any]) -> bool:
         payloads=payloads,
     ):
         return True
+    high_coverage_stage = bool(
+        _stage_ids(payloads) & HIGH_COVERAGE_PARTIAL_STAGE_IDS
+    )
+    exact_scope_proven = _has_exact_scope_outcome_manifest(payloads)
     if gate_statuses == {'ready'}:
-        return True
+        return not high_coverage_stage or exact_scope_proven
     return (
-        bool(_stage_ids(payloads) & HIGH_COVERAGE_PARTIAL_STAGE_IDS)
+        high_coverage_stage
+        and exact_scope_proven
         and _partial_has_high_coverage(payloads)
     ) or _partial_is_piotroski_only_fundamentals_gap(outcome, payloads)
 

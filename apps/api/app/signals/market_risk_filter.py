@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from typing import Any, Callable, Iterable, Sequence
 
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
     load_latest_available_daily_market_risk_filter_result_date,
@@ -24,6 +25,11 @@ from app.signals.market_risk_snapshot import (
     normalize_optional_market_date,
     normalize_symbol,
     normalize_symbols,
+)
+
+
+MARKET_RISK_FILTER_SCOPE_MANIFEST_VERSION = (
+    'market_risk_filter_scope_outcomes_v1'
 )
 
 
@@ -135,6 +141,18 @@ class DailyMarketRiskFilterService:
             except Exception:
                 pass
 
+        selected_symbols = list(requested_symbols or matched_symbols)
+        successful_symbols = [item['symbol'] for item in persisted_items]
+        successful_symbol_set = set(successful_symbols)
+        retry_debt_symbols = [
+            symbol
+            for symbol in selected_symbols
+            if symbol not in successful_symbol_set
+        ]
+        failed_symbols = list(
+            dict.fromkeys([*failed_symbols, *retry_debt_symbols])
+        )
+
         return {
             'market_date': normalized_market_date.isoformat(),
             'source': source,
@@ -148,13 +166,23 @@ class DailyMarketRiskFilterService:
                 'evaluated_count': len(items),
                 'passed_count': sum(1 for item in items if item.get('passed_filter')),
                 'watchlist_count': sum(1 for item in items if item.get('watchlist_flagged')),
-                'failed_count': sum(1 for item in items if not item.get('passed_filter')),
+                'screening_rejected_count': sum(
+                    1 for item in items if not item.get('passed_filter')
+                ),
             },
             'results_persisted': len(persisted_items),
             'results_failed': len(failed_symbols),
             'failed_symbols': failed_symbols,
             'failed_symbol_errors': failed_symbol_errors,
             'items': persisted_items,
+            **build_exact_symbol_scope_outcome(
+                manifest_version=(
+                    MARKET_RISK_FILTER_SCOPE_MANIFEST_VERSION
+                ),
+                selected_symbols=selected_symbols,
+                successful_symbols=successful_symbols,
+                retry_debt_symbols=retry_debt_symbols,
+            ),
         }
 
     def inspect(
@@ -199,7 +227,9 @@ class DailyMarketRiskFilterService:
             'missing_symbols': [value for value in requested_symbols if value not in matched_symbol_set],
             'passed_count': sum(1 for item in items if item.get('passed_filter')),
             'watchlist_count': sum(1 for item in items if item.get('watchlist_flagged')),
-            'failed_count': sum(1 for item in items if not item.get('passed_filter')),
+            'screening_rejected_count': sum(
+                1 for item in items if not item.get('passed_filter')
+            ),
         }
         payload: dict[str, Any] = {
             'requested_market_date': requested_market_date,

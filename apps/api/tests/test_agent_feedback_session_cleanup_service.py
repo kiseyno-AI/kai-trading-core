@@ -190,6 +190,107 @@ class AgentFeedbackSessionCleanupServiceTests(unittest.TestCase):
             'thread_id': thread_id,
         }
 
+    def test_record_failure_normalizes_structured_error_before_text_upsert(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        target = SessionCleanupTarget(
+            market_date=date(2026, 10, 30),
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='feedback-run-structured-error',
+            session_key=f'feedback/eod-summarizer/structured-error-{uuid.uuid4().hex}',
+        )
+        result = {
+            'ok': False,
+            'deleted': False,
+            'error': ['gateway', 'still unavailable'],
+        }
+        session = MagicMock()
+        existing_result = MagicMock()
+        existing_result.scalar_one_or_none.return_value = None
+        insert_result = MagicMock()
+        insert_result.scalar_one.return_value = 1
+        session.execute.side_effect = [existing_result, insert_result]
+        scoped_session = MagicMock()
+        scoped_session.__enter__.return_value = session
+        scoped_session.__exit__.return_value = False
+
+        with (
+            patch.object(session_cleanup_module, 'session_scope', return_value=scoped_session),
+            patch.object(service, '_serialize_failure', return_value={'id': 1}),
+        ):
+            service._record_failure(
+                target=target,
+                result=result,
+                deadline_monotonic=1_000_000_000.0,
+            )
+
+        statement = session.execute.call_args_list[1].args[0]
+        compiled = statement.compile(dialect=postgresql.dialect())
+        normalized_values = [
+            value
+            for value in compiled.params.values()
+            if value == '["gateway", "still unavailable"]'
+        ]
+        self.assertGreaterEqual(len(normalized_values), 2)
+        self.assertNotIn(result['error'], compiled.params.values())
+
+    def test_normalize_last_error_prefers_structured_message(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+
+        self.assertEqual(
+            service._normalize_last_error(
+                {
+                    'type': 'gateway_transport_error',
+                    'message': ' gateway connection closed ',
+                }
+            ),
+            'gateway connection closed',
+        )
+
+    def test_record_failure_prefers_stderr_over_empty_structured_error(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        target = SessionCleanupTarget(
+            market_date=date(2026, 10, 30),
+            symbol='005930',
+            agent_name='eod-summarizer',
+            run_id='feedback-run-empty-structured-error',
+            session_key=f'feedback/eod-summarizer/empty-error-{uuid.uuid4().hex}',
+        )
+        session = MagicMock()
+        existing_result = MagicMock()
+        existing_result.scalar_one_or_none.return_value = None
+        insert_result = MagicMock()
+        insert_result.scalar_one.return_value = 1
+        session.execute.side_effect = [existing_result, insert_result]
+        scoped_session = MagicMock()
+        scoped_session.__enter__.return_value = session
+        scoped_session.__exit__.return_value = False
+
+        with (
+            patch.object(session_cleanup_module, 'session_scope', return_value=scoped_session),
+            patch.object(service, '_serialize_failure', return_value={'id': 1}),
+        ):
+            service._record_failure(
+                target=target,
+                result={
+                    'ok': False,
+                    'deleted': False,
+                    'error': {'message': '  '},
+                    'stderr': 'gateway stderr detail',
+                },
+                deadline_monotonic=1_000_000_000.0,
+            )
+
+        statement = session.execute.call_args_list[1].args[0]
+        compiled = statement.compile(dialect=postgresql.dialect())
+        self.assertGreaterEqual(
+            sum(
+                value == 'gateway stderr detail'
+                for value in compiled.params.values()
+            ),
+            2,
+        )
+
     def test_enqueue_deferred_bypasses_shared_pool_wait_for_deadline_write(
         self,
     ) -> None:

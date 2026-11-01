@@ -177,6 +177,11 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
 
         with (
             patch(
+                'app.eod.action_summaries.'
+                'list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
+            patch(
                 'app.eod.action_summaries.load_daily_technical_snapshot_inputs',
                 return_value=[_snapshot()],
             ),
@@ -192,6 +197,58 @@ class DailyActionSummaryServiceTests(unittest.TestCase):
         self.assertEqual(result['failed_symbols'], [])
         self.assertEqual([item['status'] for item in progress_updates], ['running', 'completed'])
         upsert_mock.assert_called_once()
+
+    def test_rebuild_uses_exact_same_day_price_bar_universe_as_denominator(
+        self,
+    ):
+        service = DailyActionSummaryService()
+
+        with (
+            patch(
+                'app.eod.action_summaries.'
+                'list_symbols_with_daily_bar_on_date',
+                return_value=['005930', '000660'],
+            ) as price_bar_symbols,
+            patch(
+                'app.eod.action_summaries.'
+                'load_daily_technical_snapshot_inputs',
+                return_value=[_snapshot()],
+            ) as snapshot_inputs,
+            patch(
+                'app.eod.action_summaries.upsert_daily_action_summary'
+            ),
+        ):
+            result = service.rebuild_for_market_date(
+                market_date='2026-04-29',
+                include_retry_metadata=True,
+            )
+
+        price_bar_symbols.assert_called_once_with('2026-04-29')
+        snapshot_inputs.assert_called_once_with(
+            market_date='2026-04-29',
+            symbols=['005930', '000660'],
+            limit=100,
+        )
+        self.assertEqual(result['requested_symbols'], 2)
+        self.assertEqual(result['action_summaries_persisted'], 1)
+        self.assertEqual(result['action_summaries_failed'], 1)
+        self.assertEqual(
+            result['scope_outcome_manifest_version'],
+            'action_summaries_scope_outcomes_v1',
+        )
+        self.assertEqual(result['successful_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(
+            result['scope_outcome_manifest'],
+            [
+                {'stock_code': '005930', 'outcome': 'success'},
+                {'stock_code': '000660', 'outcome': 'retry_debt'},
+            ],
+        )
+        self.assertEqual(
+            result['denominator_source'],
+            'same_day_daily_price_bars',
+        )
 
     def test_rebuild_can_return_full_internal_retry_scope_without_expanding_public_preview(self):
         service = DailyActionSummaryService()

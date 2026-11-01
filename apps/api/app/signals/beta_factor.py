@@ -12,6 +12,10 @@ from app.market_data_store import (
     upsert_daily_beta_factor_result,
     upsert_daily_beta_factor_results,
 )
+from app.signals.factor_coverage import (
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+)
 
 BETA_FACTOR_VERSION = 'beta_v1'
 BETA_FACTOR_SOURCE = BETA_FACTOR_VERSION
@@ -176,20 +180,28 @@ class DailyBetaFactorService:
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
             return {
+                'status': 'completed',
+                'reason': 'explicit_empty_scope_noop',
+                'quality_status': summary['quality_status'],
+                'quality_warning': summary['quality_warning'],
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'remaining_retryable_events': 0,
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
@@ -288,8 +300,17 @@ class DailyBetaFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+            )
+        )
 
         return {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -674,7 +695,7 @@ class DailyBetaFactorService:
             for item in items
             if item['low_beta_classification'] in {'eligible', 'watchlist', 'ineligible'}
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -691,6 +712,53 @@ class DailyBetaFactorService:
             'unready_count': len(missing_symbols) + len(items) - ready_count,
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+    ) -> dict[str, Any]:
+        def metric_available(item: dict[str, Any], metric: str) -> bool:
+            payload = item.get('factor_payload')
+            availability = payload.get('availability') if isinstance(payload, dict) else None
+            metrics = availability.get('metrics') if isinstance(availability, dict) else None
+            return bool(metrics.get(metric)) if isinstance(metrics, dict) else False
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            is_ready=lambda item: item.get('low_beta_score') is not None,
+            is_complete=lambda item: all(
+                metric_available(item, metric)
+                for metric in ('beta_60d', 'beta_120d')
+            ),
+            unusable_reason=lambda item: item.get('low_beta_classification'),
+            input_families={
+                metric: (
+                    lambda item, metric=metric: metric_available(item, metric),
+                    lambda item, metric=metric: (
+                        None
+                        if metric_available(item, metric)
+                        else f'missing_{metric}'
+                    ),
+                )
+                for metric in ('beta_60d', 'beta_120d')
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

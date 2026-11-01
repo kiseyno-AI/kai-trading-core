@@ -21,6 +21,7 @@ from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import validate_market_membership_snapshot
 from app.eod.pykrx_import import import_pykrx_stock, pykrx_request_context
+from app.market.session import previous_krx_trading_date
 from app.market_data_store import (
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
@@ -126,6 +127,8 @@ SHORT_BALANCE_METRIC_KEYS = (
     'market_cap',
     'short_balance_ratio_pct',
 )
+SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS = 2
+SHORT_BALANCE_AVAILABILITY_CONTRACT = 'krx_t_plus_2'
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
 PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 30_000
@@ -219,7 +222,8 @@ def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
     if category == 'valuation_snapshot':
         market_cap = _to_float(payload.get('market_cap'))
         has_valuation_metric = any(
-            _to_float(payload.get(key)) is not None
+            (metric_value := _to_float(payload.get(key))) is not None
+            and metric_value > 0
             for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
         )
         return row.get('source') == 'pykrx' and market_cap is not None and market_cap > 0 and has_valuation_metric
@@ -242,6 +246,22 @@ def _normalize_iso_date(value: str | date) -> str:
 
 def _normalize_yyyymmdd(value: str | date) -> str:
     return _normalize_iso_date(value).replace('-', '')
+
+
+def _resolve_short_balance_as_of_date(market_date: str | date) -> date:
+    resolved_date = date.fromisoformat(_normalize_iso_date(market_date))
+    for _ in range(SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS):
+        previous_date = previous_krx_trading_date(
+            resolved_date,
+            allow_fallback=True,
+        )
+        if previous_date is None:
+            raise RuntimeError(
+                'Could not resolve KRX T+2 short balance availability date '
+                f'before {resolved_date.isoformat()}'
+            )
+        resolved_date = previous_date
+    return resolved_date
 
 
 def _current_krx_calendar_date() -> date:
@@ -1957,6 +1977,14 @@ class PykrxEnrichmentService:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        balance_as_of_date: date | None = None
+        balance_date_error: Exception | None = None
+        try:
+            balance_as_of_date = _resolve_short_balance_as_of_date(
+                market_date_iso
+            )
+        except Exception as exc:  # pragma: no cover - defensive calendar guard
+            balance_date_error = exc
         allowed_symbols = self._active_symbol_filter(symbol_filter=symbol_filter, symbol_meta=symbol_meta)
         for market in markets:
             if market not in SHORTING_SUPPORTED_MARKETS:
@@ -2027,13 +2055,21 @@ class PykrxEnrichmentService:
                 value_frame = pd.DataFrame()
 
             try:
+                if balance_as_of_date is None:
+                    raise RuntimeError(
+                        'short_selling_balance availability date resolution failed: '
+                        f'{balance_date_error}'
+                    )
+                balance_as_of_date_yyyymmdd = _normalize_yyyymmdd(
+                    balance_as_of_date
+                )
                 balance_frame = self._fetch_frame(
                     cache=cache,
-                    cache_key=('short_selling_balance', market_date_yyyymmdd, market),
+                    cache_key=('short_selling_balance', balance_as_of_date_yyyymmdd, market),
                     operation='short_selling_balance',
                     func=stock.get_shorting_balance_by_ticker,
                     require_non_empty=True,
-                    date=market_date_yyyymmdd,
+                    date=balance_as_of_date_yyyymmdd,
                     market=market,
                 )
             except Exception as exc:
@@ -2093,6 +2129,13 @@ class PykrxEnrichmentService:
                         ),
                     },
                     'short_balance': {
+                        'as_of_date': (
+                            balance_as_of_date.isoformat()
+                            if balance_as_of_date is not None
+                            else None
+                        ),
+                        'availability_lag_trading_days': SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS,
+                        'availability_contract': SHORT_BALANCE_AVAILABILITY_CONTRACT,
                         'short_balance_qty': _to_int(_frame_value(balance_frame, symbol, '공매도잔고')),
                         'listed_shares': _to_int(_frame_value(balance_frame, symbol, '상장주식수')),
                         'short_balance_amount': _to_int(_frame_value(balance_frame, symbol, '공매도금액')),
@@ -2298,8 +2341,6 @@ class PykrxEnrichmentService:
         market_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'market']
         time_sensitive_categories = set(symbol_categories) & TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES
         fresh_stock_universe_categories = set(time_sensitive_categories)
-        if 'valuation_snapshot' in symbol_categories:
-            fresh_stock_universe_categories.add('valuation_snapshot')
         coverage_symbol_categories = list(symbol_categories)
         if (
             fresh_stock_universe_categories
@@ -2620,17 +2661,25 @@ class PykrxEnrichmentService:
                             else 'fresh_pykrx_sector_classification'
                         )
                 elif category == 'valuation_snapshot':
-                    if not fresh_stock_universe_available:
+                    expected_scope_keys = {
+                        str(item.get('symbol') or '').strip().upper()
+                        for item in active_symbol_rows
+                        if str(item.get('symbol') or '').strip()
+                        and (
+                            supported_markets is None
+                            or _row_market(item) in supported_markets
+                        )
+                    }
+                    if not expected_scope_keys:
                         expected_rows = None
                         expectation_status = 'unavailable'
                         expected_universe_source = (
-                            'fresh_pykrx_stock_universe_unavailable'
+                            'validated_eod_run_market_membership_unavailable'
                         )
                     else:
-                        expected_scope_keys = fresh_stock_symbols
                         expected_rows = len(expected_scope_keys)
                         expected_universe_source = (
-                            'fresh_pykrx_sector_classification'
+                            'validated_eod_run_market_membership'
                         )
                 elif category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES:
                     if not fresh_stock_universe_available:
