@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
+from sqlalchemy.exc import IntegrityError
+
 from app.agent_context.derived_contexts import daily_price_context_service
 from app.agent_context.retry_service import (
     FeedbackRetryCycleConfig,
@@ -3833,6 +3835,11 @@ class DailyPipelineStageService:
             invocation_symbols=invocation_symbols,
             completion_parent_proof=completion_parent_proof,
         )
+        stage_reason = self._extract_stage_reason(result)
+        if stage_reason:
+            details.setdefault('reason', stage_reason)
+            if status not in {'completed', 'skipped'}:
+                details.setdefault('failure_reason', stage_reason)
         source_run_ids = self._extract_stage_source_run_ids(result)
         completion_scope_proof = details.get('completion_scope_proof')
         missing_completion_authority = bool(
@@ -3913,11 +3920,17 @@ class DailyPipelineStageService:
             'current_activity': (
                 f'{self._status_activity_prefix(status)} '
                 f'{STAGE_DEFINITIONS[stage_id].label}'
+                + (f': {stage_reason}' if stage_reason else '')
             ),
             'error_message': (
                 str(
                     result.get('error')
                     or result.get('error_message')
+                    or (
+                        stage_reason
+                        if status not in {'completed', 'skipped'}
+                        else None
+                    )
                     or ''
                 )
                 or None
@@ -4399,11 +4412,52 @@ class DailyPipelineStageService:
                 'failed': failed,
             }
         if stage_id == 'fundamentals_daily_refresh':
-            succeeded = _int(result.get('events_captured'))
-            failed = _int(result.get('events_failed'))
-            total = _int(result.get('events_detected')) or succeeded + failed
+            has_symbol_scope = any(
+                key in result
+                for key in (
+                    'symbols_checked',
+                    'symbols_selected',
+                    'successful_stock_codes',
+                    'retry_debt_stock_codes',
+                    'retry_debt_count',
+                )
+            )
+            if has_symbol_scope:
+                successful_stock_codes = result.get(
+                    'successful_stock_codes'
+                )
+                succeeded = (
+                    len(successful_stock_codes)
+                    if isinstance(successful_stock_codes, list)
+                    else _int(result.get('symbols_fresh'))
+                    + _int(result.get('symbols_refreshed'))
+                )
+                failed = _int(result.get('symbols_failed'))
+                retry_debt_count = _int(result.get('retry_debt_count'))
+                if retry_debt_count <= 0 and isinstance(
+                    result.get('retry_debt_stock_codes'),
+                    list,
+                ):
+                    retry_debt_count = len(
+                        result['retry_debt_stock_codes']
+                    )
+                total = _int(
+                    result.get('symbols_checked')
+                    or result.get('symbols_selected')
+                )
+                total = max(
+                    total,
+                    succeeded + failed + retry_debt_count,
+                )
+            else:
+                succeeded = _int(result.get('events_captured'))
+                failed = _int(result.get('events_failed'))
+                total = (
+                    _int(result.get('events_detected'))
+                    or succeeded + failed
+                )
             return {
-                'processed': succeeded + failed,
+                'processed': min(succeeded + failed, total),
                 'total': max(total, succeeded + failed),
                 'succeeded': succeeded,
                 'failed': failed,
@@ -4426,20 +4480,32 @@ class DailyPipelineStageService:
                 else 'requested_symbol_count'
             )
             total = _int(summary.get(total_key))
-            collected = _int(
-                summary.get('collected_symbol_count')
-                if 'collected_symbol_count' in summary
-                else summary.get('matched_symbol_count')
+            failed = _int(summary.get('failed_symbol_count')) + _int(
+                summary.get('skipped_symbol_count')
             )
+            if 'collected_symbol_count' in summary:
+                collected = _int(summary.get('collected_symbol_count'))
+            elif 'matched_symbol_count' in summary:
+                collected = _int(summary.get('matched_symbol_count'))
+            elif any(
+                _int(summary.get(key)) > 0
+                for key in (
+                    'items_fetched',
+                    'items_inserted',
+                    'items_updated',
+                    'symbols_with_any_news',
+                )
+            ):
+                collected = max(total - failed, 0)
+            else:
+                collected = 0
             # A successful collection attempt is terminal work even when the
             # provider returns no recent article.  Fresh/stale/no-result is a
             # data-quality distinction, not a task outcome; using only
             # ``recent_news_symbol_count`` made successful no-result and stale
             # symbols disappear from both success and failure totals.
             succeeded = collected
-            failed = _int(summary.get('failed_symbol_count')) + _int(
-                summary.get('skipped_symbol_count')
-            )
+            total = max(total, collected + failed)
             return {
                 'processed': min(collected + failed, total) if total else collected + failed,
                 'total': total,
@@ -4565,6 +4631,24 @@ class DailyPipelineStageService:
         stage_id: str,
         result: dict[str, Any],
     ) -> dict[str, Any]:
+        if stage_id == 'fundamentals_daily_refresh':
+            try:
+                retry_debt_count = int(
+                    result.get('retry_debt_count') or 0
+                )
+            except (TypeError, ValueError):
+                retry_debt_count = 0
+            if retry_debt_count <= 0 and isinstance(
+                result.get('retry_debt_stock_codes'),
+                list,
+            ):
+                retry_debt_count = len(result['retry_debt_stock_codes'])
+            if retry_debt_count <= 0:
+                return {}
+            return {
+                'remaining': 'retry_debt',
+                'retry_debt_count': retry_debt_count,
+            }
         if stage_id != 'external_news_enrich':
             return {}
         try:
@@ -4634,6 +4718,42 @@ class DailyPipelineStageService:
         if latest_run and latest_run.get('id') is not None:
             extracted.setdefault('latest_run_id', latest_run.get('id'))
         return extracted
+
+    @staticmethod
+    def _extract_stage_reason(result: Mapping[str, Any]) -> str | None:
+        payloads: list[Mapping[str, Any]] = []
+        pending: list[Mapping[str, Any]] = [result]
+        seen_ids: set[int] = set()
+        while pending:
+            payload = pending.pop(0)
+            if id(payload) in seen_ids:
+                continue
+            seen_ids.add(id(payload))
+            payloads.append(payload)
+            for key in ('result', 'result_summary', 'summary', 'details'):
+                nested = payload.get(key)
+                if isinstance(nested, Mapping):
+                    pending.append(nested)
+
+        for key in (
+            'failure_reason',
+            'reason',
+            'error',
+            'error_message',
+        ):
+            for payload in payloads:
+                value = str(payload.get(key) or '').strip()
+                if value:
+                    return value
+        for payload in payloads:
+            partial_reasons = payload.get('partial_reasons')
+            if not isinstance(partial_reasons, (list, tuple)):
+                continue
+            for reason in partial_reasons:
+                value = str(reason or '').strip()
+                if value:
+                    return value
+        return None
 
     @staticmethod
     def _build_exact_scope_outcome_proof(
@@ -6472,6 +6592,36 @@ class DailyPipelineStageService:
         return result
 
     @staticmethod
+    def _execute_optional_context_stage(
+        *,
+        stage_id: str,
+        call: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            return call()
+        except IntegrityError:
+            raise
+        except Exception as exc:
+            reason = f'{stage_id}_service_exception'
+            logger.warning(
+                'Optional daily context stage %s degraded: %s',
+                stage_id,
+                type(exc).__name__,
+            )
+            return {
+                'triggered': True,
+                'terminal': True,
+                'retry_pending': False,
+                'retryable': False,
+                'status': 'partial',
+                'stage': stage_id,
+                'reason': reason,
+                'failure_reason': reason,
+                'error_type': type(exc).__name__,
+                'error_message': str(exc),
+            }
+
+    @staticmethod
     def _combine_technical_scope_outcomes(
         *,
         price_context_result: Mapping[str, Any],
@@ -7365,25 +7515,36 @@ class DailyPipelineStageService:
                 atomic_finalization=True,
             )
         if stage_id == 'external_news_collect':
-            return asyncio.run(
-                external_news_service.collect_for_agent_feedback_candidates(
-                    market_date=market_date,
-                    symbols=symbols,
-                    display=settings.external_news_default_display,
-                    symbol_limit=symbol_limit,
-                )
+            return self._execute_optional_context_stage(
+                stage_id=stage_id,
+                call=lambda: asyncio.run(
+                    external_news_service.collect_for_agent_feedback_candidates(
+                        market_date=market_date,
+                        symbols=symbols,
+                        display=settings.external_news_default_display,
+                        symbol_limit=symbol_limit,
+                    )
+                ),
             )
         if stage_id == 'external_news_enrich':
-            return external_news_service.enrich_recent_classification(
-                symbols=symbols,
-                market_date=market_date,
-                lookback_days=settings.external_news_context_lookback_days,
-                limit=symbol_limit or 1000,
+            return self._execute_optional_context_stage(
+                stage_id=stage_id,
+                call=lambda: external_news_service.enrich_recent_classification(
+                    symbols=symbols,
+                    market_date=market_date,
+                    lookback_days=(
+                        settings.external_news_context_lookback_days
+                    ),
+                    limit=symbol_limit or 1000,
+                ),
             )
         if stage_id == 'macro_context_refresh':
-            return macro_context_service.refresh_context(
-                force=force,
-                trigger='daily_pipeline_stage',
+            return self._execute_optional_context_stage(
+                stage_id=stage_id,
+                call=lambda: macro_context_service.refresh_context(
+                    force=force,
+                    trigger='daily_pipeline_stage',
+                ),
             )
         if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
             prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(

@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy.exc import IntegrityError
+
 from app.core.settings import settings
 from app.external_news.service import ExternalNewsService
 
@@ -140,6 +142,33 @@ class ExternalNewsResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['failed_symbol_count'], 1)
         self.assertFalse(result['summary']['provider_circuit_open'])
         self.assertEqual(len(provider.queries), 2)
+
+    async def test_persistence_integrity_failure_remains_fatal(self) -> None:
+        provider = _SequencedProvider([[]])
+        service = ExternalNewsService(provider=provider)
+        integrity_error = IntegrityError(
+            'insert into external_news_items',
+            {},
+            RuntimeError('constraint violation'),
+        )
+
+        with (
+            patch(
+                'app.external_news.service.load_symbols',
+                return_value=_symbol_rows('005930'),
+            ),
+            patch(
+                'app.external_news.service.persist_external_news_items',
+                side_effect=integrity_error,
+            ),
+            patch.object(
+                settings,
+                'external_news_collect_throttle_seconds',
+                0,
+            ),
+            self.assertRaises(IntegrityError),
+        ):
+            await service.collect_for_symbols(symbols=['005930'])
 
     async def test_feedback_collection_preserves_actual_collected_symbol_count(self) -> None:
         provider = _SequencedProvider([RuntimeError('temporary outage'), []])

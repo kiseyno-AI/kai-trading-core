@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.settings import settings
 from app.db import engine, session_scope
@@ -148,6 +149,42 @@ class MacroContextServiceTests(unittest.TestCase):
         self.assertFalse(context['macro_regime_summary']['llm_generated'])
         self.assertTrue(context['usage_policy']['contextual_input_only'])
         self.assertFalse(context['usage_policy']['direct_buy_sell_signal'])
+
+    def test_refresh_integrity_failure_remains_fatal(self) -> None:
+        service = self._service()
+        integrity_error = IntegrityError(
+            'insert into macro_context_observations',
+            {},
+            RuntimeError('constraint violation'),
+        )
+
+        with (
+            patch.object(
+                service.store,
+                'upsert_observation',
+                side_effect=integrity_error,
+            ),
+            self.assertRaises(IntegrityError),
+        ):
+            service.refresh_context(force=True, trigger='unit_test')
+
+    def test_context_read_integrity_failure_remains_fatal(self) -> None:
+        service = self._service()
+        integrity_error = IntegrityError(
+            'select from macro_context_observations',
+            {},
+            RuntimeError('corrupt row'),
+        )
+
+        with (
+            patch.object(
+                service.store,
+                'load_latest_by_series',
+                side_effect=integrity_error,
+            ),
+            self.assertRaises(IntegrityError),
+        ):
+            service.get_context(as_of_date='2026-06-20')
 
     def test_disabled_keyed_provider_is_reported_without_failure(self) -> None:
         service = self._service()

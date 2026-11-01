@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import threading
 from typing import Any, Sequence
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.core.audit_logging import exception_message
 from app.core.settings import settings
@@ -452,6 +452,8 @@ class MacroContextService:
                 as_of_date=resolved_as_of,
                 fetched_at_before=knowledge_cutoff_at,
             )
+        except IntegrityError:
+            raise
         except SQLAlchemyError as exc:
             return self._unavailable_context(
                 as_of_date=resolved_as_of,
@@ -637,6 +639,8 @@ class MacroContextService:
                         'fetched_at': record.fetched_at.isoformat(),
                     }
                 )
+            except IntegrityError:
+                raise
             except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
                 observations_failed += 1
                 reason = exception_message(exc)
@@ -647,6 +651,8 @@ class MacroContextService:
                         failed_at=now,
                         reason=reason,
                     )
+                except IntegrityError:
+                    raise
                 except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
                     pass
                 series_statuses.append(
@@ -738,6 +744,8 @@ class MacroContextService:
                     status='disabled_missing_api_key',
                     reason=exception_message(exc),
                 )
+            except IntegrityError:
+                raise
             except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
                 observations_failed += 1
                 reason = exception_message(exc)
@@ -748,6 +756,8 @@ class MacroContextService:
                         failed_at=now,
                         reason=reason,
                     )
+                except IntegrityError:
+                    raise
                 except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
                     pass
                 series_statuses.append(

@@ -6,6 +6,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import IntegrityError
+
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.core.audit_logging import exception_message
 from app.core.settings import settings
@@ -261,6 +263,8 @@ class ExternalNewsService:
                     items=fetched,
                     source=self.provider.provider_name,
                 )
+            except IntegrityError:
+                raise
             except Exception as exc:
                 summary['failed_symbol_count'] += 1
                 logger.warning(
@@ -463,6 +467,8 @@ class ExternalNewsService:
                 association_start=association_start,
                 association_end=association_end,
             )
+        except IntegrityError:
+            raise
         except Exception as exc:
             logger.error(
                 'External news classification enrichment failed.',

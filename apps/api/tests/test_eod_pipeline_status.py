@@ -2033,11 +2033,76 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'unavailable',
         )
         self.assertEqual(
+            stage['details']['reason'],
+            'external_news_storage_unavailable',
+        )
+        self.assertEqual(
+            stage['details']['failure_reason'],
+            'external_news_storage_unavailable',
+        )
+        self.assertEqual(
             EODPipelineStatusService._resolve_overall_status(
                 {'external_news_enrich': stage}
             ),
             'completed',
         )
+
+    def test_official_parent_projects_nested_terminal_failure_reason(
+        self,
+    ) -> None:
+        summary = EODPipelineStatusService._build_official_run_summary(
+            {
+                'id': 598,
+                'status': 'failed',
+                'current_stage': 'fundamentals_daily_refresh',
+                'error_message': None,
+                'run_metadata': {},
+                'stages': {
+                    'fundamentals_daily_refresh': {
+                        'status': 'failed',
+                        'details': {
+                            'result_summary': {
+                                'failure_reason': (
+                                    'all_selected_symbols_retry_debt'
+                                ),
+                            },
+                        },
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(
+            summary['failure_reason'],
+            'all_selected_symbols_retry_debt',
+        )
+
+    def test_official_parent_does_not_promote_optional_warning_to_failure(
+        self,
+    ) -> None:
+        summary = EODPipelineStatusService._build_official_run_summary(
+            {
+                'id': 598,
+                'status': 'partial',
+                'current_stage': 'macro_context_refresh',
+                'error_message': None,
+                'run_metadata': {'quality_status': 'degraded'},
+                'stages': {
+                    'macro_context_refresh': {
+                        'status': 'partial',
+                        'details': {
+                            'result_summary': {
+                                'failure_reason': (
+                                    'macro_context_refresh_service_exception'
+                                ),
+                            },
+                        },
+                    },
+                },
+            }
+        )
+
+        self.assertIsNone(summary['failure_reason'])
 
     def test_read_reports_completed_with_optional_context_warning_metadata(
         self,
@@ -2615,6 +2680,63 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(enrich_stage['total'], 703)
         self.assertEqual(enrich_stage['succeeded'], 703)
         self.assertEqual(enrich_stage['failed'], 0)
+
+    def test_official_fundamentals_retry_debt_repairs_legacy_zero_counters(
+        self,
+    ) -> None:
+        market_date = '2026-10-30'
+        official_item = _completed_official_stage(
+            run_id=598,
+            stage_id='fundamentals_daily_refresh',
+            market_date=market_date,
+            processed=0,
+            total=0,
+        )
+        official_item['stage']['status'] = 'partial'
+        official_item['stage']['succeeded'] = 0
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'status': 'partial',
+                'symbols_checked': 4,
+                'symbols_fresh': 2,
+                'symbols_refreshed': 0,
+                'symbols_failed': 0,
+                'successful_stock_codes': ['000660', '005930'],
+                'retry_debt_stock_codes': ['035420', '035720'],
+                'retry_debt_count': 2,
+                'partial_reasons': ['scope_retry_debt'],
+            }
+        }
+        official_run = {
+            **official_item['run'],
+            'status': 'partial',
+            'stages': {
+                'fundamentals_daily_refresh': official_item['stage'],
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 4,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['fundamentals_daily_refresh']
+        self.assertEqual(stage['processed'], 2)
+        self.assertEqual(stage['total'], 4)
+        self.assertEqual(stage['succeeded'], 2)
+        self.assertEqual(stage['failed'], 0)
+        self.assertEqual(stage['remaining'], 2)
+        self.assertEqual(stage['details']['reason'], 'scope_retry_debt')
+        self.assertEqual(
+            stage['details']['failure_reason'],
+            'scope_retry_debt',
+        )
 
     def test_official_external_news_enrichment_recovers_legacy_lower_bound_semantics(self):
         market_date = '2026-05-28'

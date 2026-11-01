@@ -6,6 +6,8 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from sqlalchemy.exc import IntegrityError
+
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
@@ -7191,6 +7193,85 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+    def test_extract_stage_counts_preserves_collected_news_when_scope_count_is_stale(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='external_news_collect',
+            result={
+                'status': 'ok',
+                'summary': {
+                    'eligible_symbol_count': 0,
+                    'collected_symbol_count': 2,
+                    'items_inserted': 3,
+                },
+            },
+        )
+
+    def test_extract_stage_counts_recovers_legacy_news_collection_evidence(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='external_news_collect',
+            result={
+                'status': 'ok',
+                'summary': {
+                    'eligible_symbol_count': 2,
+                    'items_inserted': 3,
+                    'failed_symbol_count': 0,
+                    'skipped_symbol_count': 0,
+                },
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 2,
+                'failed': 0,
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 2,
+                'failed': 0,
+            },
+        )
+
+    def test_extract_stage_counts_keeps_fundamentals_retry_debt_remaining(
+        self,
+    ) -> None:
+        counts = DailyPipelineStageService._extract_stage_counts(
+            stage_id='fundamentals_daily_refresh',
+            result={
+                'status': 'partial',
+                'symbols_checked': 4,
+                'symbols_fresh': 2,
+                'symbols_refreshed': 0,
+                'symbols_failed': 0,
+                'successful_stock_codes': ['000660', '005930'],
+                'retry_debt_stock_codes': ['035420', '035720'],
+                'retry_debt_count': 2,
+                'partial_reasons': ['scope_retry_debt'],
+            },
+        )
+
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 4,
+                'succeeded': 2,
+                'failed': 0,
+            },
+        )
+
     def test_extract_stage_counts_keeps_trending_progress_in_period_units(self) -> None:
         counts = DailyPipelineStageService._extract_stage_counts(
             stage_id='trending_ranks',
@@ -7602,6 +7683,154 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'trigger': 'daily_pipeline_stage',
             },
         )
+
+    def test_optional_context_service_exceptions_become_terminal_degradation(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        execute_kwargs = {
+            'market_date': '2026-04-24',
+            'symbols': ['005930', '000660'],
+            'markets': [],
+            'force': True,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+        }
+        cases = (
+            (
+                'external_news_collect',
+                'app.eod.daily_pipeline_stages.external_news_service.collect_for_agent_feedback_candidates',
+                'external_news_collect_service_exception',
+            ),
+            (
+                'external_news_enrich',
+                'app.eod.daily_pipeline_stages.external_news_service.enrich_recent_classification',
+                'external_news_enrich_service_exception',
+            ),
+            (
+                'macro_context_refresh',
+                'app.eod.daily_pipeline_stages.macro_context_service.refresh_context',
+                'macro_context_refresh_service_exception',
+            ),
+        )
+
+        for stage_id, target, expected_reason in cases:
+            with self.subTest(stage_id=stage_id), patch(
+                target,
+                side_effect=RuntimeError('provider unavailable'),
+            ):
+                result = service._execute_stage(
+                    stage_id=stage_id,
+                    **execute_kwargs,
+                )
+
+            self.assertEqual(result['status'], 'partial')
+            self.assertTrue(result['terminal'])
+            self.assertFalse(result['retry_pending'])
+            self.assertEqual(result['reason'], expected_reason)
+            self.assertEqual(result['failure_reason'], expected_reason)
+            self.assertEqual(result['error_type'], 'RuntimeError')
+            self.assertEqual(result['error_message'], 'provider unavailable')
+
+    def test_optional_context_integrity_errors_remain_fatal(self) -> None:
+        service = DailyPipelineStageService()
+        integrity_error = IntegrityError(
+            'insert into context',
+            {},
+            RuntimeError('constraint violation'),
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.macro_context_service.refresh_context',
+                side_effect=integrity_error,
+            ),
+            self.assertRaises(IntegrityError),
+        ):
+            service._execute_stage(
+                stage_id='macro_context_refresh',
+                market_date='2026-04-24',
+                symbols=['005930'],
+                markets=[],
+                force=True,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+    def test_finish_tracked_stage_promotes_nested_failure_reason(self) -> None:
+        service = DailyPipelineStageService()
+
+        service._finish_tracked_stage(
+            pipeline_run_id=9000,
+            stage_id='macro_context_refresh',
+            market_date='2026-04-24',
+            outcome={'status': 'partial'},
+            result={
+                'status': 'partial',
+                'error_message': 'provider call failed',
+                'result_summary': {
+                    'failure_reason': 'macro_provider_unavailable',
+                },
+                'observations_upserted': 0,
+                'observations_failed': 0,
+            },
+        )
+
+        finish = self.run_state_service.stage_events[-1]
+        self.assertEqual(finish['event'], 'finish_stage')
+        self.assertEqual(finish['status'], 'partial')
+        self.assertEqual(
+            finish['details']['reason'],
+            'macro_provider_unavailable',
+        )
+        self.assertEqual(
+            finish['details']['failure_reason'],
+            'macro_provider_unavailable',
+        )
+        self.assertEqual(
+            finish['error_message'],
+            'provider call failed',
+        )
+        self.assertIn(
+            'macro_provider_unavailable',
+            finish['current_activity'],
+        )
+
+    def test_optional_service_degradation_does_not_fail_parent_run(self) -> None:
+        service = DailyPipelineStageService()
+
+        with patch(
+            'app.eod.daily_pipeline_stages.macro_context_service.refresh_context',
+            side_effect=RuntimeError('provider unavailable'),
+        ):
+            result = service.run(
+                market_date='2026-04-24',
+                stages=['macro_context_refresh'],
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            result['stages']['macro_context_refresh']['status'],
+            'partial',
+        )
+        finish = self.run_state_service.runs[-1]['finish']
+        self.assertEqual(finish['status'], 'completed')
+        self.assertNotIn('error_message', finish)
+        self.assertEqual(finish['run_metadata']['quality_status'], 'degraded')
 
     def test_execute_stage_forwards_market_date_to_external_news_enrichment(self) -> None:
         service = DailyPipelineStageService()

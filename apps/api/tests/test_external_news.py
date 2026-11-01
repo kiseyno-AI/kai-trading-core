@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError
 
 from app.core.settings import settings
 from app.external_news.classifier import classify_external_news_item
@@ -351,6 +352,26 @@ class ExternalNewsServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         logger.exception.assert_not_called()
+
+    def test_enrichment_integrity_failure_remains_fatal(self) -> None:
+        service = ExternalNewsService(provider=FakeExternalNewsProvider())
+        integrity_error = IntegrityError(
+            'insert into external_news_item_classifications',
+            {},
+            RuntimeError('constraint violation'),
+        )
+
+        with (
+            patch(
+                'app.external_news.service.enrich_recent_external_news_classification',
+                side_effect=integrity_error,
+            ),
+            self.assertRaises(IntegrityError),
+        ):
+            service.enrich_recent_classification(
+                symbols=['000660'],
+                market_date='2026-10-07',
+            )
 
     async def test_collect_is_disabled_without_provider_credentials_before_symbol_lookup(self) -> None:
         provider = FakeExternalNewsProvider(enabled=False)

@@ -1771,6 +1771,11 @@ class EODPipelineStatusService:
                 details['expected_rows'] = int(stage.get('total') or 0)
             if details.get('progress_source') is None:
                 details['progress_source'] = EODPipelineStatusService._infer_stage_progress_source(stage)
+            stable_reason = (
+                DailyPipelineStageService._extract_stage_reason(
+                    {**stage, 'details': details}
+                )
+            )
             if details.get('reason') is None:
                 details['reason'] = EODPipelineStatusService._infer_stage_reason(stage, details)
             raw_status = str(
@@ -1794,6 +1799,20 @@ class EODPipelineStatusService:
                     'status_canonicalization_reason',
                     'terminal_optional_context_unavailable',
                 )
+            if (
+                normalized_status
+                in {
+                    'abandoned',
+                    'blocked',
+                    'failed',
+                    'interrupted',
+                    'partial',
+                    'unavailable',
+                }
+                and details.get('failure_reason') is None
+                and stable_reason
+            ):
+                details['failure_reason'] = stable_reason
 
             normalized[stage_id] = {
                 **stage,
@@ -1895,6 +1914,11 @@ class EODPipelineStatusService:
             value = details.get(key) or stage.get(key)
             if value:
                 return str(value)
+        nested_reason = DailyPipelineStageService._extract_stage_reason(
+            details
+        )
+        if nested_reason:
+            return nested_reason
         status = str(stage.get('status') or '').strip().lower()
         if status == 'skipped':
             return str(stage.get('current_activity') or 'Stage is not applicable to this market-date status view.')
@@ -3738,7 +3762,12 @@ class EODPipelineStatusService:
             and counts.failed == 0
         )
         if (
-            stage_id in {'external_news_collect', 'external_news_enrich'}
+            stage_id
+            in {
+                'external_news_collect',
+                'external_news_enrich',
+                'fundamentals_daily_refresh',
+            }
             and result_summary
             and should_repair_legacy_counts
         ):
@@ -4534,6 +4563,53 @@ class EODPipelineStatusService:
     def _build_official_run_summary(official_run: dict[str, Any] | None) -> dict[str, Any] | None:
         if official_run is None:
             return None
+        status = str(official_run.get('status') or '').strip().lower()
+        run_metadata = (
+            official_run.get('run_metadata')
+            if isinstance(official_run.get('run_metadata'), dict)
+            else {}
+        )
+        failure_reason: str | None = None
+        if status in {
+            'abandoned',
+            'blocked',
+            'completed_with_errors',
+            'failed',
+            'interrupted',
+            'partial',
+        }:
+            failure_reason = str(
+                official_run.get('failure_reason')
+                or run_metadata.get('failure_reason')
+                or official_run.get('error_message')
+                or ''
+            ).strip() or None
+            stages = (
+                official_run.get('stages')
+                if isinstance(official_run.get('stages'), dict)
+                else {}
+            )
+            current_stage_id = str(
+                official_run.get('current_stage') or ''
+            ).strip()
+            current_stage = stages.get(current_stage_id)
+            warning_stage_ids = (
+                daily_pipeline_nonblocking_warning_stage_ids(
+                    {current_stage_id: current_stage}
+                )
+                if current_stage_id and isinstance(current_stage, dict)
+                else ()
+            )
+            if (
+                failure_reason is None
+                and isinstance(current_stage, dict)
+                and current_stage_id not in warning_stage_ids
+            ):
+                failure_reason = (
+                    DailyPipelineStageService._extract_stage_reason(
+                        current_stage
+                    )
+                )
         return {
             'id': official_run.get('id'),
             'market_date': official_run.get('market_date'),
@@ -4544,7 +4620,8 @@ class EODPipelineStatusService:
             'updated_at': official_run.get('updated_at'),
             'completed_at': official_run.get('completed_at'),
             'error_message': official_run.get('error_message'),
-            'run_metadata': official_run.get('run_metadata') or {},
+            'failure_reason': failure_reason,
+            'run_metadata': run_metadata,
         }
 
     def _build_pykrx_enrichment_stage(
