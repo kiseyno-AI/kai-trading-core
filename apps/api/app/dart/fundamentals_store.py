@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import session_scope
@@ -35,6 +35,138 @@ TERMINAL_CAPTURE_STATUSES = (
     CAPTURE_STATUS_MAPPING_FAILED,
 )
 USABLE_FUNDAMENTALS_SOURCE_STATUS = '000'
+
+
+class FundamentalsCaptureCandidateDriftError(RuntimeError):
+    """Raised when a capture result targets a stale event version."""
+
+
+class LegacyCfsRecoveryCandidateDriftError(
+    FundamentalsCaptureCandidateDriftError
+):
+    """Raised when a reviewed legacy recovery candidate is no longer exact."""
+
+
+def legacy_cfs_recovery_candidate_identity(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the immutable provider/ranking coordinates for one candidate."""
+
+    integer_fields = (
+        'event_id',
+        'legacy_snapshot_id',
+        'legacy_business_year',
+    )
+    source_fields = {
+        'event_id': candidate.get('event_id', candidate.get('id')),
+        'legacy_snapshot_id': candidate.get('legacy_snapshot_id'),
+        'legacy_business_year': candidate.get('legacy_business_year'),
+    }
+    for field in integer_fields:
+        value = source_fields[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f'legacy CFS recovery candidate has invalid {field}'
+            )
+
+    period_end_month = candidate.get('legacy_period_end_month')
+    if (
+        period_end_month is not None
+        and (
+            isinstance(period_end_month, bool)
+            or not isinstance(period_end_month, int)
+            or not 1 <= period_end_month <= 12
+        )
+    ):
+        raise ValueError(
+            'legacy CFS recovery candidate has invalid '
+            'legacy_period_end_month'
+        )
+
+    required_text_fields = (
+        'stock_code',
+        'rcept_no',
+        'corp_code',
+        'corp_name',
+        'report_nm',
+        'filing_category',
+        'receipt_date',
+        'legacy_snapshot_rcept_no',
+        'legacy_snapshot_corp_code',
+        'legacy_snapshot_stock_code',
+        'legacy_snapshot_filing_category',
+        'legacy_report_code',
+        'legacy_fs_div',
+        'legacy_statement_type',
+        'legacy_period_type',
+        'legacy_source_status',
+        'legacy_captured_at',
+    )
+    text_values: dict[str, str] = {}
+    for field in required_text_fields:
+        raw_value = candidate.get(field)
+        if isinstance(raw_value, (date, datetime)):
+            value = raw_value.isoformat()
+        else:
+            value = str(raw_value or '').strip()
+        if not value:
+            raise ValueError(
+                f'legacy CFS recovery candidate has invalid {field}'
+            )
+        text_values[field] = value
+
+    stock_code = text_values['stock_code']
+    snapshot_stock_code = text_values['legacy_snapshot_stock_code']
+    if (
+        len(stock_code) != 6
+        or not stock_code.isascii()
+        or not stock_code.isdigit()
+        or snapshot_stock_code != stock_code
+    ):
+        raise ValueError(
+            'legacy CFS recovery candidate stock identity is malformed'
+        )
+    if (
+        text_values['legacy_source_status'] != '013'
+        or text_values['legacy_fs_div'] != 'CFS'
+        or text_values['legacy_period_type'] != 'annual'
+        or candidate.get('legacy_fallback_from_status') is not None
+    ):
+        raise ValueError(
+            'legacy CFS recovery candidate is not an exact annual CFS [013] '
+            'snapshot'
+        )
+
+    return {
+        'event_id': source_fields['event_id'],
+        'legacy_snapshot_id': source_fields['legacy_snapshot_id'],
+        'stock_code': stock_code,
+        'rcept_no': text_values['rcept_no'],
+        'corp_code': text_values['corp_code'],
+        'corp_name': text_values['corp_name'],
+        'report_nm': text_values['report_nm'],
+        'filing_category': text_values['filing_category'],
+        'receipt_date': text_values['receipt_date'],
+        'legacy_snapshot_rcept_no': text_values[
+            'legacy_snapshot_rcept_no'
+        ],
+        'legacy_snapshot_corp_code': text_values[
+            'legacy_snapshot_corp_code'
+        ],
+        'legacy_snapshot_stock_code': snapshot_stock_code,
+        'legacy_snapshot_filing_category': text_values[
+            'legacy_snapshot_filing_category'
+        ],
+        'legacy_business_year': source_fields['legacy_business_year'],
+        'legacy_report_code': text_values['legacy_report_code'],
+        'legacy_fs_div': text_values['legacy_fs_div'],
+        'legacy_statement_type': text_values['legacy_statement_type'],
+        'legacy_period_type': text_values['legacy_period_type'],
+        'legacy_period_end_month': period_end_month,
+        'legacy_source_status': text_values['legacy_source_status'],
+        'legacy_fallback_from_status': None,
+        'legacy_captured_at': text_values['legacy_captured_at'],
+    }
 
 
 def is_usable_fundamentals_source_status(source_status: str | None) -> bool:
@@ -508,96 +640,176 @@ class DartFundamentalsRepository:
             return []
 
         with session_scope() as session:
-            latest_rank = func.row_number().over(
-                partition_by=DartFundamentalsSnapshot.stock_code,
-                order_by=(
-                    DartDisclosureEvent.receipt_date.desc().nullslast(),
-                    DartDisclosureEvent.rcept_no.desc(),
-                    DartFundamentalsSnapshot.business_year.desc(),
-                    DartFundamentalsSnapshot.captured_at.desc(),
-                    DartFundamentalsSnapshot.id.desc(),
-                ),
-            ).label('row_rank')
-            ranked = (
-                select(
-                    DartFundamentalsSnapshot.id.label('snapshot_id'),
-                    DartFundamentalsSnapshot.disclosure_event_id.label(
-                        'event_id'
-                    ),
-                    DartFundamentalsSnapshot.source_status.label(
-                        'source_status'
-                    ),
-                    DartFundamentalsSnapshot.fs_div.label('fs_div'),
-                    DartFundamentalsSnapshot.request_payload[
-                        'fallback_from_status'
-                    ].as_string().label('fallback_from_status'),
-                    latest_rank,
-                )
-                .join(
-                    DartDisclosureEvent,
-                    DartDisclosureEvent.id
-                    == DartFundamentalsSnapshot.disclosure_event_id,
-                )
-                .where(
-                    DartDisclosureEvent.is_financial_report.is_(True),
-                    DartDisclosureEvent.filing_category == 'annual_report',
-                    DartFundamentalsSnapshot.period_type == 'annual',
-                    DartFundamentalsSnapshot.stock_code.in_(
-                        normalized_codes
-                    ),
-                    DartDisclosureEvent.receipt_date
-                    >= receipt_date_from,
-                    DartDisclosureEvent.receipt_date
-                    <= receipt_date_to,
-                )
-                .subquery()
+            return self._list_legacy_cfs_no_data_recovery_candidates(
+                session=session,
+                stock_codes=normalized_codes,
+                receipt_date_from=receipt_date_from,
+                receipt_date_to=receipt_date_to,
+                event_ids=event_ids,
             )
-            dual_no_data_proof = and_(
-                DartDisclosureEvent.fundamentals_capture_status
-                == CAPTURE_STATUS_NO_DATA,
-                func.coalesce(
-                    DartDisclosureEvent.fundamentals_last_error,
-                    '',
-                ).ilike(
-                    '%CFS [013]%'
+
+    def _list_legacy_cfs_no_data_recovery_candidates(
+        self,
+        *,
+        session: Any,
+        stock_codes: list[str],
+        receipt_date_from: date,
+        receipt_date_to: date,
+        event_ids: list[int] | None,
+    ) -> list[dict[str, Any]]:
+        latest_rank = func.row_number().over(
+            partition_by=DartFundamentalsSnapshot.stock_code,
+            order_by=(
+                DartDisclosureEvent.receipt_date.desc().nullslast(),
+                DartDisclosureEvent.rcept_no.desc(),
+                DartFundamentalsSnapshot.business_year.desc(),
+                DartFundamentalsSnapshot.captured_at.desc(),
+                DartFundamentalsSnapshot.id.desc(),
+            ),
+        ).label('row_rank')
+        ranked = (
+            select(
+                DartFundamentalsSnapshot.id.label('snapshot_id'),
+                DartFundamentalsSnapshot.disclosure_event_id.label(
+                    'event_id'
                 ),
-                func.coalesce(
-                    DartDisclosureEvent.fundamentals_last_error,
-                    '',
-                ).ilike(
-                    '%OFS [013]%'
+                DartDisclosureEvent.receipt_date.label('receipt_date'),
+                DartFundamentalsSnapshot.rcept_no.label(
+                    'snapshot_rcept_no'
                 ),
+                DartFundamentalsSnapshot.corp_code.label(
+                    'snapshot_corp_code'
+                ),
+                DartFundamentalsSnapshot.stock_code.label(
+                    'snapshot_stock_code'
+                ),
+                DartFundamentalsSnapshot.filing_category.label(
+                    'snapshot_filing_category'
+                ),
+                DartFundamentalsSnapshot.business_year.label(
+                    'business_year'
+                ),
+                DartFundamentalsSnapshot.report_code.label('report_code'),
+                DartFundamentalsSnapshot.fs_div.label('fs_div'),
+                DartFundamentalsSnapshot.statement_type.label(
+                    'statement_type'
+                ),
+                DartFundamentalsSnapshot.period_type.label('period_type'),
+                DartFundamentalsSnapshot.period_end_month.label(
+                    'period_end_month'
+                ),
+                DartFundamentalsSnapshot.source_status.label(
+                    'source_status'
+                ),
+                DartFundamentalsSnapshot.request_payload[
+                    'fallback_from_status'
+                ].as_string().label('fallback_from_status'),
+                DartFundamentalsSnapshot.captured_at.label('captured_at'),
+                latest_rank,
             )
-            stmt = (
-                select(
-                    DartDisclosureEvent,
-                    ranked.c.snapshot_id,
-                    ranked.c.source_status,
-                )
-                .join(ranked, ranked.c.event_id == DartDisclosureEvent.id)
-                .where(
-                    ranked.c.row_rank == 1,
-                    ranked.c.source_status == '013',
-                    ranked.c.fs_div == 'CFS',
-                    ranked.c.fallback_from_status.is_(None),
-                    ~dual_no_data_proof,
-                )
-                .order_by(
-                    DartDisclosureEvent.stock_code.asc(),
-                    DartDisclosureEvent.id.asc(),
-                )
+            .join(
+                DartDisclosureEvent,
+                DartDisclosureEvent.id
+                == DartFundamentalsSnapshot.disclosure_event_id,
             )
-            if event_ids is not None:
-                stmt = stmt.where(DartDisclosureEvent.id.in_(event_ids))
-            rows = session.execute(stmt).all()
-            return [
-                {
-                    **self._serialize_event(event),
-                    'legacy_snapshot_id': snapshot_id,
-                    'legacy_source_status': source_status,
-                }
-                for event, snapshot_id, source_status in rows
-            ]
+            .where(
+                DartDisclosureEvent.is_financial_report.is_(True),
+                DartDisclosureEvent.filing_category == 'annual_report',
+                DartDisclosureEvent.stock_code
+                == DartFundamentalsSnapshot.stock_code,
+                DartFundamentalsSnapshot.period_type == 'annual',
+                DartFundamentalsSnapshot.stock_code.in_(stock_codes),
+            )
+            .subquery()
+        )
+        dual_no_data_proof = and_(
+            DartDisclosureEvent.fundamentals_capture_status
+            == CAPTURE_STATUS_NO_DATA,
+            func.coalesce(
+                DartDisclosureEvent.fundamentals_last_error,
+                '',
+            ).ilike('%CFS [013]%'),
+            func.coalesce(
+                DartDisclosureEvent.fundamentals_last_error,
+                '',
+            ).ilike('%OFS [013]%'),
+        )
+        stmt = (
+            select(
+                DartDisclosureEvent,
+                ranked.c.snapshot_id,
+                ranked.c.snapshot_rcept_no,
+                ranked.c.snapshot_corp_code,
+                ranked.c.snapshot_stock_code,
+                ranked.c.snapshot_filing_category,
+                ranked.c.business_year,
+                ranked.c.report_code,
+                ranked.c.fs_div,
+                ranked.c.statement_type,
+                ranked.c.period_type,
+                ranked.c.period_end_month,
+                ranked.c.source_status,
+                ranked.c.fallback_from_status,
+                ranked.c.captured_at,
+            )
+            .join(ranked, ranked.c.event_id == DartDisclosureEvent.id)
+            .where(
+                ranked.c.row_rank == 1,
+                ranked.c.receipt_date >= receipt_date_from,
+                ranked.c.receipt_date <= receipt_date_to,
+                ranked.c.source_status == '013',
+                ranked.c.fs_div == 'CFS',
+                ranked.c.fallback_from_status.is_(None),
+                ~dual_no_data_proof,
+            )
+            .order_by(
+                DartDisclosureEvent.stock_code.asc(),
+                DartDisclosureEvent.id.asc(),
+            )
+        )
+        if event_ids is not None:
+            stmt = stmt.where(DartDisclosureEvent.id.in_(event_ids))
+        rows = session.execute(stmt).all()
+        return [
+            {
+                **self._serialize_event(event),
+                'legacy_snapshot_id': snapshot_id,
+                'legacy_snapshot_rcept_no': snapshot_rcept_no,
+                'legacy_snapshot_corp_code': snapshot_corp_code,
+                'legacy_snapshot_stock_code': snapshot_stock_code,
+                'legacy_snapshot_filing_category': (
+                    snapshot_filing_category
+                ),
+                'legacy_business_year': business_year,
+                'legacy_report_code': report_code,
+                'legacy_fs_div': fs_div,
+                'legacy_statement_type': statement_type,
+                'legacy_period_type': period_type,
+                'legacy_period_end_month': period_end_month,
+                'legacy_source_status': source_status,
+                'legacy_fallback_from_status': fallback_from_status,
+                'legacy_captured_at': (
+                    captured_at.isoformat() if captured_at else None
+                ),
+            }
+            for (
+                event,
+                snapshot_id,
+                snapshot_rcept_no,
+                snapshot_corp_code,
+                snapshot_stock_code,
+                snapshot_filing_category,
+                business_year,
+                report_code,
+                fs_div,
+                statement_type,
+                period_type,
+                period_end_month,
+                source_status,
+                fallback_from_status,
+                captured_at,
+            ) in rows
+        ]
 
     def list_symbol_fundamentals_states(
         self,
@@ -792,43 +1004,346 @@ class DartFundamentalsRepository:
             ).scalars()
             return [self._serialize_event(row) for row in rows]
 
-    def mark_event_capture_failed(self, event_id: int, *, error_message: str) -> None:
+    def validate_legacy_cfs_no_data_recovery_candidate(
+        self,
+        expected_candidate: dict[str, Any],
+    ) -> None:
         with session_scope() as session:
-            row = session.get(DartDisclosureEvent, event_id)
+            self._assert_legacy_cfs_no_data_recovery_candidate(
+                session,
+                expected_candidate,
+            )
+
+    def _assert_legacy_cfs_no_data_recovery_candidate(
+        self,
+        session: Any,
+        expected_candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        expected_identity = legacy_cfs_recovery_candidate_identity(
+            expected_candidate
+        )
+        if session.get_bind().dialect.name == 'postgresql':
+            # The selector depends on the global latest snapshot for a stock.
+            # Row locks alone cannot stop a new snapshot from being inserted
+            # after the selector is re-evaluated.  Take the writer-serializing
+            # modes up front so concurrent exact publications cannot deadlock
+            # while upgrading a weaker table lock.  Snapshot precedes event to
+            # match the ordinary snapshot-upsert/event-status write order.
+            session.execute(
+                text(
+                    'LOCK TABLE dart_fundamentals_snapshots, '
+                    'dart_disclosure_events '
+                    'IN SHARE ROW EXCLUSIVE MODE'
+                )
+            )
+        locked_event = session.get(
+            DartDisclosureEvent,
+            expected_identity['event_id'],
+            with_for_update=True,
+            populate_existing=True,
+        )
+        locked_snapshot = session.get(
+            DartFundamentalsSnapshot,
+            expected_identity['legacy_snapshot_id'],
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if locked_event is None or locked_snapshot is None:
+            raise LegacyCfsRecoveryCandidateDriftError(
+                'legacy CFS recovery candidate changed after review: '
+                f'event_id={expected_identity["event_id"]}'
+            )
+        receipt_date = date.fromisoformat(
+            expected_identity['receipt_date']
+        )
+        current_candidates = (
+            self._list_legacy_cfs_no_data_recovery_candidates(
+                session=session,
+                stock_codes=[expected_identity['stock_code']],
+                receipt_date_from=receipt_date,
+                receipt_date_to=receipt_date,
+                event_ids=[expected_identity['event_id']],
+            )
+        )
+        if len(current_candidates) != 1:
+            raise LegacyCfsRecoveryCandidateDriftError(
+                'legacy CFS recovery candidate changed after review: '
+                f'event_id={expected_identity["event_id"]}'
+            )
+        current_identity = legacy_cfs_recovery_candidate_identity(
+            current_candidates[0]
+        )
+        if current_identity != expected_identity:
+            raise LegacyCfsRecoveryCandidateDriftError(
+                'legacy CFS recovery candidate changed after review: '
+                f'event_id={expected_identity["event_id"]}'
+            )
+        return expected_identity
+
+    @staticmethod
+    def _assert_capture_candidate_version(
+        row: DartDisclosureEvent,
+        expected_event: dict[str, Any] | None,
+    ) -> None:
+        if expected_event is None:
+            return
+        expected_status = expected_event.get(
+            'fundamentals_capture_status'
+        )
+        expected_attempts = expected_event.get(
+            'fundamentals_capture_attempts'
+        )
+        if (
+            expected_status is None
+            or isinstance(expected_attempts, bool)
+            or not isinstance(expected_attempts, int)
+        ):
+            raise ValueError(
+                'capture candidate is missing status/version coordinates'
+            )
+        if (
+            row.fundamentals_capture_status != expected_status
+            or row.fundamentals_capture_attempts != expected_attempts
+        ):
+            raise FundamentalsCaptureCandidateDriftError(
+                'capture candidate changed before failure publication: '
+                f'event_id={row.id} expected_status={expected_status} '
+                f'expected_attempts={expected_attempts} '
+                f'actual_status={row.fundamentals_capture_status} '
+                f'actual_attempts={row.fundamentals_capture_attempts}'
+            )
+
+    @staticmethod
+    def _has_usable_capture_snapshot(
+        session: Any,
+        *,
+        event_id: int,
+    ) -> bool:
+        return (
+            session.execute(
+                select(DartFundamentalsSnapshot.id)
+                .where(
+                    DartFundamentalsSnapshot.disclosure_event_id
+                    == event_id,
+                    DartFundamentalsSnapshot.source_status
+                    == USABLE_FUNDAMENTALS_SOURCE_STATUS,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+
+    def find_committed_snapshot_publication(
+        self,
+        *,
+        event_id: int,
+        capture_run_id: int,
+        rcept_no: str,
+        business_year: int,
+        report_code: str,
+        fs_div: str,
+    ) -> int | None:
+        """Read back an exact publication after a commit outcome is unknown."""
+
+        with session_scope() as session:
+            return session.execute(
+                select(DartFundamentalsSnapshot.id)
+                .join(
+                    DartDisclosureEvent,
+                    DartDisclosureEvent.id
+                    == DartFundamentalsSnapshot.disclosure_event_id,
+                )
+                .where(
+                    DartDisclosureEvent.id == event_id,
+                    DartDisclosureEvent.fundamentals_capture_status
+                    == CAPTURE_STATUS_CAPTURED,
+                    DartFundamentalsSnapshot.capture_run_id
+                    == capture_run_id,
+                    DartFundamentalsSnapshot.rcept_no == rcept_no,
+                    DartFundamentalsSnapshot.business_year
+                    == business_year,
+                    DartFundamentalsSnapshot.report_code == report_code,
+                    DartFundamentalsSnapshot.fs_div == fs_div,
+                    DartFundamentalsSnapshot.source_status
+                    == USABLE_FUNDAMENTALS_SOURCE_STATUS,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+
+    def mark_event_capture_failed(
+        self,
+        event_id: int,
+        *,
+        error_message: str,
+        expected_event: dict[str, Any] | None = None,
+        expected_recovery_candidate: dict[str, Any] | None = None,
+    ) -> bool:
+        with session_scope() as session:
+            if expected_recovery_candidate is not None:
+                expected_identity = (
+                    self._assert_legacy_cfs_no_data_recovery_candidate(
+                        session,
+                        expected_recovery_candidate,
+                    )
+                )
+                if expected_identity['event_id'] != event_id:
+                    raise LegacyCfsRecoveryCandidateDriftError(
+                        'legacy CFS recovery event ID changed before failure '
+                        'publication'
+                    )
+            row = session.get(
+                DartDisclosureEvent,
+                event_id,
+                with_for_update=True,
+                populate_existing=True,
+            )
             if row is None:
-                return
+                return False
+            self._assert_capture_candidate_version(row, expected_event)
+            if (
+                row.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED
+                and self._has_usable_capture_snapshot(
+                    session,
+                    event_id=event_id,
+                )
+            ):
+                return False
             row.fundamentals_capture_status = CAPTURE_STATUS_FAILED
             row.fundamentals_capture_attempts += 1
             row.fundamentals_last_attempt_at = _utcnow()
             row.fundamentals_last_error = error_message
+            return True
 
-    def mark_event_capture_terminal(self, event_id: int, *, capture_status: str, error_message: str) -> None:
+    def mark_event_capture_terminal(
+        self,
+        event_id: int,
+        *,
+        capture_status: str,
+        error_message: str,
+        expected_event: dict[str, Any] | None = None,
+        expected_recovery_candidate: dict[str, Any] | None = None,
+    ) -> bool:
         if capture_status not in TERMINAL_CAPTURE_STATUSES:
             raise ValueError(f'Unsupported terminal capture status: {capture_status}')
 
         with session_scope() as session:
-            row = session.get(DartDisclosureEvent, event_id)
+            if expected_recovery_candidate is not None:
+                expected_identity = (
+                    self._assert_legacy_cfs_no_data_recovery_candidate(
+                        session,
+                        expected_recovery_candidate,
+                    )
+                )
+                if expected_identity['event_id'] != event_id:
+                    raise LegacyCfsRecoveryCandidateDriftError(
+                        'legacy CFS recovery event ID changed before terminal '
+                        'publication'
+                    )
+            row = session.get(
+                DartDisclosureEvent,
+                event_id,
+                with_for_update=True,
+                populate_existing=True,
+            )
             if row is None:
-                return
+                return False
+            self._assert_capture_candidate_version(row, expected_event)
+            if (
+                row.fundamentals_capture_status == CAPTURE_STATUS_CAPTURED
+                and self._has_usable_capture_snapshot(
+                    session,
+                    event_id=event_id,
+                )
+            ):
+                return False
             row.fundamentals_capture_status = capture_status
             row.fundamentals_capture_attempts += 1
             row.fundamentals_last_attempt_at = _utcnow()
             row.fundamentals_last_error = error_message
+            return True
 
     def mark_event_capture_success(self, event_id: int) -> None:
         with session_scope() as session:
             row = session.get(DartDisclosureEvent, event_id)
             if row is None:
                 return
-            now = _utcnow()
-            row.fundamentals_capture_status = CAPTURE_STATUS_CAPTURED
-            row.fundamentals_capture_attempts += 1
-            row.fundamentals_last_attempt_at = now
-            row.fundamentals_last_success_at = now
-            row.fundamentals_last_error = None
+            self._mark_event_capture_success_in_session(row)
+
+    def _mark_event_capture_success_in_session(
+        self,
+        row: DartDisclosureEvent,
+    ) -> None:
+        now = _utcnow()
+        row.fundamentals_capture_status = CAPTURE_STATUS_CAPTURED
+        row.fundamentals_capture_attempts += 1
+        row.fundamentals_last_attempt_at = now
+        row.fundamentals_last_success_at = now
+        row.fundamentals_last_error = None
 
     def replace_snapshot_dataset(
         self,
+        *,
+        event_id: int,
+        capture_run_id: int,
+        snapshot_payload: dict[str, Any],
+        row_payloads: list[dict[str, Any]],
+        highlight_payloads: list[dict[str, Any]],
+    ) -> int:
+        with session_scope() as session:
+            return self._replace_snapshot_dataset_in_session(
+                session,
+                event_id=event_id,
+                capture_run_id=capture_run_id,
+                snapshot_payload=snapshot_payload,
+                row_payloads=row_payloads,
+                highlight_payloads=highlight_payloads,
+            )
+
+    def replace_snapshot_dataset_and_mark_event_success(
+        self,
+        *,
+        event_id: int,
+        capture_run_id: int,
+        snapshot_payload: dict[str, Any],
+        row_payloads: list[dict[str, Any]],
+        highlight_payloads: list[dict[str, Any]],
+        expected_recovery_candidate: dict[str, Any] | None = None,
+    ) -> int:
+        """Publish the snapshot and captured event status atomically."""
+
+        with session_scope() as session:
+            if expected_recovery_candidate is not None:
+                expected_identity = (
+                    self._assert_legacy_cfs_no_data_recovery_candidate(
+                        session,
+                        expected_recovery_candidate,
+                    )
+                )
+                if expected_identity['event_id'] != event_id:
+                    raise LegacyCfsRecoveryCandidateDriftError(
+                        'legacy CFS recovery event ID changed before snapshot '
+                        'publication'
+                    )
+            event = session.get(DartDisclosureEvent, event_id)
+            if event is None:
+                raise RuntimeError(
+                    'DART disclosure event disappeared before snapshot '
+                    f'publication: event_id={event_id}'
+                )
+            snapshot_id = self._replace_snapshot_dataset_in_session(
+                session,
+                event_id=event_id,
+                capture_run_id=capture_run_id,
+                snapshot_payload=snapshot_payload,
+                row_payloads=row_payloads,
+                highlight_payloads=highlight_payloads,
+            )
+            self._mark_event_capture_success_in_session(event)
+            return snapshot_id
+
+    def _replace_snapshot_dataset_in_session(
+        self,
+        session: Any,
         *,
         event_id: int,
         capture_run_id: int,
@@ -840,51 +1355,68 @@ class DartFundamentalsRepository:
         snapshot_values['disclosure_event_id'] = event_id
         snapshot_values['capture_run_id'] = capture_run_id
         snapshot_values['updated_at'] = _utcnow()
+        statement = pg_insert(DartFundamentalsSnapshot).values(
+            snapshot_values
+        )
+        snapshot_id = session.execute(
+            statement.on_conflict_do_update(
+                constraint=(
+                    'uq_dart_fundamentals_snapshots_event_period_fs_div'
+                ),
+                set_={
+                    'capture_run_id': statement.excluded.capture_run_id,
+                    'rcept_no': statement.excluded.rcept_no,
+                    'corp_code': statement.excluded.corp_code,
+                    'stock_code': statement.excluded.stock_code,
+                    'corp_name': statement.excluded.corp_name,
+                    'filing_category': statement.excluded.filing_category,
+                    'statement_type': statement.excluded.statement_type,
+                    'period_type': statement.excluded.period_type,
+                    'period_end_month': statement.excluded.period_end_month,
+                    'currency': statement.excluded.currency,
+                    'source_status': statement.excluded.source_status,
+                    'source_message': statement.excluded.source_message,
+                    'request_payload': statement.excluded.request_payload,
+                    'response_payload': statement.excluded.response_payload,
+                    'captured_at': func.now(),
+                    'updated_at': statement.excluded.updated_at,
+                },
+            ).returning(DartFundamentalsSnapshot.id)
+        ).scalar_one()
 
-        with session_scope() as session:
-            statement = pg_insert(DartFundamentalsSnapshot).values(snapshot_values)
-            snapshot_id = session.execute(
-                statement.on_conflict_do_update(
-                    constraint='uq_dart_fundamentals_snapshots_event_period_fs_div',
-                    set_={
-                        'capture_run_id': statement.excluded.capture_run_id,
-                        'rcept_no': statement.excluded.rcept_no,
-                        'corp_code': statement.excluded.corp_code,
-                        'stock_code': statement.excluded.stock_code,
-                        'corp_name': statement.excluded.corp_name,
-                        'filing_category': statement.excluded.filing_category,
-                        'statement_type': statement.excluded.statement_type,
-                        'period_type': statement.excluded.period_type,
-                        'period_end_month': statement.excluded.period_end_month,
-                        'currency': statement.excluded.currency,
-                        'source_status': statement.excluded.source_status,
-                        'source_message': statement.excluded.source_message,
-                        'request_payload': statement.excluded.request_payload,
-                        'response_payload': statement.excluded.response_payload,
-                        'captured_at': func.now(),
-                        'updated_at': statement.excluded.updated_at,
-                    },
-                )
-                .returning(DartFundamentalsSnapshot.id)
-            ).scalar_one()
+        session.execute(
+            delete(DartFundamentalsRow).where(
+                DartFundamentalsRow.snapshot_id == snapshot_id
+            )
+        )
+        session.execute(
+            delete(DartFundamentalsHighlight).where(
+                DartFundamentalsHighlight.snapshot_id == snapshot_id
+            )
+        )
 
-            session.execute(delete(DartFundamentalsRow).where(DartFundamentalsRow.snapshot_id == snapshot_id))
-            session.execute(delete(DartFundamentalsHighlight).where(DartFundamentalsHighlight.snapshot_id == snapshot_id))
-
-            if row_payloads:
-                session.execute(
-                    pg_insert(DartFundamentalsRow).values(
-                        [{**row_payload, 'snapshot_id': snapshot_id} for row_payload in row_payloads]
-                    )
+        if row_payloads:
+            session.execute(
+                pg_insert(DartFundamentalsRow).values(
+                    [
+                        {**row_payload, 'snapshot_id': snapshot_id}
+                        for row_payload in row_payloads
+                    ]
                 )
-            if highlight_payloads:
-                normalized_highlights = _normalize_highlight_payloads(highlight_payloads)
-                session.execute(
-                    pg_insert(DartFundamentalsHighlight).values(
-                        [{**payload, 'snapshot_id': snapshot_id} for payload in normalized_highlights]
-                    )
+            )
+        if highlight_payloads:
+            normalized_highlights = _normalize_highlight_payloads(
+                highlight_payloads
+            )
+            session.execute(
+                pg_insert(DartFundamentalsHighlight).values(
+                    [
+                        {**payload, 'snapshot_id': snapshot_id}
+                        for payload in normalized_highlights
+                    ]
                 )
-            return snapshot_id
+            )
+        return snapshot_id
 
     def get_capture_summary(self) -> dict[str, Any]:
         with session_scope() as session:

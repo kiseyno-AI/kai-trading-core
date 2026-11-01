@@ -19,12 +19,16 @@ from app.db import session_scope
 from app.db_models import DailyPriceBar
 from app.dart.fundamentals_store import (
     CAPTURE_STATUS_CAPTURED,
+    CAPTURE_STATUS_FAILED,
     CAPTURE_STATUS_MAPPING_FAILED,
     CAPTURE_STATUS_NO_DATA,
+    FundamentalsCaptureCandidateDriftError,
+    LegacyCfsRecoveryCandidateDriftError,
     RETRYABLE_CAPTURE_STATUSES,
     TERMINAL_CAPTURE_STATUSES,
     DartFundamentalsRepository,
     dart_fundamentals_repository,
+    legacy_cfs_recovery_candidate_identity,
 )
 from app.dart.share_issuance_audit import (
     DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
@@ -77,7 +81,7 @@ TARGETED_CAPTURE_MANIFEST_VERSION = (
 )
 LEGACY_CFS_NO_DATA_RECOVERY_MODE = 'legacy_cfs_013_to_ofs_v1'
 LEGACY_CFS_RECOVERY_CANDIDATE_MANIFEST_VERSION = (
-    'dart_legacy_cfs_013_recovery_candidates_v1'
+    'dart_legacy_cfs_013_recovery_candidates_v2'
 )
 
 
@@ -137,40 +141,10 @@ def _stock_code_manifest_sha256(stock_codes: Sequence[str]) -> str:
 def legacy_cfs_recovery_candidate_manifest(
     candidates: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    manifest: list[dict[str, Any]] = []
-    for candidate in candidates:
-        event_id = candidate.get('id')
-        snapshot_id = candidate.get('legacy_snapshot_id')
-        stock_code = str(candidate.get('stock_code') or '').strip()
-        rcept_no = str(candidate.get('rcept_no') or '').strip()
-        source_status = str(
-            candidate.get('legacy_source_status') or ''
-        ).strip()
-        if (
-            isinstance(event_id, bool)
-            or not isinstance(event_id, int)
-            or event_id <= 0
-            or isinstance(snapshot_id, bool)
-            or not isinstance(snapshot_id, int)
-            or snapshot_id <= 0
-            or len(stock_code) != 6
-            or not stock_code.isascii()
-            or not stock_code.isdigit()
-            or not rcept_no
-            or source_status != DART_NO_DATA_STATUS
-        ):
-            raise ValueError(
-                'legacy CFS recovery candidate is malformed'
-            )
-        manifest.append(
-            {
-                'event_id': event_id,
-                'legacy_snapshot_id': snapshot_id,
-                'stock_code': stock_code,
-                'rcept_no': rcept_no,
-                'legacy_source_status': source_status,
-            }
-        )
+    manifest = [
+        legacy_cfs_recovery_candidate_identity(candidate)
+        for candidate in candidates
+    ]
     return sorted(
         manifest,
         key=lambda item: (
@@ -1192,14 +1166,19 @@ class DartFundamentalsCaptureService:
                 ),
             )
         if stale_run_ids:
-            log_fetch_event(
-                service='dart',
-                operation='capture_recent_fundamentals',
-                status='stale_runs_failed',
-                stale_run_ids=stale_run_ids,
-                stale_run_count=len(stale_run_ids),
-                stale_run_minutes=self.stale_run_minutes,
-            )
+            try:
+                log_fetch_event(
+                    service='dart',
+                    operation='capture_recent_fundamentals',
+                    status='stale_runs_failed',
+                    stale_run_ids=stale_run_ids,
+                    stale_run_count=len(stale_run_ids),
+                    stale_run_minutes=self.stale_run_minutes,
+                )
+            except Exception:  # noqa: BLE001
+                # Stale-run reconciliation is already durable. Logging must
+                # never prevent a fresh capture run from starting.
+                pass
         run_id = self.repository.create_capture_run(
             trigger=trigger,
             limit_requested=limit,
@@ -1212,6 +1191,27 @@ class DartFundamentalsCaptureService:
         events_failed = 0
         events_skipped = 0
         results: list[dict[str, Any]] = []
+        telemetry_warnings: list[dict[str, Any]] = []
+
+        def record_telemetry(
+            *,
+            phase: str,
+            action: Callable[[], Any],
+            event: Mapping[str, Any] | None = None,
+        ) -> dict[str, Any] | None:
+            try:
+                action()
+            except Exception as telemetry_exc:  # noqa: BLE001
+                warning = {
+                    'phase': phase,
+                    'event_id': event.get('id') if event else None,
+                    'rcept_no': event.get('rcept_no') if event else None,
+                    'error_type': type(telemetry_exc).__name__,
+                    'error_message': str(telemetry_exc)[:500],
+                }
+                telemetry_warnings.append(warning)
+                return warning
+            return None
 
         try:
             if legacy_cfs_no_data_recovery:
@@ -1251,13 +1251,16 @@ class DartFundamentalsCaptureService:
                     event_ids=event_ids,
                 )
             run_metadata_with_progress = {**run_metadata, 'candidate_count': len(events)}
-            self.repository.update_capture_run_progress(
-                run_id,
-                events_seen=events_seen,
-                events_captured=events_captured,
-                events_failed=events_failed,
-                events_skipped=events_skipped,
-                run_metadata=run_metadata_with_progress,
+            record_telemetry(
+                phase='initial_progress',
+                action=lambda: self.repository.update_capture_run_progress(
+                    run_id,
+                    events_seen=events_seen,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    events_skipped=events_skipped,
+                    run_metadata=run_metadata_with_progress,
+                ),
             )
             for event in events:
                 events_seen += 1
@@ -1273,28 +1276,41 @@ class DartFundamentalsCaptureService:
                     },
                     'last_progress_at': _utcnow().isoformat(),
                 }
-                self.repository.update_capture_run_progress(
-                    run_id,
-                    events_seen=events_seen,
-                    events_captured=events_captured,
-                    events_failed=events_failed,
-                    events_skipped=events_skipped,
-                    run_metadata=run_metadata_with_progress,
-                )
-                log_fetch_event(
-                    service='dart',
-                    operation='capture_fundamentals_event',
-                    status='started',
-                    run_id=run_id,
-                    event_id=event['id'],
-                    rcept_no=event['rcept_no'],
-                    corp_code=event['corp_code'],
-                    stock_code=event['stock_code'],
-                    fs_div=resolved_fs_div,
-                    timeout_seconds=self.event_timeout_seconds,
+                record_telemetry(
+                    phase='event_started',
+                    event=event,
+                    action=lambda event=event: (
+                        self.repository.update_capture_run_progress(
+                            run_id,
+                            events_seen=events_seen,
+                            events_captured=events_captured,
+                            events_failed=events_failed,
+                            events_skipped=events_skipped,
+                            run_metadata=run_metadata_with_progress,
+                        ),
+                        log_fetch_event(
+                            service='dart',
+                            operation='capture_fundamentals_event',
+                            status='started',
+                            run_id=run_id,
+                            event_id=event['id'],
+                            rcept_no=event['rcept_no'],
+                            corp_code=event['corp_code'],
+                            stock_code=event['stock_code'],
+                            fs_div=resolved_fs_div,
+                            timeout_seconds=self.event_timeout_seconds,
+                        ),
+                    ),
                 )
                 audit_diagnostics: dict[str, Any] | None = None
+                expected_recovery_candidate = (
+                    event if legacy_cfs_no_data_recovery else None
+                )
                 try:
+                    if expected_recovery_candidate is not None:
+                        self.repository.validate_legacy_cfs_no_data_recovery_candidate(
+                            expected_recovery_candidate
+                        )
                     audit_signal_status = 'not_required'
                     if (
                         event.get('filing_category') == 'annual_report'
@@ -1340,11 +1356,36 @@ class DartFundamentalsCaptureService:
                             event=event,
                             run_id=run_id,
                             fs_div=resolved_fs_div,
+                            expected_recovery_candidate=(
+                                expected_recovery_candidate
+                            ),
                         ),
                         timeout=self.event_timeout_seconds,
                     )
-                    self.repository.mark_event_capture_success(event['id'])
                     events_captured += 1
+                    success_result = {
+                        'event_id': event['id'],
+                        'rcept_no': event['rcept_no'],
+                        'stock_code': event['stock_code'],
+                        'status': 'captured',
+                        'business_year': request['business_year'],
+                        'report_code': request['report_code'],
+                        'fs_div': request['fs_div'],
+                        'row_count': len(dataset['items']),
+                        'audit_signal_status': audit_signal_status,
+                    }
+                    publication_reconciliation = dataset.get(
+                        'publication_reconciliation'
+                    )
+                    if isinstance(publication_reconciliation, dict):
+                        success_result['publication_reconciliation'] = (
+                            publication_reconciliation
+                        )
+                    # The snapshot, children, and event success status are
+                    # already committed by _capture_event.  Publish that
+                    # durable result before best-effort run telemetry so a
+                    # telemetry failure cannot reclassify it as capture debt.
+                    results.append(success_result)
                     run_metadata_with_progress = {
                         **run_metadata,
                         'candidate_count': len(events),
@@ -1355,47 +1396,55 @@ class DartFundamentalsCaptureService:
                         },
                         'last_progress_at': _utcnow().isoformat(),
                     }
-                    self.repository.update_capture_run_progress(
-                        run_id,
-                        events_seen=events_seen,
-                        events_captured=events_captured,
-                        events_failed=events_failed,
-                        events_skipped=events_skipped,
-                        run_metadata=run_metadata_with_progress,
+                    warning = record_telemetry(
+                        phase='event_completed',
+                        event=event,
+                        action=lambda: (
+                            self.repository.update_capture_run_progress(
+                                run_id,
+                                events_seen=events_seen,
+                                events_captured=events_captured,
+                                events_failed=events_failed,
+                                events_skipped=events_skipped,
+                                run_metadata=run_metadata_with_progress,
+                            ),
+                            log_fetch_event(
+                                service='dart',
+                                operation='capture_fundamentals_event',
+                                status='completed',
+                                run_id=run_id,
+                                event_id=event['id'],
+                                rcept_no=event['rcept_no'],
+                                corp_code=event['corp_code'],
+                                stock_code=event['stock_code'],
+                                business_year=request['business_year'],
+                                report_code=request['report_code'],
+                                fs_div=request['fs_div'],
+                                row_count=len(dataset['items']),
+                            ),
+                        ),
                     )
-                    log_fetch_event(
-                        service='dart',
-                        operation='capture_fundamentals_event',
-                        status='completed',
-                        run_id=run_id,
-                        event_id=event['id'],
-                        rcept_no=event['rcept_no'],
-                        corp_code=event['corp_code'],
-                        stock_code=event['stock_code'],
-                        business_year=request['business_year'],
-                        report_code=request['report_code'],
-                        fs_div=request['fs_div'],
-                        row_count=len(dataset['items']),
-                    )
-                    results.append(
-                        {
-                            'event_id': event['id'],
-                            'rcept_no': event['rcept_no'],
-                            'stock_code': event['stock_code'],
-                            'status': 'captured',
-                            'business_year': request['business_year'],
-                            'report_code': request['report_code'],
-                            'fs_div': request['fs_div'],
-                            'row_count': len(dataset['items']),
-                            'audit_signal_status': audit_signal_status,
-                        }
-                    )
+                    if warning is not None:
+                        success_result['telemetry_warning'] = warning
                 except asyncio.TimeoutError:
                     timeout_message = (
                         f'Capture timed out after {self.event_timeout_seconds}s '
                         f'for event_id={event["id"]} rcept_no={event["rcept_no"]}'
                     )
-                    self.repository.mark_event_capture_failed(event['id'], error_message=timeout_message)
+                    status_write_drift = (
+                        self._mark_event_capture_failed_if_current(
+                            event=event,
+                            error_message=timeout_message,
+                            expected_recovery_candidate=(
+                                expected_recovery_candidate
+                            ),
+                        )
+                    )
+                    if status_write_drift is not None:
+                        timeout_message = (
+                            f'{timeout_message}; event status write skipped: '
+                            f'{status_write_drift}'
+                        )
                     events_failed += 1
                     run_metadata_with_progress = {
                         **run_metadata,
@@ -1408,44 +1457,66 @@ class DartFundamentalsCaptureService:
                         },
                         'last_progress_at': _utcnow().isoformat(),
                     }
-                    self.repository.update_capture_run_progress(
-                        run_id,
-                        events_seen=events_seen,
-                        events_captured=events_captured,
-                        events_failed=events_failed,
-                        events_skipped=events_skipped,
-                        run_metadata=run_metadata_with_progress,
+                    failed_result = {
+                        'event_id': event['id'],
+                        'rcept_no': event['rcept_no'],
+                        'stock_code': event['stock_code'],
+                        'status': 'failed',
+                        'error': timeout_message,
+                    }
+                    results.append(failed_result)
+                    warning = record_telemetry(
+                        phase='event_timeout',
+                        event=event,
+                        action=lambda: (
+                            self.repository.update_capture_run_progress(
+                                run_id,
+                                events_seen=events_seen,
+                                events_captured=events_captured,
+                                events_failed=events_failed,
+                                events_skipped=events_skipped,
+                                run_metadata=run_metadata_with_progress,
+                            ),
+                            log_fetch_event(
+                                service='dart',
+                                operation='capture_fundamentals_event',
+                                status='failed',
+                                run_id=run_id,
+                                event_id=event['id'],
+                                rcept_no=event['rcept_no'],
+                                corp_code=event['corp_code'],
+                                stock_code=event['stock_code'],
+                                fs_div=resolved_fs_div,
+                                error_type='TimeoutError',
+                                error_message=timeout_message,
+                            ),
+                        ),
                     )
-                    log_fetch_event(
-                        service='dart',
-                        operation='capture_fundamentals_event',
-                        status='failed',
-                        run_id=run_id,
-                        event_id=event['id'],
-                        rcept_no=event['rcept_no'],
-                        corp_code=event['corp_code'],
-                        stock_code=event['stock_code'],
-                        fs_div=resolved_fs_div,
-                        error_type='TimeoutError',
-                        error_message=timeout_message,
-                    )
-                    results.append(
-                        {
-                            'event_id': event['id'],
-                            'rcept_no': event['rcept_no'],
-                            'stock_code': event['stock_code'],
-                            'status': 'failed',
-                            'error': timeout_message,
-                        }
-                    )
+                    if warning is not None:
+                        failed_result['telemetry_warning'] = warning
                 except TerminalFundamentalsCaptureError as exc:
                     capture_status = exc.capture_status
-                    self.repository.mark_event_capture_terminal(
-                        event['id'],
-                        capture_status=capture_status,
-                        error_message=str(exc),
+                    error_message = str(exc)
+                    status_write_drift = (
+                        self._mark_event_capture_terminal_if_current(
+                            event=event,
+                            capture_status=capture_status,
+                            error_message=error_message,
+                            expected_recovery_candidate=(
+                                expected_recovery_candidate
+                            ),
+                        )
                     )
-                    events_skipped += 1
+                    terminal = status_write_drift is None
+                    if terminal:
+                        events_skipped += 1
+                    else:
+                        capture_status = CAPTURE_STATUS_FAILED
+                        events_failed += 1
+                        error_message = (
+                            f'{error_message}; event status write skipped: '
+                            f'{status_write_drift}'
+                        )
                     run_metadata_with_progress = {
                         **run_metadata,
                         'candidate_count': len(events),
@@ -1453,53 +1524,74 @@ class DartFundamentalsCaptureService:
                             'event_id': event['id'],
                             'rcept_no': event['rcept_no'],
                             'status': capture_status,
-                            'terminal': True,
-                            'error': str(exc),
+                            'terminal': terminal,
+                            'error': error_message,
                         },
                         'last_progress_at': _utcnow().isoformat(),
                     }
-                    self.repository.update_capture_run_progress(
-                        run_id,
-                        events_seen=events_seen,
-                        events_captured=events_captured,
-                        events_failed=events_failed,
-                        events_skipped=events_skipped,
-                        run_metadata=run_metadata_with_progress,
+                    terminal_result = {
+                        'event_id': event['id'],
+                        'rcept_no': event['rcept_no'],
+                        'stock_code': event['stock_code'],
+                        'status': capture_status,
+                        'terminal': terminal,
+                        'error': error_message,
+                    }
+                    results.append(terminal_result)
+                    warning = record_telemetry(
+                        phase='event_terminal',
+                        event=event,
+                        action=lambda: (
+                            self.repository.update_capture_run_progress(
+                                run_id,
+                                events_seen=events_seen,
+                                events_captured=events_captured,
+                                events_failed=events_failed,
+                                events_skipped=events_skipped,
+                                run_metadata=run_metadata_with_progress,
+                            ),
+                            log_fetch_event(
+                                service='dart',
+                                operation='capture_fundamentals_event',
+                                status=capture_status,
+                                run_id=run_id,
+                                event_id=event['id'],
+                                rcept_no=event['rcept_no'],
+                                corp_code=event['corp_code'],
+                                stock_code=event['stock_code'],
+                                fs_div=resolved_fs_div,
+                                terminal=terminal,
+                                error_type=type(exc).__name__,
+                                error_message=error_message,
+                            ),
+                        ),
                     )
-                    log_fetch_event(
-                        service='dart',
-                        operation='capture_fundamentals_event',
-                        status=capture_status,
-                        run_id=run_id,
-                        event_id=event['id'],
-                        rcept_no=event['rcept_no'],
-                        corp_code=event['corp_code'],
-                        stock_code=event['stock_code'],
-                        fs_div=resolved_fs_div,
-                        terminal=True,
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
-                    results.append(
-                        {
-                            'event_id': event['id'],
-                            'rcept_no': event['rcept_no'],
-                            'stock_code': event['stock_code'],
-                            'status': capture_status,
-                            'terminal': True,
-                            'error': str(exc),
-                        }
-                    )
+                    if warning is not None:
+                        terminal_result['telemetry_warning'] = warning
                 except Exception as exc:
                     error_message = str(exc)
                     if f'DART fundamentals returned [{DART_NO_DATA_STATUS}]' in error_message:
                         capture_status = CAPTURE_STATUS_NO_DATA
-                        self.repository.mark_event_capture_terminal(
-                            event['id'],
-                            capture_status=capture_status,
-                            error_message=error_message,
+                        status_write_drift = (
+                            self._mark_event_capture_terminal_if_current(
+                                event=event,
+                                capture_status=capture_status,
+                                error_message=error_message,
+                                expected_recovery_candidate=(
+                                    expected_recovery_candidate
+                                ),
+                            )
                         )
-                        events_skipped += 1
+                        terminal = status_write_drift is None
+                        if terminal:
+                            events_skipped += 1
+                        else:
+                            capture_status = CAPTURE_STATUS_FAILED
+                            events_failed += 1
+                            error_message = (
+                                f'{error_message}; event status write '
+                                f'skipped: {status_write_drift}'
+                            )
                         run_metadata_with_progress = {
                             **run_metadata,
                             'candidate_count': len(events),
@@ -1507,46 +1599,66 @@ class DartFundamentalsCaptureService:
                                 'event_id': event['id'],
                                 'rcept_no': event['rcept_no'],
                                 'status': capture_status,
-                                'terminal': True,
+                                'terminal': terminal,
                                 'error': error_message,
                             },
                             'last_progress_at': _utcnow().isoformat(),
                         }
-                        self.repository.update_capture_run_progress(
-                            run_id,
-                            events_seen=events_seen,
-                            events_captured=events_captured,
-                            events_failed=events_failed,
-                            events_skipped=events_skipped,
-                            run_metadata=run_metadata_with_progress,
+                        terminal_result = {
+                            'event_id': event['id'],
+                            'rcept_no': event['rcept_no'],
+                            'stock_code': event['stock_code'],
+                            'status': capture_status,
+                            'terminal': terminal,
+                            'error': error_message,
+                        }
+                        results.append(terminal_result)
+                        warning = record_telemetry(
+                            phase='event_no_data',
+                            event=event,
+                            action=lambda: (
+                                self.repository.update_capture_run_progress(
+                                    run_id,
+                                    events_seen=events_seen,
+                                    events_captured=events_captured,
+                                    events_failed=events_failed,
+                                    events_skipped=events_skipped,
+                                    run_metadata=run_metadata_with_progress,
+                                ),
+                                log_fetch_event(
+                                    service='dart',
+                                    operation='capture_fundamentals_event',
+                                    status=capture_status,
+                                    run_id=run_id,
+                                    event_id=event['id'],
+                                    rcept_no=event['rcept_no'],
+                                    corp_code=event['corp_code'],
+                                    stock_code=event['stock_code'],
+                                    fs_div=resolved_fs_div,
+                                    terminal=terminal,
+                                    error_type=type(exc).__name__,
+                                    error_message=error_message,
+                                ),
+                            ),
                         )
-                        log_fetch_event(
-                            service='dart',
-                            operation='capture_fundamentals_event',
-                            status=capture_status,
-                            run_id=run_id,
-                            event_id=event['id'],
-                            rcept_no=event['rcept_no'],
-                            corp_code=event['corp_code'],
-                            stock_code=event['stock_code'],
-                            fs_div=resolved_fs_div,
-                            terminal=True,
-                            error_type=type(exc).__name__,
-                            error_message=error_message,
-                        )
-                        results.append(
-                            {
-                                'event_id': event['id'],
-                                'rcept_no': event['rcept_no'],
-                                'stock_code': event['stock_code'],
-                                'status': capture_status,
-                                'terminal': True,
-                                'error': error_message,
-                            }
-                        )
+                        if warning is not None:
+                            terminal_result['telemetry_warning'] = warning
                         continue
 
-                    self.repository.mark_event_capture_failed(event['id'], error_message=error_message)
+                    status_write_drift = (
+                        self._mark_event_capture_failed_if_current(
+                            event=event,
+                            error_message=error_message,
+                            expected_recovery_candidate=(
+                                expected_recovery_candidate
+                            ),
+                        )
+                    )
+                    if status_write_drift is not None:
+                        error_message = (
+                            f'{error_message}; event status write skipped: '
+                            f'{status_write_drift}'
+                        )
                     events_failed += 1
                     failed_event_metadata = {
                         'event_id': event['id'],
@@ -1572,28 +1684,36 @@ class DartFundamentalsCaptureService:
                         'last_event': failed_event_metadata,
                         'last_progress_at': _utcnow().isoformat(),
                     }
-                    self.repository.update_capture_run_progress(
-                        run_id,
-                        events_seen=events_seen,
-                        events_captured=events_captured,
-                        events_failed=events_failed,
-                        events_skipped=events_skipped,
-                        run_metadata=run_metadata_with_progress,
-                    )
-                    log_fetch_event(
-                        service='dart',
-                        operation='capture_fundamentals_event',
-                        status='failed',
-                        run_id=run_id,
-                        event_id=event['id'],
-                        rcept_no=event['rcept_no'],
-                        corp_code=event['corp_code'],
-                        stock_code=event['stock_code'],
-                        fs_div=resolved_fs_div,
-                        error_type=type(exc).__name__,
-                        error_message=error_message,
-                    )
                     results.append(failed_result)
+                    warning = record_telemetry(
+                        phase='event_failed',
+                        event=event,
+                        action=lambda: (
+                            self.repository.update_capture_run_progress(
+                                run_id,
+                                events_seen=events_seen,
+                                events_captured=events_captured,
+                                events_failed=events_failed,
+                                events_skipped=events_skipped,
+                                run_metadata=run_metadata_with_progress,
+                            ),
+                            log_fetch_event(
+                                service='dart',
+                                operation='capture_fundamentals_event',
+                                status='failed',
+                                run_id=run_id,
+                                event_id=event['id'],
+                                rcept_no=event['rcept_no'],
+                                corp_code=event['corp_code'],
+                                stock_code=event['stock_code'],
+                                fs_div=resolved_fs_div,
+                                error_type=type(exc).__name__,
+                                error_message=error_message,
+                            ),
+                        ),
+                    )
+                    if warning is not None:
+                        failed_result['telemetry_warning'] = warning
 
             operator_buckets = _build_operator_buckets(
                 lookup_errors=[],
@@ -1610,6 +1730,8 @@ class DartFundamentalsCaptureService:
                 'events_skipped': events_skipped,
                 'results': results,
                 'operator_buckets': operator_buckets,
+                'telemetry_warning_count': len(telemetry_warnings),
+                'telemetry_warnings': telemetry_warnings,
             }
             if normalized_exact_manifest is not None:
                 result.update(
@@ -1637,55 +1759,123 @@ class DartFundamentalsCaptureService:
                         ],
                     }
                 )
-            log_fetch_event(
-                service='dart',
-                operation='capture_recent_fundamentals',
-                status='completed',
-                **{key: value for key, value in result.items() if key != 'status'},
+            record_telemetry(
+                phase='run_completed',
+                action=lambda: self.repository.complete_capture_run(
+                    run_id,
+                    status='completed',
+                    events_seen=events_seen,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    events_skipped=events_skipped,
+                    run_metadata={
+                        **run_metadata,
+                        'candidate_count': len(events),
+                        'operator_buckets': operator_buckets,
+                        'last_progress_at': _utcnow().isoformat(),
+                    },
+                ),
             )
-            self.repository.complete_capture_run(
-                run_id,
-                status='completed',
-                events_seen=events_seen,
-                events_captured=events_captured,
-                events_failed=events_failed,
-                events_skipped=events_skipped,
-                run_metadata={
-                    **run_metadata,
-                    'candidate_count': len(events),
-                    'operator_buckets': operator_buckets,
-                    'last_progress_at': _utcnow().isoformat(),
-                },
+            result['telemetry_warning_count'] = len(telemetry_warnings)
+            result['telemetry_warnings'] = telemetry_warnings
+            record_telemetry(
+                phase='run_completed_log',
+                action=lambda: log_fetch_event(
+                    service='dart',
+                    operation='capture_recent_fundamentals',
+                    status='completed',
+                    **{
+                        key: value
+                        for key, value in result.items()
+                        if key != 'status'
+                    },
+                ),
             )
+            result['telemetry_warning_count'] = len(telemetry_warnings)
+            result['telemetry_warnings'] = telemetry_warnings
             return result
         except Exception as exc:
-            log_fetch_event(
-                service='dart',
-                operation='capture_recent_fundamentals',
-                status='failed',
-                run_id=run_id,
-                fs_div=resolved_fs_div,
-                events_seen=events_seen,
-                events_captured=events_captured,
-                events_failed=events_failed,
-                events_skipped=events_skipped,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
+            record_telemetry(
+                phase='run_failed_log',
+                action=lambda: log_fetch_event(
+                    service='dart',
+                    operation='capture_recent_fundamentals',
+                    status='failed',
+                    run_id=run_id,
+                    fs_div=resolved_fs_div,
+                    events_seen=events_seen,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    events_skipped=events_skipped,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                ),
             )
-            self.repository.complete_capture_run(
-                run_id,
-                status='failed',
-                events_seen=events_seen,
-                events_captured=events_captured,
-                events_failed=events_failed,
-                events_skipped=events_skipped,
-                error_message=str(exc),
-                run_metadata={
-                    **run_metadata,
-                    'last_progress_at': _utcnow().isoformat(),
-                },
+            record_telemetry(
+                phase='run_failed',
+                action=lambda: self.repository.complete_capture_run(
+                    run_id,
+                    status='failed',
+                    events_seen=events_seen,
+                    events_captured=events_captured,
+                    events_failed=events_failed,
+                    events_skipped=events_skipped,
+                    error_message=str(exc),
+                    run_metadata={
+                        **run_metadata,
+                        'last_progress_at': _utcnow().isoformat(),
+                    },
+                ),
             )
             raise
+
+    def _mark_event_capture_failed_if_current(
+        self,
+        *,
+        event: dict[str, Any],
+        error_message: str,
+        expected_recovery_candidate: dict[str, Any] | None,
+    ) -> FundamentalsCaptureCandidateDriftError | None:
+        try:
+            published = self.repository.mark_event_capture_failed(
+                event['id'],
+                error_message=error_message,
+                expected_event=event,
+                expected_recovery_candidate=expected_recovery_candidate,
+            )
+            if published is False:
+                return FundamentalsCaptureCandidateDriftError(
+                    'durable captured snapshot preserved; failure status '
+                    f'not published for event_id={event["id"]}'
+                )
+        except FundamentalsCaptureCandidateDriftError as exc:
+            return exc
+        return None
+
+    def _mark_event_capture_terminal_if_current(
+        self,
+        *,
+        event: dict[str, Any],
+        capture_status: str,
+        error_message: str,
+        expected_recovery_candidate: dict[str, Any] | None,
+    ) -> FundamentalsCaptureCandidateDriftError | None:
+        try:
+            published = self.repository.mark_event_capture_terminal(
+                event['id'],
+                capture_status=capture_status,
+                error_message=error_message,
+                expected_event=event,
+                expected_recovery_candidate=expected_recovery_candidate,
+            )
+            if published is False:
+                return FundamentalsCaptureCandidateDriftError(
+                    'durable captured snapshot preserved; terminal status '
+                    f'not published for event_id={event["id"]}'
+                )
+        except FundamentalsCaptureCandidateDriftError as exc:
+            return exc
+        return None
 
     async def _capture_event(
         self,
@@ -1693,6 +1883,7 @@ class DartFundamentalsCaptureService:
         event: dict[str, Any],
         run_id: int,
         fs_div: str,
+        expected_recovery_candidate: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         company_overview = await self.client.fetch_company_overview(event['corp_code'])
         try:
@@ -1747,40 +1938,65 @@ class DartFundamentalsCaptureService:
         if not source_payload.get('list'):
             raise RuntimeError('DART fundamentals returned success with no statement rows')
         dataset = build_fundamentals_dataset(source_payload)
-        self.repository.replace_snapshot_dataset(
-            event_id=event['id'],
-            capture_run_id=run_id,
-            snapshot_payload={
-                'rcept_no': event['rcept_no'],
+        snapshot_payload = {
+            'rcept_no': event['rcept_no'],
+            'corp_code': event['corp_code'],
+            'stock_code': event['stock_code'],
+            'corp_name': event['corp_name'],
+            'business_year': request['business_year'],
+            'report_code': request['report_code'],
+            'filing_category': event['filing_category'],
+            'fs_div': request['fs_div'],
+            'statement_type': request['statement_type'],
+            'period_type': request['period_type'],
+            'period_end_month': request['period_end_month'],
+            'currency': dataset['currency'],
+            'source_status': source_payload.get('status'),
+            'source_message': source_payload.get('message'),
+            'request_payload': {
                 'corp_code': event['corp_code'],
-                'stock_code': event['stock_code'],
-                'corp_name': event['corp_name'],
                 'business_year': request['business_year'],
                 'report_code': request['report_code'],
-                'filing_category': event['filing_category'],
                 'fs_div': request['fs_div'],
-                'statement_type': request['statement_type'],
-                'period_type': request['period_type'],
-                'period_end_month': request['period_end_month'],
-                'currency': dataset['currency'],
-                'source_status': source_payload.get('status'),
-                'source_message': source_payload.get('message'),
-                'request_payload': {
-                    'corp_code': event['corp_code'],
-                    'business_year': request['business_year'],
-                    'report_code': request['report_code'],
-                    'fs_div': request['fs_div'],
-                    'requested_fs_div': requested_fs_div,
-                    'fallback_from_status': fallback_from_status,
-                    'fallback_from_message': fallback_from_message,
-                    'rcept_no': event['rcept_no'],
-                    'fiscal_year_end_month': company_overview.get('acc_mt'),
-                },
-                'response_payload': source_payload,
+                'requested_fs_div': requested_fs_div,
+                'fallback_from_status': fallback_from_status,
+                'fallback_from_message': fallback_from_message,
+                'rcept_no': event['rcept_no'],
+                'fiscal_year_end_month': company_overview.get('acc_mt'),
             },
-            row_payloads=build_row_payloads(dataset['items']),
-            highlight_payloads=build_highlight_payloads(dataset['highlights']),
-        )
+            'response_payload': source_payload,
+        }
+        try:
+            self.repository.replace_snapshot_dataset_and_mark_event_success(
+                event_id=event['id'],
+                capture_run_id=run_id,
+                snapshot_payload=snapshot_payload,
+                row_payloads=build_row_payloads(dataset['items']),
+                highlight_payloads=build_highlight_payloads(
+                    dataset['highlights']
+                ),
+                expected_recovery_candidate=expected_recovery_candidate,
+            )
+        except Exception as publication_error:  # noqa: BLE001
+            try:
+                committed_snapshot_id = (
+                    self.repository.find_committed_snapshot_publication(
+                        event_id=event['id'],
+                        capture_run_id=run_id,
+                        rcept_no=event['rcept_no'],
+                        business_year=request['business_year'],
+                        report_code=request['report_code'],
+                        fs_div=request['fs_div'],
+                    )
+                )
+            except Exception as reconciliation_error:  # noqa: BLE001
+                raise publication_error from reconciliation_error
+            if committed_snapshot_id is None:
+                raise
+            dataset['publication_reconciliation'] = {
+                'status': 'committed_after_unknown_outcome',
+                'snapshot_id': committed_snapshot_id,
+            }
         return request, dataset
 
     async def backfill_current_universe_fundamentals(
