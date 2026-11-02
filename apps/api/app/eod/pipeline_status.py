@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
@@ -96,6 +97,9 @@ from app.market_data_store import (
     load_eod_run_stage_counts,
 )
 from app.repositories.eod_run_repository import list_eod_collection_runs
+from app.signals.signal_feature_readiness import (
+    classify_signal_feature_readiness,
+)
 
 DEFAULT_FACTOR_STAGE_ORDER = tuple(
     stage_id
@@ -123,6 +127,16 @@ FACTOR_STAGE_MODELS = {
     'unified_value_factors': DailyUnifiedValueFactorResult,
     'quality_factors': DailyQualityFactorResult,
     'composite_factors': DailyCompositeFactorResult,
+}
+FACTOR_STAGE_SCORE_FIELDS = {
+    'momentum_factors': 'momentum_percentile',
+    'value_factors': 'value_score',
+    'low_risk_factors': 'low_risk_score',
+    'beta_factors': 'low_beta_score',
+    'advanced_value_factors': 'advanced_value_score',
+    'unified_value_factors': 'unified_value_score',
+    'quality_factors': 'quality_score',
+    'composite_factors': 'composite_score',
 }
 ROW_COUNT_STAGE_MODELS = {
     'market_risk_filter': DailyMarketRiskFilterResult,
@@ -375,20 +389,36 @@ def _load_signal_feature_counts(*, market_date: str) -> dict[str, Any]:
             .select_from(DailySignalFeature)
             .where(DailySignalFeature.market_date == normalized_market_date)
         ).all()
-    semantic_ready_count = sum(
-        1
-        for row in rows
-        if _signal_feature_row_is_semantically_ready(
+    readiness = [
+        classify_signal_feature_readiness(
             signal_count=row.signal_count,
             feature_payload=row.feature_payload,
+            expected_market_date=market_date,
         )
+        for row in rows
+    ]
+    semantic_ready_count = sum(
+        1 for item in readiness if item['semantic_ready']
     )
-    direct_signal_rows = sum(1 for row in rows if int(row.signal_count or 0) > 0)
+    quality_counts = Counter(
+        str(item['quality_status']) for item in readiness
+    )
+    quality_reason_counts = Counter(
+        reason
+        for item in readiness
+        for reason in item['quality_reasons']
+    )
+    direct_signal_rows = sum(
+        1
+        for item in readiness
+        if item['semantic_ready']
+        and int(item.get('direct_signal_source_count') or 0) > 0
+    )
     fallback_usable_rows = sum(
         1
-        for row in rows
-        if isinstance(row.feature_payload, dict)
-        and _payload_has_content(row.feature_payload.get('fallback_features'))
+        for item in readiness
+        if item['semantic_ready']
+        and bool(item.get('usable_fallback_groups'))
     )
     updated_at = max(
         (row.captured_at for row in rows if row.captured_at is not None),
@@ -398,16 +428,18 @@ def _load_signal_feature_counts(*, market_date: str) -> dict[str, Any]:
         'persisted': len(rows),
         'semantic_ready_count': semantic_ready_count,
         'semantic_unready_count': len(rows) - semantic_ready_count,
+        'quality_complete_count': quality_counts['complete'],
+        'quality_degraded_count': quality_counts['degraded'],
+        'quality_retry_count': quality_counts['retry'],
+        'quality_reason_counts': dict(sorted(quality_reason_counts.items())),
         'direct_signal_rows': direct_signal_rows,
         'fallback_usable_rows': fallback_usable_rows,
         'fallback_only_rows': sum(
             1
-            for row in rows
-            if int(row.signal_count or 0) <= 0
-            and isinstance(row.feature_payload, dict)
-            and _payload_has_content(
-                row.feature_payload.get('fallback_features')
-            )
+            for item in readiness
+            if item['semantic_ready']
+            and int(item.get('direct_signal_source_count') or 0) <= 0
+            and bool(item.get('usable_fallback_groups'))
         ),
         'updated_at': updated_at.isoformat() if updated_at else None,
     }
@@ -417,15 +449,15 @@ def _signal_feature_row_is_semantically_ready(
     *,
     signal_count: Any,
     feature_payload: Any,
+    expected_market_date: str | None = None,
 ) -> bool:
-    if int(signal_count or 0) > 0:
-        return True
-    if not isinstance(feature_payload, dict):
-        return False
-    fallback_features = feature_payload.get('fallback_features')
-    if not isinstance(fallback_features, dict):
-        return False
-    return _payload_has_content(fallback_features)
+    return bool(
+        classify_signal_feature_readiness(
+            signal_count=signal_count,
+            feature_payload=feature_payload,
+            expected_market_date=expected_market_date,
+        )['semantic_ready']
+    )
 
 
 def _payload_has_content(value: Any) -> bool:
@@ -622,23 +654,24 @@ def _load_row_count_stage_counts(
                 func.count(model.id),
                 func.max(model.captured_at),
             ]
-            if stage_id == 'low_risk_factors':
-                decision_ready = model.low_risk_classification.in_(
-                    (
-                        'eligible',
-                        'watchlist',
-                        'ineligible',
-                        'liquidity_excluded',
-                    )
-                )
+            score_field_name = FACTOR_STAGE_SCORE_FIELDS.get(stage_id)
+            if score_field_name is not None:
+                score_column = getattr(model, score_field_name)
+                decision_ready = score_column.is_not(None)
                 aggregate_columns.extend(
                     (
                         func.count(model.id).filter(decision_ready),
+                        func.count(model.id).filter(score_column.is_(None)),
+                        func.max(model.captured_at).filter(decision_ready),
+                    )
+                )
+            if stage_id == 'low_risk_factors':
+                aggregate_columns.extend(
+                    (
                         func.count(model.id).filter(
                             model.low_risk_classification
                             == 'insufficient_history'
                         ),
-                        func.max(model.captured_at).filter(decision_ready),
                     )
                 )
             aggregate = session.execute(
@@ -668,20 +701,29 @@ def _load_row_count_stage_counts(
                 'updated_at': updated_at.isoformat() if updated_at else None,
                 **missing_diagnostics,
             }
-            if stage_id == 'low_risk_factors':
-                ready_count, insufficient_history_count, latest_ready_at = (
-                    aggregate[2:]
-                )
+            next_column_index = 2
+            if score_field_name is not None:
+                ready_count, degraded_count, latest_ready_at = aggregate[2:5]
+                next_column_index = 5
                 counts[stage_id].update(
                     {
                         'decision_ready_count': int(ready_count or 0),
-                        'insufficient_history_count': int(
-                            insufficient_history_count or 0
+                        'decision_degraded_count': int(
+                            degraded_count or 0
                         ),
                         'latest_decision_ready_at': (
                             latest_ready_at.isoformat()
                             if latest_ready_at
                             else None
+                        ),
+                    }
+                )
+            if stage_id == 'low_risk_factors':
+                insufficient_history_count = aggregate[next_column_index]
+                counts[stage_id].update(
+                    {
+                        'insufficient_history_count': int(
+                            insufficient_history_count or 0
                         ),
                     }
                 )
@@ -790,6 +832,9 @@ def _load_row_count_stage_scope_gap(
             if stage_id == 'price_collection'
             else model.market_date
         )
+        decision_ready_symbol_ids: set[int] | None = None
+        decision_degraded_symbol_ids: set[int] | None = None
+        signal_quality_by_symbol_id: dict[int, str] | None = None
         if stage_id == 'signal_features':
             persisted_rows = (
                 session.execute(
@@ -804,13 +849,27 @@ def _load_row_count_stage_scope_gap(
                 if requested_symbol_ids
                 else []
             )
-            persisted_symbol_ids = {
-                int(row.symbol_id)
-                for row in persisted_rows
-                if _signal_feature_row_is_semantically_ready(
+            signal_readiness_by_symbol_id = {
+                int(row.symbol_id): classify_signal_feature_readiness(
                     signal_count=row.signal_count,
                     feature_payload=row.feature_payload,
+                    expected_market_date=market_date,
                 )
+                for row in persisted_rows
+            }
+            persisted_symbol_ids = {
+                symbol_id
+                for symbol_id, readiness in (
+                    signal_readiness_by_symbol_id.items()
+                )
+                if readiness['semantic_ready']
+            }
+            signal_quality_by_symbol_id = {
+                symbol_id: str(readiness['quality_status'])
+                for symbol_id, readiness in (
+                    signal_readiness_by_symbol_id.items()
+                )
+                if readiness['semantic_ready']
             }
         elif stage_id in PREREQUISITE_SCOPE_STAGE_REQUIRED_MODELS:
             required_model_symbol_ids = [
@@ -834,6 +893,31 @@ def _load_row_count_stage_scope_gap(
                 set.intersection(*required_model_symbol_ids)
                 if required_model_symbol_ids
                 else set()
+            )
+        elif stage_id in FACTOR_STAGE_SCORE_FIELDS:
+            score_column = getattr(
+                model,
+                FACTOR_STAGE_SCORE_FIELDS[stage_id],
+            )
+            factor_rows = (
+                session.execute(
+                    select(model.symbol_id, score_column)
+                    .where(date_column == normalized_market_date)
+                    .where(model.symbol_id.in_(requested_symbol_ids))
+                ).all()
+                if requested_symbol_ids
+                else []
+            )
+            persisted_symbol_ids = {
+                int(row.symbol_id) for row in factor_rows
+            }
+            decision_ready_symbol_ids = {
+                int(row.symbol_id)
+                for row in factor_rows
+                if row[1] is not None
+            }
+            decision_degraded_symbol_ids = (
+                persisted_symbol_ids - decision_ready_symbol_ids
             )
         else:
             persisted_symbol_ids = set(
@@ -872,7 +956,7 @@ def _load_row_count_stage_scope_gap(
             details_sample.append(
                 {'symbol': symbol, 'name_ko': None, 'market': None}
             )
-    return {
+    result = {
         'evidence_version': 'row_count_scope_gap_v1',
         'authoritative': True,
         'missing_count': int(missing_count or 0),
@@ -891,6 +975,51 @@ def _load_row_count_stage_scope_gap(
             for required_model in required_models
         ],
     }
+    if decision_ready_symbol_ids is not None:
+        result.update(
+            {
+                'decision_ready_count': len(decision_ready_symbol_ids),
+                'decision_degraded_count': len(
+                    decision_degraded_symbol_ids or set()
+                ),
+                'quality_status': (
+                    'unavailable'
+                    if not persisted_symbol_ids
+                    else 'degraded'
+                    if decision_degraded_symbol_ids
+                    else 'complete'
+                ),
+            }
+        )
+    if signal_quality_by_symbol_id is not None:
+        quality_complete_count = sum(
+            quality == 'complete'
+            for quality in signal_quality_by_symbol_id.values()
+        )
+        quality_degraded_count = sum(
+            quality == 'degraded'
+            for quality in signal_quality_by_symbol_id.values()
+        )
+        quality_retry_count = max(
+            len(set(normalized_symbols)) - len(persisted_symbol_ids),
+            0,
+        )
+        result.update(
+            {
+                'quality_complete_count': quality_complete_count,
+                'quality_degraded_count': quality_degraded_count,
+                'quality_retry_count': quality_retry_count,
+                'quality_status': (
+                    'retry'
+                    if not persisted_symbol_ids
+                    else 'degraded'
+                    if quality_degraded_count > 0
+                    or quality_retry_count > 0
+                    else 'complete'
+                ),
+            }
+        )
+    return result
 
 
 def _coerce_int(*values: Any, default: int = 0) -> int:
@@ -908,6 +1037,22 @@ def _strict_nonnegative_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
+
+
+def _factor_scope_has_no_decision_ready_rows(
+    *,
+    stage_id: str,
+    evidence: dict[str, Any],
+) -> bool:
+    if stage_id not in FACTOR_STAGE_SCORE_FIELDS:
+        return False
+    ready_count = _strict_nonnegative_int(
+        evidence.get('decision_ready_count')
+    )
+    degraded_count = _strict_nonnegative_int(
+        evidence.get('decision_degraded_count')
+    )
+    return bool(ready_count == 0 and (degraded_count or 0) > 0)
 
 
 def _validated_row_count_scope_gap_evidence(
@@ -1538,6 +1683,7 @@ class EODPipelineStatusService:
             market_date=resolved_market_date,
             aggregate=dict(self.signal_feature_counts_loader(market_date=resolved_market_date) or {}),
             expected_total=expected_price_rows,
+            expected_total_source=expected_price_rows_source,
             scope_symbols=normalized_scope_symbols,
         )
         external_news_counts = dict(self.external_news_counts_loader(market_date=resolved_market_date) or {})
@@ -2396,14 +2542,14 @@ class EODPipelineStatusService:
             )
             or ''
         )
-        fresher_stored_low_risk_rows_are_ready = bool(
-            stage_id == 'low_risk_factors'
+        fresher_stored_factor_rows_are_ready = bool(
+            stage_id in FACTOR_STAGE_SCORE_FIELDS
             and latest_decision_ready_at is not None
             and official_updated_at is not None
             and latest_decision_ready_at > official_updated_at
             and _coerce_int(details.get('decision_ready_count')) > 0
         )
-        if fresher_stored_low_risk_rows_are_ready:
+        if fresher_stored_factor_rows_are_ready:
             return (
                 str(fallback_stage.get('status') or '').strip().lower()
                 == 'completed'
@@ -3778,6 +3924,7 @@ class EODPipelineStatusService:
             and counts.succeeded == 0
             and counts.failed == 0
         )
+        legacy_news_count_repaired = False
         if (
             stage_id
             in {
@@ -3801,6 +3948,39 @@ class EODPipelineStatusService:
                 )
             ):
                 counts = build_stage_counts(**result_counts)
+        if stage_id == 'external_news_collect' and result_summary:
+            news_summary = (
+                result_summary.get('summary')
+                if isinstance(result_summary.get('summary'), dict)
+                else {}
+            )
+            collected_symbol_count = _strict_nonnegative_int(
+                news_summary.get('collected_symbol_count')
+            )
+            recent_news_symbol_count = _strict_nonnegative_int(
+                news_summary.get('recent_news_symbol_count')
+            )
+            if (
+                collected_symbol_count is not None
+                and recent_news_symbol_count is not None
+            ):
+                semantic_counts = (
+                    DailyPipelineStageService._extract_stage_counts(
+                        stage_id=stage_id,
+                        result=result_summary,
+                    )
+                )
+                if (
+                    semantic_counts['succeeded']
+                    == collected_symbol_count
+                    and counts.processed == semantic_counts['processed']
+                    and counts.total == semantic_counts['total']
+                    and counts.failed == semantic_counts['failed']
+                    and counts.succeeded == recent_news_symbol_count
+                    and counts.succeeded != semantic_counts['succeeded']
+                ):
+                    counts = build_stage_counts(**semantic_counts)
+                    legacy_news_count_repaired = True
         if (
             stage_id == 'agent_feedback_summaries'
             and stored_status == 'completed'
@@ -3903,6 +4083,10 @@ class EODPipelineStatusService:
         )
         if count_semantics:
             details['count_semantics'] = count_semantics
+        if legacy_news_count_repaired:
+            details['count_repair_reason'] = (
+                'legacy_recent_news_success_semantics'
+            )
         if uses_fallback_coverage_diagnostics:
             details['coverage_diagnostics_source'] = 'stage_specific_fallback'
             details['coverage_diagnostics_updated_at'] = fallback_stage.get('updated_at')
@@ -4172,6 +4356,7 @@ class EODPipelineStatusService:
         market_date: str,
         aggregate: dict[str, Any],
         expected_total: int = 0,
+        expected_total_source: str = 'caller_provided',
         scope_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
         persisted = int(
@@ -4182,9 +4367,20 @@ class EODPipelineStatusService:
             if aggregate.get('semantic_ready_count') is not None
             else persisted
         )
-        normalized_total = max(int(expected_total or 0), semantic_ready)
-        if semantic_ready <= 0:
+        normalized_total = max(
+            int(expected_total or 0),
+            persisted,
+            semantic_ready,
+        )
+        scope_is_unverified = str(expected_total_source).endswith(
+            '_unverified'
+        )
+        if semantic_ready <= 0 and persisted <= 0:
             status = 'pending'
+        elif semantic_ready <= 0:
+            status = 'partial'
+        elif scope_is_unverified:
+            status = 'partial'
         elif normalized_total > 0 and semantic_ready < normalized_total:
             status = 'partial'
         else:
@@ -4194,14 +4390,37 @@ class EODPipelineStatusService:
         )
         partial_is_progressable = bool(
             status == 'partial'
+            and not scope_is_unverified
             and coverage_ratio
             >= PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO
         )
+        quality_complete_count = int(
+            aggregate.get('quality_complete_count')
+            if aggregate.get('quality_complete_count') is not None
+            else semantic_ready
+        )
+        quality_degraded_count = int(
+            aggregate.get('quality_degraded_count') or 0
+        )
+        quality_retry_count = int(
+            aggregate.get('quality_retry_count')
+            if aggregate.get('quality_retry_count') is not None
+            else max(persisted - semantic_ready, 0)
+        )
+        if quality_degraded_count > 0:
+            quality_status = 'degraded'
+        elif quality_complete_count > 0 and quality_retry_count <= 0:
+            quality_status = 'complete'
+        elif quality_retry_count > 0:
+            quality_status = 'retry'
+        else:
+            quality_status = 'unavailable'
+        processed_rows = min(persisted, normalized_total)
         counts = build_stage_counts(
             total=normalized_total,
             succeeded=semantic_ready,
-            failed=max(normalized_total - semantic_ready, 0),
-            processed=min(semantic_ready, normalized_total),
+            failed=max(processed_rows - semantic_ready, 0),
+            processed=processed_rows,
         )
         stage = {
             'task': 'signal_features',
@@ -4238,8 +4457,9 @@ class EODPipelineStatusService:
                 else 'blocked' if status == 'partial' else 'waiting'
             ),
             'severity': (
-                'ready'
-                if status == 'completed'
+                'degraded'
+                if status == 'completed' and quality_status == 'degraded'
+                else 'ready' if status == 'completed'
                 else 'degraded'
                 if partial_is_progressable
                 else 'blocked' if status == 'partial' else 'waiting'
@@ -4254,10 +4474,21 @@ class EODPipelineStatusService:
                 'reason': (
                     'semantic_signal_features_available'
                     if status == 'completed'
+                    else 'signal_feature_scope_requires_verification'
+                    if scope_is_unverified and semantic_ready > 0
                     else 'incomplete_semantic_signal_feature_coverage'
                     if status == 'partial'
                     else 'no_semantic_signal_features_for_market_date'
                 ),
+                'gate_reason': (
+                    'expected_scope_unverified'
+                    if scope_is_unverified and semantic_ready > 0
+                    else None
+                ),
+                'scope_verification_required': bool(
+                    scope_is_unverified and semantic_ready > 0
+                ),
+                'expected_rows_source': expected_total_source,
                 'rows_persisted': persisted,
                 'semantic_ready_rows': semantic_ready,
                 'semantic_unready_rows': int(
@@ -4276,11 +4507,18 @@ class EODPipelineStatusService:
                 ),
                 'expected_rows': normalized_total,
                 'coverage_ratio': round(coverage_ratio, 6),
+                'quality_status': quality_status,
+                'quality_complete_rows': quality_complete_count,
+                'quality_degraded_rows': quality_degraded_count,
+                'quality_retry_rows': quality_retry_count,
+                'quality_reason_counts': dict(
+                    aggregate.get('quality_reason_counts') or {}
+                ),
                 'min_non_blocking_coverage_ratio': (
                     PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO
                 ),
                 'semantic_readiness_rule': (
-                    'signal_count_positive_or_owned_fallback_features_present'
+                    'market_date_and_provenance_proven_direct_or_numeric_market_fallback'
                 ),
             },
         }
@@ -5732,6 +5970,55 @@ class EODPipelineStatusService:
                     blocking_status = active_contract['blocking_status']
                     gate_reason = active_contract['gate_reason']
 
+        decision_ready_count = None
+        decision_degraded_count = None
+        quality_status = None
+        quality_reason = None
+        if stage_id in FACTOR_STAGE_SCORE_FIELDS:
+            decision_ready_count = _strict_nonnegative_int(
+                aggregate.get('decision_ready_count')
+            )
+            decision_degraded_count = _strict_nonnegative_int(
+                aggregate.get('decision_degraded_count')
+            )
+            if (
+                decision_ready_count is not None
+                and decision_degraded_count is None
+            ):
+                decision_degraded_count = max(
+                    persisted - decision_ready_count,
+                    0,
+                )
+            elif (
+                decision_degraded_count is not None
+                and decision_ready_count is None
+            ):
+                decision_ready_count = max(
+                    persisted - decision_degraded_count,
+                    0,
+                )
+            if (
+                decision_ready_count is None
+                or decision_degraded_count is None
+            ):
+                quality_status = 'unverified'
+            elif persisted <= 0:
+                quality_status = 'unavailable'
+            elif decision_degraded_count > 0:
+                quality_status = 'degraded'
+                quality_reason = (
+                    'null_score_rows_preserved_as_supporting_context'
+                )
+                if decision_ready_count == 0:
+                    gate_status = 'blocked'
+                    severity = 'blocked'
+                    blocking_status = 'blocking'
+                    gate_reason = 'no_decision_ready_factor_rows'
+                elif gate_status == 'ready':
+                    severity = 'degraded'
+            else:
+                quality_status = 'complete'
+
         return {
             'gate_status': gate_status,
             'severity': severity,
@@ -5754,11 +6041,12 @@ class EODPipelineStatusService:
                 )
             ),
             'feedback_scope_gap': feedback_scope_gap,
-            'decision_ready_count': (
-                _coerce_int(aggregate.get('decision_ready_count'))
-                if stage_id == 'low_risk_factors'
-                else None
-            ),
+            'decision_ready_count': decision_ready_count,
+            'decision_degraded_count': decision_degraded_count,
+            'persisted_ready_count': decision_ready_count,
+            'persisted_unready_count': decision_degraded_count,
+            'quality_status': quality_status,
+            'quality_reason': quality_reason,
             'insufficient_history_count': (
                 _coerce_int(aggregate.get('insufficient_history_count'))
                 if stage_id == 'low_risk_factors'
@@ -5766,7 +6054,7 @@ class EODPipelineStatusService:
             ),
             'latest_decision_ready_at': (
                 _coerce_iso_timestamp(aggregate.get('latest_decision_ready_at'))
-                if stage_id == 'low_risk_factors'
+                if stage_id in FACTOR_STAGE_SCORE_FIELDS
                 else None
             ),
         }
@@ -5942,6 +6230,19 @@ class EODPipelineStatusService:
                 ),
                 'feedback_scope_gap': feedback_scope_gap,
             }
+        if _factor_scope_has_no_decision_ready_rows(
+            stage_id=stage_id,
+            evidence=validated_scope_gap,
+        ):
+            return {
+                'gate_status': 'blocked',
+                'severity': 'blocked',
+                'blocking_status': 'blocking',
+                'gate_reason': (
+                    'no_decision_ready_factor_rows_in_requested_scope'
+                ),
+                'feedback_scope_gap': feedback_scope_gap,
+            }
         return {
             'gate_status': 'ready',
             'severity': 'degraded',
@@ -5991,19 +6292,65 @@ class EODPipelineStatusService:
                     ),
                 },
             }
+        if stage_id == 'signal_features':
+            for quality_key in (
+                'quality_complete_count',
+                'quality_degraded_count',
+                'quality_retry_count',
+                'quality_status',
+            ):
+                if scope_gap.get(quality_key) is not None:
+                    details[
+                        f'requested_scope_{quality_key}'
+                    ] = scope_gap[quality_key]
+        elif stage_id in FACTOR_STAGE_SCORE_FIELDS:
+            for quality_key in (
+                'decision_ready_count',
+                'decision_degraded_count',
+                'quality_status',
+            ):
+                if scope_gap.get(quality_key) is not None:
+                    details[
+                        f'requested_scope_{quality_key}'
+                    ] = scope_gap[quality_key]
         missing_count = int(validated_scope_gap['missing_count'])
         if missing_count <= 0:
+            if _factor_scope_has_no_decision_ready_rows(
+                stage_id=stage_id,
+                evidence=validated_scope_gap,
+            ):
+                details['gate_reason'] = (
+                    'no_decision_ready_factor_rows_in_requested_scope'
+                )
+                return {
+                    **stage,
+                    'gate_status': 'blocked',
+                    'severity': 'blocked',
+                    'blocking_status': 'blocking',
+                    'details': details,
+                }
             existing_gate_status = str(
                 stage.get('gate_status')
                 or details.get('gate_status')
                 or ''
             ).strip().lower()
             existing_status = str(stage.get('status') or '').strip().lower()
+            existing_gate_reason = str(
+                details.get('gate_reason') or ''
+            ).strip().lower()
             exact_universe_coverage = details.get('exact_universe_coverage')
             scope_can_isolate_aggregate_gap = (
                 existing_status == 'partial'
-                and isinstance(exact_universe_coverage, dict)
-                and _coerce_int(exact_universe_coverage.get('missing_count')) > 0
+                and (
+                    (
+                        isinstance(exact_universe_coverage, dict)
+                        and _coerce_int(
+                            exact_universe_coverage.get('missing_count')
+                        )
+                        > 0
+                    )
+                    or existing_gate_reason == 'expected_scope_unverified'
+                )
             )
             if (
                 (
@@ -6028,14 +6375,31 @@ class EODPipelineStatusService:
                 details['scope_gate_override'] = (
                     'requested_scope_complete_outside_scope_gap_isolated'
                 )
+            if existing_gate_reason == 'expected_scope_unverified':
+                details['scope_verification_required'] = False
+                details['scope_verified_by'] = (
+                    'requested_scope_coverage'
+                )
             details['gate_reason'] = 'requested_scope_rows_complete'
+            completed_quality_is_degraded = bool(
+                existing_status == 'completed'
+                and (
+                    str(stage.get('severity') or '').strip().lower()
+                    == 'degraded'
+                    or str(details.get('quality_status') or '')
+                    .strip()
+                    .lower()
+                    == 'degraded'
+                )
+            )
             return {
                 **stage,
                 'gate_status': 'ready',
                 'severity': (
-                    'ready'
-                    if str(stage.get('status') or '').strip().lower()
-                    == 'completed'
+                    'degraded'
+                    if completed_quality_is_degraded
+                    else 'ready'
+                    if existing_status == 'completed'
                     else 'degraded'
                 ),
                 'blocking_status': 'non_blocking',
@@ -6095,7 +6459,68 @@ class EODPipelineStatusService:
         details['expected_rows_source'] = (
             'validated_eod_run_market_membership'
         )
+        if str(stage.get('task') or '').strip().lower() == 'signal_features':
+            for quality_key in (
+                'quality_complete_count',
+                'quality_degraded_count',
+                'quality_retry_count',
+                'quality_status',
+            ):
+                if coverage.get(quality_key) is not None:
+                    details[
+                        f'exact_scope_{quality_key}'
+                    ] = coverage[quality_key]
+        stage_task = str(stage.get('task') or '').strip().lower()
+        if stage_task in FACTOR_STAGE_SCORE_FIELDS:
+            for quality_key in (
+                'decision_ready_count',
+                'decision_degraded_count',
+                'quality_status',
+            ):
+                if coverage.get(quality_key) is not None:
+                    details[
+                        f'exact_scope_{quality_key}'
+                    ] = coverage[quality_key]
         if missing_count <= 0:
+            if _factor_scope_has_no_decision_ready_rows(
+                stage_id=stage_task,
+                evidence=validated_coverage,
+            ):
+                details['gate_reason'] = (
+                    'no_decision_ready_factor_rows_in_exact_scope'
+                )
+                return {
+                    **stage,
+                    'gate_status': 'blocked',
+                    'severity': 'blocked',
+                    'blocking_status': 'blocking',
+                    'details': details,
+                }
+            stage_status = str(stage.get('status') or '').strip().lower()
+            aggregate_signal_gap = bool(
+                stage_task == 'signal_features'
+                and stage_status == 'partial'
+                and details.get('mode')
+                == 'derived_from_daily_signal_features'
+            )
+            if aggregate_signal_gap:
+                details['aggregate_status'] = stage_status
+                details['aggregate_gate_status'] = stage.get('gate_status')
+                details['aggregate_gate_reason'] = details.get('gate_reason')
+                details['aggregate_reason'] = details.get('reason')
+                details['scope_gate_override'] = (
+                    'exact_run_universe_complete_off_scope_gap_isolated'
+                )
+                details['scope_verification_required'] = False
+                details['scope_verified_by'] = 'exact_run_universe_coverage'
+                details['gate_reason'] = 'exact_run_universe_rows_complete'
+                return {
+                    **stage,
+                    'gate_status': 'ready',
+                    'severity': 'degraded',
+                    'blocking_status': 'non_blocking',
+                    'details': details,
+                }
             return {**stage, 'details': details}
         return {
             **stage,

@@ -18,14 +18,21 @@ from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
     DEFAULT_PYKRX_ENRICHMENT_CATEGORIES,
     EODPipelineStatusService,
+    FACTOR_STAGE_MODELS,
+    FACTOR_STAGE_SCORE_FIELDS,
     _load_daily_pipeline_stage_history,
     _load_latest_feedback_run_summary,
     _load_latest_pipeline_pykrx_run,
     _load_pipeline_pykrx_run_rows,
     _load_row_count_missing_diagnostics_for_model,
+    _load_row_count_stage_counts,
     _signal_feature_row_is_semantically_ready,
 )
 from app.eod.market_membership import build_market_membership_snapshot
+from app.signals.signal_feature_readiness import (
+    SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
+    classify_signal_feature_readiness,
+)
 
 
 class _FakeMarketState:
@@ -943,6 +950,62 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_factor_stage_count_queries_classify_all_score_fields(self):
+        class AggregateResult:
+            def __init__(self, values):
+                self.values = values
+
+            def one(self):
+                return self.values
+
+        class CapturingSession:
+            def __init__(self, values):
+                self.values = values
+                self.statements = []
+
+            def execute(self, statement):
+                self.statements.append(statement)
+                return AggregateResult(self.values)
+
+        for stage_id, score_field in FACTOR_STAGE_SCORE_FIELDS.items():
+            with self.subTest(stage_id=stage_id, score_field=score_field):
+                aggregate = (2, None, 1, 1, None)
+                if stage_id == 'low_risk_factors':
+                    aggregate += (0,)
+                session = CapturingSession(aggregate)
+
+                @contextmanager
+                def fake_session_scope():
+                    yield session
+
+                with (
+                    patch(
+                        'app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS',
+                        {stage_id: FACTOR_STAGE_MODELS[stage_id]},
+                    ),
+                    patch(
+                        'app.eod.pipeline_status.session_scope',
+                        fake_session_scope,
+                    ),
+                ):
+                    counts = _load_row_count_stage_counts(
+                        market_date='2026-04-21',
+                        include_missing_diagnostics=False,
+                    )
+
+                statement = str(session.statements[0])
+                self.assertIn(score_field, statement)
+                self.assertIn('IS NOT NULL', statement)
+                self.assertIn('IS NULL', statement)
+                self.assertEqual(
+                    counts[stage_id]['decision_ready_count'],
+                    1,
+                )
+                self.assertEqual(
+                    counts[stage_id]['decision_degraded_count'],
+                    1,
+                )
+
     def test_row_count_membership_diagnostics_detect_equal_count_wrong_symbol(self):
         session = MagicMock()
         price_result = MagicMock()
@@ -1014,6 +1077,90 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'missing_rows_intersect_daily_price_membership',
         )
         self.assertEqual(stage['details']['off_scope_rows_persisted'], 1)
+
+    def test_factor_rows_expose_degraded_quality_without_blocking_usable_scope(self):
+        service = EODPipelineStatusService()
+        price_stage = {
+            'status': 'completed',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'total': 2,
+            'succeeded': 2,
+            'details': {},
+        }
+
+        stage = service._build_row_count_stage(
+            stage_id='momentum_factors',
+            market_date='2026-04-21',
+            price_stage=price_stage,
+            price_rows_persisted=2,
+            prior_stages={'price_collection': price_stage},
+            aggregate={
+                'persisted': 2,
+                'decision_ready_count': 1,
+                'decision_degraded_count': 1,
+                'membership_evidence_version': 'row_count_scope_gap_v1',
+                'membership_authoritative': True,
+                'membership_requested_count': 2,
+                'membership_present_count': 2,
+                'membership_extra_count': 0,
+                'missing_count': 0,
+            },
+            live_symbols_total=2,
+            feedback_run=None,
+            scope_symbols=[],
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['severity'], 'degraded')
+        self.assertEqual(stage['details']['quality_status'], 'degraded')
+        self.assertEqual(stage['details']['decision_ready_count'], 1)
+        self.assertEqual(stage['details']['decision_degraded_count'], 1)
+
+    def test_factor_rows_with_no_decision_ready_scores_are_blocked(self):
+        service = EODPipelineStatusService()
+        price_stage = {
+            'status': 'completed',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'total': 2,
+            'succeeded': 2,
+            'details': {},
+        }
+
+        stage = service._build_row_count_stage(
+            stage_id='momentum_factors',
+            market_date='2026-04-21',
+            price_stage=price_stage,
+            price_rows_persisted=2,
+            prior_stages={'price_collection': price_stage},
+            aggregate={
+                'persisted': 2,
+                'decision_ready_count': 0,
+                'decision_degraded_count': 2,
+                'membership_evidence_version': 'row_count_scope_gap_v1',
+                'membership_authoritative': True,
+                'membership_requested_count': 2,
+                'membership_present_count': 2,
+                'membership_extra_count': 0,
+                'missing_count': 0,
+            },
+            live_symbols_total=2,
+            feedback_run=None,
+            scope_symbols=[],
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['severity'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'no_decision_ready_factor_rows',
+        )
+        self.assertEqual(stage['details']['persisted_ready_count'], 0)
+        self.assertEqual(stage['details']['persisted_unready_count'], 2)
 
     def test_read_keeps_aggregate_only_price_coverage_unverified(self):
         pykrx_run = {
@@ -1312,7 +1459,148 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 feature_payload={'fallback_features': {}},
             )
         )
-        self.assertTrue(
+
+    def test_signal_feature_direct_evidence_contract_fails_closed(self):
+        base_payload = {
+            'market_date': '2026-04-21',
+            'sources': {
+                'volume-power': {
+                    'rank': 1,
+                    'volume_power': 145.7,
+                },
+            },
+            'row_provenance': {
+                'row_kind': 'direct_only',
+                'direct_signal_source_count': 1,
+                'fallback_groups_present': [],
+            },
+            'freshness': {'market_date': '2026-04-21'},
+            'fallback_features': {},
+        }
+        cases = []
+
+        signal_count_mismatch = deepcopy(base_payload)
+        cases.append((2, signal_count_mismatch, '2026-04-21'))
+
+        provenance_count_mismatch = deepcopy(base_payload)
+        provenance_count_mismatch['row_provenance'][
+            'direct_signal_source_count'
+        ] = 2
+        cases.append((1, provenance_count_mismatch, '2026-04-21'))
+
+        row_kind_mismatch = deepcopy(base_payload)
+        row_kind_mismatch['row_provenance']['row_kind'] = 'fallback_only'
+        cases.append((1, row_kind_mismatch, '2026-04-21'))
+
+        freshness_mismatch = deepcopy(base_payload)
+        freshness_mismatch['freshness']['market_date'] = '2026-04-20'
+        cases.append((1, freshness_mismatch, '2026-04-21'))
+
+        cases.append((1, deepcopy(base_payload), '2026-04-22'))
+
+        for signal_count, feature_payload, expected_market_date in cases:
+            with self.subTest(
+                signal_count=signal_count,
+                expected_market_date=expected_market_date,
+                feature_payload=feature_payload,
+            ):
+                readiness = classify_signal_feature_readiness(
+                    signal_count=signal_count,
+                    feature_payload=feature_payload,
+                    expected_market_date=expected_market_date,
+                )
+                self.assertFalse(readiness['semantic_ready'])
+                self.assertEqual(readiness['quality_status'], 'retry')
+
+    def test_signal_feature_direct_source_values_are_source_validated(self):
+        def classify(source, source_payload):
+            return classify_signal_feature_readiness(
+                signal_count=1,
+                feature_payload={
+                    'market_date': '2026-04-21',
+                    'sources': {source: source_payload},
+                    'row_provenance': {
+                        'row_kind': 'direct_only',
+                        'direct_signal_source_count': 1,
+                        'fallback_groups_present': [],
+                    },
+                    'freshness': {'market_date': '2026-04-21'},
+                    'fallback_features': {},
+                },
+                expected_market_date='2026-04-21',
+            )
+
+        ready_cases = (
+            ('volume-power', {'volume_power': 145.7}),
+            ('volume_power', {'tday_rltv': '145.7'}),
+            ('overtime-volume', {'overtime_volume': 100}),
+            (
+                'overtime_volume',
+                {'raw': {'ovtm_untp_vol': '100'}},
+            ),
+            (
+                'overtime-fluctuation',
+                {'overtime_change_pct': 0.0},
+            ),
+        )
+        for source, source_payload in ready_cases:
+            with self.subTest(ready_source=source, payload=source_payload):
+                readiness = classify(source, source_payload)
+                self.assertTrue(readiness['semantic_ready'])
+                self.assertEqual(readiness['quality_status'], 'complete')
+
+        rejected_cases = (
+            ('volume-power', {'volume_power': 999.99}),
+            ('volume_power', {'tday_rltv': '999.99'}),
+            ('volume-power', {'volume_power': 0}),
+            ('overtime-volume', {'overtime_volume': 0}),
+            ('overtime_volume', {'ovtm_untp_vol': -1}),
+            ('overtime-fluctuation', {'rank': 1}),
+            ('unknown-source', {'status': 'available', 'rank': 1}),
+        )
+        for source, source_payload in rejected_cases:
+            with self.subTest(rejected_source=source, payload=source_payload):
+                readiness = classify(source, source_payload)
+                self.assertFalse(readiness['semantic_ready'])
+                self.assertEqual(readiness['quality_status'], 'retry')
+
+    def test_signal_feature_stored_retry_is_a_downward_readiness_floor(self):
+        readiness = classify_signal_feature_readiness(
+            signal_count=1,
+            feature_payload={
+                'market_date': '2026-04-21',
+                'sources': {
+                    'volume-power': {
+                        'rank': 1,
+                        'volume_power': 145.7,
+                    },
+                },
+                'row_provenance': {
+                    'row_kind': 'direct_only',
+                    'direct_signal_source_count': 1,
+                    'fallback_groups_present': [],
+                },
+                'freshness': {'market_date': '2026-04-21'},
+                'fallback_features': {},
+                'readiness': {
+                    'contract_version': (
+                        SIGNAL_FEATURE_READINESS_CONTRACT_VERSION
+                    ),
+                    'semantic_ready': False,
+                    'quality_status': 'retry',
+                    'quality_reasons': ['stored_source_retry_debt'],
+                },
+            },
+            expected_market_date='2026-04-21',
+        )
+
+        self.assertFalse(readiness['semantic_ready'])
+        self.assertEqual(readiness['quality_status'], 'retry')
+        self.assertIn(
+            'stored_source_retry_debt',
+            readiness['quality_reasons'],
+        )
+        self.assertFalse(
             _signal_feature_row_is_semantically_ready(
                 signal_count=0,
                 feature_payload={
@@ -1320,6 +1608,47 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         'price_action': {'close_return_1d_pct': 1.2},
                     },
                 },
+            )
+        )
+        self.assertTrue(
+            _signal_feature_row_is_semantically_ready(
+                signal_count=0,
+                feature_payload={
+                    'market_date': '2026-04-21',
+                    'row_provenance': {
+                        'row_kind': 'fallback_only',
+                        'direct_signal_source_count': 0,
+                        'fallback_groups_present': ['price_action'],
+                    },
+                    'freshness': {'market_date': '2026-04-21'},
+                    'fallback_features': {
+                        'price_action': {'close_return_1d_pct': 1.2},
+                    },
+                },
+                expected_market_date='2026-04-21',
+            )
+        )
+        self.assertFalse(
+            _signal_feature_row_is_semantically_ready(
+                signal_count=0,
+                feature_payload={
+                    'market_date': '2026-04-21',
+                    'row_provenance': {
+                        'row_kind': 'fallback_only',
+                        'direct_signal_source_count': 0,
+                        'fallback_groups_present': ['factor_scores'],
+                    },
+                    'freshness': {'market_date': '2026-04-21'},
+                    'fallback_features': {
+                        'factor_scores': {
+                            'value': {
+                                'status': 'missing_metric',
+                                'source': 'value_factor_v1',
+                            },
+                        },
+                    },
+                },
+                expected_market_date='2026-04-21',
             )
         )
         service = EODPipelineStatusService(
@@ -1353,6 +1682,269 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'missing_rows_intersect_requested_scope',
         )
 
+    def test_signal_feature_stage_does_not_self_authorize_from_one_persisted_row(self):
+        stage = EODPipelineStatusService()._build_signal_features_stage(
+            market_date='2026-04-21',
+            aggregate={
+                'persisted': 1,
+                'semantic_ready_count': 1,
+                'semantic_unready_count': 0,
+                'quality_complete_count': 1,
+                'quality_degraded_count': 0,
+            },
+            expected_total=1,
+            expected_total_source='stored_rows_unverified',
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'expected_scope_unverified',
+        )
+        self.assertTrue(stage['details']['scope_verification_required'])
+
+    def test_requested_signal_feature_scope_resolves_unverified_aggregate(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+                quality_complete_count=1,
+                quality_degraded_count=0,
+                quality_retry_count=0,
+                quality_status='complete',
+            ),
+        )
+        stage = service._build_signal_features_stage(
+            market_date='2026-04-21',
+            aggregate={
+                'persisted': 1,
+                'semantic_ready_count': 1,
+                'quality_complete_count': 1,
+            },
+            expected_total=1,
+            expected_total_source='stored_rows_unverified',
+            scope_symbols=['005930'],
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['severity'], 'degraded')
+        self.assertFalse(stage['details']['scope_verification_required'])
+        self.assertEqual(
+            stage['details']['scope_verified_by'],
+            'requested_scope_coverage',
+        )
+        self.assertEqual(
+            stage['details']['requested_scope_quality_status'],
+            'complete',
+        )
+
+    def test_signal_feature_unavailable_zero_quote_is_not_decision_usable(self):
+        readiness = classify_signal_feature_readiness(
+            signal_count=0,
+            feature_payload={
+                'market_date': '2026-04-21',
+                'row_provenance': {
+                    'row_kind': 'fallback_only',
+                    'direct_signal_source_count': 0,
+                    'fallback_groups_present': ['quote_snapshot'],
+                },
+                'freshness': {'market_date': '2026-04-21'},
+                'fallback_features': {
+                    'quote_snapshot': {
+                        'available': False,
+                        'price': None,
+                        'change': 0,
+                        'volume': 0,
+                    },
+                },
+            },
+            expected_market_date='2026-04-21',
+        )
+
+        self.assertFalse(readiness['semantic_ready'])
+        self.assertEqual(readiness['quality_status'], 'retry')
+
+    def test_signal_feature_quote_requires_same_day_freshness(self):
+        def classify_quote(quote_payload):
+            return classify_signal_feature_readiness(
+                signal_count=0,
+                feature_payload={
+                    'market_date': '2026-04-21',
+                    'row_provenance': {
+                        'row_kind': 'fallback_only',
+                        'direct_signal_source_count': 0,
+                        'fallback_groups_present': ['quote_snapshot'],
+                    },
+                    'freshness': {'market_date': '2026-04-21'},
+                    'fallback_features': {
+                        'quote_snapshot': {
+                            'available': True,
+                            'price': 72500,
+                            **quote_payload,
+                        },
+                    },
+                },
+                expected_market_date='2026-04-21',
+            )
+
+        ready_cases = (
+            {'trade_date': '2026-04-21'},
+            {'cached_at': '2026-04-20T15:30:00+00:00'},
+        )
+        for quote_payload in ready_cases:
+            with self.subTest(ready=quote_payload):
+                readiness = classify_quote(quote_payload)
+                self.assertTrue(readiness['semantic_ready'])
+                self.assertEqual(readiness['quality_status'], 'degraded')
+
+        rejected_cases = (
+            {},
+            {'trade_date': '2026-04-20'},
+            {'trade_date': '2026-04-22'},
+            {
+                'cached_at': '2026-04-20T15:30:00+00:00',
+                'captured_at': '2026-04-21T15:30:00+00:00',
+            },
+        )
+        for quote_payload in rejected_cases:
+            with self.subTest(rejected=quote_payload):
+                readiness = classify_quote(quote_payload)
+                self.assertFalse(readiness['semantic_ready'])
+                self.assertEqual(readiness['quality_status'], 'retry')
+
+    def test_signal_feature_stored_degradation_is_a_downward_quality_floor(self):
+        readiness = classify_signal_feature_readiness(
+            signal_count=1,
+            feature_payload={
+                'market_date': '2026-04-21',
+                'sources': {
+                    'volume_power': {
+                        'rank': 1,
+                        'volume_power': 145.7,
+                    },
+                },
+                'row_provenance': {
+                    'row_kind': 'direct_only',
+                    'direct_signal_source_count': 1,
+                    'fallback_groups_present': [],
+                },
+                'freshness': {'market_date': '2026-04-21'},
+                'fallback_features': {},
+                'readiness': {
+                    'contract_version': (
+                        SIGNAL_FEATURE_READINESS_CONTRACT_VERSION
+                    ),
+                    'semantic_ready': True,
+                    'quality_status': 'degraded',
+                    'quality_reasons': ['source_incomplete'],
+                },
+            },
+            expected_market_date='2026-04-21',
+        )
+
+        self.assertTrue(readiness['semantic_ready'])
+        self.assertEqual(readiness['quality_status'], 'degraded')
+        self.assertIn('source_incomplete', readiness['quality_reasons'])
+
+    def test_signal_feature_persisted_retry_row_is_partial_not_pending(self):
+        stage = EODPipelineStatusService()._build_signal_features_stage(
+            market_date='2026-04-21',
+            aggregate={
+                'persisted': 1,
+                'semantic_ready_count': 0,
+                'semantic_unready_count': 1,
+                'quality_complete_count': 0,
+                'quality_degraded_count': 0,
+                'quality_retry_count': 1,
+            },
+            expected_total=1,
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['processed'], 1)
+        self.assertEqual(stage['succeeded'], 0)
+        self.assertEqual(stage['failed'], 1)
+        self.assertEqual(stage['remaining'], 0)
+
+    def test_requested_scope_gate_preserves_completed_degraded_quality(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+            ),
+        )
+        stage = service._apply_scope_coverage_gate(
+            stage_id='signal_features',
+            market_date='2026-04-21',
+            stage={
+                'status': 'completed',
+                'gate_status': 'ready',
+                'severity': 'degraded',
+                'blocking_status': 'non_blocking',
+                'details': {'quality_status': 'degraded'},
+            },
+            scope_symbols=['005930'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['severity'], 'degraded')
+        self.assertEqual(stage['blocking_status'], 'non_blocking')
+
+    def test_exact_signal_feature_scope_isolates_off_scope_retry_rows(self):
+        service = EODPipelineStatusService()
+        aggregate_stage = service._build_signal_features_stage(
+            market_date='2026-04-21',
+            aggregate={
+                'persisted': 110,
+                'semantic_ready_count': 100,
+                'semantic_unready_count': 10,
+                'quality_complete_count': 100,
+                'quality_degraded_count': 0,
+                'quality_retry_count': 10,
+            },
+            expected_total=100,
+            expected_total_source=(
+                'validated_eod_run_market_membership'
+            ),
+        )
+
+        scoped_stage = service._apply_exact_universe_coverage_evidence(
+            stage=aggregate_stage,
+            coverage=_scope_gap_evidence(
+                requested_count=100,
+                present_count=100,
+                quality_complete_count=100,
+                quality_degraded_count=0,
+                quality_retry_count=0,
+                quality_status='complete',
+            ),
+            expected_count=100,
+            source_run_id=900,
+        )
+
+        self.assertEqual(scoped_stage['status'], 'partial')
+        self.assertEqual(scoped_stage['gate_status'], 'ready')
+        self.assertEqual(scoped_stage['severity'], 'degraded')
+        self.assertEqual(scoped_stage['blocking_status'], 'non_blocking')
+        self.assertEqual(
+            scoped_stage['details']['scope_gate_override'],
+            'exact_run_universe_complete_off_scope_gap_isolated',
+        )
+        self.assertEqual(
+            scoped_stage['details']['aggregate_gate_status'],
+            'blocked',
+        )
+        self.assertFalse(
+            scoped_stage['details']['scope_verification_required']
+        )
+        self.assertEqual(
+            scoped_stage['details']['exact_scope_quality_status'],
+            'complete',
+        )
+
     def test_factor_partial_blocks_when_missing_row_intersects_requested_scope(self):
         service = EODPipelineStatusService(
             row_count_scope_gap_loader=lambda **kwargs: _scope_gap_evidence(
@@ -1384,6 +1976,95 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(
             diagnostics['feedback_scope_gap']['missing_symbols_sample'],
             ['005930'],
+        )
+
+    def test_factor_requested_scope_blocks_when_all_scores_are_null(self):
+        scope_gap = _scope_gap_evidence(
+            requested_count=2,
+            present_count=2,
+            decision_ready_count=0,
+            decision_degraded_count=2,
+            quality_status='degraded',
+        )
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: scope_gap,
+        )
+        price_stage = {
+            'status': 'completed',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'total': 3,
+            'succeeded': 3,
+            'details': {},
+        }
+        stage = service._build_row_count_stage(
+            stage_id='quality_factors',
+            market_date='2026-04-21',
+            price_stage=price_stage,
+            price_rows_persisted=3,
+            prior_stages={'price_collection': price_stage},
+            aggregate={
+                'persisted': 3,
+                'decision_ready_count': 1,
+                'decision_degraded_count': 2,
+            },
+            live_symbols_total=3,
+            feedback_run=None,
+            scope_symbols=['000660', '005930'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'no_decision_ready_factor_rows_in_requested_scope',
+        )
+
+        scoped_stage = service._apply_scope_coverage_gate(
+            stage_id='quality_factors',
+            market_date='2026-04-21',
+            stage={
+                'task': 'quality_factors',
+                'status': 'completed',
+                'gate_status': 'ready',
+                'severity': 'degraded',
+                'blocking_status': 'non_blocking',
+                'details': {},
+            },
+            scope_symbols=['000660', '005930'],
+        )
+        self.assertEqual(scoped_stage['gate_status'], 'blocked')
+        self.assertEqual(
+            scoped_stage['details']['gate_reason'],
+            'no_decision_ready_factor_rows_in_requested_scope',
+        )
+
+    def test_factor_exact_scope_blocks_when_all_scores_are_null(self):
+        stage = EODPipelineStatusService._apply_exact_universe_coverage_evidence(
+            stage={
+                'task': 'quality_factors',
+                'status': 'completed',
+                'gate_status': 'ready',
+                'severity': 'degraded',
+                'blocking_status': 'non_blocking',
+                'details': {},
+            },
+            coverage=_scope_gap_evidence(
+                requested_count=2,
+                present_count=2,
+                decision_ready_count=0,
+                decision_degraded_count=2,
+                quality_status='degraded',
+            ),
+            expected_count=2,
+            source_run_id=900,
+        )
+
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'no_decision_ready_factor_rows_in_exact_scope',
         )
 
     def test_requested_scope_gate_fails_closed_on_malformed_zero_gap_proof(self):
@@ -2798,6 +3479,134 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(enrich_stage['succeeded'], 703)
         self.assertEqual(enrich_stage['failed'], 0)
 
+    def test_official_external_news_repairs_legacy_recent_only_success_counter(self):
+        market_date = '2026-05-28'
+        collect_item = _completed_official_stage(
+            run_id=386,
+            stage_id='external_news_collect',
+            market_date=market_date,
+            processed=201,
+            total=201,
+        )
+        collect_item['stage']['succeeded'] = 0
+        collect_item['stage']['failed'] = 0
+        collect_item['stage']['details'] = {
+            'result_summary': {
+                'summary': {
+                    'eligible_symbol_count': 201,
+                    'collected_symbol_count': 201,
+                    'recent_news_symbol_count': 0,
+                    'stale_news_symbol_count': 201,
+                    'items_inserted': 201,
+                }
+            }
+        }
+        official_run = {
+            **collect_item['run'],
+            'stages': {'external_news_collect': collect_item['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 10,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        result = service.read(market_date=market_date)
+
+        stage = result['stages']['external_news_collect']
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['processed'], 201)
+        self.assertEqual(stage['total'], 201)
+        self.assertEqual(stage['succeeded'], 201)
+        self.assertEqual(stage['failed'], 0)
+        self.assertEqual(
+            stage['details']['count_repair_reason'],
+            'legacy_recent_news_success_semantics',
+        )
+
+    def test_official_external_news_legacy_repair_requires_exact_signature(self):
+        market_date = '2026-05-28'
+        cases = (
+            {
+                'processed': 201,
+                'total': 201,
+                'succeeded': 0,
+                'failed': 1,
+                'recent': 0,
+            },
+            {
+                'processed': 200,
+                'total': 200,
+                'succeeded': 0,
+                'failed': 0,
+                'recent': 0,
+            },
+            {
+                'processed': 201,
+                'total': 201,
+                'succeeded': 0,
+                'failed': 0,
+                'recent': None,
+            },
+            {
+                'processed': 201,
+                'total': 201,
+                'succeeded': 1,
+                'failed': 0,
+                'recent': 0,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(case=case):
+                collect_item = _completed_official_stage(
+                    run_id=386,
+                    stage_id='external_news_collect',
+                    market_date=market_date,
+                    processed=case['processed'],
+                    total=case['total'],
+                )
+                collect_item['stage']['succeeded'] = case['succeeded']
+                collect_item['stage']['failed'] = case['failed']
+                news_summary = {
+                    'eligible_symbol_count': 201,
+                    'collected_symbol_count': 201,
+                    'items_inserted': 201,
+                }
+                if case['recent'] is not None:
+                    news_summary['recent_news_symbol_count'] = case['recent']
+                collect_item['stage']['details'] = {
+                    'result_summary': {'summary': news_summary}
+                }
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: None,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 10,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: {
+                        **collect_item['run'],
+                        'stages': {
+                            'external_news_collect': collect_item['stage']
+                        },
+                    },
+                    external_news_counts_loader=lambda **_: {},
+                )
+
+                stage = service.read(market_date=market_date)['stages'][
+                    'external_news_collect'
+                ]
+
+                self.assertEqual(stage['succeeded'], case['succeeded'])
+                self.assertNotIn(
+                    'count_repair_reason',
+                    stage['details'],
+                )
+
     def test_official_fundamentals_retry_debt_repairs_legacy_zero_counters(
         self,
     ) -> None:
@@ -3695,7 +4504,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        self.assertEqual(
+            result['current_stage'],
+            'signal_decider_evaluations',
+        )
         self.assertEqual(result['current_stage_status'], 'partial')
         self.assertEqual(result['partial_stages'], 1)
         self.assertNotIn('warning', result['stage_status_counts'])
@@ -3930,6 +4742,40 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(stage['gate_status'], 'ready')
         self.assertEqual(stage['details']['decision_ready_count'], 1_587)
         self.assertEqual(stage['details']['insufficient_history_count'], 1_091)
+
+    def test_all_factor_stages_preserve_fresher_decision_ready_rows(self):
+        fallback_stage = {
+            'status': 'completed',
+            'succeeded': 2,
+            'details': {
+                'rows_persisted': 2,
+                'decision_ready_count': 1,
+                'decision_degraded_count': 1,
+                'latest_decision_ready_at': '2026-09-27T22:54:27+00:00',
+            },
+        }
+        official_stage = {
+            'status': 'completed',
+            'updated_at': '2026-09-24T00:00:00+00:00',
+            'details': {
+                'result_summary': {
+                    'results_persisted': 2,
+                    'persisted_ready_count': 0,
+                    'persisted_unready_count': 2,
+                },
+            },
+        }
+
+        for stage_id in FACTOR_STAGE_SCORE_FIELDS:
+            with self.subTest(stage_id=stage_id):
+                self.assertTrue(
+                    EODPipelineStatusService
+                    ._should_preserve_stored_coverage_stage(
+                        stage_id=stage_id,
+                        fallback_stage=fallback_stage,
+                        official_stage=official_stage,
+                    )
+                )
 
     def test_newer_unready_row_does_not_make_older_ready_rows_fresh(self):
         market_date = '2026-09-23'
@@ -5777,20 +6623,28 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['total_stages'], 27)
-        self.assertEqual(result['completed_stages'], 17)
+        self.assertEqual(result['completed_stages'], 16)
         self.assertEqual(result['skipped_stages'], 2)
-        self.assertEqual(result['display_completed_stages'], 19)
+        self.assertEqual(result['display_completed_stages'], 18)
         self.assertEqual(result['pending_stages'], 6)
-        self.assertEqual(result['partial_stages'], 1)
+        self.assertEqual(result['partial_stages'], 2)
         self.assertEqual(result['running_stages'], 0)
-        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        self.assertEqual(result['current_stage'], 'signal_features')
         self.assertEqual(result['current_stage_status'], 'partial')
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(
             result['stages']['master_refresh']['details']['reason'],
             'preopen_global_stage_not_required_for_resumed_market_date_status',
         )
-        self.assertEqual(result['stages']['signal_features']['status'], 'completed')
+        self.assertEqual(result['stages']['signal_features']['status'], 'partial')
+        self.assertEqual(
+            result['stages']['signal_features']['gate_status'],
+            'blocked',
+        )
+        self.assertEqual(
+            result['stages']['signal_features']['details']['gate_reason'],
+            'expected_scope_unverified',
+        )
         self.assertEqual(result['stages']['signal_features']['details']['rows_persisted'], 2823)
         self.assertEqual(result['stages']['external_news_collect']['status'], 'completed')
         self.assertEqual(result['stages']['external_news_collect']['details']['items_persisted'], 1091)
@@ -5837,7 +6691,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ['value_factors', 'advanced_value_factors'],
         )
         self.assertEqual(result['gate_summary']['status'], 'blocked')
-        self.assertEqual(result['gate_summary']['blocked_stage_ids'], ['pykrx_enrichment'])
+        self.assertEqual(
+            result['gate_summary']['blocked_stage_ids'],
+            ['pykrx_enrichment', 'signal_features'],
+        )
         blocking_categories = pykrx_stage['details']['decider_blocking_categories']
         self.assertIn('sector_classification', {item['category'] for item in blocking_categories})
         self.assertEqual(
@@ -5951,7 +6808,12 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         signal_features = result['stages']['signal_features']
-        self.assertEqual(signal_features['status'], 'completed')
+        self.assertEqual(signal_features['status'], 'partial')
+        self.assertEqual(signal_features['gate_status'], 'blocked')
+        self.assertEqual(
+            signal_features['details']['gate_reason'],
+            'expected_scope_unverified',
+        )
         self.assertEqual(signal_features['details']['rows_persisted'], 2_703)
         external_news_collect = result['stages']['external_news_collect']
         self.assertEqual(external_news_collect['status'], 'completed')
@@ -7652,7 +8514,12 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         stage = result['stages']['signal_features']
-        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'expected_scope_unverified',
+        )
         self.assertEqual(stage['details']['rows_persisted'], 2_703)
         self.assertEqual(
             stage['details']['mode'],

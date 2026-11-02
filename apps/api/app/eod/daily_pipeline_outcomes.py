@@ -202,6 +202,18 @@ def daily_pipeline_result_has_no_ready_content(
                 and (persisted_unready_count or 0) >= persisted_count
             ):
                 return True
+    for payload in payloads:
+        decision_ready_count = _optional_int(
+            payload.get('decision_ready_count')
+        )
+        decision_degraded_count = _optional_int(
+            payload.get('decision_degraded_count')
+        )
+        if (
+            decision_ready_count == 0
+            and (decision_degraded_count or 0) > 0
+        ):
+            return True
     expected_count = next(
         (
             value

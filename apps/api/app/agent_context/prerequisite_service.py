@@ -79,13 +79,13 @@ class AgentFeedbackPrerequisiteService:
             ._is_explicitly_not_applicable_pykrx_scope(stage_payload)
         ):
             return 'blocked'
+        if daily_pipeline_result_has_no_ready_content(stage_payload):
+            return 'blocked'
         explicit_gate_status = str(
             stage_payload.get('gate_status') or details.get('gate_status') or ''
         ).strip().lower()
         if explicit_gate_status in {'ready', 'blocked', 'waiting'}:
             return explicit_gate_status
-        if daily_pipeline_result_has_no_ready_content(stage_payload):
-            return 'blocked'
         if str(stage_payload.get('task') or '') != PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:
             if AgentFeedbackPrerequisiteService._has_complete_persisted_stage_coverage(stage_payload):
                 return 'ready'

@@ -293,6 +293,50 @@ def test_high_coverage_partial_is_blocked_when_no_ready_row_persisted():
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
 
 
+def test_explicit_ready_gate_cannot_override_zero_ready_content():
+    payload = {
+        'task': 'momentum_factors',
+        'status': 'completed',
+        'gate_status': 'ready',
+        'total': 1,
+        'succeeded': 1,
+        'details': {
+            'rows_persisted': 1,
+            'expected_rows': 1,
+            'result_summary': {
+                'results_persisted': 1,
+                'persisted_ready_count': 0,
+                'persisted_unready_count': 1,
+            },
+        },
+    }
+
+    assert (
+        AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload)
+        == 'blocked'
+    )
+
+
+def test_factor_decision_counts_cannot_override_zero_ready_content():
+    payload = {
+        'task': 'momentum_factors',
+        'status': 'completed',
+        'gate_status': 'ready',
+        'total': 2,
+        'succeeded': 2,
+        'details': {
+            'rows_persisted': 2,
+            'decision_ready_count': 0,
+            'decision_degraded_count': 2,
+        },
+    }
+
+    assert (
+        AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload)
+        == 'blocked'
+    )
+
+
 def test_konex_only_pykrx_categories_satisfy_feedback_prerequisites():
     not_applicable = {
         category: {

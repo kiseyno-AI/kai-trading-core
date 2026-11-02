@@ -10,7 +10,9 @@ from app.signals.daily_signal_features import (
     VOLUME_POWER,
     DailySignalFeatureCollection,
     DailySignalFeatureService,
+    _build_quote_snapshot_features,
     _expand_rows_with_owned_fallback,
+    _merge_owned_fallback_features,
     build_daily_signal_feature_rows,
     main,
 )
@@ -103,7 +105,149 @@ class RetryableRankingError(RuntimeError):
     retryable = True
 
 
+def _ready_direct_feature_item(
+    symbol: str,
+    *,
+    market_date: str = '2026-04-14',
+) -> dict:
+    return {
+        'symbol': symbol,
+        'market_date': market_date,
+        'signal_count': 1,
+        'feature_payload': {
+            'market_date': market_date,
+            'sources': {
+                VOLUME_POWER: {
+                    'rank': 1,
+                    'volume_power': 145.7,
+                },
+            },
+            'row_provenance': {
+                'row_kind': 'direct_only',
+                'direct_signal_source_count': 1,
+                'fallback_groups_present': [],
+            },
+            'freshness': {'market_date': market_date},
+            'fallback_features': {},
+        },
+    }
+
+
 class DailySignalFeatureBuilderTests(unittest.TestCase):
+    def test_quote_snapshot_features_reject_non_same_day_evidence(self):
+        rejected_quotes = (
+            {'price': 71_000},
+            {'price': 71_000, 'trade_date': '2026-05-05'},
+            {'price': 71_000, 'trade_date': '2026-05-07'},
+            {
+                'available': False,
+                'price': None,
+                'trade_date': '2026-05-06',
+            },
+            {
+                'available': True,
+                'price': 0,
+                'trade_date': '2026-05-06',
+            },
+            {
+                'price': 71_000,
+                'cached_at': '2026-05-05T15:30:00+00:00',
+                'captured_at': '2026-05-06T15:30:00+00:00',
+            },
+        )
+
+        for quote_row in rejected_quotes:
+            with self.subTest(quote_row=quote_row):
+                payload, freshness = _build_quote_snapshot_features(
+                    quote_row=quote_row,
+                    market_date='2026-05-06',
+                )
+                self.assertIsNone(payload)
+                self.assertIsNone(freshness)
+
+    def test_quote_snapshot_features_keep_same_day_evidence(self):
+        for quote_row in (
+            {'price': 71_000, 'trade_date': '2026-05-06'},
+            {'price': 71_000, 'cached_at': '2026-05-05T15:30:00+00:00'},
+        ):
+            with self.subTest(quote_row=quote_row):
+                payload, freshness = _build_quote_snapshot_features(
+                    quote_row=quote_row,
+                    market_date='2026-05-06',
+                )
+                self.assertEqual(payload['price'], 71_000)
+                self.assertIsNotNone(freshness)
+
+    def test_direct_signal_row_does_not_publish_unusable_quote_payload(self):
+        unusable_quotes = (
+            {'price': 71_000, 'trade_date': '2026-05-05'},
+            {
+                'available': False,
+                'price': None,
+                'trade_date': '2026-05-06',
+            },
+            {
+                'available': True,
+                'price': 0,
+                'trade_date': '2026-05-06',
+            },
+        )
+
+        for quote_row in unusable_quotes:
+            with self.subTest(quote_row=quote_row):
+                entry = build_daily_signal_feature_rows(
+                    market_date='2026-05-06',
+                    source_rows={
+                        VOLUME_POWER: [
+                            {
+                                'stck_shrn_iscd': '005930',
+                                'tday_rltv': '145.7',
+                            }
+                        ]
+                    },
+                )[0]
+                support_maps = {
+                    'symbol_map': {},
+                    'quote_map': {'005930': quote_row},
+                    'price_bars_by_symbol': {},
+                    'value_map': {},
+                    'unified_value_map': {},
+                    'quality_map': {},
+                    'momentum_map': {},
+                    'advanced_value_map': {},
+                    'low_risk_map': {},
+                    'beta_map': {},
+                    'composite_map': {},
+                }
+
+                merged = _merge_owned_fallback_features(
+                    entry=entry,
+                    market_date='2026-05-06',
+                    universe={
+                        'active_symbols': ['005930'],
+                        'candidate_symbols': [],
+                        'target_symbols': ['005930'],
+                    },
+                    support_maps=support_maps,
+                    collection_payload={
+                        'collected_at': '2026-05-06T15:31:00+09:00'
+                    },
+                    source_errors={},
+                )
+
+                self.assertEqual(
+                    merged['feature_payload']['row_provenance']['row_kind'],
+                    'direct_only',
+                )
+                self.assertNotIn(
+                    'quote_snapshot',
+                    merged['feature_payload']['fallback_features'],
+                )
+                self.assertNotIn(
+                    'quote_snapshot',
+                    merged['feature_payload']['freshness'],
+                )
+
     def test_build_daily_signal_feature_rows_merges_source_features_by_symbol(self):
         rows = build_daily_signal_feature_rows(
             market_date='2026-04-14',
@@ -882,7 +1026,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
                 side_effect=lambda **kwargs: (
-                    kwargs['direct_rows'],
+                    [
+                        _ready_direct_feature_item(item['symbol'])
+                        for item in kwargs['direct_rows']
+                    ],
                     {
                         'active_symbols': ['005930', '000660'],
                         'candidate_symbols': ['005930'],
@@ -936,7 +1083,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'candidate_symbols': symbols,
                 'candidate_universe_availability': 'available',
             },
-            items=[{'symbol': symbol} for symbol in symbols],
+            items=[_ready_direct_feature_item(symbol) for symbol in symbols],
         )
 
         with (
@@ -978,7 +1125,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'candidate_symbols': symbols,
                 'candidate_universe_availability': 'available',
             },
-            items=[{'symbol': symbol} for symbol in symbols],
+            items=[_ready_direct_feature_item(symbol) for symbol in symbols],
             raw_source_counts={VOLUME_POWER: len(symbols)},
             source_health={
                 VOLUME_POWER: {
@@ -1055,7 +1202,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'candidate_symbols': symbols,
                 'candidate_universe_availability': 'available',
             },
-            items=[{'symbol': symbol} for symbol in symbols],
+            items=[_ready_direct_feature_item(symbol) for symbol in symbols],
             raw_source_counts={VOLUME_POWER: 2},
             source_health={
                 VOLUME_POWER: {
@@ -1102,11 +1249,22 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result['authoritative_market_scope'])
         bulk_upsert.assert_not_called()
-        exact_publish.assert_called_once_with(
-            market_date='2026-04-14',
-            features=collection.items,
-            exact_symbols=symbols,
-            authoritative_market_scope=authority,
+        exact_publish.assert_called_once()
+        publish_kwargs = exact_publish.call_args.kwargs
+        self.assertEqual(publish_kwargs['market_date'], '2026-04-14')
+        self.assertEqual(publish_kwargs['exact_symbols'], symbols)
+        self.assertEqual(
+            publish_kwargs['authoritative_market_scope'], authority
+        )
+        self.assertEqual(
+            [item['symbol'] for item in publish_kwargs['features']],
+            symbols,
+        )
+        self.assertTrue(
+            all(
+                item['feature_payload']['readiness']['semantic_ready']
+                for item in publish_kwargs['features']
+            )
         )
         participation_rebuild.assert_called_once()
 
@@ -1260,6 +1418,71 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             symbols,
         )
 
+    async def test_refresh_exact_empty_publication_clears_participation_context(
+        self,
+    ) -> None:
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        symbols = ['005930', '000660']
+        collection = DailySignalFeatureCollection(
+            market_date='2026-04-14',
+            sources=[VOLUME_POWER],
+            source_counts={VOLUME_POWER: 0},
+            source_errors={VOLUME_POWER: 'provider timeout'},
+            universe={
+                'target_symbols': symbols,
+                'active_symbols': symbols,
+                'candidate_symbols': symbols,
+                'candidate_universe_availability': 'available',
+            },
+            items=[{'symbol': symbol} for symbol in symbols],
+            source_health={},
+        )
+
+        with (
+            patch.object(
+                service,
+                'collect_features',
+                AsyncMock(return_value=collection),
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={
+                    'successful_symbols': [],
+                    'failed_symbols': [],
+                    'scope_finalization': {'status': 'completed'},
+                },
+            ) as exact_publish,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.'
+                'rebuild_for_market_date',
+                return_value={'captured_symbol_count': 0},
+            ) as participation_rebuild,
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                exact_symbols=symbols,
+                include_retry_metadata=True,
+            )
+
+        self.assertEqual(result['features_persisted'], 0)
+        self.assertEqual(result['retry_debt_stock_codes'], symbols)
+        self.assertEqual(
+            exact_publish.call_args.kwargs['features'],
+            [],
+        )
+        participation_rebuild.assert_called_once_with(
+            market_date='2026-04-14',
+            market='KRX',
+            source='kis_ranking',
+            exact_symbols=symbols,
+        )
+        self.assertEqual(
+            result['participation_context'],
+            {'captured_symbol_count': 0},
+        )
+
     async def test_refresh_pagination_truncation_retries_admitted_or_full_scope(self):
         service = DailySignalFeatureService(client=EmptyKISRankingClient())
         exact_symbols = ['005930', '000660']
@@ -1354,6 +1577,331 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                     exact_publish.call_args.kwargs['features'],
                     [],
                 )
+
+    async def test_refresh_partial_source_publishes_usable_subset_as_degraded(self):
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        symbols = ['005930', '000660']
+        usable_item = {
+            'symbol': '005930',
+            'market_date': '2026-04-14',
+            'signal_count': 0,
+            'feature_payload': {
+                'market_date': '2026-04-14',
+                'sources': {},
+                'row_provenance': {
+                    'row_kind': 'fallback_only',
+                    'direct_signal_source_count': 0,
+                    'fallback_groups_present': ['price_action'],
+                },
+                'freshness': {'market_date': '2026-04-14'},
+                'fallback_features': {
+                    'price_action': {'close_return_1d_pct': 1.2},
+                },
+            },
+        }
+        collection = DailySignalFeatureCollection(
+            market_date='2026-04-14',
+            sources=[VOLUME_POWER],
+            source_counts={VOLUME_POWER: 1},
+            source_errors={},
+            universe={
+                'target_symbols': symbols,
+                'active_symbols': symbols,
+                'candidate_symbols': symbols,
+                'candidate_universe_availability': 'available',
+            },
+            items=[usable_item, {'symbol': '000660'}],
+            raw_source_counts={VOLUME_POWER: 1},
+            source_health={
+                VOLUME_POWER: {
+                    'status': 'partial',
+                    'reason': 'some_rows_invalid',
+                    'raw_count': 2,
+                    'valid_count': 1,
+                    'invalid_count': 1,
+                },
+            },
+        )
+
+        with (
+            patch.object(
+                service,
+                'collect_features',
+                AsyncMock(return_value=collection),
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={
+                    'successful_symbols': ['005930'],
+                    'failed_symbols': [],
+                    'scope_finalization': {'status': 'completed'},
+                },
+            ) as exact_publish,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.'
+                'rebuild_for_market_date',
+                return_value={'captured_symbol_count': 1},
+            ) as participation_rebuild,
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                include_retry_metadata=True,
+                exact_symbols=symbols,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['quality_status'], 'degraded')
+        self.assertEqual(result['complete_stock_codes'], [])
+        self.assertEqual(result['degraded_stock_codes'], ['005930'])
+        self.assertEqual(result['successful_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(
+            result['_retry_metadata']['failed_symbols'],
+            ['000660'],
+        )
+        published_features = exact_publish.call_args.kwargs['features']
+        self.assertEqual(len(published_features), 1)
+        self.assertEqual(published_features[0]['symbol'], '005930')
+        self.assertEqual(
+            published_features[0]['feature_payload']['readiness'][
+                'quality_status'
+            ],
+            'degraded',
+        )
+        self.assertIn(
+            'source_incomplete',
+            published_features[0]['feature_payload']['readiness'][
+                'quality_reasons'
+            ],
+        )
+        self.assertNotIn('readiness', usable_item['feature_payload'])
+        self.assertEqual(
+            exact_publish.call_args.kwargs['exact_symbols'],
+            symbols,
+        )
+        participation_rebuild.assert_called_once()
+
+    async def test_refresh_complete_source_with_retry_debt_is_degraded(self):
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        symbols = ['005930', '000660']
+        collection = DailySignalFeatureCollection(
+            market_date='2026-04-14',
+            sources=[VOLUME_POWER],
+            source_counts={VOLUME_POWER: 1},
+            source_errors={},
+            universe={
+                'target_symbols': symbols,
+                'active_symbols': symbols,
+                'candidate_symbols': symbols,
+                'candidate_universe_availability': 'available',
+            },
+            items=[
+                _ready_direct_feature_item('005930'),
+                {'symbol': '000660'},
+            ],
+            raw_source_counts={VOLUME_POWER: 1},
+            source_health={
+                VOLUME_POWER: {
+                    'status': 'available',
+                    'reason': 'valid_rows_available',
+                    'raw_count': 1,
+                    'valid_count': 1,
+                    'invalid_count': 0,
+                },
+            },
+        )
+
+        with (
+            patch.object(
+                service,
+                'collect_features',
+                AsyncMock(return_value=collection),
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={
+                    'successful_symbols': ['005930'],
+                    'failed_symbols': [],
+                    'scope_finalization': {'status': 'completed'},
+                },
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.'
+                'rebuild_for_market_date',
+                return_value={'captured_symbol_count': 1},
+            ),
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                exact_symbols=symbols,
+                include_retry_metadata=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['quality_status'], 'degraded')
+        self.assertEqual(result['complete_stock_codes'], ['005930'])
+        self.assertEqual(result['degraded_stock_codes'], [])
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+
+    async def test_non_exact_refresh_publishes_only_usable_partial_subset(self):
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        symbols = ['005930', '000660']
+        usable_item = {
+            'symbol': '005930',
+            'market_date': '2026-04-14',
+            'signal_count': 0,
+            'feature_payload': {
+                'market_date': '2026-04-14',
+                'sources': {},
+                'row_provenance': {
+                    'row_kind': 'fallback_only',
+                    'direct_signal_source_count': 0,
+                    'fallback_groups_present': ['price_action'],
+                },
+                'freshness': {'market_date': '2026-04-14'},
+                'fallback_features': {
+                    'price_action': {'close_return_1d_pct': 1.2},
+                },
+            },
+        }
+        collection = DailySignalFeatureCollection(
+            market_date='2026-04-14',
+            sources=[VOLUME_POWER],
+            source_counts={VOLUME_POWER: 1},
+            source_errors={},
+            universe={
+                'target_symbols': symbols,
+                'active_symbols': symbols,
+                'candidate_symbols': symbols,
+                'candidate_universe_availability': 'available',
+            },
+            items=[usable_item, {'symbol': '000660'}],
+            raw_source_counts={VOLUME_POWER: 1},
+            source_health={
+                VOLUME_POWER: {
+                    'status': 'partial',
+                    'reason': 'some_rows_invalid',
+                    'raw_count': 2,
+                    'valid_count': 1,
+                    'invalid_count': 1,
+                },
+            },
+        )
+
+        with (
+            patch.object(
+                service,
+                'collect_features',
+                AsyncMock(return_value=collection),
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'upsert_daily_signal_features',
+                return_value=1,
+            ) as bulk_upsert,
+            patch(
+                'app.signals.daily_signal_features.'
+                'upsert_daily_signal_feature',
+            ) as fallback_upsert,
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+            ) as exact_publish,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.'
+                'rebuild_for_market_date',
+                return_value={'captured_symbol_count': 1},
+            ),
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                include_retry_metadata=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['successful_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(result['degraded_stock_codes'], ['005930'])
+        published_items = bulk_upsert.call_args.args[0]
+        self.assertEqual([item['symbol'] for item in published_items], ['005930'])
+        self.assertEqual(
+            published_items[0]['feature_payload']['readiness'][
+                'quality_status'
+            ],
+            'degraded',
+        )
+        fallback_upsert.assert_not_called()
+        exact_publish.assert_not_called()
+
+    async def test_refresh_complete_source_keeps_unusable_row_as_retry_debt(self):
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        symbol = '005930'
+        collection = DailySignalFeatureCollection(
+            market_date='2026-04-14',
+            sources=[VOLUME_POWER],
+            source_counts={VOLUME_POWER: 1},
+            source_errors={},
+            universe={
+                'target_symbols': [symbol],
+                'active_symbols': [symbol],
+                'candidate_symbols': [symbol],
+                'candidate_universe_availability': 'available',
+            },
+            items=[{'symbol': symbol}],
+            raw_source_counts={VOLUME_POWER: 1},
+            source_health={
+                VOLUME_POWER: {
+                    'status': 'available',
+                    'reason': 'valid_rows_available',
+                    'raw_count': 1,
+                    'valid_count': 1,
+                    'invalid_count': 0,
+                },
+            },
+        )
+
+        with (
+            patch.object(
+                service,
+                'collect_features',
+                AsyncMock(return_value=collection),
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'upsert_daily_signal_features',
+            ) as bulk_upsert,
+            patch(
+                'app.signals.daily_signal_features.'
+                'upsert_daily_signal_feature',
+            ) as single_upsert,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.'
+                'rebuild_for_market_date',
+            ) as participation_rebuild,
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                include_retry_metadata=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            result['reason'],
+            'signal_feature_evidence_incomplete',
+        )
+        self.assertEqual(result['successful_stock_codes'], [])
+        self.assertEqual(result['retry_debt_stock_codes'], [symbol])
+        self.assertEqual(result['semantic_ready_count'], 0)
+        self.assertEqual(result['semantic_retry_count'], 1)
+        bulk_upsert.assert_not_called()
+        single_upsert.assert_not_called()
+        participation_rebuild.assert_not_called()
 
     async def test_collect_features_can_scope_to_one_source(self):
         service = DailySignalFeatureService(client=FakeKISRankingClient())

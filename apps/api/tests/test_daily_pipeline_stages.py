@@ -8030,6 +8030,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'summary': {
                     'eligible_symbol_count': 201,
                     'collected_symbol_count': 201,
+                    'recent_news_symbol_count': 0,
                     'items_inserted': 252,
                 },
             },
@@ -8060,6 +8061,16 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             },
         )
 
+        self.assertEqual(
+            counts,
+            {
+                'processed': 2,
+                'total': 2,
+                'succeeded': 2,
+                'failed': 0,
+            },
+        )
+
     def test_extract_stage_counts_recovers_legacy_news_collection_evidence(
         self,
     ) -> None:
@@ -8073,16 +8084,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'failed_symbol_count': 0,
                     'skipped_symbol_count': 0,
                 },
-            },
-        )
-
-        self.assertEqual(
-            counts,
-            {
-                'processed': 2,
-                'total': 2,
-                'succeeded': 2,
-                'failed': 0,
             },
         )
 

@@ -36,6 +36,11 @@ from app.market_data_store import (
     upsert_daily_signal_features,
 )
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.signal_feature_readiness import (
+    SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
+    classify_signal_feature_readiness,
+    quote_snapshot_is_decision_usable,
+)
 
 SIGNAL_FEATURE_VERSION = 'daily_signal_features_v2'
 SIGNAL_FEATURE_SOURCE = 'kis_ranking'
@@ -413,6 +418,12 @@ def _build_quote_snapshot_features(*, quote_row: dict[str, Any] | None, market_d
             'captured_at': quote_row.get('captured_at'),
         }
     )
+    if not quote_snapshot_is_decision_usable(
+        payload=payload,
+        freshness=freshness,
+        expected_market_date=market_date,
+    ):
+        return None, None
     return (payload or None), (freshness or None)
 
 
@@ -770,6 +781,75 @@ def _build_feature_coverage_summary(
 
 def _feature_item_preview(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(items[:SIGNAL_FEATURE_ITEM_PREVIEW_LIMIT])
+
+
+def _prepare_signal_feature_publication_items(
+    *,
+    items: Sequence[dict[str, Any]],
+    expected_market_date: str,
+    incomplete_sources: Sequence[str],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, str],
+    dict[str, int],
+]:
+    """Select rows whose persisted evidence is decision-usable.
+
+    Every row must satisfy the same readiness contract before publication.
+    A shared source gap downgrades otherwise-usable rows instead of turning
+    the whole scope into retry debt.  Unusable rows never advance.
+    """
+
+    quality_by_symbol: dict[str, str] = {}
+    quality_reason_counts: dict[str, int] = {}
+    publication_items: list[dict[str, Any]] = []
+    for item in items:
+        symbol = str(item.get('symbol') or '').strip()
+        readiness = classify_signal_feature_readiness(
+            signal_count=item.get('signal_count'),
+            feature_payload=item.get('feature_payload'),
+            expected_market_date=expected_market_date,
+        )
+        reasons = list(readiness.get('quality_reasons') or [])
+        if not readiness.get('semantic_ready'):
+            if symbol:
+                quality_by_symbol[symbol] = 'retry'
+            for reason in reasons:
+                reason_text = str(reason).strip()
+                if reason_text:
+                    quality_reason_counts[reason_text] = (
+                        quality_reason_counts.get(reason_text, 0) + 1
+                    )
+            continue
+
+        quality_status = str(readiness.get('quality_status') or 'complete')
+        if incomplete_sources:
+            quality_status = 'degraded'
+            if 'source_incomplete' not in reasons:
+                reasons.append('source_incomplete')
+        annotated_readiness = {
+            **readiness,
+            'quality_status': quality_status,
+            'quality_reasons': reasons,
+            'incomplete_sources': list(incomplete_sources),
+        }
+        publication_item = deepcopy(item)
+        feature_payload = dict(
+            publication_item.get('feature_payload') or {}
+        )
+        feature_payload['readiness'] = annotated_readiness
+        publication_item['feature_payload'] = feature_payload
+        publication_items.append(publication_item)
+        if symbol:
+            quality_by_symbol[symbol] = quality_status
+        for reason in reasons:
+            reason_text = str(reason).strip()
+            if reason_text:
+                quality_reason_counts[reason_text] = (
+                    quality_reason_counts.get(reason_text, 0) + 1
+                )
+
+    return publication_items, quality_by_symbol, quality_reason_counts
 
 
 def _load_support_maps(
@@ -1581,8 +1661,8 @@ class DailySignalFeatureService:
         )
 
         # Source health is an authority gate, not merely response metadata.
-        # Determine it before any write so incomplete rankings cannot replace
-        # an earlier authoritative row with generated fallback content.
+        # Determine it before any write so incomplete rankings publish only
+        # rows whose direct or owned-fallback evidence is decision-usable.
         incomplete_sources = sorted(
             {
                 *(
@@ -1617,6 +1697,20 @@ class DailySignalFeatureService:
             for item in collection.items
             if str(item.get('symbol') or '').strip()
         }
+        (
+            publication_items,
+            quality_by_symbol,
+            quality_reason_counts,
+        ) = _prepare_signal_feature_publication_items(
+            items=collection.items,
+            expected_market_date=collection.market_date,
+            incomplete_sources=incomplete_sources,
+        )
+        publication_symbol_set = {
+            str(item.get('symbol') or '').strip()
+            for item in publication_items
+            if str(item.get('symbol') or '').strip()
+        }
         failed_symbols: list[str] = []
         failed_symbols.extend(
             symbol
@@ -1633,10 +1727,10 @@ class DailySignalFeatureService:
             )
             exact_publication = replace_daily_signal_features_exact_scope(
                 market_date=collection.market_date,
-                # An incomplete shared source proves no row authoritative.
-                # Publish nothing and remove stale exact-scope rows in the
-                # same transaction instead of briefly exposing fallbacks.
-                features=([] if incomplete_sources else collection.items),
+                # Publish decision-usable degraded rows even when a shared
+                # source is partial.  The exact-scope transaction still
+                # removes stale rows for symbols that remain retry debt.
+                features=publication_items,
                 exact_symbols=finalization_scope,
                 authoritative_market_scope=authoritative_market_scope,
             )
@@ -1645,7 +1739,7 @@ class DailySignalFeatureService:
             )
             persisted_items = [
                 item
-                for item in collection.items
+                for item in publication_items
                 if str(item.get('symbol') or '').strip()
                 in exact_successful
             ]
@@ -1655,16 +1749,16 @@ class DailySignalFeatureService:
             scope_finalization = exact_publication.get(
                 'scope_finalization'
             )
-        elif not incomplete_sources:
+        elif publication_items:
             try:
                 upsert_daily_signal_features(
-                    collection.items,
+                    publication_items,
                     # A non-exact invocation cannot delete unrelated rows.
                     delete_rows_outside_scope=False,
                 )
-                persisted_items = list(collection.items)
+                persisted_items = list(publication_items)
             except Exception:
-                for item in collection.items:
+                for item in publication_items:
                     try:
                         upsert_daily_signal_feature(item)
                         persisted_items.append(item)
@@ -1672,39 +1766,16 @@ class DailySignalFeatureService:
                         failed_symbols.append(item['symbol'])
 
         failed_symbols = list(dict.fromkeys(failed_symbols))
-        source_retry_symbols = list(
-            dict.fromkeys(
-                str(symbol).strip()
-                for symbol in selected_scope_symbols
-                if str(symbol).strip()
-            )
-        )
-        retry_failed_symbols = list(
-            dict.fromkeys(
-                [
-                    *failed_symbols,
-                    *(source_retry_symbols if incomplete_sources else []),
-                ]
-            )
-        )
         persisted_symbol_set = {
             str(item.get('symbol') or '').strip()
             for item in persisted_items
             if str(item.get('symbol') or '').strip()
         }
-        # Shared source gaps can omit candidates without naming them.  An
-        # exact invocation atomically removes stale rows; a non-exact one
-        # preserves the last authoritative rows.  Neither path admits the
-        # generated fallback rows as source-complete success.
-        successful_scope_symbols = (
-            []
-            if incomplete_sources
-            else [
-                symbol
-                for symbol in selected_scope_symbols
-                if symbol in persisted_symbol_set
-            ]
-        )
+        successful_scope_symbols = [
+            symbol
+            for symbol in selected_scope_symbols
+            if symbol in persisted_symbol_set
+        ]
         successful_scope_set = set(successful_scope_symbols)
         scope_outcome = build_exact_symbol_scope_outcome(
             manifest_version=(
@@ -1718,13 +1789,36 @@ class DailySignalFeatureService:
                 if symbol not in successful_scope_set
             ],
         )
+        retry_failed_symbols = list(
+            scope_outcome.get('retry_debt_stock_codes') or []
+        )
+        complete_scope_symbols = [
+            symbol
+            for symbol in successful_scope_symbols
+            if quality_by_symbol.get(symbol) == 'complete'
+        ]
+        degraded_scope_symbols = [
+            symbol
+            for symbol in successful_scope_symbols
+            if quality_by_symbol.get(symbol) == 'degraded'
+        ]
+        quality_status = (
+            'degraded'
+            if degraded_scope_symbols
+            or (successful_scope_symbols and retry_failed_symbols)
+            else ('healthy' if successful_scope_symbols else 'unavailable')
+        )
 
-        if incomplete_sources and exact_symbols is None:
+        if not persisted_items and exact_symbols is None:
             participation_context = {
                 'market_date': collection.market_date,
                 'source': SIGNAL_FEATURE_SOURCE,
                 'status': 'skipped',
-                'reason': 'signal_feature_sources_incomplete',
+                'reason': (
+                    'signal_feature_sources_incomplete'
+                    if incomplete_sources
+                    else 'no_signal_features_persisted'
+                ),
             }
         else:
             participation_context = (
@@ -1765,9 +1859,28 @@ class DailySignalFeatureService:
                 'partial' if incomplete_sources else 'complete'
             ),
             'incomplete_sources': incomplete_sources,
+            'quality_contract_version': (
+                SIGNAL_FEATURE_READINESS_CONTRACT_VERSION
+            ),
+            'quality_status': quality_status,
+            'complete_stock_codes': complete_scope_symbols,
+            'degraded_stock_codes': degraded_scope_symbols,
+            'complete_stock_code_count': len(complete_scope_symbols),
+            'degraded_stock_code_count': len(degraded_scope_symbols),
+            'semantic_ready_count': sum(
+                symbol in publication_symbol_set
+                for symbol in selected_scope_symbols
+            ),
+            'semantic_retry_count': sum(
+                symbol not in publication_symbol_set
+                for symbol in selected_scope_symbols
+            ),
+            'quality_reason_counts': quality_reason_counts,
             'status': (
                 'partial'
-                if incomplete_sources or failed_symbols
+                if incomplete_sources
+                or failed_symbols
+                or retry_failed_symbols
                 else 'completed'
             ),
             'reason': (
@@ -1776,7 +1889,11 @@ class DailySignalFeatureService:
                 else (
                     'signal_feature_persistence_incomplete'
                     if failed_symbols
-                    else None
+                    else (
+                        'signal_feature_evidence_incomplete'
+                        if retry_failed_symbols
+                        else None
+                    )
                 )
             ),
             'features_persisted': len(persisted_items),

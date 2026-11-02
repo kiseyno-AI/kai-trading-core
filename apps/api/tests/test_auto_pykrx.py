@@ -2521,6 +2521,7 @@ class PykrxBackfillServiceTests(TestCase):
                     'eligible_symbol_count': 201,
                     'collected_symbol_count': 201,
                     'matched_symbol_count': 201,
+                    'recent_news_symbol_count': 0,
                 },
             },
             stage_id='external_news_collect',
