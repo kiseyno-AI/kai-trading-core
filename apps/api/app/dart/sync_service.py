@@ -25,6 +25,7 @@ from app.core.settings import settings
 from app.dart.store import DartSyncRepository, dart_sync_repository
 from app.eod.finality import validate_finalized_krx_write_date
 from app.integrations.dart.client import DartAPIError, DartClient, dart_client
+from app.market.symbol_codes import normalize_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_lock
 
 _ANNUAL_REPORT = 'annual_report'
@@ -54,17 +55,11 @@ def _normalize_root_stock_code_manifest(
     normalized: list[str] = []
     seen: set[str] = set()
     for value in stock_codes:
-        stock_code = str(value or '').strip()
-        if (
-            not stock_code
-            or not stock_code.isascii()
-            or not stock_code.isdigit()
-            or len(stock_code) > 6
-        ):
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
             raise ValueError(
                 'DART root stock-code manifest contains an invalid stock code'
             )
-        stock_code = stock_code.zfill(6)
         if stock_code not in seen:
             seen.add(stock_code)
             normalized.append(stock_code)
@@ -1589,23 +1584,18 @@ class DartDisclosureSyncService:
         normalized_corporations: list[dict[str, str]] = []
         for item in corporations:
             corp_code = str(item.get('corp_code') or '').strip()
-            raw_stock_code = str(item.get('stock_code') or '').strip()
+            stock_code = normalize_krx_short_code(item.get('stock_code'))
             if not corp_code:
                 raise ValueError(
                     'DART per-corporation scan contains an empty corp code'
                 )
-            if (
-                not raw_stock_code
-                or not raw_stock_code.isascii()
-                or not raw_stock_code.isdigit()
-                or len(raw_stock_code) > 6
-            ):
+            if stock_code is None:
                 raise ValueError(
                     'DART per-corporation scan contains an invalid stock code'
                 )
             normalized_item = dict(item)
             normalized_item['corp_code'] = corp_code
-            normalized_item['stock_code'] = raw_stock_code.zfill(6)
+            normalized_item['stock_code'] = stock_code
             normalized_corporations.append(normalized_item)
         corporations = normalized_corporations
         requested_stock_codes = sorted(
@@ -2069,12 +2059,21 @@ class DartDisclosureSyncService:
 
     def _build_event_record(self, raw_item: dict[str, Any], *, run_id: int) -> dict[str, Any]:
         classification = classify_filing(raw_item.get('report_nm', ''))
-        stock_code = (raw_item.get('stock_code') or '').strip() or None
+        raw_stock_code = str(raw_item.get('stock_code') or '').strip()
+        stock_code = (
+            normalize_krx_short_code(raw_stock_code)
+            if raw_stock_code
+            else None
+        )
+        if raw_stock_code and stock_code is None:
+            raise ValueError(
+                'DART disclosure contains an invalid stock code'
+            )
         return {
             'rcept_no': raw_item['rcept_no'].strip(),
             'corp_code': (raw_item.get('corp_code') or '').strip(),
             'corp_name': (raw_item.get('corp_name') or '').strip(),
-            'stock_code': stock_code.zfill(6) if stock_code else None,
+            'stock_code': stock_code,
             'corp_cls': (raw_item.get('corp_cls') or '').strip() or None,
             'report_nm': (raw_item.get('report_nm') or '').strip(),
             'filing_category': classification['filing_category'],

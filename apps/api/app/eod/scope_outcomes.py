@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from app.eod.market_membership import market_membership_sha256
+from app.market.symbol_codes import normalize_krx_short_code
 
 
 EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS = frozenset(
@@ -100,6 +101,18 @@ FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION = (
 )
 
 
+def _normalize_krx_symbol_sequence(
+    values: Sequence[Any],
+) -> list[str] | None:
+    normalized: list[str] = []
+    for value in values:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
+            return None
+        normalized.append(stock_code)
+    return normalized
+
+
 def build_exact_scope_partition_identity_proof(
     *,
     retry_debt_symbols: Sequence[str],
@@ -185,16 +198,9 @@ def validate_exact_symbol_scope_outcome(
             return []
         if not isinstance(raw, list):
             return None
-        normalized = [
-            (
-                str(value or '').strip().zfill(6)
-                if str(value or '').strip().isdigit()
-                else str(value or '').strip().upper()
-            )
-            for value in raw
-        ]
+        normalized = _normalize_krx_symbol_sequence(raw)
         if (
-            any(not value for value in normalized)
+            normalized is None
             or len(normalized) != len(set(normalized))
         ):
             return None
@@ -215,16 +221,11 @@ def validate_exact_symbol_scope_outcome(
     ):
         return None
 
-    normalized_invocation = [
-        (
-            str(value or '').strip().zfill(6)
-            if str(value or '').strip().isdigit()
-            else str(value or '').strip().upper()
-        )
-        for value in invocation_symbols
-    ]
+    normalized_invocation = _normalize_krx_symbol_sequence(
+        invocation_symbols
+    )
     if (
-        any(not value for value in normalized_invocation)
+        normalized_invocation is None
         or len(normalized_invocation) != len(set(normalized_invocation))
         or set(selected) != set(normalized_invocation)
     ):
@@ -257,12 +258,7 @@ def validate_exact_symbol_scope_outcome(
     for item in raw_manifest:
         if not isinstance(item, Mapping):
             return None
-        raw_stock_code = str(item.get('stock_code') or '').strip()
-        stock_code = (
-            raw_stock_code.zfill(6)
-            if raw_stock_code.isdigit()
-            else raw_stock_code.upper()
-        )
+        stock_code = normalize_krx_short_code(item.get('stock_code'))
         outcome = str(item.get('outcome') or '').strip()
         if (
             not stock_code
@@ -302,16 +298,9 @@ def validate_atomic_scope_finalization(
     """Bind a persisted exact-scope proof to its stage and symbol sets."""
 
     def normalize_symbols(values: Sequence[str]) -> list[str] | None:
-        normalized = [
-            (
-                str(value or '').strip().zfill(6)
-                if str(value or '').strip().isdigit()
-                else str(value or '').strip().upper()
-            )
-            for value in values
-        ]
+        normalized = _normalize_krx_symbol_sequence(values)
         if (
-            any(not value for value in normalized)
+            normalized is None
             or len(normalized) != len(set(normalized))
         ):
             return None
@@ -397,15 +386,12 @@ def validate_stage_bound_scope_outcome(
     if finalization_stage_id is not None:
         if expected_market_date is None or publication_symbols is None:
             return None
-        normalized_publication = {
-            (
-                str(symbol or '').strip().zfill(6)
-                if str(symbol or '').strip().isdigit()
-                else str(symbol or '').strip().upper()
-            )
-            for symbol in publication_symbols
-            if str(symbol or '').strip()
-        }
+        normalized_publication_list = _normalize_krx_symbol_sequence(
+            publication_symbols
+        )
+        if normalized_publication_list is None:
+            return None
+        normalized_publication = set(normalized_publication_list)
         if not set(partition['selected_stock_codes']).issubset(
             normalized_publication
         ):
@@ -442,28 +428,32 @@ def build_exact_symbol_scope_outcome(
 ) -> dict[str, Any]:
     """Build an exhaustive, identity-bearing symbol outcome partition."""
 
-    selected = list(
-        dict.fromkeys(
-            str(value).strip()
-            for value in selected_symbols
-            if str(value).strip()
-        )
+    normalized_selected = _normalize_krx_symbol_sequence(selected_symbols)
+    normalized_successful = _normalize_krx_symbol_sequence(
+        successful_symbols
     )
-    successful_set = {
-        str(value).strip()
-        for value in successful_symbols
-        if str(value).strip()
-    }
-    retry_debt_set = {
-        str(value).strip()
-        for value in retry_debt_symbols
-        if str(value).strip()
-    }
-    terminal_not_applicable_set = {
-        str(value).strip()
-        for value in terminal_not_applicable_symbols
-        if str(value).strip()
-    }
+    normalized_retry_debt = _normalize_krx_symbol_sequence(
+        retry_debt_symbols
+    )
+    normalized_terminal = _normalize_krx_symbol_sequence(
+        terminal_not_applicable_symbols
+    )
+    if any(
+        normalized is None
+        for normalized in (
+            normalized_selected,
+            normalized_successful,
+            normalized_retry_debt,
+            normalized_terminal,
+        )
+    ):
+        raise ValueError(
+            'exact symbol scope outcomes require canonical KRX short codes'
+        )
+    selected = list(dict.fromkeys(normalized_selected or []))
+    successful_set = set(normalized_successful or [])
+    retry_debt_set = set(normalized_retry_debt or [])
+    terminal_not_applicable_set = set(normalized_terminal or [])
     selected_set = set(selected)
     if (
         successful_set & retry_debt_set

@@ -5,6 +5,8 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
+from app.market.symbol_codes import normalize_krx_short_code
+
 
 DART_SHARE_ISSUANCE_OPS_POLICY_VERSION = (
     'dart_share_issuance_ops_backfill_v2'
@@ -59,10 +61,10 @@ def _strict_stock_code_manifest(
     except TypeError:
         return None
     for value in iterator:
-        raw = str(value or '').strip()
-        if not raw or not raw.isdigit() or len(raw) > 6:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
             return None
-        normalized.append(raw.zfill(6))
+        normalized.append(stock_code)
     if not normalized:
         return None
     if normalized != sorted(set(normalized)):
@@ -407,12 +409,8 @@ def inspect_share_issuance_activation_audit(
                 if not isinstance(item, dict):
                     reject('outcome_classification_invalid')
                     continue
-                raw_stock_code = str(item.get('stock_code') or '').strip()
                 stock_code = (
-                    raw_stock_code.zfill(6)
-                    if raw_stock_code.isdigit()
-                    and len(raw_stock_code) <= 6
-                    else ''
+                    normalize_krx_short_code(item.get('stock_code')) or ''
                 )
                 classification = str(
                     item.get('classification') or ''

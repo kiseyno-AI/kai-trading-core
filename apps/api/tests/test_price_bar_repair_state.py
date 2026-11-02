@@ -1530,6 +1530,105 @@ class PendingExactMarketMembershipEvidenceTests(unittest.TestCase):
             ['00104K'],
         )
 
+    def test_current_pending_scope_accepts_canonical_alpha_symbol(self) -> None:
+        batches, exact_symbols, input_sha256 = self._proof_batches()
+        target_batch = batches[0]
+        recorded = target_batch['verification_metadata']['repair_evidence']
+        alpha_symbol = '0010A0'
+        exact_symbols = sorted([*exact_symbols, alpha_symbol])
+
+        manifest = recorded['provider_membership_manifest']
+        kospi_symbols = [
+            *manifest['markets']['KOSPI']['symbols'],
+            alpha_symbol,
+        ]
+        kosdaq_symbols = list(manifest['markets']['KOSDAQ']['symbols'])
+        konex_symbols = list(manifest['markets']['KONEX']['symbols'])
+        provider_manifest = build_market_membership_snapshot(
+            symbols=[
+                *(
+                    SimpleNamespace(symbol=symbol, market='KOSPI')
+                    for symbol in kospi_symbols
+                ),
+                *(
+                    SimpleNamespace(symbol=symbol, market='KOSDAQ')
+                    for symbol in kosdaq_symbols
+                ),
+                *(
+                    SimpleNamespace(symbol=symbol, market='KONEX')
+                    for symbol in konex_symbols
+                ),
+            ],
+            markets=('KOSPI', 'KOSDAQ', 'KONEX'),
+        )
+        all_provider_symbols = sorted(
+            [*exact_symbols, *konex_symbols]
+        )
+        provider_manifest['membership_sha256'] = market_membership_sha256(
+            all_provider_symbols
+        )
+        recorded['provider_membership_manifest'] = provider_manifest
+        recorded['expected_provider_membership_count'] = len(
+            all_provider_symbols
+        )
+        recorded['expected_provider_membership_sha256'] = (
+            market_membership_sha256(all_provider_symbols)
+        )
+        recorded['price_dependent_membership_symbols'] = exact_symbols
+        recorded['price_dependent_membership_count'] = len(exact_symbols)
+        recorded['price_dependent_membership_sha256'] = (
+            market_membership_sha256(exact_symbols)
+        )
+        target_scope = recorded['price_dependent_membership_by_date'][
+            MARKET_DATE.isoformat()
+        ]
+        target_scope['symbols'] = exact_symbols
+        target_scope['symbol_count'] = len(exact_symbols)
+        target_scope['membership_sha256'] = market_membership_sha256(
+            exact_symbols
+        )
+
+        result = resolve_pending_exact_market_membership_evidence(
+            market_date=MARKET_DATE,
+            pending=[target_batch],
+            input_fingerprint_loader=lambda market_date, symbols: (
+                input_sha256,
+                len(symbols),
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn(
+            alpha_symbol,
+            result['symbols_by_market']['KOSPI'],
+        )
+        self.assertEqual(result['ranking_membership_count'], len(exact_symbols))
+
+    def test_pending_scope_rejects_malformed_symbol(self) -> None:
+        batches, exact_symbols, input_sha256 = self._proof_batches()
+        target_batch = batches[0]
+        recorded = target_batch['verification_metadata']['repair_evidence']
+        target_scope = recorded['price_dependent_membership_by_date'][
+            MARKET_DATE.isoformat()
+        ]
+        malformed_symbols = sorted([*exact_symbols, 'ABC123'])
+        target_scope['symbols'] = malformed_symbols
+        target_scope['symbol_count'] = len(malformed_symbols)
+        target_scope['membership_sha256'] = market_membership_sha256(
+            malformed_symbols
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'exact validation'):
+            resolve_pending_exact_market_membership_evidence(
+                market_date=MARKET_DATE,
+                pending=[target_batch],
+                input_fingerprint_loader=lambda market_date, symbols: (
+                    input_sha256,
+                    len(symbols),
+                ),
+            )
+
     def test_price_input_drift_is_rejected(self) -> None:
         batches, exact_symbols, _input_sha256 = self._proof_batches()
 

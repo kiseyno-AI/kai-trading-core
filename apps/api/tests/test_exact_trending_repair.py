@@ -17,6 +17,7 @@ from app.eod.exact_trending_repair import (
     ExactTrendingRankRepair,
     PERIODS,
     _load_completion_state,
+    _normalize_symbols,
     main,
 )
 from app.eod.market_membership import market_membership_sha256
@@ -90,6 +91,14 @@ def _guard(**_kwargs):
 
 
 class ExactTrendingRankRepairTests(unittest.TestCase):
+    def test_scope_normalization_accepts_alpha_and_rejects_malformed_symbols(self):
+        self.assertEqual(
+            _normalize_symbols(['005930', '0010a0']),
+            ['0010A0', '005930'],
+        )
+        with self.assertRaisesRegex(ValueError, 'invalid symbol'):
+            _normalize_symbols(['ABC123'])
+
     def test_completion_state_accepts_supported_rebuild_evidence_schemas(self):
         scope_hash = market_membership_sha256(SYMBOLS)
 

@@ -991,6 +991,57 @@ class DartDisclosureSyncServiceTests(unittest.IsolatedAsyncioTestCase):
             '005930',
         )
 
+    async def test_targeted_corp_scan_supports_alpha_krx_short_code(self):
+        client = FakeSyncClient()
+        repository = FakeSyncRepository()
+        service = DartDisclosureSyncService(
+            client=client,
+            repository=repository,
+        )
+
+        result = await service.sync_disclosures_for_corporations(
+            corporations=[
+                {'corp_code': '00126380', 'stock_code': '00088k'},
+            ],
+            start_date=date(2025, 1, 1),
+            end_date=date(2026, 4, 7),
+            trigger='active_test',
+            scope='targeted_active_universe',
+            root_stock_code_manifest=['00088k'],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['root_stock_code_manifest'], ['00088K'])
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'requested_manifest'
+            ][0]['stock_code'],
+            '00088K',
+        )
+
+    def test_event_record_normalizes_alpha_and_rejects_malformed_code(self):
+        service = DartDisclosureSyncService(
+            client=FakeSyncClient(),
+            repository=FakeSyncRepository(),
+        )
+        raw_item = {
+            'rcept_no': '20260301000000',
+            'corp_code': '00126380',
+            'corp_name': 'Alpha Corp',
+            'stock_code': '00088k',
+            'report_nm': '사업보고서',
+            'rcept_dt': '20260301',
+        }
+
+        event = service._build_event_record(raw_item, run_id=1)
+
+        self.assertEqual(event['stock_code'], '00088K')
+        with self.assertRaisesRegex(ValueError, 'invalid stock code'):
+            service._build_event_record(
+                {**raw_item, 'stock_code': 'ABC123'},
+                run_id=1,
+            )
+
     async def test_complete_corp_scan_persists_positive_share_issuance_event(self):
         client = SinglePageSyncClient(
             [

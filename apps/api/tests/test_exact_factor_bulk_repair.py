@@ -23,6 +23,7 @@ from app.eod.exact_factor_bulk_repair import (
     exact_factor_bulk_guard,
     _fingerprint_price_history,
     _load_factor_source_fingerprints,
+    _normalize_symbols,
 )
 from app.eod.exact_factor_repair import (
     FACTOR_RESULT_MODELS,
@@ -38,6 +39,12 @@ INPUT_SHA256 = 'a' * 64
 PENDING_PROOF_SHA256 = 'b' * 64
 PENDING_PROOF_BATCH_IDS = ['missing-bar-authority']
 PROTECTED_PROVIDER_CODE = '00104K'
+
+
+def test_scope_normalization_accepts_alpha_and_rejects_malformed_symbols() -> None:
+    assert _normalize_symbols(['005930', '0010a0']) == ['0010A0', '005930']
+    with pytest.raises(ValueError, match='invalid symbol'):
+        _normalize_symbols(['ABC123'])
 
 
 def _manifest(*, symbols=None):

@@ -1509,7 +1509,7 @@ class DailyAdvancedValueFactorPersistenceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = DailyAdvancedValueFactorService()
         self.market_date = date(2026, 4, 24)
-        self.symbols = ['TAV1601', 'TAV1602', 'TAV1603']
+        self.symbols = ['9161A1', '9161A2', '9161A3']
 
     def tearDown(self) -> None:
         with session_scope() as session:

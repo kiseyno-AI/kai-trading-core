@@ -126,6 +126,7 @@ from app.market_data_store import (
     update_eod_collection_run_progress,
     upsert_symbol_universe,
 )
+from app.market.symbol_codes import normalize_krx_short_code
 from app.repositories.eod_run_repository import (
     load_automatic_daily_eod_collection_run_by_id,
     load_exact_automatic_daily_eod_collection_run,
@@ -171,6 +172,10 @@ FOLLOWUP_STAGE_DEBT_METADATA_KEY = 'followup_stage_debt'
 FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION = 'followup_stage_debt_v3'
 FOLLOWUP_STAGE_PROOF_PUBLICATION_SCOPE_KEY = (
     '_validated_publication_stock_codes'
+)
+FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY = '_validated_recovery_lineage'
+FOLLOWUP_STAGE_RECOVERY_LINEAGE_SCHEMA_VERSION = (
+    'followup_recovery_lineage_v1'
 )
 FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER = (
     'fundamentals_daily_refresh',
@@ -2451,6 +2456,9 @@ def _validated_followup_stage_debt_state(
         return None
     normalized_proofs: dict[str, list[dict[str, Any]]] = {}
     proof_classifications: dict[str, dict[str, set[str]]] = {}
+    recovery_proof_run_ids: set[int] = set()
+    recovery_progress_run_ids: set[int] = set()
+    recovery_proof_counts_by_stage: dict[str, int] = {}
     for raw_stage_id, raw_proofs in proofs.items():
         stage_id = str(raw_stage_id or '').strip()
         if (
@@ -2494,6 +2502,52 @@ def _validated_followup_stage_debt_state(
             if validated_proof is None:
                 return None
             partition, _proof = validated_proof
+            recovery_lineage = raw_proof.get(
+                FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+            )
+            if recovery_lineage is not None:
+                if not isinstance(recovery_lineage, Mapping):
+                    return None
+                recovery_pipeline_run_id = recovery_lineage.get(
+                    'pipeline_run_id'
+                )
+                recovery_eod_collection_run_id = recovery_lineage.get(
+                    'eod_collection_run_id'
+                )
+                if (
+                    set(recovery_lineage)
+                    != {
+                        'schema_version',
+                        'pipeline_run_id',
+                        'eod_collection_run_id',
+                        'stage_id',
+                    }
+                    or recovery_lineage.get('schema_version')
+                    != FOLLOWUP_STAGE_RECOVERY_LINEAGE_SCHEMA_VERSION
+                    or str(recovery_lineage.get('stage_id') or '').strip()
+                    != stage_id
+                    or isinstance(recovery_pipeline_run_id, bool)
+                    or not isinstance(recovery_pipeline_run_id, int)
+                    or recovery_pipeline_run_id <= 0
+                    or recovery_pipeline_run_id not in applied_run_ids
+                    or recovery_pipeline_run_id in recovery_proof_run_ids
+                    or isinstance(recovery_eod_collection_run_id, bool)
+                    or not isinstance(recovery_eod_collection_run_id, int)
+                    or recovery_eod_collection_run_id
+                    != eod_collection_run_id
+                ):
+                    return None
+                recovery_proof_run_ids.add(recovery_pipeline_run_id)
+                recovery_proof_counts_by_stage[stage_id] = (
+                    recovery_proof_counts_by_stage.get(stage_id, 0) + 1
+                )
+                if (
+                    partition['successful_stock_codes']
+                    or partition['terminal_not_applicable_stock_codes']
+                ):
+                    recovery_progress_run_ids.add(
+                        recovery_pipeline_run_id
+                    )
             selected_set = set(partition['selected_stock_codes'])
             if selected_set & (replayed_successful | replayed_terminal):
                 return None
@@ -2513,8 +2567,11 @@ def _validated_followup_stage_debt_state(
                 'pending': replayed_pending,
                 'terminal': replayed_terminal,
             }
-    if recovery_progress_count > sum(
-        len(stage_proofs) for stage_proofs in normalized_proofs.values()
+    if recovery_progress_count != len(recovery_progress_run_ids):
+        return None
+    if any(
+        proof_count > recovery_attempts.get(stage_id, 0)
+        for stage_id, proof_count in recovery_proof_counts_by_stage.items()
     ):
         return None
     parent_set = set(_dedupe_symbol_codes(parent_symbols))
@@ -2826,11 +2883,17 @@ def _advance_followup_stage_debt_state(
         state.get('applied_recovery_pipeline_run_ids') or []
     )
     if recovery_pipeline_run_id is not None:
+        recovery_eod_collection_run_id = state.get(
+            'eod_collection_run_id'
+        )
         if (
             isinstance(recovery_pipeline_run_id, bool)
             or not isinstance(recovery_pipeline_run_id, int)
             or recovery_pipeline_run_id <= 0
             or recovery_pipeline_run_id in applied_run_ids
+            or isinstance(recovery_eod_collection_run_id, bool)
+            or not isinstance(recovery_eod_collection_run_id, int)
+            or recovery_eod_collection_run_id <= 0
         ):
             return None
         current_attempts = recovery_attempts.get(stage_id, 0)
@@ -2842,6 +2905,14 @@ def _advance_followup_stage_debt_state(
             return None
         recovery_attempts[stage_id] = current_attempts + 1
         applied_run_ids.append(recovery_pipeline_run_id)
+        proof[FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY] = {
+            'schema_version': (
+                FOLLOWUP_STAGE_RECOVERY_LINEAGE_SCHEMA_VERSION
+            ),
+            'pipeline_run_id': recovery_pipeline_run_id,
+            'eod_collection_run_id': recovery_eod_collection_run_id,
+            'stage_id': stage_id,
+        }
     recovery_progress_count = state.get('recovery_progress_count', 0)
     if (
         isinstance(recovery_progress_count, bool)
@@ -2861,8 +2932,11 @@ def _advance_followup_stage_debt_state(
     terminal[stage_id] = sorted(terminal_set)
     proofs.setdefault(stage_id, []).append(proof)
     if (
-        partition['successful_stock_codes']
-        or partition['terminal_not_applicable_stock_codes']
+        recovery_pipeline_run_id is not None
+        and (
+            partition['successful_stock_codes']
+            or partition['terminal_not_applicable_stock_codes']
+        )
     ):
         recovery_progress_count += 1
 
@@ -5047,8 +5121,8 @@ class PykrxBackfillService:
         raw_tickers = index.tolist() if hasattr(index, 'tolist') else list(index)
         items: list[str] = []
         for ticker in raw_tickers:
-            normalized = str(ticker).zfill(6)
-            if not normalized.isdigit() or len(normalized) != 6:
+            normalized = normalize_krx_short_code(ticker)
+            if normalized is None:
                 continue
             items.append(normalized)
         return items
@@ -5078,11 +5152,12 @@ class PykrxBackfillService:
         for entry in get_master_symbols():
             if entry.market.upper() not in allowed_markets:
                 continue
-            if not entry.symbol.isdigit() or len(entry.symbol) != 6:
+            symbol_code = normalize_krx_short_code(entry.symbol)
+            if symbol_code is None:
                 continue
             items.append(
                 PykrxSymbol(
-                    symbol=entry.symbol,
+                    symbol=symbol_code,
                     market=entry.market,
                     name_ko=entry.name_ko,
                     standard_code=entry.standard_code,
@@ -5118,9 +5193,9 @@ class PykrxBackfillService:
         seen: set[str] = set()
         allowed_markets = {market.upper() for market in markets}
         for row in rows:
-            symbol_code = str(row['symbol']).strip()
+            symbol_code = normalize_krx_short_code(row['symbol'])
             market = str(row['market'] or '').strip()
-            if not symbol_code.isdigit() or len(symbol_code) != 6:
+            if symbol_code is None:
                 continue
             if market.upper() not in allowed_markets:
                 continue

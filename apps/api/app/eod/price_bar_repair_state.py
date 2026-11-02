@@ -46,6 +46,7 @@ from app.eod.market_membership import (
     market_membership_sha256,
     validate_market_membership_snapshot,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
 
@@ -867,7 +868,7 @@ def resolve_pending_exact_market_membership_evidence(
         if (
             not frozen_symbols
             or len(frozen_symbols) != len(set(frozen_symbols))
-            or any(len(symbol) != 6 or not symbol.isdigit() for symbol in frozen_symbols)
+            or any(not is_canonical_krx_short_code(symbol) for symbol in frozen_symbols)
             or symbol_count != len(frozen_symbols)
             or membership_sha256 != market_membership_sha256(frozen_symbols)
             or not _is_sha256(input_sha256)

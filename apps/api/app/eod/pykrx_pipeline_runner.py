@@ -47,12 +47,25 @@ from app.eod.scope_outcomes import (
 from app.eod.stage_heartbeat import PeriodicStageHeartbeat
 from app.market.clock import get_market_state
 from app.market.session import previous_krx_trading_date
+from app.market.symbol_codes import normalize_krx_short_code
 from app.market_data_store import (
     build_daily_derived_market_scope_authority,
 )
 from app.signals.market_risk_filter import MARKET_RISK_FILTER_SOURCE
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_krx_symbol_sequence(
+    values: Sequence[Any],
+) -> list[str] | None:
+    normalized: list[str] = []
+    for value in values:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
+            return None
+        normalized.append(stock_code)
+    return normalized
 
 PYKRX_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'price_collection',
@@ -725,15 +738,8 @@ def _validated_exact_scope_outcome(
             return []
         if not isinstance(raw, list):
             return None
-        normalized = [
-            (
-                str(value or '').strip().zfill(6)
-                if str(value or '').strip().isdigit()
-                else str(value or '').strip().upper()
-            )
-            for value in raw
-        ]
-        if any(not value for value in normalized):
+        normalized = _normalize_krx_symbol_sequence(raw)
+        if normalized is None:
             return None
         if len(normalized) != len(set(normalized)):
             return None
@@ -754,16 +760,11 @@ def _validated_exact_scope_outcome(
     ):
         return None
 
-    normalized_invocation = [
-        (
-            str(value or '').strip().zfill(6)
-            if str(value or '').strip().isdigit()
-            else str(value or '').strip().upper()
-        )
-        for value in invocation_symbols
-    ]
+    normalized_invocation = _normalize_krx_symbol_sequence(
+        invocation_symbols
+    )
     if (
-        any(not value for value in normalized_invocation)
+        normalized_invocation is None
         or len(normalized_invocation) != len(set(normalized_invocation))
         or set(selected) != set(normalized_invocation)
     ):
@@ -796,12 +797,7 @@ def _validated_exact_scope_outcome(
     for item in raw_manifest:
         if not isinstance(item, Mapping):
             return None
-        raw_stock_code = str(item.get('stock_code') or '').strip()
-        stock_code = (
-            raw_stock_code.zfill(6)
-            if raw_stock_code.isdigit()
-            else raw_stock_code.upper()
-        )
+        stock_code = normalize_krx_short_code(item.get('stock_code'))
         outcome = str(item.get('outcome') or '').strip()
         if (
             not stock_code
@@ -981,12 +977,13 @@ def _validated_atomic_scope_partition(
     must still use ``_validated_atomic_successful_cohort``.
     """
 
+    normalized_publication_values = _normalize_krx_symbol_sequence(
+        exact_publication_symbols
+    )
+    if normalized_publication_values is None:
+        return None
     normalized_publication = list(
-        dict.fromkeys(
-            str(symbol or '').strip().upper().zfill(6)
-            for symbol in exact_publication_symbols
-            if str(symbol or '').strip()
-        )
+        dict.fromkeys(normalized_publication_values)
     )
     if not normalized_publication:
         return None
@@ -1032,18 +1029,16 @@ def _clear_exact_scope_outcome(result: dict[str, Any]) -> None:
 def _build_pykrx_invocation_scope_proof(
     symbols: Sequence[str],
 ) -> dict[str, Any]:
-    normalized = [
-        str(value or '').strip().zfill(6)
-        if str(value or '').strip().isdigit()
-        else str(value or '').strip()
-        for value in symbols
-    ]
+    normalized = _normalize_krx_symbol_sequence(symbols)
     if (
-        not normalized
-        or any(not value for value in normalized)
+        normalized is None
+        or not normalized
         or len(normalized) != len(set(normalized))
     ):
-        raise ValueError('PyKRX invocation scope must be nonempty and unique')
+        raise ValueError(
+            'PyKRX invocation scope must contain unique canonical KRX short '
+            'codes'
+        )
     canonical = json.dumps(
         normalized,
         ensure_ascii=False,
@@ -1973,9 +1968,18 @@ def _validated_exact_piotroski_membership_symbols(
             return None
         requested_symbols.extend(entry['symbols'])
 
+    normalized_requested_symbols = _normalize_krx_symbol_sequence(
+        requested_symbols
+    )
+    if (
+        normalized_requested_symbols is None
+        or normalized_requested_symbols != requested_symbols
+    ):
+        return None
+
     validated = validate_market_membership_snapshot(
         membership,
-        requested_symbols=requested_symbols,
+        requested_symbols=normalized_requested_symbols,
         markets=normalized_markets,
     )
     if validated is None:
@@ -2005,30 +2009,28 @@ def _run_daily_piotroski_filter_followup(
 ) -> dict[str, Any]:
     from app.signals.piotroski_filter import daily_piotroski_filter_service
 
-    normalized_symbol_set: set[str] = set()
-    for symbol in exact_membership_symbols or []:
-        normalized_symbol = str(symbol or '').strip().upper()
-        if not normalized_symbol:
-            continue
-        if normalized_symbol.isdigit():
-            normalized_symbol = normalized_symbol.zfill(6)
-        normalized_symbol_set.add(normalized_symbol)
-    normalized_symbols = sorted(normalized_symbol_set)
+    normalized_membership = _normalize_krx_symbol_sequence(
+        exact_membership_symbols or []
+    )
+    normalized_symbols = (
+        sorted(set(normalized_membership))
+        if normalized_membership is not None
+        else []
+    )
     if not normalized_symbols:
         raise RuntimeError(
             'Piotroski follow-up requires validated exact EOD membership proof.'
         )
-    normalized_admitted_symbols = (
-        sorted(
-            {
-                str(symbol or '').strip().upper().zfill(6)
-                for symbol in admitted_symbols
-                if str(symbol or '').strip()
-            }
-        )
+    normalized_admitted = (
+        _normalize_krx_symbol_sequence(admitted_symbols)
         if admitted_symbols is not None
         else list(normalized_symbols)
     )
+    if normalized_admitted is None:
+        raise RuntimeError(
+            'Piotroski admitted scope contains a malformed KRX short code.'
+        )
+    normalized_admitted_symbols = sorted(set(normalized_admitted))
     outside_membership = sorted(
         set(normalized_admitted_symbols) - set(normalized_symbols)
     )
@@ -2065,26 +2067,39 @@ def _successful_symbols_from_stage_result(
     exact_symbols: Sequence[str],
     result: Mapping[str, Any],
 ) -> list[str]:
-    exact = list(dict.fromkeys(exact_symbols))
+    normalized_exact = _normalize_krx_symbol_sequence(exact_symbols)
+    if normalized_exact is None:
+        raise RuntimeError(
+            f'{stage_id} exact scope contains a malformed KRX short code.'
+        )
+    exact = list(dict.fromkeys(normalized_exact))
     exact_set = set(exact)
     explicit_success = result.get('successful_stock_codes')
     if isinstance(explicit_success, list):
-        successful = list(
-            dict.fromkeys(
-                str(symbol).strip().upper().zfill(6)
-                for symbol in explicit_success
-                if str(symbol).strip()
-            )
+        normalized_successful = _normalize_krx_symbol_sequence(
+            explicit_success
         )
+        if normalized_successful is None:
+            raise RuntimeError(
+                f'{stage_id} success scope contains a malformed KRX short '
+                'code.'
+            )
+        successful = list(dict.fromkeys(normalized_successful))
     else:
-        item_symbols = list(
-            dict.fromkeys(
-                str(item.get('symbol') or '').strip().upper().zfill(6)
-                for item in (result.get('items') or [])
-                if isinstance(item, Mapping)
-                and str(item.get('symbol') or '').strip()
-            )
+        raw_item_symbols = [
+            item.get('symbol')
+            for item in (result.get('items') or [])
+            if isinstance(item, Mapping)
+        ]
+        normalized_item_symbols = _normalize_krx_symbol_sequence(
+            raw_item_symbols
         )
+        if normalized_item_symbols is None:
+            raise RuntimeError(
+                f'{stage_id} result items contain a malformed KRX short '
+                'code.'
+            )
+        item_symbols = list(dict.fromkeys(normalized_item_symbols))
         persisted_count_key = {
             'price_contexts': 'contexts_persisted',
             'technical_snapshots': 'snapshots_persisted',
@@ -2094,14 +2109,18 @@ def _successful_symbols_from_stage_result(
         if len(item_symbols) == persisted_count:
             successful = item_symbols
         else:
-            failed = {
-                str(symbol).strip().upper().zfill(6)
-                for symbol in [
+            normalized_failed = _normalize_krx_symbol_sequence(
+                [
                     *(result.get('failed_symbols') or []),
                     *(result.get('missing_symbols') or []),
                 ]
-                if str(symbol).strip()
-            }
+            )
+            if normalized_failed is None:
+                raise RuntimeError(
+                    f'{stage_id} failure scope contains a malformed KRX '
+                    'short code.'
+                )
+            failed = set(normalized_failed)
             inferred = [symbol for symbol in exact if symbol not in failed]
             if len(inferred) != persisted_count:
                 raise RuntimeError(
@@ -2318,29 +2337,29 @@ def _run_daily_factor_followup(
     from app.signals.unified_value_factor import UNIFIED_VALUE_FACTOR_SOURCE, daily_unified_value_factor_service
     from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
 
-    normalized_symbols = sorted(
-        {
-            str(symbol or '').strip().upper().zfill(6)
-            for symbol in exact_membership_symbols or []
-            if str(symbol or '').strip()
-        }
+    normalized_membership = _normalize_krx_symbol_sequence(
+        exact_membership_symbols or []
+    )
+    normalized_symbols = (
+        sorted(set(normalized_membership))
+        if normalized_membership is not None
+        else []
     )
     if not normalized_symbols:
         raise RuntimeError(
             'Daily factor follow-up requires validated exact EOD membership '
             'proof.'
         )
-    initial_admitted_symbols = (
-        sorted(
-            {
-                str(symbol or '').strip().upper().zfill(6)
-                for symbol in admitted_symbols
-                if str(symbol or '').strip()
-            }
-        )
+    normalized_admitted = (
+        _normalize_krx_symbol_sequence(admitted_symbols)
         if admitted_symbols is not None
         else list(normalized_symbols)
     )
+    if normalized_admitted is None:
+        raise RuntimeError(
+            'Daily factor admitted scope contains a malformed KRX short code.'
+        )
+    initial_admitted_symbols = sorted(set(normalized_admitted))
     outside_membership = sorted(
         set(initial_admitted_symbols) - set(normalized_symbols)
     )

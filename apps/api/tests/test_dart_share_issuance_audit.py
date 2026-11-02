@@ -15,6 +15,7 @@ from app.dart.share_issuance_audit import (
     DART_SHARE_ISSUANCE_MANIFEST_SOURCE_EXPLICIT,
     DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
     DART_SHARE_ISSUANCE_OUTCOME_MANIFEST_VERSION,
+    _strict_stock_code_manifest,
     inspect_share_issuance_activation_audit,
 )
 from app.dart.signals_service import (
@@ -185,6 +186,46 @@ class ShareIssuanceActivationAuditTests(unittest.TestCase):
         self.assertEqual(
             result['manifest_hash'], result['recomputed_manifest_hash']
         )
+
+    def test_alpha_stock_code_is_preserved_across_manifest_and_outcome(self):
+        run = self._run()
+        aggregate = run['run_metadata']['aggregate_audit']
+        requested_stock_codes = ['000660', '00088K', '005930']
+        aggregate['requested_stock_codes'] = requested_stock_codes
+        aggregate['classification_stock_codes'] = {
+            'completed_positive': ['000660'],
+            'completed_negative': ['005930'],
+            'terminal_not_applicable': ['00088K'],
+            'retry_debt': [],
+        }
+        manifest = {
+            'manifest_version': aggregate['manifest_version'],
+            'policy_version': aggregate['policy_version'],
+            'market_date': aggregate['market_date'],
+            'window_start': aggregate['window_start'],
+            'window_end': aggregate['window_end'],
+            'requested_stock_codes': requested_stock_codes,
+            'manifest_source': aggregate['manifest_source'],
+            'audit_scope': aggregate['audit_scope'],
+        }
+        aggregate['manifest_hash'] = _sha256(manifest)
+        outcome_manifest = aggregate['outcome_manifest']
+        outcome_manifest['source_manifest_hash'] = aggregate['manifest_hash']
+        outcome_manifest['requested_stock_codes'] = requested_stock_codes
+        outcome_manifest['outcomes'][2]['stock_code'] = '00088K'
+        aggregate['outcome_manifest_sha256'] = _sha256(outcome_manifest)
+
+        result = self._inspect(run)
+
+        self.assertTrue(result['enabled'])
+        self.assertEqual(result['reasons'], [])
+
+    def test_stock_code_manifest_accepts_alpha_and_rejects_malformed(self):
+        self.assertEqual(
+            _strict_stock_code_manifest(['00088k', '5930']),
+            ['00088K', '005930'],
+        )
+        self.assertIsNone(_strict_stock_code_manifest(['ABC123']))
 
     def test_later_market_date_and_additive_symbols_do_not_revoke_bootstrap(self):
         run = self._run()

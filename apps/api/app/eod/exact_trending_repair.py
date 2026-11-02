@@ -39,6 +39,7 @@ from app.market_data_store import (
     compute_and_persist_daily_trending_ranks,
     list_symbols_with_daily_bar_on_date,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 
 
 CHECKPOINT_SCHEMA_VERSION = 'trending_rank_exact_date_checkpoint_v1'
@@ -54,7 +55,7 @@ def _normalize_symbols(values: Sequence[str]) -> list[str]:
             if str(value).strip()
         }
     )
-    if any(len(symbol) != 6 or not symbol.isdigit() for symbol in symbols):
+    if any(not is_canonical_krx_short_code(symbol) for symbol in symbols):
         raise ValueError('trending repair scope contains an invalid symbol')
     return symbols
 

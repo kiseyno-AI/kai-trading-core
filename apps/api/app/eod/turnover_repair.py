@@ -22,6 +22,7 @@ from app.market_data_store import (
     advisory_eod_collection_lock,
     repair_daily_price_bar_turnovers,
 )
+from app.market.symbol_codes import normalize_krx_short_code
 
 
 logger = logging.getLogger(__name__)
@@ -67,11 +68,7 @@ def _normalize_markets(markets: Sequence[str]) -> tuple[str, ...]:
 
 
 def _normalize_provider_stock_code(value: object) -> str | None:
-    raw_code = str(value or '').strip().upper()
-    normalized = raw_code.zfill(6)
-    if not normalized.isdigit() or len(normalized) != 6:
-        return None
-    return normalized
+    return normalize_krx_short_code(value)
 
 
 def _provider_code_preview(value: object) -> str:

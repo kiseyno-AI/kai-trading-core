@@ -44,6 +44,7 @@ from app.eod.pykrx_backfill import (
 from app.eod.price_bar_repair_state import (
     exact_daily_price_bar_scope_fingerprint,
 )
+from app.market.symbol_codes import normalize_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
 
@@ -168,11 +169,7 @@ def _normalize_market_date(value: str | date) -> date:
 
 
 def _normalize_provider_symbol(value: object) -> str | None:
-    raw = str(value or '').strip()
-    normalized = raw.zfill(6)
-    if len(normalized) != 6 or not normalized.isdigit():
-        return None
-    return normalized
+    return normalize_krx_short_code(value)
 
 
 def _normalize_expected_membership_sha256(value: object) -> str | None:
@@ -336,13 +333,11 @@ def _normalize_excluded_provider_codes(
     *,
     payload_name: str,
 ) -> list[dict[str, str]]:
-    """Validate KRX short codes intentionally outside the numeric universe.
+    """Validate legacy KRX short-code exclusions in stored repair evidence.
 
-    The strategy universe is deliberately restricted to six-digit numeric
-    stock codes.  PyKRX also returns canonical six-character short codes that
-    contain an ASCII letter (for example, preferred/security variants).  They
-    are not silently discarded: the exact market/code manifest is validated,
-    sorted, and included in the reviewed provider-payload hash.
+    Older exact repairs classified alphanumeric codes as excluded.  New
+    provider reads admit canonical alphanumeric KRX codes, but historical
+    evidence remains verifiable and must never be reinterpreted in place.
     """
 
     normalized: list[dict[str, str]] = []

@@ -6065,6 +6065,35 @@ class PykrxBackfillServiceTests(TestCase):
             limit=25,
         )
 
+    def test_market_and_active_universe_keep_canonical_alpha_symbols(self) -> None:
+        service = PykrxBackfillService()
+        frame = SimpleNamespace(
+            empty=False,
+            index=SimpleNamespace(
+                tolist=lambda: ['005930', '0010a0', 'ABC123', '12345']
+            ),
+        )
+
+        self.assertEqual(
+            service._extract_market_universe_tickers(frame),
+            ['005930', '0010A0', '012345'],
+        )
+
+        with patch(
+            'app.eod.pykrx_backfill.load_symbols',
+            return_value=[
+                {
+                    'symbol': '0010A0',
+                    'market': 'KOSPI',
+                    'name_ko': '알파종목',
+                    'standard_code': 'KRA0010A0000',
+                }
+            ],
+        ):
+            active = service.load_active_universe(markets=('KOSPI',))
+
+        self.assertEqual([item.symbol for item in active], ['0010A0'])
+
     def test_refresh_recent_universe_rejects_incomplete_snapshot_without_persisting(self) -> None:
         service = PykrxBackfillService()
         snapshot = {

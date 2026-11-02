@@ -27,6 +27,9 @@ from app.db_models import (
     DartFundamentalsSnapshot,
     Symbol,
 )
+from app.market.symbol_codes import (
+    is_canonical_krx_short_code,
+)
 from app.dart.sync_service import (
     _is_corporation_local_persistence_error,
     _is_systemic_provider_failure,
@@ -494,8 +497,7 @@ def _is_valid_audit_replacement_lineage(
             or not stored_rcept_no
             or len(stored_rcept_no) > 32
             or not isinstance(stored_stock_code, str)
-            or len(stored_stock_code) != 6
-            or not stored_stock_code.isdigit()
+            or not is_canonical_krx_short_code(stored_stock_code)
             or not isinstance(stored_receipt_date, str)
             or _canonical_audit_receipt_date(stored_receipt_date)
             != stored_receipt_date
@@ -586,8 +588,7 @@ def _is_valid_audit_exact_repair_lineage(
             or not stored_rcept_no
             or len(stored_rcept_no) > 32
             or not isinstance(stored_stock_code, str)
-            or len(stored_stock_code) != 6
-            or not stored_stock_code.isdigit()
+            or not is_canonical_krx_short_code(stored_stock_code)
             or not isinstance(stored_receipt_date, str)
             or _canonical_audit_receipt_date(stored_receipt_date)
             != stored_receipt_date
@@ -3809,6 +3810,14 @@ class DartSignalsService:
         selected_candidate_identity: Mapping[str, Any] | None = None,
         selected_candidate_market_date: date | None = None,
     ) -> ParsedAuditSignal | None:
+        stored_stock_code = event.get('stock_code')
+        if (
+            stored_stock_code not in (None, '')
+            and not is_canonical_krx_short_code(stored_stock_code)
+        ):
+            raise ValueError(
+                'DART signal event contains an invalid stock code'
+            )
         if audit_signal is None and audit_signal_evaluated:
             raise ValueError(
                 'completed audit evaluation requires an opinion signal or '

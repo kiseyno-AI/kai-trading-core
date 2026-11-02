@@ -12,6 +12,7 @@ from app.eod.pykrx_backfill import (
     AUTO_FOLLOWUP_RECOVERY_TRIGGER,
     FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
     FOLLOWUP_STAGE_PROOF_PUBLICATION_SCOPE_KEY,
+    FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY,
     PykrxBackfillService,
     _advance_followup_stage_debt_state,
     _build_followup_stage_recovery_scope_outcome,
@@ -655,7 +656,7 @@ def test_persisted_stage_debt_progress_requires_applied_run_lineage() -> None:
         eod_collection_run_id=77,
         parent_symbols=SYMBOLS,
         publication_symbols=SYMBOLS,
-    ) is not None
+    ) is None
 
 
 def test_dependency_admitted_stage_first_recovery_counts_as_progress() -> None:
@@ -682,10 +683,19 @@ def test_dependency_admitted_stage_first_recovery_counts_as_progress() -> None:
         stage_id='piotroski_filter',
         invocation_symbols=['000002'],
         stage_result=recovered,
+        recovery_pipeline_run_id=901,
     )
 
     assert advanced is not None
     assert advanced['recovery_progress_count'] == 1
+    assert advanced['proofs_by_stage']['piotroski_filter'][0][
+        FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+    ] == {
+        'schema_version': 'followup_recovery_lineage_v1',
+        'pipeline_run_id': 901,
+        'eod_collection_run_id': 77,
+        'stage_id': 'piotroski_filter',
+    }
     assert _count_nonconsuming_stage_debt_progress_runs(advanced) == 1
 
 
@@ -948,6 +958,32 @@ def test_upstream_recovery_propagates_existing_terminal_to_new_child() -> None:
         publication_symbols=SYMBOLS[:2],
         require_pending=False,
     ) is not None
+
+    wrong_eod_lineage = deepcopy(advanced)
+    wrong_eod_lineage['proofs_by_stage']['fundamentals_daily_refresh'][1][
+        FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+    ]['eod_collection_run_id'] = 78
+    assert _validated_followup_stage_debt_state(
+        wrong_eod_lineage,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=SYMBOLS[:2],
+        publication_symbols=SYMBOLS[:2],
+        require_pending=False,
+    ) is None
+
+    wrong_pipeline_run = deepcopy(advanced)
+    wrong_pipeline_run['proofs_by_stage']['fundamentals_daily_refresh'][1][
+        FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+    ]['pipeline_run_id'] = 902
+    assert _validated_followup_stage_debt_state(
+        wrong_pipeline_run,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=SYMBOLS[:2],
+        publication_symbols=SYMBOLS[:2],
+        require_pending=False,
+    ) is None
 
 
 def test_failed_all_factor_retry_rotates_to_unattempted_sibling_debt() -> None:
@@ -1271,7 +1307,16 @@ def test_failed_all_recovery_is_applied_once_per_pipeline_run_id() -> None:
         'momentum_factors': 1
     }
     assert after_first['applied_recovery_pipeline_run_ids'] == [901]
+    assert after_first['recovery_progress_count'] == 0
     assert len(after_first['proofs_by_stage']['momentum_factors']) == 1
+    assert after_first['proofs_by_stage']['momentum_factors'][0][
+        FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+    ] == {
+        'schema_version': 'followup_recovery_lineage_v1',
+        'pipeline_run_id': 901,
+        'eod_collection_run_id': 77,
+        'stage_id': 'momentum_factors',
+    }
 
     same_run_poll = resolve(after_first, 901)
     assert same_run_poll['ready'] is True

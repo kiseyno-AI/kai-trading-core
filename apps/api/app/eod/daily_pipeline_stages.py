@@ -46,7 +46,6 @@ from app.eod.summary_cutoff_contract import (
     LEGACY_CUTOFF_REPAIR_STAGE_IDS,
     SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION,
     completed_summary_scope_matches_parent,
-    normalize_symbol_codes,
     summary_cutoff_proof_from_stage,
 )
 from app.eod.master import refresh_master_if_due
@@ -100,6 +99,7 @@ from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
+from app.market.symbol_codes import normalize_krx_short_code
 from app.market_data_store import (
     DAY_BASED_TRENDING_PERIODS,
     compute_and_persist_daily_trending_ranks,
@@ -135,6 +135,28 @@ from app.signals.unified_value_factor import (
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_krx_symbol_codes(
+    values: Sequence[Any],
+) -> list[str] | None:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
+            return None
+        if stock_code in seen:
+            continue
+        seen.add(stock_code)
+        normalized.append(stock_code)
+    return normalized
+
+
+def normalize_symbol_codes(symbols: Sequence[Any]) -> list[str]:
+    """Normalize orchestration scopes without admitting malformed identities."""
+
+    return _normalize_krx_symbol_codes(symbols) or []
 
 PYKRX_PIPELINE_STAGE_ORDER: tuple[str, ...] = (
     'price_collection',
@@ -5161,10 +5183,14 @@ class DailyPipelineStageService:
         selected = result.get('selected_stock_codes')
         if not isinstance(selected, list) or invocation_symbols is None:
             return None
-        normalized_selected = normalize_symbol_codes(selected)
-        normalized_invocation = normalize_symbol_codes(invocation_symbols)
+        normalized_selected = _normalize_krx_symbol_codes(selected)
+        normalized_invocation = _normalize_krx_symbol_codes(
+            invocation_symbols
+        )
         if (
-            not normalized_selected
+            normalized_selected is None
+            or normalized_invocation is None
+            or not normalized_selected
             or len(normalized_selected) != len(selected)
             or len(normalized_invocation) != len(invocation_symbols)
             or set(normalized_selected) != set(normalized_invocation)
@@ -8779,34 +8805,43 @@ class DailyPipelineStageService:
         ):
             proof_selected = proof.get('selected_stock_codes')
             if isinstance(proof_selected, list):
-                normalized_invocation = normalize_symbol_codes(
+                normalized_invocation = _normalize_krx_symbol_codes(
                     proof_selected
                 )
-                if normalized_invocation != proof_selected:
+                if (
+                    normalized_invocation is None
+                    or normalized_invocation != proof_selected
+                ):
                     return None
                 if invocation_symbols is not None:
-                    bound_invocation = normalize_symbol_codes(
+                    bound_invocation = _normalize_krx_symbol_codes(
                         invocation_symbols
                     )
                     if (
-                        bound_invocation != list(invocation_symbols)
+                        bound_invocation is None
+                        or bound_invocation != list(invocation_symbols)
                         or bound_invocation != normalized_invocation
                     ):
                         return None
             elif invocation_symbols is not None:
-                normalized_invocation = normalize_symbol_codes(
+                normalized_invocation = _normalize_krx_symbol_codes(
                     invocation_symbols
                 )
-                if normalized_invocation != list(invocation_symbols):
+                if (
+                    normalized_invocation is None
+                    or normalized_invocation != list(invocation_symbols)
+                ):
                     return None
             else:
                 return None
-            retry_debt = normalize_symbol_codes(
+            retry_debt = _normalize_krx_symbol_codes(
                 proof.get('retry_debt_stock_codes') or []
             )
-            terminal_not_applicable = normalize_symbol_codes(
+            terminal_not_applicable = _normalize_krx_symbol_codes(
                 proof.get('terminal_not_applicable_stock_codes') or []
             )
+            if retry_debt is None or terminal_not_applicable is None:
+                return None
             retry_set = set(retry_debt)
             terminal_set = set(terminal_not_applicable)
             invocation_set = set(normalized_invocation)
@@ -8867,11 +8902,12 @@ class DailyPipelineStageService:
                 )
             )
             if finalization_stage_id is not None:
-                normalized_publication = normalize_symbol_codes(
+                normalized_publication = _normalize_krx_symbol_codes(
                     publication_symbols or []
                 )
                 if (
                     expected_market_date is None
+                    or normalized_publication is None
                     or not normalized_publication
                     or len(normalized_publication)
                     != len(publication_symbols or [])
@@ -9046,16 +9082,12 @@ class DailyPipelineStageService:
         raw_symbols = result.get('invocation_scope_stock_codes')
         if not isinstance(raw_symbols, list):
             return None
-        normalized = [
-            str(value or '').strip().zfill(6)
-            if str(value or '').strip().isdigit()
-            else str(value or '').strip()
-            for value in raw_symbols
-        ]
+        normalized = _normalize_krx_symbol_codes(raw_symbols)
         if (
-            not normalized
-            or any(not value for value in normalized)
+            normalized is None
+            or not normalized
             or len(normalized) != len(set(normalized))
+            or len(normalized) != len(raw_symbols)
         ):
             return None
         try:
@@ -9469,14 +9501,9 @@ class DailyPipelineStageService:
     def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
         if not symbols:
             return None
-        items: list[str] = []
-        seen: set[str] = set()
-        for raw_symbol in symbols:
-            symbol = str(raw_symbol or '').strip().upper()
-            if not symbol or symbol in seen:
-                continue
-            seen.add(symbol)
-            items.append(symbol)
+        items = _normalize_krx_symbol_codes(symbols)
+        if items is None:
+            return None
         return items or None
 
     def _normalize_markets(self, markets: Sequence[str] | None) -> list[str]:

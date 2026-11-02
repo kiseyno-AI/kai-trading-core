@@ -34,6 +34,7 @@ from app.eod.missing_bar_repair import (
     _missing_bar_insert_batches,
     _load_downstream_membership_manifests,
     _provider_payload_sha256,
+    _normalize_excluded_provider_codes,
     _skipped_provider_codes_sha256,
     main,
     prepare_downstream_fallback_membership_bundle,
@@ -419,19 +420,24 @@ class MissingBarProviderValidationTests(unittest.TestCase):
             values,
         )
 
-    def test_extracts_required_ohlcv_and_skips_non_numeric_codes(self):
+    def test_extracts_required_ohlcv_including_canonical_alpha_codes(self):
         frame = _FakeFrame(
             {
                 '005930': _ohlcv_row(),
                 '00104K': _ohlcv_row(),
+                'ABCDEF': _ohlcv_row(),
             }
         )
 
         bars, skipped = _extract_market_ohlcv(frame, market='KOSPI')
 
-        self.assertEqual([bar.symbol for bar in bars], ['005930'])
+        self.assertEqual(
+            [bar.symbol for bar in bars],
+            ['005930', '00104K'],
+        )
         self.assertEqual(bars[0].turnover, 105_000)
-        self.assertEqual(skipped, ['00104K'])
+        self.assertEqual(bars[1].turnover, 105_000)
+        self.assertEqual(skipped, ['ABCDEF'])
 
     def test_rejects_positive_volume_without_positive_turnover(self):
         frame = _FakeFrame(
@@ -844,91 +850,48 @@ class MissingDailyBarRepairServiceTests(unittest.TestCase):
             fallback_manifests,
         )
 
-    def test_apply_hashes_canonical_alphanumeric_code_exclusions(self):
+    def test_legacy_evidence_still_hashes_canonical_alpha_exclusions(self):
         target = date(2026, 9, 9)
         codes = {
             'KOSPI': '005930',
             'KOSDAQ': '035720',
             'KONEX': '900001',
         }
-        database_calls: list[dict] = []
-
-        def load_ohlcv(_date: str, market: str):
-            rows = {codes[market]: _ohlcv_row()}
-            if market == 'KOSPI':
-                rows['00104K'] = _ohlcv_row()
-            return _FakeFrame(rows)
-
-        service = MissingDailyBarRepairService(
-            trade_date_resolver=lambda **_kwargs: target.isoformat(),
-            market_ohlcv_loader=load_ohlcv,
-            market_fundamental_loader=lambda _date, market: _FakeFrame(
-                {codes[market]: _fundamental_row()}
-            ),
-            database_repairer=lambda **kwargs: (
-                database_calls.append(kwargs)
-                or {'status': 'completed', 'applied': True}
-            ),
-            core_api_active_checker=_core_api_inactive,
-            lock_factory=_available_lock,
-            rebuild_date_loader=lambda **_kwargs: [target],
-            minimum_market_membership={
-                'KOSPI': 1,
-                'KOSDAQ': 1,
-                'KONEX': 1,
-            },
-        )
-
-        result = service.repair_for_market_date(
-            market_date=target,
-            apply=True,
-            expected_provider_membership_count=3,
-            expected_membership_sha256=market_membership_sha256(
-                list(codes.values())
-            ),
-            expected_provider_payload_sha256=_provider_payload_sha256(
-                market_date=target,
-                bars=[
-                    MissingDailyBar(
-                        symbol=code,
-                        market=market,
-                        **{
-                            key: value
-                            for key, value in {
-                                'open_price': 100,
-                                'high_price': 110,
-                                'low_price': 90,
-                                'close_price': 105,
-                                'volume': 1_000,
-                                'turnover': 105_000,
-                                'per': Decimal('10.5'),
-                                'pbr': Decimal('1.2'),
-                                'bps': Decimal('50000'),
-                                'eps': Decimal('5000'),
-                                'dividend_yield': Decimal('2.3'),
-                                'dps': Decimal('1200'),
-                            }.items()
-                        },
-                    )
-                    for market, code in codes.items()
-                ],
-                excluded_ohlcv_codes=[
-                    {'market': 'KOSPI', 'code': '00104K'}
-                ],
-            ),
-            expected_missing_bar_count=3,
-            expected_missing_membership_sha256='0' * 64,
-        )
-
-        self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['provider_excluded_ohlcv_code_count'], 1)
-        self.assertEqual(
-            len(result['provider_excluded_ohlcv_code_sha256']),
-            64,
-        )
-        self.assertEqual(
-            database_calls[0]['excluded_ohlcv_codes'],
+        bars = [
+            MissingDailyBar(
+                symbol=code,
+                market=market,
+                open_price=100,
+                high_price=110,
+                low_price=90,
+                close_price=105,
+                volume=1_000,
+                turnover=105_000,
+                per=Decimal('10.5'),
+                pbr=Decimal('1.2'),
+                bps=Decimal('50000'),
+                eps=Decimal('5000'),
+                dividend_yield=Decimal('2.3'),
+                dps=Decimal('1200'),
+            )
+            for market, code in codes.items()
+        ]
+        legacy_exclusions = _normalize_excluded_provider_codes(
             [{'market': 'KOSPI', 'code': '00104K'}],
+            payload_name='stored repair evidence',
+        )
+
+        self.assertEqual(
+            legacy_exclusions,
+            [{'market': 'KOSPI', 'code': '00104K'}],
+        )
+        self.assertNotEqual(
+            _provider_payload_sha256(
+                market_date=target,
+                bars=bars,
+                excluded_ohlcv_codes=legacy_exclusions,
+            ),
+            _provider_payload_sha256(market_date=target, bars=bars),
         )
 
     def test_malformed_provider_code_still_blocks_repair(self):
@@ -1136,8 +1099,8 @@ class MissingDailyBarRepairServiceTests(unittest.TestCase):
             'KOSPI': _FakeFrame(
                 {
                     '005930': _fundamental_row(),
+                    '00104K': _fundamental_row(),
                     '123456': _fundamental_row(),
-                    '1234A6': _fundamental_row(),
                 }
             ),
             'KOSDAQ': _FakeFrame({'035720': _fundamental_row()}),
@@ -1158,6 +1121,7 @@ class MissingDailyBarRepairServiceTests(unittest.TestCase):
             security_group_loader=lambda: {
                 '005930': 'ST',
                 '000660': 'RT',
+                '00104K': 'ST',
                 '035720': 'ST',
                 '900001': 'ST',
             },
@@ -1171,8 +1135,8 @@ class MissingDailyBarRepairServiceTests(unittest.TestCase):
 
         result = service.repair_for_market_date(market_date='20260909')
 
-        self.assertEqual(result['provider_excluded_ohlcv_code_count'], 1)
-        self.assertEqual(result['provider_excluded_fundamental_code_count'], 1)
+        self.assertEqual(result['provider_excluded_ohlcv_code_count'], 0)
+        self.assertEqual(result['provider_excluded_fundamental_code_count'], 0)
         self.assertEqual(result['provider_missing_fundamental_count'], 1)
         self.assertEqual(
             result['provider_missing_fundamental_symbols'],
@@ -1187,6 +1151,7 @@ class MissingDailyBarRepairServiceTests(unittest.TestCase):
             bar.symbol: bar for bar in database_calls[0]['bars']
         }
         self.assertIsNone(bars_by_symbol['000660'].per)
+        self.assertEqual(bars_by_symbol['00104K'].per, Decimal('10.5'))
 
     def test_missing_fundamental_row_for_stock_blocks_repair(self):
         frames = {

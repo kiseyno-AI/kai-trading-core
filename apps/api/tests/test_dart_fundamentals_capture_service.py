@@ -10,7 +10,11 @@ from app.dart.fundamentals_capture_service import (
     DartFundamentalsProgressCallbackError,
     DartFundamentalsCaptureService as _DartFundamentalsCaptureService,
     _bounded_missing_probe_codes,
+    _exact_reusable_fundamentals_scope_outcome,
+    _load_active_symbols,
     _load_share_issuance_activation_audit,
+    _normalize_active_universe_stock_codes,
+    _normalize_exact_stock_code_manifest,
     build_row_payloads,
     infer_fundamentals_request,
     legacy_cfs_recovery_candidate_manifest_sha256,
@@ -126,6 +130,60 @@ def test_bounded_missing_probe_rotates_by_batch_without_daily_starvation() -> No
     assert first == same_day
     assert len(first) == 100
     assert set(first).isdisjoint(next_day)
+
+
+def test_fundamentals_stock_code_manifests_support_canonical_alpha_codes() -> None:
+    assert _normalize_exact_stock_code_manifest(
+        ['00088k', '5930', '00088K']
+    ) == ['00088K', '005930']
+    assert _normalize_active_universe_stock_codes(
+        [{'symbol': '00088K'}, {'symbol': '5930'}]
+    ) == ['00088K', '005930']
+
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        'invalid stock code',
+    ):
+        _normalize_exact_stock_code_manifest(['ABC123'])
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        'invalid stock code',
+    ):
+        _normalize_active_universe_stock_codes([{'symbol': 'ABC123'}])
+
+
+def test_active_symbol_loader_keeps_only_canonical_krx_scope() -> None:
+    rows = [
+        {'symbol': '005930', 'market': 'KOSPI'},
+        {'symbol': '0010A0', 'market': 'KOSDAQ'},
+        {'symbol': 'AAPL', 'market': 'NASDAQ'},
+        {'symbol': 'TQF2601', 'market': 'KOSPI'},
+    ]
+
+    with patch(
+        'app.dart.fundamentals_capture_service.load_symbols',
+        return_value=rows,
+    ) as loader:
+        assert _load_active_symbols() == rows[:2]
+
+    loader.assert_called_once_with(
+        is_active=True,
+        markets=['KOSPI', 'KOSDAQ', 'KONEX', 'KRX'],
+    )
+
+
+def test_reusable_fundamentals_scope_accepts_alpha_and_rejects_malformed_codes() -> None:
+    scope = _exact_fundamentals_scope_outcome(['00088K'])
+    assert _exact_reusable_fundamentals_scope_outcome(
+        {'fundamentals_scope_outcome': scope},
+        selected_stock_codes=['00088K'],
+    ) == scope
+
+    malformed = _exact_fundamentals_scope_outcome(['ABC123'])
+    assert _exact_reusable_fundamentals_scope_outcome(
+        {'fundamentals_scope_outcome': malformed},
+        selected_stock_codes=['ABC123'],
+    ) is None
 
 
 class FakeCaptureClient:
@@ -628,6 +686,33 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             error['mapping_authority']['source'],
             'persistent_fallback',
+        )
+
+    async def test_corp_mapping_canonicalizes_alpha_stock_code(self):
+        calls = []
+
+        class AlphaClient:
+            async def has_supported_stock_code(self, stock_code):
+                calls.append(('supported', stock_code))
+                return True
+
+            async def lookup_corp_code(self, *, stock_code):
+                calls.append(('lookup', stock_code))
+                return {
+                    'corp_code': '00126380',
+                    'corp_name': 'Alpha Corp',
+                }
+
+        corp, error = await resolve_supported_dart_corp_record(
+            AlphaClient(),
+            stock_code='00088k',
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corp['stock_code'], '00088K')
+        self.assertEqual(
+            calls,
+            [('supported', '00088K'), ('lookup', '00088K')],
         )
 
     async def test_global_activation_failure_stops_before_current_universe_work(self):

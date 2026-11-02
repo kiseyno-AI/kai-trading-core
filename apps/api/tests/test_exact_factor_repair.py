@@ -23,6 +23,7 @@ from app.eod.exact_factor_repair import (
     FACTOR_RESULT_MODELS,
     MEMBERSHIP_POLICY_STORED_ONLY,
     ExactFactorRepairService,
+    _extract_exact_market_membership,
     prune_stale_factor_rows,
     verify_exact_factor_rows,
 )
@@ -56,6 +57,19 @@ def _membership_by_market() -> dict[str, list[str]]:
     }
 
 
+def test_provider_membership_includes_alpha_and_rejects_malformed_codes() -> None:
+    numeric_symbols = [f'{value:06d}' for value in range(700)]
+    symbols, rejected = _extract_exact_market_membership(
+        _Frame([*numeric_symbols, '0010A0', 'ABC123']),
+        market='KOSPI',
+    )
+
+    assert len(symbols) == 701
+    assert '0010A0' in symbols
+    assert 'ABC123' not in symbols
+    assert rejected == ['ABC123']
+
+
 @contextmanager
 def _acquired_lock(**_kwargs):
     yield True
@@ -71,7 +85,6 @@ def _service(
     exact_symbols = sorted(
         symbol
         for symbol in membership['KOSPI'] + membership['KOSDAQ']
-        if symbol.isdigit() and len(symbol) == 6
     )
     calls = apply_results if apply_results is not None else []
 
@@ -145,7 +158,7 @@ def _service(
 
 
 def _pinned_membership(exact_symbols: list[str]) -> dict[str, object]:
-    provider_membership = [*exact_symbols, '00104K']
+    provider_membership = list(exact_symbols)
     return {
         'expected_provider_membership_count': len(provider_membership),
         'expected_membership_sha256': market_membership_sha256(
@@ -160,11 +173,11 @@ def _pending_missing_bar_membership_proof(
     membership = _membership_by_market()
     return {
         'symbols_by_market': {
-            market: [symbol for symbol in symbols if symbol.isdigit()]
+            market: list(symbols)
             for market, symbols in membership.items()
         },
         'protected_provider_codes_by_market': {
-            'KOSPI': ['00104K'],
+            'KOSPI': [],
             'KOSDAQ': [],
         },
         'membership_evidence_source': (
@@ -372,7 +385,6 @@ def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
     service.pending_membership_evidence_resolver = resolve_pending
     service.price_bar_symbols_loader = lambda _date: [
         *exact_symbols,
-        '00104K',
         '999999',
     ]
     service.stale_details_loader = stale_details
@@ -388,7 +400,7 @@ def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
         membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
     )
 
-    provider_membership = [*exact_symbols, '00104K']
+    provider_membership = list(exact_symbols)
     apply_kwargs = {
         'market_date': '2026-09-23',
         'apply': True,
@@ -420,7 +432,7 @@ def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
     assert dry_result['membership_evidence_repair_batch_ids'] == [
         'missing-bar-authority'
     ]
-    assert dry_result['provider_excluded_from_ranking_codes'] == ['00104K']
+    assert dry_result['provider_excluded_from_ranking_codes'] == []
     assert mismatched['status'] == 'blocked'
     assert mismatched['reason'] == 'expected_membership_lineage_mismatch'
     assert stage_calls == []
@@ -434,7 +446,7 @@ def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
 
     assert applied['status'] == 'completed'
     assert len(stage_calls) == len(FACTOR_RESULT_MODELS)
-    assert prune_calls[0]['protected_symbols'] == ['00104K']
+    assert prune_calls[0]['protected_symbols'] == []
     assert completion_calls[0]['membership_evidence_source'] == (
         PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
     )
@@ -445,9 +457,7 @@ def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
         'membership_evidence_repair_batch_ids'
     ] == ['missing-bar-authority']
     assert len(resolver_calls) == 3
-    assert all(
-        call['protected_symbols'] == ['00104K'] for call in stale_calls
-    )
+    assert all(call['protected_symbols'] == [] for call in stale_calls)
 
 
 def test_stored_fallback_skips_newer_unsuitable_retry_for_latest_valid_run() -> None:
@@ -688,16 +698,14 @@ def test_dry_run_discloses_exact_scope_and_never_runs_factor_stage() -> None:
     assert result['applied'] is False
     assert result['exact_membership_count'] == len(exact_symbols)
     assert result['stale_outside_membership_price_bar_count'] == 1
-    assert result['exact_provider_membership_count'] == len(exact_symbols) + 1
-    assert result['provider_excluded_from_ranking_count'] == 1
-    assert result['provider_excluded_from_ranking_codes'] == ['00104K']
+    assert result['exact_provider_membership_count'] == len(exact_symbols)
+    assert result['provider_excluded_from_ranking_count'] == 0
+    assert result['provider_excluded_from_ranking_codes'] == []
     assert result['provider_excluded_from_ranking_counts_by_market'] == {
-        'KOSPI': 1,
+        'KOSPI': 0,
         'KOSDAQ': 0,
     }
-    assert result['provider_excluded_from_ranking_preview'] == [
-        {'market': 'KOSPI', 'code': '00104K'}
-    ]
+    assert result['provider_excluded_from_ranking_preview'] == []
     assert result['stale_outside_membership_counts'] == {
         stage_id: 7 for stage_id in FACTOR_RESULT_MODELS
     }
@@ -867,7 +875,7 @@ def test_prune_runs_only_after_all_exact_stages_succeed() -> None:
     assert len(stage_calls) == len(FACTOR_RESULT_MODELS)
     assert len(prune_calls) == 1
     assert prune_calls[0]['exact_symbols'] == exact_symbols
-    assert prune_calls[0]['protected_symbols'] == ['00104K']
+    assert prune_calls[0]['protected_symbols'] == []
     assert prune_calls[0]['expected_stale_counts'] == {
         stage_id: 7 for stage_id in FACTOR_RESULT_MODELS
     }

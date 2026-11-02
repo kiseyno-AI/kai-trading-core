@@ -23,6 +23,7 @@ from app.eod.exact_signal_feature_repair import (
     ExactSignalFeatureRepair,
     _build_parser,
     _load_completion_state,
+    _normalize_symbols,
     prune_stale_signal_feature_rows,
     verify_exact_signal_feature_rows,
 )
@@ -36,6 +37,12 @@ from app.internal.exact_repair_manifest import (
 SYMBOLS = ['000660', '005930']
 MARKET_DATE = '2026-10-28'
 REPAIR_STARTED_AT = datetime(2026, 10, 29, tzinfo=timezone.utc)
+
+
+def test_scope_normalization_accepts_alpha_and_rejects_malformed_symbols() -> None:
+    assert _normalize_symbols(['005930', '0010a0']) == ['0010A0', '005930']
+    with pytest.raises(ValueError, match='invalid symbol'):
+        _normalize_symbols(['ABC123'])
 
 
 def _manifest(*, symbols=None, market_date=MARKET_DATE):

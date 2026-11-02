@@ -658,7 +658,7 @@ class DailyTurnoverRepairServiceTests(unittest.TestCase):
         self.assertEqual(result['observed_symbol_count'], 10)
         self.assertEqual(result['minimum_symbol_count'], 1200)
 
-    def test_mixed_alpha_code_is_skipped_and_reported(self):
+    def test_canonical_alpha_code_is_included_in_repair_scope(self):
         patch_calls: list[dict] = []
         values = {
             f'{symbol:06d}': 100
@@ -684,20 +684,51 @@ class DailyTurnoverRepairServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result['status'], 'ready')
-        self.assertEqual(result['market_symbol_counts'], {'KOSPI': 700})
+        self.assertEqual(result['market_symbol_counts'], {'KOSPI': 701})
+        self.assertEqual(result['provider_skipped_code_count'], 0)
+        self.assertEqual(result['provider_skipped_code_preview'], [])
+        self.assertEqual(
+            result['provider_skipped_code_counts_by_market'],
+            {'KOSPI': 0},
+        )
+        self.assertEqual(len(patch_calls), 1)
+        self.assertEqual(len(patch_calls[0]['expected_symbols']), 701)
+        self.assertIn('00104K', patch_calls[0]['expected_symbols'])
+        self.assertEqual(
+            patch_calls[0]['turnover_by_symbol']['00104K'],
+            999,
+        )
+
+    def test_malformed_provider_code_is_rejected_from_scope_and_reported(self):
+        patch_calls: list[dict] = []
+        values = {
+            f'{symbol:06d}': 100
+            for symbol in range(100_000, 100_700)
+        }
+        values['ABCDEF'] = 999
+        service = DailyTurnoverRepairService(
+            trade_date_resolver=lambda **_kwargs: '2026-08-18',
+            market_ohlcv_loader=lambda *_args: _FakeFrame(values),
+            turnover_patcher=lambda **kwargs: (
+                patch_calls.append(kwargs)
+                or {'status': 'ready', 'applied': False}
+            ),
+            lock_factory=_available_lock,
+        )
+
+        result = service.repair_for_market_date(
+            market_date='2026-08-18',
+            markets=['KOSPI'],
+            apply=False,
+        )
+
         self.assertEqual(result['provider_skipped_code_count'], 1)
         self.assertEqual(
             result['provider_skipped_code_preview'],
-            [{'market': 'KOSPI', 'code': '00104K'}],
+            [{'market': 'KOSPI', 'code': 'ABCDEF'}],
         )
-        self.assertEqual(
-            result['provider_skipped_code_counts_by_market'],
-            {'KOSPI': 1},
-        )
-        self.assertEqual(len(patch_calls), 1)
-        self.assertEqual(len(patch_calls[0]['expected_symbols']), 700)
-        self.assertNotIn('00104K', patch_calls[0]['expected_symbols'])
-        self.assertNotIn('00104K', patch_calls[0]['turnover_by_symbol'])
+        self.assertNotIn('ABCDEF', patch_calls[0]['expected_symbols'])
+        self.assertNotIn('ABCDEF', patch_calls[0]['turnover_by_symbol'])
 
     def test_konex_market_is_rejected(self):
         service = DailyTurnoverRepairService(

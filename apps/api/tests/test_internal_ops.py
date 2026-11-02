@@ -485,25 +485,31 @@ class InternalOpsTests(unittest.TestCase):
                 new=AsyncMock(
                     return_value={
                         'status': 'partial',
-                        'selected_stock_codes': ['005930', '000660'],
+                        'selected_stock_codes': ['005930', '000660', '0010A0'],
                         'successful_stock_codes': ['005930'],
-                        'retry_debt_stock_codes': ['000660'],
+                        'retry_debt_stock_codes': ['000660', '0010A0'],
                     }
                 ),
             ) as run_daily,
         ):
             result = ops.run_dart_fundamentals_daily_if_due(
                 market_date='2026-10-30',
-                symbols='005930, 000660,005930',
+                symbols='005930, 000660,0010a0,005930',
                 capture_limit=20,
             )
 
         bootstrap_runtime.assert_called_once_with()
-        self.assertEqual(result['selected_stock_codes'], ['005930', '000660'])
-        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertEqual(
+            result['selected_stock_codes'],
+            ['005930', '000660', '0010A0'],
+        )
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['000660', '0010A0'],
+        )
         self.assertEqual(
             run_daily.call_args.kwargs['symbols'],
-            ['005930', '000660'],
+            ['005930', '000660', '0010A0'],
         )
         self.assertIsNone(run_daily.call_args.kwargs['symbol_limit'])
         self.assertEqual(run_daily.call_args.kwargs['symbol_offset'], 0)

@@ -43,6 +43,7 @@ from app.internal.exact_repair_manifest import (
     load_json_mapping,
     write_checkpoint,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_lock
 
 
@@ -85,8 +86,10 @@ _AUDIT_CONTENT_FIELDS = (
 
 def _validate_stock_code(value: Any) -> str:
     stock_code = str(value or '').strip()
-    if len(stock_code) != 6 or not stock_code.isdigit():
-        raise ValueError('stock_code must contain exactly six digits')
+    if not is_canonical_krx_short_code(stock_code):
+        raise ValueError(
+            'stock_code must be a canonical six-character KRX short code'
+        )
     return stock_code
 
 

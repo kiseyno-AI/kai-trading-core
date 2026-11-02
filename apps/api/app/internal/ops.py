@@ -87,6 +87,7 @@ from app.external_news.service import external_news_service
 from app.internal.deploy_hygiene import collect_schema_drift_preflight
 from app.market.clock import get_market_state
 from app.market.kis_intraday_snapshots import KIS_INTRADAY_SNAPSHOT_SOURCE, kis_intraday_snapshot_service
+from app.market.symbol_codes import normalize_krx_short_code
 from app.market_data_store import (
     compute_and_persist_daily_trending_ranks,
     load_tracked_symbols,
@@ -284,12 +285,11 @@ def run_dart_fundamentals_daily_if_due(
             )
         parsed_symbols = []
         for value in symbols.split(','):
-            stock_code = value.strip()
-            if not stock_code or not stock_code.isdigit() or len(stock_code) > 6:
+            normalized_stock_code = normalize_krx_short_code(value)
+            if normalized_stock_code is None:
                 raise ValueError(
-                    '--symbols must contain comma-separated stock codes of 1 to 6 digits'
+                    '--symbols must contain comma-separated canonical KRX short codes'
                 )
-            normalized_stock_code = stock_code.zfill(6)
             if normalized_stock_code not in parsed_symbols:
                 parsed_symbols.append(normalized_stock_code)
 
@@ -339,12 +339,12 @@ def _normalize_dart_share_issuance_stock_codes(
 ) -> list[str]:
     normalized: set[str] = set()
     for value in values:
-        stock_code = str(value or '').strip()
-        if not stock_code or not stock_code.isdigit() or len(stock_code) > 6:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
             raise ValueError(
-                'DART share-issuance stock codes must contain 1 to 6 digits'
+                'DART share-issuance stock codes must be canonical KRX short codes'
             )
-        normalized.add(stock_code.zfill(6))
+        normalized.add(stock_code)
     return sorted(normalized)
 
 
@@ -1039,10 +1039,7 @@ async def _backfill_dart_share_issuance_evidence_async(
         mapping_result = {}
 
     def normalize_mapping_stock_code(value: Any) -> str:
-        normalized = str(value or '').strip()
-        if not normalized.isdigit() or len(normalized) > 6:
-            return ''
-        return normalized.zfill(6)
+        return normalize_krx_short_code(value) or ''
 
     requested_stock_code_set = set(requested_stock_codes)
     resolved_by_stock: dict[str, list[dict[str, Any]]] = {}

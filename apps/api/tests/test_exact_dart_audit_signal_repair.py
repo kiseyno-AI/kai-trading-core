@@ -18,6 +18,7 @@ from app.dart.exact_audit_signal_repair import (
     MANIFEST_SCHEMA_VERSION,
     _audit_batch_idle_transaction_timeout_ms,
     exact_dart_audit_batch_guard,
+    normalize_manifest,
 )
 from app.dart.signals_service import dart_signals_service
 from app.dart.signals_service import (
@@ -367,6 +368,17 @@ class ExactDartAuditSignalRepairTests(unittest.IsolatedAsyncioTestCase):
                         replacement_for=shared_target,
                     ),
                 )
+            )
+
+    def test_manifest_accepts_canonical_alpha_and_rejects_malformed_code(self):
+        normalized = normalize_manifest(
+            _manifest(_entry('00088K', 100, '20260301000000'))
+        )
+
+        self.assertEqual(normalized['entries'][0]['stock_code'], '00088K')
+        with self.assertRaisesRegex(ValueError, 'canonical six-character'):
+            normalize_manifest(
+                _manifest(_entry('ABC123', 100, '20260301000000'))
             )
 
     async def test_entry_capture_is_bounded_by_the_guard_timeout_budget(self):

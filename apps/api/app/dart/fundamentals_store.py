@@ -18,6 +18,7 @@ from app.db_models import (
     DartFundamentalsSnapshot,
 )
 from app.dart.service import classify_disclosure_event
+from app.market.symbol_codes import is_canonical_krx_short_code
 
 
 CAPTURE_STATUS_PENDING = 'pending'
@@ -118,9 +119,7 @@ def legacy_cfs_recovery_candidate_identity(
     stock_code = text_values['stock_code']
     snapshot_stock_code = text_values['legacy_snapshot_stock_code']
     if (
-        len(stock_code) != 6
-        or not stock_code.isascii()
-        or not stock_code.isdigit()
+        not is_canonical_krx_short_code(stock_code)
         or snapshot_stock_code != stock_code
     ):
         raise ValueError(

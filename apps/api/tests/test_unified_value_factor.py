@@ -703,7 +703,7 @@ class DailyUnifiedValueFactorPersistenceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = DailyUnifiedValueFactorService()
         self.market_date = date(2026, 4, 24)
-        self.symbols = ['TUV2601', 'TUV2602', 'TUV2603']
+        self.symbols = ['9262U1', '9262U2', '9262U3']
 
     def tearDown(self) -> None:
         with session_scope() as session:

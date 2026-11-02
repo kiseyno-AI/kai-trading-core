@@ -270,7 +270,7 @@ class DailyBetaFactorPersistenceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = DailyBetaFactorService()
         self.market_date = date(2026, 4, 23)
-        self.symbols = ['TB1591', 'TB1592', 'TB1593']
+        self.symbols = ['9159B1', '9159B2', '9159B3']
 
     def tearDown(self) -> None:
         with session_scope() as session:

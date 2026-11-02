@@ -64,6 +64,7 @@ from app.eod.market_membership import (
     validate_market_membership_snapshot,
 )
 from app.market.clock import MarketState
+from app.market.symbol_codes import normalize_krx_short_code
 from app.repositories.eod_run_repository import (
     advisory_eod_collection_lock,
     advisory_eod_collection_locks,
@@ -972,10 +973,8 @@ def persist_daily_price_bars(
 
 
 def _normalize_turnover_repair_symbol(value: object) -> str:
-    symbol = str(value or '').strip().upper()
-    if symbol.isdigit():
-        symbol = symbol.zfill(6)
-    if not symbol or not symbol.isdigit() or len(symbol) != 6:
+    symbol = normalize_krx_short_code(value)
+    if symbol is None:
         raise ValueError(f'invalid KRX turnover-repair symbol: {value!r}')
     return symbol
 

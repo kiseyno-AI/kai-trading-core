@@ -42,6 +42,7 @@ from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_recent_price_bars_by_symbol,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.signals.daily_signal_features import daily_signal_feature_service
 
 
@@ -83,7 +84,7 @@ def _normalize_symbols(values: Sequence[str]) -> list[str]:
             if str(value).strip()
         }
     )
-    if any(len(symbol) != 6 or not symbol.isdigit() for symbol in symbols):
+    if any(not is_canonical_krx_short_code(symbol) for symbol in symbols):
         raise ValueError('signal-feature repair scope contains an invalid symbol')
     return symbols
 

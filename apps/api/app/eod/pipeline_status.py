@@ -85,6 +85,7 @@ from app.external_news.classifier import (
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
+from app.market.symbol_codes import normalize_krx_short_code
 from app.market_data_store import (
     DAY_BASED_TRENDING_PERIODS,
     count_daily_action_summaries_for_live_symbols,
@@ -746,7 +747,22 @@ def _load_row_count_stage_scope_gap(
         stage_id,
         (model,) if model is not None else (),
     )
-    normalized_symbols = [str(symbol or '').strip().upper() for symbol in symbols if str(symbol or '').strip()]
+    normalized_candidates = [
+        normalize_krx_short_code(symbol) for symbol in symbols
+    ]
+    if any(symbol is None for symbol in normalized_candidates):
+        return {
+            'evidence_version': 'row_count_scope_gap_v1',
+            'authoritative': False,
+            'requested_count': len(symbols),
+            'present_count': 0,
+            'missing_count': len(symbols),
+            'missing_symbols_sample': [],
+            'missing_symbol_details_sample': [],
+        }
+    normalized_symbols = [
+        str(symbol) for symbol in normalized_candidates
+    ]
     if model is None or not normalized_symbols:
         return {
             'evidence_version': 'row_count_scope_gap_v1',
@@ -4815,7 +4831,9 @@ class EODPipelineStatusService:
                 if not isinstance(item, dict):
                     manifest_valid = False
                     break
-                stock_code = str(item.get('stock_code') or '').strip().upper()
+                stock_code = normalize_krx_short_code(
+                    item.get('stock_code')
+                )
                 outcome = str(item.get('outcome') or '').strip().lower()
                 if (
                     not stock_code
@@ -5834,8 +5852,8 @@ class EODPipelineStatusService:
         normalized: list[str] = []
         seen: set[str] = set()
         for item in value:
-            symbol = str(item or '').strip().upper()
-            if not symbol or symbol in seen:
+            symbol = normalize_krx_short_code(item)
+            if symbol is None or symbol in seen:
                 continue
             seen.add(symbol)
             normalized.append(symbol)

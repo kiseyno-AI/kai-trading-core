@@ -47,6 +47,7 @@ from app.market_data_store import (
     build_daily_derived_market_scope_authority,
     list_symbols_with_daily_bar_on_date,
 )
+from app.market.symbol_codes import normalize_krx_short_code
 from app.repositories.eod_run_repository import list_eod_collection_runs
 from app.signals.advanced_value_factor import (
     daily_advanced_value_factor_service,
@@ -107,11 +108,7 @@ def _normalize_market_date(value: str | date) -> date:
 
 
 def _normalize_provider_symbol(value: object) -> str | None:
-    raw = str(value or '').strip().upper()
-    symbol = raw.zfill(6)
-    if len(symbol) != 6 or not symbol.isdigit():
-        return None
-    return symbol
+    return normalize_krx_short_code(value)
 
 
 def _extract_exact_market_membership(

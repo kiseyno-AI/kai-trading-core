@@ -45,6 +45,7 @@ from app.dart.signals_service import (
     dart_signals_service,
 )
 from app.integrations.dart.client import DartClient, dart_client
+from app.market.symbol_codes import normalize_krx_short_code
 from app.market_data_store import load_symbols
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 from sqlalchemy import func, select
@@ -112,17 +113,11 @@ def _normalize_exact_stock_code_manifest(
     normalized: list[str] = []
     seen: set[str] = set()
     for value in stock_codes:
-        stock_code = str(value or '').strip()
-        if (
-            not stock_code
-            or not stock_code.isascii()
-            or not stock_code.isdigit()
-            or len(stock_code) > 6
-        ):
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
             raise ValueError(
                 'targeted fundamentals backfill contains an invalid stock code'
             )
-        stock_code = stock_code.zfill(6)
         if stock_code not in seen:
             seen.add(stock_code)
             normalized.append(stock_code)
@@ -141,6 +136,20 @@ def _stock_code_manifest_sha256(stock_codes: Sequence[str]) -> str:
             separators=(',', ':'),
         ).encode('utf-8')
     ).hexdigest()
+
+
+def _validated_stock_code_sequence(values: Any) -> list[str] | None:
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        return None
+    normalized: list[str] = []
+    for value in values:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
+            return None
+        normalized.append(stock_code)
+    return normalized
 
 
 def legacy_cfs_recovery_candidate_manifest(
@@ -241,34 +250,28 @@ def _exact_reusable_fundamentals_scope_outcome(
     ):
         return None
 
-    requested_scope = [
-        str(stock_code or '').strip().zfill(6)
-        for stock_code in selected_stock_codes
-        if str(stock_code or '').strip()
-    ]
-    stored_scope = [
-        str(stock_code or '').strip().zfill(6)
-        for stock_code in raw_outcome.get('selected_stock_codes') or []
-        if str(stock_code or '').strip()
-    ]
+    requested_scope = _validated_stock_code_sequence(selected_stock_codes)
+    stored_scope = _validated_stock_code_sequence(
+        raw_outcome.get('selected_stock_codes')
+    )
     if (
-        stored_scope != requested_scope
+        requested_scope is None
+        or stored_scope is None
+        or stored_scope != requested_scope
         or len(stored_scope) != len(set(stored_scope))
     ):
         return None
 
-    successful = [
-        str(stock_code or '').strip().zfill(6)
-        for stock_code in raw_outcome.get('successful_stock_codes') or []
-        if str(stock_code or '').strip()
-    ]
-    retry_debt = [
-        str(stock_code or '').strip().zfill(6)
-        for stock_code in raw_outcome.get('retry_debt_stock_codes') or []
-        if str(stock_code or '').strip()
-    ]
+    successful = _validated_stock_code_sequence(
+        raw_outcome.get('successful_stock_codes')
+    )
+    retry_debt = _validated_stock_code_sequence(
+        raw_outcome.get('retry_debt_stock_codes')
+    )
     if (
-        len(successful) != len(set(successful))
+        successful is None
+        or retry_debt is None
+        or len(successful) != len(set(successful))
         or len(retry_debt) != len(set(retry_debt))
         or bool(retry_debt)
         or set(successful) & set(retry_debt)
@@ -285,10 +288,9 @@ def _exact_reusable_fundamentals_scope_outcome(
     for item in raw_manifest:
         if not isinstance(item, dict):
             return None
-        raw_stock_code = str(item.get('stock_code') or '').strip()
-        if not raw_stock_code:
+        stock_code = normalize_krx_short_code(item.get('stock_code'))
+        if stock_code is None:
             return None
-        stock_code = raw_stock_code.zfill(6)
         outcome = str(item.get('outcome') or '').strip().lower()
         if (
             stock_code in manifest_outcomes
@@ -610,7 +612,9 @@ async def resolve_supported_dart_corp_record(
     *,
     stock_code: str,
 ) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
-    normalized_stock_code = stock_code.strip().zfill(6)
+    normalized_stock_code = normalize_krx_short_code(stock_code)
+    if normalized_stock_code is None:
+        raise ValueError('DART corporation mapping contains an invalid stock code')
     try:
         is_supported = await client.has_supported_stock_code(normalized_stock_code)
     except Exception:
@@ -669,7 +673,15 @@ async def resolve_supported_dart_corp_record(
 
 
 def _load_active_symbols() -> list[dict[str, Any]]:
-    return [item for item in load_symbols(is_active=True) if (item.get('symbol') or '').strip().isdigit()]
+    rows = load_symbols(
+        is_active=True,
+        markets=['KOSPI', 'KOSDAQ', 'KONEX', 'KRX'],
+    )
+    return [
+        item
+        for item in rows
+        if normalize_krx_short_code(item.get('symbol')) is not None
+    ]
 
 
 def _normalize_active_universe_stock_codes(
@@ -677,16 +689,12 @@ def _normalize_active_universe_stock_codes(
 ) -> list[str]:
     normalized: set[str] = set()
     for item in active_symbols:
-        raw_stock_code = str(item.get('symbol') or '').strip()
-        if (
-            not raw_stock_code
-            or not raw_stock_code.isdigit()
-            or len(raw_stock_code) > 6
-        ):
+        stock_code = normalize_krx_short_code(item.get('symbol'))
+        if stock_code is None:
             raise ValueError(
                 'active universe contains an invalid stock code'
             )
-        normalized.add(raw_stock_code.zfill(6))
+        normalized.add(stock_code)
     if not normalized:
         raise ValueError('active universe stock-code manifest is empty')
     return sorted(normalized)
@@ -2032,11 +2040,11 @@ class DartFundamentalsCaptureService:
                 stock_codes
             )
 
-            active_symbols_by_stock_code = {
-                str(item.get('symbol') or '').strip().zfill(6): item
-                for item in active_symbols
-                if str(item.get('symbol') or '').strip()
-            }
+            active_symbols_by_stock_code = {}
+            for item in active_symbols:
+                stock_code = normalize_krx_short_code(item.get('symbol'))
+                if stock_code is not None:
+                    active_symbols_by_stock_code[stock_code] = item
             inactive_or_unknown = [
                 stock_code
                 for stock_code in requested_stock_codes
@@ -2059,7 +2067,11 @@ class DartFundamentalsCaptureService:
         symbol_lookup_errors: list[dict[str, str]] = []
 
         for symbol in selected_symbols:
-            stock_code = (symbol.get('symbol') or '').strip().zfill(6)
+            stock_code = normalize_krx_short_code(symbol.get('symbol'))
+            if stock_code is None:
+                raise ValueError(
+                    'active universe contains an invalid stock code'
+                )
             corp_record, lookup_error = await resolve_supported_dart_corp_record(self.client, stock_code=stock_code)
             if corp_record is not None:
                 corp_records.append(corp_record)
@@ -2318,23 +2330,22 @@ class DartFundamentalsCaptureService:
             active_symbols
         )
         upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
-        selected_stock_codes = (
-            list(
-                dict.fromkeys(
-                    str(value or '').strip().zfill(6)
-                    for value in symbols
-                    if str(value or '').strip()
-                )
-            )
-            if symbols is not None
-            else list(
-                dict.fromkeys(
-                    str(item.get('symbol') or '').strip().zfill(6)
+        selected_stock_codes = _validated_stock_code_sequence(
+            (
+                symbols
+                if symbols is not None
+                else [
+                    item.get('symbol')
                     for item in active_symbols[symbol_offset:upper_bound]
                     if str(item.get('symbol') or '').strip()
-                )
+                ]
             )
         )
+        if selected_stock_codes is None:
+            raise ValueError(
+                'daily fundamentals refresh contains an invalid stock code'
+            )
+        selected_stock_codes = list(dict.fromkeys(selected_stock_codes))
         mapping_error: str | None = None
         try:
             mapping_result = await self.client.lookup_corp_codes_for_stocks(
@@ -3051,26 +3062,27 @@ class DartFundamentalsCaptureService:
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         active_symbols = self.active_symbol_loader()
         upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
-        symbol_rows_by_code = {
-            str(symbol.get('symbol') or '').strip().zfill(6): symbol
-            for symbol in active_symbols
-            if (symbol.get('symbol') or '').strip()
-        }
-        selected_stock_codes = (
-            list(
-                dict.fromkeys(
-                    str(value or '').strip().zfill(6)
-                    for value in symbols
-                    if str(value or '').strip()
-                )
+        symbol_rows_by_code = {}
+        for symbol in active_symbols:
+            stock_code = normalize_krx_short_code(symbol.get('symbol'))
+            if stock_code is not None:
+                symbol_rows_by_code[stock_code] = symbol
+        selected_stock_codes = _validated_stock_code_sequence(
+            (
+                symbols
+                if symbols is not None
+                else [
+                    symbol.get('symbol')
+                    for symbol in active_symbols[symbol_offset:upper_bound]
+                    if str(symbol.get('symbol') or '').strip()
+                ]
             )
-            if symbols is not None
-            else [
-                (symbol.get('symbol') or '').strip().zfill(6)
-                for symbol in active_symbols[symbol_offset:upper_bound]
-                if (symbol.get('symbol') or '').strip()
-            ]
         )
+        if selected_stock_codes is None:
+            raise ValueError(
+                'daily fundamentals refresh contains an invalid stock code'
+            )
+        selected_stock_codes = list(dict.fromkeys(selected_stock_codes))
         stale_refresh_run_ids = self._fail_stale_refresh_runs(
             error_message='Marked failed after exceeding the stale running threshold before a new daily refresh started'
         )

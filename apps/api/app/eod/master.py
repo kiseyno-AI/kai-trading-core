@@ -14,6 +14,7 @@ from app.core.audit_logging import download_bytes_with_audit
 from app.eod.master_state import master_refresh_state
 from app.market_data_store import upsert_master_symbols
 from app.market.clock import get_market_state
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_lock
 
 KOSPI_MASTER_URL = 'https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip'
@@ -125,9 +126,7 @@ def _parse_master_lines(raw_bytes: bytes, *, trailer_width: int, market: str) ->
             ) from exc
         if security_group not in STOCK_SECURITY_GROUP_CODES:
             continue
-        # Alphanumeric and non-six-character short codes are intentional
-        # non-common-share classes outside this system's numeric stock scope.
-        if len(symbol) != 6 or not symbol.isdigit():
+        if not is_canonical_krx_short_code(symbol):
             continue
         if not _is_valid_isin(standard_code) or not name_ko:
             raise ValueError(

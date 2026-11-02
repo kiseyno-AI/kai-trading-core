@@ -10,6 +10,7 @@ from app.eod.scope_outcomes import (
     STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
     exact_scope_partition_identity_proof_matches,
 )
+from app.market.symbol_codes import normalize_krx_short_code
 
 
 GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
@@ -959,20 +960,15 @@ def _has_exact_scope_outcome_manifest(
             values: list[Any],
         ) -> list[str] | None:
             normalized = [
-                (
-                    str(value or '').strip().zfill(6)
-                    if str(value or '').strip().isdigit()
-                    else str(value or '').strip().upper()
-                )
-                for value in values
+                normalize_krx_short_code(value) for value in values
             ]
             if (
-                any(not value for value in normalized)
+                any(value is None for value in normalized)
                 or len(normalized) != len(set(normalized))
                 or normalized != values
             ):
                 return None
-            return normalized
+            return [str(value) for value in normalized]
 
         selected_codes = normalize_proof_codes(selected)
         retry_codes = normalize_proof_codes(retry_debt)
@@ -1061,19 +1057,14 @@ def _has_exact_scope_outcome_manifest(
 
         def normalize(values: list[Any]) -> list[str] | None:
             normalized = [
-                (
-                    str(value or '').strip().zfill(6)
-                    if str(value or '').strip().isdigit()
-                    else str(value or '').strip().upper()
-                )
-                for value in values
+                normalize_krx_short_code(value) for value in values
             ]
             if (
-                any(not value for value in normalized)
+                any(value is None for value in normalized)
                 or len(normalized) != len(set(normalized))
             ):
                 return None
-            return normalized
+            return [str(value) for value in normalized]
 
         selected_codes = normalize(selected)
         successful_codes = normalize(successful)
@@ -1185,12 +1176,7 @@ def _has_exact_scope_outcome_manifest(
             if not isinstance(item, Mapping):
                 malformed = True
                 break
-            raw_stock_code = str(item.get('stock_code') or '').strip()
-            stock_code = (
-                raw_stock_code.zfill(6)
-                if raw_stock_code.isdigit()
-                else raw_stock_code.upper()
-            )
+            stock_code = normalize_krx_short_code(item.get('stock_code'))
             outcome = str(item.get('outcome') or '').strip()
             if (
                 not stock_code

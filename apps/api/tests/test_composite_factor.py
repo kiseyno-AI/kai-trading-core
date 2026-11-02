@@ -678,7 +678,7 @@ class DailyCompositeFactorPersistenceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = DailyCompositeFactorService()
         self.market_date = date(2026, 4, 24)
-        self.symbols = ['TCF1641', 'TCF1642', 'TCF1643']
+        self.symbols = ['9164C1', '9164C2', '9164C3']
 
     def tearDown(self) -> None:
         with session_scope() as session:

@@ -192,12 +192,12 @@ def test_parse_master_lines_keeps_only_stock_like_krx_groups(security_group: str
     assert rows[0].source_payload == {'security_group': security_group}
 
 
-def test_parse_master_lines_rejects_non_numeric_and_non_six_digit_codes() -> None:
+def test_parse_master_lines_keeps_canonical_alpha_and_rejects_invalid_codes() -> None:
     raw = b''.join(
         [
             _master_line(
                 symbol='00088K',
-                standard_code='KRA00088K000',
+                standard_code='KRA00088K006',
                 name_ko='주식관련권리',
                 security_group='ST',
                 trailer_field_width=221,
@@ -214,7 +214,9 @@ def test_parse_master_lines_rejects_non_numeric_and_non_six_digit_codes() -> Non
 
     rows = _parse_master_lines(raw, trailer_width=221, market='KOSDAQ')
 
-    assert rows == []
+    assert [(row.symbol, row.name_ko) for row in rows] == [
+        ('00088K', '주식관련권리')
+    ]
 
 
 def test_parse_master_lines_reads_trailer_when_final_line_has_no_newline() -> None:

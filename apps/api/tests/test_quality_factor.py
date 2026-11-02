@@ -603,7 +603,7 @@ class DailyQualityFactorPersistenceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = DailyQualityFactorService()
         self.market_date = date(2026, 4, 24)
-        self.symbols = ['TQF2601', 'TQF2602']
+        self.symbols = ['9261Q1', '9261Q2']
 
     def tearDown(self) -> None:
         with session_scope() as session:

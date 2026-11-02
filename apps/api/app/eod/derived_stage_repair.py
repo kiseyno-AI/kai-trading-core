@@ -41,6 +41,7 @@ from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_recent_price_bars_by_symbol,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
 
@@ -95,8 +96,8 @@ def capture_guard_transaction_failure(
 
 def _normalize_symbol(value: Any) -> str:
     symbol = str(value or '').strip().upper()
-    if len(symbol) != 6 or not symbol.isdigit():
-        raise ValueError('manifest symbols must contain exactly six digits')
+    if not is_canonical_krx_short_code(symbol):
+        raise ValueError('manifest symbols must be canonical KRX short codes')
     return symbol
 
 

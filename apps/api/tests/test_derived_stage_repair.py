@@ -16,6 +16,7 @@ from app.eod.derived_stage_repair import (
     ExactDerivedStageRepair,
     GuardTransactionExitError,
     MANIFEST_SCHEMA_VERSION,
+    _normalize_symbol,
     capture_guard_transaction_failure,
     exact_derived_stage_guard,
 )
@@ -146,6 +147,11 @@ class _GuardSession:
 
 
 class ExactDerivedStageRepairTests(unittest.TestCase):
+    def test_scope_normalization_accepts_alpha_and_rejects_malformed_symbols(self):
+        self.assertEqual(_normalize_symbol('0010a0'), '0010A0')
+        with self.assertRaisesRegex(ValueError, 'canonical KRX'):
+            _normalize_symbol('ABC123')
+
     def test_guard_failure_capture_does_not_swallow_entry_sql_error(self):
         @contextmanager
         def failing_entry_guard(**_kwargs):

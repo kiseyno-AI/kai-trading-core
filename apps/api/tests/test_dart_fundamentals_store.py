@@ -11,6 +11,7 @@ from app.dart.fundamentals_store import (
     LegacyCfsRecoveryCandidateDriftError,
     eligible_fundamentals_fs_divs,
     is_usable_fundamentals_source_status,
+    legacy_cfs_recovery_candidate_identity,
 )
 from app.db import session_scope
 from app.db_models import (
@@ -25,6 +26,33 @@ from sqlalchemy import delete, select
 
 
 class FundamentalsSourceStatusTests(unittest.TestCase):
+    @staticmethod
+    def _legacy_recovery_candidate(stock_code: str) -> dict:
+        return {
+            'event_id': 1,
+            'legacy_snapshot_id': 2,
+            'legacy_business_year': 2025,
+            'stock_code': stock_code,
+            'rcept_no': '20260301000000',
+            'corp_code': '00126380',
+            'corp_name': '테스트',
+            'report_nm': '사업보고서',
+            'filing_category': 'annual_report',
+            'receipt_date': '2026-03-01',
+            'legacy_snapshot_rcept_no': '20260301000000',
+            'legacy_snapshot_corp_code': '00126380',
+            'legacy_snapshot_stock_code': stock_code,
+            'legacy_snapshot_filing_category': 'annual_report',
+            'legacy_report_code': '11011',
+            'legacy_fs_div': 'CFS',
+            'legacy_statement_type': 'consolidated',
+            'legacy_period_type': 'annual',
+            'legacy_period_end_month': 12,
+            'legacy_source_status': '013',
+            'legacy_fallback_from_status': None,
+            'legacy_captured_at': '2026-03-01T12:00:00+00:00',
+        }
+
     def test_only_success_status_is_eligible_for_factor_inputs(self):
         self.assertTrue(is_usable_fundamentals_source_status('000'))
         self.assertFalse(is_usable_fundamentals_source_status('013'))
@@ -74,6 +102,17 @@ class FundamentalsSourceStatusTests(unittest.TestCase):
             order_by_sql.index('rcept_no DESC'),
             order_by_sql.index('CASE WHEN'),
         )
+
+    def test_legacy_recovery_identity_accepts_alpha_and_rejects_malformed(self):
+        identity = legacy_cfs_recovery_candidate_identity(
+            self._legacy_recovery_candidate('00088K')
+        )
+
+        self.assertEqual(identity['stock_code'], '00088K')
+        with self.assertRaisesRegex(ValueError, 'stock identity is malformed'):
+            legacy_cfs_recovery_candidate_identity(
+                self._legacy_recovery_candidate('ABC123')
+            )
 
 
 class DartFundamentalsRepositoryTests(unittest.TestCase):

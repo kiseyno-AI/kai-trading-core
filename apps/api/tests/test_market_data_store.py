@@ -33,6 +33,7 @@ from app.market_data_store import (
     _build_prior_market_turnover_bars_query,
     _build_prior_market_turnover_baselines_query,
     _build_recent_price_bars_query,
+    _normalize_turnover_repair_symbol,
     _resolve_derived_symbol_ids,
     build_daily_derived_market_scope_authority,
     finalize_daily_derived_stage_exact_scope,
@@ -76,6 +77,16 @@ from app.eod.pipeline_status import (
     _load_row_count_stage_scope_gap,
 )
 from app.eod.technical_snapshots import DailyTechnicalSnapshotService
+
+
+class TurnoverRepairSymbolNormalizationTests(unittest.TestCase):
+    def test_accepts_canonical_alpha_and_rejects_malformed_symbol(self) -> None:
+        self.assertEqual(
+            _normalize_turnover_repair_symbol('0010a0'),
+            '0010A0',
+        )
+        with self.assertRaisesRegex(ValueError, 'invalid KRX'):
+            _normalize_turnover_repair_symbol('ABC123')
 
 
 class DailySignalFeatureAuthorityTests(unittest.TestCase):

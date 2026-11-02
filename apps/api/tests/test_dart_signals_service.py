@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import io
 import json
@@ -29,6 +30,7 @@ from app.dart.signals_service import (
     DartSignalsService,
     ParsedAuditSignal,
     _decode_document_text,
+    _is_valid_audit_exact_repair_lineage,
     audit_signal_writer_lock_owner,
     build_authoritative_absence_audit_signal,
     claims_authoritative_absence_audit_payload,
@@ -2380,6 +2382,46 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         session.execute.assert_not_called()
 
+    def test_store_signals_accepts_alpha_and_rejects_malformed_code(self):
+        service = DartSignalsService(
+            client=MagicMock(),
+            repository=MagicMock(),
+        )
+        session = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
+
+        with patch(
+            'app.dart.signals_service.session_scope',
+            return_value=context,
+        ):
+            service._store_signals(
+                event={
+                    'rcept_no': '20250325000541',
+                    'stock_code': '00088K',
+                },
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=False,
+            )
+
+        session.execute.assert_not_called()
+        with (
+            self.assertRaisesRegex(ValueError, 'invalid stock code'),
+            patch('app.dart.signals_service.session_scope') as session_scope,
+        ):
+            service._store_signals(
+                event={
+                    'rcept_no': '20250325000541',
+                    'stock_code': 'ABC123',
+                },
+                audit_signal=None,
+                dilution_signal=None,
+                audit_signal_evaluated=False,
+            )
+        session_scope.assert_not_called()
+
     def test_store_signals_serializes_every_audit_mutation_transaction(self):
         service = DartSignalsService(
             client=MagicMock(),
@@ -2480,6 +2522,58 @@ class DartSignalsServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.execute.call_count, 2)
         self.assertTrue(session.execute.call_args_list[1].args[0].is_select)
         self.assertEqual(stored_signal.payload, stored['payload'])
+
+    def test_exact_repair_lineage_accepts_alpha_and_rejects_malformed_code(self):
+        identity = {
+            'event_id': 99,
+            'rcept_no': '20250325000541',
+            'stock_code': '00088K',
+            'receipt_date': '2025-03-25',
+        }
+        lineage = {
+            'schema_version': 'dart_audit_exact_repair_lineage_v1',
+            'manifest_sha256': 'a' * 64,
+            'source': identity,
+            'target': identity,
+            'mode': 'direct',
+        }
+        lineage['lineage_sha256'] = hashlib.sha256(
+            json.dumps(
+                lineage,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+
+        self.assertTrue(
+            _is_valid_audit_exact_repair_lineage(
+                lineage,
+                event_id=99,
+                rcept_no='20250325000541',
+                receipt_date='2025-03-25',
+            )
+        )
+        malformed = copy.deepcopy(lineage)
+        malformed['source']['stock_code'] = 'ABC123'
+        malformed['target']['stock_code'] = 'ABC123'
+        malformed.pop('lineage_sha256')
+        malformed['lineage_sha256'] = hashlib.sha256(
+            json.dumps(
+                malformed,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        ).hexdigest()
+        self.assertFalse(
+            _is_valid_audit_exact_repair_lineage(
+                malformed,
+                event_id=99,
+                rcept_no='20250325000541',
+                receipt_date='2025-03-25',
+            )
+        )
 
     def test_incomplete_ordinary_capture_reads_protected_exact_repair_lineage(
         self,
