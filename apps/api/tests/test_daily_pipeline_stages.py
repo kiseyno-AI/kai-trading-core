@@ -4911,6 +4911,205 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             exact_membership,
         )
 
+    def test_historical_suffix_recovery_reuses_exact_parent_price_scope(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        exact_membership = ['005930', '000660', '035420']
+        retry_subset = ['035420']
+        recovery_parent_scope = _build_exact_scope_outcome(
+            manifest_version=(
+                'auto_eod_followup_admission_scope_outcomes_v1'
+            ),
+            selected_symbols=exact_membership,
+            successful_symbols=['005930', '000660'],
+            retry_debt_symbols=retry_subset,
+        )
+        recovery_price_scope = {
+            'schema_version': 'recovery_price_scope_outcome_v1',
+            'stage_id': 'price_collection',
+            'eod_collection_run_id': 905,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=exact_membership,
+                successful_symbols=exact_membership,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
+                selected_symbols=exact_membership,
+                successful_symbols=exact_membership,
+                retry_debt_symbols=[],
+            ),
+        }
+
+        def execute(stage_id, **kwargs):
+            self.assertEqual(stage_id, 'trending_ranks')
+            self.assertEqual(kwargs['symbols'], exact_membership)
+            self.assertEqual(
+                kwargs['exact_scope_symbols'],
+                exact_membership,
+            )
+            self.assertTrue(kwargs['complete_price_scope_proven'])
+            return {'status': 'completed'}
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['trending_ranks'],
+                symbols=retry_subset,
+                exact_membership_symbols=exact_membership,
+                markets=['KOSPI', 'KOSDAQ'],
+                reused_eod_collection_run_id=905,
+                point_in_time_recovery=True,
+                trigger='auto_eod_followup_resume',
+                recovery_parent_scope_outcome=recovery_parent_scope,
+                recovery_price_scope_outcome=recovery_price_scope,
+            )
+
+        execute_stage.assert_called_once()
+        self.assertEqual(
+            result['stages']['trending_ranks']['status'],
+            'completed',
+        )
+
+    def test_historical_suffix_recovery_rejects_incomplete_price_scope(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        exact_membership = ['005930', '000660', '035420']
+        incomplete_scope = exact_membership[:2]
+        recovery_price_scope = {
+            'schema_version': 'recovery_price_scope_outcome_v1',
+            'stage_id': 'price_collection',
+            'eod_collection_run_id': 905,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=incomplete_scope,
+                successful_symbols=incomplete_scope,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
+                selected_symbols=incomplete_scope,
+                successful_symbols=incomplete_scope,
+                retry_debt_symbols=[],
+            ),
+        }
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                'recovery price scope outcome is not a valid exact',
+            ),
+        ):
+            service.run(
+                market_date='2026-04-14',
+                stages=['trending_ranks'],
+                symbols=['035420'],
+                exact_membership_symbols=exact_membership,
+                markets=['KOSPI', 'KOSDAQ'],
+                reused_eod_collection_run_id=905,
+                point_in_time_recovery=True,
+                trigger='auto_eod_followup_resume',
+                recovery_parent_scope_outcome=(
+                    _build_exact_scope_outcome(
+                        manifest_version=(
+                            'auto_eod_followup_admission_scope_outcomes_v1'
+                        ),
+                        selected_symbols=exact_membership,
+                        successful_symbols=['005930', '000660'],
+                        retry_debt_symbols=['035420'],
+                    )
+                ),
+                recovery_price_scope_outcome=recovery_price_scope,
+            )
+
+    def test_historical_suffix_recovery_rejects_unbound_price_scope(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        exact_membership = ['005930', '000660', '035420']
+        recovery_parent_scope = _build_exact_scope_outcome(
+            manifest_version=(
+                'auto_eod_followup_admission_scope_outcomes_v1'
+            ),
+            selected_symbols=exact_membership,
+            successful_symbols=['005930', '000660'],
+            retry_debt_symbols=['035420'],
+        )
+        recovery_price_scope = {
+            'schema_version': 'recovery_price_scope_outcome_v1',
+            'stage_id': 'price_collection',
+            'eod_collection_run_id': 905,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=exact_membership,
+                successful_symbols=exact_membership,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
+                selected_symbols=exact_membership,
+                successful_symbols=exact_membership,
+                retry_debt_symbols=[],
+            ),
+        }
+
+        for override in (
+            {'status': 'blocked'},
+            {'eod_collection_run_id': 906},
+        ):
+            with (
+                self.subTest(override=override),
+                patch.object(
+                    service,
+                    '_normalize_market_date',
+                    return_value='2026-04-14',
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    'recovery price scope outcome is not a valid exact',
+                ),
+            ):
+                service.run(
+                    market_date='2026-04-14',
+                    stages=['trending_ranks'],
+                    symbols=['035420'],
+                    exact_membership_symbols=exact_membership,
+                    markets=['KOSPI', 'KOSDAQ'],
+                    reused_eod_collection_run_id=905,
+                    point_in_time_recovery=True,
+                    trigger='auto_eod_followup_resume',
+                    recovery_parent_scope_outcome=recovery_parent_scope,
+                    recovery_price_scope_outcome={
+                        **recovery_price_scope,
+                        **override,
+                    },
+                )
+
     def test_stage_debt_retry_keeps_full_ranking_and_subset_publication(
         self,
     ) -> None:

@@ -68,6 +68,7 @@ from app.eod.run_stage_support import (
 )
 from app.eod.scope_outcomes import (
     FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION,
+    RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION,
     STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
     build_exact_symbol_scope_outcome,
     exact_scope_partition_identity_proof_matches,
@@ -2049,6 +2050,88 @@ def _validated_followup_admitted_symbols(
         return None
     successful_symbols = list(partition['successful_stock_codes'])
     return successful_symbols or None
+
+
+def _build_recovery_price_scope_outcome(
+    *,
+    latest_eod_run: Mapping[str, Any],
+    market_date: str,
+    membership_symbols: Sequence[str],
+) -> dict[str, Any] | None:
+    """Prove a historical price cohort from its frozen EOD identity."""
+
+    normalized_membership = sorted(
+        _dedupe_symbol_codes(membership_symbols)
+    )
+    metadata = (
+        latest_eod_run.get('run_metadata')
+        if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    requested_symbols = sorted(
+        _dedupe_symbol_codes(metadata.get('requested_symbols') or [])
+    )
+    try:
+        eod_run_id = int(latest_eod_run['id'])
+        symbols_total = int(latest_eod_run.get('symbols_total') or 0)
+        symbols_succeeded = int(
+            latest_eod_run.get('symbols_succeeded') or 0
+        )
+        symbols_failed = int(
+            latest_eod_run.get('symbols_failed') or 0
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not normalized_membership
+        or requested_symbols != normalized_membership
+        or symbols_total != len(normalized_membership)
+        or symbols_succeeded != len(normalized_membership)
+        or symbols_failed != 0
+        or _dedupe_symbol_codes(metadata.get('failed_symbols') or [])
+        or _dedupe_symbol_codes(metadata.get('unattempted_symbols') or [])
+    ):
+        return None
+    persisted_symbols = sorted(
+        _dedupe_symbol_codes(
+            load_eod_run_persisted_symbols(
+                eod_run_id,
+                trade_date=market_date,
+            )
+        )
+    )
+    if persisted_symbols != normalized_membership:
+        return None
+
+    finalization_stage_id = STAGE_ATOMIC_FINALIZATION_STAGE_IDS.get(
+        'price_collection'
+    )
+    if not finalization_stage_id:
+        return None
+    membership_digest = market_membership_sha256(normalized_membership)
+    return {
+        'schema_version': RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION,
+        'stage_id': 'price_collection',
+        'eod_collection_run_id': eod_run_id,
+        'market_date': market_date,
+        'status': 'completed',
+        **build_exact_symbol_scope_outcome(
+            manifest_version='price_contexts_scope_outcomes_v1',
+            selected_symbols=normalized_membership,
+            successful_symbols=normalized_membership,
+            retry_debt_symbols=[],
+        ),
+        'scope_finalization': {
+            'stage': finalization_stage_id,
+            'market_date': market_date,
+            'exact_symbol_count': len(normalized_membership),
+            'exact_membership_sha256': membership_digest,
+            'successful_symbol_count': len(normalized_membership),
+            'successful_membership_sha256': membership_digest,
+            'deleted_stale_row_count': 0,
+            'ready': True,
+        },
+    }
 
 
 def _followup_exact_evidence_present(stage: object) -> bool:
@@ -7479,6 +7562,35 @@ class PykrxBackfillService:
             )
 
         market_risk_recovery_scope_outcome: dict[str, Any] | None = None
+        recovery_price_scope_outcome: dict[str, Any] | None = None
+        if (
+            point_in_time_recovery
+            and point_in_time_membership_symbols
+            and 'trending_ranks' in recovery_stages
+        ):
+            recovery_price_scope_outcome = (
+                _build_recovery_price_scope_outcome(
+                    latest_eod_run=latest_eod_run,
+                    market_date=market_date,
+                    membership_symbols=point_in_time_membership_symbols,
+                )
+            )
+            if recovery_price_scope_outcome is None:
+                result = build_daily_skip_result(
+                    reason='followup_recovery_price_scope_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked',
+                    'retry_scheduled': False,
+                    'resume_from_stage': resume_from_stage,
+                    'blocker': 'historical_price_scope_mismatch',
+                }
+                return result
         targeted_market_risk_recovery = bool(
             stage_debt_request is None
             and point_in_time_recovery
@@ -7581,6 +7693,10 @@ class PykrxBackfillService:
         if market_risk_recovery_scope_outcome is not None:
             recovery_kwargs['recovery_stage_scope_outcome'] = (
                 market_risk_recovery_scope_outcome
+            )
+        if recovery_price_scope_outcome is not None:
+            recovery_kwargs['recovery_price_scope_outcome'] = (
+                recovery_price_scope_outcome
             )
         if (
             retryable_feedback_rearm_candidate

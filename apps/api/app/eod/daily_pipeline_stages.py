@@ -86,6 +86,7 @@ from app.eod.run_stage_support import (
 )
 from app.eod.scope_outcomes import (
     FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION,
+    RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION,
     STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
     STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
     build_exact_scope_partition_identity_proof,
@@ -952,6 +953,7 @@ class DailyPipelineStageService:
         provider_admission_fence_owned: bool = False,
         recovery_parent_scope_outcome: Mapping[str, Any] | None = None,
         recovery_stage_scope_outcome: Mapping[str, Any] | None = None,
+        recovery_price_scope_outcome: Mapping[str, Any] | None = None,
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
         same_day_intraday_watch_rearm_resume: bool = False,
@@ -986,6 +988,7 @@ class DailyPipelineStageService:
         recovery_parent_partition: dict[str, Any] | None = None
         recovery_stage_partition: dict[str, Any] | None = None
         recovery_stage_id: str | None = None
+        validated_recovery_price_outcome: dict[str, Any] | None = None
         resolved_markets = self._normalize_markets(markets)
         if exact_membership_symbols is not None:
             linked_exact_stage_recovery = bool(
@@ -1165,6 +1168,61 @@ class DailyPipelineStageService:
         elif recovery_stage_scope_outcome is not None:
             raise ValueError(
                 'recovery stage scope outcome requires exact membership'
+            )
+        if recovery_price_scope_outcome is not None:
+            raw_recovery_price_outcome = dict(
+                recovery_price_scope_outcome
+            )
+            try:
+                recovery_price_eod_run_id = int(
+                    raw_recovery_price_outcome.get(
+                        'eod_collection_run_id'
+                    )
+                )
+            except (TypeError, ValueError):
+                recovery_price_eod_run_id = None
+            candidate_price_outcome = {
+                'status': raw_recovery_price_outcome.get('status'),
+                'result': raw_recovery_price_outcome,
+            }
+            if not (
+                trigger == 'auto_eod_followup_resume'
+                and point_in_time_recovery
+                and reused_eod_collection_run_id is not None
+                and resolved_exact_membership_symbols
+                and recovery_parent_partition is not None
+                and 'price_collection' not in resolved_stages
+                and 'trending_ranks' in resolved_stages
+                and raw_recovery_price_outcome.get('schema_version')
+                == RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION
+                and raw_recovery_price_outcome.get('stage_id')
+                == 'price_collection'
+                and raw_recovery_price_outcome.get('status')
+                == 'completed'
+                and recovery_price_eod_run_id
+                == int(reused_eod_collection_run_id)
+                and raw_recovery_price_outcome.get('market_date')
+                == resolved_market_date
+                and self._complete_price_scope_is_proven(
+                    exact_scope_symbols=(
+                        resolved_exact_membership_symbols
+                    ),
+                    admitted_symbols=(
+                        resolved_exact_membership_symbols
+                    ),
+                    price_outcome=candidate_price_outcome,
+                    price_invocation_symbols=(
+                        resolved_exact_membership_symbols
+                    ),
+                    expected_market_date=resolved_market_date,
+                )
+            ):
+                raise ValueError(
+                    'recovery price scope outcome is not a valid exact '
+                    'historical price partition'
+                )
+            validated_recovery_price_outcome = (
+                raw_recovery_price_outcome
             )
         resolved_fs_div = (fs_div or settings.dart_fundamentals_default_fs_div).strip().upper()
         feedback_knowledge_cutoff_at: datetime | None = None
@@ -1579,6 +1637,15 @@ class DailyPipelineStageService:
         stage_outcomes: dict[str, dict[str, Any]] = {}
         stage_invocation_symbols: dict[str, list[str] | None] = {}
         handled: set[str] = set()
+        if validated_recovery_price_outcome is not None:
+            stage_outcomes['price_collection'] = {
+                'stage': 'price_collection',
+                'status': 'completed',
+                'result': validated_recovery_price_outcome,
+            }
+            stage_invocation_symbols['price_collection'] = list(
+                resolved_exact_membership_symbols or []
+            )
         if (
             existing_pipeline_run_id is not None
             and same_day_intraday_watch_rearm_resume
@@ -2885,6 +2952,10 @@ class DailyPipelineStageService:
                 and set(resolved_symbols)
                 != set(official_membership_symbols)
                 and stage_id != recovery_stage_id
+                and not (
+                    stage_id == 'trending_ranks'
+                    and validated_recovery_price_outcome is not None
+                )
             ):
                 recovery_scope = set(resolved_symbols or ())
                 parent_retry_debt = set(

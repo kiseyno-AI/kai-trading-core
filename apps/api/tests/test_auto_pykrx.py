@@ -34,6 +34,7 @@ from app.eod.pykrx_backfill import (
     PYKRX_STAGE_SEQUENCE,
     PykrxBackfillService,
     PykrxSymbol,
+    _build_recovery_price_scope_outcome,
     _call_pykrx,
     _feedback_dispatch_rate_limit_backoff,
     _feedback_suffix_has_stale_prerequisite_ordering,
@@ -8257,6 +8258,51 @@ class PykrxBackfillServiceTests(TestCase):
         )
         resolve_stage_debt.assert_not_called()
 
+    def test_recovery_price_scope_requires_exact_persisted_membership(
+        self,
+    ) -> None:
+        symbols = ['000660', '005930']
+        latest_eod_run = {
+            'id': 8,
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'requested_symbols': symbols,
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+            },
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+            return_value=symbols,
+        ):
+            proof = _build_recovery_price_scope_outcome(
+                latest_eod_run=latest_eod_run,
+                market_date='2026-04-03',
+                membership_symbols=symbols,
+            )
+
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['eod_collection_run_id'], 8)
+        self.assertEqual(proof['selected_stock_codes'], symbols)
+        self.assertEqual(proof['successful_stock_codes'], symbols)
+
+        for persisted_symbols in (['000660'], [*symbols, '035420']):
+            with self.subTest(persisted_symbols=persisted_symbols), patch(
+                'app.eod.pykrx_backfill.'
+                'load_eod_run_persisted_symbols',
+                return_value=persisted_symbols,
+            ):
+                self.assertIsNone(
+                    _build_recovery_price_scope_outcome(
+                        latest_eod_run=latest_eod_run,
+                        market_date='2026-04-03',
+                        membership_symbols=symbols,
+                    )
+                )
+
     def test_point_in_time_upstream_rebuild_uses_full_frozen_membership(
         self,
     ) -> None:
@@ -8322,6 +8368,11 @@ class PykrxBackfillServiceTests(TestCase):
                 '_resolve_followup_stage_debt_state'
             ) as resolve_stage_debt,
             patch(
+                'app.eod.pykrx_backfill.'
+                'load_eod_run_persisted_symbols',
+                return_value=frozen_scope,
+            ),
+            patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
                 return_value={'status': 'partial', 'pipeline_run_id': 93},
             ) as resume_stages,
@@ -8340,6 +8391,29 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(recovery_call['symbols'], frozen_scope)
         self.assertEqual(recovery_call['exact_membership_symbols'], frozen_scope)
         self.assertNotIn('price_collection', recovery_call['stages'])
+        recovery_price_scope = recovery_call[
+            'recovery_price_scope_outcome'
+        ]
+        self.assertEqual(
+            recovery_price_scope['schema_version'],
+            'recovery_price_scope_outcome_v1',
+        )
+        self.assertEqual(
+            recovery_price_scope['eod_collection_run_id'],
+            latest_eod_run['id'],
+        )
+        self.assertEqual(
+            recovery_price_scope['selected_stock_codes'],
+            frozen_scope,
+        )
+        self.assertEqual(
+            recovery_price_scope['successful_stock_codes'],
+            frozen_scope,
+        )
+        self.assertEqual(
+            recovery_price_scope['retry_debt_stock_codes'],
+            [],
+        )
         resolve_stage_debt.assert_not_called()
 
         latest_eod_run['run_metadata'][
@@ -8522,6 +8596,11 @@ class PykrxBackfillServiceTests(TestCase):
                     'reason': 'stale_narrow_scope',
                 },
             ) as resolve_stage_debt,
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_eod_run_persisted_symbols',
+                return_value=frozen_scope,
+            ),
             patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
                 return_value={'status': 'partial', 'pipeline_run_id': 94},

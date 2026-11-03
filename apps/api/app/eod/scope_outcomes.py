@@ -7,6 +7,11 @@ from app.eod.market_membership import market_membership_sha256
 from app.market.symbol_codes import normalize_krx_short_code
 
 
+RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION = (
+    'recovery_price_scope_outcome_v1'
+)
+
+
 EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS = frozenset(
     {
         'action_summaries_scope_outcomes_v1',
