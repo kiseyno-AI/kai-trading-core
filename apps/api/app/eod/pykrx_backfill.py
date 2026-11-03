@@ -70,6 +70,7 @@ from app.eod.scope_outcomes import (
     FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION,
     RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION,
     STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
+    STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
     build_exact_symbol_scope_outcome,
     exact_scope_partition_identity_proof_matches,
     validate_stage_bound_scope_outcome,
@@ -217,6 +218,11 @@ FOLLOWUP_EXACT_STAGE_DEPENDENCIES = {
     **FACTOR_FOLLOWUP_STAGE_DEPENDENCIES,
     'signal_features': FACTOR_FOLLOWUP_STAGE_ORDER,
 }
+RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS = (
+    'pykrx_enrichment',
+    'technical_snapshots',
+    'action_summaries',
+)
 TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
     'agent_feedback_summaries',
     'signal_decider',
@@ -2163,6 +2169,124 @@ def _followup_exact_evidence_present(stage: object) -> bool:
     )
 
 
+def _followup_quality_only_partial_is_satisfied(
+    *,
+    stage_id: str,
+    stage: Mapping[str, Any],
+    result_summary: Mapping[str, Any],
+    selected_symbols: Sequence[str],
+    successful_symbols: Sequence[str],
+    retry_debt_symbols: Sequence[str],
+    terminal_not_applicable_symbols: Sequence[str],
+) -> bool:
+    """Accept only an exhaustive, explicitly non-blocking quality warning."""
+
+    def exact_nonnegative_int(value: object) -> int | None:
+        if type(value) is not int:
+            return None
+        return value if value >= 0 else None
+
+    selected = _dedupe_symbol_codes(selected_symbols)
+    successful = _dedupe_symbol_codes(successful_symbols)
+    retry_debt = _dedupe_symbol_codes(retry_debt_symbols)
+    terminal = _dedupe_symbol_codes(
+        terminal_not_applicable_symbols
+    )
+    if not (
+        selected
+        and selected == list(selected_symbols)
+        and successful == list(successful_symbols)
+        and not retry_debt
+        and not terminal
+        and set(successful) == set(selected)
+        and str(stage.get('status') or '').strip().lower()
+        == 'partial'
+        and str(result_summary.get('status') or '').strip().lower()
+        == 'partial'
+        and str(result_summary.get('gate_status') or '').strip().lower()
+        == 'ready'
+        and str(
+            result_summary.get('blocking_status') or ''
+        ).strip().lower()
+        == 'non_blocking'
+        and str(
+            result_summary.get('ranking_dependency_status') or ''
+        ).strip().lower()
+        in {'complete', 'completed', 'ready'}
+        and exact_nonnegative_int(
+            result_summary.get('results_persisted')
+        )
+        == len(selected)
+        and exact_nonnegative_int(
+            result_summary.get('results_failed')
+        )
+        == 0
+        and daily_pipeline_outcome_is_satisfied(
+            {**dict(stage), 'stage': stage_id}
+        )
+    ):
+        return False
+
+    reason = str(result_summary.get('reason') or '').strip()
+    quality_warning = str(
+        result_summary.get('quality_warning') or ''
+    ).strip()
+    if stage_id == 'piotroski_filter':
+        usable = exact_nonnegative_int(
+            result_summary.get('full_signal_usable_count')
+        )
+        incomplete = exact_nonnegative_int(
+            result_summary.get('full_signal_incomplete_count')
+        )
+        unusable = exact_nonnegative_int(
+            result_summary.get('full_signal_unusable_count')
+        )
+        return bool(
+            reason == 'piotroski_evidence_incomplete'
+            and quality_warning == reason
+            and str(
+                result_summary.get('full_signal_coverage_status') or ''
+            ).strip().lower()
+            == 'incomplete'
+            and usable is not None
+            and incomplete is not None
+            and unusable is not None
+            and usable > 0
+            and usable + incomplete + unusable == len(selected)
+        )
+    if stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
+        factor_summary = result_summary.get('summary')
+        if not isinstance(factor_summary, Mapping):
+            factor_summary = {}
+        ready_count = exact_nonnegative_int(
+            result_summary.get('persisted_ready_count')
+            if 'persisted_ready_count' in result_summary
+            else factor_summary.get('persisted_ready_count')
+        )
+        unready_count = exact_nonnegative_int(
+            result_summary.get('persisted_unready_count')
+            if 'persisted_unready_count' in result_summary
+            else factor_summary.get('persisted_unready_count')
+        )
+        remaining_retryable = exact_nonnegative_int(
+            result_summary.get('remaining_retryable_events')
+        )
+        return bool(
+            reason == 'partial_usable_coverage'
+            and quality_warning
+            and str(
+                result_summary.get('quality_status') or ''
+            ).strip().lower()
+            == 'degraded'
+            and remaining_retryable == 0
+            and ready_count is not None
+            and unready_count is not None
+            and ready_count > 0
+            and ready_count + unready_count == len(selected)
+        )
+    return False
+
+
 def _followup_exact_result_authority(
     *,
     stage_id: str,
@@ -2257,14 +2381,17 @@ def _followup_exact_result_authority(
     ]
     market_date = str(proof.get('market_date') or '').strip()
     manifest_version = str(proof.get('manifest_version') or '').strip()
+    allowed_manifest_versions = (
+        STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(
+            stage_id,
+            frozenset(),
+        )
+    )
     if (
         proof.get('schema_version') != 'exact_scope_outcome_proof_v2'
         or str(proof.get('stage_id') or '').strip() != stage_id
         or not market_date
-        or manifest_version
-        not in FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS.get(
-            stage_id, frozenset()
-        )
+        or manifest_version not in allowed_manifest_versions
         or proof.get('selected_symbol_count') != len(selected)
         or proof.get('selected_symbol_sha256')
         != market_membership_sha256(selected)
@@ -2286,7 +2413,7 @@ def _followup_exact_result_authority(
         and str(proof.get('outcome_status') or '').strip().lower()
         == 'failed'
     )
-    proof_status = (
+    partition_status = (
         'failed'
         if failed_all
         else 'partial'
@@ -2294,9 +2421,34 @@ def _followup_exact_result_authority(
         else 'completed'
     )
     persisted_status = str(
-        stage.get('status') or result_summary.get('status') or proof_status
+        stage.get('status')
+        or result_summary.get('status')
+        or partition_status
     ).strip().lower()
-    if persisted_status != proof_status:
+    proof_outcome_status = str(
+        proof.get('outcome_status') or ''
+    ).strip().lower()
+    quality_only_partial = bool(
+        partition_status == 'completed'
+        and persisted_status == 'partial'
+        and proof_outcome_status == 'partial'
+        and _followup_quality_only_partial_is_satisfied(
+            stage_id=stage_id,
+            stage=stage,
+            result_summary=result_summary,
+            selected_symbols=selected,
+            successful_symbols=successful,
+            retry_debt_symbols=retry_debt,
+            terminal_not_applicable_symbols=terminal,
+        )
+    )
+    proof_status = (
+        'partial' if quality_only_partial else partition_status
+    )
+    if (
+        proof_outcome_status != proof_status
+        or persisted_status != proof_status
+    ):
         return None
     reconstructed = {
         'status': proof_status,
@@ -2310,9 +2462,21 @@ def _followup_exact_result_authority(
         ),
     }
     for scalar_key in (
+        'blocking_status',
+        'full_signal_coverage_status',
+        'full_signal_incomplete_count',
+        'full_signal_unusable_count',
+        'full_signal_usable_count',
         'gate_status',
+        'persisted_ready_count',
+        'persisted_unready_count',
+        'quality_status',
+        'quality_warning',
         'ranking_dependency_status',
         'reason',
+        'remaining_retryable_events',
+        'results_failed',
+        'results_persisted',
     ):
         if scalar_key in result_summary:
             reconstructed[scalar_key] = result_summary[scalar_key]
@@ -2349,6 +2513,148 @@ def _followup_exact_result_authority(
     return reconstructed
 
 
+def _recovered_followup_admission_scope_outcome(
+    *,
+    latest_eod_run: Mapping[str, Any],
+    market_date: str,
+    pipeline_run: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Rebuild stale admission authority from one exact linked PITR run."""
+
+    eod_metadata = (
+        latest_eod_run.get('run_metadata')
+        if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+        else {}
+    )
+    requested_symbols = sorted(
+        _dedupe_symbol_codes(eod_metadata.get('requested_symbols') or [])
+    )
+    prior_admission = _validated_followup_admission_partition(
+        eod_metadata
+    )
+    try:
+        eod_run_id = latest_eod_run['id']
+        pipeline_run_id = pipeline_run['id']
+    except KeyError:
+        return None
+    if (
+        type(eod_run_id) is not int
+        or eod_run_id <= 0
+        or type(pipeline_run_id) is not int
+        or pipeline_run_id <= 0
+        or not requested_symbols
+        or prior_admission is None
+        or prior_admission.get('selected_stock_codes')
+        != requested_symbols
+        or not prior_admission.get('retry_debt_stock_codes')
+        or str(pipeline_run.get('market_date') or '').strip()
+        != market_date
+        or str(pipeline_run.get('trigger') or '').strip()
+        != AUTO_FOLLOWUP_RECOVERY_TRIGGER
+    ):
+        return None
+    run_metadata = pipeline_run.get('run_metadata')
+    stage_rows = pipeline_run.get('stages')
+    if not isinstance(run_metadata, Mapping) or not isinstance(
+        stage_rows, Mapping
+    ):
+        return None
+    resolved_stages = run_metadata.get('resolved_stages')
+    normalized_resolved_stages = (
+        [str(stage_id or '').strip() for stage_id in resolved_stages]
+        if isinstance(resolved_stages, list)
+        else []
+    )
+    normalized_execution_symbols = _dedupe_symbol_codes(
+        run_metadata.get('symbols') or []
+    )
+    if (
+        str(run_metadata.get('entrypoint') or '').strip()
+        != 'daily_pipeline_stage_service.run'
+        or type(run_metadata.get('reused_eod_collection_run_id'))
+        is not int
+        or run_metadata.get('reused_eod_collection_run_id') != eod_run_id
+        or run_metadata.get('point_in_time_recovery') is not True
+        or str(run_metadata.get('resume_from_stage') or '').strip()
+        != RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS[0]
+        or not isinstance(resolved_stages, list)
+        or normalized_resolved_stages != resolved_stages
+        or len(normalized_resolved_stages)
+        != len(set(normalized_resolved_stages))
+        or not all(
+            stage_id in normalized_resolved_stages
+            for stage_id in RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS
+        )
+        or not normalized_execution_symbols
+        or normalized_execution_symbols
+        != list(run_metadata.get('symbols') or [])
+        or not set(normalized_execution_symbols).issubset(
+            set(requested_symbols)
+        )
+        or type(run_metadata.get('exact_membership_symbol_count'))
+        is not int
+        or run_metadata.get('exact_membership_symbol_count')
+        != len(requested_symbols)
+        or run_metadata.get('exact_membership_sha256')
+        != market_membership_sha256(requested_symbols)
+        or _build_recovery_price_scope_outcome(
+            latest_eod_run=latest_eod_run,
+            market_date=market_date,
+            membership_symbols=requested_symbols,
+        )
+        is None
+    ):
+        return None
+
+    for stage_id in RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS:
+        stage = stage_rows.get(stage_id)
+        if not isinstance(stage, Mapping) or not daily_pipeline_outcome_is_satisfied(
+            {**dict(stage), 'stage': stage_id}
+        ):
+            return None
+        exact_result = _followup_exact_result_authority(
+            stage_id=stage_id,
+            stage=stage,
+        )
+        validated_partition = (
+            validate_stage_bound_scope_outcome(
+                result=exact_result,
+                expected_stage_id=stage_id,
+                invocation_symbols=requested_symbols,
+                status='completed',
+                expected_market_date=market_date,
+                publication_symbols=requested_symbols,
+            )
+            if exact_result is not None
+            else None
+        )
+        if (
+            exact_result is None
+            or validated_partition is None
+            or str(exact_result.get('status') or '').strip().lower()
+            != 'completed'
+            or validated_partition.get('selected_stock_codes')
+            != requested_symbols
+            or validated_partition.get('successful_stock_codes')
+            != requested_symbols
+            or validated_partition.get('retry_debt_stock_codes') != []
+            or validated_partition.get(
+                'terminal_not_applicable_stock_codes'
+            )
+            != []
+        ):
+            return None
+
+    return build_exact_symbol_scope_outcome(
+        manifest_version=(
+            'auto_eod_followup_admission_scope_outcomes_v1'
+        ),
+        selected_symbols=requested_symbols,
+        successful_symbols=requested_symbols,
+        retry_debt_symbols=[],
+    )
+
+
 def _validated_followup_exact_partition(
     *,
     stage_id: str,
@@ -2356,6 +2662,7 @@ def _validated_followup_exact_partition(
     expected_market_date: str,
     expected_publication_symbols: Sequence[str],
     allowed_partition_symbols: Sequence[str],
+    allow_quality_only_partial: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     if stage_id not in FOLLOWUP_EXACT_STAGE_MANIFEST_VERSIONS:
         return None
@@ -2395,10 +2702,31 @@ def _validated_followup_exact_partition(
         gate_status = str(
             exact_result.get('gate_status') or ''
         ).strip().lower()
+        quality_only_partial = bool(
+            allow_quality_only_partial
+            and normalized_status == 'partial'
+            and _followup_quality_only_partial_is_satisfied(
+                stage_id=stage_id,
+                stage=stage,
+                result_summary=_stage_result_summary(stage),
+                selected_symbols=partition[
+                    'selected_stock_codes'
+                ],
+                successful_symbols=partition[
+                    'successful_stock_codes'
+                ],
+                retry_debt_symbols=partition[
+                    'retry_debt_stock_codes'
+                ],
+                terminal_not_applicable_symbols=partition[
+                    'terminal_not_applicable_stock_codes'
+                ],
+            )
+        )
         if (
             normalized_status == 'partial'
             and not partition['retry_debt_stock_codes']
-            and gate_status != 'ready'
+            and not quality_only_partial
         ):
             return None
         if gate_status == 'blocked':
@@ -2408,6 +2736,7 @@ def _validated_followup_exact_partition(
                 'piotroski_evidence_'
             )
             and not partition['retry_debt_stock_codes']
+            and not quality_only_partial
         ):
             return None
         ranking_dependency_status = str(
@@ -3134,6 +3463,26 @@ def _next_followup_stage_debt_request(
     return stage_id, symbols
 
 
+def _resolve_followup_recovery_stages(
+    *,
+    recovery_scope: Sequence[str],
+    incomplete_stages: Sequence[str],
+    has_exact_stage_debt_request: bool,
+) -> list[str]:
+    """Return the minimal safe suffix, isolating exact trending repair."""
+
+    if not incomplete_stages:
+        return []
+    resume_from_stage = incomplete_stages[0]
+    recovery_scope_list = list(recovery_scope)
+    resume_index = recovery_scope_list.index(resume_from_stage)
+    if has_exact_stage_debt_request or list(incomplete_stages) == [
+        'trending_ranks'
+    ]:
+        return [resume_from_stage]
+    return recovery_scope_list[resume_index:]
+
+
 def _resolve_followup_stage_debt_state(
     *,
     market_date: str,
@@ -3358,10 +3707,15 @@ def _resolve_followup_stage_debt_state(
     provider_result_summary: dict[str, Any] | None = None
     exact_evidence_seen = False
     for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER:
-        candidates = [
-            eod_stage_rows.get(stage_id),
-            stage_rows.get(stage_id),
-        ]
+        current_candidate = stage_rows.get(stage_id)
+        candidates = (
+            [current_candidate]
+            if _followup_exact_evidence_present(current_candidate)
+            else [
+                eod_stage_rows.get(stage_id),
+                current_candidate,
+            ]
+        )
         for candidate in candidates:
             if not isinstance(candidate, Mapping):
                 continue
@@ -3444,6 +3798,7 @@ def _resolve_followup_stage_debt_state(
                     expected_stage_publication_symbols
                 ),
                 allowed_partition_symbols=parent_symbols,
+                allow_quality_only_partial=True,
             )
             if exact_evidence_present and validated is None:
                 return {
@@ -3465,9 +3820,40 @@ def _resolve_followup_stage_debt_state(
                         partitions.get(dependency_stage_id)
                         for dependency_stage_id in dependencies
                     ]
-                    if any(
+                    missing_dependency_partition = any(
                         dependency_partition is None
                         for dependency_partition in dependency_partitions
+                    )
+                    legacy_piotroski_quality_authority = bool(
+                        missing_dependency_partition
+                        and stage_id == 'piotroski_filter'
+                        and str(
+                            partition.get('status')
+                            or exact_result.get('status')
+                            or ''
+                        ).strip().lower()
+                        == 'partial'
+                        and _followup_quality_only_partial_is_satisfied(
+                            stage_id=stage_id,
+                            stage=candidate,
+                            result_summary=result_summary,
+                            selected_symbols=partition[
+                                'selected_stock_codes'
+                            ],
+                            successful_symbols=partition[
+                                'successful_stock_codes'
+                            ],
+                            retry_debt_symbols=partition[
+                                'retry_debt_stock_codes'
+                            ],
+                            terminal_not_applicable_symbols=partition[
+                                'terminal_not_applicable_stock_codes'
+                            ],
+                        )
+                    )
+                    if (
+                        missing_dependency_partition
+                        and not legacy_piotroski_quality_authority
                     ):
                         return {
                             'required': True,
@@ -3476,17 +3862,22 @@ def _resolve_followup_stage_debt_state(
                                 f'{stage_id}_stage_debt_scope_mismatch'
                             ),
                         }
-                    expected_selected = set(
-                        dependency_partitions[0][
-                            'successful_stock_codes'
-                        ]
-                    )
-                    for dependency_partition in dependency_partitions[1:]:
-                        expected_selected.intersection_update(
-                            dependency_partition[
+                    if legacy_piotroski_quality_authority:
+                        expected_selected = set(parent_symbols)
+                    else:
+                        expected_selected = set(
+                            dependency_partitions[0][
                                 'successful_stock_codes'
                             ]
                         )
+                        for dependency_partition in (
+                            dependency_partitions[1:]
+                        ):
+                            expected_selected.intersection_update(
+                                dependency_partition[
+                                    'successful_stock_codes'
+                                ]
+                            )
                 else:
                     expected_selected = set(parent_symbols)
                 if set(partition['selected_stock_codes']) != expected_selected:
@@ -3507,6 +3898,8 @@ def _resolve_followup_stage_debt_state(
                 if provider_admission is not None:
                     exact_evidence_seen = True
                     provider_result_summary = dict(result_summary)
+            if validated is not None:
+                break
 
     if not exact_evidence_seen:
         return {'required': False, 'ready': False}
@@ -6205,6 +6598,41 @@ class PykrxBackfillService:
             else {}
         )
         stage_rows = pipeline_run.get('stages') if isinstance(pipeline_run.get('stages'), dict) else {}
+        recovered_admission = _recovered_followup_admission_scope_outcome(
+            latest_eod_run=latest_eod_run,
+            market_date=market_date,
+            pipeline_run=pipeline_run,
+        )
+        if recovered_admission is not None:
+            prior_admission = _validated_followup_admission_partition(
+                latest_eod_metadata
+            )
+            if prior_admission != recovered_admission:
+                latest_eod_metadata = dict(latest_eod_metadata)
+                latest_eod_metadata[
+                    'followup_admission_scope_outcome'
+                ] = recovered_admission
+                latest_eod_metadata[
+                    'followup_admission_reconciliation'
+                ] = {
+                    'schema_version': (
+                        'followup_admission_reconciliation_v1'
+                    ),
+                    'market_date': market_date,
+                    'eod_collection_run_id': int(latest_eod_run['id']),
+                    'source_pipeline_run_id': int(pipeline_run['id']),
+                    'symbol_count': len(
+                        recovered_admission['selected_stock_codes']
+                    ),
+                    'membership_sha256': market_membership_sha256(
+                        recovered_admission['selected_stock_codes']
+                    ),
+                    'prior_retry_debt_count': len(
+                        prior_admission['retry_debt_stock_codes']
+                    ),
+                    'reconciled_at': _utcnow_iso(),
+                }
+                latest_eod_run['run_metadata'] = latest_eod_metadata
         latest_eod_stage_progress = (
             latest_eod_metadata.get('stage_progress')
             if isinstance(
@@ -6812,11 +7240,12 @@ class PykrxBackfillService:
             return result
 
         resume_from_stage = incomplete_stages[0]
-        resume_index = recovery_scope.index(resume_from_stage)
-        recovery_stages = (
-            [resume_from_stage]
-            if stage_debt_request is not None
-            else recovery_scope[resume_index:]
+        recovery_stages = _resolve_followup_recovery_stages(
+            recovery_scope=recovery_scope,
+            incomplete_stages=incomplete_stages,
+            has_exact_stage_debt_request=(
+                stage_debt_request is not None
+            ),
         )
         proven_partial_summary_downstream_continuation = bool(
             partial_summary_prefix_proven

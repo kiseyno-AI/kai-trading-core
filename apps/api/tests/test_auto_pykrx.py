@@ -46,6 +46,7 @@ from app.eod.pykrx_backfill import (
     _retryable_feedback_rearm_config,
     _retryable_feedback_rearm_knowledge_cutoff,
     _retryable_feedback_rearm_max_cycles,
+    _resolve_followup_recovery_stages,
     _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
     _select_summary_cutoff_proof,
@@ -8302,6 +8303,33 @@ class PykrxBackfillServiceTests(TestCase):
                         membership_symbols=symbols,
                     )
                 )
+
+    def test_trending_only_recovery_does_not_repeat_later_stages(
+        self,
+    ) -> None:
+        recovery_scope = list(AUTO_DAILY_TRACKED_STAGE_ORDER[1:])
+
+        self.assertEqual(
+            _resolve_followup_recovery_stages(
+                recovery_scope=recovery_scope,
+                incomplete_stages=['trending_ranks'],
+                has_exact_stage_debt_request=False,
+            ),
+            ['trending_ranks'],
+        )
+        self.assertEqual(
+            _resolve_followup_recovery_stages(
+                recovery_scope=recovery_scope,
+                incomplete_stages=[
+                    'technical_snapshots',
+                    'trending_ranks',
+                ],
+                has_exact_stage_debt_request=False,
+            ),
+            recovery_scope[
+                recovery_scope.index('technical_snapshots') :
+            ],
+        )
 
     def test_point_in_time_upstream_rebuild_uses_full_frozen_membership(
         self,

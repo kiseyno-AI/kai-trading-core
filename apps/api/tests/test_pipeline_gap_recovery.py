@@ -19,12 +19,15 @@ from app.eod.pykrx_backfill import (
     _count_all_nonconsuming_provider_admission_runs,
     _count_nonconsuming_provider_admission_runs,
     _count_nonconsuming_stage_debt_progress_runs,
+    _followup_exact_result_authority,
     _followup_recovery_stage_attempt_finished,
     _next_followup_stage_debt_request,
+    _recovered_followup_admission_scope_outcome,
     _record_followup_stage_debt_attempt,
     _required_provider_credentials_are_ready,
     _resolve_dart_followup_recovery_scope,
     _resolve_followup_stage_debt_state,
+    _validated_followup_exact_partition,
     _validated_followup_stage_debt_state,
     _validated_required_provider_admission,
 )
@@ -205,6 +208,339 @@ def _stored_stage_proof(
             publication_symbols
         ),
     }
+
+
+def _compact_quality_only_piotroski_stage(
+    symbols: list[str],
+) -> dict:
+    result = _exact_result(
+        selected=symbols,
+        successful=symbols,
+        retry_debt=[],
+        version='piotroski_scope_outcomes_v1',
+        status='partial',
+        stage_id='piotroski_filter',
+        publication_symbols=symbols,
+    )
+    result.update(
+        {
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'ranking_dependency_status': 'complete',
+            'reason': 'piotroski_evidence_incomplete',
+            'quality_warning': 'piotroski_evidence_incomplete',
+            'full_signal_coverage_status': 'incomplete',
+            'full_signal_usable_count': len(symbols) - 2,
+            'full_signal_incomplete_count': 1,
+            'full_signal_unusable_count': 1,
+            'results_persisted': len(symbols),
+            'results_failed': 0,
+        }
+    )
+    details = DailyPipelineStageService._build_stage_run_details(
+        stage_id='piotroski_filter',
+        result=result,
+        invocation_symbols=symbols,
+        market_date='2026-10-30',
+        publication_symbols=symbols,
+    )
+    return {'status': 'partial', 'details': details}
+
+
+def test_compact_nonblocking_piotroski_warning_is_not_new_debt() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 118)]
+    stage = _compact_quality_only_piotroski_stage(symbols)
+
+    authority = _followup_exact_result_authority(
+        stage_id='piotroski_filter',
+        stage=stage,
+    )
+
+    assert authority is not None
+    assert authority['status'] == 'partial'
+    assert authority['selected_stock_codes'] == symbols
+    assert authority['successful_stock_codes'] == symbols
+    assert authority['retry_debt_stock_codes'] == []
+    common_kwargs = {
+        'stage_id': 'piotroski_filter',
+        'stage': stage,
+        'expected_market_date': '2026-10-30',
+        'expected_publication_symbols': symbols,
+        'allowed_partition_symbols': symbols,
+    }
+    assert _validated_followup_exact_partition(**common_kwargs) is None
+    validated = _validated_followup_exact_partition(
+        **common_kwargs,
+        allow_quality_only_partial=True,
+    )
+    assert validated is not None
+    assert validated[0]['successful_stock_codes'] == symbols
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (
+        ('blocking_status', 'blocking'),
+        ('quality_warning', 'different_warning'),
+        ('gate_status', 'blocked'),
+        ('reason', 'unknown_quality_warning'),
+        ('full_signal_usable_count', 0),
+        ('results_persisted', 117.0),
+    ),
+)
+def test_compact_piotroski_warning_tampering_stays_fail_closed(
+    field: str,
+    value: object,
+) -> None:
+    symbols = [f'{index:06d}' for index in range(1, 118)]
+    stage = _compact_quality_only_piotroski_stage(symbols)
+    stage['details']['result_summary'][field] = value
+
+    assert _followup_exact_result_authority(
+        stage_id='piotroski_filter',
+        stage=stage,
+    ) is None
+
+
+def test_latest_exact_piotroski_proof_wins_over_stale_eod_proof() -> None:
+    fundamentals = _exact_result(
+        selected=SYMBOLS,
+        successful=SYMBOLS,
+        retry_debt=[],
+        version='dart_fundamentals_scope_outcomes_v1',
+        status='completed',
+        stage_id='fundamentals_daily_refresh',
+        publication_symbols=SYMBOLS,
+    )
+    current_piotroski = _compact_quality_only_piotroski_stage(SYMBOLS)
+    stale_piotroski = _exact_result(
+        selected=SYMBOLS[:2],
+        successful=SYMBOLS[:2],
+        retry_debt=[],
+        version='piotroski_scope_outcomes_v1',
+        status='completed',
+        stage_id='piotroski_filter',
+        publication_symbols=SYMBOLS[:2],
+    )
+
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata={
+            'followup_admission_scope_outcome': _parent_admission_outcome(),
+            'stage_progress': {
+                'piotroski_filter': {
+                    'status': 'completed',
+                    'result': stale_piotroski,
+                }
+            },
+        },
+        stage_rows={
+            'fundamentals_daily_refresh': {
+                'status': 'completed',
+                'result': fundamentals,
+            },
+            'piotroski_filter': current_piotroski,
+        },
+        incomplete_stages=['trending_ranks'],
+    )
+
+    assert resolution == {'required': False, 'ready': False}
+
+    legacy_dependency_resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata={
+            'followup_admission_scope_outcome': _parent_admission_outcome(),
+        },
+        stage_rows={'piotroski_filter': current_piotroski},
+        incomplete_stages=['trending_ranks'],
+    )
+    assert legacy_dependency_resolution == {
+        'required': False,
+        'ready': False,
+    }
+
+
+def test_compact_factor_quality_counts_can_remain_nested() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 118)]
+    result = _exact_result(
+        selected=symbols,
+        successful=symbols,
+        retry_debt=[],
+        version='factor_scope_outcomes_v1',
+        status='partial',
+        stage_id='value_factors',
+        publication_symbols=symbols,
+    )
+    result.update(
+        {
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'ranking_dependency_status': 'complete',
+            'reason': 'partial_usable_coverage',
+            'quality_warning': 'unusable_factor_cohort',
+            'quality_status': 'degraded',
+            'remaining_retryable_events': 0,
+            'results_persisted': len(symbols),
+            'results_failed': 0,
+            'summary': {
+                'persisted_ready_count': len(symbols) - 2,
+                'persisted_unready_count': 2,
+            },
+        }
+    )
+    details = DailyPipelineStageService._build_stage_run_details(
+        stage_id='value_factors',
+        result=result,
+        invocation_symbols=symbols,
+        market_date='2026-10-30',
+        publication_symbols=symbols,
+    )
+
+    authority = _followup_exact_result_authority(
+        stage_id='value_factors',
+        stage={'status': 'partial', 'details': details},
+    )
+
+    assert authority is not None
+    assert authority['status'] == 'partial'
+    assert authority['successful_stock_codes'] == symbols
+
+
+def _linked_full_admission_recovery_run() -> dict:
+    manifests = {
+        'pykrx_enrichment': 'pykrx_enrichment_scope_outcomes_v1',
+        'technical_snapshots': 'technical_snapshots_scope_outcomes_v1',
+        'action_summaries': 'action_summaries_scope_outcomes_v1',
+    }
+    stages = {
+        stage_id: {
+            'status': 'completed',
+            'result': _exact_result(
+                selected=SYMBOLS,
+                successful=SYMBOLS,
+                retry_debt=[],
+                version=manifest_version,
+                status='completed',
+                stage_id=stage_id,
+                publication_symbols=SYMBOLS,
+            ),
+        }
+        for stage_id, manifest_version in manifests.items()
+    }
+    return {
+        'id': 603,
+        'market_date': '2026-10-30',
+        'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+        'status': 'partial',
+        'run_metadata': {
+            'entrypoint': 'daily_pipeline_stage_service.run',
+            'reused_eod_collection_run_id': 77,
+            'point_in_time_recovery': True,
+            'resume_from_stage': 'pykrx_enrichment',
+            'resolved_stages': list(manifests),
+            'symbols': list(SYMBOLS),
+            'exact_membership_symbol_count': len(SYMBOLS),
+            'exact_membership_sha256': market_membership_sha256(SYMBOLS),
+        },
+        'stages': stages,
+    }
+
+
+def test_linked_full_recovery_reconciles_stale_admission_only() -> None:
+    prior_admission = build_exact_symbol_scope_outcome(
+        manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+        selected_symbols=SYMBOLS,
+        successful_symbols=SYMBOLS[:2],
+        retry_debt_symbols=SYMBOLS[2:],
+    )
+    latest_eod_run = {
+        'id': 77,
+        'symbols_total': len(SYMBOLS),
+        'symbols_succeeded': len(SYMBOLS),
+        'symbols_failed': 0,
+        'run_metadata': {
+            'requested_symbols': list(SYMBOLS),
+            'failed_symbols': [],
+            'unattempted_symbols': [],
+            'followup_admission_scope_outcome': prior_admission,
+        },
+    }
+    pipeline_run = _linked_full_admission_recovery_run()
+
+    with patch(
+        'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+        return_value=SYMBOLS,
+    ):
+        recovered = _recovered_followup_admission_scope_outcome(
+            latest_eod_run=latest_eod_run,
+            market_date='2026-10-30',
+            pipeline_run=pipeline_run,
+        )
+
+    assert recovered is not None
+    assert recovered['selected_stock_codes'] == SYMBOLS
+    assert recovered['successful_stock_codes'] == SYMBOLS
+    assert recovered['retry_debt_stock_codes'] == []
+
+    wrong_hash = deepcopy(pipeline_run)
+    wrong_hash['run_metadata']['exact_membership_sha256'] = '0' * 64
+    with patch(
+        'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+        return_value=SYMBOLS,
+    ):
+        assert _recovered_followup_admission_scope_outcome(
+            latest_eod_run=latest_eod_run,
+            market_date='2026-10-30',
+            pipeline_run=wrong_hash,
+        ) is None
+
+    retrying_stage = deepcopy(pipeline_run)
+    retrying_stage['stages']['action_summaries']['result'] = _exact_result(
+        selected=SYMBOLS,
+        successful=SYMBOLS[:2],
+        retry_debt=SYMBOLS[2:],
+        version='action_summaries_scope_outcomes_v1',
+        status='partial',
+        stage_id='action_summaries',
+        publication_symbols=SYMBOLS,
+    )
+    retrying_stage['stages']['action_summaries']['status'] = 'partial'
+    with patch(
+        'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+        return_value=SYMBOLS,
+    ):
+        assert _recovered_followup_admission_scope_outcome(
+            latest_eod_run=latest_eod_run,
+            market_date='2026-10-30',
+            pipeline_run=retrying_stage,
+        ) is None
+
+    wrong_manifest = deepcopy(pipeline_run)
+    wrong_manifest['stages']['technical_snapshots']['result'][
+        'scope_outcome_manifest_version'
+    ] = 'action_summaries_scope_outcomes_v1'
+    wrong_finalization = deepcopy(pipeline_run)
+    wrong_finalization['stages']['action_summaries']['result'][
+        'scope_finalization'
+    ]['stage'] = 'technical_snapshots'
+    bool_lineage = deepcopy(pipeline_run)
+    bool_lineage['run_metadata']['reused_eod_collection_run_id'] = True
+    for invalid_run in (
+        wrong_manifest,
+        wrong_finalization,
+        bool_lineage,
+    ):
+        with patch(
+            'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+            return_value=SYMBOLS,
+        ):
+            assert _recovered_followup_admission_scope_outcome(
+                latest_eod_run=latest_eod_run,
+                market_date='2026-10-30',
+                pipeline_run=invalid_run,
+            ) is None
 
 
 def test_price_collection_requires_its_dedicated_scope_manifest() -> None:
