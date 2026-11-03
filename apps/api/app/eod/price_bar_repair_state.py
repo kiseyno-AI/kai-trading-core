@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import and_, case, false, func, or_, select
 
 from app.core.settings import settings
-from app.db import session_scope
+from app.db import session_scope, session_timeout_budget
 from app.db_models import (
     DailyActionSummary,
     DailyAdvancedValueFactorResult,
@@ -4369,29 +4369,36 @@ def _rebuild_pending_price_dependent_evaluations_locked(
             'frozen_membership_scopes': frozen_scope_evidence,
         }
 
-    post_decision_result = (
-        decider_post_decision_evaluation_service.compute_evaluations(
-            market_date_from=market_date_from,
-            market_date_to=market_date_to,
-            symbols=affected_symbols,
-            window_days=5,
-            force_recompute=True,
+    with session_timeout_budget(
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
+    ):
+        post_decision_result = (
+            decider_post_decision_evaluation_service.compute_evaluations(
+                market_date_from=market_date_from,
+                market_date_to=market_date_to,
+                symbols=affected_symbols,
+                window_days=5,
+                force_recompute=True,
+            )
         )
-    )
-    signal_maintenance_result = (
-        signal_decider_evaluation_maintenance_service.repair_coverage_range(
-            market_date_from=market_date_from,
-            market_date_to=market_date_to,
-            symbols=affected_symbols,
-            horizons=SIGNAL_DECIDER_EVALUATION_HORIZONS,
-            primary_horizons=SIGNAL_DECIDER_EVALUATION_HORIZONS,
-            evaluation_version=DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
-            force_recompute=True,
-            refresh_calendar=True,
-            fail_on_mature_gaps=True,
-            trigger='price_bar_repair',
+        signal_maintenance_result = (
+            signal_decider_evaluation_maintenance_service.repair_coverage_range(
+                market_date_from=market_date_from,
+                market_date_to=market_date_to,
+                symbols=affected_symbols,
+                horizons=SIGNAL_DECIDER_EVALUATION_HORIZONS,
+                primary_horizons=SIGNAL_DECIDER_EVALUATION_HORIZONS,
+                evaluation_version=(
+                    DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION
+                ),
+                force_recompute=True,
+                refresh_calendar=True,
+                fail_on_mature_gaps=True,
+                trigger='price_bar_repair',
+            )
         )
-    )
     if str(signal_maintenance_result.get('status') or '') != 'completed':
         raise RuntimeError(
             'signal-decider evaluation maintenance did not complete: '

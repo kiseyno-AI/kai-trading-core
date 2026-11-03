@@ -24,6 +24,9 @@ class _ScalarResult:
     def scalars(self):
         return self
 
+    def mappings(self):
+        return self
+
     def all(self):
         return list(self._values)
 
@@ -39,6 +42,66 @@ class _EvaluationSession:
 
 
 class DeciderPostDecisionEvaluationRepositoryTests(unittest.TestCase):
+    def test_list_feedback_sources_joins_latest_snapshot_once(self):
+        source_row = {
+            'feedback_id': 11,
+            'market_date': date(2026, 4, 23),
+            'symbol': '005930',
+            'agent_name': 'signal-decider',
+            'agent_version': 'openclaw-v1',
+            'run_id': 'run-11',
+            'received_at': datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+            'normalized_feedback_payload': {},
+            'feedback_payload': {},
+            'decision_snapshot_id': 84,
+            'feedback_received_at': datetime(
+                2026, 4, 23, 6, 1, tzinfo=timezone.utc
+            ),
+            'created_at': datetime(2026, 4, 23, 6, 2, tzinfo=timezone.utc),
+            'decision_request_payload': {},
+        }
+        session = _EvaluationSession([[source_row]])
+
+        @contextmanager
+        def session_scope():
+            yield session
+
+        with patch(
+            'app.agent_context.decider_evaluation_service.session_scope',
+            session_scope,
+        ):
+            result = (
+                DeciderPostDecisionEvaluationRepository()
+                .list_feedback_sources(
+                    market_date_from=date(2026, 4, 1),
+                    market_date_to=date(2026, 4, 30),
+                    agent_names=('signal-decider', 'short-term-decider'),
+                    symbols=('005930', '000660'),
+                )
+            )
+
+        self.assertEqual(result, [source_row])
+        statement = str(session.statements[0])
+        self.assertIn('LEFT OUTER JOIN LATERAL', statement)
+        self.assertEqual(
+            statement.count('FROM signal_decider_decision_snapshots'),
+            1,
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots.created_at DESC',
+            statement,
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots.id DESC',
+            statement,
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots.feedback_id = '
+            'agent_context_feedback.id',
+            statement,
+        )
+        self.assertIn('agent_context_feedback.symbol IN', statement)
+
     def test_bulk_upsert_serializes_rows_before_session_exit(self):
         record = SimpleNamespace(id=91)
         session = _EvaluationSession([[91], [record]])

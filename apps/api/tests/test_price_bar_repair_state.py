@@ -2508,11 +2508,17 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
         )
         lock_calls: list[dict] = []
         session_scope_calls: list[dict] = []
+        timeout_budget_calls: list[dict] = []
 
         @contextmanager
         def fake_session_scope(**kwargs):
             session_scope_calls.append(kwargs)
             yield next(sessions)
+
+        @contextmanager
+        def fake_timeout_budget(**kwargs):
+            timeout_budget_calls.append(kwargs)
+            yield
 
         @contextmanager
         def available_locks(**kwargs):
@@ -2584,6 +2590,10 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
                 side_effect=fake_session_scope,
             ),
             patch(
+                'app.eod.price_bar_repair_state.session_timeout_budget',
+                side_effect=fake_timeout_budget,
+            ),
+            patch(
                 'app.agent_context.decider_evaluation_service.'
                 'decider_post_decision_evaluation_service.compute_evaluations',
                 return_value=post_result,
@@ -2646,6 +2656,10 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
         self.assertEqual(
             session_scope_calls,
             [{'statement_timeout_ms': 300_000}] * 3,
+        )
+        self.assertEqual(
+            timeout_budget_calls,
+            [{'statement_timeout_ms': 300_000}],
         )
         self.assertEqual(
             lock_calls,

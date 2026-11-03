@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, true
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
 
@@ -424,45 +424,27 @@ class DeciderPostDecisionEvaluationRepository:
         agent_names: Sequence[str],
         symbols: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        snapshot_id_subquery = (
-            select(SignalDeciderDecisionSnapshot.id)
+        latest_snapshot = (
+            select(
+                SignalDeciderDecisionSnapshot.id.label(
+                    'decision_snapshot_id'
+                ),
+                SignalDeciderDecisionSnapshot.feedback_received_at.label(
+                    'feedback_received_at'
+                ),
+                SignalDeciderDecisionSnapshot.created_at.label('created_at'),
+                SignalDeciderDecisionSnapshot.request_payload.label(
+                    'decision_request_payload'
+                ),
+            )
             .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
             .order_by(
                 SignalDeciderDecisionSnapshot.created_at.desc(),
                 SignalDeciderDecisionSnapshot.id.desc(),
             )
             .limit(1)
-            .scalar_subquery()
-        )
-        snapshot_feedback_received_at_subquery = (
-            select(SignalDeciderDecisionSnapshot.feedback_received_at)
-            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
-            .order_by(
-                SignalDeciderDecisionSnapshot.created_at.desc(),
-                SignalDeciderDecisionSnapshot.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
-        )
-        snapshot_created_at_subquery = (
-            select(SignalDeciderDecisionSnapshot.created_at)
-            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
-            .order_by(
-                SignalDeciderDecisionSnapshot.created_at.desc(),
-                SignalDeciderDecisionSnapshot.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
-        )
-        snapshot_request_payload_subquery = (
-            select(SignalDeciderDecisionSnapshot.request_payload)
-            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
-            .order_by(
-                SignalDeciderDecisionSnapshot.created_at.desc(),
-                SignalDeciderDecisionSnapshot.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
+            .correlate(AgentContextFeedback)
+            .lateral('latest_decision_snapshot')
         )
         with session_scope() as session:
             stmt = (
@@ -476,11 +458,12 @@ class DeciderPostDecisionEvaluationRepository:
                     AgentContextFeedback.received_at.label('received_at'),
                     AgentContextFeedback.normalized_feedback_payload.label('normalized_feedback_payload'),
                     AgentContextFeedback.feedback_payload.label('feedback_payload'),
-                    snapshot_id_subquery.label('decision_snapshot_id'),
-                    snapshot_feedback_received_at_subquery.label('feedback_received_at'),
-                    snapshot_created_at_subquery.label('created_at'),
-                    snapshot_request_payload_subquery.label('decision_request_payload'),
+                    latest_snapshot.c.decision_snapshot_id,
+                    latest_snapshot.c.feedback_received_at,
+                    latest_snapshot.c.created_at,
+                    latest_snapshot.c.decision_request_payload,
                 )
+                .outerjoin(latest_snapshot, true())
                 .where(
                     AgentContextFeedback.market_date >= market_date_from,
                     AgentContextFeedback.market_date <= market_date_to,
