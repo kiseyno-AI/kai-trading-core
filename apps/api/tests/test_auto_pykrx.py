@@ -8225,6 +8225,10 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value=0,
             ),
             patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state'
+            ) as resolve_stage_debt,
+            patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
                 return_value={'status': 'partial', 'pipeline_run_id': 93},
             ) as resume_stages,
@@ -8250,6 +8254,77 @@ class PykrxBackfillServiceTests(TestCase):
                     AUTO_DAILY_TRACKED_STAGE_ORDER.index('pykrx_enrichment'):
                 ]
             ),
+        )
+        resolve_stage_debt.assert_not_called()
+
+    def test_stale_upstream_resume_marker_does_not_bypass_downstream_debt(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        latest_pipeline_run = {
+            'id': 93,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'partial',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': [
+                    'pykrx_enrichment',
+                    'fundamentals_daily_refresh',
+                    'piotroski_filter',
+                ],
+                'reused_eod_collection_run_id': 8,
+            },
+            'stages': {
+                'pykrx_enrichment': {'status': 'completed'},
+                'fundamentals_daily_refresh': {'status': 'completed'},
+                'piotroski_filter': {'status': 'partial'},
+            },
+        }
+        latest_eod_run = {
+            'id': 8,
+            'trade_date': '2026-04-03',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'downstream_retry_symbols': ['005930'],
+                'downstream_retry_resume_from_stage': 'pykrx_enrichment',
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': False,
+                    'reason': 'piotroski_filter_stage_debt_manifest_invalid',
+                },
+            ) as resolve_stage_debt,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+            )
+
+        resolve_stage_debt.assert_called_once()
+        self.assertEqual(
+            result['reason'],
+            'followup_stage_debt_scope_unavailable',
+        )
+        self.assertEqual(
+            result['followup_recovery']['blocker'],
+            'piotroski_filter_stage_debt_manifest_invalid',
         )
 
     def test_partial_followup_recovery_keeps_downstream_scope_retryable(

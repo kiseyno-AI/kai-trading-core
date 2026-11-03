@@ -6361,14 +6361,47 @@ class PykrxBackfillService:
             # its proof is copied to the EOD ancestor. Reconcile that exact
             # durable proof instead of rerunning a partial decider.
             incomplete_stages.clear()
-        stage_debt_resolution = _resolve_followup_stage_debt_state(
-            market_date=market_date,
-            eod_collection_run_id=int(latest_eod_run['id']),
-            latest_eod_metadata=latest_eod_metadata,
-            stage_rows=stage_rows,
-            incomplete_stages=incomplete_stages,
-            latest_pipeline_run=pipeline_run,
+        first_exact_followup_index = next(
+            (
+                recovery_scope.index(stage_id)
+                for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+                if stage_id in recovery_scope
+            ),
+            None,
         )
+        upstream_admission_rebuild_pending = bool(
+            downstream_retry_symbols
+            and incomplete_stages
+            and incomplete_stages[0] == downstream_resume_from_stage
+            and downstream_resume_from_stage in recovery_scope
+            and first_exact_followup_index is not None
+            and recovery_scope.index(downstream_resume_from_stage)
+            < first_exact_followup_index
+            and latest_eod_metadata.get(
+                FOLLOWUP_STAGE_DEBT_METADATA_KEY
+            )
+            is None
+        )
+        if upstream_admission_rebuild_pending:
+            # Exact follow-up debt is scoped by the upstream admission
+            # partition. When enrichment (or another admission prerequisite)
+            # must be rebuilt first, the persisted downstream partition is
+            # necessarily stale. Defer debt reconstruction to the suffix run
+            # instead of blocking that prerequisite repair with old proof.
+            stage_debt_resolution = {
+                'required': False,
+                'ready': False,
+                'source': 'deferred_for_upstream_admission_rebuild',
+            }
+        else:
+            stage_debt_resolution = _resolve_followup_stage_debt_state(
+                market_date=market_date,
+                eod_collection_run_id=int(latest_eod_run['id']),
+                latest_eod_metadata=latest_eod_metadata,
+                stage_rows=stage_rows,
+                incomplete_stages=incomplete_stages,
+                latest_pipeline_run=pipeline_run,
+            )
         if (
             stage_debt_resolution.get('required') is True
             and stage_debt_resolution.get('ready') is not True
