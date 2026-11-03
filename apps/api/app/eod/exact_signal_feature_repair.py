@@ -13,6 +13,7 @@ from sqlalchemy import delete, select, text
 from app.db import session_scope
 from app.db_models import (
     DailyMarketRiskFilterResult,
+    DailyMarketRiskSnapshot,
     DailySignalFeature,
     Symbol,
 )
@@ -25,10 +26,12 @@ from app.eod.derived_stage_repair import (
 from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import market_membership_sha256
 from app.eod.price_bar_repair_state import (
+    EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT,
     REQUIRED_EXACT_FACTOR_MODELS,
     _derived_output_fingerprint,
     _stable_output_value,
     load_pending_price_bar_rebuild_batches,
+    record_pending_exact_signal_repair_proof,
     resolve_pending_frozen_price_dependent_membership,
 )
 from app.internal.exact_repair_manifest import (
@@ -46,10 +49,20 @@ from app.market.symbol_codes import is_canonical_krx_short_code
 from app.signals.daily_signal_features import daily_signal_feature_service
 
 
-CHECKPOINT_SCHEMA_VERSION = 'signal_feature_exact_date_checkpoint_v1'
-IMPLEMENTATION_CONTRACT = 'signal_feature_exact_date_implementation_v2'
+CHECKPOINT_SCHEMA_VERSION = 'signal_feature_exact_date_checkpoint_v2'
+IMPLEMENTATION_CONTRACT = EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
 REPAIR_SOURCE = 'stored_owned_fallback_exact_scope'
 PRICE_HISTORY_ROWS = 2
+MARKET_RISK_COVERAGE_COMPLETE = 'complete'
+MARKET_RISK_COVERAGE_PARTIAL = 'partial'
+MARKET_RISK_COVERAGE_UNAVAILABLE = 'unavailable'
+MARKET_RISK_COVERAGE_STATUSES = frozenset(
+    {
+        MARKET_RISK_COVERAGE_COMPLETE,
+        MARKET_RISK_COVERAGE_PARTIAL,
+        MARKET_RISK_COVERAGE_UNAVAILABLE,
+    }
+)
 
 _EXACT_FACTOR_SOURCE_MODELS = {
     component: model
@@ -60,11 +73,15 @@ _FULL_DATE_UNIVERSE_SOURCE_MODELS = {
     'piotroski_filter': dict(REQUIRED_EXACT_FACTOR_MODELS)[
         'piotroski_filter'
     ],
+}
+_MARKET_RISK_SOURCE_MODELS = {
+    'market_risk_snapshot': DailyMarketRiskSnapshot,
     'market_risk_filter': DailyMarketRiskFilterResult,
 }
 SOURCE_MODELS = {
     **_EXACT_FACTOR_SOURCE_MODELS,
     **_FULL_DATE_UNIVERSE_SOURCE_MODELS,
+    **_MARKET_RISK_SOURCE_MODELS,
 }
 SOURCE_COMPONENTS = frozenset(
     {
@@ -115,6 +132,7 @@ def _model_source_fingerprint(
     market_date: date,
     symbols: Sequence[str] | None,
     required_symbols: Sequence[str] | None = None,
+    include_missing_scope: bool = False,
 ) -> dict[str, Any]:
     excluded_columns = {'id', 'symbol_id', 'created_at', 'updated_at'}
     column_names = tuple(
@@ -162,6 +180,26 @@ def _model_source_fingerprint(
                 ),
             }
         )
+        if include_missing_scope:
+            missing_required = sorted(
+                required_set.difference(observed_required)
+            )
+            if not missing_required:
+                coverage_status = MARKET_RISK_COVERAGE_COMPLETE
+            elif not observed_required:
+                coverage_status = MARKET_RISK_COVERAGE_UNAVAILABLE
+            else:
+                coverage_status = MARKET_RISK_COVERAGE_PARTIAL
+            fingerprint.update(
+                {
+                    'missing_scope_row_count': len(missing_required),
+                    'missing_scope_membership_sha256': (
+                        market_membership_sha256(missing_required)
+                    ),
+                    'missing_scope_symbols': missing_required,
+                    'coverage_status': coverage_status,
+                }
+            )
     return fingerprint
 
 
@@ -316,6 +354,15 @@ def _load_source_fingerprints(
                 symbols=None,
                 required_symbols=symbols,
             )
+        for component, model in _MARKET_RISK_SOURCE_MODELS.items():
+            fingerprints[component] = _model_source_fingerprint(
+                session,
+                model=model,
+                market_date=parsed_date,
+                symbols=None,
+                required_symbols=symbols,
+                include_missing_scope=True,
+            )
     return fingerprints
 
 
@@ -422,10 +469,15 @@ def verify_exact_signal_feature_rows(
             f'observed={len(observed)}, fresh={len(fresh)}, '
             f'expected={len(symbols)}'
         )
+    updated_at_values = [
+        row[1] for row in rows if row[1] is not None
+    ]
     return {
         'exact_row_count': len(observed),
         'fresh_exact_row_count': len(fresh),
         'membership_sha256': market_membership_sha256(observed),
+        'minimum_updated_at': min(updated_at_values).isoformat(),
+        'maximum_updated_at': max(updated_at_values).isoformat(),
     }
 
 
@@ -558,6 +610,8 @@ class ExactSignalFeatureRepair:
         | None = None,
         exact_verifier: Callable[..., Mapping[str, Any]] | None = None,
         stale_pruner: Callable[..., Mapping[str, Any]] | None = None,
+        completion_proof_recorder: Callable[..., Mapping[str, Any]]
+        | None = None,
         guard_factory: Callable[..., AbstractContextManager[Any]] | None = None,
         finality_validator: Callable[[date], None] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -586,6 +640,10 @@ class ExactSignalFeatureRepair:
             exact_verifier or verify_exact_signal_feature_rows
         )
         self.stale_pruner = stale_pruner or prune_stale_signal_feature_rows
+        self.completion_proof_recorder = (
+            completion_proof_recorder
+            or record_pending_exact_signal_repair_proof
+        )
         self.guard_factory = guard_factory or exact_signal_feature_guard
         self.finality_validator = finality_validator or (
             lambda market_date: validate_finalized_krx_write_date(
@@ -621,11 +679,15 @@ class ExactSignalFeatureRepair:
     def _validated_source_fingerprints(
         value: Any,
         *,
-        expected_symbol_count: int,
-        expected_membership_sha256: str,
+        expected_symbols: Sequence[str],
     ) -> dict[str, dict[str, Any]] | None:
         if not isinstance(value, Mapping) or set(value) != SOURCE_COMPONENTS:
             return None
+        normalized_expected = _normalize_symbols(expected_symbols)
+        expected_symbol_count = len(normalized_expected)
+        expected_membership_sha256 = market_membership_sha256(
+            normalized_expected
+        )
         normalized: dict[str, dict[str, Any]] = {}
         for component in sorted(SOURCE_COMPONENTS):
             entry = value.get(component)
@@ -691,7 +753,133 @@ class ExactSignalFeatureRepair:
                         ),
                     }
                 )
+            if component in _MARKET_RISK_SOURCE_MODELS:
+                exact_scope_row_count = entry.get(
+                    'exact_scope_row_count'
+                )
+                exact_scope_membership_sha256 = str(
+                    entry.get('exact_scope_membership_sha256') or ''
+                ).strip().lower()
+                missing_scope_row_count = entry.get(
+                    'missing_scope_row_count'
+                )
+                missing_scope_membership_sha256 = str(
+                    entry.get('missing_scope_membership_sha256') or ''
+                ).strip().lower()
+                raw_missing_scope_symbols = entry.get(
+                    'missing_scope_symbols'
+                )
+                if not isinstance(raw_missing_scope_symbols, list):
+                    return None
+                missing_scope_symbols = _normalize_symbols(
+                    raw_missing_scope_symbols
+                )
+                if raw_missing_scope_symbols != missing_scope_symbols:
+                    return None
+                expected_set = set(normalized_expected)
+                missing_set = set(missing_scope_symbols)
+                if not missing_set.issubset(expected_set):
+                    return None
+                exact_scope_symbols = sorted(
+                    expected_set.difference(missing_set)
+                )
+                coverage_status = str(
+                    entry.get('coverage_status') or ''
+                ).strip().lower()
+                hashes = (
+                    exact_scope_membership_sha256,
+                    missing_scope_membership_sha256,
+                )
+                if (
+                    isinstance(exact_scope_row_count, bool)
+                    or not isinstance(exact_scope_row_count, int)
+                    or exact_scope_row_count < 0
+                    or isinstance(missing_scope_row_count, bool)
+                    or not isinstance(missing_scope_row_count, int)
+                    or missing_scope_row_count < 0
+                    or exact_scope_row_count + missing_scope_row_count
+                    != expected_symbol_count
+                    or exact_scope_row_count != len(exact_scope_symbols)
+                    or missing_scope_row_count != len(missing_scope_symbols)
+                    or exact_scope_membership_sha256
+                    != market_membership_sha256(exact_scope_symbols)
+                    or missing_scope_membership_sha256
+                    != market_membership_sha256(missing_scope_symbols)
+                    or row_count < exact_scope_row_count
+                    or coverage_status not in MARKET_RISK_COVERAGE_STATUSES
+                    or any(
+                        len(value_hash) != 64
+                        or any(
+                            character not in '0123456789abcdef'
+                            for character in value_hash
+                        )
+                        for value_hash in hashes
+                    )
+                ):
+                    return None
+                expected_coverage_status = (
+                    MARKET_RISK_COVERAGE_COMPLETE
+                    if missing_scope_row_count == 0
+                    else MARKET_RISK_COVERAGE_UNAVAILABLE
+                    if exact_scope_row_count == 0
+                    else MARKET_RISK_COVERAGE_PARTIAL
+                )
+                if coverage_status != expected_coverage_status:
+                    return None
+                if (
+                    exact_scope_row_count == expected_symbol_count
+                    and exact_scope_membership_sha256
+                    != expected_membership_sha256
+                ):
+                    return None
+                if (
+                    exact_scope_row_count == 0
+                    and exact_scope_membership_sha256
+                    != market_membership_sha256(())
+                ):
+                    return None
+                if (
+                    missing_scope_row_count == 0
+                    and missing_scope_membership_sha256
+                    != market_membership_sha256(())
+                ):
+                    return None
+                if (
+                    missing_scope_row_count == expected_symbol_count
+                    and missing_scope_membership_sha256
+                    != expected_membership_sha256
+                ):
+                    return None
+                normalized_entry.update(
+                    {
+                        'exact_scope_row_count': exact_scope_row_count,
+                        'exact_scope_membership_sha256': (
+                            exact_scope_membership_sha256
+                        ),
+                        'missing_scope_row_count': missing_scope_row_count,
+                        'missing_scope_membership_sha256': (
+                            missing_scope_membership_sha256
+                        ),
+                        'missing_scope_symbols': missing_scope_symbols,
+                        'coverage_status': coverage_status,
+                    }
+                )
             normalized[component] = normalized_entry
+        snapshot = normalized['market_risk_snapshot']
+        filter_result = normalized['market_risk_filter']
+        subset_fields = (
+            'exact_scope_row_count',
+            'exact_scope_membership_sha256',
+            'missing_scope_row_count',
+            'missing_scope_membership_sha256',
+            'missing_scope_symbols',
+            'coverage_status',
+        )
+        if any(
+            snapshot[field] != filter_result[field]
+            for field in subset_fields
+        ):
+            return None
         return normalized
 
     @staticmethod
@@ -736,8 +924,7 @@ class ExactSignalFeatureRepair:
             state.get('source_fingerprints')
             if isinstance(state, Mapping)
             else None,
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         stale_extras = self._validated_stale_extras(
             state.get('stale_extras')
@@ -772,13 +959,11 @@ class ExactSignalFeatureRepair:
             return False
         sources = cls._validated_source_fingerprints(
             result.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         reviewed_sources = cls._validated_source_fingerprints(
             proof.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         if sources is None or reviewed_sources != sources:
             return False
@@ -850,13 +1035,11 @@ class ExactSignalFeatureRepair:
             return False
         live_sources = self._validated_source_fingerprints(
             live_state.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         expected_sources = self._validated_source_fingerprints(
             unit['result'].get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         return bool(
             live_sources is not None
@@ -886,13 +1069,11 @@ class ExactSignalFeatureRepair:
     ) -> bool:
         reviewed_sources = cls._validated_source_fingerprints(
             reviewed_proof.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         current_sources = cls._validated_source_fingerprints(
             current_proof.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         current_stale = cls._validated_stale_extras(
             current_proof.get('stale_extras')
@@ -935,13 +1116,11 @@ class ExactSignalFeatureRepair:
     ) -> dict[str, Any]:
         reviewed_sources = self._validated_source_fingerprints(
             dry_proof.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         before_sources = self._validated_source_fingerprints(
             before_state.get('source_fingerprints'),
-            expected_symbol_count=int(item['symbol_count']),
-            expected_membership_sha256=str(item['membership_sha256']),
+            expected_symbols=list(item['symbols']),
         )
         if reviewed_sources is None or before_sources != reviewed_sources:
             raise RuntimeError(
@@ -992,8 +1171,7 @@ class ExactSignalFeatureRepair:
         )
         persisted_sources = self._validated_source_fingerprints(
             persisted_state.get('source_fingerprints'),
-            expected_symbol_count=expected_count,
-            expected_membership_sha256=expected_hash,
+            expected_symbols=list(item['symbols']),
         )
         if persisted_sources != before_sources:
             raise RuntimeError(
@@ -1014,12 +1192,19 @@ class ExactSignalFeatureRepair:
         )
         final_sources = self._validated_source_fingerprints(
             final_state.get('source_fingerprints'),
-            expected_symbol_count=expected_count,
-            expected_membership_sha256=expected_hash,
+            expected_symbols=list(item['symbols']),
         )
         if final_sources != before_sources:
             raise RuntimeError(
                 'signal-feature source dependency changed during stale prune'
+            )
+        rebuild_completed_at = self.clock()
+        if (
+            rebuild_completed_at.tzinfo is None
+            or rebuild_completed_at < repair_started_at
+        ):
+            raise ValueError(
+                'signal-feature repair completion clock is invalid'
             )
         result = {
             'implementation_contract': IMPLEMENTATION_CONTRACT,
@@ -1029,6 +1214,8 @@ class ExactSignalFeatureRepair:
             'repair_source': REPAIR_SOURCE,
             'exact_symbol_count': expected_count,
             'membership_sha256': expected_hash,
+            'repair_started_at': repair_started_at.isoformat(),
+            'rebuild_completed_at': rebuild_completed_at.isoformat(),
             'source_fingerprints': final_sources,
             'rebuild_result': rebuild_result,
             'persistence_verification': persistence_verification,
@@ -1051,7 +1238,70 @@ class ExactSignalFeatureRepair:
             raise RuntimeError(
                 'signal-feature live completion evidence does not match result'
             )
+        durable_proof = self._record_durable_completed_proof(item, result)
+        result['durable_proof'] = durable_proof
         return result
+
+    def _record_durable_completed_proof(
+        self,
+        item: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            repair_started_at = datetime.fromisoformat(
+                str(result['repair_started_at'])
+            )
+            rebuild_completed_at = datetime.fromisoformat(
+                str(result['rebuild_completed_at'])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                'signal-feature completion timestamps are invalid'
+            ) from exc
+        source_fingerprints = self._validated_source_fingerprints(
+            result.get('source_fingerprints'),
+            expected_symbols=list(item['symbols']),
+        )
+        output_fingerprint = (
+            (result.get('completion_evidence') or {}).get(
+                'output_fingerprint'
+            )
+            if isinstance(result.get('completion_evidence'), Mapping)
+            else None
+        )
+        if (
+            source_fingerprints is None
+            or not isinstance(output_fingerprint, Mapping)
+        ):
+            raise RuntimeError(
+                'signal-feature completion evidence is invalid'
+            )
+        rebuild_result = result.get('rebuild_result')
+        durable_proof = dict(
+            self.completion_proof_recorder(
+                market_date=str(item['market_date']),
+                exact_symbols=list(item['symbols']),
+                manifest_sha256=self.manifest_sha256,
+                item_sha256=canonical_json_sha256(item),
+                implementation_contract=IMPLEMENTATION_CONTRACT,
+                source_fingerprints=source_fingerprints,
+                output_fingerprint=dict(output_fingerprint),
+                repair_started_at=repair_started_at,
+                rebuild_completed_at=rebuild_completed_at,
+                preserved_direct_source_rows=int(
+                    (rebuild_result or {}).get(
+                        'preserved_direct_source_rows'
+                    )
+                    if isinstance(rebuild_result, Mapping)
+                    else 0
+                ),
+            )
+        )
+        if int(durable_proof.get('updated_batch_count') or 0) <= 0:
+            raise RuntimeError(
+                'signal-feature durable pending-batch proof was not recorded'
+            )
+        return durable_proof
 
     def _reconcile_applied_result(
         self,
@@ -1291,6 +1541,32 @@ class ExactSignalFeatureRepair:
                             'error_message': str(exc)[:500],
                         }
                 if completed_valid:
+                    if apply:
+                        try:
+                            durable_proof = (
+                                self._record_durable_completed_proof(
+                                    item,
+                                    previous['result'],
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            return {
+                                **base,
+                                'status': 'blocked',
+                                'applied': False,
+                                'reason': 'durable_proof_reconciliation_failed',
+                                'market_date': market_date,
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                            }
+                        reconciled_unit = deepcopy(dict(previous))
+                        reconciled_result = dict(
+                            reconciled_unit['result']
+                        )
+                        reconciled_result['durable_proof'] = durable_proof
+                        reconciled_unit['result'] = reconciled_result
+                        checkpoint['units'][market_date] = reconciled_unit
+                        write_checkpoint(checkpoint_path, checkpoint)
                     completed_dates += 1
                     skipped_dates += 1
                     continue

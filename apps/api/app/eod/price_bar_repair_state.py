@@ -46,6 +46,7 @@ from app.eod.market_membership import (
     market_membership_sha256,
     validate_market_membership_snapshot,
 )
+from app.internal.exact_repair_manifest import canonical_json_sha256
 from app.market.symbol_codes import is_canonical_krx_short_code
 from app.repositories.eod_run_repository import advisory_eod_collection_locks
 
@@ -74,6 +75,10 @@ PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE = (
 )
 FACTOR_REBUILD_METADATA_SCHEMA_VERSION = 3
 SUPPORTED_FACTOR_REBUILD_METADATA_SCHEMA_VERSIONS = frozenset({2, 3})
+EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION = 1
+EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT = (
+    'signal_feature_exact_date_implementation_v3'
+)
 
 
 class PendingPriceBarRebuildError(RuntimeError):
@@ -145,6 +150,167 @@ def load_pending_price_bar_rebuild_batches() -> list[dict[str, Any]]:
             )
         ).all()
         return [_serialize_batch(row) for row in rows]
+
+
+def record_pending_exact_signal_repair_proof(
+    *,
+    market_date: str | date,
+    exact_symbols: Sequence[str],
+    manifest_sha256: str,
+    item_sha256: str,
+    implementation_contract: str,
+    source_fingerprints: Mapping[str, Any],
+    output_fingerprint: Mapping[str, Any],
+    repair_started_at: datetime,
+    rebuild_completed_at: datetime,
+    preserved_direct_source_rows: int,
+) -> dict[str, Any]:
+    """Bind one exact signal repair to each covered pending batch."""
+
+    normalized_date = _normalize_date(market_date)
+    date_key = normalized_date.isoformat()
+    normalized_symbols = tuple(
+        sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in exact_symbols
+                if str(symbol).strip()
+            }
+        )
+    )
+    if (
+        not normalized_symbols
+        or len(normalized_symbols) != len(exact_symbols)
+        or any(
+            not is_canonical_krx_short_code(symbol)
+            for symbol in normalized_symbols
+        )
+    ):
+        raise ValueError(
+            'exact signal repair proof requires a non-empty canonical scope'
+        )
+    if implementation_contract != EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT:
+        raise ValueError('exact signal repair implementation contract mismatch')
+    if repair_started_at.tzinfo is None or rebuild_completed_at.tzinfo is None:
+        raise ValueError('exact signal repair proof timestamps require timezone')
+    if rebuild_completed_at < repair_started_at:
+        raise ValueError('exact signal repair proof timestamps are reversed')
+    for label, digest in (
+        ('manifest', manifest_sha256),
+        ('item', item_sha256),
+    ):
+        if not _is_sha256(str(digest).strip().lower()):
+            raise ValueError(f'exact signal repair {label} hash is invalid')
+    output_count = output_fingerprint.get('row_count')
+    output_sha256 = str(
+        output_fingerprint.get('output_sha256') or ''
+    ).strip().lower()
+    if (
+        isinstance(output_count, bool)
+        or not isinstance(output_count, int)
+        or output_count != len(normalized_symbols)
+        or not _is_sha256(output_sha256)
+    ):
+        raise ValueError('exact signal repair output fingerprint is invalid')
+
+    with session_scope(
+        statement_timeout_ms=(
+            settings.price_bar_repair_db_statement_timeout_ms
+        ),
+    ) as session:
+        pending_rows = session.scalars(
+            select(DailyPriceBarRepairBatch)
+            .where(DailyPriceBarRepairBatch.status == 'pending')
+            .order_by(DailyPriceBarRepairBatch.created_at.asc())
+            .with_for_update()
+        ).all()
+        affected_rows = [
+            row
+            for row in pending_rows
+            if row.created_at <= repair_started_at
+            and date_key
+            in {str(value) for value in row.required_rebuild_trade_dates or []}
+            and _frozen_signal_feature_symbols_for_batch(
+                batch=row,
+                market_date=normalized_date,
+            )
+            is not None
+        ]
+        if not affected_rows:
+            raise RuntimeError(
+                'exact signal repair proof has no covered pending batch'
+            )
+        affected_batches = [_serialize_batch(row) for row in affected_rows]
+        frozen_union, _ = _pending_frozen_signal_feature_scopes(
+            pending=affected_batches,
+            required_dates=[normalized_date],
+        )
+        if tuple(frozen_union.get(normalized_date) or ()) != normalized_symbols:
+            raise RuntimeError(
+                'exact signal repair proof scope does not match pending batch '
+                f'membership: date={date_key}'
+            )
+        covered_batch_ids = sorted(
+            str(row.repair_batch_id) for row in affected_rows
+        )
+        evidence = {
+            'item_sha256': str(item_sha256).strip().lower(),
+            'covered_repair_batch_ids': covered_batch_ids,
+            'exact_symbol_count': len(normalized_symbols),
+            'membership_sha256': market_membership_sha256(
+                normalized_symbols
+            ),
+            'source_fingerprints': deepcopy(dict(source_fingerprints)),
+            'output_fingerprint': deepcopy(dict(output_fingerprint)),
+            'repair_started_at': repair_started_at.isoformat(),
+            'rebuild_completed_at': rebuild_completed_at.isoformat(),
+            'preserved_direct_source_rows': int(
+                preserved_direct_source_rows
+            ),
+        }
+        for row in affected_rows:
+            factor_metadata = dict(row.factor_rebuild_metadata or {})
+            if (
+                int(factor_metadata.get('schema_version') or 0)
+                != FACTOR_REBUILD_METADATA_SCHEMA_VERSION
+            ):
+                raise RuntimeError(
+                    'exact signal repair proof requires current factor '
+                    f'metadata: batch={row.repair_batch_id}'
+                )
+            exact_metadata = dict(
+                factor_metadata.get('exact_signal_repair') or {}
+            )
+            existing_manifest_sha256 = str(
+                exact_metadata.get('manifest_sha256') or ''
+            ).strip().lower()
+            if existing_manifest_sha256 and (
+                existing_manifest_sha256
+                != str(manifest_sha256).strip().lower()
+            ):
+                raise RuntimeError(
+                    'exact signal repair manifest changed for pending batch: '
+                    f'{row.repair_batch_id}'
+                )
+            exact_dates = dict(exact_metadata.get('dates') or {})
+            exact_dates[date_key] = evidence
+            factor_metadata['exact_signal_repair'] = {
+                'schema_version': (
+                    EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION
+                ),
+                'implementation_contract': (
+                    EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+                ),
+                'manifest_sha256': str(manifest_sha256).strip().lower(),
+                'dates': exact_dates,
+            }
+            row.factor_rebuild_metadata = factor_metadata
+    return {
+        'market_date': date_key,
+        'updated_batch_count': len(affected_rows),
+        'repair_batch_ids': covered_batch_ids,
+        'membership_sha256': market_membership_sha256(normalized_symbols),
+    }
 
 
 def assert_no_pending_price_bar_rebuilds() -> None:
@@ -735,6 +901,276 @@ def _is_sha256(value: object) -> bool:
     return len(normalized) == 64 and all(
         character in '0123456789abcdef' for character in normalized
     )
+
+
+def validate_pending_exact_signal_repair_proofs(
+    *,
+    pending: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Require batch-bound, live-valid exact signal proof for every date."""
+
+    required_dates = sorted(
+        {
+            _normalize_date(value)
+            for batch in pending
+            for value in batch.get('required_rebuild_trade_dates') or []
+        }
+    )
+    if not required_dates:
+        return {
+            'ready': False,
+            'reason': 'pending_rebuild_dates_missing',
+            'issues': [],
+        }
+    try:
+        frozen_union_by_date, _ = _pending_frozen_signal_feature_scopes(
+            pending=pending,
+            required_dates=required_dates,
+        )
+        from app.eod.exact_signal_feature_repair import (
+            ExactSignalFeatureRepair,
+            _load_completion_state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            'ready': False,
+            'reason': 'exact_signal_scope_invalid',
+            'issues': [
+                {
+                    'error_type': type(exc).__name__,
+                    'error_message': str(exc)[:500],
+                }
+            ],
+        }
+
+    exact_required_dates = sorted(frozen_union_by_date)
+    if not exact_required_dates:
+        return {
+            'ready': True,
+            'reason': 'exact_signal_repair_proof_not_required',
+            'implementation_contract': (
+                EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+            ),
+            'dates_verified': 0,
+            'dates_required': 0,
+            'earliest_repair_started_at': None,
+            'proofs_by_date': {},
+            'issues': [],
+        }
+
+    issues: list[dict[str, Any]] = []
+    proofs_by_date: dict[str, dict[str, Any]] = {}
+    repair_started_values: list[datetime] = []
+    for market_date in exact_required_dates:
+        date_key = market_date.isoformat()
+        expected_symbols = tuple(
+            frozen_union_by_date.get(market_date) or ()
+        )
+        date_batches = [
+            batch
+            for batch in pending
+            if market_date
+            in {
+                _normalize_date(value)
+                for value in batch.get('required_rebuild_trade_dates') or []
+            }
+        ]
+        legacy_batch_ids = sorted(
+            str(batch.get('repair_batch_id') or '')
+            for batch in date_batches
+            if _frozen_signal_feature_symbols_for_batch(
+                batch=batch,
+                market_date=market_date,
+            )
+            is None
+        )
+        if legacy_batch_ids:
+            issues.append(
+                {
+                    'market_date': date_key,
+                    'error_type': 'MixedSignalRepairAuthorityError',
+                    'error_message': (
+                        'exact and legacy pending repair batches share one '
+                        'signal-feature date; refusing partial downstream '
+                        'mutation'
+                    ),
+                    'legacy_repair_batch_ids': legacy_batch_ids,
+                }
+            )
+            continue
+        affected_batches = date_batches
+        current_batch_ids = sorted(
+            str(batch.get('repair_batch_id') or '')
+            for batch in affected_batches
+        )
+        try:
+            if not expected_symbols or any(not value for value in current_batch_ids):
+                raise ValueError('pending exact signal scope is empty')
+            expected_membership_sha256 = market_membership_sha256(
+                expected_symbols
+            )
+            expected_item = {
+                'market_date': date_key,
+                'symbol_count': len(expected_symbols),
+                'membership_sha256': expected_membership_sha256,
+                'symbols': list(expected_symbols),
+            }
+            expected_item_sha256 = canonical_json_sha256(expected_item)
+            batch_proofs: list[dict[str, Any]] = []
+            manifest_hashes: set[str] = set()
+            for batch in affected_batches:
+                factor_metadata = dict(
+                    batch.get('factor_rebuild_metadata') or {}
+                )
+                exact_metadata = dict(
+                    factor_metadata.get('exact_signal_repair') or {}
+                )
+                if (
+                    exact_metadata.get('schema_version')
+                    != EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION
+                    or exact_metadata.get('implementation_contract')
+                    != EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+                ):
+                    raise ValueError(
+                        'pending batch exact signal metadata contract is invalid'
+                    )
+                manifest_sha256 = str(
+                    exact_metadata.get('manifest_sha256') or ''
+                ).strip().lower()
+                if not _is_sha256(manifest_sha256):
+                    raise ValueError(
+                        'pending batch exact signal manifest hash is invalid'
+                    )
+                manifest_hashes.add(manifest_sha256)
+                raw_proof = (exact_metadata.get('dates') or {}).get(
+                    date_key
+                )
+                if not isinstance(raw_proof, Mapping):
+                    raise ValueError(
+                        'pending batch exact signal date proof is missing'
+                    )
+                batch_proofs.append(deepcopy(dict(raw_proof)))
+            if len(manifest_hashes) != 1 or not batch_proofs:
+                raise ValueError(
+                    'pending batch exact signal manifest lineage differs'
+                )
+            proof_hashes = {
+                _stable_json_sha256(proof) for proof in batch_proofs
+            }
+            if len(proof_hashes) != 1:
+                raise ValueError(
+                    'pending batch exact signal date proofs differ'
+                )
+            proof = batch_proofs[0]
+            if (
+                proof.get('covered_repair_batch_ids') != current_batch_ids
+                or proof.get('item_sha256') != expected_item_sha256
+                or proof.get('exact_symbol_count') != len(expected_symbols)
+                or proof.get('membership_sha256')
+                != expected_membership_sha256
+            ):
+                raise ValueError(
+                    'pending batch exact signal scope proof is stale'
+                )
+            repair_started_at = _normalize_datetime(
+                proof['repair_started_at']
+            )
+            rebuild_completed_at = _normalize_datetime(
+                proof['rebuild_completed_at']
+            )
+            if rebuild_completed_at < repair_started_at:
+                raise ValueError(
+                    'pending batch exact signal timestamps are reversed'
+                )
+            if any(
+                repair_started_at
+                < _normalize_datetime(batch['created_at'])
+                for batch in affected_batches
+            ):
+                raise ValueError(
+                    'pending batch was created after exact signal proof began'
+                )
+            proof_sources = (
+                ExactSignalFeatureRepair._validated_source_fingerprints(
+                    proof.get('source_fingerprints'),
+                    expected_symbols=expected_symbols,
+                )
+            )
+            output_fingerprint = proof.get('output_fingerprint')
+            if (
+                proof_sources is None
+                or not isinstance(output_fingerprint, Mapping)
+                or output_fingerprint.get('row_count')
+                != len(expected_symbols)
+                or not _is_sha256(
+                    output_fingerprint.get('output_sha256')
+                )
+            ):
+                raise ValueError(
+                    'pending batch exact signal fingerprints are invalid'
+                )
+            live_state = _load_completion_state(
+                date_key,
+                expected_symbols,
+            )
+            live_sources = (
+                ExactSignalFeatureRepair._validated_source_fingerprints(
+                    live_state.get('source_fingerprints'),
+                    expected_symbols=expected_symbols,
+                )
+            )
+            stale_extras = ExactSignalFeatureRepair._validated_stale_extras(
+                live_state.get('stale_extras')
+            )
+            if (
+                live_sources != proof_sources
+                or live_state.get('output_membership')
+                != list(expected_symbols)
+                or live_state.get('output_fingerprint')
+                != dict(output_fingerprint)
+                or stale_extras
+                != {
+                    'row_count': 0,
+                    'membership_sha256': market_membership_sha256(()),
+                    'output_sha256': _stable_json_sha256([]),
+                }
+            ):
+                raise ValueError(
+                    'pending batch exact signal live proof has drifted'
+                )
+            repair_started_values.append(repair_started_at)
+            proofs_by_date[date_key] = {
+                **proof,
+                'manifest_sha256': next(iter(manifest_hashes)),
+            }
+        except Exception as exc:  # noqa: BLE001
+            issues.append(
+                {
+                    'market_date': date_key,
+                    'error_type': type(exc).__name__,
+                    'error_message': str(exc)[:500],
+                }
+            )
+    return {
+        'ready': not issues,
+        'reason': (
+            'exact_signal_repair_proof_ready'
+            if not issues
+            else 'exact_signal_repair_proof_invalid'
+        ),
+        'implementation_contract': (
+            EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+        ),
+        'dates_verified': len(exact_required_dates) - len(issues),
+        'dates_required': len(exact_required_dates),
+        'earliest_repair_started_at': (
+            min(repair_started_values).isoformat()
+            if repair_started_values
+            else None
+        ),
+        'proofs_by_date': proofs_by_date,
+        'issues': issues[:20],
+    }
 
 
 def _normalize_pending_provider_exclusions(
@@ -2301,6 +2737,15 @@ def _signal_context_rebuild_evidence(
         metadata.get('deterministic_signal_contexts') or {}
     )
     date_scopes = dict(context_metadata.get('dates') or {})
+    factor_exact_metadata = dict(
+        dict(batch.factor_rebuild_metadata or {}).get(
+            'exact_signal_repair'
+        )
+        or {}
+    )
+    durable_exact_dates = dict(
+        factor_exact_metadata.get('dates') or {}
+    )
     try:
         context_schema_version = int(context_metadata['schema_version'])
     except (KeyError, TypeError, ValueError):
@@ -2342,6 +2787,44 @@ def _signal_context_rebuild_evidence(
             date_results.append(issue)
             continue
 
+        durable_exact_scope = dict(
+            durable_exact_dates.get(date_key) or {}
+        )
+        if frozen_symbols is None:
+            exact_signal_repair_started_at = rebuild_started_at
+            exact_signal_proof_valid = True
+        else:
+            try:
+                exact_signal_repair_started_at = _normalize_datetime(
+                    scope['exact_signal_repair_started_at']
+                )
+                exact_signal_repair_completed_at = _normalize_datetime(
+                    scope['exact_signal_repair_completed_at']
+                )
+            except (KeyError, TypeError, ValueError):
+                exact_signal_repair_started_at = rebuild_started_at
+                exact_signal_proof_valid = False
+            else:
+                exact_signal_proof_valid = bool(
+                    factor_exact_metadata.get('schema_version')
+                    == EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION
+                    and factor_exact_metadata.get(
+                        'implementation_contract'
+                    )
+                    == EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+                    and scope.get('exact_signal_repair_manifest_sha256')
+                    == factor_exact_metadata.get('manifest_sha256')
+                    and scope.get('exact_signal_repair_item_sha256')
+                    == durable_exact_scope.get('item_sha256')
+                    and scope.get('exact_signal_repair_started_at')
+                    == durable_exact_scope.get('repair_started_at')
+                    and scope.get('exact_signal_repair_completed_at')
+                    == durable_exact_scope.get('rebuild_completed_at')
+                    and exact_signal_repair_completed_at
+                    >= exact_signal_repair_started_at
+                    and exact_signal_repair_started_at >= batch.created_at
+                )
+
         frozen_scope = {}
         expected_scoped_signal_count: int | None = None
         expected_scoped_signal_sha256: str | None = None
@@ -2370,7 +2853,7 @@ def _signal_context_rebuild_evidence(
                 recorded_membership_count = 0
                 recorded_membership_sha256 = ''
             frozen_scope_metadata_valid = bool(
-                context_schema_version == 2
+                context_schema_version == 3
                 and recorded_membership_count == len(frozen_symbols)
                 and recorded_membership_sha256
                 == frozen_membership_sha256
@@ -2416,7 +2899,8 @@ def _signal_context_rebuild_evidence(
         signal_fresh = bool(
             observed_scoped_signal_count > 0
             and minimum_scoped_signal_updated_at is not None
-            and minimum_scoped_signal_updated_at >= rebuild_started_at
+            and minimum_scoped_signal_updated_at
+            >= exact_signal_repair_started_at
             and dependency_watermark is not None
             and minimum_scoped_signal_updated_at >= dependency_watermark
         )
@@ -2432,6 +2916,7 @@ def _signal_context_rebuild_evidence(
         )
         ready = bool(
             rebuild_started_at_valid
+            and exact_signal_proof_valid
             and dependency_watermark is not None
             and observed_signal_count == expected_signal_count
             and observed_signal_sha256 == expected_signal_sha256
@@ -2459,6 +2944,10 @@ def _signal_context_rebuild_evidence(
             'expected_signal_feature_sha256': expected_signal_sha256,
             'observed_signal_feature_sha256': observed_signal_sha256,
             'signal_features_fresh': signal_fresh,
+            'exact_signal_repair_proof_valid': exact_signal_proof_valid,
+            'exact_signal_repair_started_at': (
+                exact_signal_repair_started_at.isoformat()
+            ),
             'frozen_scope_required': frozen_symbols is not None,
             'frozen_scope_metadata_valid': frozen_scope_metadata_valid,
             'expected_frozen_membership_count': (
@@ -3521,11 +4010,42 @@ def rebuild_pending_price_dependent_evaluations() -> dict[str, Any]:
                 'blocked_trade_date': blocked_trade_date,
                 'updated_batch_count': 0,
             }
-        return _rebuild_pending_price_dependent_evaluations_locked(pending)
+        current_pending = load_pending_price_bar_rebuild_batches()
+        expected_batch_ids = sorted(
+            str(batch.get('repair_batch_id') or '') for batch in pending
+        )
+        current_batch_ids = sorted(
+            str(batch.get('repair_batch_id') or '')
+            for batch in current_pending
+        )
+        if current_batch_ids != expected_batch_ids:
+            return {
+                'status': 'blocked',
+                'reason': 'pending_repair_batches_changed_under_lock',
+                'updated_batch_count': 0,
+                'expected_repair_batch_ids': expected_batch_ids,
+                'current_repair_batch_ids': current_batch_ids,
+            }
+        exact_signal_proof = validate_pending_exact_signal_repair_proofs(
+            pending=current_pending
+        )
+        if exact_signal_proof.get('ready') is not True:
+            return {
+                'status': 'blocked',
+                'reason': 'exact_signal_repair_proof_invalid',
+                'updated_batch_count': 0,
+                'exact_signal_repair_proof': exact_signal_proof,
+            }
+        return _rebuild_pending_price_dependent_evaluations_locked(
+            current_pending,
+            exact_signal_repair_proof=exact_signal_proof,
+        )
 
 
 def _rebuild_pending_price_dependent_evaluations_locked(
     pending: Sequence[dict[str, Any]],
+    *,
+    exact_signal_repair_proof: Mapping[str, Any],
 ) -> dict[str, Any]:
     batch_ids = [str(item['repair_batch_id']) for item in pending]
     affected_symbols = sorted(
@@ -3621,17 +4141,40 @@ def _rebuild_pending_price_dependent_evaluations_locked(
     deterministic_signal_dates: dict[str, dict[str, Any]] = {}
     for rebuild_date in required_rebuild_dates:
         exact_symbols = frozen_signal_union_by_date.get(rebuild_date)
-        signal_rebuild_kwargs: dict[str, Any] = {
-            'market_date': rebuild_date,
-        }
-        if exact_symbols is not None:
-            signal_rebuild_kwargs['exact_symbols'] = exact_symbols
-        signal_result = (
-            daily_signal_feature_service.
-            rebuild_stored_owned_fallback_for_market_date(
-                **signal_rebuild_kwargs
+        exact_date_proof = dict(
+            (exact_signal_repair_proof.get('proofs_by_date') or {}).get(
+                rebuild_date.isoformat()
             )
+            or {}
         )
+        if exact_symbols is not None:
+            if not exact_date_proof:
+                raise RuntimeError(
+                    'live-valid exact signal proof is missing inside rebuild '
+                    f'lock: {rebuild_date.isoformat()}'
+                )
+            signal_result = {
+                'exact_scope': True,
+                'features_persisted': len(exact_symbols),
+                'scope_symbol_count': len(exact_symbols),
+                'scope_membership_sha256': market_membership_sha256(
+                    exact_symbols
+                ),
+                'preserved_direct_source_rows': int(
+                    exact_date_proof.get(
+                        'preserved_direct_source_rows'
+                    )
+                    or 0
+                ),
+                'reused_exact_signal_repair_proof': True,
+            }
+        else:
+            signal_result = (
+                daily_signal_feature_service.
+                rebuild_stored_owned_fallback_for_market_date(
+                    market_date=rebuild_date,
+                )
+            )
         participation_result = (
             daily_market_participation_context_service.rebuild_for_market_date(
                 market_date=rebuild_date,
@@ -3795,6 +4338,24 @@ def _rebuild_pending_price_dependent_evaluations_locked(
             'preserved_direct_source_rows': int(
                 signal_result.get('preserved_direct_source_rows') or 0
             ),
+            **(
+                {
+                    'exact_signal_repair_manifest_sha256': (
+                        exact_date_proof.get('manifest_sha256')
+                    ),
+                    'exact_signal_repair_item_sha256': (
+                        exact_date_proof.get('item_sha256')
+                    ),
+                    'exact_signal_repair_started_at': (
+                        exact_date_proof.get('repair_started_at')
+                    ),
+                    'exact_signal_repair_completed_at': (
+                        exact_date_proof.get('rebuild_completed_at')
+                    ),
+                }
+                if exact_symbols is not None
+                else {}
+            ),
             'exact_scope_union_count': (
                 len(exact_symbols)
                 if exact_symbols is not None
@@ -3955,7 +4516,7 @@ def _rebuild_pending_price_dependent_evaluations_locked(
         'run_started_at': run_started_at.isoformat(),
         'rebuilt_at': rebuilt_at.isoformat(),
         'deterministic_signal_contexts': {
-            'schema_version': 2,
+            'schema_version': 3,
             'dates': deterministic_signal_dates,
         },
         'post_decision': _slim_rebuild_result(post_decision_result),
@@ -4053,9 +4614,39 @@ def verify_pending_price_bar_rebuilds(*, apply: bool = False) -> dict[str, Any]:
                 'completed_batch_count': 0,
                 'batches': [],
             }
+        current_pending = load_pending_price_bar_rebuild_batches()
+        current_batch_ids = tuple(
+            sorted(
+                str(batch.get('repair_batch_id') or '').strip()
+                for batch in current_pending
+                if str(batch.get('repair_batch_id') or '').strip()
+            )
+        )
+        if current_batch_ids != pending_batch_ids:
+            return {
+                'status': 'blocked',
+                'applied': False,
+                'reason': 'pending_repair_batches_changed_under_lock',
+                'pending_batch_count': len(current_pending),
+                'completed_batch_count': 0,
+                'batches': [],
+            }
+        exact_signal_proof = validate_pending_exact_signal_repair_proofs(
+            pending=current_pending
+        )
+        if exact_signal_proof.get('ready') is not True:
+            return {
+                'status': 'blocked',
+                'applied': False,
+                'reason': 'exact_signal_repair_proof_invalid',
+                'pending_batch_count': len(current_pending),
+                'completed_batch_count': 0,
+                'exact_signal_repair_proof': exact_signal_proof,
+                'batches': [],
+            }
         return _verify_pending_price_bar_rebuilds_locked(
             apply=apply,
-            expected_batch_ids=pending_batch_ids,
+            expected_batch_ids=current_batch_ids,
         )
 
 

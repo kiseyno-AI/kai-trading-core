@@ -237,11 +237,11 @@ path, or Exec.
 cd apps/api
 .venv/bin/python -m app.eod.exact_signal_feature_repair \
   --manifest /reviewed/factor-date-manifest.json \
-  --checkpoint /durable/signal-feature-checkpoint.json --dry-run
+  --checkpoint /durable/signal-feature-checkpoint-v2.json --dry-run
 
 .venv/bin/python -m app.eod.exact_signal_feature_repair \
   --manifest /reviewed/factor-date-manifest.json \
-  --checkpoint /durable/signal-feature-checkpoint.json \
+  --checkpoint /durable/signal-feature-checkpoint-v2.json \
   --expected-manifest-sha256 SHA_FROM_DRY_RUN --apply
 ```
 
@@ -261,8 +261,43 @@ rebuilt idempotently. A new outside row or any source drift requires another
 dry review; it is never silently pruned under an older proof. The legacy
 factor checkpoint is not a signal checkpoint and cannot be reused.
 
+Signal checkpoints use `signal_feature_exact_date_checkpoint_v2` and bind
+`signal_feature_exact_date_implementation_v3`. A v1 signal checkpoint does not
+contain the historical market-risk absence proof required by this contract and
+is intentionally incompatible. Resume only from a v2 checkpoint created by a
+fresh dry run, using a new checkpoint path; never delete, relabel, or edit the
+v1 checkpoint.
+
+Piotroski and every stored factor source must still cover the full exact
+manifest scope. Historical market-risk evidence is different because current
+KIS state cannot safely recreate a missing historical snapshot. The v3 repair
+therefore fingerprints both `daily_market_risk_snapshots` and
+`daily_market_risk_filter_results`. Their exact-scope present subsets must have
+identical count and membership, including when both are empty. The checkpoint
+also binds the complementary missing count and membership hash plus a
+canonical missing-symbol list and a `complete`, `partial`, or `unavailable`
+coverage status. The present subset is recomputed as the exact manifest scope
+minus that missing list, so both membership hashes are independently checked.
+Partial or unavailable coverage remains explicit degraded evidence; it is not
+synthesized, fetched, or treated as passing market risk. Any present/missing
+subset drift requires a new dry review.
+
 This command owns only `daily_signal_features`; it does not mark a pending
-price-bar repair batch complete. After a successful apply, continue the
-documented `app.eod.price_bar_repair_state --rebuild-evaluations`, verify, and
-`--complete` sequence so stored market-participation, evaluation, calendar,
-and closeout fingerprints are refreshed from the repaired signal scope.
+price-bar repair batch complete. A successful apply records its completed,
+live-valid exact-signal proof under each affected pending batch's durable
+`factor_rebuild_metadata.exact_signal_repair` entry. Continue with the
+documented evaluation rebuild only after that proof exists:
+
+```bash
+.venv/bin/python -m app.eod.price_bar_repair_state \
+  --rebuild-evaluations
+```
+
+The rebuild command revalidates every pending batch's durable proof against
+the frozen exact scope and live stored signal output before mutation. Missing,
+reviewed-only, failed, version-incompatible, or drifted proof blocks the
+command. Because exact signal rows were already persisted by the reviewed
+repair, this step does not rebuild them again; it refreshes participation,
+evaluations, and calendars from the proven exact signal scope. Only after that
+rebuild succeeds should operators run verify and `--complete` so the closeout
+fingerprints are refreshed from the repaired signal scope.

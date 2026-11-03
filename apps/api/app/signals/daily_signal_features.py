@@ -618,15 +618,76 @@ def _resolve_exact_repair_generation_universe(
             f'{len(missing_bar_symbols)}, preview={missing_bar_symbols[:20]}'
         )
     try:
-        candidate_metadata = _candidate_universe_metadata(
-            market_date=market_date
+        piotroski_rows = load_daily_piotroski_filter_results(
+            market_date=market_date,
+            symbols=list(normalized_symbols),
+            passed_filter=None,
+            limit=None,
         )
+        market_risk_rows = load_daily_market_risk_filter_results(
+            market_date=market_date,
+            symbols=list(normalized_symbols),
+            passed_filter=None,
+            limit=None,
+        )
+        market_risk_symbols = sorted(
+            {
+                str(row.get('symbol') or '').strip().upper()
+                for row in market_risk_rows
+                if str(row.get('symbol') or '').strip()
+            }
+        )
+        missing_market_risk_symbols = sorted(
+            set(normalized_symbols).difference(market_risk_symbols)
+        )
+        if not missing_market_risk_symbols:
+            market_risk_coverage_status = 'complete'
+            availability = FILTER_UNIVERSE_AVAILABLE
+        elif not market_risk_symbols:
+            market_risk_coverage_status = 'unavailable'
+            availability = FILTER_UNIVERSE_UNAVAILABLE
+        else:
+            market_risk_coverage_status = 'partial'
+            availability = FILTER_UNIVERSE_PARTIAL
+        candidate_metadata = {
+            'availability': availability,
+            'symbols': load_agent_feedback_eligible_symbols(
+                market_date=date.fromisoformat(market_date),
+                requested_symbols=normalized_symbols,
+            ),
+            'has_piotroski_rows': bool(piotroski_rows),
+            'has_market_risk_rows': bool(market_risk_rows),
+            'market_risk_coverage_status': (
+                market_risk_coverage_status
+            ),
+            'market_risk_present_symbol_count': len(
+                market_risk_symbols
+            ),
+            'market_risk_present_membership_sha256': (
+                market_membership_sha256(market_risk_symbols)
+            ),
+            'market_risk_missing_symbol_count': len(
+                missing_market_risk_symbols
+            ),
+            'market_risk_missing_membership_sha256': (
+                market_membership_sha256(missing_market_risk_symbols)
+            ),
+        }
     except Exception as exc:
         candidate_metadata = {
             'availability': FILTER_UNIVERSE_UNAVAILABLE,
             'symbols': [],
             'has_piotroski_rows': False,
             'has_market_risk_rows': False,
+            'market_risk_coverage_status': 'unavailable',
+            'market_risk_present_symbol_count': 0,
+            'market_risk_present_membership_sha256': (
+                market_membership_sha256(())
+            ),
+            'market_risk_missing_symbol_count': len(normalized_symbols),
+            'market_risk_missing_membership_sha256': (
+                market_membership_sha256(normalized_symbols)
+            ),
             'error': str(exc),
         }
     exact_symbol_set = set(normalized_symbols)
@@ -672,6 +733,21 @@ def _resolve_exact_repair_generation_universe(
             ),
             'error': candidate_metadata.get('error'),
         },
+        'market_risk_coverage_status': candidate_metadata.get(
+            'market_risk_coverage_status'
+        ),
+        'market_risk_present_symbol_count': int(
+            candidate_metadata.get('market_risk_present_symbol_count') or 0
+        ),
+        'market_risk_present_membership_sha256': candidate_metadata.get(
+            'market_risk_present_membership_sha256'
+        ),
+        'market_risk_missing_symbol_count': int(
+            candidate_metadata.get('market_risk_missing_symbol_count') or 0
+        ),
+        'market_risk_missing_membership_sha256': candidate_metadata.get(
+            'market_risk_missing_membership_sha256'
+        ),
         'missing_bar_symbols': missing_bar_symbols,
         'missing_bar_symbol_count': len(missing_bar_symbols),
         'repair_scope': {
@@ -1063,7 +1139,7 @@ def _merge_owned_fallback_features(
     payload['collection'] = dict(payload.get('collection') or {})
     payload['collection']['collected_at'] = collection_payload.get('collected_at')
     payload['collection']['source_errors'] = dict(source_errors)
-    payload['collection']['universe'] = {
+    universe_payload = {
         'target_symbol_count': len(universe.get('target_symbols') or []),
         'active_symbol_count': len(universe.get('active_symbols') or []),
         'candidate_symbol_count': len(universe.get('candidate_symbols') or []),
@@ -1071,6 +1147,27 @@ def _merge_owned_fallback_features(
         'excluded_candidate_symbol_count': int(universe.get('excluded_candidate_symbol_count') or 0),
         'candidate_universe_availability': universe.get('candidate_universe_availability'),
     }
+    if universe.get('market_risk_coverage_status') is not None:
+        universe_payload.update(
+            {
+                'market_risk_coverage_status': universe.get(
+                    'market_risk_coverage_status'
+                ),
+                'market_risk_present_symbol_count': int(
+                    universe.get('market_risk_present_symbol_count') or 0
+                ),
+                'market_risk_present_membership_sha256': universe.get(
+                    'market_risk_present_membership_sha256'
+                ),
+                'market_risk_missing_symbol_count': int(
+                    universe.get('market_risk_missing_symbol_count') or 0
+                ),
+                'market_risk_missing_membership_sha256': universe.get(
+                    'market_risk_missing_membership_sha256'
+                ),
+            }
+        )
+    payload['collection']['universe'] = universe_payload
     payload['row_provenance'] = row_provenance
     payload['freshness'] = freshness
     payload['fallback_features'] = fallback_features

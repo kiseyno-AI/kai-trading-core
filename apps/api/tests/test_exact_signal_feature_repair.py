@@ -61,7 +61,7 @@ def _manifest(*, symbols=None, market_date=MARKET_DATE):
     }
 
 
-def _source_fingerprints(*, suffix='v1'):
+def _source_fingerprints(*, suffix='v1', risk_present_symbols=None):
     result = {
         component: {
             'row_count': (
@@ -90,13 +90,41 @@ def _source_fingerprints(*, suffix='v1'):
             'placeholder_name_count': 0,
         }
     )
-    for component in ('piotroski_filter', 'market_risk_filter'):
+    result['piotroski_filter'].update(
+        {
+            'exact_scope_row_count': len(SYMBOLS),
+            'exact_scope_membership_sha256': (
+                market_membership_sha256(SYMBOLS)
+            ),
+        }
+    )
+    present_symbols = sorted(
+        risk_present_symbols
+        if risk_present_symbols is not None
+        else SYMBOLS
+    )
+    missing_symbols = sorted(set(SYMBOLS).difference(present_symbols))
+    coverage_status = (
+        'complete'
+        if not missing_symbols
+        else 'partial'
+        if present_symbols
+        else 'unavailable'
+    )
+    for component in ('market_risk_snapshot', 'market_risk_filter'):
         result[component].update(
             {
-                'exact_scope_row_count': len(SYMBOLS),
+                'row_count': len(present_symbols),
+                'exact_scope_row_count': len(present_symbols),
                 'exact_scope_membership_sha256': (
-                    market_membership_sha256(SYMBOLS)
+                    market_membership_sha256(present_symbols)
                 ),
+                'missing_scope_row_count': len(missing_symbols),
+                'missing_scope_membership_sha256': (
+                    market_membership_sha256(missing_symbols)
+                ),
+                'missing_scope_symbols': missing_symbols,
+                'coverage_status': coverage_status,
             }
         )
     return result
@@ -120,13 +148,15 @@ def _state(
     output_suffix='v1',
     stale_count=1,
     stale_suffix='v1',
+    risk_present_symbols=None,
 ):
     resolved_membership = list(
         membership if membership is not None else [*SYMBOLS, '999999']
     )
     return {
         'source_fingerprints': _source_fingerprints(
-            suffix=source_suffix
+            suffix=source_suffix,
+            risk_present_symbols=risk_present_symbols,
         ),
         'output_membership': resolved_membership,
         'output_fingerprint': {
@@ -145,12 +175,18 @@ def _state(
     }
 
 
-def _completed_state(*, source_suffix='v1', output_suffix='completed'):
+def _completed_state(
+    *,
+    source_suffix='v1',
+    output_suffix='completed',
+    risk_present_symbols=None,
+):
     return _state(
         source_suffix=source_suffix,
         membership=SYMBOLS,
         output_suffix=output_suffix,
         stale_count=0,
+        risk_present_symbols=risk_present_symbols,
     )
 
 
@@ -174,6 +210,8 @@ def _verification_result():
         'exact_row_count': len(SYMBOLS),
         'fresh_exact_row_count': len(SYMBOLS),
         'membership_sha256': market_membership_sha256(SYMBOLS),
+        'minimum_updated_at': REPAIR_STARTED_AT.isoformat(),
+        'maximum_updated_at': REPAIR_STARTED_AT.isoformat(),
     }
 
 
@@ -210,6 +248,7 @@ def _repair(
     stale_pruner=None,
     guard_factory=_guard,
     finality_validator=lambda _market_date: None,
+    completion_proof_recorder=None,
 ):
     return ExactSignalFeatureRepair(
         _manifest(),
@@ -228,6 +267,12 @@ def _repair(
         ),
         guard_factory=guard_factory,
         finality_validator=finality_validator,
+        completion_proof_recorder=completion_proof_recorder
+        or (
+            lambda **_kwargs: {
+                'updated_batch_count': 1,
+            }
+        ),
         clock=lambda: REPAIR_STARTED_AT,
     )
 
@@ -267,11 +312,65 @@ def test_dry_run_writes_hash_bound_reviewed_checkpoint() -> None:
     assert unit['dry_proof']['stale_extras']['row_count'] == 1
 
 
+def test_checkpoint_and_implementation_contract_versions_are_not_legacy() -> None:
+    assert CHECKPOINT_SCHEMA_VERSION == 'signal_feature_exact_date_checkpoint_v2'
+    assert IMPLEMENTATION_CONTRACT == (
+        'signal_feature_exact_date_implementation_v3'
+    )
+
+
+def test_dry_run_binds_partial_market_risk_coverage_as_degraded_evidence() -> None:
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint-v2.json'
+        _repair, result = _dry_review(
+            checkpoint,
+            state=_state(risk_present_symbols=[SYMBOLS[0]]),
+        )
+        saved = json.loads(checkpoint.read_text())
+
+    assert result['status'] == 'dry_run'
+    proof = saved['units'][MARKET_DATE]['dry_proof'][
+        'source_fingerprints'
+    ]
+    for component in ('market_risk_snapshot', 'market_risk_filter'):
+        assert proof[component]['coverage_status'] == 'partial'
+        assert proof[component]['exact_scope_row_count'] == 1
+        assert proof[component]['exact_scope_membership_sha256'] == (
+            market_membership_sha256([SYMBOLS[0]])
+        )
+        assert proof[component]['missing_scope_row_count'] == 1
+        assert proof[component]['missing_scope_membership_sha256'] == (
+            market_membership_sha256([SYMBOLS[1]])
+        )
+        assert proof[component]['missing_scope_symbols'] == [SYMBOLS[1]]
+
+
 def test_checkpoint_is_required_even_for_dry_run() -> None:
     repair = _repair(state_loader=lambda *_args: _state())
     result = repair.run()
     assert result['status'] == 'blocked'
     assert result['reason'] == 'checkpoint_path_required'
+
+
+def test_legacy_v1_checkpoint_requires_a_new_path() -> None:
+    repair = _repair(state_loader=lambda *_args: _state())
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'legacy-signal-checkpoint.json'
+        checkpoint.write_text(
+            json.dumps(
+                {
+                    'schema_version': 'signal_feature_exact_date_checkpoint_v1',
+                    'manifest_sha256': repair.manifest_sha256,
+                    'item_count': 1,
+                    'unit_size': 1,
+                    'units': {},
+                }
+            )
+        )
+        result = repair.run(checkpoint_path=checkpoint)
+
+    assert result['status'] == 'blocked'
+    assert result['reason'] == 'checkpoint_manifest_mismatch'
 
 
 def test_checkpoint_refuses_a_concurrent_repair_writer() -> None:
@@ -371,6 +470,83 @@ def test_apply_persists_verifies_then_prunes_and_checkpoints_completion() -> Non
     ] == 1
 
 
+def test_apply_records_durable_pending_batch_proof_before_completion() -> None:
+    recorder = Mock(
+        return_value={
+            'updated_batch_count': 1,
+            'recorded_membership_scope_count': 1,
+        }
+    )
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint-v2.json'
+        reviewed = _state(risk_present_symbols=[SYMBOLS[0]])
+        dry_repair, _result = _dry_review(checkpoint, state=reviewed)
+        states = iter(
+            [
+                reviewed,
+                _state(
+                    risk_present_symbols=[SYMBOLS[0]],
+                    output_suffix='persisted',
+                ),
+                _completed_state(risk_present_symbols=[SYMBOLS[0]]),
+            ]
+        )
+        result = _repair(
+            state_loader=lambda *_args: next(states),
+            completion_proof_recorder=recorder,
+        ).run(
+            apply=True,
+            expected_manifest_sha256=dry_repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+        saved = json.loads(checkpoint.read_text())
+
+    assert result['status'] == 'completed'
+    assert saved['units'][MARKET_DATE]['result']['durable_proof'][
+        'updated_batch_count'
+    ] == 1
+    recorder.assert_called_once()
+    call = recorder.call_args.kwargs
+    assert call['market_date'] == MARKET_DATE
+    assert call['exact_symbols'] == SYMBOLS
+    assert call['manifest_sha256'] == dry_repair.manifest_sha256
+    assert call['implementation_contract'] == IMPLEMENTATION_CONTRACT
+    assert call['source_fingerprints']['market_risk_filter'][
+        'coverage_status'
+    ] == 'partial'
+    assert call['output_fingerprint']['row_count'] == len(SYMBOLS)
+    assert call['repair_started_at'] == REPAIR_STARTED_AT
+    assert call['rebuild_completed_at'] == REPAIR_STARTED_AT
+
+
+def test_apply_fails_closed_when_durable_pending_batch_proof_is_not_recorded() -> None:
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint-v2.json'
+        reviewed = _state()
+        dry_repair, _result = _dry_review(checkpoint, state=reviewed)
+        states = iter(
+            [
+                reviewed,
+                _state(output_suffix='persisted'),
+                _completed_state(),
+            ]
+        )
+        result = _repair(
+            state_loader=lambda *_args: next(states),
+            completion_proof_recorder=lambda **_kwargs: {
+                'updated_batch_count': 0,
+            },
+        ).run(
+            apply=True,
+            expected_manifest_sha256=dry_repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+
+    assert result['status'] == 'partial'
+    assert result['applied'] is False
+    assert result['failed_dates'] == 1
+
+
 def test_incomplete_exact_persistence_never_prunes() -> None:
     prune = Mock()
     with TemporaryDirectory() as temporary:
@@ -447,6 +623,31 @@ def test_reviewed_source_or_stale_scope_drift_blocks_before_write() -> None:
         dry_repair, _result = _dry_review(checkpoint)
         repair = _repair(
             state_loader=lambda *_args: _state(stale_suffix='changed'),
+            rebuild_runner=rebuild,
+        )
+        result = repair.run(
+            apply=True,
+            expected_manifest_sha256=dry_repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+
+    assert result['status'] == 'blocked'
+    assert result['reason'] == 'reviewed_dry_proof_drift'
+    rebuild.assert_not_called()
+
+
+def test_reviewed_market_risk_subset_drift_blocks_before_write() -> None:
+    rebuild = Mock()
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint-v2.json'
+        dry_repair, _result = _dry_review(
+            checkpoint,
+            state=_state(risk_present_symbols=[SYMBOLS[0]]),
+        )
+        repair = _repair(
+            state_loader=lambda *_args: _state(
+                risk_present_symbols=SYMBOLS,
+            ),
             rebuild_runner=rebuild,
         )
         result = repair.run(
@@ -774,10 +975,7 @@ def test_source_fingerprint_contract_requires_complete_factor_coverage() -> None
     assert (
         ExactSignalFeatureRepair._validated_source_fingerprints(
             incomplete,
-            expected_symbol_count=len(SYMBOLS),
-            expected_membership_sha256=market_membership_sha256(
-                SYMBOLS
-            ),
+            expected_symbols=SYMBOLS,
         )
         is None
     )
@@ -787,11 +985,11 @@ def test_source_fingerprint_contract_allows_full_date_universe_rows() -> None:
     fingerprints = _source_fingerprints()
     fingerprints['piotroski_filter']['row_count'] = len(SYMBOLS) + 3
     fingerprints['market_risk_filter']['row_count'] = len(SYMBOLS) + 4
+    fingerprints['market_risk_snapshot']['row_count'] = len(SYMBOLS) + 5
 
     assert ExactSignalFeatureRepair._validated_source_fingerprints(
         fingerprints,
-        expected_symbol_count=len(SYMBOLS),
-        expected_membership_sha256=market_membership_sha256(SYMBOLS),
+        expected_symbols=SYMBOLS,
     ) is not None
 
 
@@ -800,11 +998,9 @@ def test_source_fingerprint_contract_allows_full_date_universe_rows() -> None:
     [
         ('piotroski_filter', 0),
         ('piotroski_filter', len(SYMBOLS) - 1),
-        ('market_risk_filter', 0),
-        ('market_risk_filter', len(SYMBOLS) - 1),
     ],
 )
-def test_source_fingerprint_contract_rejects_incomplete_filter_coverage(
+def test_source_fingerprint_contract_rejects_incomplete_piotroski_coverage(
     component,
     row_count,
 ) -> None:
@@ -817,16 +1013,15 @@ def test_source_fingerprint_contract_rejects_incomplete_filter_coverage(
 
     assert ExactSignalFeatureRepair._validated_source_fingerprints(
         fingerprints,
-        expected_symbol_count=len(SYMBOLS),
-        expected_membership_sha256=market_membership_sha256(SYMBOLS),
+        expected_symbols=SYMBOLS,
     ) is None
 
 
 @pytest.mark.parametrize(
     'component',
-    ['piotroski_filter', 'market_risk_filter'],
+    ['piotroski_filter'],
 )
-def test_source_fingerprint_contract_rejects_wrong_filter_membership(
+def test_source_fingerprint_contract_rejects_wrong_piotroski_membership(
     component,
 ) -> None:
     fingerprints = _source_fingerprints()
@@ -836,8 +1031,102 @@ def test_source_fingerprint_contract_rejects_wrong_filter_membership(
 
     assert ExactSignalFeatureRepair._validated_source_fingerprints(
         fingerprints,
-        expected_symbol_count=len(SYMBOLS),
-        expected_membership_sha256=market_membership_sha256(SYMBOLS),
+        expected_symbols=SYMBOLS,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ('present_symbols', 'coverage_status'),
+    [
+        ([SYMBOLS[0]], 'partial'),
+        ([], 'unavailable'),
+    ],
+)
+def test_source_fingerprint_contract_accepts_matching_market_risk_subsets(
+    present_symbols,
+    coverage_status,
+) -> None:
+    fingerprints = _source_fingerprints(
+        risk_present_symbols=present_symbols,
+    )
+
+    validated = ExactSignalFeatureRepair._validated_source_fingerprints(
+        fingerprints,
+        expected_symbols=SYMBOLS,
+    )
+
+    assert validated is not None
+    for component in ('market_risk_snapshot', 'market_risk_filter'):
+        assert validated[component]['coverage_status'] == coverage_status
+        assert validated[component]['exact_scope_row_count'] == len(
+            present_symbols
+        )
+        assert validated[component]['missing_scope_row_count'] == (
+            len(SYMBOLS) - len(present_symbols)
+        )
+
+
+@pytest.mark.parametrize(
+    'field',
+    [
+        'exact_scope_row_count',
+        'exact_scope_membership_sha256',
+        'missing_scope_row_count',
+        'missing_scope_membership_sha256',
+        'missing_scope_symbols',
+        'coverage_status',
+    ],
+)
+def test_source_fingerprint_contract_rejects_market_risk_subset_mismatch(
+    field,
+) -> None:
+    fingerprints = _source_fingerprints(
+        risk_present_symbols=[SYMBOLS[0]],
+    )
+    replacements = {
+        'exact_scope_row_count': 0,
+        'exact_scope_membership_sha256': market_membership_sha256(()),
+        'missing_scope_row_count': 0,
+        'missing_scope_membership_sha256': market_membership_sha256(()),
+        'missing_scope_symbols': [],
+        'coverage_status': 'unavailable',
+    }
+    fingerprints['market_risk_filter'][field] = replacements[field]
+
+    assert ExactSignalFeatureRepair._validated_source_fingerprints(
+        fingerprints,
+        expected_symbols=SYMBOLS,
+    ) is None
+
+
+def test_source_fingerprint_contract_rejects_incomplete_missing_scope_proof() -> None:
+    fingerprints = _source_fingerprints(
+        risk_present_symbols=[SYMBOLS[0]],
+    )
+    for component in ('market_risk_snapshot', 'market_risk_filter'):
+        fingerprints[component]['missing_scope_row_count'] = 0
+
+    assert ExactSignalFeatureRepair._validated_source_fingerprints(
+        fingerprints,
+        expected_symbols=SYMBOLS,
+    ) is None
+
+
+def test_source_fingerprint_contract_rejects_matching_noncomplement_risk_hashes() -> None:
+    fingerprints = _source_fingerprints(
+        risk_present_symbols=[SYMBOLS[0]],
+    )
+    for component in ('market_risk_snapshot', 'market_risk_filter'):
+        fingerprints[component]['exact_scope_membership_sha256'] = (
+            market_membership_sha256(['111111'])
+        )
+        fingerprints[component]['missing_scope_membership_sha256'] = (
+            market_membership_sha256(['222222'])
+        )
+
+    assert ExactSignalFeatureRepair._validated_source_fingerprints(
+        fingerprints,
+        expected_symbols=SYMBOLS,
     ) is None
 
 

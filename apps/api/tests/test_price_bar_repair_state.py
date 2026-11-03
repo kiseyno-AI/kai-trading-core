@@ -8,25 +8,35 @@ import unittest
 from unittest.mock import ANY, MagicMock, patch
 
 from app.db_models import DailyMomentumFactorResult
+from app.eod.exact_signal_feature_repair import (
+    PRICE_HISTORY_ROWS,
+    SOURCE_COMPONENTS,
+)
+from app.internal.exact_repair_manifest import canonical_json_sha256
 from app.eod.market_membership import (
     build_market_membership_snapshot,
     market_membership_sha256,
 )
 from app.eod.price_bar_repair_state import (
+    EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT,
+    EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION,
     _causal_raw_dependency_watermarks,
     _exact_factor_stage_evidence,
     _expected_price_counts,
     _full_coverage_stage_evidence,
     _missing_bar_insert_repair_evidence,
     _pending_frozen_signal_feature_scopes,
+    _rebuild_pending_price_dependent_evaluations_locked,
     _signal_context_rebuild_evidence,
     _stable_json_sha256,
     _trending_evidence,
     _verify_pending_price_bar_rebuilds_locked,
     rebuild_pending_price_dependent_evaluations,
     record_pending_exact_factor_rebuild,
+    record_pending_exact_signal_repair_proof,
     record_pending_trending_rebuild,
     resolve_pending_exact_market_membership_evidence,
+    validate_pending_exact_signal_repair_proofs,
     verify_pending_price_bar_rebuilds,
 )
 
@@ -94,6 +104,159 @@ def _trending_rebuild_metadata() -> dict:
             }
         },
     }
+
+
+def _exact_signal_source_fingerprints(symbols: list[str]) -> dict:
+    membership_sha256 = market_membership_sha256(symbols)
+    result = {
+        component: {
+            'row_count': 0 if component == 'direct_signal_evidence' else len(symbols),
+            'source_sha256': canonical_json_sha256(
+                {'component': component, 'symbols': symbols}
+            ),
+        }
+        for component in SOURCE_COMPONENTS
+    }
+    result['price_history'].update(
+        {
+            'row_count': len(symbols) * PRICE_HISTORY_ROWS,
+            'history_row_limit': PRICE_HISTORY_ROWS,
+        }
+    )
+    result['symbol_metadata'].update(
+        {
+            'scope_symbol_count': len(symbols),
+            'placeholder_name_count': 0,
+        }
+    )
+    result['piotroski_filter'].update(
+        {
+            'exact_scope_row_count': len(symbols),
+            'exact_scope_membership_sha256': membership_sha256,
+        }
+    )
+    for component in ('market_risk_snapshot', 'market_risk_filter'):
+        result[component].update(
+            {
+                'exact_scope_row_count': len(symbols),
+                'exact_scope_membership_sha256': membership_sha256,
+                'missing_scope_row_count': 0,
+                'missing_scope_membership_sha256': (
+                    market_membership_sha256(())
+                ),
+                'missing_scope_symbols': [],
+                'coverage_status': 'complete',
+            }
+        )
+    return result
+
+
+def _pending_with_exact_signal_proof(
+    *,
+    output_sha256: str = 'a' * 64,
+) -> tuple[dict, dict]:
+    market_date = date(2026, 9, 19)
+    date_key = market_date.isoformat()
+    symbols = ['005930']
+    membership_sha256 = market_membership_sha256(symbols)
+    item = {
+        'market_date': date_key,
+        'symbol_count': 1,
+        'membership_sha256': membership_sha256,
+        'symbols': symbols,
+    }
+    source_fingerprints = _exact_signal_source_fingerprints(symbols)
+    proof = {
+        'item_sha256': canonical_json_sha256(item),
+        'covered_repair_batch_ids': ['repair-batch-1'],
+        'exact_symbol_count': 1,
+        'membership_sha256': membership_sha256,
+        'source_fingerprints': source_fingerprints,
+        'output_fingerprint': {
+            'row_count': 1,
+            'output_sha256': output_sha256,
+        },
+        'repair_started_at': UTC_NOW.isoformat(),
+        'rebuild_completed_at': UTC_NOW.isoformat(),
+        'preserved_direct_source_rows': 0,
+    }
+    pending = {
+        'repair_batch_id': 'repair-batch-1',
+        'created_at': (UTC_NOW - timedelta(days=1)).isoformat(),
+        'affected_symbols': symbols,
+        'required_rebuild_trade_dates': [date_key],
+        'required_evaluation_market_date_from': '2026-09-21',
+        'required_evaluation_market_date_to': '2026-09-23',
+        'factor_rebuild_metadata': {
+            'schema_version': 3,
+            'exact_signal_repair': {
+                'schema_version': EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION,
+                'implementation_contract': (
+                    EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+                ),
+                'manifest_sha256': 'b' * 64,
+                'dates': {date_key: proof},
+            },
+        },
+        'verification_metadata': {
+            'repair_evidence': {
+                'repair_kind': 'missing_bar_insert',
+                'schema_version': 'missing_bar_insert_v3',
+                'price_dependent_membership_by_date': {
+                    date_key: {
+                        'symbols': symbols,
+                        'symbol_count': 1,
+                        'membership_sha256': membership_sha256,
+                    }
+                },
+            }
+        },
+    }
+    live_state = {
+        'source_fingerprints': source_fingerprints,
+        'output_membership': symbols,
+        'output_fingerprint': dict(proof['output_fingerprint']),
+        'stale_extras': {
+            'row_count': 0,
+            'membership_sha256': market_membership_sha256(()),
+            'output_sha256': canonical_json_sha256([]),
+        },
+    }
+    return pending, live_state
+
+
+def _signal_context_exact_metadata(
+    *,
+    market_date: date,
+    repair_started_at: datetime,
+) -> tuple[dict, dict]:
+    manifest_sha256 = 'd' * 64
+    item_sha256 = 'e' * 64
+    timestamp = repair_started_at.isoformat()
+    factor_metadata = {
+        'schema_version': 3,
+        'exact_signal_repair': {
+            'schema_version': EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION,
+            'implementation_contract': (
+                EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+            ),
+            'manifest_sha256': manifest_sha256,
+            'dates': {
+                market_date.isoformat(): {
+                    'item_sha256': item_sha256,
+                    'repair_started_at': timestamp,
+                    'rebuild_completed_at': timestamp,
+                }
+            },
+        },
+    }
+    context_fields = {
+        'exact_signal_repair_manifest_sha256': manifest_sha256,
+        'exact_signal_repair_item_sha256': item_sha256,
+        'exact_signal_repair_started_at': timestamp,
+        'exact_signal_repair_completed_at': timestamp,
+    }
+    return factor_metadata, context_fields
 
 
 def _missing_bar_batch_with_stored_lineage() -> SimpleNamespace:
@@ -1323,13 +1486,22 @@ class PriceBarRepairFactorEvidenceTests(unittest.TestCase):
         rebuild_started_at = UTC_NOW - timedelta(minutes=20)
         signal_updated_at = UTC_NOW - timedelta(minutes=10)
         dependency_updated_at = UTC_NOW - timedelta(minutes=5)
+        factor_metadata, exact_context_fields = (
+            _signal_context_exact_metadata(
+                market_date=MARKET_DATE,
+                repair_started_at=rebuild_started_at,
+            )
+        )
         batch = SimpleNamespace(
             created_at=UTC_NOW - timedelta(hours=1),
+            factor_rebuild_metadata=factor_metadata,
             evaluation_rebuild_metadata={
                 'run_started_at': rebuild_started_at.isoformat(),
                 'deterministic_signal_contexts': {
+                    'schema_version': 3,
                     'dates': {
                         MARKET_DATE.isoformat(): {
+                            **exact_context_fields,
                             'signal_feature_count': 1,
                             'signal_feature_sha256': 'signal-sha256',
                             'market_participation_sha256': (
@@ -1692,6 +1864,12 @@ class PriceBarRepairFactorEvidenceContinuationTests(unittest.TestCase):
         participation_updated_at = UTC_NOW - timedelta(minutes=5)
         frozen_symbols = ('000660', '005930')
         frozen_sha256 = market_membership_sha256(frozen_symbols)
+        factor_metadata, exact_context_fields = (
+            _signal_context_exact_metadata(
+                market_date=MARKET_DATE,
+                repair_started_at=rebuild_started_at,
+            )
+        )
         batch = SimpleNamespace(
             repair_batch_id='repair-batch-1',
             created_at=UTC_NOW - timedelta(hours=1),
@@ -1708,12 +1886,14 @@ class PriceBarRepairFactorEvidenceContinuationTests(unittest.TestCase):
                     },
                 }
             },
+            factor_rebuild_metadata=factor_metadata,
             evaluation_rebuild_metadata={
                 'run_started_at': rebuild_started_at.isoformat(),
                 'deterministic_signal_contexts': {
-                    'schema_version': 2,
+                    'schema_version': 3,
                     'dates': {
                         MARKET_DATE.isoformat(): {
+                            **exact_context_fields,
                             'signal_feature_count': 3,
                             'signal_feature_sha256': 'global-signal-sha256',
                             'market_participation_sha256': (
@@ -1796,6 +1976,12 @@ class PriceBarRepairFactorEvidenceContinuationTests(unittest.TestCase):
         dependency_updated_at = UTC_NOW - timedelta(minutes=30)
         frozen_symbols = ('005930',)
         frozen_sha256 = market_membership_sha256(frozen_symbols)
+        factor_metadata, exact_context_fields = (
+            _signal_context_exact_metadata(
+                market_date=MARKET_DATE,
+                repair_started_at=rebuild_started_at,
+            )
+        )
         batch = SimpleNamespace(
             repair_batch_id='repair-batch-1',
             created_at=UTC_NOW - timedelta(hours=1),
@@ -1812,12 +1998,14 @@ class PriceBarRepairFactorEvidenceContinuationTests(unittest.TestCase):
                     },
                 }
             },
+            factor_rebuild_metadata=factor_metadata,
             evaluation_rebuild_metadata={
                 'run_started_at': rebuild_started_at.isoformat(),
                 'deterministic_signal_contexts': {
-                    'schema_version': 2,
+                    'schema_version': 3,
                     'dates': {
                         MARKET_DATE.isoformat(): {
+                            **exact_context_fields,
                             'signal_feature_count': 1,
                             'signal_feature_sha256': 'global-sha256',
                             'market_participation_sha256': (
@@ -1884,8 +2072,400 @@ class PriceBarRepairFactorEvidenceContinuationTests(unittest.TestCase):
         )
 
 
+class PriceBarRepairExactSignalProofTests(unittest.TestCase):
+    def test_recorder_persists_batch_bound_exact_signal_proof(self) -> None:
+        batch = SimpleNamespace(
+            repair_batch_id='repair-batch-1',
+            created_at=UTC_NOW - timedelta(days=1),
+            required_rebuild_trade_dates=['2026-09-19'],
+            factor_rebuild_metadata={
+                'schema_version': 3,
+                'dates': {'preserved': {'value': True}},
+            },
+        )
+        session = MagicMock()
+        session.scalars.return_value.all.return_value = [batch]
+        symbols = ['005930']
+        source_fingerprints = _exact_signal_source_fingerprints(symbols)
+
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.session_scope',
+                return_value=_session_scope_for(session),
+            ),
+            patch(
+                'app.eod.price_bar_repair_state._serialize_batch',
+                return_value={'repair_batch_id': 'repair-batch-1'},
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_frozen_signal_feature_symbols_for_batch',
+                return_value=('005930',),
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_pending_frozen_signal_feature_scopes',
+                return_value=(
+                    {date(2026, 9, 19): ('005930',)},
+                    {},
+                ),
+            ),
+        ):
+            result = record_pending_exact_signal_repair_proof(
+                market_date='2026-09-19',
+                exact_symbols=symbols,
+                manifest_sha256='a' * 64,
+                item_sha256='b' * 64,
+                implementation_contract=(
+                    EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+                ),
+                source_fingerprints=source_fingerprints,
+                output_fingerprint={
+                    'row_count': 1,
+                    'output_sha256': 'c' * 64,
+                },
+                repair_started_at=UTC_NOW,
+                rebuild_completed_at=UTC_NOW,
+                preserved_direct_source_rows=0,
+            )
+
+        self.assertEqual(result['updated_batch_count'], 1)
+        self.assertEqual(
+            batch.factor_rebuild_metadata['dates'],
+            {'preserved': {'value': True}},
+        )
+        exact_metadata = batch.factor_rebuild_metadata[
+            'exact_signal_repair'
+        ]
+        self.assertEqual(
+            exact_metadata['schema_version'],
+            EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            exact_metadata['implementation_contract'],
+            EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT,
+        )
+        proof = exact_metadata['dates']['2026-09-19']
+        self.assertEqual(
+            proof['covered_repair_batch_ids'],
+            ['repair-batch-1'],
+        )
+        self.assertEqual(proof['source_fingerprints'], source_fingerprints)
+        self.assertEqual(proof['output_fingerprint']['output_sha256'], 'c' * 64)
+
+    def test_recorder_scopes_missing_batch_and_validator_blocks_mixed_date(
+        self,
+    ) -> None:
+        pending_with_proof, live_state = _pending_with_exact_signal_proof()
+        missing_pending = deepcopy(pending_with_proof)
+        missing_pending['factor_rebuild_metadata'] = {
+            'schema_version': 3,
+            'dates': {},
+        }
+        unrelated_pending = {
+            'repair_batch_id': 'legacy-final-bar-batch',
+            'created_at': (UTC_NOW - timedelta(days=1)).isoformat(),
+            'affected_symbols': ['005930'],
+            'required_rebuild_trade_dates': ['2026-09-19'],
+            'required_evaluation_market_date_from': '2026-09-21',
+            'required_evaluation_market_date_to': '2026-09-23',
+            'factor_rebuild_metadata': {
+                'schema_version': 3,
+                'dates': {},
+            },
+            'verification_metadata': {
+                'repair_evidence': {
+                    'repair_kind': 'kis_final_bar_update',
+                }
+            },
+        }
+        missing_row = SimpleNamespace(
+            repair_batch_id='repair-batch-1',
+            created_at=UTC_NOW - timedelta(days=1),
+            required_rebuild_trade_dates=['2026-09-19'],
+            factor_rebuild_metadata={
+                'schema_version': 3,
+                'dates': {},
+            },
+            verification_metadata=deepcopy(
+                missing_pending['verification_metadata']
+            ),
+        )
+        unrelated_row = SimpleNamespace(
+            repair_batch_id='legacy-final-bar-batch',
+            created_at=UTC_NOW - timedelta(days=1),
+            required_rebuild_trade_dates=['2026-09-19'],
+            factor_rebuild_metadata={
+                'schema_version': 3,
+                'dates': {},
+            },
+            verification_metadata=deepcopy(
+                unrelated_pending['verification_metadata']
+            ),
+        )
+        session = MagicMock()
+        session.scalars.return_value.all.return_value = [
+            missing_row,
+            unrelated_row,
+        ]
+        symbols = ['005930']
+        membership_sha256 = market_membership_sha256(symbols)
+        item_sha256 = canonical_json_sha256(
+            {
+                'market_date': '2026-09-19',
+                'symbol_count': 1,
+                'membership_sha256': membership_sha256,
+                'symbols': symbols,
+            }
+        )
+
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.session_scope',
+                return_value=_session_scope_for(session),
+            ),
+            patch(
+                'app.eod.price_bar_repair_state._serialize_batch',
+                return_value=missing_pending,
+            ) as serialize_batch,
+        ):
+            recorded = record_pending_exact_signal_repair_proof(
+                market_date='2026-09-19',
+                exact_symbols=symbols,
+                manifest_sha256='b' * 64,
+                item_sha256=item_sha256,
+                implementation_contract=(
+                    EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT
+                ),
+                source_fingerprints=_exact_signal_source_fingerprints(
+                    symbols
+                ),
+                output_fingerprint={
+                    'row_count': 1,
+                    'output_sha256': 'a' * 64,
+                },
+                repair_started_at=UTC_NOW,
+                rebuild_completed_at=UTC_NOW,
+                preserved_direct_source_rows=0,
+            )
+
+        self.assertEqual(recorded['repair_batch_ids'], ['repair-batch-1'])
+        serialize_batch.assert_called_once_with(missing_row)
+        recorded_proof = missing_row.factor_rebuild_metadata[
+            'exact_signal_repair'
+        ]['dates']['2026-09-19']
+        self.assertEqual(
+            recorded_proof['covered_repair_batch_ids'],
+            ['repair-batch-1'],
+        )
+        self.assertNotIn(
+            'exact_signal_repair',
+            unrelated_row.factor_rebuild_metadata,
+        )
+
+        validated_missing = deepcopy(missing_pending)
+        validated_missing['factor_rebuild_metadata'] = deepcopy(
+            missing_row.factor_rebuild_metadata
+        )
+        with patch(
+            'app.eod.exact_signal_feature_repair._load_completion_state',
+            return_value=live_state,
+        ):
+            validated = validate_pending_exact_signal_repair_proofs(
+                pending=[validated_missing, unrelated_pending]
+            )
+
+        self.assertFalse(validated['ready'])
+        self.assertEqual(
+            validated['reason'],
+            'exact_signal_repair_proof_invalid',
+        )
+        self.assertEqual(validated['dates_required'], 1)
+        self.assertEqual(
+            validated['issues'][0]['error_type'],
+            'MixedSignalRepairAuthorityError',
+        )
+        self.assertEqual(
+            validated['issues'][0]['legacy_repair_batch_ids'],
+            ['legacy-final-bar-batch'],
+        )
+        self.assertEqual(
+            validated['proofs_by_date'],
+            {},
+        )
+        self.assertEqual(
+            recorded_proof['covered_repair_batch_ids'],
+            ['repair-batch-1'],
+        )
+
+    def test_validator_accepts_batch_bound_live_valid_exact_signal_proof(
+        self,
+    ) -> None:
+        pending, live_state = _pending_with_exact_signal_proof()
+        with patch(
+            'app.eod.exact_signal_feature_repair._load_completion_state',
+            return_value=live_state,
+        ) as load_live_state:
+            result = validate_pending_exact_signal_repair_proofs(
+                pending=[pending]
+            )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['dates_verified'], 1)
+        self.assertEqual(result['dates_required'], 1)
+        self.assertEqual(
+            result['reason'],
+            'exact_signal_repair_proof_ready',
+        )
+        load_live_state.assert_called_once_with(
+            '2026-09-19',
+            ('005930',),
+        )
+
+    def test_validator_rejects_live_output_drift(self) -> None:
+        pending, live_state = _pending_with_exact_signal_proof()
+        live_state['output_fingerprint'] = {
+            'row_count': 1,
+            'output_sha256': 'c' * 64,
+        }
+        with patch(
+            'app.eod.exact_signal_feature_repair._load_completion_state',
+            return_value=live_state,
+        ):
+            result = validate_pending_exact_signal_repair_proofs(
+                pending=[pending]
+            )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(
+            result['reason'],
+            'exact_signal_repair_proof_invalid',
+        )
+        self.assertIn(
+            'live proof has drifted',
+            result['issues'][0]['error_message'],
+        )
+
+    def test_rebuild_blocks_before_mutation_on_live_source_only_drift(
+        self,
+    ) -> None:
+        pending, live_state = _pending_with_exact_signal_proof()
+        live_state = deepcopy(live_state)
+        live_state['source_fingerprints']['market_risk_filter'][
+            'source_sha256'
+        ] = 'f' * 64
+
+        @contextmanager
+        def available_locks(**_kwargs):
+            yield True, None
+
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'load_pending_price_bar_rebuild_batches',
+                side_effect=([pending], [pending]),
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'advisory_eod_collection_locks',
+                side_effect=available_locks,
+            ),
+            patch(
+                'app.eod.exact_signal_feature_repair.'
+                '_load_completion_state',
+                return_value=live_state,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_rebuild_pending_price_dependent_evaluations_locked'
+            ) as rebuild_locked,
+        ):
+            result = rebuild_pending_price_dependent_evaluations()
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(
+            result['reason'],
+            'exact_signal_repair_proof_invalid',
+        )
+        self.assertIn(
+            'live proof has drifted',
+            result['exact_signal_repair_proof']['issues'][0][
+                'error_message'
+            ],
+        )
+        rebuild_locked.assert_not_called()
+
+    def test_validator_rejects_missing_or_legacy_metadata(self) -> None:
+        pending, _live_state = _pending_with_exact_signal_proof()
+        pending['factor_rebuild_metadata']['exact_signal_repair'][
+            'schema_version'
+        ] = 0
+
+        result = validate_pending_exact_signal_repair_proofs(
+            pending=[pending]
+        )
+
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['dates_verified'], 0)
+        self.assertIn(
+            'metadata contract is invalid',
+            result['issues'][0]['error_message'],
+        )
+
+
 class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
-    def test_rebuild_refreshes_stored_signal_contexts_and_evaluations_without_agents(
+    def test_unrelated_batch_keeps_legacy_signal_rebuild_path(self) -> None:
+        pending = [
+            {
+                'repair_batch_id': 'legacy-final-bar-batch',
+                'affected_symbols': ['005930'],
+                'required_rebuild_trade_dates': ['2026-09-19'],
+                'required_evaluation_market_date_from': '2026-09-21',
+                'required_evaluation_market_date_to': '2026-09-23',
+                'verification_metadata': {
+                    'repair_evidence': {
+                        'repair_kind': 'kis_final_bar_update',
+                    }
+                },
+            }
+        ]
+        proof = validate_pending_exact_signal_repair_proofs(
+            pending=pending
+        )
+        session = MagicMock()
+        session.scalars.return_value.all.return_value = []
+
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.session_scope',
+                return_value=_session_scope_for(session),
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_signal_feature_service.'
+                'rebuild_stored_owned_fallback_for_market_date',
+                side_effect=RuntimeError('legacy signal rebuild invoked'),
+            ) as rebuild_signal_features,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'legacy signal rebuild invoked',
+            ):
+                _rebuild_pending_price_dependent_evaluations_locked(
+                    pending,
+                    exact_signal_repair_proof=proof,
+                )
+
+        self.assertTrue(proof['ready'])
+        self.assertEqual(
+            proof['reason'],
+            'exact_signal_repair_proof_not_required',
+        )
+        rebuild_signal_features.assert_called_once_with(
+            market_date=date(2026, 9, 19),
+        )
+
+    def test_rebuild_uses_proven_signal_contexts_and_refreshes_evaluations_without_agents(
         self,
     ) -> None:
         pending = [
@@ -1973,6 +2553,27 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             patch(
                 'app.eod.price_bar_repair_state.load_pending_price_bar_rebuild_batches',
                 return_value=pending,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs',
+                return_value={
+                    'ready': True,
+                    'reason': 'exact_signal_repair_proof_ready',
+                    'dates_verified': 1,
+                    'dates_required': 1,
+                    'earliest_repair_started_at': UTC_NOW.isoformat(),
+                    'proofs_by_date': {
+                        '2026-09-19': {
+                            'manifest_sha256': '1' * 64,
+                            'item_sha256': '2' * 64,
+                            'repair_started_at': UTC_NOW.isoformat(),
+                            'rebuild_completed_at': UTC_NOW.isoformat(),
+                            'preserved_direct_source_rows': 1,
+                        }
+                    },
+                    'issues': [],
+                },
             ),
             patch(
                 'app.eod.price_bar_repair_state.advisory_eod_collection_locks',
@@ -2081,10 +2682,7 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             trigger='price_bar_repair',
         )
         agent_dispatch.assert_not_called()
-        rebuild_signal_features.assert_called_once_with(
-            market_date=date(2026, 9, 19),
-            exact_symbols=('005930',),
-        )
+        rebuild_signal_features.assert_not_called()
         rebuild_participation.assert_called_once_with(
             market_date=date(2026, 9, 19),
             market='KRX',
@@ -2117,6 +2715,122 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             1,
         )
 
+    def test_rebuild_blocks_before_mutation_without_live_valid_signal_proof(
+        self,
+    ) -> None:
+        pending = [
+            {
+                'repair_batch_id': 'repair-batch-1',
+                'affected_symbols': ['005930'],
+                'required_rebuild_trade_dates': ['2026-09-19'],
+                'required_evaluation_market_date_from': '2026-09-21',
+                'required_evaluation_market_date_to': '2026-09-23',
+            }
+        ]
+        lock_calls: list[dict] = []
+
+        @contextmanager
+        def available_locks(**kwargs):
+            lock_calls.append(kwargs)
+            yield True, None
+
+        invalid_proof = {
+            'ready': False,
+            'reason': 'exact_signal_repair_proof_invalid',
+            'dates_verified': 0,
+            'dates_required': 1,
+            'proofs_by_date': {},
+            'issues': [
+                {
+                    'market_date': '2026-09-19',
+                    'error_type': 'ValueError',
+                    'error_message': 'date proof is missing',
+                }
+            ],
+        }
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'load_pending_price_bar_rebuild_batches',
+                return_value=pending,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'advisory_eod_collection_locks',
+                side_effect=available_locks,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs',
+                return_value=invalid_proof,
+            ) as validate_proof,
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_rebuild_pending_price_dependent_evaluations_locked'
+            ) as rebuild_locked,
+        ):
+            result = rebuild_pending_price_dependent_evaluations()
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(
+            result['reason'],
+            'exact_signal_repair_proof_invalid',
+        )
+        self.assertEqual(result['updated_batch_count'], 0)
+        self.assertEqual(result['exact_signal_repair_proof'], invalid_proof)
+        self.assertEqual(len(lock_calls), 1)
+        validate_proof.assert_called_once_with(pending=pending)
+        rebuild_locked.assert_not_called()
+
+    def test_rebuild_blocks_when_pending_batches_change_under_lock(
+        self,
+    ) -> None:
+        initial = {
+            'repair_batch_id': 'repair-batch-1',
+            'affected_symbols': ['005930'],
+            'required_rebuild_trade_dates': ['2026-09-19'],
+            'required_evaluation_market_date_from': '2026-09-21',
+            'required_evaluation_market_date_to': '2026-09-23',
+        }
+        inserted = {
+            **initial,
+            'repair_batch_id': 'repair-batch-2',
+        }
+
+        @contextmanager
+        def available_locks(**_kwargs):
+            yield True, None
+
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'load_pending_price_bar_rebuild_batches',
+                side_effect=([initial], [initial, inserted]),
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'advisory_eod_collection_locks',
+                side_effect=available_locks,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs'
+            ) as validate_proof,
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_rebuild_pending_price_dependent_evaluations_locked'
+            ) as rebuild_locked,
+        ):
+            result = rebuild_pending_price_dependent_evaluations()
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(
+            result['reason'],
+            'pending_repair_batches_changed_under_lock',
+        )
+        validate_proof.assert_not_called()
+        rebuild_locked.assert_not_called()
+
     def test_rebuild_stops_before_any_work_when_one_date_lock_is_denied(
         self,
     ) -> None:
@@ -2144,6 +2858,19 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             patch(
                 'app.eod.price_bar_repair_state.load_pending_price_bar_rebuild_batches',
                 return_value=pending,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs',
+                return_value={
+                    'ready': True,
+                    'reason': 'exact_signal_repair_proof_ready',
+                    'dates_verified': 3,
+                    'dates_required': 3,
+                    'earliest_repair_started_at': UTC_NOW.isoformat(),
+                    'proofs_by_date': {},
+                    'issues': [],
+                },
             ),
             patch(
                 'app.eod.price_bar_repair_state.advisory_eod_collection_locks',
@@ -2256,6 +2983,14 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
             ),
             patch(
                 'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs',
+                return_value={
+                    'ready': True,
+                    'reason': 'exact_signal_repair_proof_ready',
+                },
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
                 '_verify_pending_price_bar_rebuilds_locked',
                 return_value=expected,
             ) as verify_locked,
@@ -2270,6 +3005,116 @@ class PriceBarRepairEvaluationRebuildTests(unittest.TestCase):
                 'repair-batch-older',
             ),
         )
+
+    def test_verifier_blocks_when_pending_batches_change_under_lock(
+        self,
+    ) -> None:
+        initial = {
+            'repair_batch_id': 'repair-batch-1',
+            'required_rebuild_trade_dates': ['2026-09-21'],
+        }
+        inserted = {
+            'repair_batch_id': 'repair-batch-2',
+            'required_rebuild_trade_dates': ['2026-09-21'],
+        }
+
+        @contextmanager
+        def available_locks(**_kwargs):
+            yield True, None
+
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'load_pending_price_bar_rebuild_batches',
+                side_effect=([initial], [initial, inserted]),
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'advisory_eod_collection_locks',
+                side_effect=available_locks,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs'
+            ) as validate_proof,
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_verify_pending_price_bar_rebuilds_locked'
+            ) as verify_locked,
+        ):
+            result = verify_pending_price_bar_rebuilds(apply=True)
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertFalse(result['applied'])
+        self.assertEqual(
+            result['reason'],
+            'pending_repair_batches_changed_under_lock',
+        )
+        validate_proof.assert_not_called()
+        verify_locked.assert_not_called()
+
+    def test_verifier_blocks_completion_when_live_signal_proof_drifted(
+        self,
+    ) -> None:
+        pending = [
+            {
+                'repair_batch_id': 'repair-batch-1',
+                'required_rebuild_trade_dates': ['2026-09-21'],
+            }
+        ]
+
+        @contextmanager
+        def available_locks(**_kwargs):
+            yield True, None
+
+        invalid_proof = {
+            'ready': False,
+            'reason': 'exact_signal_repair_proof_invalid',
+            'dates_verified': 0,
+            'dates_required': 1,
+            'proofs_by_date': {},
+            'issues': [
+                {
+                    'market_date': '2026-09-21',
+                    'error_type': 'ValueError',
+                    'error_message': (
+                        'pending batch exact signal live proof has drifted'
+                    ),
+                }
+            ],
+        }
+        with (
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'load_pending_price_bar_rebuild_batches',
+                return_value=pending,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'advisory_eod_collection_locks',
+                side_effect=available_locks,
+            ),
+            patch(
+                'app.eod.price_bar_repair_state.'
+                'validate_pending_exact_signal_repair_proofs',
+                return_value=invalid_proof,
+            ) as validate_proof,
+            patch(
+                'app.eod.price_bar_repair_state.'
+                '_verify_pending_price_bar_rebuilds_locked'
+            ) as verify_locked,
+        ):
+            result = verify_pending_price_bar_rebuilds(apply=True)
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertFalse(result['applied'])
+        self.assertEqual(
+            result['reason'],
+            'exact_signal_repair_proof_invalid',
+        )
+        self.assertEqual(result['exact_signal_repair_proof'], invalid_proof)
+        validate_proof.assert_called_once_with(pending=pending)
+        verify_locked.assert_not_called()
 
     def test_locked_verifier_uses_configured_repair_timeout(self) -> None:
         session = MagicMock()
