@@ -41,6 +41,7 @@ SHADOW_AVOID_CHASE_SCHEMA_VERSION = 'short_term_avoid_chase_shadow_v1'
 EVALUATION_COST_ASSUMPTIONS_SCHEMA_VERSION = (
     'decider_evaluation_cost_assumptions_v1'
 )
+DECIDER_EVALUATION_UPSERT_BATCH_SIZE = 500
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -485,33 +486,55 @@ class DeciderPostDecisionEvaluationRepository:
             return []
 
         with session_scope() as session:
-            stmt = insert(DeciderPostDecisionEvaluation).values(list(items))
-            excluded = stmt.excluded
-            stmt = stmt.on_conflict_do_update(
-                constraint='uq_decider_post_decision_evaluations_feedback_window',
-                set_={
-                    'decision_snapshot_id': excluded.decision_snapshot_id,
-                    'agent_name': excluded.agent_name,
-                    'market_date': excluded.market_date,
-                    'symbol': excluded.symbol,
-                    'decision_action': excluded.decision_action,
-                    'entry_trade_date': excluded.entry_trade_date,
-                    'entry_price': excluded.entry_price,
-                    'target_price': excluded.target_price,
-                    'stop_loss_price': excluded.stop_loss_price,
-                    'first_target_hit_trade_date': excluded.first_target_hit_trade_date,
-                    'first_stop_hit_trade_date': excluded.first_stop_hit_trade_date,
-                    'mfe_pct': excluded.mfe_pct,
-                    'mae_pct': excluded.mae_pct,
-                    'outcome_label': excluded.outcome_label,
-                    'outcome_reason': excluded.outcome_reason,
-                    'data_quality_warnings_payload': excluded.data_quality_warnings_payload,
-                    'metadata_payload': excluded.metadata_payload,
-                    'computed_at': excluded.computed_at,
-                    'updated_at': excluded.updated_at,
-                },
-            ).returning(DeciderPostDecisionEvaluation.id)
-            record_ids = list(session.execute(stmt).scalars().all())
+            record_ids: list[int] = []
+            for offset in range(
+                0,
+                len(items),
+                DECIDER_EVALUATION_UPSERT_BATCH_SIZE,
+            ):
+                batch = list(
+                    items[
+                        offset : offset
+                        + DECIDER_EVALUATION_UPSERT_BATCH_SIZE
+                    ]
+                )
+                stmt = insert(DeciderPostDecisionEvaluation).values(batch)
+                excluded = stmt.excluded
+                stmt = stmt.on_conflict_do_update(
+                    constraint=(
+                        'uq_decider_post_decision_evaluations_feedback_window'
+                    ),
+                    set_={
+                        'decision_snapshot_id': excluded.decision_snapshot_id,
+                        'agent_name': excluded.agent_name,
+                        'market_date': excluded.market_date,
+                        'symbol': excluded.symbol,
+                        'decision_action': excluded.decision_action,
+                        'entry_trade_date': excluded.entry_trade_date,
+                        'entry_price': excluded.entry_price,
+                        'target_price': excluded.target_price,
+                        'stop_loss_price': excluded.stop_loss_price,
+                        'first_target_hit_trade_date': (
+                            excluded.first_target_hit_trade_date
+                        ),
+                        'first_stop_hit_trade_date': (
+                            excluded.first_stop_hit_trade_date
+                        ),
+                        'mfe_pct': excluded.mfe_pct,
+                        'mae_pct': excluded.mae_pct,
+                        'outcome_label': excluded.outcome_label,
+                        'outcome_reason': excluded.outcome_reason,
+                        'data_quality_warnings_payload': (
+                            excluded.data_quality_warnings_payload
+                        ),
+                        'metadata_payload': excluded.metadata_payload,
+                        'computed_at': excluded.computed_at,
+                        'updated_at': excluded.updated_at,
+                    },
+                ).returning(DeciderPostDecisionEvaluation.id)
+                record_ids.extend(
+                    session.execute(stmt).scalars().all()
+                )
             if not record_ids:
                 return []
             rows = session.execute(
