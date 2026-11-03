@@ -1,8 +1,10 @@
 import unittest
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 from app.brokers.kis.client import KISClient
 from app.eod.market_membership import market_membership_sha256
+from app.market_data_store import sanitize_daily_signal_feature_payload
 from app.signals.daily_signal_features import (
     OVERTIME_FLUCTUATION,
     OVERTIME_VOLUME,
@@ -15,6 +17,9 @@ from app.signals.daily_signal_features import (
     _merge_owned_fallback_features,
     build_daily_signal_feature_rows,
     main,
+)
+from app.signals.signal_feature_readiness import (
+    classify_signal_feature_readiness,
 )
 
 
@@ -295,6 +300,75 @@ class DailySignalFeatureBuilderTests(unittest.TestCase):
         self.assertEqual(collection['legacy_marker'], 'preserved')
         self.assertNotIn('collected_at', collection)
         self.assertNotIn('source_errors', collection)
+
+    def test_stored_rebuild_keeps_invalid_raw_source_out_of_provenance(self):
+        raw_source = {'rank': 1, 'overtime_volume': 0}
+        entry = {
+            'symbol': '005930',
+            'name_ko': '삼성전자',
+            'market': 'KOSPI',
+            'market_date': '2026-05-06',
+            'source': 'kis_ranking',
+            'signal_count': 1,
+            'volume_power_rank': None,
+            'volume_power': None,
+            'overtime_volume_rank': 1,
+            'overtime_volume': 0,
+            'overtime_fluctuation_rank': None,
+            'overtime_fluctuation_rate': None,
+            'feature_payload': {
+                'sources': {OVERTIME_VOLUME: raw_source},
+                'collection': {},
+            },
+        }
+        support_maps = {
+            'symbol_map': {},
+            'quote_map': {},
+            'price_bars_by_symbol': {},
+            'value_map': {},
+            'unified_value_map': {},
+            'quality_map': {},
+            'momentum_map': {},
+            'advanced_value_map': {},
+            'low_risk_map': {},
+            'beta_map': {},
+            'composite_map': {},
+        }
+
+        merged = _merge_owned_fallback_features(
+            entry=entry,
+            market_date='2026-05-06',
+            universe={
+                'active_symbols': ['005930'],
+                'candidate_symbols': [],
+                'target_symbols': ['005930'],
+            },
+            support_maps=support_maps,
+            collection_payload={},
+            source_errors={},
+            preserve_collection_shape=True,
+        )
+
+        self.assertEqual(
+            merged['feature_payload']['sources'][OVERTIME_VOLUME],
+            raw_source,
+        )
+        provenance = merged['feature_payload']['row_provenance']
+        self.assertEqual(provenance['direct_signal_source_count'], 0)
+        self.assertEqual(provenance['direct_signal_sources'], [])
+        self.assertEqual(provenance['row_kind'], 'fallback_only')
+        self.assertEqual(
+            sanitize_daily_signal_feature_payload(
+                merged['feature_payload']
+            )['sources'],
+            {},
+        )
+        readiness = classify_signal_feature_readiness(
+            signal_count=merged['signal_count'],
+            feature_payload=merged['feature_payload'],
+            expected_market_date='2026-05-06',
+        )
+        self.assertFalse(readiness['semantic_ready'])
 
     def test_build_daily_signal_feature_rows_merges_source_features_by_symbol(self):
         rows = build_daily_signal_feature_rows(
@@ -810,6 +884,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'overtime_fluctuation_rank': None,
             'overtime_fluctuation_rate': None,
             'feature_payload': {
+                'market_date': '2026-05-06',
                 'sources': stored_sources,
                 'collection': {},
                 'fallback_features': {
@@ -866,11 +941,13 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                'app.signals.daily_signal_features.load_daily_signal_features',
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
                 return_value=[stored_row],
             ),
             patch(
-                'app.signals.daily_signal_features._resolve_generation_universe',
+                'app.signals.daily_signal_features.'
+                '_resolve_exact_repair_generation_universe',
                 return_value={
                     'target_symbols': ['005930'],
                     'active_symbols': ['005930'],
@@ -888,7 +965,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             ) as upsert,
         ):
             result = service.rebuild_stored_owned_fallback_for_market_date(
-                market_date='2026-05-06'
+                market_date='2026-05-06',
+                exact_symbols=['005930'],
             )
 
         self.assertEqual(result['features_persisted'], 1)
@@ -897,6 +975,24 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rebuilt['volume_power_rank'], 1)
         self.assertEqual(rebuilt['volume_power'], 145.7)
         self.assertEqual(rebuilt['feature_payload']['sources'], stored_sources)
+        self.assertEqual(
+            rebuilt['feature_payload']['row_provenance'][
+                'direct_signal_source_count'
+            ],
+            1,
+        )
+        self.assertEqual(
+            sanitize_daily_signal_feature_payload(
+                rebuilt['feature_payload']
+            )['sources'],
+            stored_sources,
+        )
+        readiness = classify_signal_feature_readiness(
+            signal_count=rebuilt['signal_count'],
+            feature_payload=rebuilt['feature_payload'],
+            expected_market_date='2026-05-06',
+        )
+        self.assertTrue(readiness['semantic_ready'])
         self.assertNotIn(
             'collected_at', rebuilt['feature_payload']['collection']
         )
@@ -915,6 +1011,127 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
             71_000,
         )
+
+    def test_repair_non_exact_scope_uses_bounded_raw_rows(self) -> None:
+        service = DailySignalFeatureService(client=EmptyKISRankingClient())
+        stored_sources = {
+            VOLUME_POWER: {
+                'data_rank': '1',
+                'tday_rltv': '145.7',
+            },
+            OVERTIME_VOLUME: {
+                'data_rank': '2',
+                'ovtm_untp_vol': '0',
+            },
+        }
+        stored_row = {
+            'symbol': '005930',
+            'name_ko': '삼성전자',
+            'market': 'KOSPI',
+            'market_date': '2026-05-06',
+            'source': 'kis_ranking',
+            'signal_count': 2,
+            'volume_power_rank': 1,
+            'volume_power': Decimal('145.7000'),
+            'overtime_volume_rank': 2,
+            'overtime_volume': 0,
+            'overtime_fluctuation_rank': None,
+            'overtime_fluctuation_rate': None,
+            'feature_payload': {
+                'sources': stored_sources,
+                'collection': {},
+            },
+        }
+        support_maps = {
+            'symbol_map': {
+                '005930': {
+                    'symbol': '005930',
+                    'name_ko': '삼성전자',
+                    'market': 'KOSPI',
+                }
+            },
+            'quote_map': {},
+            'price_bars_by_symbol': {
+                '005930': [
+                    {
+                        'trade_date': '2026-05-06',
+                        'open_price': 70_000,
+                        'high_price': 72_000,
+                        'low_price': 69_000,
+                        'close_price': 71_000,
+                        'volume': 100_000,
+                        'turnover': 7_100_000_000,
+                        'source': 'pykrx',
+                        'captured_at': '2026-05-06T15:30:00+09:00',
+                    }
+                ]
+            },
+            'value_map': {},
+            'unified_value_map': {},
+            'quality_map': {},
+            'momentum_map': {},
+            'advanced_value_map': {},
+            'low_risk_map': {},
+            'beta_map': {},
+            'composite_map': {},
+        }
+
+        with (
+            patch(
+                'app.signals.daily_signal_features.'
+                'list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ) as load_bar_symbols,
+            patch(
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
+                return_value=[stored_row],
+            ) as load_features,
+            patch(
+                'app.signals.daily_signal_features.'
+                '_resolve_generation_universe',
+                return_value={
+                    'target_symbols': ['005930'],
+                    'active_symbols': ['005930'],
+                    'candidate_symbols': [],
+                    'candidate_universe_availability': 'available',
+                },
+            ),
+            patch(
+                'app.signals.daily_signal_features._load_support_maps',
+                return_value=support_maps,
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'upsert_daily_signal_features',
+                return_value=1,
+            ) as upsert,
+        ):
+            result = service.rebuild_stored_owned_fallback_for_market_date(
+                market_date='2026-05-06',
+            )
+
+        load_bar_symbols.assert_called_once_with('2026-05-06')
+        load_features.assert_called_once_with(
+            market_date='2026-05-06',
+            symbols=['005930'],
+        )
+        rebuilt = upsert.call_args.args[0][0]
+        self.assertFalse(upsert.call_args.kwargs['delete_rows_outside_scope'])
+        self.assertIsInstance(rebuilt['volume_power'], Decimal)
+        self.assertEqual(rebuilt['volume_power'], Decimal('145.7000'))
+        self.assertEqual(rebuilt['overtime_volume'], 0)
+        self.assertEqual(
+            rebuilt['feature_payload']['sources'],
+            stored_sources,
+        )
+        self.assertEqual(
+            rebuilt['feature_payload']['row_provenance'][
+                'direct_signal_sources'
+            ],
+            [VOLUME_POWER],
+        )
+        self.assertFalse(result['exact_scope'])
 
     def test_repair_exact_scope_creates_missing_fallback_rows(self) -> None:
         service = DailySignalFeatureService(client=EmptyKISRankingClient())
@@ -986,7 +1203,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                'app.signals.daily_signal_features.load_daily_signal_features',
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
                 return_value=[stored_row],
             ) as load_features,
             patch(
@@ -1022,7 +1240,6 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         load_features.assert_called_once_with(
             market_date='2026-05-06',
             symbols=['000660', '005930'],
-            limit=None,
         )
         rebuilt_by_symbol = {
             row['symbol']: row for row in upsert.call_args.args[0]
@@ -1052,7 +1269,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                'app.signals.daily_signal_features.load_daily_signal_features',
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
                 return_value=[],
             ),
             patch(

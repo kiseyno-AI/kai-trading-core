@@ -48,6 +48,7 @@ from app.market_data_store import (
     load_daily_pykrx_enrichment_rows,
     load_daily_signal_feature_context_rows,
     load_daily_signal_features,
+    load_raw_daily_signal_features_for_repair,
     load_prior_market_turnover_baselines,
     persist_daily_price_bar,
     persist_daily_price_bars,
@@ -206,6 +207,64 @@ class DailySignalFeatureAuthorityTests(unittest.TestCase):
                 'order by daily_signal_features.signal_count desc',
                 sql,
             )
+
+    def test_raw_repair_loader_preserves_rejected_provider_evidence(
+        self,
+    ) -> None:
+        statements = []
+        feature = SimpleNamespace(
+            market_date=date(2026, 10, 30),
+            source='kis_ranking',
+            signal_count=1,
+            volume_power_rank=None,
+            volume_power=None,
+            overtime_volume_rank=1,
+            overtime_volume=0,
+            overtime_fluctuation_rank=None,
+            overtime_fluctuation_rate=None,
+            feature_payload={
+                'sources': {
+                    'overtime-volume': {
+                        'rank': 1,
+                        'overtime_volume': 0,
+                    }
+                }
+            },
+        )
+
+        class _Result:
+            @staticmethod
+            def all():
+                return [(feature, '005930', '삼성전자', 'KOSPI')]
+
+        class _Session:
+            @staticmethod
+            def execute(statement):
+                statements.append(statement)
+                return _Result()
+
+        @contextmanager
+        def fake_session_scope():
+            yield _Session()
+
+        with patch('app.market_data_store.session_scope', fake_session_scope):
+            rows = load_raw_daily_signal_features_for_repair(
+                market_date='2026-10-30',
+                symbols=['005930'],
+            )
+
+        self.assertEqual(rows[0]['signal_count'], 1)
+        self.assertEqual(rows[0]['overtime_volume_rank'], 1)
+        self.assertEqual(rows[0]['overtime_volume'], 0)
+        self.assertEqual(
+            rows[0]['feature_payload']['sources']['overtime-volume'],
+            {'rank': 1, 'overtime_volume': 0},
+        )
+        sql = str(
+            statements[0].compile(dialect=postgresql.dialect())
+        ).lower()
+        self.assertNotIn('join daily_price_bars', sql)
+        self.assertIn('symbols.symbol in', sql)
 
     def test_bulk_signal_feature_refresh_prunes_stale_rows_in_same_transaction(self) -> None:
         scope_count = 0
@@ -939,6 +998,49 @@ class DailySignalFeatureScopedRepairIntegrationTests(unittest.TestCase):
         self.assertEqual(
             dict(rows),
             {self.KOSPI_SYMBOL: 3, self.KOSDAQ_SYMBOL: 2},
+        )
+
+    def test_raw_repair_loader_preserves_unusable_legacy_evidence(self) -> None:
+        legacy_source = {'rank': 1, 'overtime_volume': 0}
+        upsert_daily_signal_features(
+            [
+                {
+                    **self._feature(self.KOSPI_SYMBOL, signal_count=1),
+                    'overtime_volume_rank': 1,
+                    'overtime_volume': 0,
+                    'feature_payload': {
+                        'sources': {
+                            'overtime-volume': legacy_source,
+                        }
+                    },
+                },
+                self._feature(self.KOSDAQ_SYMBOL, signal_count=0),
+            ]
+        )
+
+        self.assertEqual(
+            load_daily_signal_features(
+                market_date=self.MARKET_DATE,
+                limit=None,
+            ),
+            [],
+        )
+        rows = load_raw_daily_signal_features_for_repair(
+            market_date=self.MARKET_DATE,
+            symbols=[self.KOSDAQ_SYMBOL, self.KOSPI_SYMBOL],
+        )
+
+        self.assertEqual(
+            [row['symbol'] for row in rows],
+            [self.KOSPI_SYMBOL, self.KOSDAQ_SYMBOL],
+        )
+        self.assertEqual(rows[0]['signal_count'], 1)
+        self.assertEqual(rows[0]['overtime_volume_rank'], 1)
+        self.assertIsInstance(rows[0]['overtime_volume'], int)
+        self.assertEqual(rows[0]['overtime_volume'], 0)
+        self.assertEqual(
+            rows[0]['feature_payload']['sources']['overtime-volume'],
+            legacy_source,
         )
 
     def test_exact_stage_finalizer_removes_outside_and_failed_stale_rows(

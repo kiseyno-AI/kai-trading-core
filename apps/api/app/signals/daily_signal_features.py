@@ -29,6 +29,7 @@ from app.market_data_store import (
     load_daily_signal_features,
     load_daily_unified_value_factor_results,
     load_daily_value_factor_results,
+    load_raw_daily_signal_features_for_repair,
     load_recent_price_bars_by_symbol,
     load_symbols,
     replace_daily_signal_features_exact_scope,
@@ -39,6 +40,7 @@ from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.signal_feature_readiness import (
     SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
     classify_signal_feature_readiness,
+    decision_usable_direct_signal_sources,
     quote_snapshot_is_decision_usable,
 )
 
@@ -1088,7 +1090,9 @@ def _merge_owned_fallback_features(
             'quote_snapshot': quote_snapshot_features,
         }
     )
-    direct_sources = sorted(((entry.get('feature_payload') or {}).get('sources') or {}).keys())
+    direct_sources = decision_usable_direct_signal_sources(
+        entry.get('feature_payload')
+    )
     fallback_groups_present = _count_present_feature_groups(fallback_features)
     direct_signal_source_count = len(direct_sources)
 
@@ -2084,10 +2088,16 @@ class DailySignalFeatureService:
                     'and duplicate-free'
                 )
             normalized_exact_symbols.sort()
-        stored_rows = load_daily_signal_features(
+        repair_symbols = (
+            normalized_exact_symbols
+            if normalized_exact_symbols is not None
+            else list_symbols_with_daily_bar_on_date(
+                normalized_market_date
+            )
+        )
+        stored_rows = load_raw_daily_signal_features_for_repair(
             market_date=normalized_market_date,
-            symbols=normalized_exact_symbols,
-            limit=None,
+            symbols=repair_symbols,
         )
         if not stored_rows and normalized_exact_symbols is None:
             return {

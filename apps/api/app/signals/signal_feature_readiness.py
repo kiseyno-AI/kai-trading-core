@@ -66,12 +66,20 @@ def _direct_source_metric(
     return None
 
 
-def _direct_source_is_decision_usable(
+def direct_signal_source_is_decision_usable(
     *,
     source: str,
     payload: Mapping[str, Any],
 ) -> bool:
     normalized_source = str(source).strip().lower().replace('_', '-')
+    rank = _direct_source_metric(payload, 'rank', 'data_rank')
+    rank_is_usable = bool(
+        rank is not None
+        and rank > 0
+        and float(rank).is_integer()
+    )
+    if not rank_is_usable:
+        return False
     if normalized_source == 'volume-power':
         volume_power = _direct_source_metric(
             payload,
@@ -152,6 +160,26 @@ def quote_snapshot_is_same_day(
     )
 
 
+def decision_usable_direct_signal_sources(
+    feature_payload: Any,
+) -> list[str]:
+    if not isinstance(feature_payload, Mapping):
+        return []
+    sources = feature_payload.get('sources')
+    if not isinstance(sources, Mapping):
+        return []
+    return sorted(
+        str(source)
+        for source, payload in sources.items()
+        if str(source).strip()
+        and isinstance(payload, Mapping)
+        and direct_signal_source_is_decision_usable(
+            source=str(source),
+            payload=payload,
+        )
+    )
+
+
 def quote_snapshot_is_decision_usable(
     *,
     payload: Mapping[str, Any],
@@ -217,18 +245,9 @@ def classify_signal_feature_readiness(
         normalized_signal_count = max(int(signal_count or 0), 0)
     except (TypeError, ValueError):
         normalized_signal_count = 0
-    sources = feature_payload.get('sources')
-    sources = sources if isinstance(sources, Mapping) else {}
-    usable_direct_sources = [
-        str(source)
-        for source, payload in sources.items()
-        if str(source).strip()
-        and isinstance(payload, Mapping)
-        and _direct_source_is_decision_usable(
-            source=str(source),
-            payload=payload,
-        )
-    ]
+    usable_direct_sources = decision_usable_direct_signal_sources(
+        feature_payload
+    )
     try:
         provenance_direct_count = max(
             int(provenance.get('direct_signal_source_count') or 0),

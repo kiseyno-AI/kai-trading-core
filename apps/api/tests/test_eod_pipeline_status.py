@@ -1531,16 +1531,16 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             )
 
         ready_cases = (
-            ('volume-power', {'volume_power': 145.7}),
-            ('volume_power', {'tday_rltv': '145.7'}),
-            ('overtime-volume', {'overtime_volume': 100}),
+            ('volume-power', {'rank': 1, 'volume_power': 145.7}),
+            ('volume_power', {'data_rank': '1', 'tday_rltv': '145.7'}),
+            ('overtime-volume', {'rank': 1, 'overtime_volume': 100}),
             (
                 'overtime_volume',
-                {'raw': {'ovtm_untp_vol': '100'}},
+                {'raw': {'data_rank': '1', 'ovtm_untp_vol': '100'}},
             ),
             (
                 'overtime-fluctuation',
-                {'overtime_change_pct': 0.0},
+                {'rank': 1, 'overtime_change_pct': 0.0},
             ),
         )
         for source, source_payload in ready_cases:
@@ -1550,12 +1550,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 self.assertEqual(readiness['quality_status'], 'complete')
 
         rejected_cases = (
-            ('volume-power', {'volume_power': 999.99}),
-            ('volume_power', {'tday_rltv': '999.99'}),
-            ('volume-power', {'volume_power': 0}),
-            ('overtime-volume', {'overtime_volume': 0}),
-            ('overtime_volume', {'ovtm_untp_vol': -1}),
+            ('volume-power', {'rank': 1, 'volume_power': 999.99}),
+            ('volume_power', {'data_rank': '1', 'tday_rltv': '999.99'}),
+            ('volume-power', {'rank': 1, 'volume_power': 0}),
+            ('volume-power', {'volume_power': 145.7}),
+            ('volume-power', {'rank': 0, 'volume_power': 145.7}),
+            ('overtime-volume', {'rank': 1, 'overtime_volume': 0}),
+            ('overtime_volume', {'data_rank': '1', 'ovtm_untp_vol': -1}),
             ('overtime-fluctuation', {'rank': 1}),
+            ('overtime-fluctuation', {'overtime_change_pct': 1.5}),
             ('unknown-source', {'status': 'available', 'rank': 1}),
         )
         for source, source_payload in rejected_cases:

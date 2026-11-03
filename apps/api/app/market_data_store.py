@@ -100,6 +100,9 @@ from app.repositories.symbol_repository import (
     upsert_symbol_universe,
 )
 from app.scanner.state import scanner_state
+from app.signals.signal_feature_readiness import (
+    direct_signal_source_is_decision_usable,
+)
 
 
 EXACT_SCOPE_ROW_LOCAL_ERRORS = (
@@ -3975,34 +3978,11 @@ def sanitize_daily_signal_feature_payload(payload: Any) -> dict[str, Any]:
         str(source): deepcopy(value)
         for source, value in raw_sources.items()
         if isinstance(value, Mapping)
+        and direct_signal_source_is_decision_usable(
+            source=str(source),
+            payload=value,
+        )
     }
-
-    volume_power = sources.get('volume-power')
-    if volume_power is not None:
-        normalized = _decimal_to_float(volume_power.get('volume_power'))
-        rank = volume_power.get('rank')
-        if (
-            rank is None
-            or normalized is None
-            or normalized <= 0
-            or abs(normalized - 999.99) < 1e-9
-        ):
-            sources.pop('volume-power', None)
-
-    overtime_volume = sources.get('overtime-volume')
-    if overtime_volume is not None:
-        try:
-            normalized_overtime = int(
-                overtime_volume.get('overtime_volume')
-            )
-        except (TypeError, ValueError):
-            normalized_overtime = None
-        if (
-            overtime_volume.get('rank') is None
-            or normalized_overtime is None
-            or normalized_overtime <= 0
-        ):
-            sources.pop('overtime-volume', None)
 
     sanitized['sources'] = sources
     return sanitized
@@ -6387,6 +6367,65 @@ def load_daily_signal_features(
                     feature.feature_payload
                 )
             ]
+        ]
+
+
+def load_raw_daily_signal_features_for_repair(
+    *,
+    market_date: str | date,
+    symbols: Sequence[str],
+) -> list[dict]:
+    """Load stored signal rows without consumer-facing sanitization.
+
+    Historical exact repair must preserve the original provider columns and
+    payload even when current readers reject that evidence for strategy use.
+    The caller must provide the exact authority scope.  That keeps this raw
+    path aligned with repair proof queries without broadening ordinary reads.
+    """
+
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_symbols = sorted(
+        {_normalize_symbol_code(str(symbol)) for symbol in symbols}
+    )
+    if not normalized_symbols:
+        return []
+    with session_scope() as session:
+        statement = (
+            select(
+                DailySignalFeature,
+                Symbol.symbol,
+                Symbol.name_ko,
+                Symbol.market,
+            )
+            .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+            .where(
+                DailySignalFeature.market_date == normalized_market_date,
+                Symbol.symbol.in_(normalized_symbols),
+            )
+            .order_by(Symbol.symbol.asc())
+        )
+        rows = session.execute(statement).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': feature.market_date.isoformat(),
+                'source': feature.source,
+                'signal_count': feature.signal_count,
+                'volume_power_rank': feature.volume_power_rank,
+                'volume_power': feature.volume_power,
+                'overtime_volume_rank': feature.overtime_volume_rank,
+                'overtime_volume': feature.overtime_volume,
+                'overtime_fluctuation_rank': (
+                    feature.overtime_fluctuation_rank
+                ),
+                'overtime_fluctuation_rate': (
+                    feature.overtime_fluctuation_rate
+                ),
+                'feature_payload': deepcopy(feature.feature_payload or {}),
+            }
+            for feature, symbol, name_ko, market in rows
         ]
 
 
