@@ -8257,6 +8257,227 @@ class PykrxBackfillServiceTests(TestCase):
         )
         resolve_stage_debt.assert_not_called()
 
+    def test_point_in_time_upstream_rebuild_uses_full_frozen_membership(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        frozen_symbols = [
+            PykrxSymbol('000660', 'KOSPI', 'SK하이닉스'),
+            PykrxSymbol('005930', 'KOSPI', '삼성전자'),
+            PykrxSymbol('472220', 'KOSPI', '가격 복구 종목'),
+        ]
+        frozen_scope = sorted(item.symbol for item in frozen_symbols)
+        frozen_snapshot = {
+            **_stored_daily_universe_snapshot(frozen_symbols),
+            'point_in_time': True,
+            'current_universe_mutated': False,
+        }
+        stage_rows = {
+            stage_id: {'status': 'completed'}
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+        }
+        latest_pipeline_run = {
+            'id': 92,
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
+                'eod_collection_run_id': 8,
+            },
+            'stages': stage_rows,
+        }
+        latest_eod_run = {
+            'id': 8,
+            'trade_date': '2026-04-03',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed_with_errors',
+            'symbols_total': len(frozen_scope),
+            'symbols_succeeded': len(frozen_scope),
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': frozen_scope,
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': ['005930'],
+                'downstream_retry_resume_from_stage': 'pykrx_enrichment',
+                'universe_snapshot': frozen_snapshot,
+            },
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state'
+            ) as resolve_stage_debt,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={'status': 'partial', 'pipeline_run_id': 93},
+            ) as resume_stages,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertIsNotNone(result)
+        recovery_call = resume_stages.call_args.kwargs
+        self.assertEqual(recovery_call['resume_from_stage'], 'pykrx_enrichment')
+        self.assertEqual(recovery_call['symbols'], frozen_scope)
+        self.assertEqual(recovery_call['exact_membership_symbols'], frozen_scope)
+        self.assertNotIn('price_collection', recovery_call['stages'])
+        resolve_stage_debt.assert_not_called()
+
+    def test_narrow_completed_recovery_reopens_upstream_admission(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        frozen_symbols = [
+            PykrxSymbol('000660', 'KOSPI', 'SK하이닉스'),
+            PykrxSymbol('005930', 'KOSPI', '삼성전자'),
+            PykrxSymbol('472220', 'KOSPI', '가격 복구 종목'),
+        ]
+        frozen_scope = sorted(item.symbol for item in frozen_symbols)
+        frozen_snapshot = {
+            **_stored_daily_universe_snapshot(frozen_symbols),
+            'point_in_time': True,
+            'current_universe_mutated': False,
+        }
+        stage_rows = {
+            stage_id: {'status': 'completed'}
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+        }
+        stage_rows['technical_snapshots'] = {'status': 'partial'}
+        latest_pipeline_run = {
+            'id': 93,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'partial',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
+                'reused_eod_collection_run_id': 8,
+                'point_in_time_recovery': True,
+                'resume_from_stage': 'pykrx_enrichment',
+                'symbols': ['005930'],
+                'exact_membership_symbol_count': len(frozen_scope),
+                'exact_membership_sha256': market_membership_sha256(
+                    frozen_scope
+                ),
+            },
+            'stages': stage_rows,
+        }
+        latest_eod_run = {
+            'id': 8,
+            'trade_date': '2026-04-03',
+            'trigger': 'auto_close_scheduler',
+            'status': 'completed_with_errors',
+            'symbols_total': len(frozen_scope),
+            'symbols_succeeded': len(frozen_scope),
+            'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': frozen_scope,
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': ['005930'],
+                'downstream_retry_resume_from_stage': 'pykrx_enrichment',
+                'universe_snapshot': frozen_snapshot,
+            },
+        }
+
+        mismatched_scope_run = deepcopy(latest_pipeline_run)
+        mismatched_scope_run['run_metadata'][
+            'exact_membership_sha256'
+        ] = '0' * 64
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=mismatched_scope_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': False,
+                    'reason': 'stale_narrow_scope',
+                },
+            ) as blocked_resolve_stage_debt,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run'
+            ) as blocked_resume_stages,
+        ):
+            blocked = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertEqual(
+            blocked['reason'],
+            'followup_stage_debt_scope_unavailable',
+        )
+        blocked_resolve_stage_debt.assert_called_once()
+        blocked_resume_stages.assert_not_called()
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': False,
+                    'reason': 'stale_narrow_scope',
+                },
+            ) as resolve_stage_debt,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={'status': 'partial', 'pipeline_run_id': 94},
+            ) as resume_stages,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertIsNotNone(result)
+        recovery_call = resume_stages.call_args.kwargs
+        self.assertEqual(recovery_call['resume_from_stage'], 'pykrx_enrichment')
+        self.assertEqual(recovery_call['symbols'], frozen_scope)
+        self.assertEqual(recovery_call['exact_membership_symbols'], frozen_scope)
+        self.assertNotIn('price_collection', recovery_call['stages'])
+        resolve_stage_debt.assert_not_called()
+
     def test_stale_upstream_resume_marker_does_not_bypass_downstream_debt(
         self,
     ) -> None:

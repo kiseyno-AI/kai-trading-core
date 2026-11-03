@@ -6345,8 +6345,58 @@ class PykrxBackfillService:
                 ),
                 '',
             )
+        first_exact_followup_index = next(
+            (
+                recovery_scope.index(stage_id)
+                for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
+                if stage_id in recovery_scope
+            ),
+            None,
+        )
+        full_point_in_time_scope = sorted(
+            point_in_time_membership_symbols or []
+        )
+        persisted_recovery_symbols = _dedupe_symbol_codes(
+            run_metadata.get('symbols') or []
+        )
+        downstream_resume_stage = stage_rows.get(
+            downstream_resume_from_stage
+        )
+        narrow_upstream_recovery_scope = bool(
+            pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            and point_in_time_recovery
+            and not price_retry_symbols
+            and run_metadata.get('point_in_time_recovery') is True
+            and str(run_metadata.get('resume_from_stage') or '').strip()
+            == downstream_resume_from_stage
+            and downstream_resume_from_stage in recovery_scope
+            and first_exact_followup_index is not None
+            and recovery_scope.index(downstream_resume_from_stage)
+            < first_exact_followup_index
+            and full_point_in_time_scope
+            and run_metadata.get('exact_membership_symbol_count')
+            == len(full_point_in_time_scope)
+            and run_metadata.get('exact_membership_sha256')
+            == market_membership_sha256(full_point_in_time_scope)
+            and persisted_recovery_symbols
+            and set(persisted_recovery_symbols)
+            < set(full_point_in_time_scope)
+            and set(persisted_recovery_symbols)
+            == set(downstream_retry_symbols)
+            and isinstance(downstream_resume_stage, Mapping)
+            and daily_pipeline_outcome_is_satisfied(
+                {
+                    **dict(downstream_resume_stage),
+                    'stage': downstream_resume_from_stage,
+                }
+            )
+        )
         if (
-            pipeline_run.get('trigger') != AUTO_FOLLOWUP_RECOVERY_TRIGGER
+            (
+                pipeline_run.get('trigger')
+                != AUTO_FOLLOWUP_RECOVERY_TRIGGER
+                or narrow_upstream_recovery_scope
+            )
             and downstream_retry_symbols
             and downstream_resume_from_stage in recovery_scope
             and (
@@ -6361,14 +6411,6 @@ class PykrxBackfillService:
             # its proof is copied to the EOD ancestor. Reconcile that exact
             # durable proof instead of rerunning a partial decider.
             incomplete_stages.clear()
-        first_exact_followup_index = next(
-            (
-                recovery_scope.index(stage_id)
-                for stage_id in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
-                if stage_id in recovery_scope
-            ),
-            None,
-        )
         upstream_admission_rebuild_pending = bool(
             downstream_retry_symbols
             and incomplete_stages
@@ -7630,6 +7672,16 @@ class PykrxBackfillService:
             and dart_recovery_scope.get('ready') is True
         ):
             recovery_symbols = list(dart_recovery_scope['symbols'])
+        elif (
+            point_in_time_recovery
+            and upstream_admission_rebuild_pending
+            and not price_retry_symbols
+            and point_in_time_membership_symbols
+        ):
+            # Admission-producing stages must see the full frozen membership.
+            # Passing only the stale retry subset makes exact downstream
+            # publishers classify every other frozen member as failed.
+            recovery_symbols = sorted(point_in_time_membership_symbols)
         elif point_in_time_recovery and downstream_retry_symbols:
             recovery_symbols = downstream_retry_symbols
         elif recovering_safe_downstream_scope:
