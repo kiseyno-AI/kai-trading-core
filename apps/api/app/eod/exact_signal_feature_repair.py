@@ -1454,6 +1454,41 @@ class ExactSignalFeatureRepair:
                     'reason': 'checkpoint_date_hash_mismatch',
                     'market_date': market_date,
                 }
+            previous_status = (
+                str(previous.get('status') or '').strip().lower()
+                if isinstance(previous, Mapping)
+                else ''
+            )
+            unresolved_previous_attempt = bool(
+                previous_status == 'applying'
+                or (
+                    isinstance(previous, Mapping)
+                    and (
+                        previous.get('operator_recovery_required') is True
+                        or isinstance(
+                            previous.get('last_uncertain_attempt'),
+                            Mapping,
+                        )
+                    )
+                )
+                or (
+                    apply
+                    and previous_status in {'failed', 'uncertain'}
+                )
+            )
+            if unresolved_previous_attempt:
+                return {
+                    **base,
+                    'status': 'blocked',
+                    'applied': False,
+                    'reason': 'uncertain_previous_attempt',
+                    'market_date': market_date,
+                    'previous_status': previous_status or None,
+                    'uncertain_commit': True,
+                    'automatic_retry_allowed': False,
+                    'operator_recovery_required': True,
+                    'retry_required': False,
+                }
             if apply and (
                 not isinstance(previous, Mapping)
                 or not isinstance(previous.get('dry_proof'), Mapping)
@@ -1482,10 +1517,26 @@ class ExactSignalFeatureRepair:
                     'error_message': str(exc)[:500],
                 }
                 write_checkpoint(checkpoint_path, checkpoint)
+                if apply:
+                    return {
+                        **base,
+                        'status': 'blocked',
+                        'applied': False,
+                        'reason': 'market_date_not_finalized',
+                        'market_date': market_date,
+                        'completed_dates': completed_dates,
+                        'skipped_dates': skipped_dates,
+                        'failed_dates': failed_dates,
+                        'uncertain_commit': False,
+                        'automatic_retry_allowed': False,
+                        'operator_recovery_required': True,
+                        'retry_required': False,
+                    }
                 continue
 
             applied_result: dict[str, Any] | None = None
             reviewed_proof: dict[str, Any] | None = None
+            applying_unit: dict[str, Any] | None = None
             guard_exit_state: dict[str, Any] = {}
             with suppress(
                 GuardTransactionExitError
@@ -1516,6 +1567,23 @@ class ExactSignalFeatureRepair:
                     }
                     write_checkpoint(checkpoint_path, checkpoint)
                     failed_dates += 1
+                    if apply:
+                        return {
+                            **base,
+                            'status': 'blocked',
+                            'applied': False,
+                            'reason': 'date_review_failed',
+                            'market_date': market_date,
+                            'completed_dates': completed_dates,
+                            'skipped_dates': skipped_dates,
+                            'failed_dates': failed_dates,
+                            'error_type': type(exc).__name__,
+                            'error_message': str(exc)[:500],
+                            'uncertain_commit': False,
+                            'automatic_retry_allowed': False,
+                            'operator_recovery_required': True,
+                            'retry_required': False,
+                        }
                     continue
 
                 completed_valid = False
@@ -1542,6 +1610,42 @@ class ExactSignalFeatureRepair:
                         }
                 if completed_valid:
                     if apply:
+                        reconciling_unit = deepcopy(dict(previous))
+                        reconciling_unit.update(
+                            {
+                                'status': 'applying',
+                                'pending_operation': (
+                                    'durable_proof_reconciliation'
+                                ),
+                                'uncertain_commit': True,
+                                'automatic_retry_allowed': False,
+                                'operator_recovery_required': True,
+                            }
+                        )
+                        checkpoint['units'][market_date] = (
+                            reconciling_unit
+                        )
+                        try:
+                            write_checkpoint(checkpoint_path, checkpoint)
+                        except Exception as exc:  # noqa: BLE001
+                            return {
+                                **base,
+                                'status': 'blocked',
+                                'applied': False,
+                                'reason': (
+                                    'checkpoint_write_failed_before_apply'
+                                ),
+                                'market_date': market_date,
+                                'completed_dates': completed_dates,
+                                'skipped_dates': skipped_dates,
+                                'failed_dates': failed_dates,
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                                'uncertain_commit': False,
+                                'automatic_retry_allowed': False,
+                                'operator_recovery_required': True,
+                                'retry_required': False,
+                            }
                         try:
                             durable_proof = (
                                 self._record_durable_completed_proof(
@@ -1550,15 +1654,55 @@ class ExactSignalFeatureRepair:
                                 )
                             )
                         except Exception as exc:  # noqa: BLE001
-                            return {
+                            failed_dates += 1
+                            failed_unit = deepcopy(reconciling_unit)
+                            failed_unit.update(
+                                {
+                                    'status': 'failed',
+                                    'error_type': type(exc).__name__,
+                                    'error_message': str(exc)[:500],
+                                }
+                            )
+                            checkpoint['units'][market_date] = failed_unit
+                            checkpoint_error: Exception | None = None
+                            try:
+                                write_checkpoint(
+                                    checkpoint_path,
+                                    checkpoint,
+                                )
+                            except Exception as write_exc:  # noqa: BLE001
+                                checkpoint_error = write_exc
+                            failure_result = {
                                 **base,
-                                'status': 'blocked',
+                                'status': 'partial',
                                 'applied': False,
                                 'reason': 'durable_proof_reconciliation_failed',
                                 'market_date': market_date,
+                                'completed_dates': completed_dates,
+                                'skipped_dates': skipped_dates,
+                                'failed_dates': failed_dates,
                                 'error_type': type(exc).__name__,
                                 'error_message': str(exc)[:500],
+                                'uncertain_commit': True,
+                                'checkpoint_persisted': (
+                                    checkpoint_error is None
+                                ),
+                                'automatic_retry_allowed': False,
+                                'operator_recovery_required': True,
+                                'retry_required': False,
                             }
+                            if checkpoint_error is not None:
+                                failure_result.update(
+                                    {
+                                        'checkpoint_error_type': type(
+                                            checkpoint_error
+                                        ).__name__,
+                                        'checkpoint_error_message': str(
+                                            checkpoint_error
+                                        )[:500],
+                                    }
+                                )
+                            return failure_result
                         reconciled_unit = deepcopy(dict(previous))
                         reconciled_result = dict(
                             reconciled_unit['result']
@@ -1566,7 +1710,28 @@ class ExactSignalFeatureRepair:
                         reconciled_result['durable_proof'] = durable_proof
                         reconciled_unit['result'] = reconciled_result
                         checkpoint['units'][market_date] = reconciled_unit
-                        write_checkpoint(checkpoint_path, checkpoint)
+                        try:
+                            write_checkpoint(checkpoint_path, checkpoint)
+                        except Exception as exc:  # noqa: BLE001
+                            return {
+                                **base,
+                                'status': 'partial',
+                                'applied': False,
+                                'reason': (
+                                    'checkpoint_write_failed_after_commit'
+                                ),
+                                'market_date': market_date,
+                                'completed_dates': completed_dates,
+                                'skipped_dates': skipped_dates,
+                                'failed_dates': failed_dates,
+                                'error_type': type(exc).__name__,
+                                'error_message': str(exc)[:500],
+                                'uncertain_commit': True,
+                                'checkpoint_persisted': False,
+                                'automatic_retry_allowed': False,
+                                'operator_recovery_required': True,
+                                'retry_required': False,
+                            }
                     completed_dates += 1
                     skipped_dates += 1
                     continue
@@ -1600,6 +1765,34 @@ class ExactSignalFeatureRepair:
                             'reason': 'reviewed_dry_proof_drift',
                             'market_date': market_date,
                         }
+                applying_unit = {
+                    'status': 'applying',
+                    'item_sha256': item_sha256,
+                    'dry_proof': reviewed_proof,
+                    'uncertain_commit': True,
+                    'automatic_retry_allowed': False,
+                    'operator_recovery_required': True,
+                }
+                checkpoint['units'][market_date] = applying_unit
+                try:
+                    write_checkpoint(checkpoint_path, checkpoint)
+                except Exception as exc:  # noqa: BLE001
+                    return {
+                        **base,
+                        'status': 'blocked',
+                        'applied': False,
+                        'reason': 'checkpoint_write_failed_before_apply',
+                        'market_date': market_date,
+                        'completed_dates': completed_dates,
+                        'skipped_dates': skipped_dates,
+                        'failed_dates': failed_dates,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc)[:500],
+                        'uncertain_commit': False,
+                        'automatic_retry_allowed': False,
+                        'operator_recovery_required': True,
+                        'retry_required': False,
+                    }
                 try:
                     applied_result = self._apply_date(
                         item,
@@ -1613,10 +1806,45 @@ class ExactSignalFeatureRepair:
                         'dry_proof': reviewed_proof,
                         'error_type': type(exc).__name__,
                         'error_message': str(exc)[:500],
+                        'uncertain_commit': True,
+                        'automatic_retry_allowed': False,
+                        'operator_recovery_required': True,
                     }
-                    write_checkpoint(checkpoint_path, checkpoint)
                     failed_dates += 1
-                    continue
+                    checkpoint_error: Exception | None = None
+                    try:
+                        write_checkpoint(checkpoint_path, checkpoint)
+                    except Exception as write_exc:  # noqa: BLE001
+                        checkpoint_error = write_exc
+                    failure_result = {
+                        **base,
+                        'status': 'partial',
+                        'applied': False,
+                        'reason': 'signal_feature_apply_failed',
+                        'market_date': market_date,
+                        'completed_dates': completed_dates,
+                        'skipped_dates': skipped_dates,
+                        'failed_dates': failed_dates,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc)[:500],
+                        'uncertain_commit': True,
+                        'checkpoint_persisted': checkpoint_error is None,
+                        'automatic_retry_allowed': False,
+                        'operator_recovery_required': True,
+                        'retry_required': False,
+                    }
+                    if checkpoint_error is not None:
+                        failure_result.update(
+                            {
+                                'checkpoint_error_type': type(
+                                    checkpoint_error
+                                ).__name__,
+                                'checkpoint_error_message': str(
+                                    checkpoint_error
+                                )[:500],
+                            }
+                        )
+                    return failure_result
             guard_exit_error = guard_exit_state.get('error')
             if isinstance(guard_exit_error, Exception):
                 live_valid = False
@@ -1636,14 +1864,17 @@ class ExactSignalFeatureRepair:
                     'live_completion_verified': live_valid,
                     'reconciliation': reconciliation,
                 }
-                uncertain_unit = (
-                    deepcopy(dict(previous))
-                    if isinstance(previous, Mapping)
-                    else {
-                        'status': 'uncertain',
+                uncertain_unit = deepcopy(
+                    applying_unit
+                    or {
+                        'status': 'applying',
                         'item_sha256': item_sha256,
                     }
                 )
+                uncertain_unit['status'] = 'failed'
+                uncertain_unit['uncertain_commit'] = True
+                uncertain_unit['automatic_retry_allowed'] = False
+                uncertain_unit['operator_recovery_required'] = True
                 uncertain_unit['last_uncertain_attempt'] = (
                     uncertain_attempt
                 )
@@ -1664,7 +1895,9 @@ class ExactSignalFeatureRepair:
                     'uncertain_commit': True,
                     'checkpoint_persisted': checkpoint_error is None,
                     'reconciled_proof_count': int(live_valid),
-                    'retry_required': True,
+                    'retry_required': False,
+                    'automatic_retry_allowed': False,
+                    'operator_recovery_required': True,
                     'reconciliation': reconciliation,
                 }
                 if checkpoint_error is not None:
@@ -1712,7 +1945,9 @@ class ExactSignalFeatureRepair:
                     'uncertain_commit': True,
                     'checkpoint_persisted': False,
                     'reconciled_proof_count': int(live_valid),
-                    'retry_required': True,
+                    'retry_required': False,
+                    'automatic_retry_allowed': False,
+                    'operator_recovery_required': True,
                     'reconciliation': reconciliation,
                 }
             completed_dates += 1
@@ -1737,6 +1972,8 @@ class ExactSignalFeatureRepair:
             'skipped_dates': skipped_dates,
             'failed_dates': failed_dates,
             'retry_required': failed_dates > 0,
+            'automatic_retry_allowed': failed_dates == 0,
+            'operator_recovery_required': failed_dates > 0,
         }
 
 

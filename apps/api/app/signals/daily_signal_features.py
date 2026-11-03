@@ -1041,6 +1041,7 @@ def _merge_owned_fallback_features(
     collection_payload: dict[str, Any],
     source_errors: dict[str, str],
     preserve_collection_shape: bool = False,
+    preserve_quote_snapshot_shape: bool = False,
 ) -> dict[str, Any] | None:
     symbol = entry['symbol']
     symbol_metadata = (support_maps.get('symbol_map') or {}).get(symbol)
@@ -1075,9 +1076,22 @@ def _merge_owned_fallback_features(
         momentum_row=momentum_row,
         low_risk_row=low_risk_row,
     )
-    quote_snapshot_features, quote_freshness = _build_quote_snapshot_features(
+    (
+        normalized_quote_snapshot,
+        quote_freshness,
+    ) = _build_quote_snapshot_features(
         quote_row=quote_row,
         market_date=market_date,
+    )
+    # Exact repair fingerprints bind the stored quote as historical evidence.
+    # Preserve that raw shape while the rebuilt freshness/readiness contract
+    # continues to decide whether the quote is strategy-usable.
+    quote_snapshot_features = (
+        deepcopy(quote_row)
+        if preserve_quote_snapshot_shape
+        and isinstance(quote_row, dict)
+        and quote_row
+        else normalized_quote_snapshot
     )
 
     fallback_features = _clean_mapping(
@@ -1087,9 +1101,10 @@ def _merge_owned_fallback_features(
             'returns': return_features,
             'volatility': volatility_features,
             'factor_scores': factor_score_features,
-            'quote_snapshot': quote_snapshot_features,
         }
     )
+    if quote_snapshot_features is not None:
+        fallback_features['quote_snapshot'] = quote_snapshot_features
     direct_sources = decision_usable_direct_signal_sources(
         entry.get('feature_payload')
     )
@@ -1146,11 +1161,11 @@ def _merge_owned_fallback_features(
         payload['collection']['collected_at'] = collection_payload.get(
             'collected_at'
         )
-    if (
-        not preserve_collection_shape
-        or source_errors
-        or 'source_errors' in collection_payload
-    ):
+    if preserve_collection_shape and 'source_errors' in collection_payload:
+        payload['collection']['source_errors'] = deepcopy(
+            collection_payload.get('source_errors')
+        )
+    elif not preserve_collection_shape or source_errors:
         payload['collection']['source_errors'] = dict(source_errors)
     universe_payload = {
         'target_symbol_count': len(universe.get('target_symbols') or []),
@@ -2225,6 +2240,7 @@ class DailySignalFeatureService:
                 collection_payload=collection_payload,
                 source_errors=source_errors,
                 preserve_collection_shape=True,
+                preserve_quote_snapshot_shape=True,
             )
             if merged is None:
                 raise RuntimeError(

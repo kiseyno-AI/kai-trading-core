@@ -1,8 +1,12 @@
 import unittest
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.brokers.kis.client import KISClient
+from app.eod.exact_signal_feature_repair import (
+    _preserved_direct_signal_payload,
+)
 from app.eod.market_membership import market_membership_sha256
 from app.market_data_store import sanitize_daily_signal_feature_payload
 from app.signals.daily_signal_features import (
@@ -863,9 +867,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         stored_quote = {
             'source': 'kis',
             'market_state': 'CLOSED',
-            'price': 71_000,
+            'price': Decimal('71000.00'),
             'trade_date': '2026-05-06',
             'captured_at': '2026-05-06T15:30:00+09:00',
+            'legacy_marker': {'available': None, 'raw_scale': '2'},
         }
         stored_sources = {
             VOLUME_POWER: {'data_rank': '1', 'tday_rltv': '145.7'}
@@ -878,7 +883,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'source': 'kis_ranking',
             'signal_count': 1,
             'volume_power_rank': 1,
-            'volume_power': 145.7,
+            'volume_power': Decimal('145.7000'),
             'overtime_volume_rank': None,
             'overtime_volume': None,
             'overtime_fluctuation_rank': None,
@@ -886,13 +891,18 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'feature_payload': {
                 'market_date': '2026-05-06',
                 'sources': stored_sources,
-                'collection': {},
+                'collection': {'source_errors': None},
                 'fallback_features': {
                     'price_action': {'close_price': 70_000},
                     'quote_snapshot': stored_quote,
                 },
+                'legacy_unowned_payload': {'shape': ['must', 'survive']},
             },
         }
+        expected_preserved_payload = _preserved_direct_signal_payload(
+            SimpleNamespace(**stored_row),
+            symbol='005930',
+        )
         support_maps = {
             'symbol_map': {
                 '005930': {
@@ -973,7 +983,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         rebuilt = upsert.call_args.args[0][0]
         self.assertEqual(rebuilt['signal_count'], 1)
         self.assertEqual(rebuilt['volume_power_rank'], 1)
-        self.assertEqual(rebuilt['volume_power'], 145.7)
+        self.assertEqual(rebuilt['volume_power'], Decimal('145.7000'))
         self.assertEqual(rebuilt['feature_payload']['sources'], stored_sources)
         self.assertEqual(
             rebuilt['feature_payload']['row_provenance'][
@@ -996,8 +1006,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             'collected_at', rebuilt['feature_payload']['collection']
         )
-        self.assertNotIn(
-            'source_errors', rebuilt['feature_payload']['collection']
+        self.assertIsNone(
+            rebuilt['feature_payload']['collection']['source_errors']
         )
         self.assertEqual(
             rebuilt['feature_payload']['fallback_features']['price_action'][
@@ -1006,10 +1016,87 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             72_000,
         )
         self.assertEqual(
-            rebuilt['feature_payload']['fallback_features']['quote_snapshot'][
-                'price'
-            ],
-            71_000,
+            rebuilt['feature_payload']['fallback_features']['quote_snapshot'],
+            stored_quote,
+        )
+        self.assertEqual(
+            _preserved_direct_signal_payload(
+                SimpleNamespace(**rebuilt),
+                symbol='005930',
+            ),
+            expected_preserved_payload,
+        )
+
+    def test_repair_preserves_stale_quote_shape_without_making_it_usable(
+        self,
+    ) -> None:
+        stale_quote = {
+            'source': 'kis',
+            'price': 71_000,
+            'trade_date': '2026-05-05',
+            'captured_at': '2026-05-05T15:30:00+09:00',
+            'legacy_marker': {'available': None},
+        }
+        merged = _merge_owned_fallback_features(
+            entry={
+                'symbol': '005930',
+                'name_ko': '삼성전자',
+                'market': 'KOSPI',
+                'market_date': '2026-05-06',
+                'source': 'kis_ranking',
+                'signal_count': 0,
+                'volume_power_rank': None,
+                'volume_power': None,
+                'overtime_volume_rank': None,
+                'overtime_volume': None,
+                'overtime_fluctuation_rank': None,
+                'overtime_fluctuation_rate': None,
+                'feature_payload': {
+                    'market_date': '2026-05-06',
+                    'sources': {},
+                    'collection': {},
+                },
+            },
+            market_date='2026-05-06',
+            universe={
+                'target_symbols': ['005930'],
+                'active_symbols': ['005930'],
+                'candidate_symbols': [],
+                'candidate_universe_availability': 'available',
+            },
+            support_maps={
+                'symbol_map': {},
+                'quote_map': {'005930': stale_quote},
+                'price_bars_by_symbol': {},
+                'value_map': {},
+                'unified_value_map': {},
+                'quality_map': {},
+                'momentum_map': {},
+                'advanced_value_map': {},
+                'low_risk_map': {},
+                'beta_map': {},
+                'composite_map': {},
+            },
+            collection_payload={},
+            source_errors={},
+            preserve_collection_shape=True,
+            preserve_quote_snapshot_shape=True,
+        )
+
+        self.assertIsNotNone(merged)
+        feature_payload = merged['feature_payload']
+        self.assertEqual(
+            feature_payload['fallback_features']['quote_snapshot'],
+            stale_quote,
+        )
+        readiness = classify_signal_feature_readiness(
+            signal_count=merged['signal_count'],
+            feature_payload=feature_payload,
+            expected_market_date='2026-05-06',
+        )
+        self.assertFalse(readiness['semantic_ready'])
+        self.assertNotIn(
+            'quote_snapshot', readiness['usable_fallback_groups']
         )
 
     def test_repair_non_exact_scope_uses_bounded_raw_rows(self) -> None:

@@ -31,6 +31,7 @@ from app.eod.market_membership import market_membership_sha256
 from app.internal.exact_repair_manifest import (
     canonical_json_sha256,
     checkpoint_file_lock,
+    write_checkpoint,
 )
 
 
@@ -45,18 +46,25 @@ def test_scope_normalization_accepts_alpha_and_rejects_malformed_symbols() -> No
         _normalize_symbols(['ABC123'])
 
 
-def _manifest(*, symbols=None, market_date=MARKET_DATE):
+def _manifest(
+    *,
+    symbols=None,
+    market_date=MARKET_DATE,
+    market_dates=None,
+):
     exact = list(symbols or SYMBOLS)
+    dates = list(market_dates or [market_date])
     return {
         'schema_version': MANIFEST_SCHEMA_VERSION,
-        'date_count': 1,
+        'date_count': len(dates),
         'dates': [
             {
-                'market_date': market_date,
+                'market_date': current_market_date,
                 'symbol_count': len(exact),
                 'membership_sha256': market_membership_sha256(exact),
                 'symbols': exact,
             }
+            for current_market_date in dates
         ],
     }
 
@@ -243,6 +251,7 @@ def _prune_result_for_expected(expected):
 def _repair(
     *,
     state_loader,
+    manifest=None,
     rebuild_runner=None,
     exact_verifier=None,
     stale_pruner=None,
@@ -251,7 +260,7 @@ def _repair(
     completion_proof_recorder=None,
 ):
     return ExactSignalFeatureRepair(
-        _manifest(),
+        manifest or _manifest(),
         rebuild_runner=rebuild_runner or (lambda **_kwargs: _rebuild_result()),
         stored_symbols_loader=lambda _market_date: [*SYMBOLS, '999999'],
         pending_batch_loader=lambda: [{'repair_batch_id': 'batch-1'}],
@@ -277,9 +286,10 @@ def _repair(
     )
 
 
-def _dry_review(checkpoint: Path, *, state=None):
+def _dry_review(checkpoint: Path, *, state=None, manifest=None):
     repair = _repair(
-        state_loader=lambda _market_date, _symbols: state or _state()
+        state_loader=lambda _market_date, _symbols: state or _state(),
+        manifest=manifest,
     )
     result = repair.run(checkpoint_path=checkpoint)
     assert result['status'] == 'dry_run'
@@ -595,6 +605,7 @@ def test_failed_exact_verification_never_prunes() -> None:
 
 def test_source_drift_after_persistence_never_prunes() -> None:
     prune = Mock()
+    durable_proof = Mock()
     with TemporaryDirectory() as temporary:
         checkpoint = Path(temporary) / 'signal-checkpoint.json'
         reviewed = _state()
@@ -605,6 +616,7 @@ def test_source_drift_after_persistence_never_prunes() -> None:
         repair = _repair(
             state_loader=lambda *_args: next(states),
             stale_pruner=prune,
+            completion_proof_recorder=durable_proof,
         )
         result = repair.run(
             apply=True,
@@ -613,7 +625,145 @@ def test_source_drift_after_persistence_never_prunes() -> None:
         )
 
     assert result['status'] == 'partial'
+    assert result['reason'] == 'signal_feature_apply_failed'
+    assert result['automatic_retry_allowed'] is False
+    assert result['operator_recovery_required'] is True
+    assert result['uncertain_commit'] is True
     prune.assert_not_called()
+    durable_proof.assert_not_called()
+
+
+def test_apply_stops_after_first_failed_date_without_running_later_dates() -> None:
+    market_dates = ['2026-10-26', '2026-10-27', MARKET_DATE]
+    manifest = _manifest(market_dates=market_dates)
+    rebuild_dates: list[str] = []
+    prune_dates: list[str] = []
+    durable_proof = Mock(return_value={'updated_batch_count': 1})
+
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint.json'
+        dry_repair, _result = _dry_review(
+            checkpoint,
+            manifest=manifest,
+        )
+        states = iter(
+            [
+                _state(),
+                _state(output_suffix='persisted-first'),
+                _completed_state(output_suffix='completed-first'),
+                _state(),
+                _state(
+                    source_suffix='changed',
+                    output_suffix='persisted-second',
+                ),
+            ]
+        )
+
+        def rebuild_runner(**kwargs):
+            rebuild_dates.append(kwargs['market_date'])
+            return _rebuild_result()
+
+        def stale_pruner(**kwargs):
+            prune_dates.append(kwargs['market_date'].isoformat())
+            return _prune_result_for_expected(
+                kwargs['expected_stale_extras']
+            )
+
+        result = _repair(
+            manifest=manifest,
+            state_loader=lambda *_args: next(states),
+            rebuild_runner=rebuild_runner,
+            stale_pruner=stale_pruner,
+            completion_proof_recorder=durable_proof,
+        ).run(
+            apply=True,
+            expected_manifest_sha256=dry_repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+        saved = json.loads(checkpoint.read_text())
+
+    assert result['status'] == 'partial'
+    assert result['completed_dates'] == 1
+    assert result['failed_dates'] == 1
+    assert result['market_date'] == market_dates[1]
+    assert result['automatic_retry_allowed'] is False
+    assert result['operator_recovery_required'] is True
+    assert rebuild_dates == market_dates[:2]
+    assert prune_dates == market_dates[:1]
+    assert durable_proof.call_count == 1
+    assert saved['units'][market_dates[0]]['status'] == 'completed'
+    assert saved['units'][market_dates[1]]['status'] == 'failed'
+    assert saved['units'][market_dates[2]]['status'] == 'reviewed'
+
+
+def test_keyboard_interrupt_leaves_applying_marker_and_blocks_resume() -> None:
+    resumed_rebuild = Mock()
+
+    def interrupting_rebuild(**_kwargs):
+        raise KeyboardInterrupt()
+
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint.json'
+        dry_repair, _result = _dry_review(checkpoint)
+        interrupted = _repair(
+            state_loader=lambda *_args: _state(),
+            rebuild_runner=interrupting_rebuild,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            interrupted.run(
+                apply=True,
+                expected_manifest_sha256=dry_repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+        applying = json.loads(checkpoint.read_text())['units'][MARKET_DATE]
+        resumed = _repair(
+            state_loader=Mock(),
+            rebuild_runner=resumed_rebuild,
+        ).run(
+            apply=True,
+            expected_manifest_sha256=dry_repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+
+    assert applying['status'] == 'applying'
+    assert applying['uncertain_commit'] is True
+    assert applying['automatic_retry_allowed'] is False
+    assert applying['operator_recovery_required'] is True
+    assert resumed['status'] == 'blocked'
+    assert resumed['reason'] == 'uncertain_previous_attempt'
+    assert resumed['previous_status'] == 'applying'
+    assert resumed['retry_required'] is False
+    resumed_rebuild.assert_not_called()
+
+
+def test_dry_run_recovers_legacy_failed_unit_without_uncertainty_flags() -> None:
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint.json'
+        _repair_instance, _result = _dry_review(checkpoint)
+        saved = json.loads(checkpoint.read_text())
+        failed_unit = dict(saved['units'][MARKET_DATE])
+        failed_unit.update(
+            {
+                'status': 'failed',
+                'error_type': 'RuntimeError',
+                'error_message': 'legacy apply failure',
+            }
+        )
+        saved['units'][MARKET_DATE] = failed_unit
+        write_checkpoint(checkpoint, saved)
+
+        result = _repair(
+            state_loader=lambda *_args: _state(),
+        ).run(checkpoint_path=checkpoint)
+        recovered = json.loads(checkpoint.read_text())['units'][MARKET_DATE]
+
+    assert result['status'] == 'dry_run'
+    assert result['reviewed_dates'] == 1
+    assert result['failed_dates'] == 0
+    assert recovered['status'] == 'reviewed'
+    assert recovered['dry_proof']['market_date'] == MARKET_DATE
 
 
 def test_reviewed_source_or_stale_scope_drift_blocks_before_write() -> None:
@@ -661,7 +811,8 @@ def test_reviewed_market_risk_subset_drift_blocks_before_write() -> None:
     rebuild.assert_not_called()
 
 
-def test_prune_failure_is_checkpointed_and_resume_retries_same_date() -> None:
+def test_prune_failure_requires_operator_recovery_and_blocks_resume() -> None:
+    resumed_rebuild = Mock()
     with TemporaryDirectory() as temporary:
         checkpoint = Path(temporary) / 'signal-checkpoint.json'
         reviewed = _state()
@@ -680,23 +831,25 @@ def test_prune_failure_is_checkpointed_and_resume_retries_same_date() -> None:
             expected_manifest_sha256=dry_repair.manifest_sha256,
             checkpoint_path=checkpoint,
         )
-        second_states = iter(
-            [
-                reviewed,
-                _state(output_suffix='persisted-again'),
-                _completed_state(output_suffix='resumed'),
-            ]
-        )
         resumed = _repair(
-            state_loader=lambda *_args: next(second_states)
+            state_loader=Mock(),
+            rebuild_runner=resumed_rebuild,
         ).run(
             apply=True,
             expected_manifest_sha256=dry_repair.manifest_sha256,
             checkpoint_path=checkpoint,
         )
+        saved = json.loads(checkpoint.read_text())
 
     assert failed['status'] == 'partial'
-    assert resumed['status'] == 'completed'
+    assert failed['automatic_retry_allowed'] is False
+    assert failed['operator_recovery_required'] is True
+    assert resumed['status'] == 'blocked'
+    assert resumed['reason'] == 'uncertain_previous_attempt'
+    assert resumed['automatic_retry_allowed'] is False
+    assert saved['units'][MARKET_DATE]['status'] == 'failed'
+    assert saved['units'][MARKET_DATE]['uncertain_commit'] is True
+    resumed_rebuild.assert_not_called()
 
 
 def test_guard_exit_failure_reconciles_durable_signal_rows() -> None:
@@ -751,9 +904,18 @@ def test_checkpoint_failure_reconciles_durable_signal_rows() -> None:
                 _completed_state(),
             ]
         )
+        checkpoint_write_count = 0
+
+        def fail_after_applying_marker(path, payload):
+            nonlocal checkpoint_write_count
+            checkpoint_write_count += 1
+            if checkpoint_write_count == 1:
+                return write_checkpoint(path, payload)
+            raise OSError('checkpoint disk unavailable')
+
         with patch(
             'app.eod.exact_signal_feature_repair.write_checkpoint',
-            side_effect=OSError('checkpoint disk unavailable'),
+            side_effect=fail_after_applying_marker,
         ):
             result = _repair(
                 state_loader=lambda *_args: next(states)
@@ -762,6 +924,7 @@ def test_checkpoint_failure_reconciles_durable_signal_rows() -> None:
                 expected_manifest_sha256=dry_repair.manifest_sha256,
                 checkpoint_path=checkpoint,
             )
+        saved = json.loads(checkpoint.read_text())
 
     assert result['status'] == 'partial'
     assert result['applied'] is False
@@ -770,6 +933,7 @@ def test_checkpoint_failure_reconciles_durable_signal_rows() -> None:
     assert result['checkpoint_persisted'] is False
     assert result['reconciled_proof_count'] == 1
     assert result['error_type'] == 'OSError'
+    assert saved['units'][MARKET_DATE]['status'] == 'applying'
 
 
 def _completed_checkpoint(checkpoint: Path, *, initial_stale_count=0):
@@ -812,6 +976,47 @@ def test_completed_date_is_skipped_after_live_revalidation() -> None:
     assert result['status'] == 'completed'
     assert result['skipped_dates'] == 1
     rebuild.assert_not_called()
+
+
+def test_completed_reconciliation_marks_applying_before_durable_write() -> None:
+    with TemporaryDirectory() as temporary:
+        checkpoint = Path(temporary) / 'signal-checkpoint.json'
+        repair = _completed_checkpoint(checkpoint)
+
+        def interrupting_recorder(**_kwargs):
+            unit = json.loads(checkpoint.read_text())['units'][MARKET_DATE]
+            assert unit['status'] == 'applying'
+            assert unit['pending_operation'] == (
+                'durable_proof_reconciliation'
+            )
+            raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            _repair(
+                state_loader=lambda *_args: _completed_state(),
+                completion_proof_recorder=interrupting_recorder,
+            ).run(
+                apply=True,
+                expected_manifest_sha256=repair.manifest_sha256,
+                checkpoint_path=checkpoint,
+            )
+
+        applying = json.loads(checkpoint.read_text())['units'][MARKET_DATE]
+        resumed = _repair(
+            state_loader=Mock(),
+            rebuild_runner=Mock(),
+        ).run(
+            apply=True,
+            expected_manifest_sha256=repair.manifest_sha256,
+            checkpoint_path=checkpoint,
+        )
+
+    assert applying['status'] == 'applying'
+    assert applying['uncertain_commit'] is True
+    assert applying['automatic_retry_allowed'] is False
+    assert applying['operator_recovery_required'] is True
+    assert resumed['status'] == 'blocked'
+    assert resumed['reason'] == 'uncertain_previous_attempt'
 
 
 def test_completed_output_drift_rebuilds_idempotently() -> None:
