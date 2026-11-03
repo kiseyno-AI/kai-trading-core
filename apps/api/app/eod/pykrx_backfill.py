@@ -6548,7 +6548,11 @@ class PykrxBackfillService:
                 convergence_kwargs: dict[str, Any] = {
                     'pipeline_run_id': int(pipeline_run['id']),
                 }
-                if is_followup_recovery_parent:
+                if is_followup_recovery_parent or pipeline_status in {
+                    'completed',
+                    'partial',
+                    'skipped',
+                }:
                     convergence_kwargs['allow_satisfied_terminal'] = True
                 pipeline_convergence = (
                     daily_pipeline_run_state_service

@@ -8004,6 +8004,102 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertNotIn('symbols', resume_stages.call_args.kwargs)
 
+    def test_primary_optional_warning_partial_converges_without_replay(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        stage_rows = {
+            stage_id: {'status': 'completed'}
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+        }
+        stage_rows['macro_context_refresh'] = {
+            'status': 'partial',
+            'details': {
+                'result_summary': {
+                    'triggered': True,
+                    'status': 'partial',
+                    'remaining_retryable_events': 0,
+                },
+            },
+        }
+        latest_pipeline_run = {
+            'id': 91,
+            'trigger': 'auto_close_scheduler',
+            'status': 'partial',
+            'updated_at': '2026-04-03T08:00:00+00:00',
+            'completed_at': '2026-04-03T08:00:00+00:00',
+            'run_metadata': {
+                'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
+                'eod_collection_run_id': 7,
+            },
+            'stages': stage_rows,
+        }
+        latest_eod_run = {
+            'id': 7,
+            'trade_date': '2026-04-03',
+            'status': 'completed',
+            'symbols_total': 1,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'requested_symbols': ['005930'],
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': [],
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value=latest_eod_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 91,
+                    'status': 'completed',
+                },
+            ) as converge_pipeline_run,
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.'
+                'run'
+            ) as resume_stages,
+            patch.object(
+                service,
+                '_run_market_data_pipeline',
+            ) as run_collection,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'daily_pipeline_state_converged')
+        converge_pipeline_run.assert_called_once_with(
+            pipeline_run_id=91,
+            allow_satisfied_terminal=True,
+        )
+        resume_stages.assert_not_called()
+        run_collection.assert_not_called()
+
     def test_legacy_scope_recovers_enrichment_before_a_later_failure(self) -> None:
         service = PykrxBackfillService()
         stage_rows = {

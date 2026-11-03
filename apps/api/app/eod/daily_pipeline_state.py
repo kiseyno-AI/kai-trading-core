@@ -4431,7 +4431,15 @@ class DailyPipelineRunStateService:
             else:
                 terminal_status = 'completed'
             if sealing_satisfied_terminal:
-                if terminal_status != current_status:
+                optional_warning_upgrade = bool(
+                    current_status == 'partial'
+                    and terminal_status == 'completed'
+                    and warning_stage_ids
+                )
+                if (
+                    terminal_status != current_status
+                    and not optional_warning_upgrade
+                ):
                     return {
                         'updated': False,
                         'pipeline_run_id': normalized_pipeline_run_id,
@@ -4464,12 +4472,15 @@ class DailyPipelineRunStateService:
                         **warning_metadata,
                     }
                 )
+                if optional_warning_upgrade:
+                    run_row.status = terminal_status
+                    run_row.error_message = None
                 run_row.updated_at = now
                 run_row.run_metadata = metadata
                 return {
                     'updated': True,
                     'pipeline_run_id': normalized_pipeline_run_id,
-                    'status': current_status,
+                    'status': terminal_status,
                     'resolved_stages': resolved_stages,
                     'stage_statuses': stage_statuses,
                 }
