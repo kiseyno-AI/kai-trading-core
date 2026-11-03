@@ -248,6 +248,54 @@ class DailySignalFeatureBuilderTests(unittest.TestCase):
                     merged['feature_payload']['freshness'],
                 )
 
+    def test_stored_rebuild_preserves_absent_legacy_collection_keys(self):
+        entry = build_daily_signal_feature_rows(
+            market_date='2026-05-06',
+            source_rows={
+                VOLUME_POWER: [
+                    {
+                        'stck_shrn_iscd': '005930',
+                        'tday_rltv': '145.7',
+                    }
+                ]
+            },
+        )[0]
+        entry['feature_payload']['collection'] = {
+            'legacy_marker': 'preserved',
+        }
+        support_maps = {
+            'symbol_map': {},
+            'quote_map': {},
+            'price_bars_by_symbol': {},
+            'value_map': {},
+            'unified_value_map': {},
+            'quality_map': {},
+            'momentum_map': {},
+            'advanced_value_map': {},
+            'low_risk_map': {},
+            'beta_map': {},
+            'composite_map': {},
+        }
+
+        merged = _merge_owned_fallback_features(
+            entry=entry,
+            market_date='2026-05-06',
+            universe={
+                'active_symbols': ['005930'],
+                'candidate_symbols': [],
+                'target_symbols': ['005930'],
+            },
+            support_maps=support_maps,
+            collection_payload={'legacy_marker': 'preserved'},
+            source_errors={},
+            preserve_collection_shape=True,
+        )
+
+        collection = merged['feature_payload']['collection']
+        self.assertEqual(collection['legacy_marker'], 'preserved')
+        self.assertNotIn('collected_at', collection)
+        self.assertNotIn('source_errors', collection)
+
     def test_build_daily_signal_feature_rows_merges_source_features_by_symbol(self):
         rows = build_daily_signal_feature_rows(
             market_date='2026-04-14',
@@ -763,10 +811,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'overtime_fluctuation_rate': None,
             'feature_payload': {
                 'sources': stored_sources,
-                'collection': {
-                    'collected_at': '2026-05-06T15:31:00+09:00',
-                    'source_errors': {},
-                },
+                'collection': {},
                 'fallback_features': {
                     'price_action': {'close_price': 70_000},
                     'quote_snapshot': stored_quote,
@@ -852,6 +897,12 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rebuilt['volume_power_rank'], 1)
         self.assertEqual(rebuilt['volume_power'], 145.7)
         self.assertEqual(rebuilt['feature_payload']['sources'], stored_sources)
+        self.assertNotIn(
+            'collected_at', rebuilt['feature_payload']['collection']
+        )
+        self.assertNotIn(
+            'source_errors', rebuilt['feature_payload']['collection']
+        )
         self.assertEqual(
             rebuilt['feature_payload']['fallback_features']['price_action'][
                 'close_price'

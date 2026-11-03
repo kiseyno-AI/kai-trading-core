@@ -1038,6 +1038,7 @@ def _merge_owned_fallback_features(
     support_maps: dict[str, Any],
     collection_payload: dict[str, Any],
     source_errors: dict[str, str],
+    preserve_collection_shape: bool = False,
 ) -> dict[str, Any] | None:
     symbol = entry['symbol']
     symbol_metadata = (support_maps.get('symbol_map') or {}).get(symbol)
@@ -1137,8 +1138,16 @@ def _merge_owned_fallback_features(
     payload = dict(entry['feature_payload'])
     payload['feature_version'] = SIGNAL_FEATURE_VERSION
     payload['collection'] = dict(payload.get('collection') or {})
-    payload['collection']['collected_at'] = collection_payload.get('collected_at')
-    payload['collection']['source_errors'] = dict(source_errors)
+    if not preserve_collection_shape or 'collected_at' in collection_payload:
+        payload['collection']['collected_at'] = collection_payload.get(
+            'collected_at'
+        )
+    if (
+        not preserve_collection_shape
+        or source_errors
+        or 'source_errors' in collection_payload
+    ):
+        payload['collection']['source_errors'] = dict(source_errors)
     universe_payload = {
         'target_symbol_count': len(universe.get('target_symbols') or []),
         'active_symbol_count': len(universe.get('active_symbols') or []),
@@ -2205,6 +2214,7 @@ class DailySignalFeatureService:
                 support_maps=support_maps,
                 collection_payload=collection_payload,
                 source_errors=source_errors,
+                preserve_collection_shape=True,
             )
             if merged is None:
                 raise RuntimeError(
