@@ -196,6 +196,9 @@ EXACT_FINALIZATION_STAGE_IDS = frozenset(
     }
 )
 EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS = {
+    'market_risk_filter': frozenset(
+        {'market_risk_filter_scope_outcomes_v1'}
+    ),
     'fundamentals_daily_refresh': frozenset(
         {
             'dart_daily_data_scope_outcomes_v1',
@@ -1052,10 +1055,22 @@ class DailyPipelineStageService:
                     'recovery parent scope outcome is not an auto-EOD '
                     'follow-up admission partition'
                 )
+            requested_recovery_stage_id = str(
+                (
+                    recovery_stage_scope_outcome.get('stage_id')
+                    if isinstance(recovery_stage_scope_outcome, Mapping)
+                    else ''
+                )
+                or ''
+            ).strip()
+            market_risk_suffix_recovery = bool(
+                requested_recovery_stage_id == 'market_risk_filter'
+            )
             expected_parent_membership = (
-                recovery_parent_partition['successful_stock_codes']
-                if recovery_stage_scope_outcome is not None
-                else recovery_parent_partition['selected_stock_codes']
+                recovery_parent_partition['selected_stock_codes']
+                if market_risk_suffix_recovery
+                or recovery_stage_scope_outcome is None
+                else recovery_parent_partition['successful_stock_codes']
             )
             if set(resolved_exact_membership_symbols) != set(
                 expected_parent_membership
@@ -1070,12 +1085,21 @@ class DailyPipelineStageService:
                         'exact stage recovery requires a validated auto-EOD '
                         'parent admission partition'
                     )
-                if len(requested_stages) != 1 or not resolved_symbols:
-                    raise ValueError(
-                        'recovery stage scope outcome requires one exact '
-                        'stage and a non-empty retry scope'
+                if (
+                    not requested_stages
+                    or requested_stages[0]
+                    != requested_recovery_stage_id
+                    or not resolved_symbols
+                    or (
+                        not market_risk_suffix_recovery
+                        and len(requested_stages) != 1
                     )
-                recovery_stage_id = requested_stages[0]
+                ):
+                    raise ValueError(
+                        'recovery stage scope outcome requires its exact '
+                        'stage first and a non-empty retry scope'
+                    )
+                recovery_stage_id = requested_recovery_stage_id
                 allowed_versions = (
                     EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS.get(
                         recovery_stage_id
@@ -1123,6 +1147,20 @@ class DailyPipelineStageService:
                     raise ValueError(
                         'recovery stage scope outcome is not a valid '
                         'stage-debt-bound partition'
+                    )
+                if market_risk_suffix_recovery and any(
+                    set(recovery_stage_partition[key])
+                    != set(recovery_parent_partition[key])
+                    for key in (
+                        'selected_stock_codes',
+                        'successful_stock_codes',
+                        'retry_debt_stock_codes',
+                        'terminal_not_applicable_stock_codes',
+                    )
+                ):
+                    raise ValueError(
+                        'market-risk recovery scope does not match the '
+                        'durable follow-up admission partition'
                     )
         elif recovery_stage_scope_outcome is not None:
             raise ValueError(
@@ -2587,15 +2625,26 @@ class DailyPipelineStageService:
                 continue
             stage_symbols = resolved_symbols
             if (
-                stage_id in EXACT_MEMBERSHIP_BOUND_STAGE_IDS
-                and official_membership_symbols is not None
+                official_membership_symbols is not None
                 and (
-                    stage_symbols is None
+                    (
+                        stage_id in EXACT_MEMBERSHIP_BOUND_STAGE_IDS
+                        and (
+                            stage_symbols is None
+                            or (
+                                point_in_time_recovery
+                                and resolved_exact_membership_symbols
+                                is not None
+                                and stage_id
+                                in EXACT_FINALIZATION_STAGE_IDS
+                                and stage_id != recovery_stage_id
+                            )
+                        )
+                    )
                     or (
-                        point_in_time_recovery
-                        and resolved_exact_membership_symbols is not None
-                        and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                        recovery_stage_id == 'market_risk_filter'
                         and stage_id != recovery_stage_id
+                        and STAGE_DEFINITIONS[stage_id].supports_symbols
                     )
                 )
             ):
@@ -2825,6 +2874,10 @@ class DailyPipelineStageService:
                             incomplete_dependencies.append(dependency)
             if (
                 stage_id in EXACT_FINALIZATION_STAGE_IDS
+                and (
+                    recovery_stage_id != 'market_risk_filter'
+                    or stage_id == 'piotroski_filter'
+                )
                 and official_membership_symbols is not None
                 and point_in_time_recovery
                 and resolved_exact_membership_symbols is not None
@@ -2862,16 +2915,60 @@ class DailyPipelineStageService:
                         ]
                     )
                     currently_admitted = set(stage_symbols or ())
-                    if not currently_admitted <= recovery_scope:
-                        incomplete_dependencies.append(
-                            'recovery_current_scope_outcome'
+                    recovered_retry_symbols: set[str] | None = None
+                    if recovery_stage_id is not None:
+                        recovery_invocation = (
+                            stage_invocation_symbols.get(recovery_stage_id)
                         )
+                        recovery_attempt_partition = (
+                            self._exact_partial_success_scope(
+                                outcome=stage_outcomes.get(
+                                    recovery_stage_id
+                                ),
+                                invocation_symbols=recovery_invocation,
+                                expected_stage_id=recovery_stage_id,
+                                expected_market_date=(
+                                    resolved_market_date
+                                ),
+                                publication_symbols=recovery_invocation,
+                            )
+                        )
+                        recovered_retry_symbols = set(
+                            (
+                                recovery_attempt_partition or {}
+                            ).get('successful_stock_codes')
+                            or []
+                        )
+                    merged_successful = previously_successful | (
+                        recovered_retry_symbols or set()
+                    )
+                    if recovery_stage_id is None:
+                        if not currently_admitted <= recovery_scope:
+                            incomplete_dependencies.append(
+                                'recovery_current_scope_outcome'
+                            )
+                        else:
+                            merged_successful.update(
+                                currently_admitted
+                            )
                     else:
+                        if (
+                            not recovery_scope
+                            <= (recovered_retry_symbols or set())
+                            or not currently_admitted
+                            <= merged_successful
+                        ):
+                            incomplete_dependencies.append(
+                                'recovery_current_scope_outcome'
+                            )
+                    if (
+                        'recovery_current_scope_outcome'
+                        not in incomplete_dependencies
+                    ):
                         stage_symbols = [
                             symbol
                             for symbol in official_membership_symbols
-                            if symbol in previously_successful
-                            or symbol in currently_admitted
+                            if symbol in merged_successful
                         ]
             try:
                 self._start_tracked_stage(
@@ -7847,7 +7944,7 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: asyncio.run(
                     daily_market_risk_snapshot_service.collect_for_market_date(
                         market_date=market_date,
@@ -7857,9 +7954,11 @@ class DailyPipelineStageService:
                         progress_callback=progress_callback,
                         **(
                             {
-                                'exact_scope_symbols': exact_scope_symbols,
+                                'exact_scope_symbols': (
+                                    derived_publication_scope_symbols
+                                ),
                             }
-                            if exact_scope_symbols is not None
+                            if derived_publication_scope_symbols is not None
                             else {}
                         ),
                     )
@@ -7870,7 +7969,7 @@ class DailyPipelineStageService:
             return self._execute_exact_scoped_derived_stage(
                 stage_id=stage_id,
                 market_date=market_date,
-                exact_scope_symbols=exact_scope_symbols,
+                exact_scope_symbols=derived_publication_scope_symbols,
                 call=lambda: asyncio.run(
                     daily_market_risk_filter_service.rebuild_for_market_date(
                         market_date=market_date,
@@ -7879,8 +7978,12 @@ class DailyPipelineStageService:
                         market_code='J',
                         progress_callback=progress_callback,
                         **(
-                            {'exact_scope_symbols': exact_scope_symbols}
-                            if exact_scope_symbols is not None
+                            {
+                                'exact_scope_symbols': (
+                                    derived_publication_scope_symbols
+                                )
+                            }
+                            if derived_publication_scope_symbols is not None
                             else {}
                         ),
                     )

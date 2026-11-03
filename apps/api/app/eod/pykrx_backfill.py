@@ -7478,6 +7478,76 @@ class PykrxBackfillService:
                 if str(market or '').strip()
             )
 
+        market_risk_recovery_scope_outcome: dict[str, Any] | None = None
+        targeted_market_risk_recovery = bool(
+            stage_debt_request is None
+            and point_in_time_recovery
+            and resume_from_stage == 'market_risk_filter'
+            and recovery_stages[:1] == ['market_risk_filter']
+            and downstream_retry_symbols
+        )
+        if targeted_market_risk_recovery:
+            admission_partition = (
+                _validated_followup_admission_partition(
+                    latest_eod_metadata
+                )
+            )
+            exact_membership = sorted(
+                point_in_time_membership_symbols or []
+            )
+            if (
+                admission_partition is None
+                or not exact_membership
+                or set(
+                    admission_partition['selected_stock_codes']
+                )
+                != set(exact_membership)
+                or set(
+                    admission_partition['retry_debt_stock_codes']
+                )
+                != set(downstream_retry_symbols)
+            ):
+                result = build_daily_skip_result(
+                    reason='followup_recovery_exact_scope_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=(
+                        latest_available_trade_date
+                    ),
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked',
+                    'retry_scheduled': False,
+                    'resume_from_stage': resume_from_stage,
+                    'blocker': (
+                        'market_risk_admission_partition_mismatch'
+                    ),
+                }
+                return result
+            market_risk_recovery_scope_outcome = {
+                'schema_version': (
+                    FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION
+                ),
+                'stage_id': 'market_risk_filter',
+                **build_exact_symbol_scope_outcome(
+                    manifest_version=(
+                        'market_risk_filter_scope_outcomes_v1'
+                    ),
+                    selected_symbols=admission_partition[
+                        'selected_stock_codes'
+                    ],
+                    successful_symbols=admission_partition[
+                        'successful_stock_codes'
+                    ],
+                    retry_debt_symbols=admission_partition[
+                        'retry_debt_stock_codes'
+                    ],
+                    terminal_not_applicable_symbols=admission_partition[
+                        'terminal_not_applicable_stock_codes'
+                    ],
+                ),
+            }
+
         feedback_input_stage_ids = set(
             FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
         )
@@ -7508,6 +7578,10 @@ class PykrxBackfillService:
                 provider_admission_fence_owned
             ),
         }
+        if market_risk_recovery_scope_outcome is not None:
+            recovery_kwargs['recovery_stage_scope_outcome'] = (
+                market_risk_recovery_scope_outcome
+            )
         if (
             retryable_feedback_rearm_candidate
             and not proven_partial_summary_downstream_continuation

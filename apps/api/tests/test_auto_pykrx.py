@@ -8345,6 +8345,18 @@ class PykrxBackfillServiceTests(TestCase):
         latest_eod_run['run_metadata'][
             'downstream_retry_resume_from_stage'
         ] = 'market_risk_filter'
+        latest_eod_run['run_metadata'][
+            'followup_admission_scope_outcome'
+        ] = build_exact_symbol_scope_outcome(
+            manifest_version=(
+                'auto_eod_followup_admission_scope_outcomes_v1'
+            ),
+            selected_symbols=frozen_scope,
+            successful_symbols=[
+                symbol for symbol in frozen_scope if symbol != '005930'
+            ],
+            retry_debt_symbols=['005930'],
+        )
         with (
             patch(
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
@@ -8378,6 +8390,21 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(
             market_risk_call['exact_membership_symbols'],
             frozen_scope,
+        )
+        market_risk_recovery_scope = market_risk_call[
+            'recovery_stage_scope_outcome'
+        ]
+        self.assertEqual(
+            market_risk_recovery_scope['stage_id'],
+            'market_risk_filter',
+        )
+        self.assertEqual(
+            market_risk_recovery_scope['selected_stock_codes'],
+            frozen_scope,
+        )
+        self.assertEqual(
+            market_risk_recovery_scope['retry_debt_stock_codes'],
+            ['005930'],
         )
 
     def test_narrow_completed_recovery_reopens_upstream_admission(

@@ -540,6 +540,77 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
         )
         self.assertNotIn('market_warning_code', stored_filters[0])
 
+    async def test_targeted_exact_retry_preserves_unaffected_filter_rows(
+        self,
+    ) -> None:
+        inputs = [
+            MarketRiskSymbolInput(
+                symbol='196001',
+                name_ko='테스트주의',
+                market='KOSPI',
+            ),
+            MarketRiskSymbolInput(
+                symbol='196002',
+                name_ko='테스트관리',
+                market='KOSDAQ',
+            ),
+        ]
+        retry_symbol = '196002'
+
+        with patch.object(
+            self.snapshot_service,
+            '_load_symbol_rows',
+            return_value=(inputs, self.symbols, []),
+        ):
+            initial = await self.filter_service.rebuild_for_market_date(
+                market_date=self.market_date.isoformat(),
+                run_id=self.run_id,
+            )
+
+        before_retry = load_daily_market_risk_filter_results(
+            market_date=self.market_date,
+            symbols=self.symbols,
+        )
+        unaffected_before = next(
+            item for item in before_retry if item['symbol'] == '196001'
+        )
+
+        with patch.object(
+            self.snapshot_service,
+            '_load_symbol_rows',
+            return_value=(inputs[1:], [retry_symbol], []),
+        ):
+            recovered = await self.filter_service.rebuild_for_market_date(
+                market_date=self.market_date.isoformat(),
+                symbols=[retry_symbol],
+                exact_scope_symbols=[retry_symbol],
+                run_id=self.run_id,
+            )
+
+        after_retry = load_daily_market_risk_filter_results(
+            market_date=self.market_date,
+            symbols=self.symbols,
+        )
+        unaffected_after = next(
+            item for item in after_retry if item['symbol'] == '196001'
+        )
+
+        self.assertEqual(initial['results_persisted'], 2)
+        self.assertEqual(
+            recovered['selected_stock_codes'],
+            [retry_symbol],
+        )
+        self.assertEqual(
+            recovered['successful_stock_codes'],
+            [retry_symbol],
+        )
+        self.assertEqual(recovered['retry_debt_stock_codes'], [])
+        self.assertEqual(
+            {item['symbol'] for item in after_retry},
+            set(self.symbols),
+        )
+        self.assertEqual(unaffected_after, unaffected_before)
+
 
 if __name__ == '__main__':
     unittest.main()

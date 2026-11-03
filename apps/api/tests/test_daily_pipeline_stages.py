@@ -4997,6 +4997,168 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             retry_subset,
         )
 
+    def test_market_risk_stage_debt_retry_restores_full_suffix_scope(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        exact_membership = ['005930', '000660', '035420']
+        prior_successes = ['005930', '000660']
+        retry_subset = ['035420']
+        piotroski_successes = ['005930', '035420']
+        piotroski_retry_debt = ['000660']
+        recovery_stage_scope = {
+            'schema_version': 'followup_stage_recovery_scope_v1',
+            'stage_id': 'market_risk_filter',
+            **_build_exact_scope_outcome(
+                manifest_version=(
+                    'market_risk_filter_scope_outcomes_v1'
+                ),
+                selected_symbols=exact_membership,
+                successful_symbols=prior_successes,
+                retry_debt_symbols=retry_subset,
+            ),
+        }
+        market_risk_result = {
+            'status': 'completed',
+            'market_date': '2026-04-14',
+            'results_persisted': 1,
+            'results_failed': 0,
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='market_risk_filter',
+                exact_symbols=retry_subset,
+                successful_symbols=retry_subset,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version=(
+                    'market_risk_filter_scope_outcomes_v1'
+                ),
+                selected_symbols=retry_subset,
+                successful_symbols=retry_subset,
+                retry_debt_symbols=[],
+            ),
+        }
+        piotroski_result = {
+            'status': 'partial',
+            'market_date': '2026-04-14',
+            'results_persisted': len(piotroski_successes),
+            'results_failed': len(piotroski_retry_debt),
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='piotroski_filter',
+                exact_symbols=exact_membership,
+                successful_symbols=piotroski_successes,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='piotroski_scope_outcomes_v1',
+                selected_symbols=exact_membership,
+                successful_symbols=piotroski_successes,
+                retry_debt_symbols=piotroski_retry_debt,
+            ),
+        }
+        market = MagicMock(
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            current_calendar_date=None,
+            server_time='2026-04-15T08:30:00+09:00',
+        )
+        original_execute_stage = service._execute_stage
+        feedback_invocation_symbols: list[str] = []
+
+        def execute_with_feedback_capture(stage_id, **kwargs):
+            if stage_id == 'agent_feedback_summaries':
+                feedback_invocation_symbols.extend(kwargs['symbols'])
+                return {
+                    'status': 'completed',
+                    'market_date': '2026-04-14',
+                }
+            return original_execute_stage(stage_id, **kwargs)
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_required_provider_blocked_stage_result',
+                return_value=None,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.pykrx_pipeline_runner.previous_krx_trading_date',
+                return_value=date(2026, 4, 14),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_market_risk_filter_service.rebuild_for_market_date',
+                new=AsyncMock(return_value=market_risk_result),
+            ) as rebuild_market_risk,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_piotroski_filter_service.rebuild_for_market_date',
+                return_value=piotroski_result,
+            ) as rebuild_piotroski,
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute_with_feedback_capture,
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'market_risk_filter',
+                    'piotroski_filter',
+                    'agent_feedback_summaries',
+                ],
+                symbols=retry_subset,
+                exact_membership_symbols=exact_membership,
+                markets=['KOSPI', 'KOSDAQ'],
+                reused_eod_collection_run_id=905,
+                point_in_time_recovery=True,
+                trigger='auto_eod_followup_resume',
+                recovery_parent_scope_outcome=(
+                    _build_exact_scope_outcome(
+                        manifest_version=(
+                            'auto_eod_followup_admission_scope_outcomes_v1'
+                        ),
+                        selected_symbols=exact_membership,
+                        successful_symbols=prior_successes,
+                        retry_debt_symbols=retry_subset,
+                    )
+                ),
+                recovery_stage_scope_outcome=recovery_stage_scope,
+            )
+
+        self.assertEqual(
+            rebuild_market_risk.await_args.kwargs['symbols'],
+            retry_subset,
+        )
+        self.assertEqual(
+            rebuild_market_risk.await_args.kwargs['exact_scope_symbols'],
+            retry_subset,
+        )
+        self.assertEqual(
+            rebuild_piotroski.call_args.kwargs['symbols'],
+            exact_membership,
+        )
+        self.assertEqual(
+            rebuild_piotroski.call_args.kwargs['ranking_symbols'],
+            exact_membership,
+        )
+        self.assertEqual(
+            rebuild_piotroski.call_args.kwargs['exact_scope_symbols'],
+            exact_membership,
+        )
+        self.assertEqual(feedback_invocation_symbols, piotroski_successes)
+        self.assertEqual(result['status'], 'partial')
+
     def test_pitr_rejects_conflicting_complete_membership_snapshot(
         self,
     ) -> None:
