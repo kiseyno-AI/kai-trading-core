@@ -131,6 +131,19 @@ SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS = 2
 SHORT_BALANCE_AVAILABILITY_CONTRACT = 'krx_t_plus_2'
 SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING = 'not_applicable_new_listing'
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
+VALUATION_AVAILABILITY_AVAILABLE = 'available'
+VALUATION_AVAILABILITY_PROVIDER_REPORTED_UNAVAILABLE = (
+    'provider_reported_unavailable'
+)
+VALUATION_AVAILABILITY_PROVIDER_SCOPE_ABSENT = 'provider_scope_absent'
+VALUATION_AVAILABILITY_PROVIDER_ERROR = 'provider_error'
+VALUATION_TERMINAL_UNAVAILABLE_STATUSES = frozenset(
+    {
+        VALUATION_AVAILABILITY_PROVIDER_REPORTED_UNAVAILABLE,
+        VALUATION_AVAILABILITY_PROVIDER_SCOPE_ABSENT,
+    }
+)
+VALUATION_MIN_HEALTHY_FUNDAMENTAL_SCOPE_RATIO = 0.95
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
 PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 30_000
 PYKRX_COVERAGE_RUN_CANDIDATE_LIMIT = 50
@@ -189,6 +202,22 @@ def is_decision_usable_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
         return _metric_group_complete(
             dict(payload.get('short_volume') or {}),
             SHORT_VOLUME_METRIC_KEYS,
+        )
+    if category == 'valuation_snapshot':
+        has_valuation_metric = any(
+            (metric_value := _to_float(payload.get(key))) is not None
+            and metric_value > 0
+            for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
+        )
+        if has_valuation_metric:
+            return True
+        market_cap = _to_float(payload.get('market_cap'))
+        return (
+            source == 'pykrx'
+            and market_cap is not None
+            and market_cap > 0
+            and payload.get('valuation_availability_status')
+            in VALUATION_TERMINAL_UNAVAILABLE_STATUSES
         )
     return True
 
@@ -329,13 +358,23 @@ def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
             )
         )
     if category == 'valuation_snapshot':
+        # A successful same-day provider response can authoritatively report
+        # that valuation multiples do not apply to a symbol (for example,
+        # SPACs, preferred shares, REITs, or foreign listings).  That is a
+        # terminal acquisition outcome, not retry debt.  Provider failures
+        # never receive a terminal status and remain fail-closed above.
         market_cap = _to_float(payload.get('market_cap'))
+        if row.get('source') != 'pykrx' or market_cap is None or market_cap <= 0:
+            return False
         has_valuation_metric = any(
             (metric_value := _to_float(payload.get(key))) is not None
             and metric_value > 0
             for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
         )
-        return row.get('source') == 'pykrx' and market_cap is not None and market_cap > 0 and has_valuation_metric
+        return has_valuation_metric or (
+            payload.get('valuation_availability_status')
+            in VALUATION_TERMINAL_UNAVAILABLE_STATUSES
+        )
     return True
 
 
@@ -2583,18 +2622,90 @@ class PykrxEnrichmentService:
                     date=market_date_yyyymmdd,
                     market=market,
                 )
+                fundamental_fetch_failed = False
             except Exception as exc:
                 errors.append({'market': market, 'operation': 'valuation_fundamentals', 'error': str(exc)})
                 fundamental_frame = pd.DataFrame()
+                fundamental_fetch_failed = True
 
-            symbols_for_market = {
-                str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()
-                for item in set(market_cap_frame.index.tolist()) | set(fundamental_frame.index.tolist())
+            market_cap_symbols = {
+                _normalize_symbol(item)
+                for item in market_cap_frame.index.tolist()
+                if _normalize_symbol(item)
             }
+            fundamental_symbols = {
+                _normalize_symbol(item)
+                for item in fundamental_frame.index.tolist()
+                if _normalize_symbol(item)
+            }
+            if not fundamental_fetch_failed and market_cap_symbols:
+                fundamental_scope_ratio = len(
+                    fundamental_symbols & market_cap_symbols
+                ) / len(market_cap_symbols)
+                if (
+                    fundamental_scope_ratio
+                    < VALUATION_MIN_HEALTHY_FUNDAMENTAL_SCOPE_RATIO
+                ):
+                    errors.append(
+                        {
+                            'market': market,
+                            'operation': 'valuation_fundamentals_scope',
+                            'error': 'fundamental scope below healthy minimum',
+                            'fundamental_scope_ratio': round(
+                                fundamental_scope_ratio,
+                                6,
+                            ),
+                            'minimum_scope_ratio': (
+                                VALUATION_MIN_HEALTHY_FUNDAMENTAL_SCOPE_RATIO
+                            ),
+                        }
+                    )
+                    fundamental_fetch_failed = True
+            symbols_for_market = market_cap_symbols | fundamental_symbols
             for symbol in sorted(symbols_for_market):
                 if allowed_symbols and symbol not in allowed_symbols:
                     continue
                 symbol_info = symbol_meta.get(symbol) or {}
+                valuation_metrics = {
+                    'bps': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'BPS')
+                    ),
+                    'per': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'PER')
+                    ),
+                    'pbr': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'PBR')
+                    ),
+                    'eps': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'EPS')
+                    ),
+                    'dividend_yield': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'DIV')
+                    ),
+                    'dps': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'DPS')
+                    ),
+                }
+                has_valuation_metric = any(
+                    (valuation_metrics.get(key) or 0) > 0
+                    for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
+                )
+                if has_valuation_metric:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_AVAILABLE
+                    )
+                elif fundamental_fetch_failed:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_PROVIDER_ERROR
+                    )
+                elif symbol in fundamental_symbols:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_PROVIDER_REPORTED_UNAVAILABLE
+                    )
+                else:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_PROVIDER_SCOPE_ABSENT
+                    )
                 rows.append(
                     {
                         'market_date': market_date_iso,
@@ -2613,12 +2724,10 @@ class PykrxEnrichmentService:
                             'volume': _to_int(_frame_value(market_cap_frame, symbol, '거래량')),
                             'trading_value': _to_int(_frame_value(market_cap_frame, symbol, '거래대금')),
                             'listed_shares': _to_int(_frame_value(market_cap_frame, symbol, '상장주식수')),
-                            'bps': _to_float(_frame_value(fundamental_frame, symbol, 'BPS')),
-                            'per': _to_float(_frame_value(fundamental_frame, symbol, 'PER')),
-                            'pbr': _to_float(_frame_value(fundamental_frame, symbol, 'PBR')),
-                            'eps': _to_float(_frame_value(fundamental_frame, symbol, 'EPS')),
-                            'dividend_yield': _to_float(_frame_value(fundamental_frame, symbol, 'DIV')),
-                            'dps': _to_float(_frame_value(fundamental_frame, symbol, 'DPS')),
+                            **valuation_metrics,
+                            'valuation_availability_status': (
+                                valuation_availability_status
+                            ),
                         },
                     }
                 )

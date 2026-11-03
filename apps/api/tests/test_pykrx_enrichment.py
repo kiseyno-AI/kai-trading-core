@@ -14,6 +14,7 @@ from app.eod.pykrx_enrichment import (
     _market_ticker_membership_frame,
     _preserve_existing_short_selling_components,
     _resolve_short_balance_as_of_date,
+    is_complete_pykrx_enrichment_row,
 )
 from app.eod.pykrx_enrichment_gate import build_pykrx_enrichment_preflight
 from app.market.session import (
@@ -2258,6 +2259,49 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(coverage['missing_component_rows'], 1)
         self.assertEqual(coverage['coverage_status'], 'missing')
 
+    def test_valuation_coverage_counts_terminal_provider_absence_as_resolved(self):
+        service = PykrxEnrichmentService()
+        row = {
+            'category': 'valuation_snapshot',
+            'market': 'KOSDAQ',
+            'scope_key': '123450',
+            'symbol': '123450',
+            'source': 'pykrx',
+            'payload': {
+                'per': 0.0,
+                'pbr': 0.0,
+                'dividend_yield': 0.0,
+                'market_cap': 12600000000,
+                'valuation_availability_status': (
+                    'provider_reported_unavailable'
+                ),
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '123450', 'market': 'KOSDAQ'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[row],
+            ),
+        ):
+            result = service._build_coverage_summary(
+                market_date='2026-11-02',
+                markets=['KOSDAQ'],
+                symbols=['123450'],
+                categories=['valuation_snapshot'],
+            )
+
+        coverage = result['categories']['valuation_snapshot']
+        self.assertEqual(coverage['present_rows'], 1)
+        self.assertEqual(coverage['decision_usable_present_rows'], 1)
+        self.assertEqual(coverage['complete_present_rows'], 1)
+        self.assertEqual(coverage['coverage_status'], 'complete')
+
     @patch('app.eod.pykrx_enrichment.stock.get_market_net_purchases_of_equities_by_ticker')
     def test_symbol_investor_rows_zero_fill_absent_investor_activity(
         self,
@@ -3355,6 +3399,143 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]['symbol'], '005930')
         self.assertEqual(rows[0]['payload']['market_cap'], 420000000000)
         self.assertIsNone(rows[0]['payload']['per'])
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_error',
+        )
+        self.assertFalse(is_complete_pykrx_enrichment_row(rows[0]))
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_resolves_provider_reported_zero_metrics(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [2100],
+                '시가총액': [12600000000],
+                '거래량': [1000],
+                '거래대금': [2100000],
+                '상장주식수': [6000000],
+            },
+            index=['123450'],
+        )
+        get_market_fundamental_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                'BPS': [0],
+                'PER': [0],
+                'PBR': [0],
+                'EPS': [0],
+                'DIV': [0],
+                'DPS': [0],
+            },
+            index=['123450'],
+        )
+
+        rows, details = PykrxEnrichmentService()._collect_valuation_snapshot_rows(
+            market_date_iso='2026-11-02',
+            market_date_yyyymmdd='20261102',
+            markets=['KOSDAQ'],
+            symbol_filter={'123450'},
+            symbol_meta={'123450': {'name_ko': '테스트스팩'}},
+            cache={},
+        )
+
+        self.assertEqual(details['errors'], [])
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_reported_unavailable',
+        )
+        self.assertTrue(is_complete_pykrx_enrichment_row(rows[0]))
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_resolves_provider_scope_absence(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        support_symbols = [f'{value:06d}' for value in range(1, 20)]
+        market_cap_symbols = ['950001', *support_symbols]
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [5000] * len(market_cap_symbols),
+                '시가총액': [50000000000] * len(market_cap_symbols),
+                '거래량': [1000] * len(market_cap_symbols),
+                '거래대금': [5000000] * len(market_cap_symbols),
+                '상장주식수': [10000000] * len(market_cap_symbols),
+            },
+            index=market_cap_symbols,
+        )
+        get_market_fundamental_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                'BPS': [1000] * len(support_symbols),
+                'PER': [10] * len(support_symbols),
+                'PBR': [1] * len(support_symbols),
+                'EPS': [500] * len(support_symbols),
+                'DIV': [2] * len(support_symbols),
+                'DPS': [100] * len(support_symbols),
+            },
+            index=support_symbols,
+        )
+
+        rows, details = PykrxEnrichmentService()._collect_valuation_snapshot_rows(
+            market_date_iso='2026-11-02',
+            market_date_yyyymmdd='20261102',
+            markets=['KOSDAQ'],
+            symbol_filter={'950001'},
+            symbol_meta={'950001': {'name_ko': '테스트외국주'}},
+            cache={},
+        )
+
+        self.assertEqual(details['errors'], [])
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_scope_absent',
+        )
+        self.assertTrue(is_complete_pykrx_enrichment_row(rows[0]))
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_rejects_empty_fundamental_scope(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [5000],
+                '시가총액': [50000000000],
+                '거래량': [1000],
+                '거래대금': [5000000],
+                '상장주식수': [10000000],
+            },
+            index=['950001'],
+        )
+        get_market_fundamental_by_ticker_mock.return_value = pd.DataFrame(
+            columns=['BPS', 'PER', 'PBR', 'EPS', 'DIV', 'DPS']
+        )
+
+        rows, details = PykrxEnrichmentService()._collect_valuation_snapshot_rows(
+            market_date_iso='2026-11-02',
+            market_date_yyyymmdd='20261102',
+            markets=['KOSDAQ'],
+            symbol_filter={'950001'},
+            symbol_meta={'950001': {'name_ko': '테스트외국주'}},
+            cache={},
+        )
+
+        self.assertEqual(
+            details['errors'][0]['operation'],
+            'valuation_fundamentals_scope',
+        )
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_error',
+        )
+        self.assertFalse(is_complete_pykrx_enrichment_row(rows[0]))
 
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_collect_for_market_date_falls_back_for_market_cap_only_valuation_rows(self, load_symbols_mock):
