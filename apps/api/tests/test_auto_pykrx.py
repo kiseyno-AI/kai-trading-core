@@ -8342,6 +8342,44 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertNotIn('price_collection', recovery_call['stages'])
         resolve_stage_debt.assert_not_called()
 
+        latest_eod_run['run_metadata'][
+            'downstream_retry_resume_from_stage'
+        ] = 'market_risk_filter'
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                return_value={'status': 'partial', 'pipeline_run_id': 94},
+            ) as retry_market_risk,
+        ):
+            service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        market_risk_call = retry_market_risk.call_args.kwargs
+        self.assertEqual(
+            market_risk_call['resume_from_stage'],
+            'market_risk_filter',
+        )
+        self.assertEqual(market_risk_call['symbols'], ['005930'])
+        self.assertEqual(
+            market_risk_call['exact_membership_symbols'],
+            frozen_scope,
+        )
+
     def test_narrow_completed_recovery_reopens_upstream_admission(
         self,
     ) -> None:

@@ -6369,6 +6369,7 @@ class PykrxBackfillService:
             and run_metadata.get('point_in_time_recovery') is True
             and str(run_metadata.get('resume_from_stage') or '').strip()
             == downstream_resume_from_stage
+            and downstream_resume_from_stage == 'pykrx_enrichment'
             and downstream_resume_from_stage in recovery_scope
             and first_exact_followup_index is not None
             and recovery_scope.index(downstream_resume_from_stage)
@@ -7675,6 +7676,7 @@ class PykrxBackfillService:
         elif (
             point_in_time_recovery
             and upstream_admission_rebuild_pending
+            and downstream_resume_from_stage == 'pykrx_enrichment'
             and not price_retry_symbols
             and point_in_time_membership_symbols
         ):
