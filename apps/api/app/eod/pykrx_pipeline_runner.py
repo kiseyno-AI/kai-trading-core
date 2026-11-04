@@ -39,6 +39,7 @@ from app.eod.run_stage_support import (
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
     is_nonblocking_quality_only_piotroski_partial,
+    is_nonblocking_quality_only_signal_features_partial,
 )
 from app.eod.scope_outcomes import (
     EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
@@ -871,6 +872,18 @@ def _validated_successful_cohort(
                 ],
             )
         )
+        quality_only_signal_features_partial = (
+            stage_id == 'signal_features'
+            and is_nonblocking_quality_only_signal_features_partial(
+                stage_result=stage_result,
+                selected_symbols=partition['selected_stock_codes'],
+                successful_symbols=successful_symbols,
+                retry_debt_symbols=retry_debt_symbols,
+                terminal_not_applicable_symbols=partition[
+                    'terminal_not_applicable_stock_codes'
+                ],
+            )
+        )
         if not successful_symbols:
             return None
         # A symbol-exhaustive debt partition advances only its proven success
@@ -882,6 +895,7 @@ def _validated_successful_cohort(
             and not retry_debt_symbols
             and str(stage_result.get('gate_status') or '').lower()
             != 'ready'
+            and not quality_only_signal_features_partial
         ):
             return None
         if str(stage_result.get('gate_status') or '').lower() == 'blocked':
@@ -955,6 +969,18 @@ def _validated_atomic_successful_cohort(
             ],
         )
     )
+    quality_only_signal_features_partial = (
+        stage_id == 'signal_features'
+        and is_nonblocking_quality_only_signal_features_partial(
+            stage_result=stage_result,
+            selected_symbols=partition['selected_stock_codes'],
+            successful_symbols=successful_symbols,
+            retry_debt_symbols=retry_debt_symbols,
+            terminal_not_applicable_symbols=partition[
+                'terminal_not_applicable_stock_codes'
+            ],
+        )
+    )
     if not successful_symbols:
         return None
     stage_status = _resolve_result_status(
@@ -965,6 +991,7 @@ def _validated_atomic_successful_cohort(
         stage_status == 'partial'
         and not retry_debt_symbols
         and str(stage_result.get('gate_status') or '').lower() != 'ready'
+        and not quality_only_signal_features_partial
     ):
         return None
     if str(stage_result.get('gate_status') or '').lower() == 'blocked':

@@ -205,6 +205,145 @@ def is_nonblocking_quality_only_piotroski_partial(
         and usable > 0
         and usable + incomplete + unusable == len(selected)
     )
+
+
+def is_nonblocking_quality_only_signal_features_partial(
+    *,
+    stage_result: Mapping[str, Any],
+    selected_symbols: Sequence[str],
+    successful_symbols: Sequence[str],
+    retry_debt_symbols: Sequence[str],
+    terminal_not_applicable_symbols: Sequence[str],
+) -> bool:
+    """Validate a fully persisted signal-feature source-quality warning.
+
+    Missing optional ranking sources may leave every exact-scope row usable
+    through same-date owned fallbacks.  That quality degradation may advance,
+    but semantic gaps, persistence failures, dependency blocks, or symbol debt
+    remain fail-closed.
+    """
+
+    def exact_nonnegative_int(value: object) -> int | None:
+        if type(value) is not int:
+            return None
+        return value if value >= 0 else None
+
+    def optional_status_is(
+        key: str,
+        allowed: set[str],
+    ) -> bool:
+        value = str(stage_result.get(key) or '').strip().lower()
+        return not value or value in allowed
+
+    selected = list(selected_symbols)
+    successful = list(successful_symbols)
+    retry_debt = list(retry_debt_symbols)
+    terminal = list(terminal_not_applicable_symbols)
+    incomplete_sources = stage_result.get('incomplete_sources')
+    complete_codes = stage_result.get('complete_stock_codes')
+    degraded_codes = stage_result.get('degraded_stock_codes')
+    complete_count = exact_nonnegative_int(
+        stage_result.get('complete_stock_code_count')
+    )
+    degraded_count = exact_nonnegative_int(
+        stage_result.get('degraded_stock_code_count')
+    )
+    failed_symbols = stage_result.get('failed_symbols')
+    retry_metadata = stage_result.get('_retry_metadata')
+    retry_metadata_failed = (
+        retry_metadata.get('failed_symbols')
+        if isinstance(retry_metadata, Mapping)
+        else None
+    )
+
+    if not (
+        selected
+        and len(selected) == len(set(selected))
+        and len(successful) == len(set(successful))
+        and not retry_debt
+        and not terminal
+        and set(successful) == set(selected)
+        and str(stage_result.get('status') or '').strip().lower()
+        == 'partial'
+        and str(stage_result.get('reason') or '').strip()
+        == 'signal_feature_sources_incomplete'
+        and str(
+            stage_result.get('source_completeness_status') or ''
+        ).strip().lower()
+        == 'partial'
+        and isinstance(incomplete_sources, list)
+        and incomplete_sources
+        and all(
+            isinstance(source, str) and source.strip()
+            for source in incomplete_sources
+        )
+        and len(incomplete_sources)
+        == len(set(incomplete_sources))
+        and str(stage_result.get('quality_status') or '').strip().lower()
+        == 'degraded'
+        and exact_nonnegative_int(
+            stage_result.get('features_persisted')
+        )
+        == len(selected)
+        and exact_nonnegative_int(stage_result.get('features_failed')) == 0
+        and exact_nonnegative_int(
+            stage_result.get('semantic_ready_count')
+        )
+        == len(selected)
+        and exact_nonnegative_int(
+            stage_result.get('semantic_retry_count')
+        )
+        == 0
+        and complete_count is not None
+        and degraded_count is not None
+        and degraded_count > 0
+        and complete_count + degraded_count == len(selected)
+        and optional_status_is('gate_status', {'ready'})
+        and optional_status_is(
+            'blocking_status',
+            {'non_blocking'},
+        )
+        and optional_status_is(
+            'ranking_dependency_status',
+            {'complete', 'completed', 'ready'},
+        )
+        and (
+            failed_symbols is None
+            or isinstance(failed_symbols, list)
+            and not failed_symbols
+        )
+        and (
+            retry_metadata_failed is None
+            or isinstance(retry_metadata_failed, list)
+            and not retry_metadata_failed
+        )
+    ):
+        return False
+
+    if complete_codes is not None and not (
+        isinstance(complete_codes, list)
+        and len(complete_codes) == complete_count
+        and len(complete_codes) == len(set(complete_codes))
+        and set(complete_codes).issubset(selected)
+    ):
+        return False
+    if degraded_codes is not None and not (
+        isinstance(degraded_codes, list)
+        and len(degraded_codes) == degraded_count
+        and len(degraded_codes) == len(set(degraded_codes))
+        and set(degraded_codes).issubset(selected)
+    ):
+        return False
+    if (
+        complete_codes is not None
+        and degraded_codes is not None
+        and (
+            set(complete_codes).intersection(degraded_codes)
+            or set(complete_codes).union(degraded_codes) != set(selected)
+        )
+    ):
+        return False
+    return True
 SAME_DAY_INTRADAY_WATCH_REARM_VERSION = 1
 SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT = 8
 

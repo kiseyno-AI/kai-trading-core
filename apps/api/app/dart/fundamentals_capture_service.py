@@ -3905,12 +3905,31 @@ class DartFundamentalsCaptureService:
             )
             symbols_refreshed = len(refreshed_symbols)
             symbols_failed = len(failed_symbols)
+            maintenance_deferred_stock_codes = sorted(
+                stock_code
+                for stock_code in selected_stock_codes
+                if str(
+                    (symbol_results.get(stock_code) or {}).get('state')
+                    or ''
+                )
+                == 'stale_incremental_backfill_deferred'
+                and bool(
+                    (symbol_results.get(stock_code) or {}).get(
+                        'has_fundamentals'
+                    )
+                )
+            )
+            maintenance_deferred_stock_code_set = set(
+                maintenance_deferred_stock_codes
+            )
             symbols_fresh = len(
                 [
                     stock_code
                     for stock_code, latest_date in latest_fundamentals_date_by_symbol.items()
                     if latest_date is not None
                     and stock_code not in stale_symbols
+                    and stock_code
+                    not in maintenance_deferred_stock_code_set
                 ]
             )
             operator_buckets = _build_operator_buckets(
@@ -3943,6 +3962,18 @@ class DartFundamentalsCaptureService:
                         (symbol_results.get(stock_code) or {}).get('state') or ''
                     )
                     in successful_terminal_states
+                    or (
+                        str(
+                            (symbol_results.get(stock_code) or {}).get('state')
+                            or ''
+                        )
+                        == 'stale_incremental_backfill_deferred'
+                        and bool(
+                            (symbol_results.get(stock_code) or {}).get(
+                                'has_fundamentals'
+                            )
+                        )
+                    )
                 )
                 and stock_code not in exact_retry_debt_symbols
             }
@@ -4119,6 +4150,12 @@ class DartFundamentalsCaptureService:
                 'retry_cycles_completed': retry_cycles_completed,
                 'failure_reason': failure_reason,
                 'retry_debt_count': retry_debt_count,
+                'maintenance_deferred_stock_codes': (
+                    maintenance_deferred_stock_codes
+                ),
+                'maintenance_deferred_count': len(
+                    maintenance_deferred_stock_codes
+                ),
                 'state_histogram': normalized_state_histogram,
                 'partial_reasons': partial_reasons,
                 'piotroski_filter_followup': piotroski_filter_followup,
@@ -4246,6 +4283,12 @@ class DartFundamentalsCaptureService:
                 'successful_stock_codes': sorted(successful_stock_codes),
                 'retry_debt_stock_codes': sorted(exact_retry_debt_symbols),
                 'retry_debt_count': retry_debt_count,
+                'maintenance_deferred_stock_codes': (
+                    maintenance_deferred_stock_codes
+                ),
+                'maintenance_deferred_count': len(
+                    maintenance_deferred_stock_codes
+                ),
                 'state_histogram': normalized_state_histogram,
                 'failure_reason': failure_reason,
                 'scope_outcome_manifest': outcome_manifest,

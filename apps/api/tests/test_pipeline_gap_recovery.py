@@ -247,6 +247,54 @@ def _compact_quality_only_piotroski_stage(
     return {'status': 'partial', 'details': details}
 
 
+def _quality_only_signal_features_result(symbols: list[str]) -> dict:
+    result = _exact_result(
+        selected=symbols,
+        successful=symbols,
+        retry_debt=[],
+        version='signal_features_scope_outcomes_v1',
+        status='partial',
+        stage_id='signal_features',
+        publication_symbols=symbols,
+    )
+    result.update(
+        {
+            'reason': 'signal_feature_sources_incomplete',
+            'source_completeness_status': 'partial',
+            'incomplete_sources': [
+                'overtime-fluctuation',
+                'overtime-volume',
+                'volume-power',
+            ],
+            'quality_status': 'degraded',
+            'complete_stock_codes': [],
+            'degraded_stock_codes': list(symbols),
+            'complete_stock_code_count': 0,
+            'degraded_stock_code_count': len(symbols),
+            'semantic_ready_count': len(symbols),
+            'semantic_retry_count': 0,
+            'features_persisted': len(symbols),
+            'features_failed': 0,
+            'failed_symbols': [],
+        }
+    )
+    return result
+
+
+def _compact_quality_only_signal_features_stage(
+    symbols: list[str],
+) -> dict:
+    result = _quality_only_signal_features_result(symbols)
+    details = DailyPipelineStageService._build_stage_run_details(
+        stage_id='signal_features',
+        result=result,
+        invocation_symbols=symbols,
+        market_date='2026-10-30',
+        publication_symbols=symbols,
+    )
+    return {'status': 'partial', 'details': details}
+
+
 def test_compact_nonblocking_piotroski_warning_is_not_new_debt() -> None:
     symbols = [f'{index:06d}' for index in range(1, 118)]
     stage = _compact_quality_only_piotroski_stage(symbols)
@@ -275,6 +323,156 @@ def test_compact_nonblocking_piotroski_warning_is_not_new_debt() -> None:
     )
     assert validated is not None
     assert validated[0]['successful_stock_codes'] == symbols
+
+
+def test_signal_feature_quality_only_partial_advances_exact_success_scope() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 4)]
+    result = _quality_only_signal_features_result(symbols)
+    stage = _compact_quality_only_signal_features_stage(symbols)
+
+    assert _validated_successful_cohort(
+        stage_result=result,
+        invocation_symbols=symbols,
+        stage_id='signal_features',
+    ) == symbols
+    assert _validated_atomic_successful_cohort(
+        stage_result=result,
+        invocation_symbols=symbols,
+        stage_id='signal_features',
+        finalization_stage_id='signal_features',
+        market_date='2026-10-30',
+        exact_publication_symbols=symbols,
+    ) == symbols
+    stage_scope = DailyPipelineStageService._exact_partial_success_scope(
+        outcome={'status': 'partial', 'result': result},
+        invocation_symbols=symbols,
+        expected_stage_id='signal_features',
+        expected_market_date='2026-10-30',
+        publication_symbols=symbols,
+    )
+    assert stage_scope is not None
+    validated = _validated_followup_exact_partition(
+        stage_id='signal_features',
+        stage=stage,
+        expected_market_date='2026-10-30',
+        expected_publication_symbols=symbols,
+        allowed_partition_symbols=symbols,
+        allow_quality_only_partial=True,
+    )
+    assert validated is not None
+    assert validated[0]['successful_stock_codes'] == symbols
+
+
+def test_failed_signal_feature_wrapper_stays_fail_closed() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 4)]
+    result = _quality_only_signal_features_result(symbols)
+    compact_stage = _compact_quality_only_signal_features_stage(symbols)
+    stage = {
+        'status': 'failed',
+        'result': result,
+        'details': compact_stage['details'],
+    }
+
+    assert _validated_followup_exact_partition(
+        stage_id='signal_features',
+        stage=stage,
+        expected_market_date='2026-10-30',
+        expected_publication_symbols=symbols,
+        allowed_partition_symbols=symbols,
+        allow_quality_only_partial=True,
+    ) is None
+
+
+def test_compact_signal_feature_quality_partial_accepts_omitted_large_quality_list() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 118)]
+    stage = _compact_quality_only_signal_features_stage(symbols)
+    result_summary = stage['details']['result_summary']
+
+    assert result_summary['complete_stock_codes'] == []
+    assert 'degraded_stock_codes' not in result_summary
+    validated = _validated_followup_exact_partition(
+        stage_id='signal_features',
+        stage=stage,
+        expected_market_date='2026-10-30',
+        expected_publication_symbols=symbols,
+        allowed_partition_symbols=symbols,
+        allow_quality_only_partial=True,
+    )
+    assert validated is not None
+    assert validated[0]['successful_stock_codes'] == symbols
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (
+        ('reason', 'unknown_partial'),
+        ('source_completeness_status', 'complete'),
+        ('incomplete_sources', []),
+        ('quality_status', 'unavailable'),
+        ('semantic_ready_count', 2),
+        ('semantic_retry_count', 1),
+        ('features_persisted', 2),
+        ('features_failed', 1),
+        ('degraded_stock_codes', ['000001', '000002']),
+        ('degraded_stock_code_count', 2),
+        ('failed_symbols', ['000003']),
+        ('gate_status', 'blocked'),
+        ('blocking_status', 'blocking'),
+        ('ranking_dependency_status', 'incomplete'),
+    ),
+)
+def test_signal_feature_quality_partial_tampering_stays_fail_closed(
+    field: str,
+    value: object,
+) -> None:
+    symbols = [f'{index:06d}' for index in range(1, 4)]
+    result = _quality_only_signal_features_result(symbols)
+    result[field] = value
+
+    assert _validated_successful_cohort(
+        stage_result=result,
+        invocation_symbols=symbols,
+        stage_id='signal_features',
+    ) is None
+    assert DailyPipelineStageService._exact_partial_success_scope(
+        outcome={'status': 'partial', 'result': result},
+        invocation_symbols=symbols,
+        expected_stage_id='signal_features',
+        expected_market_date='2026-10-30',
+        publication_symbols=symbols,
+    ) is None
+
+
+def test_quality_partial_uses_top_level_result_summary_market_date() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 4)]
+    result_summary = _exact_result(
+        selected=symbols,
+        successful=symbols,
+        retry_debt=[],
+        version='piotroski_scope_outcomes_v1',
+        status='partial',
+        stage_id='piotroski_filter',
+        publication_symbols=symbols,
+    )
+    result_summary.update(
+        {
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'ranking_dependency_status': 'complete',
+            'reason': 'piotroski_evidence_incomplete',
+            'quality_warning': 'piotroski_evidence_incomplete',
+            'results_persisted': len(symbols),
+            'results_failed': 0,
+        }
+    )
+
+    assert daily_pipeline_outcome_is_satisfied(
+        {
+            'stage': 'piotroski_filter',
+            'status': 'partial',
+            'result_summary': result_summary,
+        }
+    )
 
 
 @pytest.mark.parametrize(
