@@ -2931,14 +2931,20 @@ def _validated_followup_stage_debt_state(
                 )
             ):
                 return None
+            proof_stage = {
+                'status': raw_proof.get('status'),
+                'result': raw_proof,
+                'result_summary': raw_proof,
+            }
             validated_proof = _validated_followup_exact_partition(
                 stage_id=stage_id,
-                stage=raw_proof,
+                stage=proof_stage,
                 expected_market_date=market_date,
                 expected_publication_symbols=(
                     normalized_publication_symbols
                 ),
                 allowed_partition_symbols=parent_symbols,
+                allow_quality_only_partial=True,
             )
             if validated_proof is None:
                 return None
