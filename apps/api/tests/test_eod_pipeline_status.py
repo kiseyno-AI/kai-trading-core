@@ -2253,6 +2253,129 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'requested_scope_rows_complete',
         )
 
+    def test_requested_scope_completion_isolates_pending_full_universe_factor_debt(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=2,
+                present_count=2,
+                decision_ready_count=1,
+                decision_degraded_count=1,
+                quality_status='degraded',
+            ),
+        )
+        stage = service._apply_scope_coverage_gate(
+            stage_id='value_factors',
+            market_date='2026-11-04',
+            stage={
+                'task': 'value_factors',
+                'status': 'pending',
+                'gate_status': 'blocked',
+                'severity': 'blocked',
+                'blocking_status': 'blocking',
+                'details': {
+                    'gate_reason': 'missing_rows_intersect_exact_run_universe',
+                    'rows_persisted': 2,
+                    'expected_rows': 4,
+                    'blocking_stages': ['pykrx_enrichment'],
+                    'failed_blocking_stages': [],
+                    'exact_universe_coverage': _scope_gap_evidence(
+                        requested_count=4,
+                        present_count=2,
+                        missing_symbols_sample=['000020', '000040'],
+                    ),
+                },
+            },
+            scope_symbols=['005930', '000660'],
+        )
+
+        self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['severity'], 'degraded')
+        self.assertEqual(stage['blocking_status'], 'non_blocking')
+        self.assertEqual(stage['details']['aggregate_status'], 'pending')
+        self.assertEqual(
+            stage['details']['aggregate_gate_reason'],
+            'missing_rows_intersect_exact_run_universe',
+        )
+        self.assertEqual(
+            stage['details']['gate_reason'],
+            'requested_scope_rows_complete',
+        )
+
+    def test_requested_scope_does_not_isolate_pending_failed_dependency(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+                decision_ready_count=1,
+                decision_degraded_count=0,
+                quality_status='complete',
+            ),
+        )
+        stage = service._apply_scope_coverage_gate(
+            stage_id='value_factors',
+            market_date='2026-11-04',
+            stage={
+                'task': 'value_factors',
+                'status': 'pending',
+                'gate_status': 'blocked',
+                'severity': 'blocked',
+                'blocking_status': 'blocking',
+                'details': {
+                    'gate_reason': 'missing_rows_intersect_exact_run_universe',
+                    'rows_persisted': 1,
+                    'expected_rows': 2,
+                    'blocking_stages': ['pykrx_enrichment'],
+                    'failed_blocking_stages': ['pykrx_enrichment'],
+                    'exact_universe_coverage': _scope_gap_evidence(
+                        requested_count=2,
+                        present_count=1,
+                        missing_symbols_sample=['000020'],
+                    ),
+                },
+            },
+            scope_symbols=['005930'],
+        )
+
+        self.assertEqual(stage['status'], 'pending')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
+
+    def test_requested_scope_does_not_isolate_pending_without_decision_evidence(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+            ),
+        )
+        stage = service._apply_scope_coverage_gate(
+            stage_id='value_factors',
+            market_date='2026-11-04',
+            stage={
+                'task': 'value_factors',
+                'status': 'pending',
+                'gate_status': 'blocked',
+                'severity': 'blocked',
+                'blocking_status': 'blocking',
+                'details': {
+                    'gate_reason': (
+                        'missing_rows_intersect_exact_run_universe'
+                    ),
+                    'failed_blocking_stages': [],
+                    'exact_universe_coverage': _scope_gap_evidence(
+                        requested_count=2,
+                        present_count=1,
+                        missing_symbols_sample=['000020'],
+                    ),
+                },
+            },
+            scope_symbols=['005930'],
+        )
+
+        self.assertEqual(stage['status'], 'pending')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
+
     def test_requested_scope_never_promotes_non_partial_dependency_states(self):
         service = EODPipelineStatusService()
         for status, gate_status in (
@@ -2691,6 +2814,129 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 scope_symbols=['000660', '005930'],
             )
         )
+
+    def test_pykrx_exact_success_scope_isolates_symbol_only_global_gap(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2,
+            market_count=2,
+            updated_at='2026-11-04T21:00:00+09:00',
+        )
+        coverage['categories']['investor_flow_symbol'].update(
+            {
+                'scope_type': 'symbol',
+                'present_rows': 1,
+                'expected_rows': 2,
+                'coverage_ratio': 0.5,
+                'coverage_status': 'partial',
+            }
+        )
+        run = {
+            'id': 587,
+            'run_metadata': {
+                'stage_progress': {
+                    'pykrx_enrichment': {
+                        'status': 'partial',
+                        'processed': 7,
+                        'total': 7,
+                        'succeeded': 6,
+                        'failed': 1,
+                        'scope_outcome_manifest_version': (
+                            'pykrx_enrichment_scope_outcomes_v1'
+                        ),
+                        'selected_stock_codes': ['005930', '000660'],
+                        'successful_stock_codes': ['005930'],
+                        'retry_debt_stock_codes': ['000660'],
+                        'terminal_not_applicable_stock_codes': [],
+                        'scope_outcome_manifest': [
+                            {'stock_code': '005930', 'outcome': 'success'},
+                            {'stock_code': '000660', 'outcome': 'retry_debt'},
+                        ],
+                    }
+                }
+            },
+        }
+        service = EODPipelineStatusService()
+
+        successful_scope = service._build_pykrx_enrichment_stage(
+            market_date='2026-11-04',
+            coverage=coverage,
+            run=run,
+            scope_symbols=['005930'],
+        )
+        retry_scope = service._build_pykrx_enrichment_stage(
+            market_date='2026-11-04',
+            coverage=coverage,
+            run=run,
+            scope_symbols=['000660'],
+        )
+
+        self.assertEqual(successful_scope['status'], 'completed')
+        self.assertEqual(successful_scope['gate_status'], 'ready')
+        self.assertEqual(successful_scope['blocking_status'], 'non_blocking')
+        self.assertEqual(
+            successful_scope['details']['requested_scope_coverage'][
+                'missing_count'
+            ],
+            0,
+        )
+        self.assertEqual(retry_scope['gate_status'], 'blocked')
+        self.assertEqual(
+            retry_scope['details']['requested_scope_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['000660'],
+        )
+
+    def test_pykrx_exact_symbol_scope_does_not_override_market_gap(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=1,
+            market_count=2,
+            updated_at='2026-11-04T21:00:00+09:00',
+        )
+        coverage['categories']['market_breadth'].update(
+            {
+                'scope_type': 'market',
+                'present_rows': 1,
+                'expected_rows': 2,
+                'coverage_ratio': 0.5,
+                'coverage_status': 'partial',
+            }
+        )
+        run = {
+            'id': 587,
+            'run_metadata': {
+                'stage_progress': {
+                    'pykrx_enrichment': {
+                        'status': 'partial',
+                        'processed': 7,
+                        'total': 7,
+                        'succeeded': 6,
+                        'failed': 1,
+                        'scope_outcome_manifest_version': (
+                            'pykrx_enrichment_scope_outcomes_v1'
+                        ),
+                        'selected_stock_codes': ['005930'],
+                        'successful_stock_codes': ['005930'],
+                        'retry_debt_stock_codes': [],
+                        'terminal_not_applicable_stock_codes': [],
+                        'scope_outcome_manifest': [
+                            {'stock_code': '005930', 'outcome': 'success'},
+                        ],
+                    }
+                }
+            },
+        }
+
+        stage = EODPipelineStatusService()._build_pykrx_enrichment_stage(
+            market_date='2026-11-04',
+            coverage=coverage,
+            run=run,
+            scope_symbols=['005930'],
+        )
+
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'blocked')
+        self.assertEqual(stage['blocking_status'], 'blocking')
 
     def test_legacy_optional_unavailable_stage_is_rendered_partial(self) -> None:
         normalized = EODPipelineStatusService._normalize_stage_contract(

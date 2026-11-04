@@ -5121,11 +5121,35 @@ class EODPipelineStatusService:
         ]
         requested_scope_coverage = None
         if requested_scope_count:
+            nonready_category_gates = [
+                item
+                for item in gate_details.get('decider_category_gates') or []
+                if isinstance(item, dict)
+                and str(item.get('gate_status') or '').strip().lower()
+                not in {'ready', 'not_applicable'}
+            ]
+            symbol_scoped_categories = {
+                'sector_classification',
+                'investor_flow_symbol',
+                'short_selling',
+                'valuation_snapshot',
+            }
+            symbol_only_aggregate_gap = bool(nonready_category_gates) and all(
+                str(item.get('scope_type') or '').strip().lower()
+                == 'symbol'
+                or str(item.get('category') or '').strip()
+                in symbol_scoped_categories
+                for item in nonready_category_gates
+            )
+            scope_category_gate_ready = gate_status == 'ready' or (
+                gate_status == 'blocked'
+                and symbol_only_aggregate_gap
+            )
             scope_ready = (
                 status in {'completed', 'partial'}
                 and exact_scope_loaded
                 and not missing_scope_symbols
-                and gate_status == 'ready'
+                and scope_category_gate_ready
             )
             scope_waiting = status in {'pending', 'running', 'waiting'}
             requested_scope_coverage = {
@@ -5148,7 +5172,17 @@ class EODPipelineStatusService:
                     else normalized_scope_symbols
                 )[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT],
             }
-            if not scope_ready:
+            if scope_ready:
+                if gate_status != 'ready':
+                    gate_details[
+                        'aggregate_decider_category_gate_status'
+                    ] = gate_status
+                    gate_details['scope_gate_override'] = (
+                        'exact_success_scope_isolates_symbol_only_gap'
+                    )
+                    gate_details['decider_category_gate_status'] = 'ready'
+                gate_status = 'ready'
+            else:
                 gate_status = 'waiting' if scope_waiting else 'blocked'
         severity = 'blocked' if gate_status == 'blocked' else gate_status
         blocking_status = 'blocking' if gate_status == 'blocked' else gate_status
@@ -6339,17 +6373,67 @@ class EODPipelineStatusService:
                 details.get('gate_reason') or ''
             ).strip().lower()
             exact_universe_coverage = details.get('exact_universe_coverage')
+            exact_universe_requested_count = (
+                _strict_nonnegative_int(
+                    exact_universe_coverage.get('requested_count')
+                )
+                if isinstance(exact_universe_coverage, dict)
+                else None
+            )
+            validated_exact_universe_coverage = (
+                _validated_row_count_scope_gap_evidence(
+                    exact_universe_coverage,
+                    requested_count=exact_universe_requested_count,
+                )
+                if isinstance(exact_universe_coverage, dict)
+                and exact_universe_requested_count is not None
+                and exact_universe_requested_count > 0
+                else None
+            )
+            validated_exact_universe_has_residual_debt = bool(
+                validated_exact_universe_coverage is not None
+                and int(
+                    validated_exact_universe_coverage['missing_count']
+                )
+                > 0
+            )
+            requested_scope_decision_ready_count = (
+                _strict_nonnegative_int(
+                    validated_scope_gap.get('decision_ready_count')
+                )
+            )
+            failed_blocking_stages = details.get(
+                'failed_blocking_stages'
+            )
+            scope_isolated_pending = bool(
+                stage_id in FACTOR_STAGE_SCORE_FIELDS
+                and existing_status == 'pending'
+                and existing_gate_status == 'blocked'
+                and existing_gate_reason
+                == 'missing_rows_intersect_exact_run_universe'
+                and validated_exact_universe_has_residual_debt
+                and requested_scope_decision_ready_count is not None
+                and requested_scope_decision_ready_count > 0
+                and isinstance(failed_blocking_stages, list)
+                and not failed_blocking_stages
+            )
             scope_can_isolate_aggregate_gap = (
-                existing_status == 'partial'
-                and (
-                    (
-                        isinstance(exact_universe_coverage, dict)
-                        and _coerce_int(
-                            exact_universe_coverage.get('missing_count')
+                scope_isolated_pending
+                or (
+                    existing_status == 'partial'
+                    and (
+                        (
+                            isinstance(exact_universe_coverage, dict)
+                            and _coerce_int(
+                                exact_universe_coverage.get(
+                                    'missing_count'
+                                )
+                            )
+                            > 0
                         )
-                        > 0
+                        or existing_gate_reason
+                        == 'expected_scope_unverified'
                     )
-                    or existing_gate_reason == 'expected_scope_unverified'
                 )
             )
             if (
@@ -6363,13 +6447,17 @@ class EODPipelineStatusService:
                     'blocked',
                     'waiting',
                     'running',
-                    'pending',
                     'interrupted',
                     'abandoned',
                 }
+                or (
+                    existing_status == 'pending'
+                    and not scope_isolated_pending
+                )
             ):
                 return {**stage, 'details': details}
             if scope_can_isolate_aggregate_gap:
+                details['aggregate_status'] = existing_status
                 details['aggregate_gate_status'] = existing_gate_status
                 details['aggregate_gate_reason'] = details.get('gate_reason')
                 details['scope_gate_override'] = (
@@ -6394,6 +6482,11 @@ class EODPipelineStatusService:
             )
             return {
                 **stage,
+                'status': (
+                    'partial'
+                    if scope_isolated_pending
+                    else stage.get('status')
+                ),
                 'gate_status': 'ready',
                 'severity': (
                     'degraded'
