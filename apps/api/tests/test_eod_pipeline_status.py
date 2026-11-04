@@ -2253,7 +2253,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'requested_scope_rows_complete',
         )
 
-    def test_requested_scope_completion_isolates_pending_full_universe_factor_debt(self):
+    def test_requested_scope_completion_isolates_pending_exact_success_cohort(self):
         service = EODPipelineStatusService(
             row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
                 requested_count=2,
@@ -2276,7 +2276,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     'gate_reason': 'missing_rows_intersect_exact_run_universe',
                     'rows_persisted': 2,
                     'expected_rows': 4,
-                    'blocking_stages': ['pykrx_enrichment'],
+                    'blocking_stages': [],
                     'failed_blocking_stages': [],
                     'exact_universe_coverage': _scope_gap_evidence(
                         requested_count=4,
@@ -2301,6 +2301,98 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             stage['details']['gate_reason'],
             'requested_scope_rows_complete',
         )
+
+    def test_requested_scope_does_not_isolate_nonfailed_blocking_dependency(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+                decision_ready_count=1,
+                decision_degraded_count=0,
+                quality_status='complete',
+            ),
+        )
+        price_stage = {
+            'status': 'completed',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'total': 2,
+            'succeeded': 2,
+            'details': {},
+        }
+
+        for dependency_status in (
+            'running',
+            'waiting',
+            'blocked',
+            'interrupted',
+            'abandoned',
+        ):
+            with self.subTest(dependency_status=dependency_status):
+                dependency_waiting = dependency_status in {
+                    'running',
+                    'waiting',
+                }
+                pykrx_enrichment_stage = {
+                    'status': dependency_status,
+                    'gate_status': (
+                        'waiting' if dependency_waiting else 'blocked'
+                    ),
+                    'blocking_status': (
+                        'waiting' if dependency_waiting else 'blocking'
+                    ),
+                    'details': {},
+                }
+                stage = service._build_row_count_stage(
+                    stage_id='value_factors',
+                    market_date='2026-11-04',
+                    price_stage=price_stage,
+                    price_rows_persisted=2,
+                    prior_stages={
+                        'price_collection': price_stage,
+                        'pykrx_enrichment': pykrx_enrichment_stage,
+                    },
+                    aggregate={
+                        'persisted': 1,
+                        'decision_ready_count': 1,
+                        'decision_degraded_count': 0,
+                    },
+                    live_symbols_total=2,
+                    feedback_run=None,
+                    scope_symbols=['005930'],
+                )
+                stage = service._apply_exact_universe_coverage_evidence(
+                    stage=stage,
+                    coverage=_scope_gap_evidence(
+                        requested_count=2,
+                        present_count=1,
+                        missing_symbols_sample=['000660'],
+                    ),
+                    expected_count=2,
+                    source_run_id=587,
+                )
+                stage = service._apply_scope_coverage_gate(
+                    stage_id='value_factors',
+                    market_date='2026-11-04',
+                    stage=stage,
+                    scope_symbols=['005930'],
+                )
+
+                self.assertEqual(stage['status'], 'pending')
+                self.assertEqual(stage['gate_status'], 'blocked')
+                self.assertEqual(stage['blocking_status'], 'blocking')
+                self.assertEqual(
+                    stage['details']['blocking_stages'],
+                    ['pykrx_enrichment'],
+                )
+                self.assertEqual(
+                    stage['details']['failed_blocking_stages'],
+                    [],
+                )
+                self.assertEqual(
+                    stage['details']['gate_reason'],
+                    'missing_rows_intersect_exact_run_universe',
+                )
 
     def test_requested_scope_does_not_isolate_pending_failed_dependency(self):
         service = EODPipelineStatusService(
