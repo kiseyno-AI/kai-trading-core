@@ -8304,6 +8304,82 @@ class PykrxBackfillServiceTests(TestCase):
                     )
                 )
 
+    def test_recovery_price_scope_accepts_exact_persisted_success_subset(
+        self,
+    ) -> None:
+        membership = ['000660', '005930', '121850', '472220']
+        successful = ['000660', '005930']
+        failed = ['121850', '472220']
+        latest_eod_run = {
+            'id': 9,
+            'symbols_total': 4,
+            'symbols_succeeded': 2,
+            'symbols_failed': 2,
+            'run_metadata': {
+                'requested_symbols': membership,
+                'failed_symbols': failed,
+                'unattempted_symbols': [],
+            },
+        }
+
+        with patch(
+            'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+            return_value=successful,
+        ):
+            proof = _build_recovery_price_scope_outcome(
+                latest_eod_run=latest_eod_run,
+                market_date='2026-04-03',
+                membership_symbols=membership,
+                allow_terminal_failures=True,
+            )
+
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['status'], 'partial')
+        self.assertEqual(proof['selected_stock_codes'], membership)
+        self.assertEqual(proof['successful_stock_codes'], successful)
+        self.assertEqual(proof['retry_debt_stock_codes'], failed)
+        self.assertEqual(
+            proof['scope_finalization']['exact_symbol_count'],
+            len(membership),
+        )
+        self.assertEqual(
+            proof['scope_finalization']['successful_symbol_count'],
+            len(successful),
+        )
+
+        invalid_runs = (
+            {
+                **latest_eod_run,
+                'run_metadata': {
+                    **latest_eod_run['run_metadata'],
+                    'unattempted_symbols': ['472220'],
+                },
+            },
+            {**latest_eod_run, 'symbols_succeeded': 1},
+            {
+                **latest_eod_run,
+                'symbols_succeeded': 0,
+                'symbols_failed': 4,
+                'run_metadata': {
+                    **latest_eod_run['run_metadata'],
+                    'failed_symbols': membership,
+                },
+            },
+        )
+        for invalid_run in invalid_runs:
+            with self.subTest(invalid_run=invalid_run), patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=successful,
+            ):
+                self.assertIsNone(
+                    _build_recovery_price_scope_outcome(
+                        latest_eod_run=invalid_run,
+                        market_date='2026-04-03',
+                        membership_symbols=membership,
+                        allow_terminal_failures=True,
+                    )
+                )
+
     def test_trending_only_recovery_does_not_repeat_later_stages(
         self,
     ) -> None:

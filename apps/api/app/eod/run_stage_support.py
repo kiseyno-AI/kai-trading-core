@@ -133,6 +133,78 @@ NONBLOCKING_DOWNSTREAM_SCOPE_PROOF_SCHEMA_VERSION = (
 SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY = (
     'same_day_intraday_watch_rearm'
 )
+
+
+def is_nonblocking_quality_only_piotroski_partial(
+    *,
+    stage_result: Mapping[str, Any],
+    selected_symbols: Sequence[str],
+    successful_symbols: Sequence[str],
+    retry_debt_symbols: Sequence[str],
+    terminal_not_applicable_symbols: Sequence[str],
+) -> bool:
+    """Validate a fully persisted Piotroski-only quality warning.
+
+    The scope partition proves execution and persistence, while the embedded
+    Piotroski evidence flags keep incomplete symbols out of the strategy
+    candidate set. This is not an escape hatch for ranking, write, or retry
+    failures: those remain globally blocking.
+    """
+
+    def exact_nonnegative_int(value: object) -> int | None:
+        if type(value) is not int:
+            return None
+        return value if value >= 0 else None
+
+    selected = list(selected_symbols)
+    successful = list(successful_symbols)
+    retry_debt = list(retry_debt_symbols)
+    terminal = list(terminal_not_applicable_symbols)
+    usable = exact_nonnegative_int(
+        stage_result.get('full_signal_usable_count')
+    )
+    incomplete = exact_nonnegative_int(
+        stage_result.get('full_signal_incomplete_count')
+    )
+    unusable = exact_nonnegative_int(
+        stage_result.get('full_signal_unusable_count')
+    )
+    reason = str(stage_result.get('reason') or '').strip()
+    return bool(
+        selected
+        and len(selected) == len(set(selected))
+        and len(successful) == len(set(successful))
+        and not retry_debt
+        and not terminal
+        and set(successful) == set(selected)
+        and str(stage_result.get('status') or '').strip().lower()
+        == 'partial'
+        and str(stage_result.get('gate_status') or '').strip().lower()
+        == 'ready'
+        and str(
+            stage_result.get('blocking_status') or ''
+        ).strip().lower()
+        == 'non_blocking'
+        and str(
+            stage_result.get('ranking_dependency_status') or ''
+        ).strip().lower()
+        in {'complete', 'completed', 'ready'}
+        and exact_nonnegative_int(stage_result.get('results_persisted'))
+        == len(selected)
+        and exact_nonnegative_int(stage_result.get('results_failed')) == 0
+        and reason == 'piotroski_evidence_incomplete'
+        and str(stage_result.get('quality_warning') or '').strip()
+        == reason
+        and str(
+            stage_result.get('full_signal_coverage_status') or ''
+        ).strip().lower()
+        == 'incomplete'
+        and usable is not None
+        and incomplete is not None
+        and unusable is not None
+        and usable > 0
+        and usable + incomplete + unusable == len(selected)
+    )
 SAME_DAY_INTRADAY_WATCH_REARM_VERSION = 1
 SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT = 8
 
@@ -1355,12 +1427,15 @@ def admits_previous_session_preopen_auto_recovery(
     resolved_stages: Sequence[str],
     provider_admission_fence_owned: bool,
     existing_pipeline_run_id: int | None,
+    canonical_recovery_stage_order: Sequence[str] | None = None,
 ) -> bool:
-    """Admit only an exact automatic prior-session suffix before the open.
+    """Admit a proven automatic prior-session suffix before the open.
 
     This admission is intentionally separate from the same-day intraday-watch
     contract: it lets the scheduler finish yesterday's decision suffix during
     today's PREOPEN, but it expires immediately when the market becomes OPEN.
+    A broader recovery may enter only when it is an intact suffix of the
+    caller's canonical order and recomputes the complete decision tail.
     """
 
     market_state = str(getattr(market, 'state', '') or '').strip().upper()
@@ -1372,17 +1447,39 @@ def admits_previous_session_preopen_auto_recovery(
         and not isinstance(reused_eod_collection_run_id, bool)
         and reused_eod_collection_run_id > 0
         and force is False
-        and reuse_existing_feedback is True
         and provider_admission_fence_owned is True
         and existing_pipeline_run_id is None
         and isinstance(resolved_stages, (list, tuple))
     ):
         return False
     normalized_stages = tuple(resolved_stages)
-    if not (
+    exact_terminal_suffix = bool(
         normalized_stages in AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS
         and resume_from_stage == normalized_stages[0]
+        and reuse_existing_feedback is True
+    )
+    broad_canonical_suffix = False
+    if (
+        isinstance(canonical_recovery_stage_order, (list, tuple))
+        and normalized_stages
+        and resume_from_stage == normalized_stages[0]
+        and reuse_existing_feedback is False
     ):
+        canonical_order = tuple(canonical_recovery_stage_order)
+        terminal_tail = AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS[0]
+        try:
+            start_index = canonical_order.index(normalized_stages[0])
+            feedback_index = canonical_order.index(terminal_tail[0])
+        except ValueError:
+            pass
+        else:
+            broad_canonical_suffix = bool(
+                start_index < feedback_index
+                and normalized_stages == canonical_order[start_index:]
+                and normalized_stages[-len(terminal_tail) :]
+                == terminal_tail
+            )
+    if not (exact_terminal_suffix or broad_canonical_suffix):
         return False
 
     server_time = str(getattr(market, 'server_time', '') or '')

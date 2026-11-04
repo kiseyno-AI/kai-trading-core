@@ -61,6 +61,7 @@ from app.eod.run_stage_support import (
     is_completed_auto_pitr_intraday_watch_recovery,
     is_canonical_same_day_signal_rearm_proof,
     is_exact_auto_pitr_intraday_watch_recovery_request,
+    is_nonblocking_quality_only_piotroski_partial,
     is_recoverable_same_day_intraday_watch_expiration,
     outcome_contains_reason,
     pending_same_day_intraday_watch_rearm_marker,
@@ -2063,8 +2064,9 @@ def _build_recovery_price_scope_outcome(
     latest_eod_run: Mapping[str, Any],
     market_date: str,
     membership_symbols: Sequence[str],
+    allow_terminal_failures: bool = False,
 ) -> dict[str, Any] | None:
-    """Prove a historical price cohort from its frozen EOD identity."""
+    """Prove the exact persisted price partition for a frozen EOD run."""
 
     normalized_membership = sorted(
         _dedupe_symbol_codes(membership_symbols)
@@ -2074,8 +2076,24 @@ def _build_recovery_price_scope_outcome(
         if isinstance(latest_eod_run.get('run_metadata'), Mapping)
         else {}
     )
+    raw_requested_symbols = metadata.get('requested_symbols') or []
+    raw_failed_symbols = metadata.get('failed_symbols') or []
+    raw_unattempted_symbols = metadata.get('unattempted_symbols') or []
+    if not all(
+        isinstance(raw_symbols, list)
+        for raw_symbols in (
+            raw_requested_symbols,
+            raw_failed_symbols,
+            raw_unattempted_symbols,
+        )
+    ):
+        return None
     requested_symbols = sorted(
-        _dedupe_symbol_codes(metadata.get('requested_symbols') or [])
+        _dedupe_symbol_codes(raw_requested_symbols)
+    )
+    failed_symbols = sorted(_dedupe_symbol_codes(raw_failed_symbols))
+    unattempted_symbols = sorted(
+        _dedupe_symbol_codes(raw_unattempted_symbols)
     )
     try:
         eod_run_id = int(latest_eod_run['id'])
@@ -2091,12 +2109,26 @@ def _build_recovery_price_scope_outcome(
     if (
         not normalized_membership
         or requested_symbols != normalized_membership
+        or len(requested_symbols) != len(raw_requested_symbols)
+        or len(failed_symbols) != len(raw_failed_symbols)
+        or len(unattempted_symbols) != len(raw_unattempted_symbols)
         or symbols_total != len(normalized_membership)
-        or symbols_succeeded != len(normalized_membership)
-        or symbols_failed != 0
-        or _dedupe_symbol_codes(metadata.get('failed_symbols') or [])
-        or _dedupe_symbol_codes(metadata.get('unattempted_symbols') or [])
+        or symbols_succeeded <= 0
+        or symbols_succeeded + symbols_failed != symbols_total
+        or symbols_failed != len(failed_symbols)
+        or unattempted_symbols
+        or not set(failed_symbols).issubset(
+            set(normalized_membership)
+        )
+        or (failed_symbols and not allow_terminal_failures)
     ):
+        return None
+    expected_persisted_symbols = [
+        symbol
+        for symbol in normalized_membership
+        if symbol not in set(failed_symbols)
+    ]
+    if len(expected_persisted_symbols) != symbols_succeeded:
         return None
     persisted_symbols = sorted(
         _dedupe_symbol_codes(
@@ -2106,7 +2138,7 @@ def _build_recovery_price_scope_outcome(
             )
         )
     )
-    if persisted_symbols != normalized_membership:
+    if persisted_symbols != expected_persisted_symbols:
         return None
 
     finalization_stage_id = STAGE_ATOMIC_FINALIZATION_STAGE_IDS.get(
@@ -2115,25 +2147,26 @@ def _build_recovery_price_scope_outcome(
     if not finalization_stage_id:
         return None
     membership_digest = market_membership_sha256(normalized_membership)
+    successful_digest = market_membership_sha256(persisted_symbols)
     return {
         'schema_version': RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION,
         'stage_id': 'price_collection',
         'eod_collection_run_id': eod_run_id,
         'market_date': market_date,
-        'status': 'completed',
+        'status': 'partial' if failed_symbols else 'completed',
         **build_exact_symbol_scope_outcome(
             manifest_version='price_contexts_scope_outcomes_v1',
             selected_symbols=normalized_membership,
-            successful_symbols=normalized_membership,
-            retry_debt_symbols=[],
+            successful_symbols=persisted_symbols,
+            retry_debt_symbols=failed_symbols,
         ),
         'scope_finalization': {
             'stage': finalization_stage_id,
             'market_date': market_date,
             'exact_symbol_count': len(normalized_membership),
             'exact_membership_sha256': membership_digest,
-            'successful_symbol_count': len(normalized_membership),
-            'successful_membership_sha256': membership_digest,
+            'successful_symbol_count': len(persisted_symbols),
+            'successful_membership_sha256': successful_digest,
             'deleted_stale_row_count': 0,
             'ready': True,
         },
@@ -2232,27 +2265,12 @@ def _followup_quality_only_partial_is_satisfied(
         result_summary.get('quality_warning') or ''
     ).strip()
     if stage_id == 'piotroski_filter':
-        usable = exact_nonnegative_int(
-            result_summary.get('full_signal_usable_count')
-        )
-        incomplete = exact_nonnegative_int(
-            result_summary.get('full_signal_incomplete_count')
-        )
-        unusable = exact_nonnegative_int(
-            result_summary.get('full_signal_unusable_count')
-        )
-        return bool(
-            reason == 'piotroski_evidence_incomplete'
-            and quality_warning == reason
-            and str(
-                result_summary.get('full_signal_coverage_status') or ''
-            ).strip().lower()
-            == 'incomplete'
-            and usable is not None
-            and incomplete is not None
-            and unusable is not None
-            and usable > 0
-            and usable + incomplete + unusable == len(selected)
+        return is_nonblocking_quality_only_piotroski_partial(
+            stage_result=result_summary,
+            selected_symbols=selected,
+            successful_symbols=successful,
+            retry_debt_symbols=retry_debt,
+            terminal_not_applicable_symbols=terminal,
         )
     if stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
         factor_summary = result_summary.get('summary')
@@ -8002,6 +8020,9 @@ class PykrxBackfillService:
                     latest_eod_run=latest_eod_run,
                     market_date=market_date,
                     membership_symbols=point_in_time_membership_symbols,
+                    allow_terminal_failures=(
+                        recovering_safe_downstream_scope
+                    ),
                 )
             )
             if recovery_price_scope_outcome is None:
@@ -8244,6 +8265,30 @@ class PykrxBackfillService:
             parent_scope_outcome = latest_eod_metadata.get(
                 'followup_admission_scope_outcome'
             )
+            if (
+                not isinstance(parent_scope_outcome, Mapping)
+                and recovery_price_scope_outcome is not None
+            ):
+                parent_scope_outcome = build_exact_symbol_scope_outcome(
+                    manifest_version=(
+                        'auto_eod_followup_admission_scope_outcomes_v1'
+                    ),
+                    selected_symbols=recovery_price_scope_outcome[
+                        'selected_stock_codes'
+                    ],
+                    successful_symbols=recovery_price_scope_outcome[
+                        'successful_stock_codes'
+                    ],
+                    retry_debt_symbols=recovery_price_scope_outcome[
+                        'retry_debt_stock_codes'
+                    ],
+                    terminal_not_applicable_symbols=(
+                        recovery_price_scope_outcome.get(
+                            'terminal_not_applicable_stock_codes'
+                        )
+                        or []
+                    ),
+                )
             if isinstance(parent_scope_outcome, Mapping):
                 recovery_kwargs['recovery_parent_scope_outcome'] = dict(
                     parent_scope_outcome

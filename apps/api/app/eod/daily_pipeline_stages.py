@@ -81,6 +81,7 @@ from app.eod.run_stage_support import (
     build_expired_decision_replay_result,
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
+    is_nonblocking_quality_only_piotroski_partial,
     is_exact_auto_pitr_intraday_watch_recovery_request,
     nonblocking_partial_progression_digest,
 )
@@ -1173,6 +1174,9 @@ class DailyPipelineStageService:
             raw_recovery_price_outcome = dict(
                 recovery_price_scope_outcome
             )
+            recovery_price_status = str(
+                raw_recovery_price_outcome.get('status') or ''
+            ).strip().lower()
             try:
                 recovery_price_eod_run_id = int(
                     raw_recovery_price_outcome.get(
@@ -1182,9 +1186,42 @@ class DailyPipelineStageService:
             except (TypeError, ValueError):
                 recovery_price_eod_run_id = None
             candidate_price_outcome = {
-                'status': raw_recovery_price_outcome.get('status'),
+                'status': recovery_price_status,
                 'result': raw_recovery_price_outcome,
             }
+            recovery_price_successful_symbols = (
+                raw_recovery_price_outcome.get(
+                    'successful_stock_codes'
+                )
+            )
+            partial_price_partition_matches_parent = bool(
+                recovery_price_status != 'partial'
+                or (
+                    isinstance(recovery_price_successful_symbols, list)
+                    and recovery_parent_partition is not None
+                    and all(
+                        set(
+                            raw_recovery_price_outcome.get(key) or []
+                        )
+                        == set(recovery_parent_partition[key])
+                        for key in (
+                            'selected_stock_codes',
+                            'successful_stock_codes',
+                            'retry_debt_stock_codes',
+                            'terminal_not_applicable_stock_codes',
+                        )
+                    )
+                )
+            )
+            partial_price_invocation_matches_successes = bool(
+                recovery_price_status != 'partial'
+                or (
+                    isinstance(recovery_price_successful_symbols, list)
+                    and resolved_symbols is not None
+                    and set(resolved_symbols)
+                    == set(recovery_price_successful_symbols)
+                )
+            )
             if not (
                 trigger == 'auto_eod_followup_resume'
                 and point_in_time_recovery
@@ -1197,24 +1234,28 @@ class DailyPipelineStageService:
                 == RECOVERY_PRICE_SCOPE_OUTCOME_SCHEMA_VERSION
                 and raw_recovery_price_outcome.get('stage_id')
                 == 'price_collection'
-                and raw_recovery_price_outcome.get('status')
-                == 'completed'
+                and recovery_price_status in {'completed', 'partial'}
                 and recovery_price_eod_run_id
                 == int(reused_eod_collection_run_id)
                 and raw_recovery_price_outcome.get('market_date')
                 == resolved_market_date
+                and partial_price_partition_matches_parent
+                and partial_price_invocation_matches_successes
                 and self._complete_price_scope_is_proven(
                     exact_scope_symbols=(
                         resolved_exact_membership_symbols
                     ),
                     admitted_symbols=(
-                        resolved_exact_membership_symbols
+                        recovery_price_successful_symbols
                     ),
                     price_outcome=candidate_price_outcome,
                     price_invocation_symbols=(
                         resolved_exact_membership_symbols
                     ),
                     expected_market_date=resolved_market_date,
+                    allow_partial_admission=(
+                        recovery_price_status == 'partial'
+                    ),
                 )
             ):
                 raise ValueError(
@@ -1370,23 +1411,10 @@ class DailyPipelineStageService:
             trigger == 'auto_eod_followup_resume'
             and point_in_time_recovery is True
             and force is False
-            and reuse_existing_feedback is True
             and provider_admission_fence_owned is True
             and existing_pipeline_run_id is None
-            and tuple(resolved_stages)
-            in {
-                (
-                    'agent_feedback_summaries',
-                    'signal_decider',
-                    'next_open_execution_plan',
-                    'signal_decider_evaluations',
-                ),
-                (
-                    'signal_decider',
-                    'next_open_execution_plan',
-                    'signal_decider_evaluations',
-                ),
-            }
+            and resolved_stages
+            and resume_from_stage == resolved_stages[0]
         )
         previous_session_preopen_market = (
             get_market_state()
@@ -1411,6 +1439,9 @@ class DailyPipelineStageService:
                     provider_admission_fence_owned
                 ),
                 existing_pipeline_run_id=existing_pipeline_run_id,
+                canonical_recovery_stage_order=(
+                    DEFAULT_DAILY_STAGE_ORDER
+                ),
             )
         )
         if (
@@ -1640,7 +1671,7 @@ class DailyPipelineStageService:
         if validated_recovery_price_outcome is not None:
             stage_outcomes['price_collection'] = {
                 'stage': 'price_collection',
-                'status': 'completed',
+                'status': validated_recovery_price_outcome['status'],
                 'result': validated_recovery_price_outcome,
             }
             stage_invocation_symbols['price_collection'] = list(
@@ -2273,7 +2304,15 @@ class DailyPipelineStageService:
         ]
         grouped_pykrx_requested = 'price_collection' in pykrx_requested
         official_membership_symbols: list[str] | None = (
-            list(resolved_exact_membership_symbols)
+            list(
+                validated_recovery_price_outcome.get(
+                    'successful_stock_codes'
+                )
+                or []
+            )
+            if validated_recovery_price_outcome is not None
+            and validated_recovery_price_outcome.get('status') == 'partial'
+            else list(resolved_exact_membership_symbols)
             if resolved_exact_membership_symbols is not None
             else (
                 list(resolved_symbols)
@@ -2893,6 +2932,13 @@ class DailyPipelineStageService:
                         publication_symbols=(
                             stage_invocation_symbols.get(dependency)
                             if dependency == 'signal_features'
+                            else resolved_exact_membership_symbols
+                            if dependency == 'price_collection'
+                            and validated_recovery_price_outcome is not None
+                            and validated_recovery_price_outcome.get(
+                                'status'
+                            )
+                            == 'partial'
                             else official_membership_symbols
                         ),
                     )
@@ -3560,7 +3606,14 @@ class DailyPipelineStageService:
                             complete_price_scope_proven=(
                                 self._complete_price_scope_is_proven(
                                     exact_scope_symbols=(
-                                        official_membership_symbols
+                                        resolved_exact_membership_symbols
+                                        if validated_recovery_price_outcome
+                                        is not None
+                                        and validated_recovery_price_outcome.get(
+                                            'status'
+                                        )
+                                        == 'partial'
+                                        else official_membership_symbols
                                     ),
                                     admitted_symbols=stage_symbols,
                                     price_outcome=stage_outcomes.get(
@@ -3573,6 +3626,14 @@ class DailyPipelineStageService:
                                     ),
                                     expected_market_date=(
                                         resolved_market_date
+                                    ),
+                                    allow_partial_admission=(
+                                        validated_recovery_price_outcome
+                                        is not None
+                                        and validated_recovery_price_outcome.get(
+                                            'status'
+                                        )
+                                        == 'partial'
                                     ),
                                 )
                                 if stage_id == 'trending_ranks'
@@ -3870,11 +3931,16 @@ class DailyPipelineStageService:
             if isinstance(existing_run_metadata.get('stage_statuses'), dict)
             else {}
         )
+        current_run_stage_outcomes = {
+            stage_id: outcome
+            for stage_id, outcome in stage_outcomes.items()
+            if stage_id in resolved_stages
+        }
         merged_stage_statuses = {
             **existing_stage_statuses,
             **{
                 stage_id: outcome.get('status')
-                for stage_id, outcome in stage_outcomes.items()
+                for stage_id, outcome in current_run_stage_outcomes.items()
             },
         }
         merged_stage_outcomes = {
@@ -3884,7 +3950,7 @@ class DailyPipelineStageService:
             }
             for stage_id, stage_status in merged_stage_statuses.items()
         }
-        merged_stage_outcomes.update(stage_outcomes)
+        merged_stage_outcomes.update(current_run_stage_outcomes)
         warning_metadata = daily_pipeline_warning_metadata(
             merged_stage_outcomes,
         )
@@ -3912,7 +3978,7 @@ class DailyPipelineStageService:
                     reused_eod_collection_run_id
                 ),
                 trigger=trigger,
-                stage_outcomes=stage_outcomes,
+                stage_outcomes=current_run_stage_outcomes,
                 feedback_cutoff_resolution=feedback_cutoff_resolution,
             )
         )
@@ -3928,7 +3994,7 @@ class DailyPipelineStageService:
             )
         if overall_status == 'partial' and all(
             daily_pipeline_outcome_is_satisfied(outcome)
-            for outcome in stage_outcomes.values()
+            for outcome in current_run_stage_outcomes.values()
         ):
             run_metadata['resumable'] = False
         final_run = self._finish_run_with_retry(
@@ -8867,16 +8933,22 @@ class DailyPipelineStageService:
         price_outcome: dict[str, Any] | None,
         price_invocation_symbols: Sequence[str] | None,
         expected_market_date: str,
+        allow_partial_admission: bool = False,
     ) -> bool:
         """Require an exhaustive same-run price partition for global ranks."""
 
         exact_scope = normalize_symbol_codes(exact_scope_symbols or [])
         admitted_scope = normalize_symbol_codes(admitted_symbols or [])
-        if not (
-            exact_scope
-            and admitted_scope
-            and len(exact_scope) == len(admitted_scope)
-            and set(exact_scope) == set(admitted_scope)
+        if not exact_scope or not admitted_scope:
+            return False
+        exact_set = set(exact_scope)
+        admitted_set = set(admitted_scope)
+        if (
+            admitted_set != exact_set
+            and not (
+                allow_partial_admission
+                and admitted_set < exact_set
+            )
         ):
             return False
         price_scope = cls._exact_partial_success_scope(
@@ -8886,17 +8958,24 @@ class DailyPipelineStageService:
             expected_market_date=expected_market_date,
             publication_symbols=exact_scope_symbols,
         )
+        if (
+            price_scope is None
+            or set(price_scope['selected_stock_codes']) != exact_set
+            or price_scope['terminal_not_applicable_stock_codes']
+        ):
+            return False
+        successful_set = set(price_scope['successful_stock_codes'])
+        retry_debt_set = set(price_scope['retry_debt_stock_codes'])
+        if allow_partial_admission:
+            return bool(
+                successful_set == admitted_set
+                and successful_set
+                and retry_debt_set == exact_set - admitted_set
+            )
         return bool(
-            price_scope is not None
-            and not price_scope['retry_debt_stock_codes']
-            and len(price_scope['selected_stock_codes'])
-            == len(exact_scope)
-            and set(price_scope['selected_stock_codes'])
-            == set(exact_scope)
-            and len(price_scope['successful_stock_codes'])
-            == len(exact_scope)
-            and set(price_scope['successful_stock_codes'])
-            == set(exact_scope)
+            not retry_debt_set
+            and successful_set == exact_set
+            and admitted_set == exact_set
         )
 
     @staticmethod
@@ -8941,7 +9020,10 @@ class DailyPipelineStageService:
             payload: Mapping[str, Any],
             *,
             status: str,
+            selected_symbols: Sequence[str],
+            successful_symbols: Sequence[str],
             retry_symbols: Sequence[str],
+            terminal_symbols: Sequence[str],
         ) -> bool:
             gate_status = str(
                 payload.get('gate_status') or ''
@@ -8950,6 +9032,16 @@ class DailyPipelineStageService:
                 payload.get('ranking_dependency_status') or ''
             ).strip().lower()
             reason = str(payload.get('reason') or '').strip()
+            quality_only_piotroski_partial = bool(
+                expected_stage_id == 'piotroski_filter'
+                and is_nonblocking_quality_only_piotroski_partial(
+                    stage_result=payload,
+                    selected_symbols=selected_symbols,
+                    successful_symbols=successful_symbols,
+                    retry_debt_symbols=retry_symbols,
+                    terminal_not_applicable_symbols=terminal_symbols,
+                )
+            )
             return bool(
                 not (
                     status == 'partial'
@@ -8960,6 +9052,7 @@ class DailyPipelineStageService:
                 and not (
                     reason.startswith('piotroski_evidence_')
                     and not retry_symbols
+                    and not quality_only_piotroski_partial
                 )
                 and (
                     not ranking_status
@@ -9117,7 +9210,10 @@ class DailyPipelineStageService:
             if not progression_gate_allows(
                 persisted_result_summary,
                 status=outcome_status,
+                selected_symbols=normalized_invocation,
+                successful_symbols=successful,
                 retry_symbols=retry_debt,
+                terminal_symbols=terminal_not_applicable,
             ):
                 return None
             return {
@@ -9239,7 +9335,10 @@ class DailyPipelineStageService:
         if partition is None or not progression_gate_allows(
             result,
             status=outcome_status,
+            selected_symbols=selected,
+            successful_symbols=successful,
             retry_symbols=retry_debt,
+            terminal_symbols=terminal_not_applicable,
         ):
             return None
         return partition
