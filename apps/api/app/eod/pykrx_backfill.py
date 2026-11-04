@@ -62,6 +62,7 @@ from app.eod.run_stage_support import (
     is_canonical_same_day_signal_rearm_proof,
     is_exact_auto_pitr_intraday_watch_recovery_request,
     is_nonblocking_quality_only_piotroski_partial,
+    is_nonblocking_quality_only_signal_features_partial,
     is_recoverable_same_day_intraday_watch_expiration,
     outcome_contains_reason,
     pending_same_day_intraday_watch_rearm_marker,
@@ -2225,6 +2226,16 @@ def _followup_quality_only_partial_is_satisfied(
     terminal = _dedupe_symbol_codes(
         terminal_not_applicable_symbols
     )
+    if stage_id == 'signal_features':
+        if str(stage.get('status') or '').strip().lower() != 'partial':
+            return False
+        return is_nonblocking_quality_only_signal_features_partial(
+            stage_result=result_summary,
+            selected_symbols=selected,
+            successful_symbols=successful,
+            retry_debt_symbols=retry_debt,
+            terminal_not_applicable_symbols=terminal,
+        )
     if not (
         selected
         and selected == list(selected_symbols)

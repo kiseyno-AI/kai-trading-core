@@ -1294,6 +1294,7 @@ def _partial_outcome_is_satisfied(outcome: Mapping[str, Any]) -> bool:
         for value in (
             outcome.get('market_date'),
             result.get('market_date'),
+            _mapping(outcome.get('result_summary')).get('market_date'),
             result_summary.get('market_date'),
         )
         if str(value or '').strip()

@@ -2633,7 +2633,7 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             symbols=['222222'],
         )
 
-    async def test_daily_incremental_refresh_persists_stale_debt_failure_reason(self):
+    async def test_daily_incremental_refresh_admits_persisted_stale_symbols_without_provider_refresh(self):
         repository = FakeCaptureRepository()
         repository.symbol_states = {
             stock_code: {
@@ -2671,28 +2671,41 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 run_feedback_followup=False,
             )
 
-        failure_reason = (
-            'all_selected_symbols_stale_incremental_backfill_deferred'
-        )
-        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['symbols_failed'], 0)
-        self.assertEqual(result['failure_reason'], failure_reason)
-        self.assertEqual(result['retry_debt_count'], 2)
+        self.assertIsNone(result['failure_reason'])
+        self.assertEqual(result['successful_stock_codes'], ['000660', '005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertEqual(result['retry_debt_count'], 0)
+        self.assertEqual(result['symbols_fresh'], 0)
+        self.assertEqual(
+            result['maintenance_deferred_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(result['maintenance_deferred_count'], 2)
+        self.assertNotIn('scope_retry_debt', result['partial_reasons'])
         self.assertEqual(
             result['state_histogram'],
             {'stale_incremental_backfill_deferred': 2},
         )
         completed_run = repository.completed_refresh_runs[-1][1]
-        self.assertEqual(completed_run['status'], 'failed')
+        self.assertEqual(completed_run['status'], 'completed')
         self.assertEqual(completed_run['symbols_failed'], 0)
-        self.assertEqual(completed_run['error_message'], failure_reason)
-        self.assertEqual(
-            completed_run['run_metadata']['failure_reason'],
-            failure_reason,
-        )
+        self.assertIsNone(completed_run['error_message'])
+        self.assertIsNone(completed_run['run_metadata']['failure_reason'])
         self.assertEqual(
             completed_run['run_metadata']['retry_debt_count'],
-            2,
+            0,
+        )
+        self.assertEqual(
+            completed_run['run_metadata']['successful_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(
+            completed_run['run_metadata'][
+                'maintenance_deferred_stock_codes'
+            ],
+            ['000660', '005930'],
         )
         self.assertEqual(
             completed_run['run_metadata']['state_histogram'],

@@ -82,6 +82,7 @@ from app.eod.run_stage_support import (
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
     is_nonblocking_quality_only_piotroski_partial,
+    is_nonblocking_quality_only_signal_features_partial,
     is_exact_auto_pitr_intraday_watch_recovery_request,
     nonblocking_partial_progression_digest,
 )
@@ -9042,11 +9043,22 @@ class DailyPipelineStageService:
                     terminal_not_applicable_symbols=terminal_symbols,
                 )
             )
+            quality_only_signal_features_partial = bool(
+                expected_stage_id == 'signal_features'
+                and is_nonblocking_quality_only_signal_features_partial(
+                    stage_result=payload,
+                    selected_symbols=selected_symbols,
+                    successful_symbols=successful_symbols,
+                    retry_debt_symbols=retry_symbols,
+                    terminal_not_applicable_symbols=terminal_symbols,
+                )
+            )
             return bool(
                 not (
                     status == 'partial'
                     and not retry_symbols
                     and gate_status != 'ready'
+                    and not quality_only_signal_features_partial
                 )
                 and gate_status != 'blocked'
                 and not (
