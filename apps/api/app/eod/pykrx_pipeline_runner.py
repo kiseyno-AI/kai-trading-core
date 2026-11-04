@@ -38,6 +38,7 @@ from app.eod.run_stage_support import (
     build_expired_decision_replay_result,
     build_next_open_window_expired_result,
     extract_next_open_plan_stage_counts,
+    is_nonblocking_quality_only_piotroski_partial,
 )
 from app.eod.scope_outcomes import (
     EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
@@ -858,11 +859,24 @@ def _validated_successful_cohort(
             return None
         successful_symbols = list(partition['successful_stock_codes'])
         retry_debt_symbols = list(partition['retry_debt_stock_codes'])
+        quality_only_piotroski_partial = (
+            stage_id == 'piotroski_filter'
+            and is_nonblocking_quality_only_piotroski_partial(
+                stage_result=stage_result,
+                selected_symbols=partition['selected_stock_codes'],
+                successful_symbols=successful_symbols,
+                retry_debt_symbols=retry_debt_symbols,
+                terminal_not_applicable_symbols=partition[
+                    'terminal_not_applicable_stock_codes'
+                ],
+            )
+        )
         if not successful_symbols:
             return None
-        # A symbol-exhaustive debt partition may advance only its proven
-        # success subset. A partial result without symbol debt represents a
-        # shared/global quality failure and remains fail-closed.
+        # A symbol-exhaustive debt partition advances only its proven success
+        # subset. A partial result without symbol debt remains fail-closed
+        # except for the fully persisted, non-blocking Piotroski quality
+        # warning validated below.
         if (
             stage_status == 'partial'
             and not retry_debt_symbols
@@ -886,6 +900,7 @@ def _validated_successful_cohort(
                 'piotroski_evidence_'
             )
             and not retry_debt_symbols
+            and not quality_only_piotroski_partial
         ):
             return None
         return successful_symbols
@@ -928,6 +943,18 @@ def _validated_atomic_successful_cohort(
         return None
     successful_symbols = list(partition['successful_stock_codes'])
     retry_debt_symbols = list(partition['retry_debt_stock_codes'])
+    quality_only_piotroski_partial = (
+        stage_id == 'piotroski_filter'
+        and is_nonblocking_quality_only_piotroski_partial(
+            stage_result=stage_result,
+            selected_symbols=partition['selected_stock_codes'],
+            successful_symbols=successful_symbols,
+            retry_debt_symbols=retry_debt_symbols,
+            terminal_not_applicable_symbols=partition[
+                'terminal_not_applicable_stock_codes'
+            ],
+        )
+    )
     if not successful_symbols:
         return None
     stage_status = _resolve_result_status(
@@ -956,6 +983,7 @@ def _validated_atomic_successful_cohort(
             'piotroski_evidence_'
         )
         and not retry_debt_symbols
+        and not quality_only_piotroski_partial
     ):
         return None
     return successful_symbols

@@ -702,6 +702,61 @@ def test_piotroski_exact_partial_advances_only_proven_success_subset() -> None:
     ) == ['000001']
 
 
+def test_piotroski_quality_only_partial_advances_on_initial_execution() -> None:
+    symbols = [f'{index:06d}' for index in range(1, 118)]
+    quality_only = _exact_result(
+        selected=symbols,
+        successful=symbols,
+        retry_debt=[],
+        version='piotroski_scope_outcomes_v1',
+        status='partial',
+        stage_id='piotroski_filter',
+        publication_symbols=symbols,
+    )
+    quality_only.update(
+        {
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'ranking_dependency_status': 'complete',
+            'reason': 'piotroski_evidence_incomplete',
+            'quality_warning': 'piotroski_evidence_incomplete',
+            'full_signal_coverage_status': 'incomplete',
+            'full_signal_usable_count': len(symbols) - 2,
+            'full_signal_incomplete_count': 1,
+            'full_signal_unusable_count': 1,
+            'results_persisted': len(symbols),
+            'results_failed': 0,
+        }
+    )
+
+    assert _validated_successful_cohort(
+        stage_result=quality_only,
+        invocation_symbols=symbols,
+        stage_id='piotroski_filter',
+    ) == symbols
+    assert _validated_atomic_successful_cohort(
+        stage_result=quality_only,
+        invocation_symbols=symbols,
+        stage_id='piotroski_filter',
+        finalization_stage_id='piotroski_filter',
+        market_date='2026-10-30',
+        exact_publication_symbols=symbols,
+    ) == symbols
+    stage_scope = DailyPipelineStageService._exact_partial_success_scope(
+        outcome={'status': 'partial', 'result': quality_only},
+        invocation_symbols=symbols,
+        expected_stage_id='piotroski_filter',
+        expected_market_date='2026-10-30',
+        publication_symbols=symbols,
+    )
+    assert stage_scope is not None
+    assert stage_scope['manifest_version'] == 'piotroski_scope_outcomes_v1'
+    assert stage_scope['selected_stock_codes'] == symbols
+    assert stage_scope['successful_stock_codes'] == symbols
+    assert stage_scope['retry_debt_stock_codes'] == []
+    assert stage_scope['terminal_not_applicable_stock_codes'] == []
+
+
 def test_partial_piotroski_followup_keeps_full_membership_authority() -> None:
     authority = {'scope': 'frozen-market-membership'}
     result = _exact_result(

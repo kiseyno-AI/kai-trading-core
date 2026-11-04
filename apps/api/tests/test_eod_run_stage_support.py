@@ -657,6 +657,73 @@ class EODRunStageSupportTests(unittest.TestCase):
                         )
                     )
 
+    def test_previous_session_preopen_recovery_accepts_broad_canonical_suffix(
+        self,
+    ) -> None:
+        market = SimpleNamespace(
+            state='PREOPEN',
+            server_time='2026-09-14T08:00:00+09:00',
+        )
+        canonical_order = (
+            'market_risk_filter',
+            'signal_features',
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        )
+        request = {
+            'market_date': '2026-09-11',
+            'market': market,
+            'trigger': 'auto_eod_followup_resume',
+            'point_in_time_recovery': True,
+            'reused_eod_collection_run_id': 581,
+            'force': False,
+            'reuse_existing_feedback': False,
+            'resume_from_stage': 'market_risk_filter',
+            'resolved_stages': list(canonical_order),
+            'provider_admission_fence_owned': True,
+            'existing_pipeline_run_id': None,
+            'canonical_recovery_stage_order': canonical_order,
+        }
+
+        with patch(
+            'app.orders.next_open_execution.'
+            'normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            self.assertTrue(
+                admits_previous_session_preopen_auto_recovery(**request)
+            )
+            self.assertFalse(
+                admits_previous_session_preopen_auto_recovery(
+                    **{
+                        **request,
+                        'resolved_stages': [
+                            stage_id
+                            for stage_id in canonical_order
+                            if stage_id != 'signal_features'
+                        ],
+                    }
+                )
+            )
+            self.assertFalse(
+                admits_previous_session_preopen_auto_recovery(
+                    **{**request, 'reuse_existing_feedback': True}
+                )
+            )
+            self.assertFalse(
+                admits_previous_session_preopen_auto_recovery(
+                    **{
+                        **request,
+                        'market': SimpleNamespace(
+                            state='OPEN',
+                            server_time='2026-09-14T09:00:00+09:00',
+                        ),
+                    }
+                )
+            )
+
     def test_previous_session_preopen_recovery_expires_at_open(self):
         preopen = SimpleNamespace(
             state='PREOPEN',

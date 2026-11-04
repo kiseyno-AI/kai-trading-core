@@ -248,6 +248,10 @@ class PykrxAutomaticRetryPacingTests(TestCase):
                 return_value=0,
             ),
             patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=['005930', '000660'],
+            ),
+            patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.'
                 'run',
                 return_value={'status': 'completed', 'pipeline_run_id': 92},
@@ -291,6 +295,20 @@ class PykrxAutomaticRetryPacingTests(TestCase):
         self.assertEqual(recovery_call['symbols'], ['005930', '000660'])
         self.assertNotIn('price_collection', recovery_call['stages'])
         self.assertIn('next_open_execution_plan', recovery_call['stages'])
+        price_scope = recovery_call['recovery_price_scope_outcome']
+        self.assertEqual(price_scope['status'], 'partial')
+        self.assertEqual(
+            price_scope['selected_stock_codes'],
+            ['000660', '005930', '121850', '472220'],
+        )
+        self.assertEqual(
+            price_scope['successful_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(
+            price_scope['retry_debt_stock_codes'],
+            ['121850', '472220'],
+        )
         recovery_start_index = AUTO_DAILY_TRACKED_STAGE_ORDER.index(
             'pykrx_enrichment'
         )

@@ -2729,6 +2729,138 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             )
         )
 
+    def test_broad_previous_session_recovery_admits_contiguous_preopen_suffix(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        symbols = ['000660', '005930']
+        cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+        market = type(
+            'Market',
+            (),
+            {
+                'state': 'PREOPEN',
+                'server_time': '2026-04-15T08:00:00+09:00',
+            },
+        )()
+        feedback_boundary: dict[str, datetime | None] = {'value': None}
+        stages = [
+            'intraday_snapshots',
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+
+        def execute(stage_id, **stage_kwargs):
+            if stage_id == 'intraday_snapshots':
+                return {
+                    'triggered': False,
+                    'skipped': True,
+                    'safe_skip': True,
+                    'status': 'skipped',
+                    'reason': 'point_in_time_recovery_current_only_stage',
+                }
+            if stage_id == 'agent_feedback_summaries':
+                feedback_boundary['value'] = stage_kwargs[
+                    'feedback_knowledge_cutoff_at'
+                ]
+                return _completed_feedback_result(
+                    symbols=symbols,
+                    cutoff_at=feedback_boundary['value'],
+                )
+            if stage_id == 'signal_decider':
+                return _completed_decider_result(
+                    symbols=symbols,
+                    cutoff_at=feedback_boundary['value'],
+                    source_summary_run_id='summary-run',
+                )
+            if stage_id == 'next_open_execution_plan':
+                return _next_open_completion_result(
+                    parent_run_id='signal-decider-completed',
+                    completed_symbols=list(stage_kwargs['symbols']),
+                )
+            if stage_id == 'signal_decider_evaluations':
+                return _completed_evaluation_result(
+                    symbols=list(stage_kwargs['symbols'])
+                )
+            raise AssertionError(stage_id)
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 4, 15),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                side_effect=lambda **_kwargs: {
+                    'ready': True,
+                    'knowledge_cutoff_at': feedback_boundary['value'],
+                    'source_run_id': 'summary-run',
+                    'feedback_scope_mode': 'broad_feedback_universe',
+                    'requested_symbols': symbols,
+                    'completed_scope_proof': {
+                        'schema_version': (
+                            'completed_summarizer_intersection_v1'
+                        ),
+                        'completed_symbols': symbols,
+                        'admitted_symbols': symbols,
+                    },
+                },
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=stages,
+                symbols=symbols,
+                resume_from_stage='intraday_snapshots',
+                trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=73,
+                point_in_time_recovery=True,
+                reuse_existing_feedback=False,
+                provider_admission_fence_owned=True,
+            )
+
+        self.assertEqual(result['status'], 'completed', result)
+        self.assertTrue(
+            self.run_state_service.runs[-1]['run_metadata'][
+                'previous_session_preopen_recovery_admitted'
+            ]
+        )
+        self.assertEqual(
+            [call.args[0] for call in execute_stage.call_args_list],
+            stages,
+        )
+        self.assertTrue(
+            all(
+                call.kwargs['allow_previous_session_preopen_recovery']
+                is True
+                for call in execute_stage.call_args_list
+            )
+        )
+
     def test_decider_only_recovery_inherits_completed_summary_cutoff(self) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
         cutoff = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
@@ -4984,6 +5116,183 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(
             result['stages']['trending_ranks']['status'],
             'completed',
+        )
+
+    def test_historical_suffix_recovery_ranks_exact_price_success_subset(
+        self,
+    ) -> None:
+        exact_membership = ['005930', '000660', '035420']
+        successful_prices = ['005930', '000660']
+        failed_prices = ['035420']
+        recovery_parent_scope = _build_exact_scope_outcome(
+            manifest_version=(
+                'auto_eod_followup_admission_scope_outcomes_v1'
+            ),
+            selected_symbols=exact_membership,
+            successful_symbols=successful_prices,
+            retry_debt_symbols=failed_prices,
+        )
+        recovery_price_scope = {
+            'schema_version': 'recovery_price_scope_outcome_v1',
+            'stage_id': 'price_collection',
+            'eod_collection_run_id': 905,
+            'market_date': '2026-04-14',
+            'status': 'partial',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=exact_membership,
+                successful_symbols=successful_prices,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
+                selected_symbols=exact_membership,
+                successful_symbols=successful_prices,
+                retry_debt_symbols=failed_prices,
+            ),
+        }
+
+        def execute(stage_id, **kwargs):
+            self.assertEqual(stage_id, 'trending_ranks')
+            self.assertEqual(kwargs['symbols'], successful_prices)
+            self.assertEqual(
+                kwargs['exact_scope_symbols'],
+                successful_prices,
+            )
+            self.assertTrue(kwargs['complete_price_scope_proven'])
+            return {'status': 'completed'}
+
+        with (
+            patch.object(
+                service := DailyPipelineStageService(),
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['trending_ranks'],
+                symbols=successful_prices,
+                exact_membership_symbols=exact_membership,
+                markets=['KOSPI', 'KOSDAQ'],
+                reused_eod_collection_run_id=905,
+                point_in_time_recovery=True,
+                trigger='auto_eod_followup_resume',
+                recovery_parent_scope_outcome=recovery_parent_scope,
+                recovery_price_scope_outcome=recovery_price_scope,
+            )
+
+        execute_stage.assert_called_once()
+        self.assertEqual(
+            result['stages']['trending_ranks']['status'],
+            'completed',
+        )
+
+    def test_partial_price_recovery_narrows_real_rank_and_factor_writes(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        exact_membership = ['005930', '000660', '035420']
+        successful_prices = ['005930', '000660']
+        failed_prices = ['035420']
+        recovery_parent_scope = _build_exact_scope_outcome(
+            manifest_version=(
+                'auto_eod_followup_admission_scope_outcomes_v1'
+            ),
+            selected_symbols=exact_membership,
+            successful_symbols=successful_prices,
+            retry_debt_symbols=failed_prices,
+        )
+        recovery_price_scope = {
+            'schema_version': 'recovery_price_scope_outcome_v1',
+            'stage_id': 'price_collection',
+            'eod_collection_run_id': 905,
+            'market_date': '2026-04-14',
+            'status': 'partial',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='price_contexts',
+                exact_symbols=exact_membership,
+                successful_symbols=successful_prices,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='price_contexts_scope_outcomes_v1',
+                selected_symbols=exact_membership,
+                successful_symbols=successful_prices,
+                retry_debt_symbols=failed_prices,
+            ),
+        }
+        momentum_result = {
+            'status': 'completed',
+            'scope_finalization': _atomic_scope_finalization(
+                stage_id='momentum_factors',
+                exact_symbols=successful_prices,
+                successful_symbols=successful_prices,
+                market_date='2026-04-14',
+            ),
+            **_build_exact_scope_outcome(
+                manifest_version='factor_scope_outcomes_v1',
+                selected_symbols=successful_prices,
+                successful_symbols=successful_prices,
+                retry_debt_symbols=[],
+            ),
+        }
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'compute_and_persist_daily_trending_ranks',
+                return_value={
+                    'status': 'completed',
+                    'periods_persisted': 6,
+                    'periods_unavailable': 0,
+                },
+            ) as persist_trending,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_momentum_factor_service.rebuild_for_market_date',
+                return_value=momentum_result,
+            ) as rebuild_momentum,
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=['trending_ranks', 'momentum_factors'],
+                symbols=successful_prices,
+                exact_membership_symbols=exact_membership,
+                markets=['KOSPI', 'KOSDAQ'],
+                reused_eod_collection_run_id=905,
+                point_in_time_recovery=True,
+                trigger='auto_eod_followup_resume',
+                recovery_parent_scope_outcome=recovery_parent_scope,
+                recovery_price_scope_outcome=recovery_price_scope,
+            )
+
+        self.assertEqual(result['status'], 'completed', result)
+        self.assertEqual(
+            persist_trending.call_args.kwargs['symbols'],
+            successful_prices,
+        )
+        self.assertEqual(
+            rebuild_momentum.call_args.kwargs['symbols'],
+            successful_prices,
+        )
+        self.assertEqual(
+            rebuild_momentum.call_args.kwargs['exact_scope_symbols'],
+            successful_prices,
+        )
+        self.assertEqual(
+            rebuild_momentum.call_args.kwargs['ranking_symbols'],
+            successful_prices,
         )
 
     def test_historical_suffix_recovery_rejects_incomplete_price_scope(
