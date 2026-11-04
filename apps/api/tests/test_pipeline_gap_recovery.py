@@ -867,6 +867,67 @@ def _completed_stage_debt_prerequisites(
     return successful, proofs
 
 
+def test_stage_debt_ledger_accepts_strict_signal_quality_partial_proof() -> None:
+    successful, proofs = _completed_stage_debt_prerequisites(
+        'signal_features'
+    )
+    signal_result = _quality_only_signal_features_result(SYMBOLS)
+    successful['signal_features'] = list(SYMBOLS)
+    proofs['signal_features'] = [
+        _stored_stage_proof(
+            signal_result,
+            publication_symbols=SYMBOLS,
+        )
+    ]
+    state = {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': '2026-10-30',
+        'eod_collection_run_id': 77,
+        'pending_by_stage': {},
+        'successful_by_stage': successful,
+        'terminal_by_stage': {},
+        'proofs_by_stage': proofs,
+        'recovery_progress_count': 0,
+        'recovery_attempts_by_stage': {},
+        'applied_recovery_pipeline_run_ids': [],
+    }
+
+    assert _validated_followup_stage_debt_state(
+        state,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=SYMBOLS,
+        publication_symbols=SYMBOLS,
+        require_pending=False,
+    ) is not None
+
+    tampered_reason = deepcopy(state)
+    tampered_reason['proofs_by_stage']['signal_features'][0][
+        'reason'
+    ] = 'unknown_partial'
+    assert _validated_followup_stage_debt_state(
+        tampered_reason,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=SYMBOLS,
+        publication_symbols=SYMBOLS,
+        require_pending=False,
+    ) is None
+
+    failed_wrapper = deepcopy(state)
+    failed_wrapper['proofs_by_stage']['signal_features'][0][
+        'status'
+    ] = 'failed'
+    assert _validated_followup_stage_debt_state(
+        failed_wrapper,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=SYMBOLS,
+        publication_symbols=SYMBOLS,
+        require_pending=False,
+    ) is None
+
+
 def test_full_cohort_dart_refresh_is_explicitly_bound_to_frozen_symbols() -> None:
     callback = Mock()
 
