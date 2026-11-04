@@ -7467,6 +7467,13 @@ class PykrxBackfillService:
                     )
                     and resolved_stage_list
                     == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+                    and _validated_followup_stage_debt_terminal_progression_result(
+                        persisted_recovery_result,
+                        market_date=market_date,
+                        eod_collection_run_id=int(latest_eod_run['id']),
+                        cohort_symbols=unrecorded_suffix_symbols,
+                    )
+                    is not None
                 ):
                     suffix_reconciliation = (
                         self._persist_followup_stage_debt_terminal_progression(
