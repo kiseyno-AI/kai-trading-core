@@ -4580,6 +4580,156 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         self.assertIsNone(exhausted_plan)
 
+    def test_boundary_resume_is_not_cut_off_by_retry_cycle_budget(self):
+        service = AgentFeedbackRetryService()
+        role = 'eod-summarizer'
+        symbol = '005930'
+        snapshot = _snapshot(
+            symbols=(symbol,),
+            role_states={
+                role: _role_state(
+                    role=role,
+                    symbols=(symbol,),
+                    boundary_pending=(symbol,),
+                    retry_pending=(symbol,),
+                )
+            },
+        )
+
+        plan = service._resolve_cycle_plan(
+            snapshot=snapshot,
+            max_cycles=3,
+            previous_cycle_number=3,
+            previous_completed_cycles=3,
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.cycle_number, 4)
+        self.assertEqual(plan.completed_cycles, 3)
+        self.assertEqual(plan.mode, 'boundary_resume')
+
+    def test_boundary_resume_stops_when_a_cycle_makes_no_terminal_progress(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        role = 'eod-summarizer'
+        symbol = '005930'
+        symbols = (symbol,)
+        pending_snapshot = _snapshot(
+            symbols=symbols,
+            role_states={
+                role: _role_state(
+                    role=role,
+                    symbols=symbols,
+                    boundary_pending=symbols,
+                    retry_pending=symbols,
+                )
+            },
+        )
+        snapshot_calls = {'count': 0}
+
+        def unchanged_snapshot(**_kwargs):
+            snapshot_calls['count'] += 1
+            if snapshot_calls['count'] > 6:
+                raise AssertionError(
+                    'boundary resume repeated without terminal progress'
+                )
+            return pending_snapshot
+
+        dispatch_calls = []
+
+        def dispatch_for_symbols(**kwargs):
+            dispatch_calls.append(kwargs)
+            return {
+                'request': {
+                    'roles': kwargs['roles'],
+                    'symbols': kwargs['symbols'],
+                },
+                'summary': {
+                    'status': 'partial',
+                    'completed': 0,
+                    'failed': 0,
+                },
+            }
+
+        progress = {
+            'request': {'expected_agents': [role]},
+            'summary': {'cycle_status': 'partial'},
+        }
+        eligibility_records = [
+            {
+                'symbol': symbol,
+                'candidate_rank': 1,
+                'candidate_score': 100,
+                'hard_blocked': False,
+                'cap_excluded': False,
+                'forced_inclusion_reasons': [],
+            }
+        ]
+
+        with (
+            patch(
+                'app.agent_context.retry_service.'
+                'load_agent_feedback_eligibility_records',
+                return_value=eligibility_records,
+            ),
+            patch.object(
+                service,
+                '_build_role_sequence_snapshot',
+                side_effect=unchanged_snapshot,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_feedback_run_state_service',
+                run_state_service,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_feedback_orchestrator.dispatch_for_symbols',
+                side_effect=dispatch_for_symbols,
+            ),
+            patch(
+                'app.agent_context.retry_service.'
+                'agent_context_progress_service.get_feedback_progress',
+                return_value=progress,
+            ),
+        ):
+            result = service._run_retry_cycles_admitted(
+                config=SimpleNamespace(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=(role,),
+                    symbols=symbols,
+                    feedback_scope_mode='decider_scope_fast_path',
+                    max_cycles=1,
+                    outer_batch_size=20,
+                    reuse_existing=True,
+                    force_recompute=False,
+                    progress_callback=None,
+                ),
+                prerequisites=_feedback_prerequisites(),
+                preloaded_eligible_symbols=symbols,
+                effective_knowledge_cutoff_at=datetime(
+                    2026,
+                    4,
+                    16,
+                    6,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                knowledge_cutoff_source='market_close',
+            )
+
+        self.assertEqual(len(dispatch_calls), 1)
+        self.assertEqual(snapshot_calls['count'], 6)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['final_pending'], 1)
+        self.assertTrue(result['cycles'][0]['boundary_progress_stalled'])
+        self.assertEqual(
+            run_state_service.finished[0]['summary_payload'][
+                'progress_summary'
+            ]['completed_cycles'],
+            0,
+        )
+
     def test_retry_parent_failure_scope_rejects_ambiguous_evidence(self):
         service = AgentFeedbackRetryService()
         role = 'signal-decider'

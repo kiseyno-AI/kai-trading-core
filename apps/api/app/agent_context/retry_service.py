@@ -4546,7 +4546,17 @@ class AgentFeedbackRetryService:
                 previous_cycle_number or 1,
                 previous_completed_cycles + 1,
             )
-            if enforce_max_cycles and cycle_number > max_cycles:
+            summarizer_first_pass_incomplete = all(
+                role in SUMMARIZER_AGENT_NAMES
+                for role in boundary_pending_roles
+            )
+            # Retry budgets must not truncate unattempted summarizer fanout.
+            # A no-progress guard in the execution loop still bounds stalls.
+            if (
+                enforce_max_cycles
+                and cycle_number > max_cycles
+                and not summarizer_first_pass_incomplete
+            ):
                 return None
             current_role = boundary_pending_roles[0]
             current_index = snapshot.roles.index(current_role)
@@ -6296,6 +6306,12 @@ class AgentFeedbackRetryService:
         try:
             while active_plan is not None:
                 cycle_roles: list[dict[str, Any]] = []
+                cycle_snapshot_before = (
+                    initial_snapshot if not cycles else snapshot_after_cycle
+                )
+                cycle_start_terminal_items = self._collect_terminal_items(
+                    cycle_snapshot_before
+                )
                 cycle_state_before = runtime_feedback_state_store.get_run(
                     config.market_date,
                     run_id=request_run_id,
@@ -6308,7 +6324,7 @@ class AgentFeedbackRetryService:
                 )
                 cycle_start_pending = len(
                     self._collect_retry_pending_symbols(
-                        initial_snapshot if not cycles else snapshot_after_cycle,
+                        cycle_snapshot_before,
                         retry_attempted_symbols_by_role=retry_attempted_before,
                     )
                 )
@@ -6716,8 +6732,14 @@ class AgentFeedbackRetryService:
                     snapshot_after_cycle,
                     retry_attempted_symbols_by_role=retry_attempted_after,
                 )
+                boundary_progress_stalled = (
+                    active_plan.mode == 'boundary_resume'
+                    and bool(snapshot_after_cycle.boundary_pending_roles())
+                    and self._collect_terminal_items(snapshot_after_cycle)
+                    <= cycle_start_terminal_items
+                )
                 cycle_status = 'blocked' if blocked else ('completed' if not retry_pending_symbols else 'partial')
-                if not blocked:
+                if not blocked and not boundary_progress_stalled:
                     completed_cycles = active_plan.cycle_number
                 cycles.append(
                     {
@@ -6729,9 +6751,10 @@ class AgentFeedbackRetryService:
                         'completed_roles': list(cycle_state.completed_roles if cycle_state is not None else active_plan.completed_roles),
                         'remaining_roles': list(cycle_state.remaining_roles if cycle_state is not None else active_plan.remaining_roles),
                         'role_batches': cycle_roles,
+                        'boundary_progress_stalled': boundary_progress_stalled,
                     }
                 )
-                if blocked or not retry_pending_symbols:
+                if blocked or not retry_pending_symbols or boundary_progress_stalled:
                     initial_snapshot = snapshot_after_cycle
                     break
 
