@@ -32,6 +32,7 @@ from app.eod.pykrx_backfill import (
     AUTO_FOLLOWUP_RECOVERY_TRIGGER,
     FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
     PYKRX_STAGE_SEQUENCE,
+    TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
     PykrxBackfillService,
     PykrxSymbol,
     _build_recovery_price_scope_outcome,
@@ -81,6 +82,7 @@ from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_FOLLOWUP_STAGE_ORDER,
     AUTO_DAILY_TRACKED_STAGE_ORDER,
     DailyPipelineTrackingWriteError,
+    FACTOR_FOLLOWUP_STAGE_ORDER,
     HISTORICAL_BACKFILL_STAGE_ORDER,
     _OfficialDailyPipelineTracker,
     _bounded_failure_diagnostics,
@@ -1485,6 +1487,126 @@ def _stored_daily_universe_snapshot(
             markets=markets,
         ),
     }
+
+
+def _residual_debt_terminal_progression_fixture(
+    *,
+    factor_cohort: Sequence[str],
+    residual_symbol: str = '0010F0',
+    processed_factor_symbols: Sequence[str] = (),
+    market_date: str = '2026-04-03',
+) -> tuple[dict, dict, dict]:
+    parent_symbols = [*factor_cohort, residual_symbol]
+    stored_symbols = [
+        PykrxSymbol(symbol, 'KOSPI', symbol)
+        for symbol in parent_symbols
+    ]
+    stage_rows = {
+        stage_id: {'status': 'completed'}
+        for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+    }
+    stage_rows['signal_features'] = {'status': 'blocked'}
+    for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+        stage_rows[stage_id] = {'status': 'blocked'}
+    pipeline_run = {
+        'id': 607,
+        'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+        'status': 'partial',
+        'market_date': market_date,
+        'updated_at': '2026-04-03T16:00:00+00:00',
+        'completed_at': '2026-04-03T16:00:00+00:00',
+        'run_metadata': {
+            'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
+            'reused_eod_collection_run_id': 587,
+            'markets': ['KOSPI'],
+            'point_in_time_recovery': True,
+        },
+        'stages': stage_rows,
+    }
+    stage_debt = {
+        'schema_version': 'followup_stage_debt_v3',
+        'market_date': market_date,
+        'eod_collection_run_id': 587,
+        'pending_by_stage': {
+            'fundamentals_daily_refresh': [residual_symbol],
+            'signal_features': list(factor_cohort),
+        },
+        'successful_by_stage': {
+            'fundamentals_daily_refresh': list(factor_cohort),
+            'piotroski_filter': list(factor_cohort),
+            **{
+                stage_id: list(factor_cohort)
+                for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+            },
+        },
+        'terminal_by_stage': {},
+        'proofs_by_stage': {},
+        'recovery_progress_count': 0,
+        'recovery_attempts_by_stage': {},
+        'applied_recovery_pipeline_run_ids': [],
+    }
+    metadata = {
+        'markets': ['KOSPI'],
+        'requested_symbols': parent_symbols,
+        'failed_symbols': [],
+        'unattempted_symbols': [],
+        'followup_recovery_required': True,
+        'universe_snapshot': {
+            **_stored_daily_universe_snapshot(
+                stored_symbols,
+                market_date=market_date,
+            ),
+            'point_in_time': True,
+            'current_universe_mutated': False,
+        },
+        'followup_admission_scope_outcome': (
+            build_exact_symbol_scope_outcome(
+                manifest_version=(
+                    'auto_eod_followup_admission_scope_outcomes_v1'
+                ),
+                selected_symbols=parent_symbols,
+                successful_symbols=parent_symbols,
+                retry_debt_symbols=[],
+            )
+        ),
+    }
+    processed = list(processed_factor_symbols)
+    if processed:
+        metadata['followup_stage_debt_terminal_progression'] = {
+            'schema_version': (
+                'followup_stage_debt_terminal_progression_v1'
+            ),
+            'market_date': market_date,
+            'eod_collection_run_id': 587,
+            'processed_stock_codes': processed,
+            'processed_stock_code_count': len(processed),
+            'processed_membership_sha256': market_membership_sha256(
+                processed
+            ),
+            'batches': [
+                {
+                    'pipeline_run_id': 606,
+                    'cohort_basis': 'factor_intersection',
+                    'stock_codes': processed,
+                    'stock_code_count': len(processed),
+                    'membership_sha256': market_membership_sha256(
+                        processed
+                    ),
+                    'outcome_status': 'completed',
+                }
+            ],
+        }
+    latest_eod_run = {
+        'id': 587,
+        'trade_date': market_date,
+        'trigger': 'auto_close_scheduler',
+        'status': 'completed_with_errors',
+        'symbols_total': len(parent_symbols),
+        'symbols_succeeded': len(parent_symbols),
+        'symbols_failed': 0,
+        'run_metadata': metadata,
+    }
+    return pipeline_run, stage_debt, latest_eod_run
 
 
 class NextOpenExecutionPlanFollowupTests(TestCase):
@@ -8795,6 +8917,423 @@ class PykrxBackfillServiceTests(TestCase):
             result['followup_recovery']['blocker'],
             'piotroski_filter_stage_debt_manifest_invalid',
         )
+
+    def test_prior_date_residual_debt_runs_terminal_suffix_for_factor_cohort(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        market_date = '2026-04-03'
+        residual_symbol = '0010F0'
+        cohort = ['000660', '005930']
+        pipeline_run, stage_debt, latest_eod_run = (
+            _residual_debt_terminal_progression_fixture(
+                factor_cohort=cohort,
+                residual_symbol=residual_symbol,
+                market_date=market_date,
+            )
+        )
+        suffix_stages = {
+            stage_id: {'status': 'completed'}
+            for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+        }
+        suffix_pipeline_run = {
+            'id': 608,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'completed',
+            'market_date': market_date,
+            'run_metadata': {
+                'resolved_stages': list(
+                    TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                ),
+                'symbols': cohort,
+                'reused_eod_collection_run_id': 587,
+                'point_in_time_recovery': True,
+            },
+            'stages': suffix_stages,
+        }
+        suffix_result = {
+            'triggered': True,
+            'status': 'completed',
+            'market_date': market_date,
+            'pipeline_run_id': 608,
+            'pipeline_run': suffix_pipeline_run,
+            'resolved_stages': list(
+                TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            ),
+            'stages': suffix_stages,
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 4, 4),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': True,
+                    'state': stage_debt,
+                    'source': 'persisted_stage_debt',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_state',
+                return_value={'updated': True},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_dart_followup_recovery_scope',
+                return_value={'required': False, 'ready': False},
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value=suffix_result,
+            ) as run_suffix,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 608,
+                    'status': 'completed',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_terminal_progression',
+                create=True,
+                return_value={'updated': True},
+            ) as persist_progression,
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+            ) as clear_all_debt,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date=market_date,
+                latest_available_trade_date=market_date,
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        recovery_call = run_suffix.call_args.kwargs
+        self.assertEqual(
+            recovery_call['stages'],
+            list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES),
+        )
+        self.assertEqual(
+            recovery_call['resume_from_stage'],
+            'agent_feedback_summaries',
+        )
+        self.assertEqual(recovery_call['symbols'], cohort)
+        self.assertTrue(recovery_call['point_in_time_recovery'])
+        self.assertEqual(
+            stage_debt['pending_by_stage']['fundamentals_daily_refresh'],
+            [residual_symbol],
+        )
+        progression_call = persist_progression.call_args.kwargs
+        self.assertEqual(
+            progression_call['cohort_basis'],
+            'factor_intersection',
+        )
+        self.assertEqual(progression_call['cohort_symbols'], cohort)
+        self.assertEqual(
+            progression_call['recovery_result']['pipeline_run_id'],
+            608,
+        )
+        clear_all_debt.assert_not_called()
+
+    def test_residual_debt_terminal_progression_runs_only_new_factor_delta(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        market_date = '2026-04-03'
+        processed = ['000660']
+        delta = ['005930']
+        pipeline_run, stage_debt, latest_eod_run = (
+            _residual_debt_terminal_progression_fixture(
+                factor_cohort=[*processed, *delta],
+                processed_factor_symbols=processed,
+                market_date=market_date,
+            )
+        )
+        suffix_stages = {
+            stage_id: {'status': 'completed'}
+            for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+        }
+        suffix_pipeline_run = {
+            'id': 608,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'completed',
+            'market_date': market_date,
+            'run_metadata': {
+                'resolved_stages': list(
+                    TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                ),
+                'symbols': delta,
+                'reused_eod_collection_run_id': 587,
+                'point_in_time_recovery': True,
+            },
+            'stages': suffix_stages,
+        }
+        suffix_result = {
+            'triggered': True,
+            'status': 'completed',
+            'market_date': market_date,
+            'pipeline_run_id': 608,
+            'pipeline_run': suffix_pipeline_run,
+            'resolved_stages': list(
+                TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            ),
+            'stages': suffix_stages,
+        }
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 4, 4),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': True,
+                    'state': stage_debt,
+                    'source': 'persisted_stage_debt',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_state',
+                return_value={'updated': True},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_dart_followup_recovery_scope',
+                return_value={'required': False, 'ready': False},
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value=suffix_result,
+            ) as run_suffix,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={
+                    'updated': True,
+                    'pipeline_run_id': 608,
+                    'status': 'completed',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_terminal_progression',
+                create=True,
+                return_value={'updated': True},
+            ) as persist_progression,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date=market_date,
+                latest_available_trade_date=market_date,
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(run_suffix.call_args.kwargs['symbols'], delta)
+        progression_call = persist_progression.call_args.kwargs
+        self.assertEqual(progression_call['cohort_symbols'], delta)
+        self.assertEqual(
+            latest_eod_run['run_metadata'][
+                'followup_stage_debt_terminal_progression'
+            ]['processed_stock_codes'],
+            processed,
+        )
+
+    def test_invalid_residual_debt_progression_marker_fails_closed(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        market_date = '2026-04-03'
+        pipeline_run, stage_debt, latest_eod_run = (
+            _residual_debt_terminal_progression_fixture(
+                factor_cohort=['000660', '005930'],
+                processed_factor_symbols=['000660'],
+                market_date=market_date,
+            )
+        )
+        latest_eod_run['run_metadata'][
+            'followup_stage_debt_terminal_progression'
+        ]['processed_membership_sha256'] = '0' * 64
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 4, 4),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': True,
+                    'state': stage_debt,
+                    'source': 'persisted_stage_debt',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_state',
+                return_value={'updated': True},
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as run_suffix,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date=market_date,
+                latest_available_trade_date=market_date,
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(
+            result['reason'],
+            'followup_stage_debt_state_unavailable',
+        )
+        self.assertEqual(
+            result['followup_recovery']['blocker'],
+            'followup_stage_debt_terminal_marker_invalid',
+        )
+        run_suffix.assert_not_called()
+
+    def test_processed_terminal_marker_advances_residual_debt_without_replay(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        market_date = '2026-04-03'
+        residual_symbol = '0010F0'
+        factor_cohort = ['000660', '005930']
+        pipeline_run, stage_debt, latest_eod_run = (
+            _residual_debt_terminal_progression_fixture(
+                factor_cohort=factor_cohort,
+                residual_symbol=residual_symbol,
+                processed_factor_symbols=factor_cohort,
+                market_date=market_date,
+            )
+        )
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 4, 4),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=0,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_followup_stage_debt_state',
+                return_value={
+                    'required': True,
+                    'ready': True,
+                    'state': stage_debt,
+                    'source': 'persisted_stage_debt',
+                },
+            ),
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_state',
+                return_value={'updated': True},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                '_resolve_dart_followup_recovery_scope',
+                return_value={
+                    'required': True,
+                    'ready': True,
+                    'source': 'stage_debt',
+                    'symbols': [residual_symbol],
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 608,
+                },
+            ) as run_next_debt,
+            patch.object(
+                service,
+                '_persist_followup_stage_debt_terminal_progression',
+                create=True,
+            ) as persist_progression,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date=market_date,
+                latest_available_trade_date=market_date,
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        recovery_call = run_next_debt.call_args.kwargs
+        self.assertEqual(
+            recovery_call['stages'],
+            ['fundamentals_daily_refresh'],
+        )
+        self.assertEqual(
+            recovery_call['resume_from_stage'],
+            'fundamentals_daily_refresh',
+        )
+        self.assertEqual(recovery_call['symbols'], [residual_symbol])
+        persist_progression.assert_not_called()
 
     def test_partial_followup_recovery_keeps_downstream_scope_retryable(
         self,

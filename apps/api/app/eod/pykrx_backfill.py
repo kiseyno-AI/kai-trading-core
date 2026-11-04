@@ -181,6 +181,12 @@ FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY = '_validated_recovery_lineage'
 FOLLOWUP_STAGE_RECOVERY_LINEAGE_SCHEMA_VERSION = (
     'followup_recovery_lineage_v1'
 )
+FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_METADATA_KEY = (
+    'followup_stage_debt_terminal_progression'
+)
+FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_SCHEMA_VERSION = (
+    'followup_stage_debt_terminal_progression_v1'
+)
 FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER = (
     'fundamentals_daily_refresh',
     'piotroski_filter',
@@ -3254,6 +3260,39 @@ def _record_followup_stage_debt_attempt(
     }
 
 
+def _followup_stage_debt_recovery_proof_run_ids(
+    state: Mapping[str, Any],
+    *,
+    stage_id: str,
+) -> set[int]:
+    """Return lineage IDs backed by an accepted exact stage proof."""
+
+    raw_proofs = (state.get('proofs_by_stage') or {}).get(stage_id) or []
+    if not isinstance(raw_proofs, list):
+        return set()
+    proof_run_ids: set[int] = set()
+    for raw_proof in raw_proofs:
+        if not isinstance(raw_proof, Mapping):
+            continue
+        recovery_lineage = raw_proof.get(
+            FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+        )
+        if not isinstance(recovery_lineage, Mapping):
+            continue
+        pipeline_run_id = recovery_lineage.get('pipeline_run_id')
+        if (
+            recovery_lineage.get('schema_version')
+            == FOLLOWUP_STAGE_RECOVERY_LINEAGE_SCHEMA_VERSION
+            and str(recovery_lineage.get('stage_id') or '').strip()
+            == stage_id
+            and isinstance(pipeline_run_id, int)
+            and not isinstance(pipeline_run_id, bool)
+            and pipeline_run_id > 0
+        ):
+            proof_run_ids.add(pipeline_run_id)
+    return proof_run_ids
+
+
 def _followup_recovery_stage_attempt_finished(
     stage: object,
     *,
@@ -3297,6 +3336,7 @@ def _advance_followup_stage_debt_state(
     invocation_symbols: Sequence[str],
     stage_result: Mapping[str, Any],
     recovery_pipeline_run_id: int | None = None,
+    recovery_attempt_already_recorded: bool = False,
 ) -> dict[str, Any] | None:
     """Apply one exhaustive stage proof without touching sibling debt."""
 
@@ -3313,6 +3353,7 @@ def _advance_followup_stage_debt_state(
         expected_market_date=str(state.get('market_date') or ''),
         expected_publication_symbols=normalized_invocation,
         allowed_partition_symbols=normalized_invocation,
+        allow_quality_only_partial=True,
     )
     if validated is None:
         return None
@@ -3337,11 +3378,16 @@ def _advance_followup_stage_debt_state(
             isinstance(recovery_pipeline_run_id, bool)
             or not isinstance(recovery_pipeline_run_id, int)
             or recovery_pipeline_run_id <= 0
-            or recovery_pipeline_run_id in applied_run_ids
             or isinstance(recovery_eod_collection_run_id, bool)
             or not isinstance(recovery_eod_collection_run_id, int)
             or recovery_eod_collection_run_id <= 0
         ):
+            return None
+        proof_run_ids = _followup_stage_debt_recovery_proof_run_ids(
+            state,
+            stage_id=stage_id,
+        )
+        if recovery_pipeline_run_id in proof_run_ids:
             return None
         current_attempts = recovery_attempts.get(stage_id, 0)
         if (
@@ -3350,8 +3396,17 @@ def _advance_followup_stage_debt_state(
             or current_attempts < 0
         ):
             return None
-        recovery_attempts[stage_id] = current_attempts + 1
-        applied_run_ids.append(recovery_pipeline_run_id)
+        if recovery_attempt_already_recorded:
+            if (
+                recovery_pipeline_run_id not in applied_run_ids
+                or current_attempts <= 0
+            ):
+                return None
+        else:
+            if recovery_pipeline_run_id in applied_run_ids:
+                return None
+            recovery_attempts[stage_id] = current_attempts + 1
+            applied_run_ids.append(recovery_pipeline_run_id)
         proof[FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY] = {
             'schema_version': (
                 FOLLOWUP_STAGE_RECOVERY_LINEAGE_SCHEMA_VERSION
@@ -3498,6 +3553,242 @@ def _next_followup_stage_debt_request(
     return stage_id, symbols
 
 
+def _followup_stage_debt_terminal_cohort(
+    state: Mapping[str, Any],
+    *,
+    point_in_time_recovery: bool,
+    require_prior_attempts: bool = True,
+) -> tuple[str, list[str]] | None:
+    """Return the exact cohort safe to enter the terminal suffix.
+
+    Prior-date recovery must not recreate current-only KIS signal features.
+    It therefore uses the intersection that completed every stored-data
+    factor.  A current-date recovery requires the stricter published signal
+    feature success set.
+    """
+
+    successful = state.get('successful_by_stage')
+    pending = state.get('pending_by_stage')
+    attempts = state.get('recovery_attempts_by_stage')
+    if not isinstance(successful, Mapping) or not isinstance(pending, Mapping):
+        return None
+    attempts = attempts if isinstance(attempts, Mapping) else {}
+    attempted_stage_ids = (
+        ('piotroski_filter', *FACTOR_FOLLOWUP_STAGE_ORDER)
+        if point_in_time_recovery
+        else (
+            'piotroski_filter',
+            *FACTOR_FOLLOWUP_STAGE_ORDER,
+            'signal_features',
+        )
+    )
+    if require_prior_attempts:
+        for stage_id in attempted_stage_ids:
+            stage_pending = _dedupe_symbol_codes(pending.get(stage_id) or [])
+            raw_attempts = attempts.get(stage_id, 0)
+            attempt_count = (
+                raw_attempts
+                if isinstance(raw_attempts, int)
+                and not isinstance(raw_attempts, bool)
+                and raw_attempts >= 0
+                else 0
+            )
+            if stage_pending and attempt_count == 0:
+                return None
+
+    if point_in_time_recovery:
+        factor_sets: list[set[str]] = []
+        for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
+            stage_symbols = _dedupe_symbol_codes(
+                successful.get(stage_id) or []
+            )
+            if not stage_symbols:
+                return None
+            factor_sets.append(set(stage_symbols))
+        cohort = set.intersection(*factor_sets)
+        cohort_basis = 'factor_intersection'
+    else:
+        cohort = set(
+            _dedupe_symbol_codes(
+                successful.get('signal_features') or []
+            )
+        )
+        cohort_basis = 'signal_features'
+    if not cohort:
+        return None
+    return cohort_basis, sorted(cohort)
+
+
+def _validated_followup_stage_debt_terminal_progression_marker(
+    value: object,
+    *,
+    state: Mapping[str, Any],
+    market_date: str,
+    eod_collection_run_id: int,
+) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    if set(value) != {
+        'schema_version',
+        'market_date',
+        'eod_collection_run_id',
+        'processed_stock_codes',
+        'processed_stock_code_count',
+        'processed_membership_sha256',
+        'batches',
+    }:
+        return None
+    if not (
+        value.get('schema_version')
+        == FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_SCHEMA_VERSION
+        and str(value.get('market_date') or '').strip() == market_date
+        and value.get('eod_collection_run_id') == eod_collection_run_id
+    ):
+        return None
+    processed = value.get('processed_stock_codes')
+    batches = value.get('batches')
+    if not isinstance(processed, list) or not isinstance(batches, list):
+        return None
+    normalized_processed = sorted(_dedupe_symbol_codes(processed))
+    if (
+        not normalized_processed
+        or normalized_processed != processed
+        or value.get('processed_stock_code_count')
+        != len(normalized_processed)
+        or value.get('processed_membership_sha256')
+        != market_membership_sha256(normalized_processed)
+    ):
+        return None
+
+    batch_symbols_seen: set[str] = set()
+    pipeline_run_ids_seen: set[int] = set()
+    normalized_batches: list[dict[str, Any]] = []
+    for raw_batch in batches:
+        if not isinstance(raw_batch, Mapping) or set(raw_batch) != {
+            'pipeline_run_id',
+            'cohort_basis',
+            'stock_codes',
+            'stock_code_count',
+            'membership_sha256',
+            'outcome_status',
+        }:
+            return None
+        pipeline_run_id = raw_batch.get('pipeline_run_id')
+        cohort_basis = str(raw_batch.get('cohort_basis') or '').strip()
+        stock_codes = raw_batch.get('stock_codes')
+        outcome_status = str(
+            raw_batch.get('outcome_status') or ''
+        ).strip()
+        if (
+            isinstance(pipeline_run_id, bool)
+            or not isinstance(pipeline_run_id, int)
+            or pipeline_run_id <= 0
+            or pipeline_run_id in pipeline_run_ids_seen
+            or cohort_basis not in {'factor_intersection', 'signal_features'}
+            or outcome_status
+            not in {'completed', 'validated_nonblocking_partial'}
+            or not isinstance(stock_codes, list)
+        ):
+            return None
+        normalized_stock_codes = sorted(_dedupe_symbol_codes(stock_codes))
+        cohort = _followup_stage_debt_terminal_cohort(
+            state,
+            point_in_time_recovery=(
+                cohort_basis == 'factor_intersection'
+            ),
+            require_prior_attempts=False,
+        )
+        if (
+            not normalized_stock_codes
+            or normalized_stock_codes != stock_codes
+            or raw_batch.get('stock_code_count')
+            != len(normalized_stock_codes)
+            or raw_batch.get('membership_sha256')
+            != market_membership_sha256(normalized_stock_codes)
+            or cohort is None
+            or cohort[0] != cohort_basis
+            or not set(normalized_stock_codes).issubset(set(cohort[1]))
+            or batch_symbols_seen.intersection(normalized_stock_codes)
+        ):
+            return None
+        pipeline_run_ids_seen.add(pipeline_run_id)
+        batch_symbols_seen.update(normalized_stock_codes)
+        normalized_batches.append(dict(raw_batch))
+    if batch_symbols_seen != set(normalized_processed):
+        return None
+    return {
+        'schema_version': (
+            FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_SCHEMA_VERSION
+        ),
+        'market_date': market_date,
+        'eod_collection_run_id': eod_collection_run_id,
+        'processed_stock_codes': normalized_processed,
+        'processed_stock_code_count': len(normalized_processed),
+        'processed_membership_sha256': market_membership_sha256(
+            normalized_processed
+        ),
+        'batches': normalized_batches,
+    }
+
+
+def _validated_followup_stage_debt_terminal_progression_result(
+    result: object,
+    *,
+    market_date: str,
+    eod_collection_run_id: int,
+    cohort_symbols: Sequence[str],
+) -> dict[str, Any] | None:
+    if not isinstance(result, Mapping):
+        return None
+    pipeline_run_id = result.get('pipeline_run_id')
+    pipeline_run = result.get('pipeline_run')
+    resolved_stages = result.get('resolved_stages')
+    normalized_cohort = sorted(_dedupe_symbol_codes(cohort_symbols))
+    if (
+        not normalized_cohort
+        or isinstance(pipeline_run_id, bool)
+        or not isinstance(pipeline_run_id, int)
+        or pipeline_run_id <= 0
+        or not isinstance(pipeline_run, Mapping)
+        or pipeline_run.get('id') != pipeline_run_id
+        or str(result.get('market_date') or '').strip() != market_date
+        or resolved_stages != list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    ):
+        return None
+    run_metadata = pipeline_run.get('run_metadata')
+    if not isinstance(run_metadata, Mapping) or not (
+        pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and run_metadata.get('reused_eod_collection_run_id')
+        == eod_collection_run_id
+        and run_metadata.get('resolved_stages')
+        == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+        and sorted(
+            _dedupe_symbol_codes(run_metadata.get('symbols') or [])
+        )
+        == normalized_cohort
+    ):
+        return None
+    nonblocking_marker = validated_nonblocking_partial_progression_marker(
+        result,
+        expected_eod_collection_run_id=eod_collection_run_id,
+    )
+    if daily_pipeline_outcome_is_satisfied(result):
+        outcome_status = 'completed'
+    elif nonblocking_marker is not None:
+        outcome_status = 'validated_nonblocking_partial'
+    else:
+        return None
+    return {
+        'pipeline_run_id': pipeline_run_id,
+        'outcome_status': outcome_status,
+        **(
+            {'nonblocking_partial_progression': nonblocking_marker}
+            if nonblocking_marker is not None
+            else {}
+        ),
+    }
+
+
 def _resolve_followup_recovery_stages(
     *,
     recovery_scope: Sequence[str],
@@ -3566,23 +3857,42 @@ def _resolve_followup_stage_debt_state(
                 'ready': False,
                 'reason': 'followup_stage_debt_state_invalid',
             }
-        next_request = _next_followup_stage_debt_request(persisted_state)
         pipeline_metadata = (
             latest_pipeline_run.get('run_metadata')
             if isinstance(latest_pipeline_run, Mapping)
             else None
         )
+        linked_resolved_stages = (
+            pipeline_metadata.get('resolved_stages')
+            if isinstance(pipeline_metadata, Mapping)
+            else None
+        )
         linked_recovery_stage = (
-            next_request[0]
-            if next_request is not None
-            and isinstance(pipeline_metadata, Mapping)
+            str(linked_resolved_stages[0]).strip()
+            if isinstance(linked_resolved_stages, list)
+            and len(linked_resolved_stages) == 1
+            and str(linked_resolved_stages[0]).strip()
+            in FOLLOWUP_EXACT_RECOVERY_STAGE_ORDER
             and str(latest_pipeline_run.get('trigger') or '').strip()
             == AUTO_FOLLOWUP_RECOVERY_TRIGGER
             and pipeline_metadata.get('reused_eod_collection_run_id')
             == eod_collection_run_id
-            and pipeline_metadata.get('resolved_stages')
-            == [next_request[0]]
+            and _dedupe_symbol_codes(
+                (
+                    persisted_state.get('pending_by_stage') or {}
+                ).get(str(linked_resolved_stages[0]).strip()) or []
+            )
             else None
+        )
+        linked_recovery_symbols = (
+            _dedupe_symbol_codes(
+                (persisted_state.get('pending_by_stage') or {}).get(
+                    linked_recovery_stage
+                )
+                or []
+            )
+            if linked_recovery_stage is not None
+            else []
         )
         linked_recovery_run_id = (
             latest_pipeline_run.get('id')
@@ -3603,11 +3913,17 @@ def _resolve_followup_stage_debt_state(
             exact_evidence_present = _followup_exact_evidence_present(
                 candidate
             )
-            proof_already_applied = linked_recovery_run_id in set(
+            attempt_already_recorded = linked_recovery_run_id in set(
                 persisted_state.get(
                     'applied_recovery_pipeline_run_ids'
                 )
                 or []
+            )
+            proof_already_applied = linked_recovery_run_id in (
+                _followup_stage_debt_recovery_proof_run_ids(
+                    persisted_state,
+                    stage_id=linked_recovery_stage,
+                )
             )
             attempt_finished = _followup_recovery_stage_attempt_finished(
                 candidate,
@@ -3618,23 +3934,28 @@ def _resolve_followup_stage_debt_state(
                     stage_id=linked_recovery_stage,
                     stage=candidate,
                     expected_market_date=market_date,
-                    expected_publication_symbols=next_request[1],
-                    allowed_partition_symbols=next_request[1],
+                    expected_publication_symbols=linked_recovery_symbols,
+                    allowed_partition_symbols=linked_recovery_symbols,
+                    allow_quality_only_partial=True,
                 )
                 if validated is None:
                     advanced_state = (
                         _record_followup_stage_debt_attempt(
                             persisted_state,
                             stage_id=linked_recovery_stage,
-                            invocation_symbols=next_request[1],
+                            invocation_symbols=linked_recovery_symbols,
                             recovery_pipeline_run_id=(
                                 linked_recovery_run_id
                             ),
                         )
                         if attempt_finished
+                        and not attempt_already_recorded
                         else None
                     )
-                    if advanced_state is None:
+                    if (
+                        advanced_state is None
+                        and not attempt_already_recorded
+                    ):
                         return {
                             'required': True,
                             'ready': False,
@@ -3642,27 +3963,32 @@ def _resolve_followup_stage_debt_state(
                                 f'{linked_recovery_stage}_recovery_manifest_invalid'
                             ),
                         }
-                    reconciliation_error = (
-                        f'{linked_recovery_stage}_recovery_manifest_invalid'
-                    )
+                    if advanced_state is not None:
+                        reconciliation_error = (
+                            f'{linked_recovery_stage}_recovery_manifest_invalid'
+                        )
                 else:
                     partition, _proof = validated
                     if set(partition['selected_stock_codes']) != set(
-                        next_request[1]
+                        linked_recovery_symbols
                     ):
                         advanced_state = (
                             _record_followup_stage_debt_attempt(
                                 persisted_state,
                                 stage_id=linked_recovery_stage,
-                                invocation_symbols=next_request[1],
+                                invocation_symbols=linked_recovery_symbols,
                                 recovery_pipeline_run_id=(
                                     linked_recovery_run_id
                                 ),
                             )
                             if attempt_finished
+                            and not attempt_already_recorded
                             else None
                         )
-                        if advanced_state is None:
+                        if (
+                            advanced_state is None
+                            and not attempt_already_recorded
+                        ):
                             return {
                                 'required': True,
                                 'ready': False,
@@ -3670,20 +3996,24 @@ def _resolve_followup_stage_debt_state(
                                     f'{linked_recovery_stage}_recovery_scope_mismatch'
                                 ),
                             }
-                        reconciliation_error = (
-                            f'{linked_recovery_stage}_recovery_scope_mismatch'
-                        )
+                        if advanced_state is not None:
+                            reconciliation_error = (
+                                f'{linked_recovery_stage}_recovery_scope_mismatch'
+                            )
                     else:
                         advanced_state = _advance_followup_stage_debt_state(
                             persisted_state,
                             stage_id=linked_recovery_stage,
-                            invocation_symbols=next_request[1],
+                            invocation_symbols=linked_recovery_symbols,
                             stage_result=candidate,
                             recovery_pipeline_run_id=(
                                 linked_recovery_run_id
                             ),
+                            recovery_attempt_already_recorded=(
+                                attempt_already_recorded
+                            ),
                         )
-                if advanced_state is None:
+                if advanced_state is None and validated is not None:
                     return {
                         'required': True,
                         'ready': False,
@@ -3691,13 +4021,18 @@ def _resolve_followup_stage_debt_state(
                             f'{linked_recovery_stage}_recovery_transition_invalid'
                         ),
                     }
-                persisted_state = advanced_state
-                reconciled = True
-            elif not proof_already_applied and attempt_finished:
+                if advanced_state is not None:
+                    persisted_state = advanced_state
+                    reconciled = True
+            elif (
+                not proof_already_applied
+                and not attempt_already_recorded
+                and attempt_finished
+            ):
                 advanced_state = _record_followup_stage_debt_attempt(
                     persisted_state,
                     stage_id=linked_recovery_stage,
-                    invocation_symbols=next_request[1],
+                    invocation_symbols=linked_recovery_symbols,
                     recovery_pipeline_run_id=linked_recovery_run_id,
                 )
                 if advanced_state is None:
@@ -7054,6 +7389,184 @@ class PykrxBackfillService:
             if stage_debt_state is not None
             else None
         )
+        stage_debt_terminal_progression = False
+        stage_debt_terminal_progression_basis: str | None = None
+        stage_debt_terminal_progression_symbols: list[str] = []
+        deferred_stage_debt_request = stage_debt_request
+        if stage_debt_state is not None:
+            raw_terminal_marker = latest_eod_metadata.get(
+                FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_METADATA_KEY
+            )
+            validated_terminal_marker = None
+            if raw_terminal_marker is not None:
+                validated_terminal_marker = (
+                    _validated_followup_stage_debt_terminal_progression_marker(
+                        raw_terminal_marker,
+                        state=stage_debt_state,
+                        market_date=market_date,
+                        eod_collection_run_id=int(latest_eod_run['id']),
+                    )
+                )
+                if validated_terminal_marker is None:
+                    result = build_daily_skip_result(
+                        reason='followup_stage_debt_state_unavailable',
+                        market_date=market_date,
+                        latest_available_trade_date=(
+                            latest_available_trade_date
+                        ),
+                        existing_run=latest_eod_run,
+                    )
+                    result['followup_recovery'] = {
+                        'status': 'state_unavailable',
+                        'retry_scheduled': False,
+                        'blocker': (
+                            'followup_stage_debt_terminal_marker_invalid'
+                        ),
+                        'stage_debt_preserved': True,
+                    }
+                    return result
+            terminal_point_in_time_recovery = bool(
+                date.fromisoformat(market_date)
+                < current_krx_calendar_date
+            )
+            terminal_cohort = _followup_stage_debt_terminal_cohort(
+                stage_debt_state,
+                point_in_time_recovery=(
+                    terminal_point_in_time_recovery
+                ),
+                # Exact per-stage success is sufficient authority for this
+                # cohort. Newly admitted retry debt must not hold already
+                # proven symbols behind an unrelated first-attempt gate.
+                require_prior_attempts=False,
+            )
+            processed_terminal_symbols = set(
+                (
+                    validated_terminal_marker.get(
+                        'processed_stock_codes'
+                    )
+                    if validated_terminal_marker is not None
+                    else []
+                )
+                or []
+            )
+            if terminal_cohort is not None:
+                cohort_basis, cohort_symbols = terminal_cohort
+                latest_suffix_symbols = sorted(
+                    _dedupe_symbol_codes(
+                        run_metadata.get('symbols') or []
+                    )
+                )
+                unrecorded_suffix_symbols = sorted(
+                    set(latest_suffix_symbols)
+                    - processed_terminal_symbols
+                )
+                if (
+                    unrecorded_suffix_symbols
+                    and set(unrecorded_suffix_symbols).issubset(
+                        set(cohort_symbols)
+                    )
+                    and resolved_stage_list
+                    == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+                ):
+                    suffix_reconciliation = (
+                        self._persist_followup_stage_debt_terminal_progression(
+                            latest_eod_run=latest_eod_run,
+                            state=stage_debt_state,
+                            cohort_basis=cohort_basis,
+                            cohort_symbols=unrecorded_suffix_symbols,
+                            recovery_result=persisted_recovery_result,
+                        )
+                    )
+                    if suffix_reconciliation.get('updated'):
+                        validated_terminal_marker = (
+                            suffix_reconciliation.get('marker')
+                        )
+                        processed_terminal_symbols = set(
+                            (
+                                validated_terminal_marker.get(
+                                    'processed_stock_codes'
+                                )
+                                if isinstance(
+                                    validated_terminal_marker, Mapping
+                                )
+                                else []
+                            )
+                            or []
+                        )
+                        persisted_metadata = latest_eod_run.get(
+                            'run_metadata'
+                        )
+                        if isinstance(persisted_metadata, Mapping):
+                            latest_eod_metadata = dict(
+                                persisted_metadata
+                            )
+                    elif suffix_reconciliation.get('reason') not in {
+                        'followup_stage_debt_terminal_already_persisted',
+                    }:
+                        result = build_daily_skip_result(
+                            reason='followup_stage_debt_state_unavailable',
+                            market_date=market_date,
+                            latest_available_trade_date=(
+                                latest_available_trade_date
+                            ),
+                            existing_run=latest_eod_run,
+                        )
+                        result['followup_recovery'] = {
+                            'status': 'state_unavailable',
+                            'retry_scheduled': False,
+                            'blocker': suffix_reconciliation.get(
+                                'reason'
+                            ),
+                            'stage_debt_preserved': True,
+                        }
+                        return result
+                unprocessed_terminal_symbols = sorted(
+                    set(cohort_symbols) - processed_terminal_symbols
+                )
+                if unprocessed_terminal_symbols:
+                    stage_debt_terminal_progression = True
+                    stage_debt_terminal_progression_basis = cohort_basis
+                    stage_debt_terminal_progression_symbols = (
+                        unprocessed_terminal_symbols
+                    )
+                    stage_debt_request = None
+                    point_in_time_recovery = (
+                        terminal_point_in_time_recovery
+                    )
+                    point_in_time_membership_symbols = (
+                        _validated_followup_admitted_symbols(
+                            latest_eod_metadata
+                        )
+                    )
+                    if not point_in_time_membership_symbols:
+                        result = build_daily_skip_result(
+                            reason='followup_stage_debt_scope_unavailable',
+                            market_date=market_date,
+                            latest_available_trade_date=(
+                                latest_available_trade_date
+                            ),
+                            existing_run=latest_eod_run,
+                        )
+                        result['followup_recovery'] = {
+                            'status': 'blocked',
+                            'retry_scheduled': False,
+                            'resume_from_stage': (
+                                TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+                            ),
+                            'blocker': (
+                                'frozen_stage_membership_unavailable'
+                            ),
+                            'stage_debt_preserved': True,
+                        }
+                        return result
+                    for terminal_stage_id in (
+                        TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                    ):
+                        if terminal_stage_id not in recovery_scope:
+                            recovery_scope.append(terminal_stage_id)
+                    incomplete_stages = list(
+                        TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                    )
         stage_debt_scope_outcome: dict[str, Any] | None = None
         if stage_debt_request is not None:
             debt_stage_id, debt_symbols = stage_debt_request
@@ -7802,6 +8315,7 @@ class PykrxBackfillService:
             recovery_attempts
             >= MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_TRADE_DATE
             and repair_checkpoint is None
+            and not stage_debt_terminal_progression
             and not terminal_continuation_in_place
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
@@ -7900,7 +8414,8 @@ class PykrxBackfillService:
                 return result
 
         current_price_scope_preflight_required = bool(
-            not terminal_continuation_in_place
+            not stage_debt_terminal_progression
+            and not terminal_continuation_in_place
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
             and not same_day_post_signal_continuation_in_place
@@ -7956,7 +8471,8 @@ class PykrxBackfillService:
                 )
 
         if (
-            not terminal_continuation_in_place
+            not stage_debt_terminal_progression
+            and not terminal_continuation_in_place
             and not cutoff_contract_repair
             and not cutoff_contract_repair_resume
             and not same_day_post_signal_continuation_in_place
@@ -8002,7 +8518,10 @@ class PykrxBackfillService:
         # Imported lazily because the stage orchestrator depends on this service.
         from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 
-        if terminal_continuation_in_place:
+        if stage_debt_terminal_progression:
+            resume_from_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            recovery_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+        elif terminal_continuation_in_place:
             resume_from_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
             recovery_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
             persisted_markets = run_metadata.get('markets')
@@ -8318,7 +8837,11 @@ class PykrxBackfillService:
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in incomplete_stages
         )
-        if stage_debt_request is not None:
+        if stage_debt_terminal_progression:
+            recovery_symbols = list(
+                stage_debt_terminal_progression_symbols
+            )
+        elif stage_debt_request is not None:
             recovery_symbols = list(stage_debt_request[1])
         elif terminal_continuation_in_place:
             recovery_symbols = _dedupe_symbol_codes(
@@ -8575,8 +9098,12 @@ class PykrxBackfillService:
                         stage_debt_convergence.get('reason')
                         or 'followup_stage_debt_persist_failed'
                     )
-        elif recovery_symbols and daily_pipeline_outcome_is_satisfied(
-            recovery_result
+        elif (
+            not stage_debt_terminal_progression
+            and recovery_symbols
+            and daily_pipeline_outcome_is_satisfied(
+                recovery_result
+            )
         ):
             recovery_result[
                 '_proven_resolved_downstream_symbols'
@@ -8683,6 +9210,25 @@ class PykrxBackfillService:
                     ),
                 }
             )
+        elif stage_debt_terminal_progression:
+            convergence = (
+                self._persist_followup_stage_debt_terminal_progression(
+                    latest_eod_run=latest_eod_run,
+                    state=stage_debt_state or {},
+                    cohort_basis=(
+                        stage_debt_terminal_progression_basis or ''
+                    ),
+                    cohort_symbols=(
+                        stage_debt_terminal_progression_symbols
+                    ),
+                    recovery_result=recovery_result,
+                )
+                if pipeline_parent_finalized
+                else {
+                    'updated': False,
+                    'reason': 'recovery_parent_not_finalized',
+                }
+            )
         elif pipeline_parent_finalized:
             convergence = self._persist_successful_followup_recovery(
                 latest_eod_run=latest_eod_run,
@@ -8702,9 +9248,13 @@ class PykrxBackfillService:
         recovery_result.setdefault(
             'reason',
             (
-                'terminal_followup_continuation_resumed'
-                if terminal_continuation_in_place
-                else 'incomplete_followups_resumed'
+                'stage_debt_success_cohort_resumed'
+                if stage_debt_terminal_progression
+                else (
+                    'terminal_followup_continuation_resumed'
+                    if terminal_continuation_in_place
+                    else 'incomplete_followups_resumed'
+                )
             ),
         )
         recovery_result.setdefault('market_date', market_date)
@@ -8713,7 +9263,8 @@ class PykrxBackfillService:
         recovery_result['followup_recovery'] = {
             'attempt': (
                 recovery_attempts
-                if terminal_continuation_in_place
+                if stage_debt_terminal_progression
+                or terminal_continuation_in_place
                 or cutoff_contract_repair_resume
                 or same_day_post_signal_continuation_in_place
                 else recovery_attempts + 1
@@ -8776,6 +9327,22 @@ class PykrxBackfillService:
                 recovery_result['followup_recovery'][
                     'stage_debt_transition_error'
                 ] = stage_debt_transition_error
+        if stage_debt_terminal_progression:
+            recovery_result['followup_recovery'].update(
+                {
+                    'stage_debt_success_cohort_progression': True,
+                    'stage_debt_preserved': True,
+                    'cohort_basis': (
+                        stage_debt_terminal_progression_basis
+                    ),
+                    'cohort_symbol_count': len(
+                        stage_debt_terminal_progression_symbols
+                    ),
+                    'deferred_stage_debt_request': (
+                        deferred_stage_debt_request
+                    ),
+                }
+            )
         if provider_outage_rearm_due:
             recovery_result['followup_recovery'].update(
                 {
@@ -9077,6 +9644,216 @@ class PykrxBackfillService:
             'next_request': _next_followup_stage_debt_request(
                 validated_state
             ),
+        }
+
+    def _persist_followup_stage_debt_terminal_progression(
+        self,
+        *,
+        latest_eod_run: Mapping[str, Any],
+        state: Mapping[str, Any],
+        cohort_basis: str,
+        cohort_symbols: Sequence[str],
+        recovery_result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Checkpoint a proven terminal suffix without clearing root debt."""
+
+        metadata = (
+            dict(latest_eod_run.get('run_metadata') or {})
+            if isinstance(latest_eod_run.get('run_metadata'), Mapping)
+            else {}
+        )
+        admission_partition = _validated_followup_admission_partition(
+            metadata
+        )
+        parent_symbols = (
+            list(admission_partition['successful_stock_codes'])
+            if admission_partition is not None
+            else []
+        )
+        publication_symbols = (
+            list(admission_partition['selected_stock_codes'])
+            if admission_partition is not None
+            else []
+        )
+        eod_collection_run_id = latest_eod_run.get('id')
+        market_date = str(latest_eod_run.get('trade_date') or '')
+        if (
+            not parent_symbols
+            or isinstance(eod_collection_run_id, bool)
+            or not isinstance(eod_collection_run_id, int)
+            or eod_collection_run_id <= 0
+        ):
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_parent_scope_unavailable',
+            }
+        validated_state = _validated_followup_stage_debt_state(
+            state,
+            market_date=market_date,
+            eod_collection_run_id=eod_collection_run_id,
+            parent_symbols=parent_symbols,
+            publication_symbols=publication_symbols,
+            require_pending=False,
+        )
+        expected_cohort = _followup_stage_debt_terminal_cohort(
+            validated_state or {},
+            point_in_time_recovery=(
+                cohort_basis == 'factor_intersection'
+            ),
+            require_prior_attempts=False,
+        )
+        normalized_cohort = sorted(_dedupe_symbol_codes(cohort_symbols))
+        if (
+            validated_state is None
+            or expected_cohort is None
+            or expected_cohort[0] != cohort_basis
+            or not normalized_cohort
+            or not set(normalized_cohort).issubset(set(expected_cohort[1]))
+        ):
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_terminal_cohort_invalid',
+            }
+        proof = _validated_followup_stage_debt_terminal_progression_result(
+            recovery_result,
+            market_date=market_date,
+            eod_collection_run_id=eod_collection_run_id,
+            cohort_symbols=normalized_cohort,
+        )
+        if proof is None:
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_terminal_result_invalid',
+            }
+
+        raw_marker = metadata.get(
+            FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_METADATA_KEY
+        )
+        if raw_marker is None:
+            existing_marker = None
+            processed_symbols: list[str] = []
+            batches: list[dict[str, Any]] = []
+        else:
+            existing_marker = (
+                _validated_followup_stage_debt_terminal_progression_marker(
+                    raw_marker,
+                    state=validated_state,
+                    market_date=market_date,
+                    eod_collection_run_id=eod_collection_run_id,
+                )
+            )
+            if existing_marker is None:
+                return {
+                    'updated': False,
+                    'reason': (
+                        'followup_stage_debt_terminal_marker_invalid'
+                    ),
+                }
+            processed_symbols = list(
+                existing_marker['processed_stock_codes']
+            )
+            batches = list(existing_marker['batches'])
+        if proof['pipeline_run_id'] in {
+            batch['pipeline_run_id'] for batch in batches
+        }:
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_terminal_already_persisted',
+                'marker': existing_marker,
+            }
+        if set(processed_symbols).intersection(normalized_cohort):
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_terminal_scope_overlap',
+            }
+
+        batches.append(
+            {
+                'pipeline_run_id': proof['pipeline_run_id'],
+                'cohort_basis': cohort_basis,
+                'stock_codes': normalized_cohort,
+                'stock_code_count': len(normalized_cohort),
+                'membership_sha256': market_membership_sha256(
+                    normalized_cohort
+                ),
+                'outcome_status': proof['outcome_status'],
+            }
+        )
+        processed_symbols = sorted(
+            set(processed_symbols).union(normalized_cohort)
+        )
+        marker = {
+            'schema_version': (
+                FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_SCHEMA_VERSION
+            ),
+            'market_date': market_date,
+            'eod_collection_run_id': eod_collection_run_id,
+            'processed_stock_codes': processed_symbols,
+            'processed_stock_code_count': len(processed_symbols),
+            'processed_membership_sha256': market_membership_sha256(
+                processed_symbols
+            ),
+            'batches': batches,
+        }
+        validated_marker = (
+            _validated_followup_stage_debt_terminal_progression_marker(
+                marker,
+                state=validated_state,
+                market_date=market_date,
+                eod_collection_run_id=eod_collection_run_id,
+            )
+        )
+        if validated_marker is None:
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_terminal_marker_invalid',
+            }
+        metadata[
+            FOLLOWUP_STAGE_DEBT_TERMINAL_PROGRESSION_METADATA_KEY
+        ] = validated_marker
+        nonblocking_marker = proof.get('nonblocking_partial_progression')
+        if isinstance(nonblocking_marker, Mapping):
+            metadata['nonblocking_partial_progression'] = dict(
+                nonblocking_marker
+            )
+            retry_debt = nonblocking_marker.get('retry_debt')
+            if isinstance(retry_debt, Mapping):
+                metadata['nonblocking_feedback_retry_debt'] = dict(
+                    retry_debt
+                )
+        metadata['followup_recovery_required'] = bool(
+            _next_followup_stage_debt_request(validated_state)
+            or metadata.get('nonblocking_feedback_retry_debt')
+        )
+        try:
+            update_eod_collection_run_progress(
+                eod_collection_run_id,
+                symbols_succeeded=max(
+                    int(latest_eod_run.get('symbols_succeeded') or 0),
+                    0,
+                ),
+                symbols_failed=max(
+                    int(latest_eod_run.get('symbols_failed') or 0),
+                    0,
+                ),
+                run_metadata=metadata,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception(
+                'Unable to persist stage-debt terminal progression for EOD %s',
+                eod_collection_run_id,
+            )
+            return {
+                'updated': False,
+                'reason': 'followup_stage_debt_terminal_persist_failed',
+                'error_type': type(exc).__name__,
+            }
+        if isinstance(latest_eod_run, dict):
+            latest_eod_run['run_metadata'] = metadata
+        return {
+            'updated': True,
+            'reason': 'followup_stage_debt_terminal_progression_persisted',
+            'marker': validated_marker,
         }
 
     def _persist_successful_followup_recovery(

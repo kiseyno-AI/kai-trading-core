@@ -21,6 +21,7 @@ from app.eod.pykrx_backfill import (
     _count_nonconsuming_stage_debt_progress_runs,
     _followup_exact_result_authority,
     _followup_recovery_stage_attempt_finished,
+    _followup_stage_debt_terminal_cohort,
     _next_followup_stage_debt_request,
     _recovered_followup_admission_scope_outcome,
     _record_followup_stage_debt_attempt,
@@ -865,6 +866,436 @@ def _completed_stage_debt_prerequisites(
             )
         ]
     return successful, proofs
+
+
+def _piotroski_attempt_only_stage_debt_state(
+    *,
+    pipeline_run_id: int = 607,
+) -> dict:
+    successful, proofs = _completed_stage_debt_prerequisites(
+        'piotroski_filter'
+    )
+    state = {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': '2026-10-30',
+        'eod_collection_run_id': 77,
+        'pending_by_stage': {'piotroski_filter': list(SYMBOLS)},
+        'successful_by_stage': successful,
+        'terminal_by_stage': {},
+        'proofs_by_stage': proofs,
+        'recovery_progress_count': 0,
+        'recovery_attempts_by_stage': {},
+        'applied_recovery_pipeline_run_ids': [],
+    }
+    recorded = _record_followup_stage_debt_attempt(
+        state,
+        stage_id='piotroski_filter',
+        invocation_symbols=SYMBOLS,
+        recovery_pipeline_run_id=pipeline_run_id,
+    )
+    assert recorded is not None
+    return recorded
+
+
+def _resolve_piotroski_recovery(
+    state: dict,
+    *,
+    stage: dict | None = None,
+    pipeline_run_id: int = 607,
+    eod_collection_run_id: int = 77,
+) -> dict:
+    return _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata={
+            'followup_admission_scope_outcome': (
+                _parent_admission_outcome()
+            ),
+            'followup_stage_debt': state,
+        },
+        stage_rows={
+            'piotroski_filter': (
+                stage or _compact_quality_only_piotroski_stage(SYMBOLS)
+            )
+        },
+        incomplete_stages=['piotroski_filter'],
+        latest_pipeline_run={
+            'id': pipeline_run_id,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'run_metadata': {
+                'reused_eod_collection_run_id': eod_collection_run_id,
+                'resolved_stages': ['piotroski_filter'],
+            },
+        },
+    )
+
+
+def test_quality_only_piotroski_recovery_advances_stage_debt() -> None:
+    successful, proofs = _completed_stage_debt_prerequisites(
+        'piotroski_filter'
+    )
+    state = {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': '2026-10-30',
+        'eod_collection_run_id': 77,
+        'pending_by_stage': {'piotroski_filter': list(SYMBOLS)},
+        'successful_by_stage': successful,
+        'terminal_by_stage': {},
+        'proofs_by_stage': proofs,
+        'recovery_progress_count': 0,
+        'recovery_attempts_by_stage': {},
+        'applied_recovery_pipeline_run_ids': [],
+    }
+
+    advanced = _advance_followup_stage_debt_state(
+        state,
+        stage_id='piotroski_filter',
+        invocation_symbols=SYMBOLS,
+        stage_result=_compact_quality_only_piotroski_stage(SYMBOLS),
+        recovery_pipeline_run_id=607,
+    )
+
+    assert advanced is not None
+    assert advanced['successful_by_stage']['piotroski_filter'] == SYMBOLS
+    assert 'piotroski_filter' not in advanced['pending_by_stage']
+    assert advanced['recovery_attempts_by_stage'] == {
+        'piotroski_filter': 1
+    }
+    assert advanced['applied_recovery_pipeline_run_ids'] == [607]
+    assert advanced['recovery_progress_count'] == 1
+    assert _validated_followup_stage_debt_state(
+        advanced,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=SYMBOLS,
+        publication_symbols=SYMBOLS,
+    ) is not None
+
+
+def test_attempt_only_quality_partial_is_promoted_without_double_count() -> None:
+    attempt_only = _piotroski_attempt_only_stage_debt_state()
+
+    first = _resolve_piotroski_recovery(attempt_only)
+
+    assert first['ready'] is True
+    assert first['source'] == 'persisted_stage_debt_reconciled'
+    promoted = first['state']
+    assert promoted['successful_by_stage']['piotroski_filter'] == SYMBOLS
+    assert promoted['recovery_attempts_by_stage'] == {
+        'piotroski_filter': 1
+    }
+    assert promoted['applied_recovery_pipeline_run_ids'] == [607]
+    assert promoted['recovery_progress_count'] == 1
+    proof = promoted['proofs_by_stage']['piotroski_filter'][0]
+    assert proof[FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY][
+        'pipeline_run_id'
+    ] == 607
+
+    second = _resolve_piotroski_recovery(promoted)
+
+    assert second['ready'] is True
+    assert second['source'] == 'persisted_stage_debt'
+    assert second['state'] == promoted
+
+
+def test_attempt_only_quality_partial_reconciles_behind_earlier_debt() -> None:
+    residual_symbol = SYMBOLS[0]
+    piotroski_symbols = SYMBOLS[1:]
+    fundamentals_result = _exact_result(
+        selected=SYMBOLS,
+        successful=piotroski_symbols,
+        retry_debt=[residual_symbol],
+        version='dart_fundamentals_scope_outcomes_v1',
+        status='partial',
+        stage_id='fundamentals_daily_refresh',
+        publication_symbols=SYMBOLS,
+    )
+    state = {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': '2026-10-30',
+        'eod_collection_run_id': 77,
+        'pending_by_stage': {
+            'fundamentals_daily_refresh': [residual_symbol],
+            'piotroski_filter': list(piotroski_symbols),
+        },
+        'successful_by_stage': {
+            'fundamentals_daily_refresh': list(piotroski_symbols),
+        },
+        'terminal_by_stage': {},
+        'proofs_by_stage': {
+            'fundamentals_daily_refresh': [
+                _stored_stage_proof(
+                    fundamentals_result,
+                    publication_symbols=SYMBOLS,
+                )
+            ]
+        },
+        'recovery_progress_count': 0,
+        'recovery_attempts_by_stage': {},
+        'applied_recovery_pipeline_run_ids': [],
+    }
+    attempt_only = _record_followup_stage_debt_attempt(
+        state,
+        stage_id='piotroski_filter',
+        invocation_symbols=piotroski_symbols,
+        recovery_pipeline_run_id=607,
+    )
+    assert attempt_only is not None
+
+    piotroski_stage = _compact_quality_only_piotroski_stage(
+        piotroski_symbols
+    )
+    piotroski_summary = piotroski_stage['details']['result_summary']
+    piotroski_summary['full_signal_usable_count'] = 1
+    piotroski_summary['full_signal_incomplete_count'] = 1
+    piotroski_summary['full_signal_unusable_count'] = 0
+
+    resolved = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata={
+            'followup_admission_scope_outcome': (
+                _parent_admission_outcome()
+            ),
+            'followup_stage_debt': attempt_only,
+        },
+        stage_rows={'piotroski_filter': piotroski_stage},
+        incomplete_stages=[
+            'fundamentals_daily_refresh',
+            'piotroski_filter',
+        ],
+        latest_pipeline_run={
+            'id': 607,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'run_metadata': {
+                'reused_eod_collection_run_id': 77,
+                'resolved_stages': ['piotroski_filter'],
+            },
+        },
+    )
+
+    assert resolved['ready'] is True
+    assert resolved['source'] == 'persisted_stage_debt_reconciled'
+    promoted = resolved['state']
+    assert promoted['pending_by_stage'][
+        'fundamentals_daily_refresh'
+    ] == [residual_symbol]
+    assert promoted['successful_by_stage']['piotroski_filter'] == (
+        piotroski_symbols
+    )
+    assert promoted['recovery_attempts_by_stage'] == {
+        'piotroski_filter': 1
+    }
+    assert promoted['applied_recovery_pipeline_run_ids'] == [607]
+    assert promoted['recovery_progress_count'] == 1
+    assert _next_followup_stage_debt_request(promoted) == (
+        'fundamentals_daily_refresh',
+        [residual_symbol],
+    )
+
+
+def test_run607_shape_advances_existing_factor_success_cohort() -> None:
+    parent_symbols = ['000001', '000002', '000003', '000004']
+    residual_symbol = parent_symbols[0]
+    proven_symbol = parent_symbols[1]
+    piotroski_retry_symbols = parent_symbols[2:]
+    fundamentals_success = parent_symbols[1:]
+
+    fundamentals_result = _exact_result(
+        selected=parent_symbols,
+        successful=fundamentals_success,
+        retry_debt=[residual_symbol],
+        version='dart_fundamentals_scope_outcomes_v1',
+        status='partial',
+        stage_id='fundamentals_daily_refresh',
+        publication_symbols=parent_symbols,
+    )
+    fundamentals_proof = _stored_stage_proof(
+        fundamentals_result,
+        publication_symbols=parent_symbols,
+    )
+    fundamentals_proof[
+        FOLLOWUP_STAGE_PROOF_RECOVERY_LINEAGE_KEY
+    ] = {
+        'schema_version': 'followup_recovery_lineage_v1',
+        'pipeline_run_id': 606,
+        'eod_collection_run_id': 77,
+        'stage_id': 'fundamentals_daily_refresh',
+    }
+    piotroski_result = _exact_result(
+        selected=fundamentals_success,
+        successful=[proven_symbol],
+        retry_debt=piotroski_retry_symbols,
+        version='piotroski_scope_outcomes_v1',
+        status='partial',
+        stage_id='piotroski_filter',
+        publication_symbols=parent_symbols,
+    )
+    signal_result = _exact_result(
+        selected=[proven_symbol],
+        successful=[proven_symbol],
+        retry_debt=[],
+        version='signal_features_scope_outcomes_v1',
+        status='completed',
+        publication_symbols=parent_symbols,
+    )
+    state = {
+        'schema_version': FOLLOWUP_STAGE_DEBT_SCHEMA_VERSION,
+        'market_date': '2026-10-30',
+        'eod_collection_run_id': 77,
+        'pending_by_stage': {
+            'fundamentals_daily_refresh': [residual_symbol],
+            'piotroski_filter': list(piotroski_retry_symbols),
+        },
+        'successful_by_stage': {
+            'fundamentals_daily_refresh': fundamentals_success,
+            'piotroski_filter': [proven_symbol],
+            **{
+                stage_id: [proven_symbol]
+                for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+            },
+            'signal_features': [proven_symbol],
+        },
+        'terminal_by_stage': {},
+        'proofs_by_stage': {
+            'fundamentals_daily_refresh': [fundamentals_proof],
+            'piotroski_filter': [
+                _stored_stage_proof(
+                    piotroski_result,
+                    publication_symbols=parent_symbols,
+                )
+            ],
+            **{
+                stage_id: [
+                    _stored_stage_proof(
+                        _exact_result(
+                            selected=[proven_symbol],
+                            successful=[proven_symbol],
+                            retry_debt=[],
+                            version='factor_scope_outcomes_v1',
+                            status='completed',
+                            stage_id=stage_id,
+                            publication_symbols=parent_symbols,
+                        ),
+                        publication_symbols=parent_symbols,
+                    )
+                ]
+                for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER
+            },
+            'signal_features': [
+                _stored_stage_proof(
+                    signal_result,
+                    publication_symbols=parent_symbols,
+                )
+            ],
+        },
+        'recovery_progress_count': 1,
+        'recovery_attempts_by_stage': {
+            'fundamentals_daily_refresh': 1,
+            'piotroski_filter': 1,
+        },
+        'applied_recovery_pipeline_run_ids': [606, 607],
+    }
+    piotroski_stage = _compact_quality_only_piotroski_stage(
+        piotroski_retry_symbols
+    )
+    piotroski_summary = piotroski_stage['details']['result_summary']
+    piotroski_summary['full_signal_usable_count'] = 1
+    piotroski_summary['full_signal_incomplete_count'] = 1
+    piotroski_summary['full_signal_unusable_count'] = 0
+
+    resolved = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata={
+            'followup_admission_scope_outcome': (
+                build_exact_symbol_scope_outcome(
+                    manifest_version=(
+                        'auto_eod_followup_admission_scope_outcomes_v1'
+                    ),
+                    selected_symbols=parent_symbols,
+                    successful_symbols=parent_symbols,
+                    retry_debt_symbols=[],
+                )
+            ),
+            'followup_stage_debt': state,
+        },
+        stage_rows={'piotroski_filter': piotroski_stage},
+        incomplete_stages=[
+            'fundamentals_daily_refresh',
+            'piotroski_filter',
+        ],
+        latest_pipeline_run={
+            'id': 607,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'run_metadata': {
+                'reused_eod_collection_run_id': 77,
+                'resolved_stages': ['piotroski_filter'],
+            },
+        },
+    )
+
+    assert resolved['ready'] is True, resolved
+    assert resolved['source'] == 'persisted_stage_debt_reconciled'
+    promoted = resolved['state']
+    assert promoted['pending_by_stage']['momentum_factors'] == (
+        piotroski_retry_symbols
+    )
+    assert _next_followup_stage_debt_request(promoted) == (
+        'momentum_factors',
+        piotroski_retry_symbols,
+    )
+    assert _followup_stage_debt_terminal_cohort(
+        promoted,
+        point_in_time_recovery=True,
+        require_prior_attempts=False,
+    ) == ('factor_intersection', [proven_symbol])
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (
+        ('reason', 'unknown_partial'),
+        ('gate_status', 'blocked'),
+        ('ranking_dependency_status', 'incomplete'),
+        ('results_persisted', len(SYMBOLS) - 1),
+    ),
+)
+def test_attempt_only_quality_partial_tampering_stays_pending(
+    field: str,
+    value: object,
+) -> None:
+    attempt_only = _piotroski_attempt_only_stage_debt_state()
+    stage = _compact_quality_only_piotroski_stage(SYMBOLS)
+    stage['details']['result_summary'][field] = value
+
+    resolved = _resolve_piotroski_recovery(attempt_only, stage=stage)
+
+    assert resolved['ready'] is True
+    assert resolved['state']['pending_by_stage']['piotroski_filter'] == (
+        SYMBOLS
+    )
+    assert resolved['state']['successful_by_stage'].get(
+        'piotroski_filter'
+    ) is None
+    assert resolved['state']['recovery_attempts_by_stage'] == {
+        'piotroski_filter': 1
+    }
+    assert resolved['state']['applied_recovery_pipeline_run_ids'] == [607]
+    assert resolved['state']['recovery_progress_count'] == 0
+
+
+def test_attempt_only_quality_partial_requires_exact_recovery_lineage() -> None:
+    attempt_only = _piotroski_attempt_only_stage_debt_state()
+
+    mismatched = _resolve_piotroski_recovery(
+        attempt_only,
+        eod_collection_run_id=78,
+    )
+
+    assert mismatched['ready'] is True
+    assert mismatched['source'] == 'persisted_stage_debt'
+    assert mismatched['state'] == attempt_only
 
 
 def test_stage_debt_ledger_accepts_strict_signal_quality_partial_proof() -> None:
@@ -1975,8 +2406,18 @@ def test_failed_all_recovery_is_applied_once_per_pipeline_run_id() -> None:
 
     new_run = resolve(same_run_poll['state'], 902)
     assert new_run['ready'] is True
-    assert new_run['source'] == 'persisted_stage_debt'
-    assert new_run['state'] == after_first
+    assert new_run['source'] == 'persisted_stage_debt_reconciled'
+    assert new_run['state']['recovery_attempts_by_stage'] == {
+        'momentum_factors': 2
+    }
+    assert new_run['state']['applied_recovery_pipeline_run_ids'] == [
+        901,
+        902,
+    ]
+    assert new_run['state']['recovery_progress_count'] == 0
+    assert len(
+        new_run['state']['proofs_by_stage']['momentum_factors']
+    ) == 2
     assert _next_followup_stage_debt_request(new_run['state']) == (
         'value_factors',
         SYMBOLS,
@@ -2849,6 +3290,36 @@ def test_final_reconciled_stage_debt_is_persisted_before_convergence() -> None:
             }
         },
     }
+    suffix_stages = {
+        stage_id: {'status': 'completed'}
+        for stage_id in (
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        )
+    }
+    suffix_result = {
+        'triggered': True,
+        'status': 'completed',
+        'market_date': '2026-10-30',
+        'pipeline_run_id': 94,
+        'pipeline_run': {
+            'id': 94,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'completed',
+            'market_date': '2026-10-30',
+            'run_metadata': {
+                'resolved_stages': list(suffix_stages),
+                'symbols': list(SYMBOLS),
+                'reused_eod_collection_run_id': 77,
+                'point_in_time_recovery': True,
+            },
+            'stages': suffix_stages,
+        },
+        'resolved_stages': list(suffix_stages),
+        'stages': suffix_stages,
+    }
     latest_eod_run = {
         'id': 77,
         'trade_date': '2026-10-30',
@@ -2879,6 +3350,11 @@ def test_final_reconciled_stage_debt_is_persisted_before_convergence() -> None:
             return_value={'updated': True, 'status': 'completed'},
         ),
         patch(
+            'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+            'count_runs',
+            return_value=0,
+        ),
+        patch(
             'app.eod.pykrx_backfill.update_eod_collection_run_progress'
         ) as update_eod,
         patch(
@@ -2892,7 +3368,8 @@ def test_final_reconciled_stage_debt_is_persisted_before_convergence() -> None:
         patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
         patch(
             'app.eod.daily_pipeline_stages.'
-            'daily_pipeline_stage_service.run'
+            'daily_pipeline_stage_service.run',
+            return_value=suffix_result,
         ) as run_stage,
     ):
         result = service._resume_auto_daily_followups_if_due(
@@ -2902,11 +3379,16 @@ def test_final_reconciled_stage_debt_is_persisted_before_convergence() -> None:
             markets=('KOSPI', 'KOSDAQ', 'KONEX'),
         )
 
-    run_stage.assert_not_called()
-    assert result['reason'] == 'followup_recovery_state_converged'
+    run_stage.assert_called_once()
+    assert run_stage.call_args.kwargs['stages'] == list(suffix_stages)
+    assert run_stage.call_args.kwargs['symbols'] == SYMBOLS
+    assert result['reason'] == 'stage_debt_success_cohort_resumed'
     tombstone = latest_eod_run['run_metadata']['followup_stage_debt']
     assert tombstone['pending_by_stage'] == {}
     assert latest_eod_run['run_metadata']['followup_recovery_required'] is False
+    assert latest_eod_run['run_metadata'][
+        'followup_stage_debt_terminal_progression'
+    ]['processed_stock_codes'] == SYMBOLS
     assert any(
         call.kwargs['run_metadata']['followup_stage_debt'][
             'pending_by_stage'
