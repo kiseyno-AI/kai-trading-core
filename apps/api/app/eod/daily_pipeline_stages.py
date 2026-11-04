@@ -4010,7 +4010,7 @@ class DailyPipelineStageService:
             'requested_stages': requested_stages,
             'resolved_stages': resolved_stages,
             'status': overall_status,
-            'stages': stage_outcomes,
+            'stages': current_run_stage_outcomes,
         }
 
     @staticmethod

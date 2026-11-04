@@ -5189,6 +5189,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         execute_stage.assert_called_once()
         self.assertEqual(
+            list(result['stages']),
+            ['trending_ranks'],
+        )
+        self.assertTrue(daily_pipeline_outcome_is_satisfied(result))
+        self.assertEqual(
             result['stages']['trending_ranks']['status'],
             'completed',
         )
