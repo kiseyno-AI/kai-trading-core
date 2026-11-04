@@ -9179,6 +9179,122 @@ class PykrxBackfillServiceTests(TestCase):
             processed,
         )
 
+    def test_unsuccessful_terminal_suffixes_remain_retryable(self) -> None:
+        market_date = '2026-04-03'
+        cohort = ['000660', '005930']
+        outcomes = {
+            'failed': {
+                stage_id: {'status': 'failed'}
+                for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            },
+            'blocking_partial': {
+                stage_id: {
+                    'status': (
+                        'partial'
+                        if stage_id == 'agent_feedback_summaries'
+                        else 'blocked'
+                    )
+                }
+                for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            },
+        }
+
+        for outcome, suffix_stages in outcomes.items():
+            with self.subTest(outcome=outcome):
+                service = PykrxBackfillService()
+                _, stage_debt, latest_eod_run = (
+                    _residual_debt_terminal_progression_fixture(
+                        factor_cohort=cohort,
+                        market_date=market_date,
+                    )
+                )
+                completed_at = datetime.now(timezone.utc).isoformat()
+                pipeline_run = {
+                    'id': 608,
+                    'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+                    'status': 'failed' if outcome == 'failed' else 'partial',
+                    'market_date': market_date,
+                    'updated_at': completed_at,
+                    'completed_at': completed_at,
+                    'run_metadata': {
+                        'resolved_stages': list(
+                            TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                        ),
+                        'symbols': cohort,
+                        'reused_eod_collection_run_id': 587,
+                        'point_in_time_recovery': True,
+                    },
+                    'stages': suffix_stages,
+                }
+
+                with (
+                    patch(
+                        'app.eod.pykrx_backfill._current_krx_calendar_date',
+                        return_value=date(2026, 4, 4),
+                    ),
+                    patch(
+                        'app.eod.pykrx_backfill.'
+                        'daily_pipeline_run_state_service.'
+                        'get_latest_run_for_context',
+                        return_value=pipeline_run,
+                    ),
+                    patch(
+                        'app.eod.pykrx_backfill.'
+                        'daily_pipeline_run_state_service.count_runs',
+                        return_value=1,
+                    ),
+                    patch(
+                        'app.eod.pykrx_backfill.'
+                        '_resolve_followup_stage_debt_state',
+                        return_value={
+                            'required': True,
+                            'ready': True,
+                            'state': stage_debt,
+                            'source': 'persisted_stage_debt',
+                        },
+                    ),
+                    patch(
+                        'app.eod.pykrx_backfill.'
+                        '_resolve_dart_followup_recovery_scope',
+                        return_value={'required': False, 'ready': False},
+                    ),
+                    patch.object(
+                        service,
+                        '_persist_followup_stage_debt_terminal_progression',
+                        wraps=(
+                            service._persist_followup_stage_debt_terminal_progression
+                        ),
+                    ) as persist_progression,
+                    patch(
+                        'app.eod.daily_pipeline_stages.'
+                        'daily_pipeline_stage_service.run'
+                    ) as retry_suffix,
+                ):
+                    result = service._resume_auto_daily_followups_if_due(
+                        market_date=market_date,
+                        latest_available_trade_date=market_date,
+                        latest_eod_run=latest_eod_run,
+                        markets=('KOSPI',),
+                        point_in_time_recovery=True,
+                    )
+
+                self.assertFalse(result['triggered'])
+                self.assertEqual(result['reason'], 'followup_recovery_backoff')
+                self.assertGreater(
+                    result['followup_recovery']['retry_after_seconds'],
+                    0,
+                )
+                self.assertEqual(
+                    result['followup_recovery']['resume_from_stage'],
+                    'agent_feedback_summaries',
+                )
+                persist_progression.assert_not_called()
+                retry_suffix.assert_not_called()
+                self.assertNotIn(
+                    'followup_stage_debt_terminal_progression',
+                    latest_eod_run['run_metadata'],
+                )
+
     def test_invalid_residual_debt_progression_marker_fails_closed(
         self,
     ) -> None:
