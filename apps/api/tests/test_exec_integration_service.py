@@ -11746,6 +11746,46 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(audit['core_state_before']['execution_status'], 'submit_failed')
             self.assertEqual(audit['core_state_after']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
 
+    async def test_readback_keeps_watch_sizing_pending_unapproved_and_inactive(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_sizing_pending',
+        )
+
+        self.assertFalse(short_item['exec_monitoring_active'])
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'blocked')
+        self.assertEqual(short_item['execution_status'], 'planned')
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 0)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+            self.assertNotIn(
+                'core_state_sync',
+                row.submission_payload['exec_dispatch'],
+            )
+
+    async def test_readback_keeps_dispatch_accepted_entry_unapproved_and_inactive(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='accepted',
+        )
+
+        self.assertFalse(short_item['exec_monitoring_active'])
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'blocked')
+        self.assertEqual(short_item['execution_status'], 'planned')
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 0)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+            self.assertNotIn(
+                'core_state_sync',
+                row.submission_payload['exec_dispatch'],
+            )
+
     async def test_readback_reconciles_recovered_watch_expiry_without_stale_quarantine_reason(self) -> None:
         overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
             exec_status='watch_expired',
@@ -11800,11 +11840,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(short_board_item['status'], 'scheduled')
-        self.assertEqual(short_board_item['monitoring_state'], 'watching_fill')
-        self.assertTrue(short_board_item['exec_monitoring_active'])
-        self.assertTrue(short_board_item['exec_runtime_showable'])
-        self.assertEqual(short_board_item['exec_runtime_state'], 'exec_approved_watch')
-        self.assertEqual(short_board_item['core_state_divergence_warning']['code'], 'exec_watch_state_divergence')
+        self.assertEqual(short_board_item['monitoring_state'], 'idle')
+        self.assertFalse(short_board_item['exec_monitoring_active'])
+        self.assertFalse(short_board_item['exec_runtime_showable'])
+        self.assertFalse(short_board_item['exec_agent_approved'])
+        self.assertEqual(short_board_item['exec_runtime_state'], 'core_planned_only')
+        self.assertIsNone(short_board_item['core_state_divergence_warning'])
         self.assertEqual(short_board_item['open_quantity'], 0)
         self.assertIsNone(short_board_item['broker_order_id'])
 
@@ -13836,7 +13877,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['approved_notional'], '250000.0000')
         self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
 
-    async def test_runtime_monitored_symbols_treats_accepted_entry_link_as_exec_approved_watch(self) -> None:
+    async def test_runtime_monitored_symbols_keep_scheduled_entry_links_inactive(self) -> None:
         with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
@@ -13911,15 +13952,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
                     item = payload['items'][0]
                     self.assertEqual(item['symbol'], symbol)
-                    self.assertTrue(item['exec_runtime_showable'])
-                    self.assertTrue(item['exec_monitoring_active'])
-                    self.assertTrue(item['exec_agent_approved'])
-                    self.assertEqual(item['exec_agent_action'], 'approve')
-                    self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
-                    self.assertIsNone(item['exec_runtime_exclusion_reason'])
+                    self.assertFalse(item['exec_runtime_showable'])
+                    self.assertFalse(item['exec_monitoring_active'])
+                    self.assertFalse(item['exec_agent_approved'])
+                    self.assertIsNone(item['exec_agent_action'])
+                    self.assertEqual(item['exec_runtime_state'], 'core_planned_only')
+                    self.assertEqual(
+                        item['exec_runtime_exclusion_reason'],
+                        'core_planned_not_exec_approved',
+                    )
                     self.assertIn(entry_status, item['monitoring_statuses'])
-                    self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
-                    self.assertNotEqual(item['exec_runtime_state'], 'core_planned_only')
+                    self.assertNotIn('watch_monitoring_active', item['monitoring_statuses'])
 
     async def test_runtime_monitored_symbols_flags_core_only_and_rejected_candidates(self) -> None:
         core_only = self.service._build_runtime_board_item(

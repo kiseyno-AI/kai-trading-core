@@ -423,10 +423,16 @@ EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
 }
 EXEC_WATCH_STATE_SYNC_SCHEMA_VERSION = 'exec_watch_state_sync_v1'
 EXEC_WATCH_STATE_SYNC_WARNING_CODE = 'exec_watch_state_divergence'
-EXEC_WATCH_READBACK_ACTIVE_STATUSES = EXEC_MONITORING_ACTIVE_STATUSES | EXEC_AGENT_ACCEPTED_ENTRY_STATUSES | {
-    'watch_buy_submitted',
+EXEC_WATCH_READBACK_NONACTIVE_PENDING_STATUSES = EXEC_V4_PENDING_ITEM_STATUSES | REMOTE_SCHEDULED_STATUSES | {
+    'scheduled',
     'watch_monitoring_pending',
-} | EXEC_V4_PENDING_ITEM_STATUSES | EXEC_V4_WORKING_ITEM_STATUSES
+}
+EXEC_WATCH_READBACK_ACTIVE_STATUSES = (
+    EXEC_MONITORING_ACTIVE_STATUSES
+    | EXEC_AGENT_ACCEPTED_ENTRY_STATUSES
+    | {'watch_buy_submitted'}
+    | EXEC_V4_WORKING_ITEM_STATUSES
+) - EXEC_WATCH_READBACK_NONACTIVE_PENDING_STATUSES
 MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_DEFAULT_MULTIPLIER_CAP = Decimal('1.0')
@@ -7982,12 +7988,12 @@ class SignalDeciderExecIntegrationService:
         if exec_monitoring_active:
             result['exec_monitoring_active'] = True
             result['exec_runtime_showable'] = True
-            result['exec_runtime_state'] = (
-                item.get('exec_runtime_state')
-                if original_exec_showable
-                or item.get('exec_agent_approved') is True
-                else 'runtime_membership_confirmed'
-            )
+            if item.get('exec_agent_approved') is True:
+                result['exec_runtime_state'] = 'exec_approved_watch'
+            elif original_exec_showable:
+                result['exec_runtime_state'] = item.get('exec_runtime_state')
+            else:
+                result['exec_runtime_state'] = 'runtime_membership_confirmed'
             result['exec_runtime_exclusion_reason'] = None
             result['exec_runtime_exclusion_reasons'] = []
         elif exec_membership_complete:
@@ -8029,6 +8035,16 @@ class SignalDeciderExecIntegrationService:
             monitoring_statuses.discard('runtime_membership_active')
             if exec_monitoring_active:
                 monitoring_statuses.add('runtime_membership_active')
+                if (
+                    item.get('exec_agent_approved') is True
+                    and _normalize_optional_text(
+                        item.get('intent'),
+                        lowercase=True,
+                    )
+                    in EXEC_ENTRY_BUY_INTENTS
+                ):
+                    monitoring_statuses.discard('watch_monitoring_pending')
+                    monitoring_statuses.add('watch_monitoring_active')
         result['monitoring_statuses'] = sorted(monitoring_statuses)
 
         if exec_monitoring_active and not result.get('exec_agent_approved'):
@@ -12910,7 +12926,7 @@ class SignalDeciderExecIntegrationService:
         warning = {
             'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
             'message': (
-                'Exec readback shows active or pending watch monitoring while core still had blocked/planned '
+                'Exec readback shows active watch monitoring while core still had blocked/planned '
                 'or failed state; preserving original gate evidence and surfacing Exec watch state for monitoring.'
             ),
             'severity': 'warning',
@@ -13845,6 +13861,10 @@ class SignalDeciderExecIntegrationService:
             item_statuses & EXEC_V4_PENDING_ITEM_STATUSES
         ):
             derived_status = 'pending'
+        elif item_statuses & REMOTE_SCHEDULED_STATUSES:
+            # Scheduling/dispatch acknowledgement is useful readback state,
+            # but it is not proof that Exec has started monitoring the item.
+            derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
         elif any(status in EXEC_WATCH_READBACK_ACTIVE_STATUSES for status in item_statuses):
             derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
 
@@ -13913,7 +13933,7 @@ class SignalDeciderExecIntegrationService:
         return {
             'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
             'message': (
-                'Exec has active or pending watch monitoring while core still had blocked/planned state; '
+                'Exec has active watch monitoring while core still had blocked/planned state; '
                 'runtime views are using Exec watch truth and preserving original core gate evidence.'
             ),
             'core_state_before': core_state_before,
@@ -13989,20 +14009,37 @@ class SignalDeciderExecIntegrationService:
                 else None
             )
         )
-        exec_agent_approved = bool(agent_decision['approved'])
+        held_position = (
+            _positive_decimal(derived_state.get('open_quantity'))
+            or Decimal('0')
+        ) > Decimal('0')
+        readback_proves_exec_activity = bool(
+            held_position
+            or remote_status in {'open', 'working'}
+        )
+        exec_agent_approved = bool(
+            agent_decision['approved']
+            or (
+                readback_proves_exec_activity
+                and not agent_decision['rejected']
+            )
+        )
         exec_agent_rejected = bool(agent_decision['rejected'])
         terminal = remote_status in EXEC_MONITORING_TERMINAL_STATUSES or dispatch_status in {
             EXEC_DISPATCH_STATUS_FAILED,
             EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
             EXEC_DISPATCH_STATUS_UNAVAILABLE,
         }
-        held_position = (_positive_decimal(derived_state.get('open_quantity')) or Decimal('0')) > Decimal('0')
-        active_remote = (
-            dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}
-            or remote_status in EXEC_MONITORING_ACTIVE_STATUSES
-        )
-        exec_monitoring_active = bool(held_position or (exec_agent_approved and active_remote and not terminal))
         active_exec_statuses = self._entry_link_active_statuses(item_links=dispatch_payload.get('item_links') or [])
+        active_remote = bool(
+            held_position
+            or active_exec_statuses
+            or remote_status in {'open', 'working'}
+        )
+        exec_monitoring_active = bool(
+            held_position
+            or (exec_agent_approved and active_remote and not terminal)
+        )
         core_was_blocked_or_planned = bool(
             item.get('eligibility_status') == ELIGIBILITY_BLOCKED
             or _normalize_status(item.get('execution_status'))
@@ -14100,7 +14137,7 @@ class SignalDeciderExecIntegrationService:
                 {
                     'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
                     'message': (
-                        'Exec has active or pending watch monitoring for rows that core still had as blocked/planned.'
+                        'Exec has active watch monitoring for rows that core still had as blocked/planned.'
                     ),
                     'count': len(divergence_items),
                     'symbols': sorted(
@@ -14859,15 +14896,17 @@ class SignalDeciderExecIntegrationService:
                 statuses.add('stop_sell_monitoring')
 
         active_entry_status = status in {
-            UI_BOARD_STATUS_ACCEPTED,
-            UI_BOARD_STATUS_SCHEDULED,
             UI_BOARD_STATUS_SUBMITTED,
             UI_BOARD_STATUS_PARTIAL,
         }
         if exec_agent_approved and intent in EXEC_ENTRY_BUY_INTENTS:
-            if monitoring_state == UI_MONITORING_STATE_WATCHING_FILL or active_entry_status:
+            if active_entry_status:
                 statuses.add('watch_monitoring_active')
-            elif status == UI_BOARD_STATUS_PLANNED:
+            elif status in {
+                UI_BOARD_STATUS_PLANNED,
+                UI_BOARD_STATUS_ACCEPTED,
+                UI_BOARD_STATUS_SCHEDULED,
+            }:
                 statuses.add('watch_monitoring_pending')
 
         return sorted(statuses)
@@ -14878,9 +14917,7 @@ class SignalDeciderExecIntegrationService:
             normalized = _normalize_status(status)
             if not normalized or normalized in EXEC_MONITORING_TERMINAL_STATUSES:
                 continue
-            if normalized in EXEC_MONITORING_ACTIVE_STATUSES:
-                return True
-            if normalized.endswith('_monitoring') or normalized.startswith('watch_monitoring_'):
+            if normalized in EXEC_WATCH_READBACK_ACTIVE_STATUSES:
                 return True
         return False
 
@@ -14904,7 +14941,29 @@ class SignalDeciderExecIntegrationService:
     ) -> dict[str, Any]:
         held_position = position_quantity > Decimal('0')
         agent_decision = cls._extract_exec_agent_decision(item)
-        exec_agent_approved = bool(agent_decision['approved'])
+        overview_exec_monitoring_active = bool(
+            item.get('exec_monitoring_active')
+            and item.get('exec_agent_approved')
+        )
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        remote_status = _normalize_status(remote_state.get('derived_status'))
+        readback_proves_exec_activity = bool(
+            held_position
+            or overview_exec_monitoring_active
+            or status in {
+                UI_BOARD_STATUS_SUBMITTED,
+                UI_BOARD_STATUS_PARTIAL,
+                UI_BOARD_STATUS_FILLED,
+            }
+            or remote_status in {'open', 'working'}
+        )
+        exec_agent_approved = bool(
+            agent_decision['approved']
+            or (
+                readback_proves_exec_activity
+                and not agent_decision['rejected']
+            )
+        )
         monitoring_statuses = cls._collect_runtime_monitoring_statuses(
             item=item,
             status=status,
@@ -14914,8 +14973,19 @@ class SignalDeciderExecIntegrationService:
             held_position=held_position,
             exec_agent_approved=exec_agent_approved,
         )
+        if overview_exec_monitoring_active:
+            monitoring_statuses = sorted(
+                (
+                    set(monitoring_statuses)
+                    - {'watch_monitoring_pending'}
+                )
+                | {'watch_monitoring_active'}
+            )
         terminal = cls._has_terminal_exec_monitoring_status(status=status, statuses=monitoring_statuses)
-        active_monitoring = cls._has_active_exec_monitoring_status(monitoring_statuses)
+        active_monitoring = bool(
+            overview_exec_monitoring_active
+            or cls._has_active_exec_monitoring_status(monitoring_statuses)
+        )
         exec_monitoring_active = held_position or (exec_agent_approved and active_monitoring and not terminal)
         has_execution_plan = bool(_normalize_optional_text((item.get('dispatch') or {}).get('plan_id')))
 
@@ -15053,6 +15123,11 @@ class SignalDeciderExecIntegrationService:
             position_quantity=contract_position_quantity,
             position_average_price=position_average_price,
         )
+        if (
+            not bool(exec_contract.get('exec_monitoring_active'))
+            and monitoring_state == UI_MONITORING_STATE_WATCHING_FILL
+        ):
+            monitoring_state = UI_MONITORING_STATE_IDLE
         return {
             'plan_item_id': item.get('plan_item_id'),
             'account_reference': item.get('account_reference'),
@@ -15952,7 +16027,13 @@ class SignalDeciderExecIntegrationService:
         if _normalize_decision_agent_name(item.get('decision_agent_name')) != SHORT_TERM_DECIDER_AGENT_NAME:
             return None
         dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
-        statuses = set(cls._entry_link_active_statuses(item_links=dispatch.get('item_links') or []))
+        statuses: set[str] = set()
+        for link in dispatch.get('item_links') or []:
+            if not isinstance(link, dict):
+                continue
+            if _normalize_optional_text(link.get('intent'), lowercase=True) not in EXEC_ENTRY_BUY_INTENTS:
+                continue
+            statuses.update(cls._entry_link_statuses(link))
         if not statuses:
             return None
         if statuses & REMOTE_PARTIAL_STATUSES:
