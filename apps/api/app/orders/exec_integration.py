@@ -13817,7 +13817,6 @@ class SignalDeciderExecIntegrationService:
         has_entry_fill_evidence = (
             buy_quantity > Decimal('0')
             or self._has_order_fill_evidence(orders=orders, side='buy')
-            or bool(order_status_counts.keys() & REMOTE_PARTIAL_STATUSES)
         )
         has_exit_fill_evidence = sell_quantity > Decimal('0') or self._has_order_fill_evidence(orders=orders, side='sell')
         has_plan_fill_evidence = has_entry_fill_evidence or has_exit_fill_evidence
@@ -14013,9 +14012,32 @@ class SignalDeciderExecIntegrationService:
             _positive_decimal(derived_state.get('open_quantity'))
             or Decimal('0')
         ) > Decimal('0')
+        active_exec_statuses = self._entry_link_active_statuses(
+            item_links=dispatch_payload.get('item_links') or [],
+        )
+        readback_orders = (
+            _extract_field(readback, 'orders', 'items')
+            or []
+        )
+        readback_executions = (
+            _extract_field(readback, 'executions', 'items')
+            or []
+        )
         readback_proves_exec_activity = bool(
             held_position
-            or remote_status in {'open', 'working'}
+            or active_exec_statuses
+            or _positive_decimal(
+                derived_state.get('entry_filled_quantity')
+            )
+            or self._has_active_order_evidence(
+                orders=readback_orders,
+                side='buy',
+            )
+            or self._sum_execution_quantity(
+                executions=readback_executions,
+                side='buy',
+            )
+            > Decimal('0')
         )
         exec_agent_approved = bool(
             agent_decision['approved']
@@ -14030,12 +14052,7 @@ class SignalDeciderExecIntegrationService:
             EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
             EXEC_DISPATCH_STATUS_UNAVAILABLE,
         }
-        active_exec_statuses = self._entry_link_active_statuses(item_links=dispatch_payload.get('item_links') or [])
-        active_remote = bool(
-            held_position
-            or active_exec_statuses
-            or remote_status in {'open', 'working'}
-        )
+        active_remote = readback_proves_exec_activity
         exec_monitoring_active = bool(
             held_position
             or (exec_agent_approved and active_remote and not terminal)
@@ -14110,8 +14127,8 @@ class SignalDeciderExecIntegrationService:
                 'open_quantity': derived_state.get('open_quantity'),
                 'closed_quantity': derived_state.get('closed_quantity'),
                 'plan_item_status_counts': derived_state.get('plan_item_status_counts') or {},
-                'orders': _extract_field(readback, 'orders', 'items') or [],
-                'executions': _extract_field(readback, 'executions', 'items') or [],
+                'orders': readback_orders,
+                'executions': readback_executions,
                 'positions': _extract_field(readback, 'positions', 'items') or [],
                 'endpoint_statuses': derived_state.get('endpoint_statuses') or {},
             },
@@ -14946,16 +14963,23 @@ class SignalDeciderExecIntegrationService:
             and item.get('exec_agent_approved')
         )
         remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
-        remote_status = _normalize_status(remote_state.get('derived_status'))
+        orders = remote_state.get('orders') if isinstance(remote_state.get('orders'), list) else []
+        executions = remote_state.get('executions') if isinstance(remote_state.get('executions'), list) else []
         readback_proves_exec_activity = bool(
             held_position
             or overview_exec_monitoring_active
-            or status in {
-                UI_BOARD_STATUS_SUBMITTED,
-                UI_BOARD_STATUS_PARTIAL,
-                UI_BOARD_STATUS_FILLED,
-            }
-            or remote_status in {'open', 'working'}
+            or _positive_decimal(
+                remote_state.get('entry_filled_quantity')
+            )
+            or cls._has_active_order_evidence(
+                orders=orders,
+                side='buy',
+            )
+            or cls._sum_execution_quantity(
+                executions=executions,
+                side='buy',
+            )
+            > Decimal('0')
         )
         exec_agent_approved = bool(
             agent_decision['approved']
@@ -15722,6 +15746,34 @@ class SignalDeciderExecIntegrationService:
         return False
 
     @staticmethod
+    def _has_active_order_evidence(
+        *,
+        orders: Sequence[dict[str, Any]],
+        side: str,
+    ) -> bool:
+        active_statuses = (
+            REMOTE_ACTIVE_STATUSES
+            | REMOTE_SUBMITTED_STATUSES
+            | REMOTE_PARTIAL_STATUSES
+            | EXEC_V4_WORKING_ITEM_STATUSES
+        )
+        for order in orders:
+            order_side = _normalize_status(order.get('side'))
+            if side == 'sell':
+                if order_side != 'sell':
+                    continue
+            elif order_side == 'sell':
+                continue
+            status = _normalize_status(
+                order.get('status')
+                or order.get('current_status')
+                or order.get('broker_status')
+            )
+            if status in active_statuses:
+                return True
+        return False
+
+    @staticmethod
     def _sum_position_quantity(*, positions: Sequence[dict[str, Any]]) -> Decimal:
         total = Decimal('0')
         for position in positions:
@@ -16042,7 +16094,11 @@ class SignalDeciderExecIntegrationService:
             return UI_BOARD_STATUS_SUBMITTED
         if statuses & {'watch_monitoring_active', 'active', 'monitoring'}:
             return UI_BOARD_STATUS_ACCEPTED
-        if statuses & ({'watch_monitoring_pending'} | REMOTE_SCHEDULED_STATUSES):
+        if statuses & (
+            EXEC_V4_PENDING_ITEM_STATUSES
+            | REMOTE_SCHEDULED_STATUSES
+            | {'watch_monitoring_pending'}
+        ):
             return UI_BOARD_STATUS_SCHEDULED
         if statuses & EXEC_WATCH_READBACK_ACTIVE_STATUSES:
             return UI_BOARD_STATUS_ACCEPTED

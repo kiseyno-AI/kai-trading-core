@@ -5104,6 +5104,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         *,
         exec_status: str = 'watch_monitoring_active',
         response_item_status: str | None = None,
+        additional_intent_statuses: dict[str, str] | None = None,
         core_execution_status: str = 'planned',
         blocking_reason_code: str = 'manual_recovery_gate_block',
     ) -> tuple[dict, dict, int]:
@@ -5174,24 +5175,57 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'ready': True,
             'monitoring': {'alive': True},
         }
+        response_items = [
+            {
+                'core_item_key': short_entry_item['core_item_key'],
+                'execution_plan_id': short_entry_link['exec_plan_id'],
+                'execution_plan_item_id': short_entry_link[
+                    'exec_plan_item_id'
+                ],
+                'symbol': self.symbol,
+                'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                'status': response_item_status or exec_status,
+                'monitoring_status': exec_status,
+            }
+        ]
+        for intent, status in (additional_intent_statuses or {}).items():
+            source_item = next(
+                item
+                for item in short_post_call['items']
+                if item.get('intent') == intent
+            )
+            with session_scope() as session:
+                persisted_short_row = session.get(
+                    SignalDeciderExecutionPlanItem,
+                    short_plan_item_id,
+                )
+                intent_link = next(
+                    link
+                    for link in persisted_short_row.submission_payload[
+                        'exec_dispatch'
+                    ]['item_links']
+                    if link['intent'] == intent
+                )
+            response_items.append(
+                {
+                    'core_item_key': source_item['core_item_key'],
+                    'execution_plan_id': intent_link['exec_plan_id'],
+                    'execution_plan_item_id': intent_link[
+                        'exec_plan_item_id'
+                    ],
+                    'symbol': self.symbol,
+                    'intent': intent,
+                    'status': status,
+                    'monitoring_status': status,
+                }
+            )
+
         self.client.plan_response = {
             'items': [
                 {
                     'external_plan_id': short_plan_id,
                     'status': 'accepted',
-                    'items': [
-                        {
-                            'core_item_key': short_entry_item['core_item_key'],
-                            'execution_plan_id': short_entry_link['exec_plan_id'],
-                            'execution_plan_item_id': short_entry_link[
-                                'exec_plan_item_id'
-                            ],
-                            'symbol': self.symbol,
-                            'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
-                            'status': response_item_status or exec_status,
-                            'monitoring_status': exec_status,
-                        }
-                    ],
+                    'items': response_items,
                 }
             ]
         }
@@ -11779,6 +11813,48 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+            self.assertNotIn(
+                'core_state_sync',
+                row.submission_payload['exec_dispatch'],
+            )
+
+    async def test_readback_does_not_promote_pending_entry_from_active_exit_intent(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_sizing_pending',
+            additional_intent_statuses={
+                EXEC_INTENT_TARGET_SELL: 'target_sell_monitoring',
+            },
+        )
+
+        self.assertEqual(short_item['remote_state']['derived_status'], 'working')
+        self.assertFalse(short_item['exec_monitoring_active'])
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'blocked')
+        self.assertEqual(short_item['execution_status'], 'planned')
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 0)
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+        board_item = next(
+            item
+            for item in board['items']
+            if item['plan_item_id'] == short_plan_item_id
+        )
+        self.assertEqual(board_item['status'], 'scheduled')
+        self.assertEqual(board_item['monitoring_state'], 'idle')
+        self.assertFalse(board_item['exec_monitoring_active'])
+        self.assertFalse(board_item['exec_agent_approved'])
+
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
             self.assertEqual(row.execution_status, 'planned')
             self.assertFalse(row.traceability_payload['exec_monitoring_active'])
             self.assertNotIn(
