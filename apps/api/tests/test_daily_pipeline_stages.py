@@ -10912,7 +10912,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(len(feedback_retry_service.calls), 1)
         self.assertEqual(len(evaluation_service.calls), 1)
 
-    def test_execute_decider_does_not_start_during_preopen(
+    def test_unadmitted_decider_started_preopen_expires_after_open(
         self,
     ) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
@@ -10960,7 +10960,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
-        self.assertEqual(feedback_retry_service.calls, [])
+        self.assertEqual(len(feedback_retry_service.calls), 1)
 
     def test_execute_decider_keeps_preopen_admission_after_market_open(
         self,
@@ -11255,7 +11255,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ]
         )
 
-    def test_exact_auto_pitr_recovery_cannot_start_during_preopen(
+    def test_exact_auto_pitr_recovery_starts_during_preopen(
         self,
     ) -> None:
         feedback_retry_service = _FakeFeedbackRetryService()
@@ -11320,6 +11320,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=581,
                 point_in_time_recovery=True,
+                provider_admission_fence_owned=True,
                 force=False,
                 reuse_existing_feedback=True,
                 summary_cutoff_proof={
@@ -11334,21 +11335,20 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(result['status'], 'completed')
-        self.assertEqual(feedback_retry_service.calls, [])
-        refresh_plan.assert_not_called()
-        self.assertEqual(evaluation_service.calls, [])
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(len(feedback_retry_service.calls), 1)
+        refresh_plan.assert_called_once()
+        self.assertEqual(len(evaluation_service.calls), 1)
         self.assertTrue(
             all(
-                outcome['status'] == 'skipped'
-                and outcome['result']['reason']
-                == 'next_open_window_expired'
+                outcome['result'].get('reason')
+                != 'next_open_window_expired'
                 for outcome in result['stages'].values()
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             self.run_state_service.runs[-1]['run_metadata'][
-                'same_day_intraday_watch_continuation_admitted'
+                'previous_session_preopen_recovery_admitted'
             ]
         )
 

@@ -72,13 +72,11 @@ def build_next_open_window_expired_result(
         default=candidate,
         allow_fallback=True,
     )
+    # Crossing midnight does not consume the next-open window. Admission is
+    # required only to keep a recovered run alive after that session opens.
     target_is_still_actionable = bool(
         (
             market_state == 'PREOPEN'
-            and (
-                allow_same_day_intraday_watch_continuation
-                or allow_previous_session_preopen_recovery
-            )
             and target_trade_date >= current_market_date
         )
         or target_trade_date > current_market_date

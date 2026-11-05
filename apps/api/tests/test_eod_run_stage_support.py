@@ -1232,6 +1232,23 @@ class EODRunStageSupportTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_preopen_current_target_remains_eligible_without_admission(self):
+        market = SimpleNamespace(
+            state='PREOPEN',
+            server_time='2026-09-14T01:55:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+            return_value=date(2026, 9, 14),
+        ):
+            result = build_next_open_window_expired_result(
+                market_date='2026-09-11',
+                market=market,
+            )
+
+        self.assertIsNone(result)
+
     def test_non_open_states_skip_targets_before_current_calendar_date(self):
         for market_state in ('PREOPEN', 'WEEKEND', 'HOLIDAY'):
             with self.subTest(market_state=market_state):
