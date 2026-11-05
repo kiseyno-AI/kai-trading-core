@@ -59,6 +59,10 @@ class MarketSnapshotMarket(BaseModel):
         default='krw',
         description='Unit for `foreign_net_value` and `institution_net_value`.',
     )
+    flow_leg: dict | None = Field(
+        default=None,
+        description='Investor-flow freshness and current-session provenance.',
+    )
 
 
 class MarketSnapshotFX(BaseModel):

@@ -79,6 +79,16 @@ def _snapshot_payload(
                 'foreign_net_value': kospi_foreign_value,
                 'institution_net_value': kospi_institution_value,
                 'investor_flow_value_unit': 'krw',
+                'flow_leg': {
+                    'status': 'ready',
+                    'source': 'kis_investor_time_by_market',
+                    'provider_observed_at': '2026-04-29T10:05:00+09:00',
+                    'provider_business_date': '2026-04-29',
+                    'provider_session_time': '10:05:00',
+                    'observation_age_seconds': 12.0,
+                    'current_session': True,
+                    'max_age_seconds': 360,
+                },
             },
             'kosdaq': {
                 'label': 'KOSDAQ',
@@ -94,6 +104,16 @@ def _snapshot_payload(
                 'foreign_net_value': kosdaq_foreign_value,
                 'institution_net_value': kosdaq_institution_value,
                 'investor_flow_value_unit': 'krw',
+                'flow_leg': {
+                    'status': 'ready',
+                    'source': 'kis_investor_time_by_market',
+                    'provider_observed_at': '2026-04-29T10:05:00+09:00',
+                    'provider_business_date': '2026-04-29',
+                    'provider_session_time': '10:05:00',
+                    'observation_age_seconds': 12.0,
+                    'current_session': True,
+                    'max_age_seconds': 360,
+                },
             },
         },
         'usd_krw': {
@@ -231,6 +251,102 @@ class SignalDeciderMarketContextBuilderTests(unittest.TestCase):
         self.assertIn('foreign', result['flows'])
         self.assertNotIn('institutional', result['flows'])
         self.assertIsNone(result['stale_reason'])
+
+    def test_build_excludes_flow_without_fresh_current_session_provenance(self) -> None:
+        snapshot = _snapshot_payload()
+        snapshot['markets']['kospi']['flow_leg']['status'] = 'cached'
+        snapshot['markets']['kospi']['flow_leg']['current_session'] = False
+        snapshot['markets']['kospi']['flow_leg']['observation_age_seconds'] = 3_601.0
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot),
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='OPEN',
+                server_time='2026-04-29T10:05:12+09:00',
+                is_open=True,
+            ),
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['flows'], {})
+        self.assertIn('flows.foreign', result['missing_fields'])
+        self.assertIn('flows.institutional', result['missing_fields'])
+        self.assertNotEqual(result['summary']['market_bias'], 'risk_off')
+
+    def test_build_excludes_legacy_flow_without_provenance(self) -> None:
+        snapshot = _snapshot_payload()
+        for row in snapshot['markets'].values():
+            row.pop('flow_leg')
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot),
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='OPEN',
+                server_time='2026-04-29T10:05:12+09:00',
+                is_open=True,
+            ),
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['flows'], {})
+        self.assertIn('flows.foreign', result['missing_fields'])
+        self.assertIn('flows.institutional', result['missing_fields'])
+
+    def test_postclose_build_accepts_same_day_regular_session_closing_flow(self) -> None:
+        snapshot = _snapshot_payload()
+        for row in snapshot['markets'].values():
+            row['flow_leg'].update(
+                {
+                    'status': 'unverified',
+                    'provider_observed_at': '2026-04-29T15:30:00+09:00',
+                    'provider_session_time': '15:30:00',
+                    'observation_age_seconds': 16_800.0,
+                    'current_session': True,
+                }
+            )
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot),
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='POSTCLOSE',
+                server_time='2026-04-29T20:10:00+09:00',
+                is_open=False,
+            ),
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['flows']['foreign']['value'], -1667138000000)
+        self.assertEqual(result['flows']['institutional']['value'], -20710000000)
+
+    def test_historical_build_accepts_proven_same_date_closing_flow(self) -> None:
+        snapshot = _snapshot_payload()
+        for row in snapshot['markets'].values():
+            row['flow_leg'].update(
+                {
+                    'status': 'cached',
+                    'provider_observed_at': '2026-04-29T15:30:00+09:00',
+                    'provider_session_time': '15:30:00',
+                    'observation_age_seconds': 63_000.0,
+                    'current_session': True,
+                }
+            )
+        builder = SignalDeciderMarketContextBuilder(
+            snapshot_service=FakeSnapshotService(snapshot),
+            market_state_loader=lambda: FakeCurrentMarketState(
+                state='OPEN',
+                server_time='2026-04-30T09:00:00+09:00',
+                is_open=True,
+            ),
+        )
+
+        result = builder.build(market_date=date(2026, 4, 29))
+
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['flows']['foreign']['value'], -1667138000000)
+        self.assertEqual(result['flows']['institutional']['value'], -20710000000)
 
     def test_build_returns_stale_when_fx_fallback_was_used(self) -> None:
         builder = SignalDeciderMarketContextBuilder(

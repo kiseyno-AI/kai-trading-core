@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import re
 import uuid
 from copy import deepcopy
@@ -24,6 +25,44 @@ ABORTLIKE_ERROR_MARKERS = (
     'killed',
     'failed',
 )
+
+
+def canonical_decider_price_issue(
+    *,
+    item: dict[str, Any],
+    market_date: date,
+) -> dict[str, Any] | None:
+    """Return a symbol-local issue when canonical same-day price is unusable."""
+
+    price_context = item.get('price_context')
+    if not isinstance(price_context, dict):
+        return {
+            'code': 'canonical_price_context_missing',
+            'market_date': market_date.isoformat(),
+        }
+    actual_trade_date = str(price_context.get('trade_date') or '').strip()
+    if actual_trade_date != market_date.isoformat():
+        return {
+            'code': 'canonical_price_context_date_mismatch',
+            'market_date': market_date.isoformat(),
+            'actual_trade_date': actual_trade_date or None,
+        }
+    raw_close = price_context.get('close_price')
+    try:
+        close_price = float(raw_close)
+    except (TypeError, ValueError):
+        close_price = 0.0
+    if (
+        isinstance(raw_close, bool)
+        or not math.isfinite(close_price)
+        or close_price <= 0
+    ):
+        return {
+            'code': 'canonical_price_context_close_invalid',
+            'market_date': market_date.isoformat(),
+            'actual_trade_date': actual_trade_date,
+        }
+    return None
 
 
 def is_abortlike_error(error: Any) -> bool:
@@ -2673,6 +2712,8 @@ def build_signal_decider_payload(
         'next_day_open_action',
         'wait_reason',
         'entry_price_basis',
+        'trigger_price',
+        'chase_limit_price',
         'target_price',
         'expected_return_pct',
         'stop_loss_price',
@@ -2680,6 +2721,7 @@ def build_signal_decider_payload(
         'confidence_score_10',
         'conviction_score_10',
         'thesis_summary',
+        'trigger_conditions',
         'supporting_evidence',
         'decision_risks',
         'decision_delta',

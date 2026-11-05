@@ -28,8 +28,8 @@ PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
 BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS = 45
 NEXT_OPEN_PLAN_REFRESH_TIMEOUT_SECONDS = 120
 BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS = 600
-MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(9, 0)
-MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(14, 31)
+MARKET_SNAPSHOT_OPEN_DRIVE_START_KST = time(8, 50)
+MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(15, 31)
 NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
 OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY = 'signal_decider_exec_dispatch_open_plan'
 BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD = 3
@@ -157,7 +157,8 @@ class EODBackgroundRunner:
     def _open_drive_market_time(market: object) -> datetime | None:
         if (
             str(getattr(market, 'market', '') or '').strip().upper() != 'KRX'
-            or str(getattr(market, 'state', '') or '').strip().upper() != 'OPEN'
+            or str(getattr(market, 'state', '') or '').strip().upper()
+            not in {'PREOPEN', 'OPEN'}
             or not bool(getattr(market, 'is_trading_day', False))
         ):
             return None
@@ -194,7 +195,7 @@ class EODBackgroundRunner:
             return False
 
         interval_seconds = settings.market_snapshot_open_drive_refresh_interval_seconds
-        window_start = current.replace(hour=9, minute=0, second=0, microsecond=0)
+        window_start = current.replace(hour=8, minute=50, second=0, microsecond=0)
         elapsed_seconds = int((current - window_start).total_seconds())
         bucket_started_at = window_start + timedelta(
             seconds=(elapsed_seconds // interval_seconds) * interval_seconds
@@ -502,6 +503,11 @@ class EODBackgroundRunner:
                         runtime_background_enabled
                         and market.state == 'PREOPEN'
                     ):
+                        force_index_refresh = (
+                            self._claim_market_snapshot_open_drive_refresh(
+                                market
+                            )
+                        )
                         await self._run_async_step(
                             'market_snapshot_refresh_if_due',
                             market_snapshot_service.refresh_market_snapshot_if_due(
@@ -509,7 +515,7 @@ class EODBackgroundRunner:
                                     f'background_runner:{market.state.lower()}:'
                                     'daily_pipeline_preflight'
                                 ),
-                                force_index=False,
+                                force_index=force_index_refresh,
                             ),
                             fail_closed=True,
                         )

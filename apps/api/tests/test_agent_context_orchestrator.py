@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
+from app.agent_context import orchestrator_helpers as orchestrator_helpers_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
     build_decider_input_generation,
@@ -47,6 +48,140 @@ def _attach_response_correlation(result: dict, *, expected_symbols: list[str]) -
     result['decoded'] = decoded
     result['response_correlation'] = response_correlation
     return result
+
+
+class CanonicalDeciderPriceGuardTests(unittest.TestCase):
+    def test_rejects_missing_stale_and_nonpositive_canonical_price(self):
+        validate = getattr(
+            orchestrator_helpers_module,
+            'canonical_decider_price_issue',
+            None,
+        )
+        self.assertTrue(callable(validate))
+
+        cases = (
+            ({'symbol': '005930'}, 'canonical_price_context_missing'),
+            (
+                {
+                    'symbol': '005930',
+                    'price_context': {
+                        'trade_date': '2026-04-13',
+                        'close_price': 71000,
+                    },
+                },
+                'canonical_price_context_date_mismatch',
+            ),
+            (
+                {
+                    'symbol': '005930',
+                    'price_context': {
+                        'trade_date': '2026-04-14',
+                        'close_price': None,
+                    },
+                },
+                'canonical_price_context_close_invalid',
+            ),
+        )
+        for item, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                issue = validate(
+                    item=item,
+                    market_date=date(2026, 4, 14),
+                )
+                self.assertEqual(issue['code'], expected_code)
+
+        self.assertIsNone(
+            validate(
+                item={
+                    'symbol': '005930',
+                    'price_context': {
+                        'trade_date': '2026-04-14',
+                        'close_price': 71000,
+                    },
+                },
+                market_date=date(2026, 4, 14),
+            )
+        )
+
+    def test_decider_dispatch_excludes_only_symbol_with_stale_price(self):
+        service = AgentFeedbackOrchestrator()
+        all_failures: list[dict] = []
+        buffered_failures: list[tuple[tuple, dict]] = []
+
+        def buffer_failure(*args, **kwargs):
+            buffered_failures.append((args, kwargs))
+
+        symbol_context_items = [
+            {
+                'symbol': '005930',
+                'price_context': {
+                    'trade_date': '2026-04-13',
+                    'close_price': 71000,
+                },
+            },
+            {
+                'symbol': '000660',
+                'price_context': {
+                    'trade_date': '2026-04-14',
+                    'close_price': 185000,
+                },
+            },
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_build_decider_policy_context',
+                return_value={},
+            ),
+            patch.object(
+                service,
+                '_build_upstream_feedback_bundle',
+                return_value=({}, {}, []),
+            ),
+            patch.object(
+                service,
+                '_build_signal_decider_payload',
+                side_effect=lambda **kwargs: {
+                    'symbol': kwargs['item']['symbol'],
+                },
+            ),
+            patch.object(
+                orchestrator_module.signal_decider_market_context_builder,
+                'build',
+                return_value={},
+            ),
+        ):
+            dispatch_items = service._prepare_role_dispatch_items(
+                role='signal-decider',
+                market_date=date(2026, 4, 14),
+                policy_context_as_of_date=date(2026, 4, 14),
+                request_run_id='canonical-price-guard-test',
+                symbol_context_items=symbol_context_items,
+                source_context_scope_symbols=['005930', '000660'],
+                eligibility_scope_symbols=['005930', '000660'],
+                fs_div='CFS',
+                disclosures_limit=10,
+                source_knowledge_cutoff_at='2026-04-14T06:30:00+00:00',
+                upstream_summary_run_id=None,
+                reuse_decisions={},
+                previous_decision_context_decisions={},
+                upstream_reuse_decisions={},
+                all_failures=all_failures,
+                buffer_failure=buffer_failure,
+            )
+
+        self.assertEqual(
+            [item['symbol'] for item in dispatch_items],
+            ['000660'],
+        )
+        self.assertEqual(len(all_failures), 1)
+        self.assertEqual(all_failures[0]['symbol'], '005930')
+        self.assertEqual(
+            all_failures[0]['error'],
+            'canonical_price_context_date_mismatch',
+        )
+        self.assertEqual(len(buffered_failures), 1)
 
 
 def _batch_result(symbol: str) -> dict:
@@ -4256,7 +4391,10 @@ class DeciderReadyAgentContextReadService:
                 {
                     'symbol': symbol,
                     'market_date': kwargs['market_date'].isoformat(),
-                    'price_context': {'close_price': 85700},
+                    'price_context': {
+                        'trade_date': kwargs['market_date'].isoformat(),
+                        'close_price': 85700,
+                    },
                     'liquidity_context': {
                         'status': 'available',
                         'turnover': {
@@ -8141,6 +8279,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])
         self.assertTrue(decider_payload['output_contract']['symbol_identity']['exact_match_required'])
         self.assertIn('wait_reason', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('trigger_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('chase_limit_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('target_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('stop_loss_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('trigger_conditions', decider_payload['output_contract']['required_feedback_fields'])
         self.assertIn('decision_delta', decider_payload['output_contract']['required_feedback_fields'])
         self.assertIn(
             'item_symbol_feedback_symbol_and_traceability_symbol_match_assigned_symbol',

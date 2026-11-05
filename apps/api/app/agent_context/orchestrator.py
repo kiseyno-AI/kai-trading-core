@@ -50,6 +50,7 @@ from app.agent_context.orchestrator_helpers import (
     build_decider_source_context_generation as _build_decider_source_context_generation,
     durable_decider_source_context_fingerprint_matches as _durable_decider_source_context_fingerprint_matches,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
+    canonical_decider_price_issue as _canonical_decider_price_issue,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
     coerce_decoded_batch_response as _coerce_decoded_batch_response,
     correlate_decoded_batch_response as _correlate_decoded_batch_response,
@@ -5052,6 +5053,59 @@ class AgentFeedbackOrchestrator:
                     error_message=error,
                     missing_roles=missing_roles,
                     dependency_policy=dependency_context['dependency_policy'],
+                )
+                continue
+            canonical_price_issue = _canonical_decider_price_issue(
+                item=item,
+                market_date=market_date,
+            )
+            if canonical_price_issue is not None:
+                error = str(canonical_price_issue['code'])
+                failure_kind = (
+                    FeedbackFailureKind.DEPENDENCY_MISSING_UPSTREAM.value
+                )
+                dependency_context = {
+                    'dependency_status': (
+                        'blocked_missing_canonical_same_day_price'
+                    ),
+                    'failure_status': 'dependency/missing-upstream',
+                    'failure_kind': failure_kind,
+                    'dependency_policy': 'record_failure_and_continue',
+                    'canonical_price_issue': canonical_price_issue,
+                }
+                failure = _build_failed_dispatch_item(
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    error=error,
+                    retryable=True,
+                    failure_kind=failure_kind,
+                    context=dependency_context,
+                )
+                all_failures.append(failure)
+                buffer_failure(
+                    role,
+                    symbol,
+                    error,
+                    True,
+                    failure_kind=failure_kind,
+                    context=dependency_context,
+                    agent_name=role,
+                )
+                log_agent_feedback_event(
+                    'decider_canonical_price_rejected',
+                    status='blocked',
+                    market_date=market_date.isoformat(),
+                    request_run_id=request_run_id,
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    error_type='CanonicalPriceUnavailable',
+                    error_message=error,
+                    dependency_policy=dependency_context[
+                        'dependency_policy'
+                    ],
+                    canonical_price_issue=canonical_price_issue,
                 )
                 continue
             if market_context is None:

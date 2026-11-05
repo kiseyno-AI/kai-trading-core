@@ -39,6 +39,16 @@ class FakeMarketSnapshotService:
                     'institution_net_quantity': 720,
                     'institution_net_value': 283792000000,
                     'investor_flow_value_unit': 'krw',
+                    'flow_leg': {
+                        'status': 'ready',
+                        'source': 'kis_investor_time_by_market',
+                        'provider_observed_at': '2026-04-29T10:05:00+09:00',
+                        'provider_business_date': '2026-04-29',
+                        'provider_session_time': '10:05:00',
+                        'observation_age_seconds': 12.0,
+                        'current_session': True,
+                        'max_age_seconds': 360,
+                    },
                 },
                 'kosdaq': {
                     'label': 'KOSDAQ',
@@ -157,6 +167,11 @@ class MarketRouteTests(unittest.TestCase):
         self.assertEqual(payload['markets']['kosdaq']['foreign_net_quantity'], -18565)
         self.assertEqual(payload['markets']['kospi']['trading_value_unit'], 'million_krw')
         self.assertEqual(payload['markets']['kospi']['investor_flow_value_unit'], 'krw')
+        self.assertTrue(payload['markets']['kospi']['flow_leg']['current_session'])
+        self.assertEqual(
+            payload['markets']['kospi']['flow_leg']['provider_business_date'],
+            '2026-04-29',
+        )
         self.assertEqual(payload['markets']['kosdaq']['institution_net_value'], -304502000000)
         self.assertEqual(payload['status'], 'ready')
         self.assertEqual(payload['usd_krw']['pair'], 'USD/KRW')

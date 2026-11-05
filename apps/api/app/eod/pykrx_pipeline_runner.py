@@ -231,6 +231,32 @@ def _is_pykrx_provider_failure(exc: BaseException) -> bool:
     return False
 
 
+def _pykrx_failure_type(exc: BaseException) -> str:
+    """Report the provider root type when a local recovery wrapper preserves it."""
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        error_type = type(current).__name__
+        lowered_type = error_type.lower()
+        message = str(current).lower()
+        if (
+            isinstance(current, (TimeoutError, ConnectionError))
+            or any(
+                token in lowered_type
+                for token in ('timeout', 'connection', 'transport')
+            )
+            or any(
+                marker in message
+                for marker in _PYKRX_PROVIDER_FAILURE_MESSAGE_MARKERS
+            )
+        ):
+            return error_type
+        current = current.__cause__ or current.__context__
+    return type(exc).__name__
+
+
 def _parse_market_date(value: str | date) -> date:
     normalized = str(value).strip()
     if len(normalized) == 8 and normalized.isdigit():
@@ -2817,6 +2843,66 @@ def _to_int_or_none(value: Any) -> int | None:
     return converted if converted > 0 else None
 
 
+def _to_nonnegative_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        if hasattr(value, 'item'):
+            value = value.item()
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted >= 0 else None
+
+
+def _exact_daily_bars(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    market_date: str,
+) -> list[dict[str, Any]]:
+    """Keep only a usable canonical close for the requested market date."""
+
+    exact: list[dict[str, Any]] = []
+    for raw_bar in bars:
+        trade_date = str(raw_bar.get('trade_date') or '').strip()
+        if trade_date != market_date:
+            continue
+        close_price = _to_int_or_none(raw_bar.get('close_price'))
+        if close_price is None:
+            continue
+        bar = dict(raw_bar)
+        bar['close_price'] = close_price
+        exact.append(bar)
+    return exact
+
+
+def _bar_from_exact_market_frame(
+    frame: Any,
+    *,
+    symbol: str,
+    market_date: str,
+) -> dict[str, Any] | None:
+    """Build one exact-date bar from PyKRX's market-wide ticker frame."""
+
+    open_price = _to_nonnegative_int_or_none(_frame_value(frame, symbol, '시가'))
+    high_price = _to_nonnegative_int_or_none(_frame_value(frame, symbol, '고가'))
+    low_price = _to_nonnegative_int_or_none(_frame_value(frame, symbol, '저가'))
+    close_price = _to_int_or_none(_frame_value(frame, symbol, '종가'))
+    volume = _to_nonnegative_int_or_none(_frame_value(frame, symbol, '거래량'))
+    turnover = _to_nonnegative_int_or_none(_frame_value(frame, symbol, '거래대금'))
+    if None in (open_price, high_price, low_price, close_price, volume, turnover):
+        return None
+    return {
+        'trade_date': date.fromisoformat(market_date),
+        'open_price': open_price,
+        'high_price': high_price,
+        'low_price': low_price,
+        'close_price': close_price,
+        'volume': volume,
+        'turnover': turnover,
+    }
+
+
 def _summarize_turnover_coverage(counters: Mapping[str, Any]) -> dict[str, Any]:
     total_bars = int(counters.get('total_bars') or 0)
     zero_volume_bars = int(counters.get('zero_volume_bars') or 0)
@@ -3620,6 +3706,13 @@ def run_market_data_pipeline(
     price_failure_types: set[str] = set()
     early_abort_triggered = False
     bars_upserted = 0
+    price_recovery: dict[str, Any] = {
+        'schema_version': 'same_run_exact_price_recovery_v1',
+        'attempted_symbols': [],
+        'recovered_symbols': [],
+        'unresolved_symbols': [],
+        'details': {},
+    }
 
     def terminalize_tracking_failure(
         exc: Exception,
@@ -3800,17 +3893,129 @@ def run_market_data_pipeline(
         for index, item in enumerate(symbols):
             symbol_started_at = time.perf_counter()
             try:
-                frame = dependencies.get_market_ohlcv_by_date(normalized_start, normalized_end, item.symbol)
-                if frame.empty:
-                    raise RuntimeError('No OHLCV rows returned.')
-                fundamentals_frame = None
-                if mode not in {'daily_auto', 'daily_stage_run'}:
-                    fundamentals_frame = service._load_symbol_fundamentals(
-                        symbol=item.symbol,
-                        start_date=normalized_start,
-                        end_date=normalized_end,
+                daily_exact_collection = mode in {
+                    'daily_auto',
+                    'daily_stage_run',
+                }
+                direct_failure: Exception | None = None
+                try:
+                    frame = dependencies.get_market_ohlcv_by_date(
+                        normalized_start,
+                        normalized_end,
+                        item.symbol,
                     )
-                bars = service._map_symbol_bars(frame, fundamentals_frame=fundamentals_frame)
+                    if frame.empty:
+                        raise RuntimeError('No OHLCV rows returned.')
+                    fundamentals_frame = None
+                    if not daily_exact_collection:
+                        fundamentals_frame = service._load_symbol_fundamentals(
+                            symbol=item.symbol,
+                            start_date=normalized_start,
+                            end_date=normalized_end,
+                        )
+                    bars = service._map_symbol_bars(
+                        frame,
+                        fundamentals_frame=fundamentals_frame,
+                    )
+                    if daily_exact_collection:
+                        bars = _exact_daily_bars(
+                            bars,
+                            market_date=latest_trade_date,
+                        )
+                        if not bars:
+                            raise RuntimeError(
+                                'No exact-date usable OHLCV row returned.'
+                            )
+                except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+                    raise
+                except Exception as exc:
+                    if not daily_exact_collection:
+                        raise
+                    direct_failure = exc
+                    price_recovery['attempted_symbols'].append(item.symbol)
+                    cache_key = (
+                        latest_trade_date.replace('-', ''),
+                        item.market,
+                    )
+                    getter = dependencies.get_market_ohlcv_by_ticker
+                    if (
+                        getter is not None
+                        and cache_key not in market_turnover_cache
+                    ):
+                        turnover_coverage_counters['market_fetch_attempts'] = (
+                            int(
+                                turnover_coverage_counters.get(
+                                    'market_fetch_attempts'
+                                )
+                                or 0
+                            )
+                            + 1
+                        )
+                        try:
+                            market_turnover_cache[cache_key] = getter(*cache_key)
+                        except Exception as fallback_exc:
+                            market_turnover_cache[cache_key] = None
+                            turnover_coverage_counters['market_fetch_failures'] = (
+                                int(
+                                    turnover_coverage_counters.get(
+                                        'market_fetch_failures'
+                                    )
+                                    or 0
+                                )
+                                + 1
+                            )
+                            dependencies.log_fetch(
+                                'fetch_exact_market_ohlcv_recovery',
+                                'failed',
+                                run_id=run_id,
+                                symbol=item.symbol,
+                                market=item.market,
+                                trade_date=latest_trade_date,
+                                error_type=type(fallback_exc).__name__,
+                                error_message=str(fallback_exc),
+                            )
+                    exact_market_frame = market_turnover_cache.get(cache_key)
+                    recovered_bar = _bar_from_exact_market_frame(
+                        exact_market_frame,
+                        symbol=item.symbol,
+                        market_date=latest_trade_date,
+                    )
+                    if recovered_bar is None:
+                        if (
+                            (
+                                exact_market_frame is None
+                                or bool(
+                                    getattr(
+                                        exact_market_frame,
+                                        'empty',
+                                        False,
+                                    )
+                                )
+                            )
+                            and _is_pykrx_provider_failure(direct_failure)
+                        ):
+                            raise direct_failure
+                        raise RuntimeError(
+                            'Exact-date OHLCV unavailable after same-run '
+                            'symbol and market-frame attempts.'
+                        ) from direct_failure
+                    bars = [recovered_bar]
+                    price_recovery['recovered_symbols'].append(item.symbol)
+                    price_recovery['details'][item.symbol] = {
+                        'status': 'recovered',
+                        'source': 'pykrx_market_ohlcv_by_ticker',
+                        'market_date': latest_trade_date,
+                        'direct_failure_type': type(direct_failure).__name__,
+                        'direct_failure_message': str(direct_failure),
+                    }
+                    dependencies.log_fetch(
+                        'fetch_exact_market_ohlcv_recovery',
+                        'completed',
+                        run_id=run_id,
+                        symbol=item.symbol,
+                        market=item.market,
+                        trade_date=latest_trade_date,
+                    )
                 invalid_turnover_before = int(
                     turnover_coverage_counters.get('invalid_turnover_bars') or 0
                 )
@@ -3862,7 +4067,15 @@ def run_market_data_pipeline(
             except Exception as exc:
                 symbols_failed += 1
                 failed_symbols.append(item.symbol)
-                price_failure_types.add(type(exc).__name__)
+                if item.symbol in price_recovery['attempted_symbols']:
+                    price_recovery['unresolved_symbols'].append(item.symbol)
+                    price_recovery['details'][item.symbol] = {
+                        'status': 'unresolved',
+                        'market_date': latest_trade_date,
+                        'error_type': type(exc).__name__,
+                        'error_message': str(exc),
+                    }
+                price_failure_types.add(_pykrx_failure_type(exc))
                 if _is_pykrx_provider_failure(exc):
                     provider_failure_count += 1
                 logger.warning('pykrx backfill failed for %s: %s', item.symbol, exc)
@@ -3882,6 +4095,7 @@ def run_market_data_pipeline(
                     mode == 'daily_auto'
                     and symbols_succeeded == 0
                     and symbols_failed >= min(PYKRX_PROVIDER_OUTAGE_EARLY_ABORT_FAILURES, len(symbols))
+                    and provider_failure_count == symbols_failed
                 ):
                     dependencies.log_fetch(
                         'run_collection',
@@ -3946,6 +4160,7 @@ def run_market_data_pipeline(
                     current_symbol=next_symbol,
                     extra={
                         'bars_upserted': bars_upserted,
+                        'price_recovery': price_recovery,
                         'turnover_coverage': turnover_coverage,
                         **_gap_policy_details(failed=symbols_failed, total=len(symbols)),
                     },
@@ -3994,7 +4209,10 @@ def run_market_data_pipeline(
             succeeded=symbols_succeeded,
             failed=symbols_failed,
             current_symbol=None,
-            extra={'bars_upserted': bars_upserted},
+            extra={
+                'bars_upserted': bars_upserted,
+                'price_recovery': price_recovery,
+            },
         )
         if failed_symbols:
             run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
@@ -4080,6 +4298,7 @@ def run_market_data_pipeline(
         run_metadata['provider_outage_suspected'] = provider_outage_suspected
         run_metadata['provider_outage_evidence'] = provider_outage_evidence
         run_metadata['retry_scope_status'] = retry_scope_status
+        run_metadata['price_recovery'] = price_recovery
         persist_stage_progress(
             stage='price_collection',
             status='partial',
@@ -4100,6 +4319,7 @@ def run_market_data_pipeline(
                 'unresolved_symbols': list(unresolved_symbols),
                 'unresolved_symbols_count': len(unresolved_symbols),
                 'retry_scope_status': retry_scope_status,
+                'price_recovery': price_recovery,
             },
         )
         complete_eod_run_or_fail_tracking(
@@ -4131,6 +4351,7 @@ def run_market_data_pipeline(
             'unattempted_symbols': unattempted_symbols[:50],
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
+            'price_recovery': price_recovery,
             'turnover_coverage': turnover_coverage,
             'turnover_invalid_symbols': turnover_invalid_symbols[:50],
             'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
@@ -4144,9 +4365,26 @@ def run_market_data_pipeline(
             'universe_snapshot': universe_snapshot,
         }
     if mode == 'daily_auto' and symbols_succeeded == 0 and symbols_failed > 0:
+        provider_outage_suspected = bool(
+            provider_failure_count == symbols_failed
+        )
+        error_type = (
+            'PykrxProviderUnavailable'
+            if provider_outage_suspected
+            else 'PykrxPriceScopeUnresolved'
+        )
         error_message = (
-            'PyKRX daily price collection failed for every requested symbol; '
-            'provider appears unavailable, so downstream EOD stages were not run.'
+            (
+                'PyKRX daily price collection failed for every requested '
+                'symbol; provider appears unavailable, so downstream EOD '
+                'stages were not run.'
+            )
+            if provider_outage_suspected
+            else (
+                'Every requested symbol remains without an exact same-day '
+                'usable price after symbol and market-frame attempts; '
+                'downstream EOD stages were not run.'
+            )
         )
         dependencies.log_fetch(
             'run_collection',
@@ -4161,13 +4399,17 @@ def run_market_data_pipeline(
             symbols_succeeded=symbols_succeeded,
             symbols_failed=symbols_failed,
             bars_upserted=bars_upserted,
-            error_type='PykrxProviderUnavailable',
+            error_type=error_type,
             error_message=error_message,
         )
         persist_stage_progress(
             stage='price_collection',
             status='failed',
-            current_step='price_collection_provider_unavailable',
+            current_step=(
+                'price_collection_provider_unavailable'
+                if provider_outage_suspected
+                else 'price_collection_scope_unresolved'
+            ),
             current_activity=error_message,
             processed=symbols_failed,
             total=len(symbols),
@@ -4176,11 +4418,16 @@ def run_market_data_pipeline(
             current_symbol=None,
             extra={
                 'bars_upserted': bars_upserted,
-                'provider_outage_suspected': True,
+                'provider_outage_suspected': provider_outage_suspected,
+                'price_recovery': price_recovery,
                 'downstream_stages_skipped': True,
             },
         )
         run_metadata = service._run_metadata_with_failed_symbols(run_metadata, failed_symbols)
+        run_metadata['provider_outage_suspected'] = (
+            provider_outage_suspected
+        )
+        run_metadata['price_recovery'] = price_recovery
         complete_eod_run_or_fail_tracking(
             status='failed',
             symbols_succeeded=symbols_succeeded,
@@ -4205,11 +4452,13 @@ def run_market_data_pipeline(
             'unattempted_symbols': unattempted_symbols[:50],
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
+            'price_recovery': price_recovery,
             'turnover_coverage': turnover_coverage,
             'turnover_invalid_symbols': turnover_invalid_symbols[:50],
             'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
-            'error_type': 'PykrxProviderUnavailable',
+            'error_type': error_type,
             'error_message': error_message,
+            'provider_outage_suspected': provider_outage_suspected,
             'refresh_universe': effective_refresh_universe,
             'universe_snapshot': universe_snapshot,
         }
@@ -5468,6 +5717,7 @@ def run_market_data_pipeline(
     run_metadata['turnover_invalid_symbols_count'] = len(
         run_metadata['turnover_invalid_symbols']
     )
+    run_metadata['price_recovery'] = price_recovery
     complete_eod_run_or_fail_tracking(
         status=status,
         symbols_succeeded=symbols_succeeded,
@@ -5495,6 +5745,7 @@ def run_market_data_pipeline(
         'downstream_retry_symbols': downstream_retry_symbol_codes[:50],
         'downstream_retry_symbols_count': len(downstream_retry_symbol_codes),
         'bars_upserted': bars_upserted,
+        'price_recovery': price_recovery,
         'turnover_coverage': turnover_coverage,
         'turnover_invalid_symbols': turnover_invalid_symbols[:50],
         'turnover_invalid_symbols_count': len(turnover_invalid_symbols),

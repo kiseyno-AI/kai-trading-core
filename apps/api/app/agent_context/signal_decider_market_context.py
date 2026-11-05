@@ -6,6 +6,7 @@ import logging
 import threading
 from typing import Any
 
+from app.core.settings import settings
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market.snapshot import market_snapshot_service, normalize_market_snapshot_payload
@@ -190,7 +191,12 @@ class SignalDeciderMarketContextBuilder:
             market_date=market_date,
             missing_fields=missing_fields,
         )
-        flows = self._build_flow_context(snapshot_markets=snapshot_markets, missing_fields=missing_fields)
+        flows = self._build_flow_context(
+            snapshot_markets=snapshot_markets,
+            market_date=market_date,
+            market_session=market_session,
+            missing_fields=missing_fields,
+        )
         summary = self._build_summary(
             market_date_text=market_date_text,
             snapshot_markets=snapshot_markets,
@@ -342,6 +348,8 @@ class SignalDeciderMarketContextBuilder:
         self,
         *,
         snapshot_markets: dict[str, Any],
+        market_date: date,
+        market_session: dict[str, Any],
         missing_fields: list[str],
     ) -> dict[str, Any]:
         flows: dict[str, Any] = {}
@@ -353,6 +361,17 @@ class SignalDeciderMarketContextBuilder:
         for key in EXPECTED_INDEX_KEYS:
             payload = snapshot_markets.get(key)
             if not isinstance(payload, dict):
+                missing_foreign = True
+                missing_institutional = True
+                continue
+            flow_leg = payload.get('flow_leg')
+            if not self._flow_leg_is_fresh_current_session(
+                flow_leg=flow_leg,
+                market_date=market_date,
+                require_live_freshness=self._requires_live_flow_freshness(
+                    market_session
+                ),
+            ):
                 missing_foreign = True
                 missing_institutional = True
                 continue
@@ -376,6 +395,54 @@ class SignalDeciderMarketContextBuilder:
         else:
             _append_missing_field(missing_fields, 'flows.institutional')
         return flows
+
+    @staticmethod
+    def _flow_leg_is_fresh_current_session(
+        *,
+        flow_leg: Any,
+        market_date: date,
+        require_live_freshness: bool,
+    ) -> bool:
+        if not isinstance(flow_leg, dict):
+            return False
+        flow_status = str(flow_leg.get('status') or '').strip().lower()
+        allowed_statuses = (
+            {'ready'}
+            if require_live_freshness
+            else {'ready', 'cached', 'unverified'}
+        )
+        if flow_status not in allowed_statuses:
+            return False
+        if flow_leg.get('current_session') is not True:
+            return False
+        if str(flow_leg.get('provider_business_date') or '').strip() != market_date.isoformat():
+            return False
+        session_time = str(flow_leg.get('provider_session_time') or '').strip()
+        if not ('09:00:00' <= session_time <= '15:30:00'):
+            return False
+        observed_at = _normalize_datetime(flow_leg.get('provider_observed_at'))
+        if observed_at is None or observed_at.tzinfo is None or observed_at.date() != market_date:
+            return False
+        if not require_live_freshness:
+            return True
+        age_seconds = _to_float(flow_leg.get('observation_age_seconds'))
+        return bool(
+            age_seconds is not None
+            and 0 <= age_seconds <= settings.market_snapshot_open_drive_max_age_seconds
+        )
+
+    @staticmethod
+    def _requires_live_flow_freshness(market_session: dict[str, Any]) -> bool:
+        if not bool(
+            market_session.get('requested_date_is_current_calendar_date')
+        ):
+            return False
+        current_state = str(
+            market_session.get('current_market_state')
+            or market_session.get('market_state')
+            or ''
+        ).strip().upper()
+        return current_state in {'PREOPEN', 'OPEN'}
 
     def _build_summary(
         self,

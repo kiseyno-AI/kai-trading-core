@@ -18711,6 +18711,63 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(price_collection_updates[-1]['status'], 'failed')
         self.assertEqual(price_collection_updates[-1]['current_step'], 'price_collection_provider_unavailable')
 
+    def test_daily_all_symbol_local_price_gaps_are_not_mislabeled_provider_outage(self) -> None:
+        service = PykrxBackfillService()
+        service.symbol_pause_seconds = 0
+        symbols = [
+            PykrxSymbol(symbol='0017J0', market='KOSPI', name_ko='Gap'),
+        ]
+
+        with (
+            patch.object(service, 'load_active_universe', return_value=symbols),
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                return_value=SimpleNamespace(empty=True),
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame(
+                    columns=[
+                        '시가',
+                        '고가',
+                        '저가',
+                        '종가',
+                        '거래량',
+                        '거래대금',
+                    ],
+                ),
+            ) as exact_market_fetch,
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=15,
+            ),
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='test',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=('price_collection',),
+                chain_fundamentals_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error_type'], 'PykrxPriceScopeUnresolved')
+        self.assertFalse(result['provider_outage_suspected'])
+        self.assertEqual(
+            result['price_recovery']['unresolved_symbols'],
+            ['0017J0'],
+        )
+
     def test_run_collection_aborts_on_price_persistence_database_failure(self) -> None:
         service = PykrxBackfillService()
         service.symbol_pause_seconds = 0
@@ -21408,6 +21465,20 @@ class PykrxBackfillServiceTests(TestCase):
             patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=12),
             patch('app.eod.pykrx_backfill._get_market_ohlcv_by_date', side_effect=price_frame),
             patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame(
+                    {
+                        '시가': [1],
+                        '고가': [2],
+                        '저가': [1],
+                        '종가': [2],
+                        '거래량': [3],
+                        '거래대금': [4],
+                    },
+                    index=['005930'],
+                ),
+            ) as exact_market_fetch,
+            patch(
                 'app.eod.pykrx_pipeline_runner._enrich_bars_with_market_turnover',
                 side_effect=lambda **kwargs: kwargs['bars'],
             ),
@@ -21486,10 +21557,229 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['status'], 'completed_with_errors')
         self.assertEqual(result['price_retry_symbols'], ['472220'])
         self.assertEqual(result['downstream_retry_symbols'], [])
+        self.assertEqual(
+            result['price_recovery']['unresolved_symbols'],
+            ['472220'],
+        )
+        self.assertEqual(
+            result['price_recovery']['details']['472220']['status'],
+            'unresolved',
+        )
+        exact_market_fetch.assert_called_once_with('20260403', 'KOSPI')
         self.assertEqual(result['technical_snapshots']['causally_skipped_symbols'], ['472220'])
         completed_metadata = complete_run.call_args.kwargs['run_metadata']
         self.assertEqual(completed_metadata['failed_symbols'], ['472220'])
         self.assertEqual(completed_metadata['downstream_retry_symbols'], [])
+
+    def test_daily_price_collection_recovers_alphanumeric_symbol_from_exact_market_frame(self) -> None:
+        service = PykrxBackfillService()
+        service.symbol_pause_seconds = 0
+        symbols = [
+            PykrxSymbol(
+                symbol='0017J0',
+                market='KOSPI',
+                name_ko='Alphanumeric Listing',
+            ),
+        ]
+        exact_market_frame = pd.DataFrame(
+            {
+                '시가': [1000],
+                '고가': [1040],
+                '저가': [990],
+                '종가': [1025],
+                '거래량': [12345],
+                '거래대금': [12653625],
+            },
+            index=['0017J0'],
+        )
+
+        with (
+            patch.object(service, 'load_active_universe', return_value=symbols),
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=13,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                return_value=SimpleNamespace(empty=False),
+            ),
+            patch.object(
+                service,
+                '_map_symbol_bars',
+                return_value=[
+                    {
+                        'trade_date': '2026-04-02',
+                        'open_price': 980,
+                        'high_price': 1010,
+                        'low_price': 970,
+                        'close_price': 1000,
+                        'volume': 10000,
+                        'turnover': 10000000,
+                    },
+                ],
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=exact_market_frame,
+            ) as exact_market_fetch,
+            patch(
+                'app.eod.pykrx_backfill.persist_daily_price_bars',
+                return_value=1,
+            ) as persist_bars,
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={
+                    'requested_symbols': 1,
+                    'contexts_persisted': 1,
+                    'contexts_failed': 0,
+                    '_retry_metadata': {'failed_symbols': []},
+                    **_atomic_exact_scope_proof(
+                        manifest_version='price_contexts_scope_outcomes_v1',
+                        selected_symbols=['0017J0'],
+                        successful_symbols=['0017J0'],
+                        retry_debt_symbols=[],
+                    ),
+                },
+            ),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='test',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=('price_collection',),
+                chain_fundamentals_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_succeeded'], 1)
+        self.assertEqual(result['symbols_failed'], 0)
+        self.assertEqual(result['price_retry_symbols'], [])
+        self.assertEqual(result['price_recovery']['recovered_symbols'], ['0017J0'])
+        exact_market_fetch.assert_called_once_with('20260403', 'KOSPI')
+        persisted = persist_bars.call_args.args[1]
+        self.assertEqual(
+            persisted,
+            [
+                {
+                    'trade_date': date(2026, 4, 3),
+                    'open_price': 1000,
+                    'high_price': 1040,
+                    'low_price': 990,
+                    'close_price': 1025,
+                    'volume': 12345,
+                    'turnover': 12653625,
+                },
+            ],
+        )
+
+    def test_symbol_local_price_gaps_do_not_trigger_provider_outage_early_abort(self) -> None:
+        service = PykrxBackfillService()
+        service.symbol_pause_seconds = 0
+        missing_symbols = [f'{value:06d}' for value in range(1, 21)]
+        symbols = [
+            *[
+                PykrxSymbol(symbol=value, market='KOSPI', name_ko=value)
+                for value in missing_symbols
+            ],
+            PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Healthy'),
+        ]
+
+        def price_frame(_start: str, _end: str, symbol: str) -> SimpleNamespace:
+            return SimpleNamespace(empty=symbol in missing_symbols)
+
+        with (
+            patch.object(service, 'load_active_universe', return_value=symbols),
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch.object(
+                service,
+                '_map_symbol_bars',
+                return_value=[
+                    {
+                        'trade_date': '2026-04-03',
+                        'open_price': 1,
+                        'high_price': 2,
+                        'low_price': 1,
+                        'close_price': 2,
+                        'volume': 3,
+                        'turnover': 4,
+                    },
+                ],
+            ),
+            patch(
+                'app.eod.pykrx_backfill.create_eod_collection_run',
+                return_value=14,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
+                side_effect=price_frame,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                side_effect=TimeoutError('market frame unavailable'),
+            ) as exact_market_fetch,
+            patch(
+                'app.eod.pykrx_pipeline_runner._enrich_bars_with_market_turnover',
+                side_effect=lambda **kwargs: kwargs['bars'],
+            ),
+            patch(
+                'app.eod.pykrx_backfill.persist_daily_price_bars',
+                return_value=1,
+            ) as persist_bars,
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
+            patch(
+                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
+                return_value={
+                    'requested_symbols': 21,
+                    'contexts_persisted': 1,
+                    'contexts_failed': 20,
+                    '_retry_metadata': {
+                        'failed_symbols': missing_symbols,
+                    },
+                    **_atomic_exact_scope_proof(
+                        manifest_version='price_contexts_scope_outcomes_v1',
+                        selected_symbols=[*missing_symbols, '005930'],
+                        successful_symbols=['005930'],
+                        retry_debt_symbols=missing_symbols,
+                    ),
+                },
+            ) as price_contexts,
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
+        ):
+            result = service._run_market_data_pipeline(
+                start_date='20260403',
+                end_date='20260403',
+                markets=('KOSPI',),
+                trigger='test',
+                refresh_universe=False,
+                mode='daily_auto',
+                selected_stages=('price_collection',),
+                chain_fundamentals_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed_with_errors')
+        self.assertEqual(result['symbols_succeeded'], 1)
+        self.assertEqual(result['failed_symbols'], missing_symbols)
+        self.assertEqual(
+            result['price_recovery']['unresolved_symbols'],
+            missing_symbols,
+        )
+        self.assertEqual(price_contexts.call_args.kwargs['symbols'], ['005930'])
+        self.assertEqual(persist_bars.call_args.args[0], '005930')
+        exact_market_fetch.assert_called_once_with('20260403', 'KOSPI')
 
     def test_run_market_data_pipeline_finalizes_empty_symbol_stages_when_no_price_was_collected(self) -> None:
         service = PykrxBackfillService()

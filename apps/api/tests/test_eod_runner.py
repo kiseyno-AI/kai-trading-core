@@ -325,7 +325,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         after_window = MarketState(
             **{
                 **open_market.__dict__,
-                'server_time': '2026-04-30T14:31:00+09:00',
+                'server_time': '2026-04-30T15:31:00+09:00',
             }
         )
 
@@ -392,12 +392,72 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    def test_snapshot_force_window_includes_preopen_and_full_session_boundaries(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=60)
+
+        def market_at(server_time: str, *, state: str) -> MarketState:
+            return MarketState(
+                market='KRX',
+                state=state,
+                is_trading_day=True,
+                is_open=state == 'OPEN',
+                server_time=server_time,
+                session_open_at='2026-04-30T09:00:00+09:00',
+                session_close_at='2026-04-30T15:30:00+09:00',
+            )
+
+        with patch(
+            'app.eod.runner.settings.market_snapshot_open_drive_refresh_interval_seconds',
+            300,
+        ):
+            self.assertFalse(
+                runner._claim_market_snapshot_open_drive_refresh(
+                    market_at(
+                        '2026-04-30T08:49:59+09:00',
+                        state='PREOPEN',
+                    )
+                )
+            )
+            self.assertTrue(
+                runner._claim_market_snapshot_open_drive_refresh(
+                    market_at(
+                        '2026-04-30T08:50:00+09:00',
+                        state='PREOPEN',
+                    )
+                )
+            )
+            self.assertFalse(
+                runner._claim_market_snapshot_open_drive_refresh(
+                    market_at(
+                        '2026-04-30T08:54:59+09:00',
+                        state='PREOPEN',
+                    )
+                )
+            )
+            self.assertTrue(
+                runner._claim_market_snapshot_open_drive_refresh(
+                    market_at(
+                        '2026-04-30T15:30:59+09:00',
+                        state='OPEN',
+                    )
+                )
+            )
+            self.assertFalse(
+                runner._claim_market_snapshot_open_drive_refresh(
+                    market_at(
+                        '2026-04-30T15:31:00+09:00',
+                        state='OPEN',
+                    )
+                )
+            )
+
     async def test_market_snapshot_refresh_is_forced_only_during_open_drive_window(self) -> None:
         cases = (
             ('2026-04-30T09:10:00+09:00', True),
             ('2026-04-30T09:21:00+09:00', True),
             ('2026-04-30T14:30:00+09:00', True),
-            ('2026-04-30T14:31:00+09:00', False),
+            ('2026-04-30T14:31:00+09:00', True),
+            ('2026-04-30T15:31:00+09:00', False),
         )
 
         for server_time, expected_force in cases:
@@ -1991,7 +2051,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             state='PREOPEN',
             is_trading_day=True,
             is_open=False,
-            server_time='2026-09-14T08:00:00+09:00',
+            server_time='2026-09-14T08:50:00+09:00',
             session_open_at='2026-09-14T09:00:00+09:00',
             session_close_at='2026-09-14T15:30:00+09:00',
             latest_valid_trading_date='2026-09-11',
@@ -2043,7 +2103,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market_clock.await_count, 2)
         refresh_snapshot.assert_awaited_once_with(
             trigger='background_runner:preopen:daily_pipeline_preflight',
-            force_index=False,
+            force_index=True,
         )
         refresh_master.assert_called_once_with()
         refresh_plan.assert_called_once_with(
