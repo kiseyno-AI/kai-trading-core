@@ -724,7 +724,7 @@ class EODRunStageSupportTests(unittest.TestCase):
                 )
             )
 
-    def test_previous_session_preopen_recovery_expires_at_open(self):
+    def test_previous_session_preopen_recovery_continues_through_open(self):
         preopen = SimpleNamespace(
             state='PREOPEN',
             server_time='2026-09-14T08:59:00+09:00',
@@ -732,6 +732,10 @@ class EODRunStageSupportTests(unittest.TestCase):
         opened = SimpleNamespace(
             state='OPEN',
             server_time='2026-09-14T09:00:00+09:00',
+        )
+        closed = SimpleNamespace(
+            state='CLOSED',
+            server_time='2026-09-14T15:31:00+09:00',
         )
 
         with patch(
@@ -746,14 +750,32 @@ class EODRunStageSupportTests(unittest.TestCase):
                     allow_previous_session_preopen_recovery=True,
                 )
             )
-            opened_result = build_next_open_window_expired_result(
+            self.assertIsNone(
+                build_next_open_window_expired_result(
+                    market_date='2026-09-11',
+                    market=opened,
+                    allow_previous_session_preopen_recovery=True,
+                )
+            )
+            unadmitted_opened_result = (
+                build_next_open_window_expired_result(
+                    market_date='2026-09-11',
+                    market=opened,
+                )
+            )
+            closed_result = build_next_open_window_expired_result(
                 market_date='2026-09-11',
-                market=opened,
+                market=closed,
                 allow_previous_session_preopen_recovery=True,
             )
 
-        self.assertEqual(opened_result['reason'], 'next_open_window_expired')
-        self.assertEqual(opened_result['market_state'], 'OPEN')
+        self.assertEqual(
+            unadmitted_opened_result['reason'],
+            'next_open_window_expired',
+        )
+        self.assertEqual(unadmitted_opened_result['market_state'], 'OPEN')
+        self.assertEqual(closed_result['reason'], 'next_open_window_expired')
+        self.assertEqual(closed_result['market_state'], 'CLOSED')
 
     def test_exact_auto_pitr_intraday_watch_recovery_request_is_narrow(self):
         request = {

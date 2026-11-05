@@ -8648,9 +8648,10 @@ class DailyPipelineStageService:
         if stage_id == 'next_open_execution_plan':
             from app.orders.next_open_execution import signal_decider_next_open_execution_service
 
+            plan_market = get_market_state()
             expired_result = build_next_open_window_expired_result(
                 market_date=market_date,
-                market=get_market_state(),
+                market=plan_market,
                 allow_same_day_intraday_watch_continuation=(
                     allow_same_day_intraday_watch_continuation
                 ),
@@ -8660,6 +8661,26 @@ class DailyPipelineStageService:
             )
             if expired_result is not None:
                 return {**expired_result, 'stage': stage_id}
+            if (
+                str(getattr(plan_market, 'state', '') or '').strip().upper()
+                == 'OPEN'
+                and (
+                    allow_same_day_intraday_watch_continuation
+                    or allow_previous_session_preopen_recovery
+                )
+                and self.validated_stage_completion_scope_proof(
+                    'signal_decider',
+                    completion_parent_proof,
+                )
+                is None
+            ):
+                return {
+                    'triggered': False,
+                    'status': 'blocked',
+                    'reason': 'late_open_completion_proof_unavailable',
+                    'market_date': market_date,
+                    'stage': stage_id,
+                }
             target_trade_date = (date.fromisoformat(market_date) + timedelta(days=1)).isoformat()
             return signal_decider_next_open_execution_service.refresh_plan_items(
                 target_trade_date=target_trade_date,

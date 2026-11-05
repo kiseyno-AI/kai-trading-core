@@ -10482,6 +10482,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self,
     ) -> None:
         service = DailyPipelineStageService()
+        completion_proof = _terminal_decider_completion_proof(
+            symbols=['005930'],
+            cutoff_at=datetime(2026, 9, 13, 23, 30, tzinfo=timezone.utc),
+        )
         market = MagicMock(
             state='OPEN',
             server_time='2026-09-14T09:01:00+09:00',
@@ -10521,6 +10525,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 reuse_existing_feedback=True,
                 point_in_time_recovery=True,
                 allow_same_day_intraday_watch_continuation=True,
+                completion_parent_proof=completion_proof,
             )
 
         self.assertEqual(result['status'], 'completed')
@@ -10528,8 +10533,118 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             target_trade_date='2026-09-12',
             trigger='daily_pipeline_post_decider',
             force=False,
-            completion_parent_proof=None,
+            completion_parent_proof=completion_proof,
         )
+
+    def test_execute_stage_hands_previous_session_preopen_recovery_to_open_plan(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        completion_proof = _terminal_decider_completion_proof(
+            symbols=['005930'],
+            cutoff_at=datetime(2026, 9, 13, 23, 30, tzinfo=timezone.utc),
+        )
+        market = MagicMock(
+            state='OPEN',
+            server_time='2026-09-14T09:01:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 9, 14),
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'signal_decider_next_open_execution_service.'
+                'refresh_plan_items',
+                return_value={'status': 'completed'},
+            ) as refresh_plan,
+        ):
+            result = service._execute_stage(
+                stage_id='next_open_execution_plan',
+                market_date='2026-09-11',
+                symbols=None,
+                markets=[],
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+                point_in_time_recovery=True,
+                allow_previous_session_preopen_recovery=True,
+                completion_parent_proof=completion_proof,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        refresh_plan.assert_called_once_with(
+            target_trade_date='2026-09-12',
+            trigger='daily_pipeline_post_decider',
+            force=False,
+            completion_parent_proof=completion_proof,
+        )
+
+    def test_execute_stage_blocks_admitted_open_plan_without_completion_proof(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        market = MagicMock(
+            state='OPEN',
+            server_time='2026-09-14T09:01:00+09:00',
+        )
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 9, 14),
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'signal_decider_next_open_execution_service.'
+                'refresh_plan_items',
+            ) as refresh_plan,
+        ):
+            result = service._execute_stage(
+                stage_id='next_open_execution_plan',
+                market_date='2026-09-11',
+                symbols=None,
+                markets=[],
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+                point_in_time_recovery=True,
+                allow_previous_session_preopen_recovery=True,
+                completion_parent_proof=None,
+            )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(
+            result['reason'],
+            'late_open_completion_proof_unavailable',
+        )
+        refresh_plan.assert_not_called()
 
     def test_execute_stage_skips_expired_prior_date_decision_replay(
         self,
@@ -10740,6 +10855,108 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
         self.assertTrue(result['completed'])
         self.assertEqual(len(feedback_retry_service.calls), 1)
+
+    def test_execute_decider_keeps_previous_session_preopen_admission_after_open(
+        self,
+    ) -> None:
+        feedback_retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(
+            feedback_retry_service=feedback_retry_service,
+        )
+        call_kwargs = {
+            'stage_id': 'signal_decider',
+            'market_date': '2026-09-11',
+            'symbols': ['005930'],
+            'markets': [],
+            'force': False,
+            'bypass_prerequisite_gate': False,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+            'allow_previous_session_preopen_recovery': True,
+        }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                side_effect=[
+                    MagicMock(
+                        state='PREOPEN',
+                        server_time='2026-09-14T08:59:00+09:00',
+                    ),
+                    MagicMock(
+                        state='OPEN',
+                        server_time='2026-09-14T09:01:00+09:00',
+                    ),
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 9, 14),
+            ),
+        ):
+            result = service._execute_stage(**call_kwargs)
+
+        self.assertTrue(result['completed'])
+        self.assertNotIn('completed_after_action_window', result)
+        self.assertEqual(len(feedback_retry_service.calls), 1)
+
+    def test_execute_evaluations_keep_previous_session_admission_after_open(
+        self,
+    ) -> None:
+        evaluation_service = _FakeSignalDeciderEvaluationService()
+        service = DailyPipelineStageService(
+            decision_loop_service=evaluation_service,
+        )
+        call_kwargs = {
+            'stage_id': 'signal_decider_evaluations',
+            'market_date': '2026-09-11',
+            'symbols': ['005930'],
+            'markets': [],
+            'force': False,
+            'bypass_prerequisite_gate': True,
+            'fs_div': 'CFS',
+            'symbol_limit': None,
+            'symbol_offset': 0,
+            'capture_limit': 500,
+            'retry_cycles': None,
+            'feedback_max_cycles': 3,
+            'feedback_outer_batch_size': 20,
+            'reuse_existing_feedback': True,
+            'allow_previous_session_preopen_recovery': True,
+        }
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.get_market_state',
+                side_effect=[
+                    MagicMock(
+                        state='PREOPEN',
+                        server_time='2026-09-14T08:59:00+09:00',
+                    ),
+                    MagicMock(
+                        state='OPEN',
+                        server_time='2026-09-14T09:01:00+09:00',
+                    ),
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution.'
+                'normalize_next_open_target_trade_date',
+                return_value=date(2026, 9, 14),
+            ),
+        ):
+            result = service._execute_stage(**call_kwargs)
+
+        self.assertEqual(result['summary']['evaluations_upserted'], 4)
+        self.assertNotIn('completed_after_action_window', result)
+        self.assertEqual(len(evaluation_service.calls), 1)
 
     def test_auto_pitr_preopen_plan_only_does_not_persist_admission(
         self,

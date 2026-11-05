@@ -83,7 +83,10 @@ def build_next_open_window_expired_result(
         )
         or target_trade_date > current_market_date
         or (
-            allow_same_day_intraday_watch_continuation
+            (
+                allow_same_day_intraday_watch_continuation
+                or allow_previous_session_preopen_recovery
+            )
             and market_state == 'OPEN'
             and target_trade_date == current_market_date
         )
@@ -1571,10 +1574,12 @@ def admits_previous_session_preopen_auto_recovery(
     """Admit a proven automatic prior-session suffix before the open.
 
     This admission is intentionally separate from the same-day intraday-watch
-    contract: it lets the scheduler finish yesterday's decision suffix during
-    today's PREOPEN, but it expires immediately when the market becomes OPEN.
-    A broader recovery may enter only when it is an intact suffix of the
-    caller's canonical order and recomputes the complete decision tail.
+    contract: only PREOPEN can admit yesterday's decision suffix. Once
+    admitted, that exact run may finish during the target day's OPEN session;
+    the execution planner still limits late output to bounded trigger-gated
+    watches and expires ordinary next-open BUY authority per item. A broader
+    recovery may enter only when it is an intact suffix of the caller's
+    canonical order and recomputes the complete decision tail.
     """
 
     market_state = str(getattr(market, 'state', '') or '').strip().upper()
