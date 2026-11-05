@@ -6039,6 +6039,225 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['stop_loss_price'], 49_000)
         self.assertTrue(item['exec_monitoring_active'])
 
+    def test_complete_signal_wait_skips_blank_top_level_price_placeholders(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='wait',
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            target_price=54_000,
+            stop_loss_price=49_000,
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            self.assertIsNotNone(snapshot)
+            response_payload = dict(snapshot.response_payload or {})
+            response_payload.update(
+                {
+                    'trigger_price': ' ',
+                    'chase_limit_price': '',
+                    'target_price': '\t',
+                    'stop_loss_price': '',
+                    'details': {
+                        'decision_support': {
+                            'trigger_price': 50_500,
+                            'chase_limit_price': 51_500,
+                            'target_price': 54_000,
+                            'stop_loss_price': 49_000,
+                        }
+                    },
+                }
+            )
+            snapshot.target_price = None
+            snapshot.stop_loss_price = None
+            snapshot.response_payload = response_payload
+
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_snapshot_id'] == snapshot_id
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertEqual(item['trigger_price'], 50_500)
+        self.assertEqual(item['chase_limit_price'], 51_500)
+        self.assertEqual(item['target_price'], 54_000)
+        self.assertEqual(item['stop_loss_price'], 49_000)
+        self.assertTrue(item['handoff_active'])
+        self.assertTrue(item['exec_monitoring_active'])
+
+    def test_complete_short_term_wait_skips_blank_top_level_price_placeholders(
+        self,
+    ) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_short_term_snapshot(
+            symbol='0001A0',
+            tactical_action='wait',
+            trigger_price=9_900,
+            chase_limit_price=10_100,
+            target_price=10_600,
+            stop_loss_price=9_600,
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            self.assertIsNotNone(snapshot)
+            response_payload = dict(snapshot.response_payload or {})
+            response_payload.update(
+                {
+                    'trigger_price': '',
+                    'chase_limit_price': ' ',
+                    'target_price': '',
+                    'stop_loss_price': '\n',
+                }
+            )
+            traceability_payload = dict(snapshot.traceability_payload or {})
+            traceability_payload['tactical_context'] = {
+                **dict(traceability_payload.get('tactical_context') or {}),
+                'trigger_price': 9_900,
+                'chase_limit_price': 10_100,
+                'target_price': 10_600,
+                'stop_loss_price': 9_600,
+            }
+            snapshot.target_price = None
+            snapshot.stop_loss_price = None
+            snapshot.response_payload = response_payload
+            snapshot.traceability_payload = traceability_payload
+
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 9_800}],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_snapshot_id'] == snapshot_id
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertEqual(item['trigger_price'], 9_900)
+        self.assertEqual(item['chase_limit_price'], 10_100)
+        self.assertEqual(item['target_price'], 10_600)
+        self.assertEqual(item['stop_loss_price'], 9_600)
+        self.assertTrue(item['handoff_active'])
+        self.assertTrue(item['exec_monitoring_active'])
+
+    def test_explicit_invalid_top_level_prices_block_nested_fallback(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        signal_snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='wait',
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            target_price=54_000,
+            stop_loss_price=49_000,
+        )
+        short_snapshot_id = self._seed_short_term_snapshot(
+            symbol='0001A0',
+            tactical_action='watch_for_trigger',
+            trigger_price=9_900,
+            chase_limit_price=10_100,
+            target_price=10_600,
+            stop_loss_price=9_600,
+        )
+        with session_scope() as session:
+            signal_snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                signal_snapshot_id,
+            )
+            short_snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                short_snapshot_id,
+            )
+            self.assertIsNotNone(signal_snapshot)
+            self.assertIsNotNone(short_snapshot)
+
+            signal_response = dict(signal_snapshot.response_payload or {})
+            signal_response['trigger_price'] = 0
+            signal_response['chase_limit_price'] = -1
+            signal_response['details'] = {
+                'decision_support': {
+                    'trigger_price': 50_500,
+                    'chase_limit_price': 51_500,
+                    'target_price': 54_000,
+                    'stop_loss_price': 49_000,
+                }
+            }
+            signal_snapshot.response_payload = signal_response
+
+            short_response = dict(short_snapshot.response_payload or {})
+            short_response['trigger_price'] = 'not-a-price'
+            short_snapshot.response_payload = short_response
+            short_traceability = dict(short_snapshot.traceability_payload or {})
+            short_traceability['tactical_context'] = {
+                **dict(short_traceability.get('tactical_context') or {}),
+                'trigger_price': 9_900,
+                'chase_limit_price': 10_100,
+                'target_price': 10_600,
+                'stop_loss_price': 9_600,
+            }
+            short_snapshot.traceability_payload = short_traceability
+
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 10_000}],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        by_snapshot = {
+            item['decision_snapshot_id']: item for item in result['items']
+        }
+        for snapshot_id in (signal_snapshot_id, short_snapshot_id):
+            item = by_snapshot[snapshot_id]
+            self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+            self.assertFalse(item['handoff_active'])
+            self.assertFalse(item['exec_monitoring_active'])
+            self.assertIn(
+                'trigger_price_missing',
+                {
+                    reason['code']
+                    for reason in item['validation']['blocking_reasons']
+                },
+            )
+        self.assertIn(
+            'chase_limit_price_missing',
+            {
+                reason['code']
+                for reason in by_snapshot[signal_snapshot_id]['validation'][
+                    'blocking_reasons'
+                ]
+            },
+        )
+
     def test_complete_short_term_wait_is_delegated_as_independent_exec_watch(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         signal_snapshot_id = self._seed_snapshot(

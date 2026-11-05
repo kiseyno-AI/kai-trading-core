@@ -1970,7 +1970,13 @@ def _trigger_entry_price_values(
     )
 
     def _first_persisted_value(*values: Any) -> Any:
-        return next((value for value in values if value is not None), None)
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+        return None
 
     trigger_price = _to_decimal(
         _first_persisted_value(
@@ -9321,9 +9327,9 @@ class SignalDeciderNextOpenExecutionService:
             target_price = int(signal_trigger_levels['target_price'])
             stop_loss_price = int(signal_trigger_levels['stop_loss_price'])
         elif decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
-            target_price = snapshot.target_price if snapshot.target_price is not None else _to_int(response_payload.get('target_price'))
-            stop_loss_price = (
-                snapshot.stop_loss_price if snapshot.stop_loss_price is not None else _to_int(response_payload.get('stop_loss_price'))
+            target_price = _to_int(trigger_entry_price_values['target_price'])
+            stop_loss_price = _to_int(
+                trigger_entry_price_values['stop_loss_price']
             )
             suggested_holding_period = _short_term_field_text(snapshot, 'expected_holding_period') or snapshot.suggested_holding_period
         row.decision_snapshot_id = snapshot.id
