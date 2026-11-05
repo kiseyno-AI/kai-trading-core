@@ -831,6 +831,8 @@ class KISRealtimePriceService:
             > Decimal('0')
         ):
             return 2
+        if item.get('exec_monitoring_active') is True:
+            return 1
         if monitoring_state in {'watching_target_stop', 'reconciling'}:
             return 1
         return 0

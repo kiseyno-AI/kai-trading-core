@@ -1258,6 +1258,38 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot['limited_symbols'], ['005930'])
         self.assertEqual(snapshot['protected_symbols'], ['030000'])
 
+    async def test_partial_source_prioritizes_active_exec_watch_over_passive_observation(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['005930'],
+            trigger='cached-passive-observation',
+            preserve_order=True,
+        )
+        payload = _runtime_source_payload(
+            ['005930', '030000'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=False,
+        )
+        payload['items'][1].update(
+            {
+                'monitoring_state': 'watching_fill',
+                'exec_monitoring_active': True,
+                'exec_runtime_showable': True,
+            }
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            payload,
+            trigger='partial-active-exec-watch',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['030000'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+        self.assertEqual(snapshot['protected_symbols'], ['030000'])
+
     async def test_planned_exit_intents_alone_do_not_take_capacity(self) -> None:
         settings.kis_realtime_price_max_subscriptions = 1
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())

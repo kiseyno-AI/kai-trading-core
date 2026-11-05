@@ -16669,7 +16669,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('xxxx', board_payload)
         self.assertLess(len(board_payload.encode('utf-8')), 20000)
 
-    async def test_runtime_monitored_symbols_include_target_stop_watch_from_partial_read_model(self) -> None:
+    async def test_runtime_monitored_symbols_keep_unsubmitted_blocked_geometry_idle(self) -> None:
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             row.eligibility_status = 'blocked'
@@ -16699,11 +16699,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(monitored['summary']['items_total'], 1)
-        self.assertEqual(monitored['summary']['watching_fill'], 1)
+        self.assertEqual(monitored['summary']['watching_fill'], 0)
+        self.assertEqual(monitored['summary']['idle'], 1)
         self.assertEqual(monitored['freshness']['status'], 'partial')
         self.assertEqual(monitored['freshness']['readback_missing_count'], 1)
         self.assertEqual(monitored['items'][0]['symbol'], self.symbol)
-        self.assertEqual(monitored['items'][0]['monitoring_state'], 'watching_fill')
+        self.assertEqual(monitored['items'][0]['monitoring_state'], 'idle')
+        self.assertFalse(monitored['items'][0]['exec_monitoring_active'])
         self.assertEqual(monitored['items'][0]['planned_intents'], ['stop_sell', 'target_sell'])
         self.assertEqual(self.client.runtime_calls, 0)
         self.assertEqual(self.client.order_calls, [])

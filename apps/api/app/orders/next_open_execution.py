@@ -1716,7 +1716,7 @@ def _has_trustworthy_decision_input_quality_envelope(
 
 def _context_market_date(
     *contexts: dict[str, Any],
-    default: date,
+    default: date | None,
 ) -> date | None:
     for context in contexts:
         if not isinstance(context, dict):
@@ -1836,7 +1836,7 @@ def _structured_close_price_mismatch(
         source_date = _context_market_date(
             price_payload,
             enclosing_payload,
-            default=snapshot.market_date,
+            default=None,
         )
         if (
             close_price is None
@@ -3423,6 +3423,11 @@ class SignalDeciderNextOpenExecutionService:
                 current_agent_context = self._attach_snapshot_generation_validation(
                     agent_context_completeness=current_agent_context,
                     generation_validation=generation_validation,
+                )
+                current_agent_context = _candidate_agent_context(
+                    current_agent_context,
+                    symbol=scope[0],
+                    decision_agent_name=decision_agent_name,
                 )
 
                 if (
@@ -8521,7 +8526,23 @@ class SignalDeciderNextOpenExecutionService:
                 'canonical_price_evidence': close_price_mismatch['canonical_price_evidence'],
                 'conflicts': close_price_mismatch['conflicts'],
             }
-            blocking_reasons.append(close_price_mismatch_reason)
+            if handoff_intent == 'intraday_watch_buy':
+                warnings.append(
+                    {
+                        **close_price_mismatch_reason,
+                        'code': (
+                            'structured_close_price_mismatch_'
+                            'delegated_to_exec_watch'
+                        ),
+                        'message': (
+                            f"{close_price_mismatch_reason['message']} "
+                            'The bounded watch remains active; live trigger and '
+                            'chase prices remain authoritative before any order.'
+                        ),
+                    }
+                )
+            else:
+                blocking_reasons.append(close_price_mismatch_reason)
         if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
             snapshot.specialist_disagreement_payload
         ):

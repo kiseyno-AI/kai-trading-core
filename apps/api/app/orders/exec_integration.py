@@ -8009,6 +8009,7 @@ class SignalDeciderExecIntegrationService:
             and exec_membership_complete
             and monitoring_state
             in {
+                UI_MONITORING_STATE_WATCHING_FILL,
                 UI_MONITORING_STATE_WATCHING_TARGET_STOP,
                 UI_MONITORING_STATE_RECONCILING,
             }
@@ -16038,8 +16039,6 @@ class SignalDeciderExecIntegrationService:
             UI_BOARD_STATUS_SUBMITTED,
             UI_BOARD_STATUS_PARTIAL,
         }:
-            return UI_MONITORING_STATE_WATCHING_FILL
-        if has_target_stop_watch:
             return UI_MONITORING_STATE_WATCHING_FILL
         return UI_MONITORING_STATE_IDLE
 

@@ -284,6 +284,32 @@ def test_structured_close_mismatch_ignores_same_basis_sub_tolerance_difference()
     assert _structured_close_price_mismatch(snapshot) is None
 
 
+def test_structured_close_mismatch_does_not_infer_auxiliary_market_date() -> None:
+    snapshot = SimpleNamespace(
+        symbol='005930',
+        market_date=date(2026, 10, 6),
+        request_payload={
+            'symbol_day_context': {
+                'market_date': '2026-10-06',
+                'price_context': {
+                    'trade_date': '2026-10-06',
+                    'close_price': 50_000,
+                    'price_source': 'daily_price_bars',
+                    'adjusted': False,
+                },
+            },
+            'sector_peer_context': {
+                'close_price': 51_000,
+                'price_source': 'pykrx',
+                'adjusted': False,
+            },
+        },
+        response_payload={},
+    )
+
+    assert _structured_close_price_mismatch(snapshot) is None
+
+
 def test_dispatch_authority_source_locks_use_one_deadlock_safe_order() -> None:
     session = MagicMock()
     bind = MagicMock()
@@ -6397,7 +6423,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('data_quality_warnings_present', block_codes)
         self.assertIn('decision_input_quality_liquidity_turnover_hard_block', block_codes)
 
-    def test_refresh_plan_items_fails_closed_for_same_market_date_structured_close_mismatch(
+    def test_refresh_plan_items_delegates_watch_close_mismatch_to_exec(
         self,
     ) -> None:
         snapshot_id = self._seed_short_term_snapshot(symbol='005930')
@@ -6449,14 +6475,78 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         item = result['items'][0]
         block_codes = {reason['code'] for reason in item['validation']['blocking_reasons']}
-        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
-        self.assertIn('structured_close_price_mismatch', block_codes)
+        warning_codes = {reason['code'] for reason in item['validation']['warnings']}
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertNotIn('structured_close_price_mismatch', block_codes)
+        self.assertIn(
+            'structured_close_price_mismatch_delegated_to_exec_watch',
+            warning_codes,
+        )
         mismatch = next(
             reason
-            for reason in item['validation']['blocking_reasons']
-            if reason['code'] == 'structured_close_price_mismatch'
+            for reason in item['validation']['warnings']
+            if reason['code']
+            == 'structured_close_price_mismatch_delegated_to_exec_watch'
         )
         self.assertEqual(mismatch['comparison_status'], 'price_value_mismatch')
+
+    def test_refresh_plan_items_keeps_direct_buy_close_mismatch_blocked(
+        self,
+    ) -> None:
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                snapshot_id,
+            )
+            request_payload = copy.deepcopy(snapshot.request_payload or {})
+            symbol_day_context = copy.deepcopy(
+                request_payload.get('symbol_day_context') or {}
+            )
+            symbol_day_context.update(
+                {
+                    'market_date': self.market_date.isoformat(),
+                    'price_context': {
+                        'trade_date': self.market_date.isoformat(),
+                        'close_price': 50_000,
+                        'price_source': 'daily_price_bars',
+                        'adjusted': False,
+                    },
+                }
+            )
+            request_payload.update(
+                {
+                    'symbol_day_context': symbol_day_context,
+                    'sector_peer_context': {
+                        'market_date': self.market_date.isoformat(),
+                        'close_price': 51_000,
+                        'price_source': 'pykrx',
+                        'adjusted': False,
+                    },
+                }
+            )
+            snapshot.request_payload = request_payload
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        item = result['items'][0]
+        block_codes = {
+            reason['code']
+            for reason in item['validation']['blocking_reasons']
+        }
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn('structured_close_price_mismatch', block_codes)
 
     def test_refresh_plan_items_ignores_structured_close_from_different_market_date(self) -> None:
         snapshot_id = self._seed_short_term_snapshot(symbol='005930')
@@ -12879,6 +12969,93 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     generation['issues'][0]['replacement_action'],
                     'reject',
                 )
+
+    def test_dispatch_compares_row_candidate_agent_context_authority(self) -> None:
+        self._seed_snapshot(symbol='005930')
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        candidate_context = {
+            'schema_version': 'agent_context_completeness_v1',
+            'source_market_date': self.market_date.isoformat(),
+            'candidate_symbols': ['005930'],
+            'decision_agent_name': 'signal-decider',
+            'candidate_set_basis': 'latest_signal_decider_snapshots',
+            'status': 'complete',
+            'cohort_status': 'complete',
+            'has_incomplete_agent_context': False,
+            'candidate_set_definitive': True,
+            'authority_fingerprint': 'candidate-authority',
+            'latest_run': {'run_id': 'parent', 'status': 'completed'},
+            'failure_count': 0,
+            'failure_groups': [],
+        }
+
+        def cohort_context(global_fingerprint: str) -> dict:
+            return {
+                **candidate_context,
+                'candidate_symbols': ['005930', '000660'],
+                'authority_fingerprint': global_fingerprint,
+                '_candidate_contexts_by_key': {
+                    ('005930', 'signal-decider'): copy.deepcopy(
+                        candidate_context
+                    ),
+                },
+            }
+
+        with (
+            patch.object(
+                service,
+                '_build_agent_context_completeness_context',
+                return_value=cohort_context('stored-global-authority'),
+            ),
+            patch.object(
+                service,
+                '_build_agent_context_completeness_from_state',
+                return_value=cohort_context('stored-global-authority'),
+            ),
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+        ):
+            service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='store_candidate_scoped_agent_context',
+            )
+
+        with session_scope() as session:
+            row = (
+                session.query(SignalDeciderExecutionPlanItem)
+                .filter(
+                    SignalDeciderExecutionPlanItem.account_reference
+                    == self.account_reference,
+                    SignalDeciderExecutionPlanItem.symbol == '005930',
+                )
+                .one()
+            )
+            expected_row_bindings = {
+                int(row.id): {
+                    'decision_snapshot_id': int(row.decision_snapshot_id),
+                    'row_revision_fingerprint': (
+                        _execution_plan_row_authority_fingerprint(row)
+                    ),
+                }
+            }
+
+        with patch.object(
+            service,
+            '_build_agent_context_completeness_from_state',
+            return_value=cohort_context('different-global-authority'),
+        ):
+            generation = service.inspect_dispatch_authority_generation(
+                target_trade_date=self.target_trade_date,
+                expected_row_bindings=expected_row_bindings,
+            )
+
+        self.assertEqual(generation['status'], 'valid')
+        self.assertEqual(generation['issues'], [])
 
     def test_terminal_buy_revokes_when_agent_context_authority_regresses(self) -> None:
         self._seed_snapshot(symbol='005930')
