@@ -5980,6 +5980,65 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['chase_limit_price'], 51_500)
         self.assertTrue(item['exec_monitoring_active'])
 
+    def test_complete_signal_wait_uses_persisted_decision_support_prices(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='wait',
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            target_price=54_000,
+            stop_loss_price=49_000,
+        )
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, snapshot_id)
+            self.assertIsNotNone(snapshot)
+            response_payload = dict(snapshot.response_payload or {})
+            response_payload['details'] = {
+                'decision_support': {
+                    'trigger_price': 50_500,
+                    'chase_limit_price': 51_500,
+                    'target_price': 54_000,
+                    'stop_loss_price': 49_000,
+                }
+            }
+            for field in (
+                'trigger_price',
+                'chase_limit_price',
+                'target_price',
+                'stop_loss_price',
+            ):
+                response_payload.pop(field, None)
+            snapshot.target_price = None
+            snapshot.stop_loss_price = None
+            snapshot.response_payload = response_payload
+
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_snapshot_id'] == snapshot_id
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertEqual(item['trigger_price'], 50_500)
+        self.assertEqual(item['chase_limit_price'], 51_500)
+        self.assertEqual(item['target_price'], 54_000)
+        self.assertEqual(item['stop_loss_price'], 49_000)
+        self.assertTrue(item['exec_monitoring_active'])
+
     def test_complete_short_term_wait_is_delegated_as_independent_exec_watch(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         signal_snapshot_id = self._seed_snapshot(
@@ -6036,7 +6095,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             by_snapshot[short_snapshot_id]['client_order_id'],
         )
 
-    def test_incomplete_wait_geometry_never_becomes_execution_authority(self) -> None:
+    def test_signal_wait_missing_trigger_is_visible_but_not_execution_authority(self) -> None:
         snapshot_id = self._seed_snapshot(
             symbol='005930',
             next_day_open_action='wait',
@@ -6062,9 +6121,60 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 trigger='test',
             )
 
-        self.assertNotIn(
-            snapshot_id,
-            {item['decision_snapshot_id'] for item in result['items']},
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_snapshot_id'] == snapshot_id
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertFalse(item['handoff_active'])
+        self.assertFalse(item['exec_monitoring_active'])
+        self.assertIn(
+            'trigger_price_missing',
+            {
+                reason['code']
+                for reason in item['validation']['blocking_reasons']
+            },
+        )
+
+    def test_signal_wait_missing_target_is_visible_but_not_execution_authority(self) -> None:
+        snapshot_id = self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='wait',
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            target_price=None,
+            stop_loss_price=49_000,
+        )
+        service = self._service(
+            state='PREOPEN',
+            server_time='2026-04-30T08:40:00+09:00',
+        )
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+        ):
+            result = service.refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='test',
+            )
+
+        item = next(
+            row
+            for row in result['items']
+            if row['decision_snapshot_id'] == snapshot_id
+        )
+        self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertFalse(item['handoff_active'])
+        self.assertFalse(item['exec_monitoring_active'])
+        self.assertIn(
+            'target_price_missing',
+            {
+                reason['code']
+                for reason in item['validation']['blocking_reasons']
+            },
         )
 
     def test_watch_for_trigger_is_a_monitor_candidate_not_a_buy_eligible_planned_order(self) -> None:

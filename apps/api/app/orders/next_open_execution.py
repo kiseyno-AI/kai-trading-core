@@ -1947,26 +1947,79 @@ def _short_term_tactical_action(snapshot: SignalDeciderDecisionSnapshot) -> str:
     return 'wait'
 
 
+def _trigger_entry_price_values(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Decimal | None]:
+    response_payload = _snapshot_response_payload(snapshot)
+    details_payload = _json_object_payload(response_payload.get('details'))
+    decision_context = _json_object_payload(
+        details_payload.get(
+            'tactical_decision_support'
+            if _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
+            else 'decision_support'
+        )
+    )
+    traceability_payload = _json_object_payload(
+        getattr(snapshot, 'traceability_payload', None)
+    )
+    tactical_context = _json_object_payload(
+        traceability_payload.get('tactical_context')
+    )
+    final_action_rationale = _json_object_payload(
+        traceability_payload.get('final_action_rationale')
+    )
+
+    def _first_persisted_value(*values: Any) -> Any:
+        return next((value for value in values if value is not None), None)
+
+    trigger_price = _to_decimal(
+        _first_persisted_value(
+            response_payload.get('trigger_price'),
+            decision_context.get('trigger_price'),
+            tactical_context.get('trigger_price'),
+        )
+    )
+    chase_limit_price = _to_decimal(
+        _first_persisted_value(
+            response_payload.get('chase_limit_price'),
+            decision_context.get('chase_limit_price'),
+            tactical_context.get('chase_limit_price'),
+        )
+    )
+    target_price = _to_decimal(
+        _first_persisted_value(
+            getattr(snapshot, 'target_price', None),
+            response_payload.get('target_price'),
+            decision_context.get('target_price'),
+            tactical_context.get('target_price'),
+            final_action_rationale.get('target_price'),
+        )
+    )
+    stop_loss_price = _to_decimal(
+        _first_persisted_value(
+            getattr(snapshot, 'stop_loss_price', None),
+            response_payload.get('stop_loss_price'),
+            decision_context.get('stop_loss_price'),
+            tactical_context.get('stop_loss_price'),
+            final_action_rationale.get('stop_loss_price'),
+        )
+    )
+    return {
+        'trigger_price': trigger_price,
+        'chase_limit_price': chase_limit_price,
+        'target_price': target_price,
+        'stop_loss_price': stop_loss_price,
+    }
+
+
 def _trigger_entry_levels(
     snapshot: SignalDeciderDecisionSnapshot,
 ) -> dict[str, Decimal] | None:
-    response_payload = _snapshot_response_payload(snapshot)
-    trigger_price = _to_decimal(response_payload.get('trigger_price'))
-    chase_limit_price = _to_decimal(
-        response_payload.get('chase_limit_price')
-    )
-    snapshot_target_price = getattr(snapshot, 'target_price', None)
-    target_price = _to_decimal(
-        snapshot_target_price
-        if snapshot_target_price is not None
-        else response_payload.get('target_price')
-    )
-    snapshot_stop_loss_price = getattr(snapshot, 'stop_loss_price', None)
-    stop_loss_price = _to_decimal(
-        snapshot_stop_loss_price
-        if snapshot_stop_loss_price is not None
-        else response_payload.get('stop_loss_price')
-    )
+    values = _trigger_entry_price_values(snapshot)
+    trigger_price = values['trigger_price']
+    chase_limit_price = values['chase_limit_price']
+    target_price = values['target_price']
+    stop_loss_price = values['stop_loss_price']
     if not (
         str(getattr(snapshot, 'entry_price_basis', None) or '')
         .strip()
@@ -1988,6 +2041,43 @@ def _trigger_entry_levels(
         'target_price': target_price,
         'stop_loss_price': stop_loss_price,
     }
+
+
+def _signal_trigger_entry_price_reasons(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> list[dict[str, str]]:
+    values = _trigger_entry_price_values(snapshot)
+    reasons: list[dict[str, str]] = []
+    field_messages = {
+        'trigger_price': 'Signal trigger entry requires an explicit positive trigger_price.',
+        'chase_limit_price': 'Signal trigger entry requires an explicit positive chase_limit_price.',
+        'target_price': 'Signal trigger entry requires an explicit positive target_price.',
+        'stop_loss_price': 'Signal trigger entry requires an explicit positive stop_loss_price.',
+    }
+    for field_name, message in field_messages.items():
+        value = values[field_name]
+        if value is None or value <= 0:
+            reasons.append(_reason(f'{field_name}_missing', message))
+    if reasons:
+        return reasons
+
+    trigger_price = values['trigger_price']
+    chase_limit_price = values['chase_limit_price']
+    target_price = values['target_price']
+    stop_loss_price = values['stop_loss_price']
+    if not (
+        stop_loss_price
+        < trigger_price
+        <= chase_limit_price
+        < target_price
+    ):
+        reasons.append(
+            _reason(
+                'invalid_signal_trigger_geometry',
+                'Signal trigger prices must satisfy stop < trigger <= chase < target.',
+            )
+        )
+    return reasons
 
 
 def _is_direct_exec_wait_snapshot(
@@ -2158,9 +2248,12 @@ def _short_term_entry_execution_mode(tactical_action: str) -> str | None:
 def _is_signal_trigger_entry_snapshot(
     snapshot: SignalDeciderDecisionSnapshot,
 ) -> bool:
+    raw_action = _normalize_action(
+        snapshot.next_day_open_action or snapshot.decision_action
+    )
     return bool(
         _snapshot_agent_name(snapshot) == SIGNAL_DECIDER_AGENT_NAME
-        and _effective_signal_action(snapshot) == 'buy'
+        and raw_action in {'buy', 'wait'}
         and str(snapshot.entry_price_basis or '').strip().lower()
         in SIGNAL_TRIGGER_ENTRY_PRICE_BASES
     )
@@ -4847,7 +4940,11 @@ class SignalDeciderNextOpenExecutionService:
                     else _effective_short_term_tactical_action(snapshot)
                 )
                 actionable = _is_actionable_snapshot(snapshot)
-                if not actionable:
+                visible_signal_trigger_contract = (
+                    decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                    and _is_signal_trigger_entry_snapshot(snapshot)
+                )
+                if not actionable and not visible_signal_trigger_contract:
                     self._block_missing_symbol_rows(
                         rows=attached_existing,
                         symbol=snapshot.symbol,
@@ -8390,6 +8487,7 @@ class SignalDeciderNextOpenExecutionService:
             if short_term_tactical_action is not None
             else _effective_signal_action(snapshot)
         )
+        trigger_entry_price_values = _trigger_entry_price_values(snapshot)
         signal_trigger_entry = _is_signal_trigger_entry_snapshot(snapshot)
         signal_trigger_levels = _signal_trigger_entry_levels(snapshot)
         handoff_intent = (
@@ -8622,9 +8720,9 @@ class SignalDeciderNextOpenExecutionService:
         if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME and (
             estimated_reference_price is None or estimated_reference_price <= 0
         ):
-            estimated_reference_price = _to_int(response_payload.get('trigger_price')) or _to_int(
-                response_payload.get('chase_limit_price')
-            )
+            estimated_reference_price = _to_int(
+                trigger_entry_price_values['trigger_price']
+            ) or _to_int(trigger_entry_price_values['chase_limit_price'])
             price_cache[snapshot.symbol] = estimated_reference_price
             estimated_reference_price_basis = 'short_term_trigger_price'
 
@@ -8674,12 +8772,20 @@ class SignalDeciderNextOpenExecutionService:
                     )
                 )
             if signal_trigger_entry and signal_trigger_levels is None:
-                blocking_reasons.append(
-                    _reason(
-                        'invalid_signal_trigger_geometry',
-                        'Signal trigger entry requires non-empty trigger conditions and positive prices satisfying stop < trigger <= chase < target.',
-                    )
+                signal_trigger_price_reasons = (
+                    _signal_trigger_entry_price_reasons(snapshot)
                 )
+                blocking_reasons.extend(signal_trigger_price_reasons)
+                if not any(
+                    reason.get('code') == 'invalid_signal_trigger_geometry'
+                    for reason in signal_trigger_price_reasons
+                ):
+                    blocking_reasons.append(
+                        _reason(
+                            'invalid_signal_trigger_geometry',
+                            'Signal trigger entry requires positive prices satisfying stop < trigger <= chase < target.',
+                        )
+                    )
             elif (
                 str(snapshot.entry_price_basis or '').strip().lower()
                 != 'next_open'
@@ -8745,14 +8851,10 @@ class SignalDeciderNextOpenExecutionService:
             )
             blocking_reasons.extend(entry_quality_blocks)
             warnings.extend(entry_quality_warnings)
-            trigger_price = _to_decimal(response_payload.get('trigger_price'))
-            chase_limit_price = _to_decimal(response_payload.get('chase_limit_price'))
-            target_price = _to_decimal(
-                snapshot.target_price if snapshot.target_price is not None else response_payload.get('target_price')
-            )
-            stop_loss_price = _to_decimal(
-                snapshot.stop_loss_price if snapshot.stop_loss_price is not None else response_payload.get('stop_loss_price')
-            )
+            trigger_price = trigger_entry_price_values['trigger_price']
+            chase_limit_price = trigger_entry_price_values['chase_limit_price']
+            target_price = trigger_entry_price_values['target_price']
+            stop_loss_price = trigger_entry_price_values['stop_loss_price']
             if trigger_price is None or trigger_price <= 0:
                 blocking_reasons.append(
                     _reason(
@@ -9100,10 +9202,18 @@ class SignalDeciderNextOpenExecutionService:
                 'generic_action': generic_action,
                 'handoff_intent': handoff_intent,
                 'entry_execution_mode': _short_term_entry_execution_mode(short_term_tactical_action or 'wait'),
-                'trigger_price': response_payload.get('trigger_price'),
-                'chase_limit_price': response_payload.get('chase_limit_price'),
-                'target_price': response_payload.get('target_price'),
-                'stop_loss_price': response_payload.get('stop_loss_price'),
+                'trigger_price': _to_int(
+                    trigger_entry_price_values['trigger_price']
+                ),
+                'chase_limit_price': _to_int(
+                    trigger_entry_price_values['chase_limit_price']
+                ),
+                'target_price': _to_int(
+                    trigger_entry_price_values['target_price']
+                ),
+                'stop_loss_price': _to_int(
+                    trigger_entry_price_values['stop_loss_price']
+                ),
                 'budget_krw': _decimal_to_text(target.budget_krw),
                 'budget_note': pricing_note,
                 'decision_snapshot_id': snapshot.id,
@@ -9168,6 +9278,7 @@ class SignalDeciderNextOpenExecutionService:
             if short_term_tactical_action is not None
             else _effective_signal_action(snapshot)
         )
+        trigger_entry_price_values = _trigger_entry_price_values(snapshot)
         signal_trigger_entry = _is_signal_trigger_entry_snapshot(snapshot)
         signal_trigger_levels = _signal_trigger_entry_levels(snapshot)
         handoff_intent = (
@@ -9288,11 +9399,15 @@ class SignalDeciderNextOpenExecutionService:
                 if signal_trigger_entry
                 else 'next_open_market'
             ),
-            'trigger_price': response_payload.get('trigger_price')
+            'trigger_price': _to_int(
+                trigger_entry_price_values['trigger_price']
+            )
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
             or signal_trigger_entry
             else None,
-            'chase_limit_price': response_payload.get('chase_limit_price')
+            'chase_limit_price': _to_int(
+                trigger_entry_price_values['chase_limit_price']
+            )
             if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
             or signal_trigger_entry
             else None,
