@@ -1756,6 +1756,13 @@ class EODPipelineStatusService:
                 official_run=official_run,
                 market_date=resolved_market_date,
             )
+        if normalized_scope_symbols and 'fundamentals_daily_refresh' in stages:
+            stages['fundamentals_daily_refresh'] = (
+                self._restore_fundamentals_scope_gate_after_official_overlay(
+                    stage=stages['fundamentals_daily_refresh'],
+                    scoped_stage=fundamentals_stage,
+                )
+            )
         for stage_id, stored_stage in stored_row_count_stage_overrides.items():
             if stage_id in stages:
                 current_stage = stages[stage_id]
@@ -2058,6 +2065,59 @@ class EODPipelineStatusService:
                 'details': repaired_details,
             }
         return normalized
+
+    @staticmethod
+    def _restore_fundamentals_scope_gate_after_official_overlay(
+        *,
+        stage: dict[str, Any],
+        scoped_stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep exact DART success-partition proof when official history is overlaid."""
+        restored = dict(stage)
+        details = dict(restored.get('details') or {})
+        scoped_details = dict(scoped_stage.get('details') or {})
+        coverage = scoped_details.get('requested_scope_coverage')
+        details['scope_verification_required'] = True
+        details['requested_scope_coverage'] = coverage
+
+        status = str(restored.get('status') or 'pending').strip().lower()
+        scoped_gate_status = str(
+            scoped_stage.get('gate_status') or ''
+        ).strip().lower()
+        if status in {'pending', 'running', 'waiting'}:
+            gate_status = 'waiting'
+            blocking_status = 'waiting'
+            gate_reason = 'fundamentals_scope_evidence_pending'
+        elif (
+            status in {'completed', 'partial'}
+            and scoped_gate_status == 'ready'
+            and not daily_pipeline_result_has_no_ready_content(restored)
+        ):
+            gate_status = 'ready'
+            blocking_status = 'non_blocking'
+            gate_reason = 'requested_scope_success_partition_complete'
+        else:
+            gate_status = 'blocked'
+            blocking_status = 'blocking'
+            gate_reason = 'requested_scope_success_partition_incomplete'
+
+        restored.update(
+            {
+                'gate_status': gate_status,
+                'severity': gate_status,
+                'blocking_status': blocking_status,
+            }
+        )
+        details.update(
+            {
+                'gate_status': gate_status,
+                'severity': gate_status,
+                'blocking_status': blocking_status,
+                'gate_reason': gate_reason,
+            }
+        )
+        restored['details'] = details
+        return restored
 
     @staticmethod
     def _infer_stage_progress_source(stage: dict[str, Any]) -> str:

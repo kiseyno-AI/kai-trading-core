@@ -3913,6 +3913,109 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'scope_retry_debt',
         )
 
+    def test_official_fundamentals_overlay_preserves_exact_success_scope_gate(
+        self,
+    ) -> None:
+        market_date = '2026-11-05'
+        fundamentals_run = {
+            'id': 536,
+            'market_date': market_date,
+            'status': 'partial',
+            'fs_div': 'CFS',
+            'symbols_total': 3,
+            'symbols_checked': 3,
+            'symbols_refreshed': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'scope_outcome_manifest_version': (
+                    'dart_daily_data_scope_outcomes_v1'
+                ),
+                'selected_stock_codes': ['005930', '000660', '035420'],
+                'successful_stock_codes': ['005930'],
+                'retry_debt_stock_codes': ['000660'],
+                'terminal_not_applicable_stock_codes': ['035420'],
+                'scope_outcome_manifest': [
+                    {'stock_code': '005930', 'outcome': 'success'},
+                    {'stock_code': '000660', 'outcome': 'retry_debt'},
+                    {
+                        'stock_code': '035420',
+                        'outcome': 'terminal_not_applicable',
+                    },
+                ],
+            },
+        }
+        official_item = _incomplete_official_stage(
+            run_id=613,
+            stage_id='fundamentals_daily_refresh',
+            market_date=market_date,
+            status='partial',
+            updated_at='2026-11-05T12:27:09+00:00',
+            succeeded=1,
+            failed=0,
+        )
+        official_item['stage']['total'] = 3
+        official_item['stage']['processed'] = 1
+        official_item['stage']['remaining'] = 2
+        official_item['stage']['details'] = {
+            'result_summary': {
+                'status': 'partial',
+                'successful_stock_codes': ['005930'],
+                'retry_debt_stock_codes': ['000660'],
+                'terminal_not_applicable_stock_codes': ['035420'],
+                'partial_reasons': [
+                    'scope_retry_debt',
+                    'share_issuance_scope_incomplete',
+                ],
+            },
+        }
+        official_run = {
+            **official_item['run'],
+            'status': 'partial',
+            'stages': {
+                'fundamentals_daily_refresh': official_item['stage'],
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 3,
+            fundamentals_refresh_loader=lambda **_: fundamentals_run,
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {},
+            external_news_counts_loader=lambda **_: {},
+        )
+
+        successful_scope = service.read(
+            market_date=market_date,
+            scope_symbols=['005930'],
+        )['stages']['fundamentals_daily_refresh']
+        debt_scope = service.read(
+            market_date=market_date,
+            scope_symbols=['000660', '035420'],
+        )['stages']['fundamentals_daily_refresh']
+
+        self.assertEqual(successful_scope['status'], 'partial')
+        self.assertEqual(successful_scope['gate_status'], 'ready')
+        self.assertEqual(successful_scope['blocking_status'], 'non_blocking')
+        self.assertEqual(
+            successful_scope['details']['requested_scope_coverage'][
+                'missing_count'
+            ],
+            0,
+        )
+        self.assertEqual(
+            successful_scope['details']['mode'],
+            'official_daily_pipeline_run_state',
+        )
+        self.assertEqual(debt_scope['gate_status'], 'blocked')
+        self.assertEqual(
+            debt_scope['details']['requested_scope_coverage'][
+                'missing_symbols_sample'
+            ],
+            ['000660', '035420'],
+        )
+
     def test_official_external_news_enrichment_recovers_legacy_lower_bound_semantics(self):
         market_date = '2026-05-28'
         official_item = _completed_official_stage(
