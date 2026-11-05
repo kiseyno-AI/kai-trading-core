@@ -85,6 +85,7 @@
 - `GET /trading/accounts/{account_reference}/buying-power?symbol=005930&price=57000&order_type=market`
 - `GET /market/status`
 - `GET /market/snapshot`
+- `GET /market/live-sector-projection?symbol=005930&source_market_date=YYYY-MM-DD`
 - `GET /quotes/tracked`
 - `GET /quotes/realtime/monitored?refresh_symbols=false`
 - `GET /quotes/realtime/monitored/stream`
@@ -241,6 +242,13 @@
 - Core now persists the latest usable Korea Exim FX row in `current_fx_rate_snapshots`, keyed by `provider + currency_pair`, so USD/KRW fallback survives process restarts independently of the broader market snapshot cache payload.
 - `usd_krw` now exposes `status`, `source`, `stale_reason`, `detail`, and `captured_at`. Korea Exim `result=4` reuses the latest durable USD/KRW snapshot when available (`status=stale`, `source=cache`) and otherwise returns a partial snapshot with `usd_krw.status=missing`.
 - Korea Exim quota exhaustion is now sticky for the same search date within the persisted refresh state: once a refresh records `result=4`, later due refreshes reuse cached or missing USD/KRW state for that date instead of retrying Korea Exim immediately.
+
+## Live sector projection notes
+- `GET /market/live-sector-projection` is a read-only, per-symbol current-session projection. The caller must supply the exact PyKRX mapping date through `source_market_date`; Core does not silently substitute a different mapping snapshot.
+- Sector identity and prior-session market-cap weights come only from a complete `source=pykrx` sector-classification snapshot whose market-wide symbol count and membership SHA-256 match the stored PyKRX reference proof.
+- Core selects at most eight highest-market-cap sector members and exposes both selected and live quote market-cap coverage. A projection is `ready` only when each coverage ratio is at least 60%.
+- Performance authority is current-session KIS evidence only: fresh same-session realtime ticks are preferred, real-domain KIS quote reads are the fallback, and the market benchmark is the same-session KIS index leg already held by `/market/snapshot`. Stored PyKRX `change_pct`, close, or other EOD performance fields are never reused as live performance.
+- `observed_at` is the oldest provider observation used by the projection. PREOPEN returns `pending_current_session`; closed sessions, stale/wrong-date provider timestamps, incomplete membership proof, or insufficient quote coverage return `unavailable` with live return fields left null.
 
 ## Macro context notes
 - `GET /macro/context` reads the compact persisted macro context used by agent/decider inputs. `POST /macro/context/refresh` refreshes it on demand and returns per-source status rather than failing the whole request for optional provider gaps.
