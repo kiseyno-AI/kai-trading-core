@@ -245,6 +245,133 @@ def _completed_decider_result_for_call(
     )
 
 
+def _terminal_decider_outcome_with_role_failures(
+    *,
+    symbols: list[str],
+    failed_symbols_by_role: dict[str, list[str]],
+    cutoff_at: datetime,
+    source_summary_run_id: str = 'summary-run',
+    run_id: str = 'signal-decider-partial',
+) -> tuple[dict, dict]:
+    roles = list(DECISION_SUPPORT_AGENT_NAMES)
+    completed_symbols_by_role = {
+        role: [
+            symbol
+            for symbol in symbols
+            if symbol not in set(failed_symbols_by_role.get(role, []))
+        ]
+        for role in roles
+    }
+    failed_items = sum(
+        len(failed_symbols_by_role.get(role, [])) for role in roles
+    )
+    completed_items = sum(
+        len(completed_symbols_by_role[role]) for role in roles
+    )
+    run_status = (
+        'completed'
+        if failed_items == 0
+        else 'partial'
+        if completed_items > 0
+        else 'failed'
+    )
+    completed_scope_proof = {
+        'schema_version': 'completed_summarizer_intersection_v1',
+        'completed_symbols': list(symbols),
+        'admitted_symbols': list(symbols),
+    }
+    role_progress = {}
+    for role in roles:
+        role_failed_items = len(failed_symbols_by_role.get(role, []))
+        role_completed_items = len(completed_symbols_by_role[role])
+        role_status = (
+            'completed'
+            if role_failed_items == 0
+            else 'completed_with_failures'
+            if role_completed_items > 0
+            else 'failed'
+        )
+        role_progress[role] = {
+            'role': role,
+            'status': role_status,
+            'boundary_status': role_status,
+            'total_symbols': len(symbols),
+            'processed_symbols': len(symbols),
+            'completed_symbols': role_completed_items,
+            'terminal_symbols': len(symbols),
+            'failed_items': role_failed_items,
+            'in_progress_symbols': 0,
+            'pending_symbols': 0,
+            'retry_pending_symbols': role_failed_items,
+        }
+    decision_identities = sorted(
+        [
+            _decision_identity(
+                symbol=symbol,
+                symbol_index=symbols.index(symbol) + 1,
+                role=role,
+            )
+            for role in roles
+            for symbol in completed_symbols_by_role[role]
+        ],
+        key=lambda identity: (
+            identity['symbol'],
+            identity['decision_agent_name'],
+        ),
+    )
+    result = {
+        'status': run_status,
+        'run_id': run_id,
+        'roles': roles,
+        'requested_symbols': list(symbols),
+        'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        'scope_authority': {
+            'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+            'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+            'source_summary_run_id': source_summary_run_id,
+            'source_feedback_scope_mode': 'broad_feedback_universe',
+            'decision_feedback_scope_mode': (
+                FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            ),
+            'knowledge_cutoff_at': cutoff_at.isoformat(),
+            'completed_scope_proof': completed_scope_proof,
+        },
+        'decision_identities': decision_identities,
+        'progress': {
+            'summary': {
+                'run_id': run_id,
+                'run_status': run_status,
+                'run_table_status': run_status,
+                'run_completed_at': cutoff_at.isoformat(),
+                'is_live': False,
+                'expected_feedback_count': len(symbols) * len(roles),
+                'completed_feedback_count': completed_items,
+                'failed_items': failed_items,
+                'role_symbol_scopes': {
+                    role: list(symbols) for role in roles
+                },
+                'role_symbol_counts': {
+                    role: len(symbols) for role in roles
+                },
+                'failed_symbols_by_role': {
+                    role: list(failed_symbols_by_role.get(role, []))
+                    for role in roles
+                },
+                'role_progress': role_progress,
+            }
+        },
+    }
+    cutoff_resolution = {
+        'ready': True,
+        'knowledge_cutoff_at': cutoff_at,
+        'source_run_id': source_summary_run_id,
+        'feedback_scope_mode': 'broad_feedback_universe',
+        'requested_symbols': list(symbols),
+        'completed_scope_proof': completed_scope_proof,
+    }
+    return {'status': run_status, 'result': result}, cutoff_resolution
+
+
 def _completed_feedback_result(
     *,
     symbols: list[str],
@@ -422,14 +549,40 @@ def _next_open_completion_result(
     parent_run_id: str,
     completed_symbols: list[str],
     manifest_symbols: list[str] | None = None,
+    role_symbol_scopes: dict[str, list[str]] | None = None,
 ) -> dict:
-    manifest_symbols = list(manifest_symbols or completed_symbols)
+    resolved_role_symbol_scopes = (
+        {
+            role: list(role_symbol_scopes[role])
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        if role_symbol_scopes is not None
+        else {
+            role: list(manifest_symbols or completed_symbols)
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+    )
+    manifest_symbols = list(
+        manifest_symbols
+        or sorted(
+            {
+                symbol
+                for symbols in resolved_role_symbol_scopes.values()
+                for symbol in symbols
+            }
+        )
+    )
     completed_scope = set(completed_symbols)
     items = []
     partition = []
     for index, symbol in enumerate(manifest_symbols, start=1):
+        symbol_roles = [
+            role
+            for role in DECISION_SUPPORT_AGENT_NAMES
+            if symbol in resolved_role_symbol_scopes[role]
+        ]
         if symbol not in completed_scope:
-            for role in DECISION_SUPPORT_AGENT_NAMES:
+            for role in symbol_roles:
                 partition.append(
                     {
                         'symbol': symbol,
@@ -458,21 +611,8 @@ def _next_open_completion_result(
         )
         signal_snapshot_id = signal_identity['decision_snapshot_id']
         signal_run_id = signal_identity['decision_run_id']
-        items.append(
-            {
-                'plan_item_id': plan_item_id,
-                'account_reference': 'paper-primary',
-                'symbol': symbol,
-                'decision_agent_name': 'signal-decider',
-                'decision_run_id': signal_run_id,
-                'decision_snapshot_id': signal_snapshot_id,
-                'eligibility_status': 'eligible',
-                'handoff_active': True,
-                'exec_monitoring_active': True,
-            }
-        )
-        partition.extend(
-            [
+        if 'short-term-decider' in symbol_roles:
+            partition.append(
                 {
                     'symbol': symbol,
                     'decision_agent_name': 'short-term-decider',
@@ -489,7 +629,23 @@ def _next_open_completion_result(
                         'kind': 'non_actionable',
                         'reason_code': 'latest_snapshot_not_actionable',
                     },
-                },
+                }
+            )
+        if 'signal-decider' in symbol_roles:
+            items.append(
+                {
+                    'plan_item_id': plan_item_id,
+                    'account_reference': 'paper-primary',
+                    'symbol': symbol,
+                    'decision_agent_name': 'signal-decider',
+                    'decision_run_id': signal_run_id,
+                    'decision_snapshot_id': signal_snapshot_id,
+                    'eligibility_status': 'eligible',
+                    'handoff_active': True,
+                    'exec_monitoring_active': True,
+                }
+            )
+            partition.append(
                 {
                     'symbol': symbol,
                     'decision_agent_name': 'signal-decider',
@@ -513,8 +669,7 @@ def _next_open_completion_result(
                     ],
                     'exclusion': None,
                 },
-            ]
-        )
+            )
     partition.sort(
         key=lambda entry: (
             entry['symbol'],
@@ -526,17 +681,18 @@ def _next_open_completion_result(
         'parent_run_id': parent_run_id,
         'authority_fingerprint': f'authority-{parent_run_id}',
         'generation_fingerprint': f'generation-{parent_run_id}',
-        'role_symbol_scopes': {
-            role: list(manifest_symbols)
-            for role in DECISION_SUPPORT_AGENT_NAMES
-        },
+        'role_symbol_scopes': resolved_role_symbol_scopes,
         'decision_partition': partition,
         'decision_count': len(partition),
-        'included_decision_count': len(completed_symbols),
-        'excluded_decision_count': len(completed_symbols),
-        'incomplete_decision_count': (
-            (len(manifest_symbols) - len(completed_symbols))
-            * len(DECISION_SUPPORT_AGENT_NAMES)
+        'included_decision_count': sum(
+            entry['disposition'] == 'included' for entry in partition
+        ),
+        'excluded_decision_count': sum(
+            entry['disposition'] == 'non_actionable'
+            for entry in partition
+        ),
+        'incomplete_decision_count': sum(
+            entry['disposition'] == 'incomplete' for entry in partition
         ),
         'included_item_count': len(items),
     }
@@ -12050,6 +12206,247 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'invalid',
                 )
 
+    def test_signal_terminal_proof_preserves_short_lane_when_signal_fails(
+        self,
+    ) -> None:
+        cutoff_at = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+        outcome, cutoff_resolution = (
+            _terminal_decider_outcome_with_role_failures(
+                symbols=['000660'],
+                failed_symbols_by_role={
+                    'signal-decider': ['000660'],
+                    'short-term-decider': [],
+                },
+                cutoff_at=cutoff_at,
+            )
+        )
+
+        proof = (
+            DailyPipelineStageService
+            ._terminal_decider_progression_proof(
+                outcome,
+                expected_decider_symbols=['000660'],
+                feedback_cutoff_resolution=cutoff_resolution,
+            )
+        )
+
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['completed_symbols'], ['000660'])
+        self.assertEqual(
+            proof['completed_symbols_by_role'],
+            {
+                'signal-decider': [],
+                'short-term-decider': ['000660'],
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    identity['symbol'],
+                    identity['decision_agent_name'],
+                )
+                for identity in proof['decision_identities']
+            ],
+            [('000660', 'short-term-decider')],
+        )
+
+    def test_signal_terminal_proof_preserves_signal_lane_when_short_fails(
+        self,
+    ) -> None:
+        cutoff_at = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+        outcome, cutoff_resolution = (
+            _terminal_decider_outcome_with_role_failures(
+                symbols=['000660'],
+                failed_symbols_by_role={
+                    'signal-decider': [],
+                    'short-term-decider': ['000660'],
+                },
+                cutoff_at=cutoff_at,
+            )
+        )
+
+        proof = (
+            DailyPipelineStageService
+            ._terminal_decider_progression_proof(
+                outcome,
+                expected_decider_symbols=['000660'],
+                feedback_cutoff_resolution=cutoff_resolution,
+            )
+        )
+
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['completed_symbols'], ['000660'])
+        self.assertEqual(
+            proof['completed_symbols_by_role'],
+            {
+                'signal-decider': ['000660'],
+                'short-term-decider': [],
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    identity['symbol'],
+                    identity['decision_agent_name'],
+                )
+                for identity in proof['decision_identities']
+            ],
+            [('000660', 'signal-decider')],
+        )
+
+    def test_signal_terminal_proof_blocks_when_no_decider_lane_succeeds(
+        self,
+    ) -> None:
+        cutoff_at = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+        outcome, cutoff_resolution = (
+            _terminal_decider_outcome_with_role_failures(
+                symbols=['000660'],
+                failed_symbols_by_role={
+                    'signal-decider': ['000660'],
+                    'short-term-decider': ['000660'],
+                },
+                cutoff_at=cutoff_at,
+            )
+        )
+
+        self.assertIsNone(
+            DailyPipelineStageService
+            ._terminal_decider_progression_proof(
+                outcome,
+                expected_decider_symbols=['000660'],
+                feedback_cutoff_resolution=cutoff_resolution,
+            )
+        )
+
+    def test_run_advances_short_lane_without_unscoped_signal_evaluation(
+        self,
+    ) -> None:
+        service = DailyPipelineStageService()
+        symbols = ['000660']
+        cutoff_at = datetime(
+            2026,
+            4,
+            14,
+            8,
+            30,
+            tzinfo=timezone.utc,
+        )
+        outcome, cutoff_resolution = (
+            _terminal_decider_outcome_with_role_failures(
+                symbols=symbols,
+                failed_symbols_by_role={
+                    'signal-decider': symbols,
+                    'short-term-decider': [],
+                },
+                cutoff_at=cutoff_at,
+            )
+        )
+
+        def execute(stage_id, **_kwargs):
+            if stage_id == 'signal_decider':
+                return outcome['result']
+            if stage_id == 'next_open_execution_plan':
+                return _next_open_completion_result(
+                    parent_run_id=outcome['result']['run_id'],
+                    completed_symbols=symbols,
+                    role_symbol_scopes={
+                        'signal-decider': [],
+                        'short-term-decider': symbols,
+                    },
+                )
+            raise AssertionError(
+                'empty signal lane must not execute an unscoped evaluation'
+            )
+
+        with (
+            patch.object(
+                service,
+                '_normalize_market_date',
+                return_value='2026-04-14',
+            ),
+            patch.object(
+                service,
+                '_execute_stage',
+                side_effect=execute,
+            ) as execute_stage,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'resolve_latest_completed_summary_knowledge_cutoff',
+                return_value=cutoff_resolution,
+            ),
+        ):
+            result = service.run(
+                market_date='2026-04-14',
+                stages=[
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                symbols=symbols,
+            )
+
+        self.assertEqual(
+            result['stages']['next_open_execution_plan']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['signal_decider_evaluations']['status'],
+            'completed',
+        )
+        self.assertEqual(
+            result['stages']['signal_decider_evaluations']['result'][
+                'reason'
+            ],
+            'no_successful_signal_decider_scope',
+        )
+        self.assertEqual(
+            [call.args[0] for call in execute_stage.call_args_list],
+            ['signal_decider', 'next_open_execution_plan'],
+        )
+        marker = service._build_nonblocking_partial_progression_marker(
+            market_date='2026-04-14',
+            pipeline_run_id=96,
+            reused_eod_collection_run_id=7,
+            trigger='auto_eod_followup_resume',
+            stage_outcomes=result['stages'],
+            feedback_cutoff_resolution=cutoff_resolution,
+        )
+        self.assertIsNotNone(marker)
+        self.assertEqual(
+            marker['decider']['completed_symbols_by_role'],
+            {
+                'signal-decider': [],
+                'short-term-decider': symbols,
+            },
+        )
+        self.assertEqual(
+            marker['downstream']['evaluation_scope_proof'][
+                'requested_symbols'
+            ],
+            [],
+        )
+
     def test_evaluation_completion_proof_binds_exact_parent_scope(self) -> None:
         symbols = ['000660', '005930']
         parent_proof = _terminal_decider_completion_proof(
@@ -12172,7 +12569,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             )
         )
 
-    def test_next_open_completion_proof_partitions_partial_parent_intersection(
+    def test_next_open_completion_proof_partitions_independent_parent_lanes(
         self,
     ) -> None:
         symbols = ['000660', '005930']
@@ -12187,11 +12584,17 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 tzinfo=timezone.utc,
             ),
         )
-        parent_proof['completed_symbols'] = ['000660']
+        parent_proof['completed_symbols_by_role'][
+            'short-term-decider'
+        ] = ['000660']
         parent_proof['decision_identities'] = [
             identity
             for identity in parent_proof['decision_identities']
-            if identity['symbol'] == '000660'
+            if not (
+                identity['symbol'] == '005930'
+                and identity['decision_agent_name']
+                == 'short-term-decider'
+            )
         ]
         parent_proof['failed_symbols_by_role'][
             'short-term-decider'
@@ -12217,7 +12620,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         result = _next_open_completion_result(
             parent_run_id=parent_proof['source_run_id'],
-            completed_symbols=['000660'],
+            completed_symbols=symbols,
+            role_symbol_scopes={
+                'signal-decider': symbols,
+                'short-term-decider': ['000660'],
+            },
         )
         proof = (
             DailyPipelineStageService
@@ -12228,11 +12635,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(proof)
-        self.assertEqual(proof['parent_completed_symbols'], ['000660'])
-        self.assertEqual(proof['decision_count'], 2)
-        self.assertEqual(proof['included_decision_count'], 1)
+        self.assertEqual(proof['parent_completed_symbols'], symbols)
+        self.assertEqual(proof['decision_count'], 3)
+        self.assertEqual(proof['included_decision_count'], 2)
         self.assertEqual(proof['excluded_decision_count'], 1)
-        self.assertEqual(proof['item_count'], 1)
+        self.assertEqual(proof['item_count'], 2)
         self.assertEqual(
             DailyPipelineStageService
             .validated_stage_completion_scope_proof(
@@ -12426,15 +12833,25 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                         'knowledge_cutoff_at': cutoff_at.isoformat(),
                         'completed_scope_proof': completed_scope_proof,
                     },
-                    'decision_identities': _decision_identities(
-                        ['000660']
-                    ),
+                    'decision_identities': [
+                        identity
+                        for identity in _decision_identities(symbols)
+                        if not (
+                            identity['symbol'] == '005930'
+                            and identity['decision_agent_name']
+                            == failed_role
+                        )
+                    ],
                     'progress': {'summary': progress_summary},
                 }
             if stage_id == 'next_open_execution_plan':
                 return _next_open_completion_result(
                     parent_run_id='signal-decider-partial',
-                    completed_symbols=['000660'],
+                    completed_symbols=symbols,
+                    role_symbol_scopes={
+                        'signal-decider': symbols,
+                        'short-term-decider': ['000660'],
+                    },
                 )
             if stage_id == 'signal_decider_evaluations':
                 return _completed_evaluation_result(
@@ -12484,7 +12901,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             for call in execute_stage.call_args_list
             if call.args[0] == 'signal_decider_evaluations'
         )
-        self.assertEqual(evaluation_call.kwargs['symbols'], ['000660'])
+        self.assertEqual(evaluation_call.kwargs['symbols'], symbols)
         marker = service._build_nonblocking_partial_progression_marker(
             market_date='2026-04-14',
             pipeline_run_id=96,
@@ -12496,7 +12913,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertIsNotNone(marker)
         self.assertEqual(
             marker['decider']['completed_symbols'],
-            ['000660'],
+            symbols,
         )
         self.assertEqual(
             marker['retry_debt']['decider_failed_symbols_by_role'][
@@ -12610,9 +13027,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'knowledge_cutoff_at': cutoff_at.isoformat(),
                     'completed_scope_proof': scope_proof,
                 },
-                'decision_identities': _decision_identities(
-                    ['000660']
-                ),
+                'decision_identities': [
+                    identity
+                    for identity in _decision_identities(symbols)
+                    if not (
+                        identity['symbol'] == '005930'
+                        and identity['decision_agent_name']
+                        == 'short-term-decider'
+                    )
+                ],
                 'progress': {'summary': progress_summary},
             },
         }
@@ -12627,7 +13050,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 expected_decider_symbols=symbols,
                 feedback_cutoff_resolution=cutoff_resolution,
             ),
-            ['000660'],
+            symbols,
         )
 
         tampered_cases = []

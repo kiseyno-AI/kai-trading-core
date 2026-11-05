@@ -37,7 +37,19 @@ from app.eod.daily_pipeline_stages import DailyPipelineStageService
 
 class EODRunStageSupportTests(unittest.TestCase):
     @staticmethod
-    def _nonblocking_partial_recovery_result():
+    def _nonblocking_partial_recovery_result(
+        *,
+        short_lane_failed: bool = False,
+        signal_lane_failed: bool = False,
+    ):
+        assert not (short_lane_failed and signal_lane_failed)
+        failed_decider_role = (
+            'short-term-decider'
+            if short_lane_failed
+            else 'signal-decider'
+            if signal_lane_failed
+            else None
+        )
         summary_admitted = ['000660', '005930']
         summary_completed = ['000660']
         summary_failures = {
@@ -45,7 +57,20 @@ class EODRunStageSupportTests(unittest.TestCase):
             for role in SUMMARIZER_AGENT_NAMES
         }
         decider_failures = {
-            role: [] for role in DECISION_SUPPORT_AGENT_NAMES
+            role: (
+                list(summary_completed)
+                if role == failed_decider_role
+                else []
+            )
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
+        decider_completed_by_role = {
+            role: [
+                symbol
+                for symbol in summary_completed
+                if symbol not in decider_failures[role]
+            ]
+            for role in DECISION_SUPPORT_AGENT_NAMES
         }
         scope_proof = {
             'schema_version': 'completed_summarizer_intersection_v1',
@@ -74,9 +99,15 @@ class EODRunStageSupportTests(unittest.TestCase):
                 'decision_run_id': 'signal-decision-run',
             },
         ]
+        if failed_decider_role is not None:
+            decision_identities = [
+                identity
+                for identity in decision_identities
+                if identity['decision_agent_name'] != failed_decider_role
+            ]
         plan_result = {
             'status': 'completed',
-            'items': [
+            'items': [] if signal_lane_failed else [
                 {
                     'plan_item_id': 11,
                     'account_reference': 'paper-primary',
@@ -90,7 +121,25 @@ class EODRunStageSupportTests(unittest.TestCase):
                 }
             ],
         }
-        evaluation_result = {
+        evaluation_result = ({
+            'triggered': False,
+            'safe_skip': True,
+            'status': 'completed',
+            'reason': 'no_successful_signal_decider_scope',
+            'request': {
+                'symbols': [],
+                'horizons': [],
+                'evaluation_version': 'not_applicable',
+                'evaluation_rule_set_version': 'not_applicable',
+            },
+            'summary': {
+                'status': 'completed',
+                'decisions_considered': 0,
+                'outcomes_upserted': 0,
+                'evaluations_upserted': 0,
+            },
+            'items': [],
+        } if signal_lane_failed else {
             'status': 'completed',
             'request': {
                 'symbols': summary_completed,
@@ -134,7 +183,7 @@ class EODRunStageSupportTests(unittest.TestCase):
                     ],
                 }
             ],
-        }
+        })
         plan_scope_proof = build_nonblocking_downstream_scope_proof(
             'next_open_execution_plan',
             plan_result,
@@ -167,10 +216,11 @@ class EODRunStageSupportTests(unittest.TestCase):
                 'source_summary_run_id': 'summary-run',
                 'admitted_symbols': summary_completed,
                 'completed_symbols': summary_completed,
+                'completed_symbols_by_role': decider_completed_by_role,
                 'failed_symbols_by_role': decider_failures,
                 'total_items': 2,
-                'completed_items': 2,
-                'failed_items': 0,
+                'completed_items': 1 if failed_decider_role else 2,
+                'failed_items': 1 if failed_decider_role else 0,
             },
             'downstream': {
                 'plan_status': 'completed',
@@ -190,13 +240,15 @@ class EODRunStageSupportTests(unittest.TestCase):
         )
         decider_progress = {
             'run_id': 'decider-run',
-            'run_status': 'completed',
-            'run_table_status': 'completed',
+            'run_status': 'partial' if failed_decider_role else 'completed',
+            'run_table_status': (
+                'partial' if failed_decider_role else 'completed'
+            ),
             'run_completed_at': cutoff_at,
             'is_live': False,
             'expected_feedback_count': 2,
-            'completed_feedback_count': 2,
-            'failed_items': 0,
+            'completed_feedback_count': 1 if failed_decider_role else 2,
+            'failed_items': 1 if failed_decider_role else 0,
             'role_symbol_scopes': {
                 role: summary_completed
                 for role in DECISION_SUPPORT_AGENT_NAMES
@@ -204,26 +256,42 @@ class EODRunStageSupportTests(unittest.TestCase):
             'role_symbol_counts': {
                 role: 1 for role in DECISION_SUPPORT_AGENT_NAMES
             },
-            'failed_symbols_by_role': {},
+            'failed_symbols_by_role': decider_failures,
             'role_progress': {
                 role: {
                     'role': role,
-                    'status': 'completed',
-                    'boundary_status': 'completed',
+                    'status': (
+                        'failed'
+                        if role == failed_decider_role
+                        else 'completed'
+                    ),
+                    'boundary_status': (
+                        'failed'
+                        if role == failed_decider_role
+                        else 'completed'
+                    ),
                     'total_symbols': 1,
                     'processed_symbols': 1,
-                    'completed_symbols': 1,
+                    'completed_symbols': (
+                        0
+                        if role == failed_decider_role
+                        else 1
+                    ),
                     'terminal_symbols': 1,
-                    'failed_items': 0,
+                    'failed_items': int(
+                        role == failed_decider_role
+                    ),
                     'in_progress_symbols': 0,
                     'pending_symbols': 0,
-                    'retry_pending_symbols': 0,
+                    'retry_pending_symbols': int(
+                        role == failed_decider_role
+                    ),
                 }
                 for role in DECISION_SUPPORT_AGENT_NAMES
             },
         }
         signal_result = {
-            'status': 'completed',
+            'status': 'partial' if failed_decider_role else 'completed',
             'run_id': 'decider-run',
             'roles': list(DECISION_SUPPORT_AGENT_NAMES),
             'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
@@ -262,7 +330,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             'authority_fingerprint': 'authority-fingerprint',
             'generation_fingerprint': 'generation-fingerprint',
             'role_symbol_scopes': {
-                role: summary_completed
+                role: decider_completed_by_role[role]
                 for role in DECISION_SUPPORT_AGENT_NAMES
             },
             'decision_partition': [
@@ -309,6 +377,22 @@ class EODRunStageSupportTests(unittest.TestCase):
             'incomplete_decision_count': 0,
             'included_item_count': 1,
         }
+        if failed_decider_role is not None:
+            plan_manifest['decision_partition'] = [
+                entry
+                for entry in plan_manifest['decision_partition']
+                if entry['decision_agent_name'] != failed_decider_role
+            ]
+            plan_manifest['decision_count'] = 1
+            plan_manifest['included_decision_count'] = int(
+                not signal_lane_failed
+            )
+            plan_manifest['excluded_decision_count'] = int(
+                signal_lane_failed
+            )
+            plan_manifest['included_item_count'] = len(
+                plan_result['items']
+            )
         plan_manifest['decision_partition'].sort(
             key=lambda item: (
                 item['symbol'],
@@ -347,6 +431,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             'parent_run_id': 'decider-run',
             'parent_summary_run_id': 'summary-run',
             'completed_symbols': summary_completed,
+            'completed_symbols_by_role': decider_completed_by_role,
             'decision_identities': decision_identities,
             'signal_decider_proof_digest': (
                 parent_completion_proof['proof_digest']
@@ -400,7 +485,9 @@ class EODRunStageSupportTests(unittest.TestCase):
             },
             'stages': {
                 'signal_decider': {
-                    'status': 'completed',
+                    'status': (
+                        'partial' if failed_decider_role else 'completed'
+                    ),
                     'result': signal_result,
                     'details': {
                         'completion_scope_proof': (
@@ -599,6 +686,62 @@ class EODRunStageSupportTests(unittest.TestCase):
                 mismatched_evaluation_lineage,
                 expected_eod_collection_run_id=7,
             )
+        )
+
+    def test_nonblocking_marker_preserves_independent_decider_lane(self):
+        recovery_result = self._nonblocking_partial_recovery_result(
+            short_lane_failed=True,
+        )
+
+        marker = validated_nonblocking_partial_progression_marker(
+            recovery_result,
+            expected_eod_collection_run_id=7,
+        )
+
+        self.assertIsNotNone(marker)
+        self.assertEqual(
+            marker['decider']['completed_symbols_by_role'],
+            {
+                'signal-decider': ['000660'],
+                'short-term-decider': [],
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    identity['symbol'],
+                    identity['decision_agent_name'],
+                )
+                for identity in marker['completion_authority'][
+                    'decision_identities'
+                ]
+            ],
+            [('000660', 'signal-decider')],
+        )
+
+    def test_nonblocking_marker_accepts_short_only_lane(self):
+        recovery_result = self._nonblocking_partial_recovery_result(
+            signal_lane_failed=True,
+        )
+
+        marker = validated_nonblocking_partial_progression_marker(
+            recovery_result,
+            expected_eod_collection_run_id=7,
+        )
+
+        self.assertIsNotNone(marker)
+        self.assertEqual(
+            marker['decider']['completed_symbols_by_role'],
+            {
+                'signal-decider': [],
+                'short-term-decider': ['000660'],
+            },
+        )
+        self.assertEqual(
+            marker['downstream']['evaluation_scope_proof'][
+                'requested_symbols'
+            ],
+            [],
         )
 
     def test_previous_session_preopen_recovery_requires_exact_automatic_suffix(

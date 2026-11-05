@@ -525,7 +525,6 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
             'Account for market_regime_context when choosing scalp_buy_candidate, watch_for_trigger, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
-            'When intraday_wait_recheck_context is supplied, use its immutable fresh best-ask observation, deterministic reward/risk prefilter, and bounded rolling price/volume/order-book evidence only to reassess the prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to watch_for_trigger after a fresh conservative review. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
@@ -539,7 +538,6 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'and explicit realistic target and stop-loss levels for every symbol. '
             'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to buy. '
-            'When intraday_wait_recheck_context is supplied, use its immutable fresh best-ask observation, deterministic reward/risk prefilter, and bounded rolling price/volume/order-book evidence only to reassess this lane\'s prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to buy with complete fresh trigger, chase-limit, target, and stop geometry after a conservative review. '
             'Account for market_regime_context when choosing buy, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the thesis explicitly depends on them. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
@@ -2299,7 +2297,11 @@ class OpenClawAgentClient:
             if is_us_batch
             else (10300, 10500, 10900, 9900)
         )
-        signal_example_levels = (105.0, 98.0) if is_us_batch else (10500, 9800)
+        signal_example_levels = (
+            (103.0, 105.0, 109.0, 99.0)
+            if is_us_batch
+            else (10300, 10500, 10900, 9900)
+        )
         signal_wait_reason = (
             {
                 'code': 'insufficient_risk_reward',
@@ -2325,7 +2327,8 @@ class OpenClawAgentClient:
                 "- Every feedback.symbol and feedback.traceability.symbol is mandatory and must exactly match its item.symbol.\n"
                 "- One-symbol requests still require the same batch envelope with exactly one item; never collapse the response to a single feedback object.\n"
                 "- All operator-facing natural-language fields must be written in Korean, while the overall output remains raw JSON only.\n"
-                "- Every signal-decider item must include explicit target_price and stop_loss_price values; do not leave them unspecified unless the payload makes a justified level impossible, and in that rare case explain the limitation in data_quality_warnings.\n"
+                "- Every WAIT from either decider lane must include complete positive trigger_price, chase_limit_price, target_price, and stop_loss_price, satisfying stop_loss_price < trigger_price <= chase_limit_price < target_price. trigger_conditions are optional audit prose and never execution authority.\n"
+                "- Every signal-decider WAIT must also use entry_price_basis=trigger_limit. If complete coherent WAIT geometry cannot be supported, return REJECT instead of inventing levels; REJECT may keep unsupported levels null.\n"
                 "- Every wait-like conservative action must include a wait_reason object that names the primary normalized blocker instead of vague missing-information text.\n"
                 "- If previous_decision_context is present for a symbol, every decision-support item must include decision_delta with prior-vs-current metadata, summarize changes instead of repeating the old wait explanation, and name the concrete upgrade trigger.\n"
                 "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
@@ -2391,17 +2394,17 @@ class OpenClawAgentClient:
                 'preferred_action': 'wait',
                 'next_day_open_action': 'wait',
                 'wait_reason': signal_wait_reason,
-                'entry_price_basis': 'next_open',
-                'trigger_price': None,
-                'chase_limit_price': None,
-                'target_price': signal_example_levels[0],
+                'entry_price_basis': 'trigger_limit',
+                'trigger_price': signal_example_levels[0],
+                'chase_limit_price': signal_example_levels[1],
+                'target_price': signal_example_levels[2],
                 'expected_return_pct': None,
-                'stop_loss_price': signal_example_levels[1],
+                'stop_loss_price': signal_example_levels[3],
                 'suggested_holding_period': '3-10 trading days',
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,
                 'thesis_summary': 'brief conservative decision-support thesis',
-                'trigger_conditions': [],
+                'trigger_conditions': ['example trigger condition'],
                 'supporting_evidence': ['example evidence'],
                 'decision_risks': ['example decision risk'],
                 'decision_delta': {
@@ -2466,7 +2469,7 @@ class OpenClawAgentClient:
             "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For WAIT outputs in either decider lane, provide complete coherent trigger_price, chase_limit_price, target_price, and stop_loss_price; signal-decider WAIT must use entry_price_basis=trigger_limit. trigger_conditions are optional audit prose and never a second execution gate. If that complete WAIT price contract is not supportable, return REJECT instead of inventing levels.\n"
             "If previous_decision_context is present, use it to populate decision_delta, avoid copy-pasting the prior wait narrative, and explain both the stable blockers and the concrete upgrade trigger.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
@@ -2488,20 +2491,7 @@ class OpenClawAgentClient:
             f"Assigned batch payload:\n{json.dumps(list(prepared_items), ensure_ascii=False)}"
         )
         max_chars = int(settings.openclaw_agent_max_prompt_chars or 0)
-        force_compressed_prompt = any(
-            isinstance(item, dict)
-            and isinstance(item.get('symbol_day_context'), dict)
-            and isinstance(
-                item['symbol_day_context'].get(
-                    'intraday_wait_recheck_context'
-                ),
-                dict,
-            )
-            for item in batch_items
-        )
-        if not force_compressed_prompt and (
-            max_chars <= 0 or len(base_message) <= max_chars
-        ):
+        if max_chars <= 0 or len(base_message) <= max_chars:
             return base_message
         compressed_items = [_compressed_batch_item_for_prompt(item) for item in batch_items]
         compact_message = (
@@ -2515,7 +2505,7 @@ class OpenClawAgentClient:
             f"{signal_decider_batch_rules}"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for every assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For WAIT outputs in either decider lane, provide complete coherent trigger_price, chase_limit_price, target_price, and stop_loss_price; signal-decider WAIT must use entry_price_basis=trigger_limit. trigger_conditions are optional audit prose and never a second execution gate. If that complete WAIT price contract is not supportable, return REJECT instead of inventing levels.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
             "Interpret signal_decider_policy.performance_criteria as auditable replay context only when usage_policy.model_guidance_eligible=true. It may support conservative review or tighter buy thresholds; when manual_review_only=true it must never relax wait/reject into buy or authorize a buy. Deterministic execution may consume it only when usage_policy.deterministic_gate_eligible=true, and that eligibility never activates rule candidates or grants buy authority.\n"
@@ -3899,49 +3889,6 @@ class AgentFeedbackOrchestrator:
                     )
                 else:
                     refreshed_item.pop('agent_feedback_eligibility', None)
-            expected_wait_recheck_context = (
-                expected_symbol_context.get('intraday_wait_recheck_context')
-                if isinstance(expected_symbol_context, dict)
-                and isinstance(
-                    expected_symbol_context.get(
-                        'intraday_wait_recheck_context'
-                    ),
-                    dict,
-                )
-                else None
-            )
-            if expected_wait_recheck_context is not None:
-                from app.agent_context.wait_recheck_service import (
-                    load_validated_wait_recheck_context,
-                )
-
-                try:
-                    wait_recheck_event_id = int(
-                        expected_wait_recheck_context.get('event_id')
-                    )
-                except (TypeError, ValueError):
-                    wait_recheck_event_id = None
-                validated_wait_recheck_context = (
-                    load_validated_wait_recheck_context(
-                        event_id=wait_recheck_event_id,
-                        symbol=symbol,
-                        agent_name=decision_role,
-                    )
-                    if wait_recheck_event_id is not None
-                    else None
-                )
-                if (
-                    validated_wait_recheck_context is None
-                    or validated_wait_recheck_context
-                    != expected_wait_recheck_context
-                ):
-                    reasons.append(
-                        {'code': 'intraday_wait_recheck_context_changed'}
-                    )
-                elif isinstance(refreshed_item, dict):
-                    refreshed_item['intraday_wait_recheck_context'] = (
-                        validated_wait_recheck_context
-                    )
             refreshed_policy_context: dict[str, Any] = {}
             try:
                 if decision_role in DECISION_SUPPORT_AGENT_NAMES:
@@ -5150,16 +5097,6 @@ class AgentFeedbackOrchestrator:
                     policy_context_as_of_date.isoformat()
                 ),
                 'upstream_summary_run_id': upstream_summary_run_id,
-                'intraday_wait_recheck_event_id': (
-                    item.get('intraday_wait_recheck_context', {}).get(
-                        'event_id'
-                    )
-                    if isinstance(
-                        item.get('intraday_wait_recheck_context'),
-                        dict,
-                    )
-                    else None
-                ),
             }
             payload['decision_input_generation_fence'] = {
                 'schema_version': 'decision_input_generation_fence_v1',
@@ -6340,16 +6277,7 @@ class AgentFeedbackOrchestrator:
         upstream_summary_run_id: str | None = None,
         persistence_guard: Callable[..., Any] | None = None,
         expected_weekly_policy_binding: Mapping[str, Any] | None = None,
-        source_context_overlays: Mapping[str, Mapping[str, Any]] | None = None,
-        _dispatch_entry_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        # Internal admission hand-off used by WAIT rechecks.  The callback is
-        # deliberately the first operation in the provider entry point so a
-        # market-session revocation can be linearized against dispatch start
-        # without holding a shutdown lock for the duration of a slow model
-        # call.  Other callers leave it unset.
-        if _dispatch_entry_callback is not None:
-            _dispatch_entry_callback()
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         resolved_policy_context_as_of_date = (
             policy_context_as_of_date.date()
@@ -6411,50 +6339,6 @@ class AgentFeedbackOrchestrator:
         specs = self._select_specs(roles=roles)
         requested_role_names = [spec.role for spec in specs]
         requested_symbols = _normalize_requested_symbols(symbols)
-        normalized_source_context_overlays: dict[str, dict[str, Any]] = {}
-        if source_context_overlays is not None:
-            if (
-                len(requested_role_names) != 1
-                or requested_role_names[0]
-                not in {
-                    SIGNAL_DECIDER_AGENT_NAME,
-                    SHORT_TERM_DECIDER_AGENT_NAME,
-                }
-            ):
-                raise ValueError(
-                    'source_context_overlays require one supported decider role'
-                )
-            overlay_agent_name = requested_role_names[0]
-            from app.agent_context.wait_recheck_service import (
-                load_validated_wait_recheck_context,
-            )
-
-            for raw_symbol, raw_context in source_context_overlays.items():
-                symbol = str(raw_symbol or '').strip().upper()
-                if symbol not in set(requested_symbols):
-                    raise ValueError(
-                        'source_context_overlays must match requested symbols'
-                    )
-                if not isinstance(raw_context, Mapping):
-                    raise ValueError('source_context_overlays must contain objects')
-                try:
-                    event_id = int(raw_context.get('event_id'))
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        'source_context_overlays require a durable event_id'
-                    ) from None
-                validated_context = load_validated_wait_recheck_context(
-                    event_id=event_id,
-                    symbol=symbol,
-                    agent_name=overlay_agent_name,
-                )
-                if validated_context is None or validated_context != dict(
-                    raw_context
-                ):
-                    raise ValueError(
-                        'source_context_overlays do not match durable WAIT recheck evidence'
-                    )
-                normalized_source_context_overlays[symbol] = validated_context
         uses_precomputed_auto_scope = bool(
             auto_scope
             and role_symbol_scopes is not None
@@ -6660,11 +6544,6 @@ class AgentFeedbackOrchestrator:
                 normalized_expected_weekly_policy_binding
             ),
         }
-        if normalized_source_context_overlays:
-            request_payload['source_context_overlay_event_ids'] = {
-                symbol: context['event_id']
-                for symbol, context in normalized_source_context_overlays.items()
-            }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
@@ -7282,12 +7161,6 @@ class AgentFeedbackOrchestrator:
                             ),
                         )
                     )
-                    for context_item in symbol_context.get('items') or []:
-                        overlay = normalized_source_context_overlays.get(
-                            str(context_item.get('symbol') or '').strip().upper()
-                        )
-                        if overlay is not None:
-                            context_item['intraday_wait_recheck_context'] = overlay
                     context_materialized = True
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
@@ -7474,12 +7347,6 @@ class AgentFeedbackOrchestrator:
                         disclosures_limit=disclosures_limit,
                         knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
-                    for context_item in symbol_context.get('items') or []:
-                        overlay = normalized_source_context_overlays.get(
-                            str(context_item.get('symbol') or '').strip().upper()
-                        )
-                        if overlay is not None:
-                            context_item['intraday_wait_recheck_context'] = overlay
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
                         diagnostics=eligibility_diagnostics,

@@ -14,6 +14,7 @@ from app.agent_context.retry_service import (
     FeedbackRetryCycleConfig,
     agent_feedback_retry_service,
     resolve_latest_completed_summary_knowledge_cutoff,
+    resolve_terminal_independent_role_success,
     resolve_terminal_role_success_intersection,
 )
 from app.agent_context.prerequisite_service import (
@@ -2791,14 +2792,28 @@ class DailyPipelineStageService:
                 )
                 else None
             )
+            terminal_signal_decider_symbols = (
+                list(
+                    terminal_decider_progression_proof[
+                        'completed_symbols_by_role'
+                    ]['signal-decider']
+                )
+                if isinstance(
+                    terminal_decider_progression_proof,
+                    Mapping,
+                )
+                else None
+            )
             if (
-                stage_id in {
-                    'next_open_execution_plan',
-                    'signal_decider_evaluations',
-                }
-                and terminal_decider_symbols
+                stage_id == 'next_open_execution_plan'
+                and terminal_decider_symbols is not None
             ):
                 stage_symbols = list(terminal_decider_symbols)
+            elif (
+                stage_id == 'signal_decider_evaluations'
+                and terminal_signal_decider_symbols is not None
+            ):
+                stage_symbols = list(terminal_signal_decider_symbols)
             if (
                 stage_id == 'signal_decider'
                 and isinstance(feedback_cutoff_resolution, dict)
@@ -2887,13 +2902,13 @@ class DailyPipelineStageService:
             if (
                 stage_id == 'signal_decider_evaluations'
                 and 'signal_decider' in incomplete_dependencies
-                and terminal_decider_symbols
+                and terminal_decider_progression_proof is not None
             ):
                 incomplete_dependencies.remove('signal_decider')
             if (
                 stage_id == 'signal_decider_evaluations'
                 and stage_outcomes.get('signal_decider') is not None
-                and not terminal_decider_symbols
+                and terminal_decider_progression_proof is None
                 and str(
                     stage_outcomes['signal_decider'].get('status') or ''
                 ).strip().lower()
@@ -3517,6 +3532,37 @@ class DailyPipelineStageService:
                             if stage_symbols is not None
                             else None
                         )
+                        if (
+                            stage_id == 'signal_decider_evaluations'
+                            and stage_symbols == []
+                            and terminal_decider_progression_proof
+                            is not None
+                        ):
+                            return {
+                                'triggered': False,
+                                'safe_skip': True,
+                                'status': 'completed',
+                                'reason': (
+                                    'no_successful_signal_decider_scope'
+                                ),
+                                'request': {
+                                    'symbols': [],
+                                    'horizons': [],
+                                    'evaluation_version': (
+                                        'not_applicable'
+                                    ),
+                                    'evaluation_rule_set_version': (
+                                        'not_applicable'
+                                    ),
+                                },
+                                'summary': {
+                                    'status': 'completed',
+                                    'decisions_considered': 0,
+                                    'outcomes_upserted': 0,
+                                    'evaluations_upserted': 0,
+                                },
+                                'items': [],
+                            }
                         stage_result = self._execute_stage(
                             stage_id,
                             market_date=resolved_market_date,
@@ -4114,7 +4160,23 @@ class DailyPipelineStageService:
             role: list(decider_failed_symbols_by_role[role])
             for role in DECISION_SUPPORT_AGENT_NAMES
         }
+        decider_completed_symbols_by_role = decider_proof.get(
+            'completed_symbols_by_role'
+        )
+        if not (
+            isinstance(decider_completed_symbols_by_role, Mapping)
+            and set(decider_completed_symbols_by_role)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
+        ):
+            return None
+        decider_completed_symbols_by_role = {
+            role: list(decider_completed_symbols_by_role[role])
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
         actionable_symbols = list(decider_proof['completed_symbols'])
+        signal_evaluation_symbols = list(
+            decider_completed_symbols_by_role['signal-decider']
+        )
         plan_outcome = stage_outcomes.get('next_open_execution_plan')
         evaluation_outcome = stage_outcomes.get(
             'signal_decider_evaluations'
@@ -4164,7 +4226,7 @@ class DailyPipelineStageService:
             and isinstance(plan_completion_scope_proof, Mapping)
             and isinstance(evaluation_completion_scope_proof, Mapping)
             and evaluation_scope_proof.get('requested_symbols')
-            == actionable_symbols
+            == signal_evaluation_symbols
             and set(plan_scope_proof.get('active_symbols') or [])
             <= set(actionable_symbols)
             and (
@@ -4237,6 +4299,9 @@ class DailyPipelineStageService:
                     decider_proof['admitted_symbols']
                 ),
                 'completed_symbols': actionable_symbols,
+                'completed_symbols_by_role': (
+                    decider_completed_symbols_by_role
+                ),
                 'failed_symbols_by_role': (
                     decider_failed_symbols_by_role
                 ),
@@ -4264,6 +4329,10 @@ class DailyPipelineStageService:
                     ]
                 ),
                 'completed_symbols': list(actionable_symbols),
+                'completed_symbols_by_role': {
+                    role: list(decider_completed_symbols_by_role[role])
+                    for role in DECISION_SUPPORT_AGENT_NAMES
+                },
                 'decision_identities': list(
                     decider_completion_scope_proof[
                         'decision_identities'
@@ -5755,11 +5824,17 @@ class DailyPipelineStageService:
         raw_completed_symbols = parent_scope_proof.get(
             'completed_symbols'
         )
+        raw_completed_symbols_by_role = parent_scope_proof.get(
+            'completed_symbols_by_role'
+        )
         if not (
             parent_run_id
             and parent_summary_run_id
             and isinstance(raw_admitted_symbols, list)
             and isinstance(raw_completed_symbols, list)
+            and isinstance(raw_completed_symbols_by_role, Mapping)
+            and set(raw_completed_symbols_by_role)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
         ):
             return None
         parent_admitted_symbols = sorted(
@@ -5768,6 +5843,14 @@ class DailyPipelineStageService:
         parent_completed_symbols = sorted(
             normalize_symbol_codes(raw_completed_symbols)
         )
+        parent_completed_symbols_by_role = {
+            role: sorted(
+                normalize_symbol_codes(
+                    raw_completed_symbols_by_role[role]
+                )
+            )
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
         raw_parent_identities = parent_scope_proof.get(
             'decision_identities'
         )
@@ -5780,6 +5863,21 @@ class DailyPipelineStageService:
             == len(raw_completed_symbols)
             and set(parent_completed_symbols)
             <= set(parent_admitted_symbols)
+            and all(
+                parent_completed_symbols_by_role[role]
+                == raw_completed_symbols_by_role[role]
+                and set(parent_completed_symbols_by_role[role])
+                <= set(parent_admitted_symbols)
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            )
+            and parent_completed_symbols
+            == sorted(
+                {
+                    symbol
+                    for symbols in parent_completed_symbols_by_role.values()
+                    for symbol in symbols
+                }
+            )
             and isinstance(raw_parent_identities, list)
         ):
             return None
@@ -5845,18 +5943,18 @@ class DailyPipelineStageService:
                 isinstance(raw_scope, list)
                 and normalize_symbol_codes(raw_scope) == raw_scope
                 and sorted(set(raw_scope)) == raw_scope
-                and raw_scope == parent_completed_symbols
+                and raw_scope == parent_completed_symbols_by_role[role]
             ):
                 return None
             manifest_role_scopes[role] = list(raw_scope)
         canonical_role_scopes = {
-            role: list(parent_completed_symbols)
+            role: list(parent_completed_symbols_by_role[role])
             for role in DECISION_SUPPORT_AGENT_NAMES
         }
         expected_decisions = {
             (symbol, role)
             for role in DECISION_SUPPORT_AGENT_NAMES
-            for symbol in parent_completed_symbols
+            for symbol in parent_completed_symbols_by_role[role]
         }
         manifest_decisions = {
             (symbol, role)
@@ -6170,13 +6268,23 @@ class DailyPipelineStageService:
         parent_summary_run_id = str(
             parent_scope_proof.get('source_summary_run_id') or ''
         ).strip()
-        raw_parent_symbols = parent_scope_proof.get('completed_symbols')
+        raw_parent_symbols_by_role = parent_scope_proof.get(
+            'completed_symbols_by_role'
+        )
+        raw_parent_symbols = (
+            raw_parent_symbols_by_role.get('signal-decider')
+            if isinstance(raw_parent_symbols_by_role, Mapping)
+            else None
+        )
         raw_parent_identities = parent_scope_proof.get(
             'decision_identities'
         )
         if not (
             parent_run_id
             and parent_summary_run_id
+            and isinstance(raw_parent_symbols_by_role, Mapping)
+            and set(raw_parent_symbols_by_role)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
             and isinstance(raw_parent_symbols, list)
             and isinstance(raw_parent_identities, list)
         ):
@@ -6193,6 +6301,49 @@ class DailyPipelineStageService:
         request = result.get('request')
         summary = result.get('summary')
         items = result.get('items')
+        if not parent_symbols:
+            if not (
+                str(result.get('status') or '').strip().lower()
+                == 'completed'
+                and result.get('reason')
+                == 'no_successful_signal_decider_scope'
+                and isinstance(request, Mapping)
+                and request.get('symbols') == []
+                and request.get('horizons') == []
+                and request.get('evaluation_version')
+                == 'not_applicable'
+                and request.get('evaluation_rule_set_version')
+                == 'not_applicable'
+                and isinstance(summary, Mapping)
+                and summary.get('status') == 'completed'
+                and summary.get('decisions_considered') == 0
+                and summary.get('outcomes_upserted') == 0
+                and summary.get('evaluations_upserted') == 0
+                and items == []
+                and not signal_identity_by_symbol
+            ):
+                return None
+            proof: dict[str, Any] = {
+                'schema_version': (
+                    STAGE_COMPLETION_SCOPE_PROOF_SCHEMA_VERSION
+                ),
+                'kind': 'signal_decider_evaluations_parent_scope',
+                'parent_run_id': parent_run_id,
+                'parent_summary_run_id': parent_summary_run_id,
+                'parent_completed_symbols': [],
+                'request_symbols': [],
+                'horizons': [],
+                'evaluation_version': 'not_applicable',
+                'evaluation_rule_set_version': 'not_applicable',
+                'decision_horizon_scope': [],
+                'decision_count': 0,
+                'item_count': 0,
+            }
+            proof['proof_digest'] = (
+                DailyPipelineStageService
+                ._stage_completion_scope_proof_digest(proof)
+            )
+            return proof
         if not (
             parent_symbols
             and len(parent_symbols) == len(raw_parent_symbols)
@@ -6447,6 +6598,7 @@ class DailyPipelineStageService:
                 'knowledge_cutoff_at',
                 'admitted_symbols',
                 'completed_symbols',
+                'completed_symbols_by_role',
                 'failed_symbols_by_role',
                 'decision_identities',
                 'total_items',
@@ -6457,6 +6609,7 @@ class DailyPipelineStageService:
             roles = proof.get('roles')
             admitted_symbols = proof.get('admitted_symbols')
             completed_symbols = proof.get('completed_symbols')
+            completed_by_role = proof.get('completed_symbols_by_role')
             failed_by_role = proof.get('failed_symbols_by_role')
             decision_identities = proof.get('decision_identities')
             try:
@@ -6489,6 +6642,9 @@ class DailyPipelineStageService:
                 == completed_symbols
                 and sorted(set(completed_symbols)) == completed_symbols
                 and set(completed_symbols) <= set(admitted_symbols)
+                and isinstance(completed_by_role, Mapping)
+                and set(completed_by_role)
+                == set(DECISION_SUPPORT_AGENT_NAMES)
                 and isinstance(failed_by_role, Mapping)
                 and set(failed_by_role)
                 == set(DECISION_SUPPORT_AGENT_NAMES)
@@ -6499,17 +6655,29 @@ class DailyPipelineStageService:
             completed_items = proof.get('completed_items')
             failed_items = proof.get('failed_items')
             canonical_failed_by_role: dict[str, list[str]] = {}
+            canonical_completed_by_role: dict[str, list[str]] = {}
             for role in DECISION_SUPPORT_AGENT_NAMES:
                 failed_symbols = failed_by_role.get(role)
+                role_completed_symbols = completed_by_role.get(role)
                 if not (
                     isinstance(failed_symbols, list)
                     and normalize_symbol_codes(failed_symbols)
                     == failed_symbols
                     and sorted(set(failed_symbols)) == failed_symbols
                     and set(failed_symbols) <= set(admitted_symbols)
+                    and isinstance(role_completed_symbols, list)
+                    and normalize_symbol_codes(role_completed_symbols)
+                    == role_completed_symbols
+                    and sorted(set(role_completed_symbols))
+                    == role_completed_symbols
+                    and set(role_completed_symbols)
+                    == set(admitted_symbols).difference(failed_symbols)
                 ):
                     return None
                 canonical_failed_by_role[role] = list(failed_symbols)
+                canonical_completed_by_role[role] = list(
+                    role_completed_symbols
+                )
             canonical_identities: list[dict[str, Any]] = []
             seen_identity_keys: set[tuple[str, str]] = set()
             for raw_identity in decision_identities:
@@ -6543,8 +6711,9 @@ class DailyPipelineStageService:
                     len(normalized_symbol) == 1
                     and identity.get('symbol')
                     == normalized_symbol[0]
-                    and normalized_symbol[0] in completed_symbols
                     and role in DECISION_SUPPORT_AGENT_NAMES
+                    and normalized_symbol[0]
+                    in canonical_completed_by_role[role]
                     and type(snapshot_id) is int
                     and snapshot_id > 0
                     and decision_run_id
@@ -6568,9 +6737,16 @@ class DailyPipelineStageService:
             )
             expected_identity_keys = {
                 (symbol, role)
-                for symbol in completed_symbols
                 for role in DECISION_SUPPORT_AGENT_NAMES
+                for symbol in canonical_completed_by_role[role]
             }
+            completed_union = sorted(
+                {
+                    symbol
+                    for symbols in canonical_completed_by_role.values()
+                    for symbol in symbols
+                }
+            )
             if not (
                 type(total_items) is int
                 and total_items == (
@@ -6580,19 +6756,17 @@ class DailyPipelineStageService:
                 and type(completed_items) is int
                 and type(failed_items) is int
                 and completed_items + failed_items == total_items
+                and completed_items
+                == sum(
+                    len(symbols)
+                    for symbols in canonical_completed_by_role.values()
+                )
                 and failed_items
                 == sum(
                     len(symbols)
                     for symbols in canonical_failed_by_role.values()
                 )
-                and set(completed_symbols)
-                == set(admitted_symbols).difference(
-                    {
-                        symbol
-                        for symbols in canonical_failed_by_role.values()
-                        for symbol in symbols
-                    }
-                )
+                and completed_symbols == completed_union
                 and seen_identity_keys == expected_identity_keys
                 and decision_identities == canonical_identities
             ):
@@ -6754,8 +6928,24 @@ class DailyPipelineStageService:
                 and set(role_symbol_scopes)
                 == set(DECISION_SUPPORT_AGENT_NAMES)
                 and all(
-                    role_symbol_scopes.get(role) == completed_symbols
+                    isinstance(role_symbol_scopes.get(role), list)
+                    and normalize_symbol_codes(
+                        role_symbol_scopes.get(role)
+                    )
+                    == role_symbol_scopes.get(role)
+                    and sorted(set(role_symbol_scopes.get(role)))
+                    == role_symbol_scopes.get(role)
+                    and set(role_symbol_scopes.get(role))
+                    <= set(completed_symbols)
                     for role in DECISION_SUPPORT_AGENT_NAMES
+                )
+                and completed_symbols
+                == sorted(
+                    {
+                        symbol
+                        for role in DECISION_SUPPORT_AGENT_NAMES
+                        for symbol in role_symbol_scopes.get(role)
+                    }
                 )
                 and isinstance(partition, list)
                 and all(
@@ -6770,8 +6960,10 @@ class DailyPipelineStageService:
                     )
                 )
                 and decision_count
-                == len(completed_symbols)
-                * len(DECISION_SUPPORT_AGENT_NAMES)
+                == sum(
+                    len(role_symbol_scopes.get(role))
+                    for role in DECISION_SUPPORT_AGENT_NAMES
+                )
                 and len(partition) == decision_count
                 and included_decision_count
                 + excluded_decision_count
@@ -6838,8 +7030,9 @@ class DailyPipelineStageService:
                 )
                 if not (
                     len(normalized_symbol) == 1
-                    and normalized_symbol[0] in completed_symbols
                     and role in DECISION_SUPPORT_AGENT_NAMES
+                    and normalized_symbol[0]
+                    in role_symbol_scopes.get(role)
                     and decision_key not in seen_decisions
                     and str(
                         entry.get('decision_run_id') or ''
@@ -6971,7 +7164,7 @@ class DailyPipelineStageService:
                 == {
                     (symbol, role)
                     for role in DECISION_SUPPORT_AGENT_NAMES
-                    for symbol in completed_symbols
+                    for symbol in role_symbol_scopes.get(role)
                 }
                 and canonical_partition == partition
                 and actual_included_decisions
@@ -7011,6 +7204,25 @@ class DailyPipelineStageService:
             evaluation_rule_set_version = str(
                 proof.get('evaluation_rule_set_version') or ''
             ).strip()
+            zero_scope_proof = bool(
+                set(proof) == expected_keys
+                and proof.get('kind')
+                == 'signal_decider_evaluations_parent_scope'
+                and str(proof.get('parent_run_id') or '').strip()
+                and str(
+                    proof.get('parent_summary_run_id') or ''
+                ).strip()
+                and parent_symbols == []
+                and request_symbols == []
+                and horizons == []
+                and evaluation_version == 'not_applicable'
+                and evaluation_rule_set_version == 'not_applicable'
+                and scope == []
+                and decision_count == 0
+                and item_count == 0
+            )
+            if zero_scope_proof:
+                return proof
             if not (
                 set(proof) == expected_keys
                 and proof.get('kind')
@@ -9585,7 +9797,7 @@ class DailyPipelineStageService:
             == feedback_cutoff_resolution.get('completed_scope_proof')
         ):
             return None
-        resolution = resolve_terminal_role_success_intersection(
+        resolution = resolve_terminal_independent_role_success(
             progress_summary=progress_summary,
             roles=DECISION_SUPPORT_AGENT_NAMES,
             expected_role_symbol_scopes={
@@ -9594,10 +9806,16 @@ class DailyPipelineStageService:
             },
         )
         completed_symbols = resolution.get('completed_symbols')
+        completed_symbols_by_role = resolution.get(
+            'completed_symbols_by_role'
+        )
         if not (
             resolution.get('ready') is True
             and isinstance(completed_symbols, list)
             and completed_symbols
+            and isinstance(completed_symbols_by_role, Mapping)
+            and set(completed_symbols_by_role)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
         ):
             return None
         raw_decision_identities = (
@@ -9607,7 +9825,10 @@ class DailyPipelineStageService:
         )
         if not isinstance(raw_decision_identities, list):
             return None
-        completed_symbol_set = set(completed_symbols)
+        completed_symbol_sets_by_role = {
+            role: set(completed_symbols_by_role[role])
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        }
         decision_identities_by_key: dict[
             tuple[str, str],
             dict[str, Any],
@@ -9637,7 +9858,10 @@ class DailyPipelineStageService:
                 normalized_symbol[0] if normalized_symbol else '',
                 role,
             )
-            if key[0] not in completed_symbol_set:
+            if (
+                role in completed_symbol_sets_by_role
+                and key[0] not in completed_symbol_sets_by_role[role]
+            ):
                 # Identities from failed retry-debt scopes are intentionally
                 # omitted from terminal progression authority.
                 continue
@@ -9659,8 +9883,8 @@ class DailyPipelineStageService:
             }
         expected_identity_keys = {
             (symbol, role)
-            for symbol in completed_symbols
             for role in DECISION_SUPPORT_AGENT_NAMES
+            for symbol in completed_symbols_by_role[role]
         }
         if set(decision_identities_by_key) != expected_identity_keys:
             return None
@@ -9680,6 +9904,10 @@ class DailyPipelineStageService:
             'knowledge_cutoff_at': normalized_cutoff_at.isoformat(),
             'admitted_symbols': list(normalized_expected_symbols),
             'completed_symbols': list(completed_symbols),
+            'completed_symbols_by_role': {
+                role: list(completed_symbols_by_role[role])
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
             'failed_symbols_by_role': {
                 role: list(
                     resolution['failed_symbols_by_role'].get(role, [])
@@ -9710,7 +9938,7 @@ class DailyPipelineStageService:
         expected_decider_symbols: Sequence[str] | None,
         feedback_cutoff_resolution: Mapping[str, Any] | None,
     ) -> list[str] | None:
-        """Return the exact terminal two-decider success intersection."""
+        """Return the exact terminal union of independent decider successes."""
 
         if not (
             isinstance(outcome, dict)

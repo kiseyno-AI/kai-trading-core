@@ -1733,6 +1733,88 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
         )
         self.assertEqual(failures[0]['diagnostics']['session_cleanup']['status'], 'deleted')
 
+    def test_incomplete_wait_geometry_is_retryable_and_never_persisted(self):
+        payload = _complete_actionable_signal_feedback()
+        payload.update(
+            {
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'wait_reason': {
+                    'code': 'unsuitable_execution_timing',
+                    'summary': '구체적인 진입 트리거를 산출할 근거가 부족합니다.',
+                },
+                'entry_price_basis': 'next_open',
+                'trigger_price': None,
+                'chase_limit_price': None,
+                'expected_return_pct': None,
+                'trigger_conditions': [],
+            }
+        )
+        normalized = orchestrator_module.normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(payload, ensure_ascii=False),
+            raw_response=payload,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+        self.assertFalse(normalized['response_contract_valid'])
+
+        store_calls: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**kwargs):
+                return {
+                    'normalized_feedback': normalized,
+                    'session_ref': {
+                        'session_key': kwargs['payload']['session_key']
+                    },
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**kwargs):
+                store_calls.append(kwargs)
+                raise AssertionError(
+                    'invalid WAIT feedback must not reach persistence or snapshots'
+                )
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                return {
+                    'status': 'deleted',
+                    'session_key': kwargs['session_key'],
+                }
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='incomplete-wait-geometry',
+            specs=[
+                SimpleNamespace(
+                    role='signal-decider',
+                    agent_name='signal-decider',
+                )
+            ],
+            payloads={'signal-decider': {'trade_date': '2026-04-23'}},
+            symbol='005930',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(store_calls, [])
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0]['retryable'])
+        self.assertTrue(
+            failures[0]['failure_kind'].startswith(
+                'response_contract_invalid:action_requirement_invalid:'
+            )
+        )
+
     def test_single_dispatch_cleanup_failure_does_not_mask_contract_failure(self):
         class Client:
             @staticmethod
@@ -3967,7 +4049,7 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertIn('liquidity_context', context)
         self.assertIn('intraday_execution_context', context)
         self.assertIn('valuation_context', context)
-        self.assertIn('intraday_wait_recheck_context', context)
+        self.assertNotIn('intraday_wait_recheck_context', context)
 
 
 class FakeFuture:
@@ -5714,9 +5796,25 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             1,
         )[0]
         example_feedback = json.loads(example_text)['items'][0]['feedback']
-        self.assertIsNone(example_feedback['trigger_price'])
-        self.assertIsNone(example_feedback['chase_limit_price'])
-        self.assertEqual(example_feedback['trigger_conditions'], [])
+        self.assertEqual(example_feedback['entry_price_basis'], 'trigger_limit')
+        self.assertGreater(example_feedback['trigger_price'], 0)
+        self.assertGreaterEqual(
+            example_feedback['chase_limit_price'],
+            example_feedback['trigger_price'],
+        )
+        self.assertGreater(
+            example_feedback['target_price'],
+            example_feedback['chase_limit_price'],
+        )
+        self.assertLess(
+            example_feedback['stop_loss_price'],
+            example_feedback['trigger_price'],
+        )
+        self.assertTrue(example_feedback['trigger_conditions'])
+        self.assertNotIn(
+            'intraday_wait_recheck_context is supplied',
+            message,
+        )
 
     def test_technical_summarizer_batch_message_has_one_unambiguous_envelope_contract(self):
         fake_settings = SimpleNamespace(
@@ -5805,6 +5903,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('"expected_holding_period": "1-3 trading days"', short_term_message)
         self.assertIn('"preferred_action": "watch_for_trigger"', short_term_message)
         self.assertNotIn('1-2 trading day', short_term_message)
+        self.assertNotIn(
+            'intraday_wait_recheck_context is supplied',
+            short_term_message,
+        )
         self.assertIn('DART', fundamental_message)
         self.assertIn('SEC', fundamental_message)
         self.assertIn('market and source metadata', fundamental_message)
@@ -5885,7 +5987,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('usage_policy.model_guidance_eligible=true', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
 
-    def test_wait_recheck_forces_compact_batch_prompt_and_preserves_exact_context(self):
+    def test_retired_wait_recheck_context_is_not_prompt_input(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
             openclaw_gateway_token='gateway-token',
@@ -5948,14 +6050,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
             ordinary_message,
         )
         self.assertIn(
-            'Analyze every assigned symbol directly and return one aggregated JSON object.',
+            'Analyze each assigned symbol directly using only the supplied payload.',
             wait_message,
         )
         encoded_payload = wait_message.split('Assigned batch payload:\n', 1)[1]
         prompt_items = json.loads(encoded_payload)
-        self.assertEqual(
-            prompt_items[0]['symbol_day_context']['intraday_wait_recheck_context'],
-            wait_recheck_context,
+        self.assertNotIn(
+            'intraday_wait_recheck_context',
+            prompt_items[0]['symbol_day_context'],
         )
 
     def test_compressed_batch_prompt_builds_and_includes_contract_suffix_once(self):

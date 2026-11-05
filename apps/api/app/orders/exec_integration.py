@@ -33,6 +33,7 @@ from app.market.session import (
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
     async_get_krx_calendar_day,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.orders.execution_handoff_contract import (
     EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
     EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
@@ -191,9 +192,6 @@ _CROSS_LANE_ALIGNMENT_MARKER_KEYS = frozenset(
 )
 _CROSS_LANE_ALIGNMENT_QUANTITY_KEYS = frozenset(
     {'requested_quantity', 'final_quantity', 'enforcement_source'}
-)
-_CROSS_LANE_ALIGNMENT_STALE_SIZING_KEYS = frozenset(
-    {'planned_quantity', 'estimated_notional_krw', 'max_quantity'}
 )
 _CROSS_LANE_ALIGNMENT_REASON_CODES = frozenset(
     {
@@ -1281,29 +1279,21 @@ def _contains_cross_lane_quantity_enforcement(value: Any) -> bool:
 
 
 def _strip_cross_lane_alignment_audit(payload: dict[str, Any]) -> dict[str, Any]:
-    """Keep opposite-lane alignment evidence in Core, never in Exec decision input."""
+    """Keep legacy opposite-lane evidence in Core, never in Exec input.
 
-    sizing_enforcement_present = _contains_cross_lane_quantity_enforcement(
-        payload
-    )
+    Alignment-owned requested/final quantities are removed recursively, while
+    this lane's planned quantity and notional remain available as sizing
+    context.  A historical sibling-lane marker must never erase own-lane
+    evidence.
+    """
 
     def sanitize(value: Any) -> Any:
         if isinstance(value, dict):
-            alignment_context = any(
-                key in value for key in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
-            )
             return {
                 key: sanitize(item)
                 for key, item in value.items()
                 if key not in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
-                and not (
-                    alignment_context
-                    and key in _CROSS_LANE_ALIGNMENT_QUANTITY_KEYS
-                )
-                and not (
-                    sizing_enforcement_present
-                    and key in _CROSS_LANE_ALIGNMENT_STALE_SIZING_KEYS
-                )
+                and key not in _CROSS_LANE_ALIGNMENT_QUANTITY_KEYS
             }
         if isinstance(value, list):
             return [
@@ -6863,7 +6853,7 @@ class SignalDeciderExecIntegrationService:
             if (
                 not symbol
                 or symbol != item
-                or re.fullmatch(r'[0-9]{6}', symbol) is None
+                or not is_canonical_krx_short_code(symbol)
             ):
                 return self._degraded_cached_exec_monitoring_membership(
                     market_date
@@ -7033,7 +7023,7 @@ class SignalDeciderExecIntegrationService:
                 quantity = _safe_decimal(holding.get('quantity'))
                 if (
                     symbol is None
-                    or re.fullmatch(r'[0-9]{6}', symbol) is None
+                    or not is_canonical_krx_short_code(symbol)
                     or quantity is None
                     or quantity < Decimal('0')
                 ):
@@ -9377,7 +9367,6 @@ class SignalDeciderExecIntegrationService:
         traceability: dict[str, Any],
         validation: dict[str, Any],
         decision_traceability: dict[str, Any],
-        ignore_row_planned_notional: bool = False,
     ) -> dict[str, Any]:
         row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
         traceability = _strip_cross_lane_alignment_audit(traceability)
@@ -9441,11 +9430,7 @@ class SignalDeciderExecIntegrationService:
             traceability=traceability,
             allocation_budget_krw=row.allocation_budget_krw,
             estimated_reference_price=row.estimated_reference_price,
-            planned_notional_krw=(
-                None
-                if ignore_row_planned_notional
-                else row.estimated_notional_krw
-            ),
+            planned_notional_krw=row.estimated_notional_krw,
         )
         market_regime_context = _market_regime_context_from_payloads(
             request_payload=request_payload,
@@ -9615,22 +9600,6 @@ class SignalDeciderExecIntegrationService:
                 row.validation_payload
                 if isinstance(row.validation_payload, dict)
                 else {}
-            )
-            alignment_sizing_enforcement_present = any(
-                _contains_cross_lane_quantity_enforcement(payload)
-                for payload in (
-                    raw_traceability,
-                    raw_validation,
-                    snapshot.request_payload if snapshot is not None else {},
-                    snapshot.input_feature_snapshot_payload
-                    if snapshot is not None
-                    else {},
-                    snapshot.response_payload if snapshot is not None else {},
-                    snapshot.response_summary_payload
-                    if snapshot is not None
-                    else {},
-                )
-                if isinstance(payload, dict)
             )
             traceability = raw_traceability
             unsupported_route_reason = _unsupported_exec_sizing_route_reason(
@@ -9807,9 +9776,6 @@ class SignalDeciderExecIntegrationService:
                 traceability=dispatch_traceability,
                 validation=validation,
                 decision_traceability=decision_traceability,
-                ignore_row_planned_notional=(
-                    alignment_sizing_enforcement_present
-                ),
             )
             decision_input_quality_context = (
                 full_decider_handoff_context.get('decision_input_quality_context')
@@ -10085,22 +10051,18 @@ class SignalDeciderExecIntegrationService:
                 ),
             }
             if uses_exec_agent_sizing:
-                if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
-                    estimated_notional_krw = None
-                    pricing_note = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
-                elif alignment_sizing_enforcement_present:
-                    estimated_notional_krw = None
-                    pricing_note = (
-                        'Sizing for short-term-decider dispatch is delegated '
-                        'to exec-agent; opposite-lane alignment is Core audit only.'
+                estimated_notional_krw = _decimal_to_text(
+                    _safe_decimal(row.estimated_notional_krw)
+                )
+                pricing_note = (
+                    validation.get('pricing_note')
+                    if isinstance(validation.get('pricing_note'), str)
+                    else (
+                        'Sizing for signal-decider dispatch is delegated to exec-agent.'
+                        if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                        else 'Sizing for short-term-decider dispatch is delegated to exec-agent.'
                     )
-                else:
-                    estimated_notional_krw = _decimal_to_text(_safe_decimal(row.estimated_notional_krw))
-                    pricing_note = (
-                        validation.get('pricing_note')
-                        if isinstance(validation.get('pricing_note'), str)
-                        else None
-                    )
+                )
                 quantity_policy = {
                     'type': 'exec_agent_sized',
                     'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),

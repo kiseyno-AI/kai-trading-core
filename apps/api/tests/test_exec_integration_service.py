@@ -5314,7 +5314,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
         self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
 
-    async def test_short_term_entry_quality_keeps_signal_lane_disagreement_report_only(self) -> None:
+    async def test_short_term_entry_quality_has_no_signal_lane_dependency(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             tactical_action='scalp_buy_candidate',
             request_payload={
@@ -5347,68 +5347,43 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         with session_scope() as session:
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
-            for signal_action, expected_warning in (
-                ('wait', 'signal_decider_wait_cross_lane_observation'),
-                ('reject', 'signal_decider_reject_cross_lane_observation'),
-            ):
-                with self.subTest(signal_action=signal_action):
-                    signal_decider_crosscheck = {
-                        'action': signal_action,
-                        'decision_snapshot_id': self.snapshot_id,
-                        'policy_version': self.policy_version,
-                    }
-                    blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
-                        snapshot=snapshot,
-                        signal_decider_crosscheck=signal_decider_crosscheck,
-                        tactical_action='scalp_buy_candidate',
-                    )
+            blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
+                snapshot=snapshot,
+                tactical_action='scalp_buy_candidate',
+            )
+            validation, _traceability = (
+                signal_decider_next_open_execution_service._build_validation_payload(
+                    snapshot=snapshot,
+                    target=NextOpenAccountTarget(
+                        label='Main',
+                        account_reference=self.account_reference,
+                        budget_krw=Decimal('1500000'),
+                    ),
+                    policy_context=None,
+                    price_cache={},
+                )
+            )
 
-                    blocking_codes = {entry['code'] for entry in blocks}
-                    warning_codes = {entry['code'] for entry in warnings}
-                    self.assertNotIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
-                    self.assertNotIn('signal_decider_reject_veto', blocking_codes)
-                    self.assertIn(expected_warning, warning_codes)
-                    self.assertEqual(
-                        feature_snapshot['signal_decider_crosscheck']['action'],
-                        signal_action,
-                    )
-                    validation, _traceability = (
-                        signal_decider_next_open_execution_service._build_validation_payload(
-                            snapshot=snapshot,
-                            target=NextOpenAccountTarget(
-                                label='Main',
-                                account_reference=self.account_reference,
-                                budget_krw=Decimal('1500000'),
-                            ),
-                            policy_context=None,
-                            price_cache={},
-                            signal_decider_crosscheck=signal_decider_crosscheck,
-                        )
-                    )
-                    validation_block_codes = {
-                        entry['code'] for entry in validation['blocking_reasons']
-                    }
-                    validation_warning_codes = {
-                        entry['code'] for entry in validation['warnings']
-                    }
-                    self.assertEqual(validation['blocking_reasons'], [])
-                    self.assertNotIn(
-                        'signal_decider_wait_blocks_scalp_buy',
-                        validation_block_codes,
-                    )
-                    self.assertNotIn(
-                        'signal_decider_reject_veto',
-                        validation_block_codes,
-                    )
-                    self.assertIn(expected_warning, validation_warning_codes)
-                    self.assertEqual(
-                        validation['pricing']['requested_quantity'],
-                        validation['pricing']['final_quantity'],
-                    )
-                    self.assertEqual(
-                        validation['handoff']['approval_state'],
-                        'pending_exec_agent',
-                    )
+        self.assertEqual(blocks, [])
+        serialized_quality = json.dumps(
+            {
+                'warnings': warnings,
+                'feature_snapshot': feature_snapshot,
+            },
+            sort_keys=True,
+        )
+        serialized_validation = json.dumps(validation, sort_keys=True)
+        for serialized in (serialized_quality, serialized_validation):
+            self.assertNotIn('signal_decider_crosscheck', serialized)
+            self.assertNotIn('cross_lane', serialized)
+            self.assertNotIn('alignment_gate', serialized)
+        self.assertEqual(validation['blocking_reasons'], [])
+        self.assertNotIn('requested_quantity', validation['pricing'])
+        self.assertNotIn('final_quantity', validation['pricing'])
+        self.assertEqual(
+            validation['handoff']['approval_state'],
+            'pending_exec_agent',
+        )
 
     async def test_short_term_entry_quality_warns_low_buy_quality_score(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
@@ -5447,7 +5422,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5465,7 +5439,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5508,7 +5481,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5547,7 +5519,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5590,7 +5561,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5695,7 +5665,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry_item['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', entry_item['quantity_policy'])
         self.assertEqual(Decimal(str(entry_item['quantity_policy']['budget_krw'])), Decimal('1500000'))
-        self.assertIsNone(entry_item['quantity_policy']['estimated_notional_krw'])
+        self.assertEqual(
+            entry_item['quantity_policy']['estimated_notional_krw'],
+            '250000.00',
+        )
         self.assertEqual(entry_item['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(
             entry_item['risk_context']['max_holding_close_policy'],
@@ -11514,8 +11487,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.plan_item_id,
             )
             signal_row.eligibility_status = 'blocked'
-            signal_row.planned_quantity = Decimal('0')
-            signal_row.estimated_notional_krw = Decimal('0')
+            signal_row.planned_quantity = Decimal('20')
+            signal_row.estimated_notional_krw = Decimal('1000000')
             signal_row.validation_payload = {
                 **(signal_row.validation_payload or {}),
                 'blocking_reasons': [
@@ -11528,6 +11501,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'signal_decider_alignment': 'short_term_reject_conflict',
                     'alignment_gate_action': 'block',
                     'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 5,
+                    'final_quantity': 0,
+                },
+                'pricing': {
+                    'planned_quantity': 20,
+                    'estimated_notional_krw': '1000000',
                     'requested_quantity': 5,
                     'final_quantity': 0,
                 },
@@ -11555,8 +11534,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 short_plan_item_id,
             )
             row.eligibility_status = 'blocked'
-            row.planned_quantity = Decimal('0')
-            row.estimated_notional_krw = Decimal('0')
+            row.planned_quantity = Decimal('29')
+            row.estimated_notional_krw = Decimal('1493500')
             row.validation_payload = {
                 **(row.validation_payload or {}),
                 'blocking_reasons': [
@@ -11572,8 +11551,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'final_quantity': 0,
                 },
                 'pricing': {
-                    'planned_quantity': 0,
-                    'estimated_notional_krw': '0',
+                    'planned_quantity': 29,
+                    'estimated_notional_krw': '1493500',
                     'requested_quantity': 29,
                     'final_quantity': 0,
                 },
@@ -11623,8 +11602,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('quantity', signal_entry['quantity_policy'])
         self.assertNotIn('max_quantity', signal_entry['quantity_policy'])
-        self.assertIsNone(
-            signal_entry['quantity_policy']['estimated_notional_krw']
+        self.assertEqual(
+            Decimal(str(signal_entry['quantity_policy']['estimated_notional_krw'])),
+            Decimal('1000000'),
         )
         signal_risk_json = json.dumps(
             signal_entry['risk_context'],
@@ -11650,8 +11630,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('quantity', short_entry['quantity_policy'])
         self.assertNotIn('max_quantity', short_entry['quantity_policy'])
-        self.assertIsNone(
-            short_entry['quantity_policy']['estimated_notional_krw']
+        self.assertEqual(
+            Decimal(str(short_entry['quantity_policy']['estimated_notional_krw'])),
+            Decimal('1493500'),
         )
         short_risk_json = json.dumps(
             short_entry['risk_context'],
@@ -11668,13 +11649,29 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             '"estimated_notional_krw": "0"',
         ):
             self.assertNotIn(forbidden_text, short_risk_json)
+        outbound_json = json.dumps(by_agent, sort_keys=True)
+        for forbidden_key in (
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+            'signal_decider_crosscheck',
+        ):
+            self.assertNotIn(f'"{forbidden_key}"', outbound_json)
         with session_scope() as session:
             persisted = session.get(
                 SignalDeciderExecutionPlanItem,
                 short_plan_item_id,
             )
             self.assertEqual(persisted.eligibility_status, 'blocked')
-            self.assertEqual(persisted.planned_quantity, Decimal('0'))
+            self.assertEqual(persisted.planned_quantity, Decimal('29'))
+            self.assertEqual(
+                persisted.estimated_notional_krw,
+                Decimal('1493500'),
+            )
             self.assertEqual(
                 persisted.validation_payload['legacy_alignment_enforcement'][
                     'alignment_gate'
@@ -11691,7 +11688,11 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 persisted_signal.planned_quantity,
-                Decimal('0'),
+                Decimal('20'),
+            )
+            self.assertEqual(
+                persisted_signal.estimated_notional_krw,
+                Decimal('1000000'),
             )
 
     async def test_readback_promotes_blocked_planned_short_term_watch_to_delegated(self) -> None:
@@ -14377,6 +14378,34 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {'005930'},
             ),
+            (
+                'summary_accepts_alphanumeric_krx_symbol',
+                {
+                    'asOf': '2026-04-30T00:00:00+00:00',
+                    'source': 'kis_portfolio_summary_v1',
+                    'accountCoverage': {
+                        'status': 'complete',
+                        'configuredCount': 1,
+                        'returnedCount': 1,
+                    },
+                    'sync': {'status': 'synced'},
+                    'freshness': {
+                        'isStale': False,
+                        'refreshInFlight': False,
+                    },
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'broker': 'kis',
+                            'holdingsCompleteness': {'status': 'complete'},
+                            'holdings': [
+                                {'symbol': '0010A0', 'quantity': 5}
+                            ],
+                        }
+                    ],
+                },
+                {'0010A0'},
+            ),
         ]
 
         for label, payload, expected in cases:
@@ -14723,9 +14752,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 (frozenset(), True),
             ),
             (
+                'complete_alphanumeric_krx_symbol',
+                _runtime_monitored_membership_payload(['0010A0']),
+                (frozenset({'0010A0'}), True),
+            ),
+            (
                 'complete_rejects_non_domestic_symbols',
                 _runtime_monitored_membership_payload(
                     ['005930', 'AAPL'],
+                ),
+                None,
+            ),
+            (
+                'complete_rejects_letter_in_numeric_prefix',
+                _runtime_monitored_membership_payload(
+                    ['005930', '12A456'],
                 ),
                 None,
             ),

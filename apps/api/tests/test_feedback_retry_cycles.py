@@ -45,6 +45,7 @@ from app.agent_context.retry_service import (
     build_weekly_policy_rebind_idempotency_key,
     feedback_retry_run_is_complete_for_weekly_policy_rebind,
     resolve_latest_completed_summary_knowledge_cutoff,
+    resolve_terminal_independent_role_success,
     resolve_terminal_role_success_intersection,
 )
 from app.agent_context.roles import (
@@ -2050,6 +2051,34 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         )
 
         self.assertFalse(result['ready'])
+
+    def test_terminal_independent_role_success_preserves_each_lane(self):
+        roles = list(DECISION_SUPPORT_AGENT_NAMES)
+        progress_summary = _terminal_partial_progress_summary(
+            roles=roles,
+            run_id='signal-decider-independent-lanes',
+            completed_at='2026-04-16T06:45:00+00:00',
+        )
+
+        result = resolve_terminal_independent_role_success(
+            progress_summary=progress_summary,
+            roles=roles,
+            expected_role_symbol_scopes={
+                role: ['000660', '005930'] for role in roles
+            },
+        )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['completed_symbols'], ['000660', '005930'])
+        self.assertEqual(
+            result['completed_symbols_by_role'],
+            {
+                roles[0]: ['000660', '005930'],
+                roles[1]: ['000660'],
+            },
+        )
+        self.assertEqual(result['completed_items'], 3)
+        self.assertEqual(result['failed_items'], 1)
 
     def test_terminal_success_intersection_rejects_role_status_count_conflict(
         self,

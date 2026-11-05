@@ -138,82 +138,6 @@ class Settings(BaseSettings):
     signal_decider_next_open_block_on_data_warnings: bool = True
     signal_decider_next_open_block_on_specialist_disagreement: bool = True
     signal_decider_next_open_require_target_and_stop: bool = True
-    signal_decider_wait_conflict_gate_mode: Literal[
-        'disabled',
-        'report_only',
-        'hard_block',
-        'downsize_probe',
-    ] = 'report_only'
-    signal_decider_wait_conflict_probe_quantity: int = Field(default=1, ge=1, le=100)
-    signal_decider_wait_recheck_monitoring_enabled: bool = False
-    signal_decider_wait_recheck_max_symbols: int = Field(default=20, ge=1, le=40)
-    signal_decider_wait_recheck_max_events_per_cycle: int = Field(default=3, ge=1, le=5)
-    signal_decider_wait_recheck_max_generations_per_day: int = Field(
-        default=2,
-        ge=1,
-        le=3,
-    )
-    signal_decider_wait_recheck_max_daily_events: int = Field(
-        default=20,
-        ge=1,
-        le=200,
-    )
-    signal_decider_wait_recheck_rearm_cooldown_seconds: int = Field(
-        default=120,
-        ge=30,
-        le=3600,
-    )
-    signal_decider_wait_recheck_evidence_window_seconds: int = Field(
-        default=30,
-        ge=5,
-        le=300,
-    )
-    signal_decider_wait_recheck_evidence_max_samples: int = Field(
-        default=60,
-        ge=3,
-        le=600,
-    )
-    signal_decider_wait_recheck_evidence_min_samples: int = Field(
-        default=3,
-        ge=1,
-        le=60,
-    )
-    signal_decider_wait_recheck_evidence_min_span_seconds: int = Field(
-        default=5,
-        ge=1,
-        le=300,
-    )
-    signal_decider_wait_recheck_evidence_min_support_ratio: float = Field(
-        default=0.8,
-        ge=0,
-        le=1,
-    )
-    signal_decider_wait_recheck_material_price_move_bps: float = Field(
-        default=25,
-        ge=0,
-        le=10_000,
-    )
-    signal_decider_wait_recheck_material_volume_growth_pct: float = Field(
-        default=0.5,
-        ge=0,
-        le=100,
-    )
-    signal_decider_wait_recheck_material_depth_imbalance_delta: float = Field(
-        default=0.2,
-        ge=0,
-        le=2,
-    )
-    signal_decider_wait_recheck_max_attempts: int = Field(default=2, ge=1, le=3)
-    signal_decider_wait_recheck_retry_cooldown_seconds: int = Field(
-        default=300,
-        ge=60,
-        le=3600,
-    )
-    signal_decider_wait_recheck_running_timeout_seconds: int = Field(
-        default=600,
-        ge=120,
-        le=3600,
-    )
     signal_decider_exec_integration_mode: str = 'disabled'
     signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'
     signal_decider_exec_bearer_token: Optional[str] = None
@@ -426,45 +350,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 'MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS cannot exceed '
                 'MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS'
-            )
-        return self
-
-    @model_validator(mode='after')
-    def validate_dispatch_decider_lane_independence(self):
-        integration_mode = str(
-            self.signal_decider_exec_integration_mode or ''
-        ).strip().lower()
-        if (
-            integration_mode == 'dispatch'
-            and self.signal_decider_wait_conflict_gate_mode
-            in {'hard_block', 'downsize_probe'}
-        ):
-            raise ValueError(
-                'Exec dispatch mode requires independent decider lanes; '
-                'SIGNAL_DECIDER_WAIT_CONFLICT_GATE_MODE must be disabled '
-                'or report_only.'
-            )
-        return self
-
-    @model_validator(mode='after')
-    def validate_wait_recheck_evidence_window(self):
-        if (
-            self.signal_decider_wait_recheck_evidence_min_span_seconds
-            > self.signal_decider_wait_recheck_evidence_window_seconds
-        ):
-            raise ValueError(
-                'SIGNAL_DECIDER_WAIT_RECHECK_EVIDENCE_MIN_SPAN_SECONDS '
-                'cannot exceed '
-                'SIGNAL_DECIDER_WAIT_RECHECK_EVIDENCE_WINDOW_SECONDS'
-            )
-        if (
-            self.signal_decider_wait_recheck_evidence_min_samples
-            > self.signal_decider_wait_recheck_evidence_max_samples
-        ):
-            raise ValueError(
-                'SIGNAL_DECIDER_WAIT_RECHECK_EVIDENCE_MIN_SAMPLES '
-                'cannot exceed '
-                'SIGNAL_DECIDER_WAIT_RECHECK_EVIDENCE_MAX_SAMPLES'
             )
         return self
 

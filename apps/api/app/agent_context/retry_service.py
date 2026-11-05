@@ -127,7 +127,7 @@ def _ordered_symbol_union(symbol_scopes: Sequence[Sequence[str]]) -> list[str]:
     return ordered
 
 
-def resolve_terminal_role_success_intersection(
+def _resolve_terminal_role_success_scopes(
     *,
     progress_summary: Mapping[str, Any],
     roles: Sequence[str],
@@ -136,12 +136,13 @@ def resolve_terminal_role_success_intersection(
         Sequence[str],
     ] | None = None,
 ) -> dict[str, Any]:
-    """Prove the exact symbols completed by every required role.
+    """Validate exact terminal success/failure partitions for every role.
 
     A terminal partial run may contain useful results, but aggregate coverage
     is not enough to authorize downstream work.  This validator reconciles
     each role's admitted scope, exact failed-symbol partition, and terminal
-    counts.  Any missing or contradictory evidence fails closed.
+    counts without choosing intersection or independent-lane semantics.
+    Any missing or contradictory evidence fails closed.
     """
 
     normalized_roles = tuple(
@@ -226,7 +227,7 @@ def resolve_terminal_role_success_intersection(
                 return base_result
             normalized_expected_role_scopes[role] = expected_scope
 
-    completed_scopes: list[set[str]] = []
+    completed_symbols_by_role: dict[str, list[str]] = {}
     admitted_scopes: list[list[str]] = []
     total_items = 0
     completed_items = 0
@@ -324,7 +325,9 @@ def resolve_terminal_role_success_intersection(
             return base_result
 
         admitted_scopes.append(scope)
-        completed_scopes.append(set(scope) - set(failed_symbols))
+        completed_symbols_by_role[role] = sorted(
+            set(scope) - set(failed_symbols)
+        )
         normalized_failed_by_role[role] = failed_symbols
         total_items += total
         completed_items += completed
@@ -357,19 +360,116 @@ def resolve_terminal_role_success_intersection(
     if run_status != expected_run_status:
         return base_result
 
-    completed_intersection = sorted(set.intersection(*completed_scopes))
     admitted_symbols = sorted(set().union(*map(set, admitted_scopes)))
-    if not completed_intersection:
-        return {**base_result, 'reason': 'terminal_role_scope_zero_work'}
     return {
         'ready': True,
-        'reason': 'terminal_role_success_intersection',
-        'completed_symbols': completed_intersection,
+        'reason': 'terminal_role_success_scopes',
+        'completed_symbols_by_role': completed_symbols_by_role,
         'admitted_symbols': admitted_symbols,
         'failed_symbols_by_role': normalized_failed_by_role,
         'total_items': total_items,
         'completed_items': completed_items,
         'failed_items': failed_items,
+    }
+
+
+def resolve_terminal_role_success_intersection(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    expected_role_symbol_scopes: Mapping[
+        str,
+        Sequence[str],
+    ] | None = None,
+) -> dict[str, Any]:
+    """Prove the exact symbols completed by every required role."""
+
+    resolution = _resolve_terminal_role_success_scopes(
+        progress_summary=progress_summary,
+        roles=roles,
+        expected_role_symbol_scopes=expected_role_symbol_scopes,
+    )
+    if resolution.get('ready') is not True:
+        return resolution
+    completed_by_role = resolution.get('completed_symbols_by_role')
+    if not isinstance(completed_by_role, Mapping) or not completed_by_role:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_unproven',
+            'completed_symbols': [],
+            'admitted_symbols': [],
+        }
+    completed_intersection = sorted(
+        set.intersection(
+            *(set(symbols) for symbols in completed_by_role.values())
+        )
+    )
+    if not completed_intersection:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_zero_work',
+            'completed_symbols': [],
+            'admitted_symbols': [],
+        }
+    return {
+        key: value
+        for key, value in {
+            **resolution,
+            'reason': 'terminal_role_success_intersection',
+            'completed_symbols': completed_intersection,
+        }.items()
+        if key != 'completed_symbols_by_role'
+    }
+
+
+def resolve_terminal_independent_role_success(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    expected_role_symbol_scopes: Mapping[
+        str,
+        Sequence[str],
+    ] | None = None,
+) -> dict[str, Any]:
+    """Prove exact terminal successes while keeping role lanes independent."""
+
+    resolution = _resolve_terminal_role_success_scopes(
+        progress_summary=progress_summary,
+        roles=roles,
+        expected_role_symbol_scopes=expected_role_symbol_scopes,
+    )
+    if resolution.get('ready') is not True:
+        return resolution
+    completed_by_role = resolution.get('completed_symbols_by_role')
+    if not isinstance(completed_by_role, Mapping) or not completed_by_role:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_unproven',
+            'completed_symbols': [],
+            'completed_symbols_by_role': {},
+            'admitted_symbols': [],
+        }
+    completed_union = sorted(
+        {
+            symbol
+            for symbols in completed_by_role.values()
+            for symbol in symbols
+        }
+    )
+    if not completed_union:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_zero_work',
+            'completed_symbols': [],
+            'completed_symbols_by_role': dict(completed_by_role),
+            'admitted_symbols': list(
+                resolution.get('admitted_symbols') or []
+            ),
+        }
+    return {
+        **resolution,
+        'reason': 'terminal_independent_role_success',
+        'completed_symbols': completed_union,
     }
 
 

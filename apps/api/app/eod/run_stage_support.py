@@ -492,7 +492,6 @@ def validated_nonblocking_downstream_scope_proof(
         requested_symbol_count = proof.get('requested_symbol_count')
         if not (
             isinstance(requested_symbols, list)
-            and requested_symbols
             and normalize_symbol_codes(requested_symbols)
             == requested_symbols
             and type(requested_symbol_count) is int
@@ -620,7 +619,7 @@ def build_nonblocking_downstream_scope_proof(
         if not isinstance(raw_symbols, list):
             return None
         requested_symbols = normalize_symbol_codes(raw_symbols)
-        if not requested_symbols or requested_symbols != raw_symbols:
+        if requested_symbols != raw_symbols:
             return None
         proof = {
             'schema_version': (
@@ -705,11 +704,15 @@ def validated_nonblocking_partial_progression_marker(
     ):
         return None
 
-    def canonical_symbols(value: object) -> list[str] | None:
+    def canonical_symbols(
+        value: object,
+        *,
+        allow_empty: bool = False,
+    ) -> list[str] | None:
         if not isinstance(value, list):
             return None
         normalized = normalize_symbol_codes(value)
-        if not normalized or normalized != value:
+        if (not normalized and not allow_empty) or normalized != value:
             return None
         return normalized
 
@@ -754,6 +757,9 @@ def validated_nonblocking_partial_progression_marker(
     summary_completed = canonical_symbols(summary.get('completed_symbols'))
     decider_admitted = canonical_symbols(decider.get('admitted_symbols'))
     decider_completed = canonical_symbols(decider.get('completed_symbols'))
+    raw_decider_completed_by_role = decider.get(
+        'completed_symbols_by_role'
+    )
     actionable = canonical_symbols(downstream.get('actionable_symbols'))
     plan_scope_proof = validated_nonblocking_downstream_scope_proof(
         'next_open_execution_plan',
@@ -786,6 +792,21 @@ def validated_nonblocking_partial_progression_marker(
         )
     ):
         return None
+    if not (
+        isinstance(raw_decider_completed_by_role, Mapping)
+        and set(raw_decider_completed_by_role)
+        == set(DECISION_SUPPORT_AGENT_NAMES)
+    ):
+        return None
+    decider_completed_by_role: dict[str, list[str]] = {}
+    for role in DECISION_SUPPORT_AGENT_NAMES:
+        role_symbols = canonical_symbols(
+            raw_decider_completed_by_role.get(role),
+            allow_empty=True,
+        )
+        if role_symbols is None:
+            return None
+        decider_completed_by_role[role] = role_symbols
     summary_failed = summary_failed_scope[1]
     decider_failed = decider_failed_scope[1]
 
@@ -799,6 +820,7 @@ def validated_nonblocking_partial_progression_marker(
             'parent_run_id',
             'parent_summary_run_id',
             'completed_symbols',
+            'completed_symbols_by_role',
             'decision_identities',
             'signal_decider_proof_digest',
             'next_open_execution_plan_proof_digest',
@@ -812,6 +834,8 @@ def validated_nonblocking_partial_progression_marker(
         and completion_authority.get('parent_summary_run_id')
         == decider.get('source_summary_run_id')
         and completion_authority.get('completed_symbols') == actionable
+        and completion_authority.get('completed_symbols_by_role')
+        == decider_completed_by_role
         and isinstance(raw_decision_identities, list)
         and all(
             isinstance(completion_authority.get(field), str)
@@ -855,8 +879,8 @@ def validated_nonblocking_partial_progression_marker(
         if not (
             len(normalized_symbol) == 1
             and identity.get('symbol') == normalized_symbol[0]
-            and normalized_symbol[0] in actionable
             and role in DECISION_SUPPORT_AGENT_NAMES
+            and normalized_symbol[0] in decider_completed_by_role[role]
             and type(snapshot_id) is int
             and snapshot_id > 0
             and decision_run_id
@@ -883,8 +907,8 @@ def validated_nonblocking_partial_progression_marker(
         and seen_identity_keys
         == {
             (symbol, role)
-            for symbol in actionable
             for role in DECISION_SUPPORT_AGENT_NAMES
+            for symbol in decider_completed_by_role[role]
         }
     ):
         return None
@@ -923,13 +947,27 @@ def validated_nonblocking_partial_progression_marker(
         and set(summary_completed)
         == set(summary_admitted) - summary_failed
         and set(decider_admitted) == set(summary_completed)
-        and set(decider_completed)
-        == set(decider_admitted) - decider_failed
+        and all(
+            set(decider_completed_by_role[role])
+            == set(decider_admitted).difference(
+                decider_failed_scope[0][role]
+            )
+            for role in DECISION_SUPPORT_AGENT_NAMES
+        )
+        and decider_completed
+        == sorted(
+            {
+                symbol
+                for symbols in decider_completed_by_role.values()
+                for symbol in symbols
+            }
+        )
         and actionable == decider_completed
         and (summary_failed or decider_failed)
         and downstream.get('plan_status') == 'completed'
         and downstream.get('evaluation_status') == 'completed'
-        and evaluation_scope_proof['requested_symbols'] == actionable
+        and evaluation_scope_proof['requested_symbols']
+        == decider_completed_by_role['signal-decider']
         and set(plan_scope_proof['active_symbols']) <= set(actionable)
         and retry_debt.get('schema_version')
         == NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION
@@ -1089,10 +1127,19 @@ def validated_nonblocking_partial_progression_marker(
             # Lazy import avoids the repository -> run-stage-support ->
             # retry-service -> market-data-store repository cycle.
             from app.agent_context.retry_service import (
+                resolve_terminal_independent_role_success,
                 resolve_terminal_role_success_intersection,
             )
 
-            exact_resolution = resolve_terminal_role_success_intersection(
+            independent_roles = (
+                tuple(roles) == tuple(DECISION_SUPPORT_AGENT_NAMES)
+            )
+            resolver = (
+                resolve_terminal_independent_role_success
+                if independent_roles
+                else resolve_terminal_role_success_intersection
+            )
+            exact_resolution = resolver(
                 progress_summary=progress_summary,
                 roles=roles,
                 expected_role_symbol_scopes={
@@ -1111,7 +1158,19 @@ def validated_nonblocking_partial_progression_marker(
                     == marker_payload.get('completed_items')
                     and exact_resolution.get('failed_items')
                     == marker_payload.get('failed_items')
+                    and (
+                        not independent_roles
+                        or exact_resolution.get(
+                            'completed_symbols_by_role'
+                        )
+                        == marker_payload.get(
+                            'completed_symbols_by_role'
+                        )
+                    )
                 )
+
+        if tuple(roles) == tuple(DECISION_SUPPORT_AGENT_NAMES):
+            return False
 
         stage_counts = tuple(
             stage.get(field)
@@ -1269,6 +1328,8 @@ def validated_nonblocking_partial_progression_marker(
         == completion_authority.get('parent_summary_run_id')
         and signal_completion_proof.get('completed_symbols')
         == actionable
+        and signal_completion_proof.get('completed_symbols_by_role')
+        == decider_completed_by_role
         and signal_completion_proof.get('decision_identities')
         == decision_identities
         and plan_completion_proof.get('parent_run_id')
@@ -1280,7 +1341,7 @@ def validated_nonblocking_partial_progression_marker(
         and evaluation_completion_proof.get(
             'parent_completed_symbols'
         )
-        == actionable
+        == decider_completed_by_role['signal-decider']
     ):
         return None
 
@@ -1306,7 +1367,7 @@ def validated_nonblocking_partial_progression_marker(
     }
     expected_signal_identity_by_symbol = {
         symbol: expected_identity_by_key[(symbol, 'signal-decider')]
-        for symbol in actionable
+        for symbol in decider_completed_by_role['signal-decider']
     }
     evaluation_identities_by_symbol: dict[
         str,
@@ -1331,9 +1392,9 @@ def validated_nonblocking_partial_progression_marker(
         and evaluation_completion_proof.get('parent_summary_run_id')
         == completion_authority.get('parent_summary_run_id')
         and evaluation_completion_proof.get('request_symbols')
-        == actionable
+        == decider_completed_by_role['signal-decider']
         and evaluation_completion_proof.get('decision_count')
-        == len(actionable)
+        == len(decider_completed_by_role['signal-decider'])
         and evaluation_identities_by_symbol
         == {
             symbol: {identity}

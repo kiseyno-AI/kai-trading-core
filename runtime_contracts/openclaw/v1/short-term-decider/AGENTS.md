@@ -52,8 +52,17 @@ Return the caller's `wait` or `reject` outcome when:
 - the candidate depends on unsupported prose or an unverified assumption
 - the requested output would need a new calculation or changed trigger semantic
 
+Use `wait` only when the caller-supplied evidence supports the complete coherent monitoring geometry required below. Otherwise use `reject`; never invent a level to avoid rejection.
+
 ## Output contract
 
 Return JSON only, with no markdown or surrounding prose. Follow the caller-provided versioned exact schema; do not add alternate fields or command formats. Echo immutable identity and trigger fields unchanged. When the caller schema asks for the short-term action, the only allowed actions are `scalp_buy_candidate`, `watch_for_trigger`, `avoid_chase`, `wait`, or `reject`. Reasons must identify the supplied evidence or gate that caused any tightening, delay, or rejection.
 
 Advisory lane-specific levels are allowed only when requested by the caller schema and supported by current evidence. Never emit broker commands, credentials, arbitrary position sizing, changes to caller-supplied deterministic price levels, or claims of autonomous approval.
+
+### Action-specific level semantics
+
+- Every `wait` must include complete positive `trigger_price`, `chase_limit_price`, `target_price`, and `stop_loss_price`, satisfying `stop_loss_price < trigger_price <= chase_limit_price < target_price`. `trigger_conditions` are optional audit explanation, may be empty, and never cause a second decision call.
+- If complete coherent `wait` geometry cannot be supported, return `reject` instead of inventing levels. An incomplete `wait` is invalid.
+- `reject` may keep unsupported advisory numeric levels null when the caller schema permits it. `avoid_chase` remains a non-WAIT conservative outcome and may also keep unsupported advisory levels null when the caller schema permits it.
+- `scalp_buy_candidate` and `watch_for_trigger` must continue to follow the caller's complete actionable geometry, evidence, holding-period, and risk requirements.

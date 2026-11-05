@@ -10,6 +10,7 @@ from app.brokers.kis.client import (
     KISConfigurationError,
 )
 from app.brokers.kis.provider import kis_client
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.orders.account_scope import AccountScope, parse_kis_account_reference
 
 
@@ -284,12 +285,7 @@ class TradingAccountInquiryService:
                     }
                 )
                 continue
-            symbol_is_valid = bool(
-                row_symbol
-                and len(row_symbol) == 6
-                and row_symbol.isascii()
-                and row_symbol.isdigit()
-            )
+            symbol_is_valid = is_canonical_krx_short_code(row_symbol)
             if not symbol_is_valid:
                 malformed_row_count += 1
                 completeness_issues.append(

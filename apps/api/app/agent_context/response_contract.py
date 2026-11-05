@@ -412,6 +412,42 @@ def _append_actionable_common_requirements(
             flags.append(f'action_requirement_empty:{field}')
 
 
+def _append_complete_trigger_geometry_requirements(
+    *,
+    payload: dict[str, Any],
+    flags: list[str],
+) -> None:
+    geometry_fields = (
+        'trigger_price',
+        'chase_limit_price',
+        'target_price',
+        'stop_loss_price',
+    )
+    for field in geometry_fields:
+        value = payload.get(field)
+        if not _is_raw_number(value) or float(value) <= 0:
+            flags.append(f'action_requirement_invalid:{field}')
+    trigger_price = payload.get('trigger_price')
+    chase_limit_price = payload.get('chase_limit_price')
+    target_price = payload.get('target_price')
+    stop_loss_price = payload.get('stop_loss_price')
+    if all(
+        _is_raw_number(value)
+        for value in (
+            trigger_price,
+            chase_limit_price,
+            target_price,
+            stop_loss_price,
+        )
+    ) and not (
+        float(stop_loss_price)
+        < float(trigger_price)
+        <= float(chase_limit_price)
+        < float(target_price)
+    ):
+        flags.append('action_requirement_invalid:price_order')
+
+
 def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[str]:
     flags = _missing_required_field_flags(payload, SIGNAL_DECIDER_REQUIRED_RESPONSE_KEYS)
     _append_core_fallback_violation(payload, flags)
@@ -540,44 +576,30 @@ def _validate_signal_decider_response_schema(payload: dict[str, Any]) -> list[st
     elif action == 'wait':
         if not _valid_wait_reason(payload.get('wait_reason')):
             flags.append('action_requirement_invalid:wait_reason')
+        if entry_price_basis != 'trigger_limit':
+            flags.append('action_requirement_invalid:entry_price_basis')
     elif action == 'reject' and payload.get('wait_reason') is not None:
         flags.append('action_requirement_invalid:wait_reason')
     if has_trigger_fields and entry_price_basis != 'trigger_limit':
         flags.append('action_requirement_invalid:entry_price_basis')
     if action == 'reject' and has_trigger_contract:
         flags.append('action_requirement_invalid:entry_price_basis')
-    if action in {'buy', 'wait'} and has_trigger_contract:
+    if action in {'buy', 'wait'} and (
+        action == 'wait' or has_trigger_contract
+    ):
         _append_actionable_common_requirements(
             payload=payload,
-            numeric_fields=(
-                'trigger_price',
-                'chase_limit_price',
-                'target_price',
-                'stop_loss_price',
-            ),
-            evidence_fields=('trigger_conditions',),
+            numeric_fields=(),
+            evidence_fields=(),
             holding_period_field='suggested_holding_period',
             flags=flags,
         )
-        trigger_price = payload.get('trigger_price')
+        _append_complete_trigger_geometry_requirements(
+            payload=payload,
+            flags=flags,
+        )
         chase_limit_price = payload.get('chase_limit_price')
         target_price = payload.get('target_price')
-        stop_loss_price = payload.get('stop_loss_price')
-        if all(
-            _is_raw_number(value)
-            for value in (
-                trigger_price,
-                chase_limit_price,
-                target_price,
-                stop_loss_price,
-            )
-        ) and not (
-            float(stop_loss_price)
-            < float(trigger_price)
-            <= float(chase_limit_price)
-            < float(target_price)
-        ):
-            flags.append('action_requirement_invalid:price_order')
         expected_return_pct = payload.get('expected_return_pct')
         if (
             action == 'buy'
@@ -683,31 +705,28 @@ def _validate_short_term_decider_response_schema(payload: dict[str, Any]) -> lis
     if action in {'scalp_buy_candidate', 'watch_for_trigger'}:
         _append_actionable_common_requirements(
             payload=payload,
-            numeric_fields=('trigger_price', 'chase_limit_price', 'target_price', 'stop_loss_price'),
-            evidence_fields=('trigger_conditions', 'supporting_evidence', 'invalidation_conditions'),
+            numeric_fields=(),
+            evidence_fields=('supporting_evidence', 'invalidation_conditions'),
             holding_period_field='expected_holding_period',
             flags=flags,
         )
-        trigger_price = payload.get('trigger_price')
-        chase_limit_price = payload.get('chase_limit_price')
-        target_price = payload.get('target_price')
-        stop_loss_price = payload.get('stop_loss_price')
-        if all(
-            _is_raw_number(value)
-            for value in (trigger_price, chase_limit_price, target_price, stop_loss_price)
-        ) and not (
-            float(stop_loss_price)
-            < float(trigger_price)
-            <= float(chase_limit_price)
-            < float(target_price)
-        ):
-            flags.append('action_requirement_invalid:price_order')
+        _append_complete_trigger_geometry_requirements(
+            payload=payload,
+            flags=flags,
+        )
         if action == 'watch_for_trigger':
             if not _valid_wait_reason(payload.get('wait_reason')):
                 flags.append('action_requirement_invalid:wait_reason')
         elif payload.get('wait_reason') is not None:
             flags.append('action_requirement_invalid:wait_reason')
-    elif action in {'avoid_chase', 'wait'}:
+    elif action == 'wait':
+        if not _valid_wait_reason(payload.get('wait_reason')):
+            flags.append('action_requirement_invalid:wait_reason')
+        _append_complete_trigger_geometry_requirements(
+            payload=payload,
+            flags=flags,
+        )
+    elif action == 'avoid_chase':
         if not _valid_wait_reason(payload.get('wait_reason')):
             flags.append('action_requirement_invalid:wait_reason')
     elif action == 'reject' and payload.get('wait_reason') is not None:
@@ -1355,8 +1374,10 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '
             'decision_delta must be an object, not prose, and should summarize prior-vs-current change metadata when previous_decision_context is available in the request. '
             'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
-            'When a wait-like recommendation repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup to scalp_buy_candidate or watch_for_trigger. '
-            'trigger_price, chase_limit_price, target_price, and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; use null rather than fake precision when unsupported and explain why in data_quality_warnings. '
+            'When a wait-like recommendation repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete price contract for the monitored entry. decision_delta.upgrade_trigger is narrative audit metadata only: Core and Exec must never call a decider again or require that metadata when the immutable trigger price is touched. '
+            'trigger_price, chase_limit_price, target_price, and stop_loss_price must be included for every item. '
+            'Every WAIT must include complete positive trigger_price, chase_limit_price, target_price, and stop_loss_price satisfying stop_loss_price < trigger_price <= chase_limit_price < target_price. trigger_conditions may describe the setup for audit, but they are not execution authority and may be empty. '
+            'If complete coherent WAIT geometry cannot be supported, return REJECT instead of inventing levels; REJECT and AVOID_CHASE may keep unsupported numeric levels null when the schema permits it and data_quality_warnings explains why. '
             'expected_holding_period should normally be 2-3 trading days when the setup and evidence support a short-term position; this is not a minimum holding lock, so an invalidation, stop, or target may close the position earlier, and the maximum remains 3 trading sessions. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
             'thesis_summary must be a concise short-term tactical decision-support explanation in Korean. '
@@ -1375,7 +1396,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Missing detailed quarterly/cash-flow fields should usually reduce confidence only. '
             'Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent. '
             'Optional news/disclosure or quarterly/cash-flow gaps must not become the primary wait_reason when price, liquidity, trend, or execution blockers already explain the conservative action. '
-            'If core execution evidence is missing, stale, weak, conflicting, or chase risk is elevated, still return a complete structured conservative feedback object with avoid_chase, wait, or reject, null unsupported numeric fields, and explicit risk/data-quality warnings. '
+            'If core execution evidence is missing, stale, weak, conflicting, or chase risk is elevated, still return a complete structured conservative feedback object. Use WAIT only with complete coherent monitoring geometry; otherwise use avoid_chase or reject with null unsupported numeric fields and explicit risk/data-quality warnings. '
             'If only auxiliary context is absent, a structured scalp_buy_candidate or watch_for_trigger decision may still be valid when price, liquidity, trigger, and risk evidence are otherwise strong. '
             'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, operator-facing free-text fields are in Korean, and arrays are arrays of strings. '
             'Immediately before sending, validate the final raw JSON text again and correct any extra or missing closing braces/brackets so it begins with {, ends with }, and parses successfully.'
@@ -1405,15 +1426,17 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Do not use vague wait text such as insufficient information, need more data, or wait for more confirmation unless the same summary explicitly names the concrete blocker. '
             'decision_delta must be an object, not prose, and should summarize prior-vs-current change metadata when previous_decision_context is available in the request. '
             'decision_delta should include previous_market_date, previous_recommendation, previous_recommendation_class, previous_wait_reason, current_recommendation, current_recommendation_class, current_wait_reason, transition, persistence_trend, changed_fields, stable_fields, what_changed, what_stayed_same, and upgrade_trigger. '
-            'When wait repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that would upgrade the setup to buy. '
+            'decision_delta.upgrade_trigger is narrative audit metadata only. A complete WAIT trigger/chase/target/stop price contract is handed to Exec as an immutable watch; a price touch must not call either decider again or depend on narrative upgrade metadata. '
+            'When wait repeats, do not copy-paste the earlier explanation. Summarize what changed, what stayed the same, whether the setup is persistent or improving or worsening, and restate the immutable monitored-entry price contract without implying a future model approval. '
             'entry_price_basis should be next_open for an ordinary next-open BUY, or trigger_limit when this lane supplies an independently justified monitored trigger entry. '
-            'For a non-monitorable wait, use entry_price_basis=next_open as a non-executable schema placeholder, set trigger_price and chase_limit_price to null, and set trigger_conditions to an empty array; this placeholder does not grant next-open execution authority. target_price and stop_loss_price may remain numeric when independently supportable or null when unsupported. '
+            'For WAIT, entry_price_basis must be trigger_limit and trigger_price, chase_limit_price, target_price, and stop_loss_price must be complete, positive, and coherent, satisfying stop_loss_price < trigger_price <= chase_limit_price < target_price. trigger_conditions are optional audit metadata and are never a second execution gate. '
+            'If complete coherent WAIT geometry cannot be supported, return REJECT instead of inventing levels. '
             'For reject, also use entry_price_basis=next_open only as a non-executable schema placeholder and keep trigger_price and chase_limit_price null with empty trigger_conditions. '
-            'Do not use entry_price_basis=trigger_limit unless trigger_price, chase_limit_price, target_price, stop_loss_price, and trigger_conditions are all complete, positive, and coherent. '
-            'For trigger_limit BUY or a monitorable WAIT, trigger_price, chase_limit_price, target_price, stop_loss_price, and trigger_conditions must be complete and must satisfy stop_loss_price < trigger_price <= chase_limit_price < target_price. '
+            'Do not use entry_price_basis=trigger_limit unless trigger_price, chase_limit_price, target_price, and stop_loss_price are all complete, positive, and coherent. '
+            'For trigger_limit BUY or WAIT, trigger_price, chase_limit_price, target_price, and stop_loss_price must be complete and must satisfy stop_loss_price < trigger_price <= chase_limit_price < target_price. '
             'target_price and stop_loss_price must be included for every item and should be explicit conservative numeric levels whenever the inputs support them; if a concrete level is genuinely not supportable, keep the keys and explain the limitation in data_quality_warnings instead of omitting them. '
             'For BUY, expected_return_pct must be a positive percentage consistent with target_price and the stated entry_price_basis; for WAIT or REJECT it may be null when no supportable return can be calculated. Never report an upside that the supplied price levels do not support. Core recomputes a conservative slippage-adjusted pre-screen return from target, reference entry, and trusted quote-spread evidence; Core-local orders also include the server-owned non-spread round-trip allowance, while Exec applies its final full-cost check in dispatch mode before any live buy can qualify. '
-            'Use null rather than fake precision when a numeric field is not well-supported by the inputs. '
+            'Use null rather than fake precision only where the action contract permits null; never use an incomplete WAIT to carry unsupported levels. '
             'confidence_score_10 and conviction_score_10 must be numbers from 1 to 10 when provided. '
             'thesis_summary must be a concise decision-support explanation in Korean. '
             'trigger_conditions, supporting_evidence, decision_risks, invalidation_conditions, data_quality_warnings, specialist_disagreement, '
@@ -1432,7 +1455,7 @@ def build_contract_prompt_suffix(*, role: str | None = None) -> str:
             'Missing detailed quarterly/cash-flow fields should usually reduce confidence only. '
             'Do not classify a symbol as untradeable solely because auxiliary news or financial detail is absent. '
             'Optional news/disclosure or quarterly/cash-flow gaps must not become the primary wait_reason when price, liquidity, trend, execution timing, or volatility blockers already explain the wait. '
-            'If core execution evidence is missing, weak, conflicting, or truncated, still return a complete structured conservative feedback object with wait or reject, null unsupported numeric fields, and explicit risk/data-quality warnings. '
+            'If core execution evidence is missing, weak, conflicting, or truncated, still return a complete structured conservative feedback object. Use WAIT only with complete coherent monitoring geometry; otherwise use REJECT with null unsupported numeric fields and explicit risk/data-quality warnings. '
             'If only auxiliary context is absent, a buy decision may still be valid when price, liquidity, trend, execution risk, and invalidation evidence are otherwise strong. '
             'Before finalizing, self-check that the JSON is parseable, all required keys are present, role and agent_name are correct, symbol and traceability.symbol exactly match the assigned symbol, operator-facing free-text fields are in Korean, and arrays are arrays of strings. '
             'Immediately before sending, validate the final raw JSON text again and correct any extra or missing closing braces/brackets so it begins with {, ends with }, and parses successfully.'
