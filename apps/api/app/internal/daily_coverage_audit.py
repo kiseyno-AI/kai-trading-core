@@ -12,8 +12,15 @@ Nothing here writes to the database or changes pipeline behavior.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Mapping, Sequence
+
+from sqlalchemy import text
+from sqlalchemy.sql.elements import TextClause
+
+from app.db import session_scope
 
 BASELINE_KEY = 'bars'
 
@@ -109,3 +116,64 @@ def evaluate_daily_coverage(
         'problem_tables': problem_keys,
         'tables': rows,
     }
+
+
+_IDENTIFIER_PATTERN = re.compile(r'^[a-z_]+$')
+DEFAULT_STATEMENT_TIMEOUT_MS = 60_000
+
+
+def _count_statement(spec: CoverageTable) -> TextClause:
+    """Build the per-table count query from constant identifiers only.
+
+    Table and column names cannot be bound parameters, so they are validated
+    against a strict pattern; the market date is always a bound parameter.
+    """
+
+    if not (
+        _IDENTIFIER_PATTERN.fullmatch(spec.table)
+        and _IDENTIFIER_PATTERN.fullmatch(spec.date_column)
+    ):
+        raise ValueError(f'unsafe coverage table spec: {spec.key}')
+    return text(
+        f'select count(*) from {spec.table} where {spec.date_column} = :market_date'
+    )
+
+
+def collect_daily_table_counts(
+    market_date: date,
+    *,
+    tables: Sequence[CoverageTable] = COVERAGE_TABLES,
+    statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+) -> dict[str, int]:
+    """Count the rows each daily table holds for ``market_date`` (read-only)."""
+
+    counts: dict[str, int] = {}
+    with session_scope(statement_timeout_ms=statement_timeout_ms) as session:
+        session.execute(text('SET TRANSACTION READ ONLY'))
+        for spec in tables:
+            value = session.execute(
+                _count_statement(spec), {'market_date': market_date}
+            ).scalar_one()
+            counts[spec.key] = int(value or 0)
+    return counts
+
+
+def load_recent_trade_dates(
+    limit: int,
+    *,
+    statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+) -> list[date]:
+    """Return the most recent market dates that have stored price bars."""
+
+    if limit < 1:
+        raise ValueError('limit must be at least 1')
+    with session_scope(statement_timeout_ms=statement_timeout_ms) as session:
+        session.execute(text('SET TRANSACTION READ ONLY'))
+        rows = session.execute(
+            text(
+                'select distinct trade_date from daily_price_bars '
+                'order by trade_date desc limit :limit'
+            ),
+            {'limit': int(limit)},
+        ).all()
+    return [row[0] for row in rows]

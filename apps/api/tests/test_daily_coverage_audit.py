@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import contextmanager
+from datetime import date
+from unittest.mock import patch
 
+from app.internal import daily_coverage_audit
 from app.internal.daily_coverage_audit import (
     BASELINE_KEY,
     COVERAGE_TABLES,
+    CoverageTable,
     DEFAULT_MIN_RATIO,
     STATUS_EMPTY,
     STATUS_LOW,
     STATUS_NO_BASELINE,
     STATUS_OK,
+    _count_statement,
+    collect_daily_table_counts,
     evaluate_daily_coverage,
+    load_recent_trade_dates,
 )
 
 
@@ -127,6 +135,99 @@ class EvaluateDailyCoverageTests(unittest.TestCase):
             self.assertRegex(spec.date_column, r'^[a-z_]+$')
         keys = [spec.key for spec in COVERAGE_TABLES]
         self.assertEqual(len(keys), len(set(keys)))
+
+
+class _FakeResult:
+    def __init__(self, value=None, rows=None) -> None:
+        self._value = value
+        self._rows = rows or []
+
+    def scalar_one(self):
+        return self._value
+
+    def all(self):
+        return self._rows
+
+
+class _FakeSession:
+    """Records statements and answers count queries from a table->count map."""
+
+    def __init__(self, counts_by_table: dict[str, int], recent_dates=()) -> None:
+        self.counts_by_table = counts_by_table
+        self.recent_dates = list(recent_dates)
+        self.statements: list[str] = []
+        self.params: list[dict] = []
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+        self.params.append(dict(params or {}))
+        if sql.startswith('select count(*) from '):
+            table = sql.split(' from ', 1)[1].split(' where ', 1)[0]
+            return _FakeResult(value=self.counts_by_table.get(table))
+        if 'select distinct trade_date' in sql:
+            return _FakeResult(rows=[(d,) for d in self.recent_dates])
+        return _FakeResult()
+
+
+def _patched_session_scope(fake: _FakeSession):
+    @contextmanager
+    def scope(**_kwargs):
+        yield fake
+
+    return patch.object(daily_coverage_audit, 'session_scope', scope)
+
+
+class CollectorTests(unittest.TestCase):
+    def test_count_statement_binds_the_date_and_uses_only_spec_identifiers(self) -> None:
+        sql = str(_count_statement(CoverageTable('x', 'daily_momentum_factor_results', 'market_date')))
+
+        self.assertEqual(
+            sql,
+            'select count(*) from daily_momentum_factor_results where market_date = :market_date',
+        )
+
+    def test_count_statement_rejects_unsafe_identifiers(self) -> None:
+        for table, column in (
+            ('daily_price_bars; drop table symbols', 'trade_date'),
+            ('daily_price_bars', 'trade_date or 1=1'),
+            ('Daily_Price_Bars', 'trade_date'),
+        ):
+            with self.assertRaises(ValueError):
+                _count_statement(CoverageTable('x', table, column))
+
+    def test_collect_counts_runs_in_a_read_only_transaction_and_maps_keys(self) -> None:
+        fake = _FakeSession(
+            {spec.table: index + 1 for index, spec in enumerate(COVERAGE_TABLES)}
+        )
+        with _patched_session_scope(fake):
+            counts = collect_daily_table_counts(date(2026, 11, 5))
+
+        self.assertEqual(fake.statements[0], 'SET TRANSACTION READ ONLY')
+        self.assertEqual(
+            counts, {spec.key: index + 1 for index, spec in enumerate(COVERAGE_TABLES)}
+        )
+        count_params = [p for s, p in zip(fake.statements, fake.params) if s.startswith('select count')]
+        self.assertTrue(all(p == {'market_date': date(2026, 11, 5)} for p in count_params))
+        self.assertEqual(len(count_params), len(COVERAGE_TABLES))
+
+    def test_a_null_count_is_treated_as_zero(self) -> None:
+        fake = _FakeSession({})
+        with _patched_session_scope(fake):
+            counts = collect_daily_table_counts(date(2026, 11, 5))
+
+        self.assertTrue(all(value == 0 for value in counts.values()))
+
+    def test_recent_trade_dates_are_read_only_and_validated(self) -> None:
+        fake = _FakeSession({}, recent_dates=[date(2026, 11, 5), date(2026, 11, 4)])
+        with _patched_session_scope(fake):
+            dates = load_recent_trade_dates(2)
+
+        self.assertEqual(dates, [date(2026, 11, 5), date(2026, 11, 4)])
+        self.assertEqual(fake.statements[0], 'SET TRANSACTION READ ONLY')
+        self.assertEqual(fake.params[-1], {'limit': 2})
+        with self.assertRaises(ValueError):
+            load_recent_trade_dates(0)
 
 
 if __name__ == '__main__':
