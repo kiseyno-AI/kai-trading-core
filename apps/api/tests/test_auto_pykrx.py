@@ -1780,7 +1780,7 @@ class NextOpenExecutionPlanFollowupTests(TestCase):
 
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
-        run_retry_cycles.assert_not_called()
+        run_retry_cycles.assert_called_once()
 
 
 def _completed_factor_followup_result(*, market_date: str = '2026-04-03') -> dict:
