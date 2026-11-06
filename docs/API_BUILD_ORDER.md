@@ -47,6 +47,7 @@
 44. BTC/ETH Upbit crypto strategy context read route for paper/research decision support
 
 ## Current routes
+- `GET /health` (application and database liveness; also subject to bearer auth when `UPSTREAM_BEARER_TOKEN` is set)
 - `POST /broker/kis/token` (operator Bearer auth required; sanitized token metadata only)
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
@@ -104,6 +105,8 @@
 - `DELETE /symbols/favorites/005930`
 - `GET /symbols/005930/price-bars?start_date=2021-04-09&end_date=2026-04-09`
 - `GET /macro/bok/series?series_id=722Y001/0101000&start_period=20240101&end_period=20240131&cycle=D`
+- `GET /macro/ecos/series?stat_code=722Y001&item_code_1=0101000&start_period=20240101&end_period=20240131&cycle=D`
+- `GET /macro/ecos/catalog` (lists the configured ECOS series aliases)
 - `GET /macro/context?as_of_date=YYYY-MM-DD`
 - `POST /macro/context/refresh?force=true`
 - `GET /fx/koreaexim/rates?search_date=20260408&data=AP01`
@@ -164,6 +167,9 @@
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
 - `POST /agent-context/feedback/dispatch/symbols`
+- `POST /agent-context/feedback/dispatch/subagent-experiment` (experimental per-symbol subagent dispatch)
+- `GET /agent-context/feedback/fundamental-summaries?market_date=YYYY-MM-DD&symbol=005930&limit=50`
+- `POST /agent-context/internal/core/control` (operator-only local process control; `port` may only equal the port this API is serving, see the endpoint reference page)
 - `POST /agent-context/feedback/retry-cycles`
 - `POST /agent-context/feedback/rebind/prepare`
 - `POST /agent-context/feedback/followup`
