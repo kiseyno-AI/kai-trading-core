@@ -380,33 +380,49 @@ class DailyPriceBarTurnoverRepositoryTests(unittest.TestCase):
             [item['repair_bar_id'] for item in session.calls[1][1]], [11]
         )
 
-    def test_partial_mode_still_blocks_structural_membership_problems(self):
+    def test_partial_mode_still_blocks_a_provider_membership_mismatch(self):
+        session = _FakeSession(
+            [SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1)]
+        )
+
+        # The provider payload lacks volume/OHLC for an expected symbol.
+        result = self._partial_call(
+            session,
+            expected=['005930', '000660'],
+            turnovers={'005930': 10, '000660': 20},
+            volumes={'005930': 100},
+            ohlc={'005930': (100, 110, 90, 105)},
+        )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('provider_membership_mismatch', result['blocked_reasons'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_partial_mode_ignores_active_rows_outside_provider_membership(self):
         session = _FakeSession(
             [
                 SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1),
                 SimpleNamespace(
-                    bar_id=12, symbol='069500', volume=100, turnover=1, is_active=True
+                    bar_id=12, symbol='250030', volume=0, turnover=0, is_active=True
                 ),
             ]
         )
 
         result = self._partial_call(
             session,
-            expected=['005930', '000660'],
-            turnovers={'005930': 10, '000660': 20},
-            volumes={'005930': 100, '000660': 100},
-            ohlc={
-                '005930': (100, 110, 90, 105),
-                '000660': (100, 110, 90, 105),
-            },
+            expected=['005930'],
+            turnovers={'005930': 10},
+            volumes={'005930': 100},
+            ohlc={'005930': (100, 110, 90, 105)},
         )
 
-        self.assertEqual(result['status'], 'blocked')
-        self.assertIn(
-            'active_stored_rows_outside_provider_membership',
-            result['blocked_reasons'],
+        self.assertEqual(result['status'], 'completed_partial')
+        self.assertEqual(
+            result['active_stored_outside_membership_symbols'], ['250030']
         )
-        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(
+            [item['repair_bar_id'] for item in session.calls[1][1]], [11]
+        )
 
     def test_partial_mode_is_off_by_default(self):
         session = _FakeSession(

@@ -995,6 +995,9 @@ _TURNOVER_REPAIR_ROW_LEVEL_REASONS = frozenset(
         'invalid_provider_liquidity',
         'provider_volume_decreased',
         'provider_turnover_decreased',
+        # Rows outside the provider membership (typically trading-halted
+        # symbols the provider omits) are never part of the update set.
+        'active_stored_rows_outside_provider_membership',
     }
 )
 
@@ -1022,8 +1025,8 @@ def repair_daily_price_bar_turnovers(
     explicit operator choice for dates that can never be complete (for example
     symbols with no stored bar): rows that individually pass every check are
     still written, rows that fail any check are left untouched and reported.
-    Structural problems (provider membership mismatch, active stored rows
-    outside the provider membership) still block the date.
+    A provider membership mismatch (the provider payload is missing or has
+    unexpected symbols) still blocks the date.
     """
 
     normalized_market_date = _normalize_trade_date(market_date)
