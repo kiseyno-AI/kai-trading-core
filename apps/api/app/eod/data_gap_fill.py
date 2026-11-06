@@ -336,11 +336,42 @@ def detect_turnover_incomplete(market_date: str) -> Gap | None:
     return Gap('turnover_incomplete', market_date, count) if count else None
 
 
-class _ProviderComparison:
-    """One official-frame fetch per session shared by the two Tier B detectors."""
+# Official KRX frames for finalized sessions never change, but every scheduler tick
+# builds a new service. Keep fetched frames for the life of the process so each
+# session is read from KRX once, not every 30 minutes (KRX blocks repeated bulk reads).
+_PROVIDER_FRAME_CACHE: dict[str, dict[str, tuple[int, int, int, int]]] = {}
+_PROVIDER_FRAME_CACHE_MAX = 8
 
-    def __init__(self, recent_sessions: Callable[[], Sequence[str]]) -> None:
+
+def _load_provider_frame(market_date: str) -> dict[str, tuple[int, int, int, int]]:
+    cached = _PROVIDER_FRAME_CACHE.get(market_date)
+    if cached is not None:
+        return cached
+    from app.eod.pykrx_backfill import _get_market_ohlcv_by_ticker
+
+    compact = market_date.replace('-', '')
+    provider: dict[str, tuple[int, int, int, int]] = {}
+    for market in ('KOSPI', 'KOSDAQ'):
+        frame = _get_market_ohlcv_by_ticker(compact, market)
+        for code, row in frame.iterrows():
+            provider[str(code)] = tuple(int(row[key]) for key in ('시가', '고가', '저가', '종가'))
+    if provider:  # never cache an empty (failed or blocked) read
+        while len(_PROVIDER_FRAME_CACHE) >= _PROVIDER_FRAME_CACHE_MAX:
+            _PROVIDER_FRAME_CACHE.pop(next(iter(_PROVIDER_FRAME_CACHE)))
+        _PROVIDER_FRAME_CACHE[market_date] = provider
+    return provider
+
+
+class _ProviderComparison:
+    """One official-frame fetch per session (per process) shared by the two Tier B detectors."""
+
+    def __init__(
+        self,
+        recent_sessions: Callable[[], Sequence[str]],
+        frame_loader: Callable[[str], dict[str, tuple[int, int, int, int]]] = _load_provider_frame,
+    ) -> None:
         self._recent_sessions = recent_sessions
+        self._frame_loader = frame_loader
         self._cache: dict[str, dict[str, int]] = {}
 
     def compare(self, market_date: str) -> dict[str, int] | None:
@@ -352,14 +383,8 @@ class _ProviderComparison:
 
         from app.db import session_scope
         from app.db_models import DailyPriceBar, Symbol
-        from app.eod.pykrx_backfill import _get_market_ohlcv_by_ticker
 
-        compact = market_date.replace('-', '')
-        provider: dict[str, tuple[int, int, int, int]] = {}
-        for market in ('KOSPI', 'KOSDAQ'):
-            frame = _get_market_ohlcv_by_ticker(compact, market)
-            for code, row in frame.iterrows():
-                provider[str(code)] = tuple(int(row[key]) for key in ('시가', '고가', '저가', '종가'))
+        provider = self._frame_loader(market_date)
         with session_scope() as session:
             stored = {
                 symbol: (o, h, l, c)

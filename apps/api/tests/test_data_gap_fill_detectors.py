@@ -177,3 +177,40 @@ class DetectorSqlTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_provider_frames_are_fetched_from_krx_once_per_session_across_service_rebuilds(monkeypatch):
+    import pandas as pd
+
+    from app.eod import data_gap_fill as module
+
+    calls = []
+
+    def fake_frame(compact, market):
+        calls.append((compact, market))
+        return pd.DataFrame({'시가': [1], '고가': [2], '저가': [1], '종가': [2]}, index=['005930'])
+
+    monkeypatch.setattr(module, '_PROVIDER_FRAME_CACHE', {})
+    monkeypatch.setattr('app.eod.pykrx_backfill._get_market_ohlcv_by_ticker', fake_frame)
+    first = module._load_provider_frame('2026-11-05')
+    second = module._load_provider_frame('2026-11-05')  # a later tick: no new KRX read
+    assert first == second == {'005930': (1, 2, 1, 2)}
+    assert calls == [('20261105', 'KOSPI'), ('20261105', 'KOSDAQ')]
+
+
+def test_empty_provider_frames_are_not_cached(monkeypatch):
+    import pandas as pd
+
+    from app.eod import data_gap_fill as module
+
+    calls = []
+
+    def empty_frame(compact, market):
+        calls.append(market)
+        return pd.DataFrame({'시가': [], '고가': [], '저가': [], '종가': []})
+
+    monkeypatch.setattr(module, '_PROVIDER_FRAME_CACHE', {})
+    monkeypatch.setattr('app.eod.pykrx_backfill._get_market_ohlcv_by_ticker', empty_frame)
+    assert module._load_provider_frame('2026-11-05') == {}
+    module._load_provider_frame('2026-11-05')
+    assert len(calls) == 4 and module._PROVIDER_FRAME_CACHE == {}
