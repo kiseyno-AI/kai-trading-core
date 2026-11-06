@@ -63,5 +63,35 @@ class GuardWorkflowTests(unittest.TestCase):
         self.assertIn('runtime_contracts/**', paths)
 
 
+class AnySelfHostedWorkflowTests(unittest.TestCase):
+    """The repository is public: code from a stranger's pull request must never reach the owner's Mac.
+
+    This scans EVERY workflow, so a future workflow (or a later edit) that puts a self-hosted
+    job behind a pull request, comment, issue or fork trigger fails CI instead of exposing the machine.
+    """
+
+    SAFE_TRIGGERS = {'schedule', 'workflow_dispatch'}
+
+    def test_no_self_hosted_job_can_be_reached_by_outsiders(self) -> None:
+        offenders = []
+        for path in sorted((ROOT / '.github' / 'workflows').glob('*.y*ml')):
+            data = load(path)
+            uses_self_hosted = any(
+                'self-hosted' in (job.get('runs-on') if isinstance(job.get('runs-on'), list) else [job.get('runs-on')])
+                for job in (data.get('jobs') or {}).values()
+            )
+            if not uses_self_hosted:
+                continue
+            triggers = data['on']
+            names = set(triggers) if isinstance(triggers, dict) else ({triggers} if isinstance(triggers, str) else set(triggers))
+            if not names <= self.SAFE_TRIGGERS:
+                offenders.append((path.name, sorted(names - self.SAFE_TRIGGERS)))
+        self.assertEqual(offenders, [])
+
+    def test_the_scan_really_finds_the_lab_workflow(self) -> None:
+        names = [p.name for p in (ROOT / '.github' / 'workflows').glob('*.y*ml') if 'self-hosted' in p.read_text()]
+        self.assertIn('signal-lab-weekly.yml', names)
+
+
 if __name__ == '__main__':
     unittest.main()
