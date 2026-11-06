@@ -253,6 +253,13 @@ class Settings(BaseSettings):
     openclaw_signal_decider_expected_model: str = 'openai/gpt-6.1-sol'
     openclaw_short_term_decider_expected_model: str = 'openai/gpt-6.1-sol'
     openclaw_agent_timeout_seconds: float = 0.0
+
+    side_agents_output_dir: str = ''
+    side_agents_timeout_seconds: float = 900.0
+    side_agents_max_daily_attempts: int = 3
+    side_agents_news_max_symbols: int = 30
+    side_agents_news_batch_size: int = 10
+    side_agents_news_lookback_hours: int = 36
     openclaw_agent_max_retries: int = 0
     openclaw_agent_retry_backoff_seconds: float = 30.0
     openclaw_agent_min_dispatch_interval_seconds: float = Field(

@@ -13,6 +13,9 @@ from pathlib import Path
 
 CONTRACT_VERSION = "v1"
 AGENT_WORKSPACES = {
+    "market-context-analyst": "workspace-market-context-analyst",
+    "news-event-analyst": "workspace-news-event-analyst",
+    "postmortem-analyst": "workspace-postmortem-analyst",
     "eod-summarizer": "workspace-eod-summarizer",
     "fundamental-summarizer": "workspace-fundamental-summarizer",
     "short-term-decider": "workspace-short-term-decider",
