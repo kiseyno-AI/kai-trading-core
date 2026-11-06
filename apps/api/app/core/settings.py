@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     upstream_bearer_token: Optional[str] = None
     api_request_logging_enabled: bool = True
     upstream_http_logging_enabled: bool = True
+    app_log_level: str = 'INFO'
     api_log_directory: str = 'var/log'
     api_request_log_file_name: str = 'api-requests.log'
     upstream_http_log_file_name: str = 'upstream-http.log'
