@@ -266,7 +266,7 @@
 - Core does not add Upbit account, balance, order, cancel, amend, deposit, or withdrawal calls. Crypto data is strategy/research input only; live crypto execution remains outside `kai-trading-core`.
 
 ## Trading order adapter notes
-- `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter.
+- `POST /trading/orders/buy` and `POST /trading/orders/sell` are the internal order-control submit routes for the first KIS domestic cash adapter. `POST /trading/orders/buy`, `POST /trading/orders/sell`, and `POST /trading/orders/{client_order_id}/amend` are closed by default (`403 direct_order_api_disabled`) because normal trading is delegated to `kai-trading-exec`; set `TRADING_DIRECT_ORDER_API_ENABLED=true` to open them deliberately. Cancel is not gated.
 - `POST /trading/orders/{client_order_id}/cancel` and `POST /trading/orders/{client_order_id}/amend` are account-scoped control routes. They require `account_reference` in `KIS:<account_number>-<product_code>` format so the service can reconcile and control the correct broker account without exposing credentials.
 - `POST /trading/orders/reconcile` runs an operator-triggered recent-order sweep over persisted KIS orders, and `POST /trading/orders/{client_order_id}/reconcile` forces the same broker-truth repair path for one order.
 - `GET /trading/orders/{client_order_id}` and `GET /trading/orders` expose the persisted request snapshot, current broker-order snapshot, event timeline, and the persisted `last_reconciled_at` / `last_reconcile_status` state. `refresh=true` on the single-order read triggers KIS inquiry-based reconciliation before the response is returned.
