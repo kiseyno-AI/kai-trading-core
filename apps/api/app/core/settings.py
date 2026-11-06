@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     kis_intraday_snapshot_news_limit: int = 5
     portfolio_account_references: str = ''
     portfolio_summary_cache_ttl_seconds: int = 60
+    # Core-side direct broker order routes (POST /trading/orders/buy, /sell and
+    # /{id}/amend). Normal trading is delegated to kai-trading-exec, so these
+    # stay closed unless an operator deliberately opens them. Cancel is a
+    # risk-reducing action and is not gated.
+    trading_direct_order_api_enabled: bool = False
     signal_decider_next_open_enabled: bool = False
     signal_decider_next_open_dry_run: bool = True
     signal_decider_next_open_account_targets: str = ''
