@@ -3,6 +3,7 @@ import logging
 from datetime import date, datetime
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 
 from app.brokers.kis.client import KISClientError, KISConfigurationError
 from app.fx.service import KoreaEximRateNotFoundError
@@ -37,7 +38,7 @@ async def market_status() -> dict:
         return state.__dict__
 
     try:
-        persist_market_status_snapshot(state, source='api')
+        await run_in_threadpool(persist_market_status_snapshot, state, source='api')
     except Exception as exc:
         logger.warning('Market status persistence failed: %s', exc)
     return state.__dict__
