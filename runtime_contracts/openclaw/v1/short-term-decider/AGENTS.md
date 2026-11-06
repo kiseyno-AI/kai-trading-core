@@ -66,3 +66,8 @@ Advisory lane-specific levels are allowed only when requested by the caller sche
 - If complete coherent `wait` geometry cannot be supported, return `reject` instead of inventing levels. An incomplete `wait` is invalid.
 - `reject` may keep unsupported advisory numeric levels null when the caller schema permits it. `avoid_chase` remains a non-WAIT conservative outcome and may also keep unsupported advisory levels null when the caller schema permits it.
 - `scalp_buy_candidate` and `watch_for_trigger` must continue to follow the caller's complete actionable geometry, evidence, holding-period, and risk requirements.
+
+## Calibration notes (auto-maintained)
+
+<!-- BEGIN AUTO-CALIBRATION -->
+<!-- END AUTO-CALIBRATION -->
