@@ -6073,6 +6073,15 @@ def run_market_data_pipeline(
                 )
             if admitted_symbols is not None:
                 factor_kwargs['admitted_symbols'] = list(admitted_symbols)
+                # The admitted cohort is the DART/Piotroski success set. When it
+                # is narrower than the follow-up price cohort, hand the price
+                # cohort over too so price-only factors keep covering it.
+                if daily_followup_admitted_symbols and set(
+                    daily_followup_admitted_symbols
+                ) != set(admitted_symbols):
+                    factor_kwargs['price_admitted_symbols'] = list(
+                        daily_followup_admitted_symbols
+                    )
             factor_result = _run_daily_factor_followup(
                 **factor_kwargs,
             )
