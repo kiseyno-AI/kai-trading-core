@@ -1301,6 +1301,84 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repository.failures[0][0], 1)
         self.assertIn('timed out', repository.failures[0][1])
 
+    async def test_annual_report_audit_step_uses_the_longer_annual_timeout(self):
+        default_result = self.mock_capture_dart_signals.return_value
+
+        async def slow_signals(**_kwargs):
+            await asyncio.sleep(0.2)
+            return default_result
+
+        self.mock_capture_dart_signals.side_effect = slow_signals
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+        # The generic limit would cut this audit step off; the annual one must not.
+        service.event_timeout_seconds = 0.05
+        service.annual_event_timeout_seconds = 5
+
+        slow_result = await service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+        self.assertEqual(slow_result['events_failed'], 0)
+        self.assertEqual(slow_result['events_captured'], 1)
+
+        # Same slow step, annual limit too small -> failure that names the
+        # limit that was actually applied (not the generic one).
+        failing_repository = FakeCaptureRepository()
+        failing_service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=failing_repository,
+        )
+        failing_service.event_timeout_seconds = 5
+        failing_service.annual_event_timeout_seconds = 0.001
+        failed_result = await failing_service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+        self.assertEqual(failed_result['events_failed'], 1)
+        self.assertIn('timed out after 0.001s', failing_repository.failures[0][1])
+
+    async def test_missing_provider_document_is_terminal_not_permanent_retry_debt(self):
+        self.mock_capture_dart_signals.side_effect = RuntimeError(
+            'DART request failed [014]: 파일이 존재하지 않습니다.'
+        )
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+
+        self.assertEqual(result['events_failed'], 0)
+        self.assertEqual(result['events_skipped'], 1)
+        self.assertEqual(result['results'][0]['status'], 'no_data')
+        self.assertEqual(repository.terminals[0][0], 1)
+        self.assertEqual(repository.terminals[0][1], 'no_data')
+        self.assertIn('[014]', repository.terminals[0][2])
+        self.assertEqual(repository.failures, [])
+
+    async def test_other_provider_errors_stay_retryable(self):
+        self.mock_capture_dart_signals.side_effect = RuntimeError(
+            'DART request failed [020]: 사용한도를 초과하였습니다.'
+        )
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(repository.terminals, [])
+        self.assertEqual(repository.failures[0][0], 1)
+
     async def test_capture_recent_fundamentals_marks_dart_no_data_terminal(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()

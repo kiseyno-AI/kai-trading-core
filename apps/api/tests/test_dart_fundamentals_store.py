@@ -613,6 +613,8 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         receipt_date: date,
         capture_status: str,
         attempts: int = 0,
+        last_error: str | None = None,
+        last_attempt_at: datetime | None = None,
     ) -> int:
         suffix = uuid4().hex[:16]
         rcept_no = f'T{suffix}'
@@ -631,6 +633,8 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
                 payload={'rcept_no': rcept_no},
                 fundamentals_capture_status=capture_status,
                 fundamentals_capture_attempts=attempts,
+                fundamentals_last_error=last_error,
+                fundamentals_last_attempt_at=last_attempt_at,
             )
             session.add(event)
             session.flush()
@@ -638,6 +642,33 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
 
         self.created_event_ids.append(event_id)
         return event_id
+
+    def test_file_not_found_no_data_gets_spaced_bounded_rechecks(self):
+        stock_code = f'T{uuid4().hex[:10]}'
+        now = datetime.now(timezone.utc)
+        due = self._create_financial_event(
+            stock_code=stock_code, receipt_date=date(2026, 4, 9), capture_status='no_data', attempts=1,
+            last_error='DART request failed [014]: 파일이 존재하지 않습니다.', last_attempt_at=now - timedelta(days=4),
+        )
+        self._create_financial_event(  # too recent
+            stock_code=stock_code, receipt_date=date(2026, 4, 10), capture_status='no_data', attempts=1,
+            last_error='DART request failed [014]', last_attempt_at=now - timedelta(days=1),
+        )
+        self._create_financial_event(  # budget used up
+            stock_code=stock_code, receipt_date=date(2026, 4, 11), capture_status='no_data', attempts=3,
+            last_error='DART request failed [014]', last_attempt_at=now - timedelta(days=10),
+        )
+        self._create_financial_event(  # a real "no data" ([013]) stays terminal
+            stock_code=stock_code, receipt_date=date(2026, 4, 12), capture_status='no_data', attempts=1,
+            last_error='CFS [013] OFS [013]', last_attempt_at=now - timedelta(days=10),
+        )
+
+        candidates = self.repository.list_capture_candidates(
+            limit=None, stock_codes=[stock_code],
+            receipt_date_from=date(2026, 4, 1), receipt_date_to=date(2026, 4, 30),
+        )
+
+        self.assertEqual([candidate['id'] for candidate in candidates], [due])
 
     def test_list_stored_fundamentals_summary_excludes_snapshots_at_or_after_cutoff(self):
         stock_code = f'T{uuid4().hex[:10]}'
