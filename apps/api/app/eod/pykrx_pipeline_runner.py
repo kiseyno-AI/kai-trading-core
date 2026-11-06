@@ -107,6 +107,17 @@ FACTOR_FOLLOWUP_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         'advanced_value_factors',
     ),
 }
+# Factor stages whose inputs are price bars and same-day PyKRX data only. They do not
+# read DART fundamentals, so they are admitted by the follow-up price/enrichment
+# cohort rather than by the (often much smaller) DART/Piotroski cohort.
+NON_DART_FACTOR_FOLLOWUP_STAGE_IDS: frozenset[str] = frozenset(
+    {
+        'momentum_factors',
+        'value_factors',
+        'low_risk_factors',
+        'beta_factors',
+    }
+)
 SUCCESS_COHORT_MANIFEST_VERSIONS: dict[str, frozenset[str]] = {
     'price_collection': frozenset({'price_contexts_scope_outcomes_v1'}),
     'pykrx_enrichment': frozenset(
@@ -2396,6 +2407,7 @@ def _run_daily_factor_followup(
     market_date: str,
     exact_membership_symbols: Sequence[str] | None,
     admitted_symbols: Sequence[str] | None = None,
+    price_admitted_symbols: Sequence[str] | None = None,
     authoritative_market_scope: Mapping[str, Any] | None = None,
     stage_executor: (
         Callable[
@@ -2447,6 +2459,29 @@ def _run_daily_factor_followup(
         raise RuntimeError(
             'Daily factor admitted scope falls outside exact EOD membership: '
             f'{outside_membership[:20]}'
+        )
+    if price_admitted_symbols is None:
+        price_cohort_symbols = list(initial_admitted_symbols)
+    else:
+        normalized_price_admitted = _normalize_krx_symbol_sequence(
+            price_admitted_symbols
+        )
+        if normalized_price_admitted is None:
+            raise RuntimeError(
+                'Daily factor price-admitted scope contains a malformed KRX '
+                'short code.'
+            )
+        outside_price_membership = sorted(
+            set(normalized_price_admitted) - set(normalized_symbols)
+        )
+        if outside_price_membership:
+            raise RuntimeError(
+                'Daily factor price-admitted scope falls outside exact EOD '
+                f'membership: {outside_price_membership[:20]}'
+            )
+        # The price cohort never excludes a symbol the DART cohort admitted.
+        price_cohort_symbols = sorted(
+            set(normalized_price_admitted) | set(initial_admitted_symbols)
         )
 
     def build_stage_call(
@@ -2527,7 +2562,14 @@ def _run_daily_factor_followup(
         else:
             # Component factors are siblings. A per-symbol failure in one
             # component must not suppress an independent component attempt.
-            stage_invocation_symbols = list(initial_admitted_symbols)
+            # Stages that do not read DART fundamentals are admitted by the
+            # price cohort so a small DART/Piotroski cohort cannot shrink
+            # price-only factors to a fraction of the universe.
+            stage_invocation_symbols = list(
+                price_cohort_symbols
+                if stage_id in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS
+                else initial_admitted_symbols
+            )
         if not stage_invocation_symbols:
             overall_status = 'partial'
             successful_symbols_by_stage[stage_id] = []
@@ -6031,6 +6073,15 @@ def run_market_data_pipeline(
                 )
             if admitted_symbols is not None:
                 factor_kwargs['admitted_symbols'] = list(admitted_symbols)
+                # The admitted cohort is the DART/Piotroski success set. When it
+                # is narrower than the follow-up price cohort, hand the price
+                # cohort over too so price-only factors keep covering it.
+                if daily_followup_admitted_symbols and set(
+                    daily_followup_admitted_symbols
+                ) != set(admitted_symbols):
+                    factor_kwargs['price_admitted_symbols'] = list(
+                        daily_followup_admitted_symbols
+                    )
             factor_result = _run_daily_factor_followup(
                 **factor_kwargs,
             )
