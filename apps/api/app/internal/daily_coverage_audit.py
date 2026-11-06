@@ -12,10 +12,13 @@ Nothing here writes to the database or changes pipeline behavior.
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.sql.elements import TextClause
@@ -177,3 +180,100 @@ def load_recent_trade_dates(
             {'limit': int(limit)},
         ).all()
     return [row[0] for row in rows]
+
+
+EXIT_OK = 0
+EXIT_DEGRADED = 3  # argparse already uses 2 for usage errors
+DEFAULT_RECENT_DATES = 5
+
+
+def run_audit(
+    market_dates: Sequence[date],
+    *,
+    min_ratio: float = DEFAULT_MIN_RATIO,
+    collector: Callable[[date], Mapping[str, int]] = collect_daily_table_counts,
+) -> list[dict[str, Any]]:
+    """Evaluate coverage for each market date, newest first as given."""
+
+    return [
+        evaluate_daily_coverage(
+            collector(market_date),
+            market_date=market_date.isoformat(),
+            min_ratio=min_ratio,
+        )
+        for market_date in market_dates
+    ]
+
+
+def render_text(reports: Sequence[Mapping[str, Any]]) -> str:
+    lines: list[str] = []
+    for report in reports:
+        lines.append(
+            f"market_date={report['market_date']} "
+            f"price_bars={report['baseline_count']} "
+            f"status={str(report['status']).upper()} "
+            f"(min_ratio={report['min_ratio']:.2f})"
+        )
+        lines.append(f"  {'table':<22}{'rows':>8}{'ratio':>9}  status")
+        for row in report['tables']:
+            ratio = '-' if row['ratio'] is None else f"{row['ratio']:.4f}"
+            marker = '' if row['status'] == STATUS_OK else '  <--'
+            lines.append(
+                f"  {row['key']:<22}{row['count']:>8}{ratio:>9}  {row['status']}{marker}"
+            )
+        lines.append('')
+    return '\n'.join(lines).rstrip('\n') + '\n'
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Read-only audit comparing each daily derived table with the day\'s '
+            'price-bar universe. Exit code 0 when every audited day is ok, 3 when any '
+            'day or table is degraded.'
+        )
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        '--market-date',
+        type=date.fromisoformat,
+        help='Audit one market date (YYYY-MM-DD).',
+    )
+    scope.add_argument(
+        '--last',
+        type=int,
+        default=DEFAULT_RECENT_DATES,
+        help=f'Audit the most recent N dates with price bars (default {DEFAULT_RECENT_DATES}).',
+    )
+    parser.add_argument(
+        '--min-ratio',
+        type=float,
+        default=DEFAULT_MIN_RATIO,
+        help=f'Minimum rows/price-bars ratio for a table to be ok (default {DEFAULT_MIN_RATIO}).',
+    )
+    parser.add_argument('--format', choices=('text', 'json'), default='text')
+    return parser
+
+
+def main(
+    argv: Iterable[str] | None = None,
+    *,
+    collector: Callable[[date], Mapping[str, int]] = collect_daily_table_counts,
+    date_loader: Callable[[int], list[date]] = load_recent_trade_dates,
+) -> int:
+    args = _build_parser().parse_args(list(argv) if argv is not None else None)
+    market_dates = (
+        [args.market_date]
+        if args.market_date is not None
+        else date_loader(args.last)
+    )
+    reports = run_audit(market_dates, min_ratio=args.min_ratio, collector=collector)
+    if args.format == 'json':
+        sys.stdout.write(json.dumps(reports, ensure_ascii=False, indent=2) + '\n')
+    else:
+        sys.stdout.write(render_text(reports))
+    return EXIT_OK if all(report['status'] == 'ok' for report in reports) else EXIT_DEGRADED
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

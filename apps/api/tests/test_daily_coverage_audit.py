@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
+import json
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import date
 from unittest.mock import patch
 
@@ -15,8 +17,13 @@ from app.internal.daily_coverage_audit import (
     STATUS_LOW,
     STATUS_NO_BASELINE,
     STATUS_OK,
+    EXIT_DEGRADED,
+    EXIT_OK,
     _count_statement,
     collect_daily_table_counts,
+    main,
+    render_text,
+    run_audit,
     evaluate_daily_coverage,
     load_recent_trade_dates,
 )
@@ -228,6 +235,131 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(fake.params[-1], {'limit': 2})
         with self.assertRaises(ValueError):
             load_recent_trade_dates(0)
+
+
+HOLE_DAY = {
+    **{spec.key: 2769 for spec in COVERAGE_TABLES},
+    'momentum': 82,
+    'composite': 82,
+    'signal_features': 82,
+}
+
+
+def _collector(by_date: dict[date, dict[str, int]]):
+    return lambda market_date: by_date[market_date]
+
+
+def _run_main(argv, **kwargs) -> tuple[int, str]:
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = main(argv, **kwargs)
+    return code, out.getvalue()
+
+
+class CliTests(unittest.TestCase):
+    OK_DAY = {spec.key: 2769 for spec in COVERAGE_TABLES}
+
+    def test_run_audit_evaluates_each_date_in_order(self) -> None:
+        reports = run_audit(
+            [date(2026, 11, 5), date(2026, 11, 4)],
+            collector=_collector({date(2026, 11, 5): self.OK_DAY, date(2026, 11, 4): HOLE_DAY}),
+        )
+
+        self.assertEqual([r['market_date'] for r in reports], ['2026-11-05', '2026-11-04'])
+        self.assertEqual([r['status'] for r in reports], ['ok', 'degraded'])
+
+    def test_exit_code_is_zero_when_all_days_are_ok(self) -> None:
+        code, output = _run_main(
+            ['--market-date', '2026-11-05'],
+            collector=_collector({date(2026, 11, 5): self.OK_DAY}),
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn('market_date=2026-11-05 price_bars=2769 status=OK', output)
+        self.assertNotIn('<--', output)
+
+    def test_exit_code_flags_a_hole_and_marks_the_problem_rows(self) -> None:
+        code, output = _run_main(
+            ['--market-date', '2026-11-04'],
+            collector=_collector({date(2026, 11, 4): HOLE_DAY}),
+        )
+
+        self.assertEqual(code, EXIT_DEGRADED)
+        self.assertIn('status=DEGRADED', output)
+        momentum_line = next(line for line in output.splitlines() if line.strip().startswith('momentum'))
+        self.assertIn('82', momentum_line)
+        self.assertIn('low', momentum_line)
+        self.assertTrue(momentum_line.endswith('<--'))
+        value_line = next(line for line in output.splitlines() if line.strip().startswith('value '))
+        self.assertNotIn('<--', value_line)
+
+    def test_last_uses_the_date_loader_and_default_is_five(self) -> None:
+        seen: list[int] = []
+
+        def loader(limit: int) -> list[date]:
+            seen.append(limit)
+            return [date(2026, 11, 5)]
+
+        code, _ = _run_main([], collector=_collector({date(2026, 11, 5): self.OK_DAY}), date_loader=loader)
+        _run_main(['--last', '2'], collector=_collector({date(2026, 11, 5): self.OK_DAY}), date_loader=loader)
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(seen, [5, 2])
+
+    def test_any_degraded_day_makes_the_whole_run_degraded(self) -> None:
+        code, output = _run_main(
+            ['--last', '2'],
+            collector=_collector({date(2026, 11, 5): self.OK_DAY, date(2026, 11, 4): HOLE_DAY}),
+            date_loader=lambda _limit: [date(2026, 11, 5), date(2026, 11, 4)],
+        )
+
+        self.assertEqual(code, EXIT_DEGRADED)
+        self.assertIn('market_date=2026-11-05 price_bars=2769 status=OK', output)
+        self.assertIn('market_date=2026-11-04 price_bars=2769 status=DEGRADED', output)
+
+    def test_json_format_is_machine_readable(self) -> None:
+        code, output = _run_main(
+            ['--market-date', '2026-11-04', '--format', 'json'],
+            collector=_collector({date(2026, 11, 4): HOLE_DAY}),
+        )
+
+        payload = json.loads(output)
+        self.assertEqual(code, EXIT_DEGRADED)
+        self.assertEqual(payload[0]['market_date'], '2026-11-04')
+        self.assertIn('momentum', payload[0]['problem_tables'])
+
+    def test_min_ratio_is_applied(self) -> None:
+        counts = {**self.OK_DAY, 'momentum': 2500}
+        strict, _ = _run_main(
+            ['--market-date', '2026-11-05', '--min-ratio', '0.95'],
+            collector=_collector({date(2026, 11, 5): counts}),
+        )
+        lenient, _ = _run_main(
+            ['--market-date', '2026-11-05', '--min-ratio', '0.50'],
+            collector=_collector({date(2026, 11, 5): counts}),
+        )
+
+        self.assertEqual(strict, EXIT_DEGRADED)
+        self.assertEqual(lenient, EXIT_OK)
+
+    def test_market_date_and_last_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(io.StringIO()):
+            import contextlib
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                main(['--market-date', '2026-11-05', '--last', '3'])
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_render_text_is_stable_for_a_known_report(self) -> None:
+        report = evaluate_daily_coverage(
+            {**self.OK_DAY, 'momentum': 0}, market_date='2026-11-05'
+        )
+
+        text = render_text([report])
+        self.assertTrue(text.endswith('\n'))
+        self.assertIn('momentum', text)
+        self.assertIn('empty', text)
 
 
 if __name__ == '__main__':
