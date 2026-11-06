@@ -223,3 +223,23 @@ def test_decider_discipline_checklist_is_veto_only(agent: str) -> None:
     checklist = section[section.index("Discipline checklist") : section.index("Horizon:")]
     for outcome in re.findall(r"choose `(\w+)`", checklist):
         assert outcome in {"wait", "reject"}
+
+
+@pytest.mark.parametrize("agent", DECIDERS)
+def test_decider_calibration_has_no_fixed_caps_that_could_collide_with_core_gates(agent: str) -> None:
+    # Core gates next-open execution on confidence_score_10 (default 6.0, tightened by
+    # performance gates). A fixed prompt cap at or below that line would silently block
+    # every buy whenever an input is partial, which is the normal case.
+    section = _section(_read(agent), "Professional standard")
+    assert not re.search(r"[Cc]ap (it|confidence) at 0\.\d", section)
+    assert "there is no fixed cap" in section
+    assert "never shade your number to clear or to miss them" in section
+    assert "fallback-only by design" in section
+
+
+@pytest.mark.parametrize("agent", DECIDERS)
+def test_decider_plan_rule_refers_to_its_own_output(agent: str) -> None:
+    section = _section(_read(agent), "Professional standard")
+    assert "The request does not have to supply a plan" in section
+    assert "No written plan" not in section
+    assert "do not default to waiting" in section
