@@ -301,3 +301,39 @@ repair, this step does not rebuild them again; it refreshes participation,
 evaluations, and calendars from the proven exact signal scope. Only after that
 rebuild succeeds should operators run verify and `--complete` so the closeout
 fingerprints are refreshed from the repaired signal scope.
+
+## Official-value restatement of stored daily bars
+
+`app.eod.kis_final_bar_repair` finalizes bars that are partial days and refuses any
+row where the provider value is not a monotonic extension. Bars collected from the
+per-symbol range endpoint are different: their close/high/low disagree with the
+official market-wide table in both directions, so about a quarter of them are
+refused. `app.eod.official_bar_restatement` keeps that tool's KIS fetch, row lock,
+drift check, immutable audit rows and pending rebuild batch, and replaces only
+the safety predicate.
+
+A row is rewritten only when all of these hold:
+
+1. the official KRX market-wide table covers the date completely (both markets
+   above their size floors; a failed fetch leaves the date uncovered);
+2. the stored bar differs from the official row (a stored bar that already equals
+   it is left alone whatever KIS says, which keeps adjusted history out);
+3. KIS history returns exactly the official six values;
+4. the close moves by no more than the 31% a KRX day can produce.
+
+```bash
+cd apps/api
+.venv/bin/python -m app.eod.official_bar_restatement \
+  --start-date 2026-09-14 --end-date 2026-11-06 --symbol-limit 500 \
+  --official-cache-dir /durable/official-frames            # dry run
+
+.venv/bin/python -m app.eod.official_bar_restatement \
+  --start-date 2026-09-14 --end-date 2026-11-06 --symbol-limit 500 \
+  --official-cache-dir /durable/official-frames --apply    # one page per call
+```
+
+Page with `--after-symbol` exactly as for the KIS tool. Every applied page opens a
+pending rebuild batch and the documented downstream rebuild (price contexts,
+technical snapshots, action summaries, trending ranks, factors, signal features,
+evaluations, verify and complete) is mandatory before Core can start.
+

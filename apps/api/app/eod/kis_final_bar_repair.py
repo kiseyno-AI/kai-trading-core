@@ -581,6 +581,7 @@ def repair_existing_final_bars(
     apply: bool,
     repair_batch_id: str | None = None,
     required_rebuild_trade_dates: Sequence[str | date] | None = None,
+    planner: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized_symbols = tuple(_normalize_symbol(item) for item in selected_symbols)
     if not normalized_symbols:
@@ -625,7 +626,7 @@ def repair_existing_final_bars(
                 'repair_batch_id': None,
             }
 
-        plan = plan_final_bar_repairs(
+        plan = (planner or plan_final_bar_repairs)(
             stored_rows=current_rows,
             provider_bars=provider_bars,
         )
