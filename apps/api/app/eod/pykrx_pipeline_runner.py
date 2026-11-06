@@ -2902,6 +2902,66 @@ def _bar_from_exact_market_frame(
     }
 
 
+def _official_daily_bar(
+    *,
+    symbol: str,
+    market: str,
+    market_date: str,
+    dependencies: Any,
+    market_frame_cache: dict[tuple[str, str], Any],
+    counters: dict[str, int],
+    run_id: int | None,
+) -> dict[str, Any] | None:
+    """Return the symbol's bar from PyKRX's market-wide frame, or None.
+
+    The market-wide ticker frame is the official KRX daily table and carries
+    OHLC, volume and trading value together.  The per-symbol range endpoint is
+    a different feed: measured on 2026-11-05 its close/high/low differed from
+    the official table (and from KIS history) for about 80% of symbols, and it
+    has no trading value.  None means "not available here" (no getter, fetch
+    failed, symbol absent or incomplete, or inconsistent values) and the caller
+    falls back to the per-symbol path exactly as before.
+    """
+
+    getter = dependencies.get_market_ohlcv_by_ticker
+    if getter is None:
+        return None
+    cache_key = (market_date.replace('-', ''), market)
+    if cache_key not in market_frame_cache:
+        counters['market_fetch_attempts'] = int(counters.get('market_fetch_attempts') or 0) + 1
+        try:
+            market_frame_cache[cache_key] = getter(*cache_key)
+        except Exception as exc:  # noqa: BLE001
+            market_frame_cache[cache_key] = None
+            counters['market_fetch_failures'] = int(counters.get('market_fetch_failures') or 0) + 1
+            dependencies.log_fetch(
+                'fetch_official_market_ohlcv',
+                'failed',
+                run_id=run_id,
+                market=market,
+                trade_date=market_date,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+    bar = _bar_from_exact_market_frame(
+        market_frame_cache.get(cache_key),
+        symbol=symbol,
+        market_date=market_date,
+    )
+    if bar is None:
+        return None
+    if bar['volume'] > 0:
+        # A traded symbol must have a positive value traded and a coherent
+        # candle; otherwise prefer the existing path (which reports it).
+        if bar['turnover'] <= 0:
+            return None
+        if bar['low_price'] > min(bar['open_price'], bar['close_price'], bar['high_price']):
+            return None
+        if bar['high_price'] < max(bar['open_price'], bar['close_price'], bar['low_price']):
+            return None
+    return bar
+
+
 def _summarize_turnover_coverage(counters: Mapping[str, Any]) -> dict[str, Any]:
     total_bars = int(counters.get('total_bars') or 0)
     zero_volume_bars = int(counters.get('zero_volume_bars') or 0)
@@ -3885,6 +3945,10 @@ def run_market_data_pipeline(
         extra={'bars_upserted': 0},
     )
 
+    price_source_counters: dict[str, int] = {
+        'official_market_frame_bars': 0,
+        'per_symbol_bars': 0,
+    }
     try:
         market_turnover_cache: dict[tuple[str, str], Any] = {}
         turnover_coverage_counters: dict[str, int] = {}
@@ -3896,35 +3960,53 @@ def run_market_data_pipeline(
                     'daily_auto',
                     'daily_stage_run',
                 }
+                official_bar = (
+                    _official_daily_bar(
+                        symbol=item.symbol,
+                        market=item.market,
+                        market_date=latest_trade_date,
+                        dependencies=dependencies,
+                        market_frame_cache=market_turnover_cache,
+                        counters=turnover_coverage_counters,
+                        run_id=run_id,
+                    )
+                    if daily_exact_collection
+                    else None
+                )
                 direct_failure: Exception | None = None
                 try:
-                    frame = dependencies.get_market_ohlcv_by_date(
-                        normalized_start,
-                        normalized_end,
-                        item.symbol,
-                    )
-                    if frame.empty:
-                        raise RuntimeError('No OHLCV rows returned.')
-                    fundamentals_frame = None
-                    if not daily_exact_collection:
-                        fundamentals_frame = service._load_symbol_fundamentals(
-                            symbol=item.symbol,
-                            start_date=normalized_start,
-                            end_date=normalized_end,
+                    if official_bar is not None:
+                        bars = [official_bar]
+                        price_source_counters['official_market_frame_bars'] += 1
+                    else:
+                        frame = dependencies.get_market_ohlcv_by_date(
+                            normalized_start,
+                            normalized_end,
+                            item.symbol,
                         )
-                    bars = service._map_symbol_bars(
-                        frame,
-                        fundamentals_frame=fundamentals_frame,
-                    )
-                    if daily_exact_collection:
-                        bars = _exact_daily_bars(
-                            bars,
-                            market_date=latest_trade_date,
-                        )
-                        if not bars:
-                            raise RuntimeError(
-                                'No exact-date usable OHLCV row returned.'
+                        if frame.empty:
+                            raise RuntimeError('No OHLCV rows returned.')
+                        fundamentals_frame = None
+                        if not daily_exact_collection:
+                            fundamentals_frame = service._load_symbol_fundamentals(
+                                symbol=item.symbol,
+                                start_date=normalized_start,
+                                end_date=normalized_end,
                             )
+                        bars = service._map_symbol_bars(
+                            frame,
+                            fundamentals_frame=fundamentals_frame,
+                        )
+                        if daily_exact_collection:
+                            bars = _exact_daily_bars(
+                                bars,
+                                market_date=latest_trade_date,
+                            )
+                            if not bars:
+                                raise RuntimeError(
+                                    'No exact-date usable OHLCV row returned.'
+                                )
+                        price_source_counters['per_symbol_bars'] += len(bars)
                 except (DailyPipelineTrackingWriteError, SQLAlchemyError):
                     raise
                 except Exception as exc:
@@ -4161,6 +4243,7 @@ def run_market_data_pipeline(
                         'bars_upserted': bars_upserted,
                         'price_recovery': price_recovery,
                         'turnover_coverage': turnover_coverage,
+                        'price_source': dict(price_source_counters),
                         **_gap_policy_details(failed=symbols_failed, total=len(symbols)),
                     },
                 )
@@ -4351,6 +4434,7 @@ def run_market_data_pipeline(
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
             'price_recovery': price_recovery,
+            'price_source': dict(price_source_counters),
             'turnover_coverage': turnover_coverage,
             'turnover_invalid_symbols': turnover_invalid_symbols[:50],
             'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
@@ -4452,6 +4536,7 @@ def run_market_data_pipeline(
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
             'price_recovery': price_recovery,
+            'price_source': dict(price_source_counters),
             'turnover_coverage': turnover_coverage,
             'turnover_invalid_symbols': turnover_invalid_symbols[:50],
             'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
@@ -5745,6 +5830,7 @@ def run_market_data_pipeline(
         'downstream_retry_symbols_count': len(downstream_retry_symbol_codes),
         'bars_upserted': bars_upserted,
         'price_recovery': price_recovery,
+        'price_source': dict(price_source_counters),
         'turnover_coverage': turnover_coverage,
         'turnover_invalid_symbols': turnover_invalid_symbols[:50],
         'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
