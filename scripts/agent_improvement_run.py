@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Act on improvement findings: AI-worded contract notes by PR, everything else by issue.
 
-Runs on the self-hosted runner (see docs/AGENT_IMPROVEMENT_LOOP.md). Dry-run is the
+Runs on this Mac via scripts/run_agent_improvement_local.sh (see docs/AGENT_IMPROVEMENT_LOOP.md). Dry-run is the
 default: it only prints what it would do. With ``--apply`` it
 
 * asks the Codex CLI to edit ONLY the calibration block of the affected decider contract

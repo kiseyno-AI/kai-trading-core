@@ -7,6 +7,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 LAB = ROOT / '.github' / 'workflows' / 'signal-lab-weekly.yml'
+LOCAL = ROOT / 'scripts' / 'run_agent_improvement_local.sh'
 GUARD = ROOT / '.github' / 'workflows' / 'agent-rules-guard.yml'
 
 
@@ -16,35 +17,36 @@ def load(path: Path) -> dict:
     return data
 
 
-class LabWorkflowSafetyTests(unittest.TestCase):
-    def test_it_cannot_be_triggered_by_a_pull_request_or_a_fork(self) -> None:
-        triggers = load(LAB)['on']
-        self.assertEqual(set(triggers), {'schedule', 'workflow_dispatch'})
+class LocalLoopSafetyTests(unittest.TestCase):
+    """The loop runs on the owner's Mac through launchd, never on GitHub Actions."""
 
-    def test_it_runs_only_on_the_owners_runner_and_only_for_this_repository(self) -> None:
-        job = load(LAB)['jobs']['lab']
-        self.assertEqual(job['runs-on'], ['self-hosted', 'kai-core'])
-        self.assertIn("github.repository == 'kiseyno-AI/kai-trading-core'", job['if'])
-
-    def test_permissions_are_read_only_and_checkout_is_main(self) -> None:
-        data = load(LAB)
-        self.assertEqual(data['permissions'], {'contents': 'read'})
-        checkout = next(step for step in data['jobs']['lab']['steps'] if step.get('uses', '').startswith('actions/checkout'))
-        self.assertEqual(checkout['with']['ref'], 'main')
-
-    def test_numbers_never_reach_the_public_actions_log(self) -> None:
-        text = LAB.read_text()
-        self.assertIn('last-run.log', text)  # lab stdout is redirected to a runner file
-        self.assertIn('last-findings.log', text)
-        self.assertIn('last-improvement.log', text)
-        for forbidden in ('cat "$OUT/report', 'cat "${{ steps.lab.outputs.report', '--markdown'):
-            self.assertNotIn(forbidden, text)
+    def test_the_lab_is_not_a_github_workflow_anymore(self) -> None:
+        self.assertFalse(LAB.exists())
 
     def test_applying_is_opt_in(self) -> None:
-        text = LAB.read_text()
+        text = LOCAL.read_text()
+        self.assertIn('APPLY=false', text)
         self.assertIn('AGENT_RULES_AUTO_PR', text)
-        self.assertIn("default: false", text)
-        self.assertNotIn('--apply \\', text.replace('ARGS+=(--apply)', ''))  # no unconditional --apply
+        self.assertIn('ARGS+=(--apply)', text)
+        self.assertNotIn('--apply \\', text)
+
+    def test_numbers_stay_in_local_files(self) -> None:
+        text = LOCAL.read_text()
+        for log in ('last-run.log', 'last-findings.log', 'last-improvement.log'):
+            self.assertIn(log, text)
+        self.assertNotIn('cat "$REPORT"', text)
+
+    def test_runs_once_per_week_on_saturday_kst_unless_forced(self) -> None:
+        text = LOCAL.read_text()
+        self.assertIn('TZ=Asia/Seoul date +%u', text)
+        self.assertIn('[ "$DOW" = "6" ] || exit 0', text)
+        self.assertIn('.done-$WEEK', text)
+        self.assertIn('--force', text)
+
+    def test_launchd_template_points_at_the_local_script(self) -> None:
+        plist = (ROOT / 'scripts' / 'launchd' / 'com.kai.agent-improvement.plist.template').read_text()
+        self.assertIn('__ROOT__/scripts/run_agent_improvement_local.sh', plist)
+        self.assertIn('<key>StartInterval</key><integer>3600</integer>', plist)
 
 
 class GuardWorkflowTests(unittest.TestCase):
@@ -88,9 +90,9 @@ class AnySelfHostedWorkflowTests(unittest.TestCase):
                 offenders.append((path.name, sorted(names - self.SAFE_TRIGGERS)))
         self.assertEqual(offenders, [])
 
-    def test_the_scan_really_finds_the_lab_workflow(self) -> None:
+    def test_no_workflow_uses_a_self_hosted_runner_at_all(self) -> None:
         names = [p.name for p in (ROOT / '.github' / 'workflows').glob('*.y*ml') if 'self-hosted' in p.read_text()]
-        self.assertIn('signal-lab-weekly.yml', names)
+        self.assertEqual(names, [])
 
 
 if __name__ == '__main__':
