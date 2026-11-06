@@ -41,6 +41,7 @@ from app.core.audit_logging import (
     reset_request_id,
     set_request_id,
 )
+from app.core.app_logging import configure_application_logging
 from app.core.settings import settings
 from app.db import check_database, init_database, pool_status
 from app.db_pool_watchdog import db_pool_watchdog
@@ -59,6 +60,7 @@ from app.us_equities.scheduler import us_equity_pipeline_scheduler
 from app.scanner.state import scanner_state
 
 configure_file_logging()
+configure_application_logging(settings.app_log_level)
 logger = logging.getLogger(__name__)
 STARTUP_MAINTENANCE_TIMEOUT_SECONDS = 30
 
