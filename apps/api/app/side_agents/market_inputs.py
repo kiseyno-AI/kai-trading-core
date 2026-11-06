@@ -16,6 +16,9 @@ from zoneinfo import ZoneInfo
 
 KST = ZoneInfo('Asia/Seoul')
 LEG_TIMEOUT_SECONDS = 40.0
+# KIS has no client-side rate limiter and Core may be calling it at the same time:
+# issue KIS requests one at a time with a small gap.
+KIS_REQUEST_SPACING_SECONDS = 0.25
 LIMIT_MOVE_PCT = 29.0
 
 INDEX_CODES = {'kospi': '0001', 'kosdaq': '1001'}
@@ -222,6 +225,16 @@ def breadth_history(
     return out
 
 
+def latest_session_as_of(now_kst: datetime, is_trading_day: Callable[[date], bool] | None) -> date:
+    """The most recent session whose closing data the live KIS endpoints still describe."""
+    day = now_kst.date() if now_kst.hour >= 9 else now_kst.date() - timedelta(days=1)
+    for _ in range(14):
+        if day.weekday() < 5 and (is_trading_day is None or is_trading_day(day)):
+            return day
+        day -= timedelta(days=1)
+    return day
+
+
 async def _leg(name: str, coro: Awaitable[Any]) -> dict[str, Any]:
     try:
         return {'status': 'ok', 'data': await asyncio.wait_for(coro, LEG_TIMEOUT_SECONDS)}
@@ -247,9 +260,10 @@ async def collect_market_inputs(
     breadth_loader: Callable[[date], list[dict[str, Any]]] = load_breadth_rows,
     fx_loader: Callable[[], dict[str, Any] | None] | None = None,
     is_trading_day: Callable[[date], bool] | None = None,
+    kis_spacing_seconds: float = KIS_REQUEST_SPACING_SECONDS,
 ) -> dict[str, Any]:
     now_kst = (now or datetime.now(KST)).astimezone(KST)
-    live = market_date == now_kst.date()
+    live = market_date == latest_session_as_of(now_kst, is_trading_day)
     legs: dict[str, Any] = {}
 
     jobs: list[tuple[str, str, Awaitable[Any]]] = []
@@ -263,8 +277,16 @@ async def collect_market_inputs(
     start = (market_date - timedelta(days=14)).strftime('%Y%m%d')
     for key, kw in BOK_SERIES.items():
         jobs.append(('bok', key, _leg(key, ecos.fetch_series(start_period=start, end_period=market_date.strftime('%Y%m%d'), end_row=20, **kw))))
-    gathered = await asyncio.gather(*(job[2] for job in jobs))
-    results = {(job[0], job[1]): leg for job, leg in zip(jobs, gathered)}
+    results: dict[tuple[str, str], Any] = {}
+    for kind, name, coro in jobs:
+        if kind == 'bok':
+            continue
+        results[(kind, name)] = await coro
+        if kis_spacing_seconds > 0:
+            await asyncio.sleep(kis_spacing_seconds)
+    bok_jobs = [job for job in jobs if job[0] == 'bok']  # a different server: fine to run together
+    for job, leg in zip(bok_jobs, await asyncio.gather(*(job[2] for job in bok_jobs))):
+        results[(job[0], job[1])] = leg
 
     def group(kind: str) -> list[str]:
         return [name for (k, name) in results if k == kind]

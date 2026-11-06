@@ -193,25 +193,26 @@ def _run_due(tmp_path, gateway, now, **kw):
         is_trading_day=kw.pop('is_trading_day', lambda d: d.weekday() < 5),
         payload_builder=lambda d: {'market_date': d.isoformat()},
         news_inputs_loader=kw.pop('news_inputs_loader', lambda d, n: {}),
-        summary_loader=kw.pop('summary_loader', lambda d: None), **kw,
+        summary_loader=kw.pop('summary_loader', lambda d: None),
+        inputs_ready=kw.pop('inputs_ready', lambda d: (True, 'ready')), **kw,
     )
 
 
 def test_run_due_waits_for_scheduled_time_and_skips_non_trading_days(tmp_path):
     gw = Gateway([])
-    assert _run_due(tmp_path, gw, kst(17, 59)).outcomes == []
+    assert _run_due(tmp_path, gw, kst(21, 29)).outcomes == []
     assert gw.calls == []
-    assert _run_due(tmp_path, gw, kst(19), is_trading_day=lambda d: False).outcomes == []
+    assert _run_due(tmp_path, gw, kst(22), is_trading_day=lambda d: False).outcomes == []
     assert gw.calls == []
 
 
 def test_market_context_runs_once_and_is_idempotent(tmp_path):
     gw = Gateway([market_output()])
-    first = _run_due(tmp_path, gw, kst(18, 30), only=['market-context-analyst'])
+    first = _run_due(tmp_path, gw, kst(21, 30), only=['market-context-analyst'])
     assert [o.status for o in first.outcomes] == ['ok']
     saved = json.loads((tmp_path / 'market-context-analyst' / '2026-11-09.json').read_text())
     assert saved['advisory_only'] is True and saved['output']['regime'] == 'neutral'
-    again = _run_due(tmp_path, gw, kst(19), only=['market-context-analyst'])
+    again = _run_due(tmp_path, gw, kst(22), only=['market-context-analyst'])
     assert [o.status for o in again.outcomes] == ['skipped'] and len(gw.calls) == 1
 
 
@@ -219,16 +220,16 @@ def test_gateway_failure_backs_off_then_exhausts_budget_without_hammering(tmp_pa
     monkeypatch.setattr(runner.settings, 'side_agents_max_daily_attempts', 2)
     gw = Gateway([httpx.Response(429, text='quota'), httpx.Response(429, text='quota')])
     only = ['market-context-analyst']
-    assert _run_due(tmp_path, gw, kst(18, 30), only=only).outcomes[0].status == 'failed'
-    assert _run_due(tmp_path, gw, kst(18, 40), only=only).outcomes[0].detail == 'retry_gap'
-    assert _run_due(tmp_path, gw, kst(19, 0), only=only).outcomes[0].status == 'failed'
-    assert _run_due(tmp_path, gw, kst(20, 0), only=only).outcomes[0].detail == 'attempt_budget_exhausted'
+    assert _run_due(tmp_path, gw, kst(21, 30), only=only).outcomes[0].status == 'failed'
+    assert _run_due(tmp_path, gw, kst(21, 40), only=only).outcomes[0].detail == 'retry_gap'
+    assert _run_due(tmp_path, gw, kst(22, 0), only=only).outcomes[0].status == 'failed'
+    assert _run_due(tmp_path, gw, kst(23, 0), only=only).outcomes[0].detail == 'attempt_budget_exhausted'
     assert len(gw.calls) == 2
 
 
 def test_invalid_output_is_rejected_stored_aside_and_never_written_as_result(tmp_path):
     gw = Gateway([market_output(regime='bullish')])
-    outcome = _run_due(tmp_path, gw, kst(18, 30), only=['market-context-analyst']).outcomes[0]
+    outcome = _run_due(tmp_path, gw, kst(21, 30), only=['market-context-analyst']).outcomes[0]
     assert outcome.status == 'rejected'
     assert not (tmp_path / 'market-context-analyst' / '2026-11-09.json').exists()
     assert (tmp_path / 'market-context-analyst' / 'rejected' / '2026-11-09.json').exists()
@@ -242,19 +243,19 @@ def test_news_runs_batches_and_stops_after_gateway_failure(tmp_path, monkeypatch
     monkeypatch.setattr(runner.settings, 'side_agents_news_batch_size', 1)
     inputs = _news_inputs(('000660', '005930', '035420'))
     gw = Gateway([news_output(['000660']), httpx.Response(429, text='quota')])
-    outcomes = _run_due(tmp_path, gw, kst(19), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
+    outcomes = _run_due(tmp_path, gw, kst(21, 30), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
     assert [o.status for o in outcomes] == ['ok', 'failed']
     assert len(gw.calls) == 2
     # a later run resumes only the unfinished batches
     gw2 = Gateway([news_output(['005930']), news_output(['035420'])])
-    outcomes2 = _run_due(tmp_path, gw2, kst(19, 40), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
+    outcomes2 = _run_due(tmp_path, gw2, kst(22, 40), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
     assert [o.status for o in outcomes2] == ['skipped', 'ok', 'ok']
     assert len(gw2.calls) == 2
 
 
 def test_news_without_inputs_is_skipped_without_calling_gateway(tmp_path):
     gw = Gateway([])
-    outcomes = _run_due(tmp_path, gw, kst(19), only=['news-event-analyst']).outcomes
+    outcomes = _run_due(tmp_path, gw, kst(21, 30), only=['news-event-analyst']).outcomes
     assert [(o.status, o.detail) for o in outcomes] == [('skipped', 'no_recent_news_or_filings')] and gw.calls == []
 
 
@@ -287,7 +288,7 @@ def test_oversized_postmortem_summary_is_skipped_not_truncated(tmp_path):
 
 def test_dry_run_never_calls_the_gateway(tmp_path):
     gw = Gateway([])
-    report = _run_due(tmp_path, gw, kst(19, 30), dry_run=True, news_inputs_loader=lambda d, n: _news_inputs(('A',)))
+    report = _run_due(tmp_path, gw, kst(21, 45), dry_run=True, news_inputs_loader=lambda d, n: _news_inputs(('A',)))
     assert gw.calls == []
     assert {o.status for o in report.outcomes} == {'skipped'}
 
@@ -310,10 +311,33 @@ def test_news_contract_honors_price_forecast_prohibition_and_postmortem_cannot_l
     news = (REPO_ROOT / 'runtime_contracts/openclaw/v1/news-event-analyst/AGENTS.md').read_text(encoding='utf-8')
     assert 'price_forecast_prohibited' in news and 'No price targets' in news
     post = (REPO_ROOT / 'runtime_contracts/openclaw/v1/postmortem-analyst/AGENTS.md').read_text(encoding='utf-8')
-    assert 'never loosen a gate' in post and 'fewer than 20 records' in post
+    assert 'never loosen a gate' in post and 'fewer than 20 records' in post.lower() and 'distinct_decision_dates' in post
 
 
 def test_sync_script_knows_new_agents():
     script = (REPO_ROOT / 'scripts' / 'sync_openclaw_runtime_contract.py').read_text(encoding='utf-8')
     for agent in ('market-context-analyst', 'news-event-analyst', 'postmortem-analyst'):
         assert f'"{agent}": "workspace-{agent}"' in script
+
+
+def test_evening_agents_wait_for_daily_inputs_without_spending_attempts(tmp_path):
+    gw = Gateway([market_output()])
+    waiting = _run_due(tmp_path, gw, kst(21, 30), only=['market-context-analyst'], inputs_ready=lambda d: (False, 'risk_rows=0 bar_rows=0'))
+    assert [(o.status, o.unit) for o in waiting.outcomes] == [('waiting', '2026-11-09')] and gw.calls == []
+    assert SideAgentStore(tmp_path).load_state('market-context-analyst', '2026-11-09')['attempts'] == 0
+    assert _run_due(tmp_path, gw, kst(22), only=['market-context-analyst']).outcomes[0].status == 'ok'
+
+
+def test_after_midnight_the_previous_session_is_caught_up_and_daytime_is_idle():
+    trading = lambda d: d.weekday() < 5
+    at = lambda day, h, m=0: datetime(2026, 11, day, h, m, tzinfo=runner.KST)
+    assert runner.target_market_date(at(10, 1, 30), trading) == date(2026, 11, 9)  # Tuesday 01:30 -> Monday
+    assert runner.target_market_date(at(9, 1, 30), trading) == date(2026, 11, 6)  # Monday 01:30 -> Friday
+    assert runner.target_market_date(at(10, 12), trading) is None
+    assert runner.target_market_date(at(14, 21, 30), trading) is None  # Saturday
+
+
+def test_catch_up_run_writes_the_previous_session(tmp_path):
+    gw = Gateway([market_output()])
+    outcome = _run_due(tmp_path, gw, datetime(2026, 11, 10, 1, 30, tzinfo=runner.KST), only=['market-context-analyst']).outcomes[0]
+    assert outcome.status == 'ok' and outcome.unit == '2026-11-09'

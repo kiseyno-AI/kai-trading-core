@@ -15,6 +15,9 @@ HORIZONS = (3, 5)
 PRIMARY_HORIZON = {'short-term-decider': 3, 'signal-decider': 5}
 REGIME_MEDIAN_THRESHOLD_PCT = -0.5
 MIN_SAMPLE = 20
+# Same-day decisions share the market move and holding windows overlap, so the number of
+# distinct decision dates, not the record count, bounds the effective sample.
+MIN_DISTINCT_DATES = 10
 
 DECISIONS_SQL = """
 select distinct on (market_date, symbol, agent_name)
@@ -101,7 +104,7 @@ def summarize_outcomes(
         bars = bars_by_symbol.get(row['symbol'], [])
         entry_index = next((i for i, b in enumerate(bars) if b['trade_date'] > row['market_date']), None)
         gross = realized_return(bars, row['market_date'], horizon)
-        entry = per_agent.setdefault(agent, {'recorded': 0, 'unresolved': 0, 'actions': defaultdict(list), 'classification': defaultdict(int), 'buckets': defaultdict(list), 'all': [], 'horizon_sessions': horizon})
+        entry = per_agent.setdefault(agent, {'recorded': 0, 'unresolved': 0, 'actions': defaultdict(list), 'classification': defaultdict(int), 'buckets': defaultdict(list), 'all': [], 'dates': set(), 'action_dates': defaultdict(set), 'horizon_sessions': horizon})
         entry['recorded'] += 1
         if gross is None or entry_index is None:
             entry['unresolved'] += 1
@@ -111,6 +114,8 @@ def summarize_outcomes(
         label = classify(action, gross, window_median, cost_pct)
         entry['actions'][action].append(gross)
         entry['all'].append(gross)
+        entry['dates'].add(row['market_date'])
+        entry['action_dates'][action].add(row['market_date'])
         entry['classification'][label] += 1
         if action == 'buy':
             entry['buckets'][_bucket(row.get('confidence_score_10'))].append(gross)
@@ -119,14 +124,15 @@ def summarize_outcomes(
         resolved = sum(len(v) for v in e['actions'].values())
         agents[agent] = {
             'recorded': e['recorded'], 'resolved': resolved, 'unresolved': e['unresolved'],
-            'horizon_sessions': e['horizon_sessions'], 'sufficient_sample': resolved >= MIN_SAMPLE,
+            'distinct_decision_dates': len(e['dates']),
+            'horizon_sessions': e['horizon_sessions'], 'sufficient_sample': resolved >= MIN_SAMPLE and len(e['dates']) >= MIN_DISTINCT_DATES,
             'candidate_baseline': {
                 'n': len(e['all']), 'mean_gross_return_pct': round(statistics.fmean(e['all']), 3) if e['all'] else None,
                 'share_above_cost': round(sum(x > cost_pct for x in e['all']) / len(e['all']), 4) if e['all'] else None,
             },
             'by_action': {
                 a: {
-                    'n': len(v), 'mean_gross_return_pct': round(statistics.fmean(v), 3),
+                    'n': len(v), 'distinct_dates': len(e['action_dates'][a]), 'mean_gross_return_pct': round(statistics.fmean(v), 3),
                     'share_positive': round(sum(x > 0 for x in v) / len(v), 4),
                     'share_above_cost': round(sum(x > cost_pct for x in v) / len(v), 4),
                 }
@@ -139,7 +145,9 @@ def summarize_outcomes(
             ],
         }
     return {
-        'cost_round_trip_pct': cost_pct, 'min_sample': MIN_SAMPLE, 'return_definition': 'next-session open to close of the horizon-th session, percent, before costs',
+        'cost_round_trip_pct': cost_pct, 'min_sample': MIN_SAMPLE, 'min_distinct_dates': MIN_DISTINCT_DATES,
+        'missed_opportunity_threshold_pct': round(2 * cost_pct, 4),
+        'independence_note': 'records are not independent: decisions on the same date share the market move and holding windows overlap; treat distinct_decision_dates as the effective sample for any timing or regime claim', 'return_definition': 'next-session open to close of the horizon-th session, percent, before costs',
         'agents': agents,
         'total_resolved': sum(a['resolved'] for a in agents.values()),
     }

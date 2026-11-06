@@ -34,8 +34,15 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo('Asia/Seoul')
 RETRY_GAP = timedelta(minutes=25)
 MAX_POSTMORTEM_BYTES = 120_000  # payload cap; larger inputs are skipped, never truncated
-MARKET_DUE_HHMM = (18, 30)
-NEWS_DUE_HHMM = (19, 0)
+# The daily pipeline writes bars after ~20:10 KST and the risk snapshots (breadth, sectors)
+# around 21:00, so the evening agents wait for those inputs, not for a clock time alone.
+DAILY_DUE_HHMM = (21, 30)
+CATCHUP_UNTIL_HHMM = (6, 0)
+MIN_READY_ROWS = 500
+READINESS_SQL = (
+    'select (select count(*) from daily_market_risk_snapshots where market_date = :d) as risk_rows, '
+    '(select count(*) from daily_price_bars where trade_date = :d) as bar_rows'
+)
 POSTMORTEM_DUE_HHMM = (9, 0)
 POSTMORTEM_KNOWN_AGENTS = (
     'eod-summarizer', 'technical-summarizer', 'fundamental-summarizer',
@@ -246,6 +253,33 @@ def run_postmortem(
     )
 
 
+def daily_inputs_ready(market_date: date) -> tuple[bool, str]:
+    from sqlalchemy import text
+
+    from app.db import session_scope
+
+    with session_scope() as session:
+        row = session.execute(text(READINESS_SQL), {'d': market_date}).mappings().first()
+    risk_rows, bar_rows = int(row['risk_rows'] or 0), int(row['bar_rows'] or 0)
+    ready = risk_rows >= MIN_READY_ROWS and bar_rows >= MIN_READY_ROWS
+    return ready, f'risk_rows={risk_rows} bar_rows={bar_rows}'
+
+
+def target_market_date(current: datetime, is_trading_day: Callable[[date], bool]) -> date | None:
+    """Today's session after DAILY_DUE_HHMM; before 06:00, the previous session (late pipeline catch-up)."""
+    hhmm = (current.hour, current.minute)
+    today = current.date()
+    if hhmm >= DAILY_DUE_HHMM:
+        return today if is_trading_day(today) else None
+    if hhmm < CATCHUP_UNTIL_HHMM:
+        day = today - timedelta(days=1)
+        for _ in range(10):
+            if is_trading_day(day):
+                return day
+            day -= timedelta(days=1)
+    return None
+
+
 def _is_trading_day(day: date) -> bool:
     from app.market.session import get_krx_calendar_day
 
@@ -259,6 +293,7 @@ def run_due(
     news_inputs_loader: Callable[[date, datetime], dict[str, dict[str, Any]]] = load_news_inputs,
     payload_builder: Callable[[date], dict[str, Any]] = build_market_payload,
     summary_loader: Callable[[date], dict[str, Any] | None] = _default_summary_loader,
+    inputs_ready: Callable[[date], tuple[bool, str]] = daily_inputs_ready,
 ) -> RunReport:
     current = (now or datetime.now(timezone.utc)).astimezone(KST)
     client = client or SideAgentClient()
@@ -267,12 +302,19 @@ def run_due(
     report = RunReport()
     today = current.date()
     hhmm = (current.hour, current.minute)
-    if is_trading_day(today):
-        if MARKET_AGENT in wanted and hhmm >= MARKET_DUE_HHMM:
-            report.add(run_market_context(today, client=client, store=store, now=current, payload_builder=payload_builder, dry_run=dry_run))
-        if NEWS_AGENT in wanted and hhmm >= NEWS_DUE_HHMM:
-            for outcome in run_news_events(today, client=client, store=store, now=current, inputs_loader=news_inputs_loader, dry_run=dry_run):
-                report.add(outcome)
+    target = target_market_date(current, is_trading_day)
+    evening = [a for a in (MARKET_AGENT, NEWS_AGENT) if a in wanted]
+    if target is not None and evening:
+        ready, detail = inputs_ready(target)
+        if not ready:
+            for agent in evening:  # waiting does not consume the attempt budget
+                report.add(UnitOutcome(agent, target.isoformat(), 'waiting', f'daily inputs not ready: {detail}'))
+        else:
+            if MARKET_AGENT in evening:
+                report.add(run_market_context(target, client=client, store=store, now=current, payload_builder=payload_builder, dry_run=dry_run))
+            if NEWS_AGENT in evening:
+                for outcome in run_news_events(target, client=client, store=store, now=current, inputs_loader=news_inputs_loader, dry_run=dry_run):
+                    report.add(outcome)
     if POSTMORTEM_AGENT in wanted and current.weekday() == 5 and hhmm >= POSTMORTEM_DUE_HHMM:
         iso = current.isocalendar()
         week_key = f'{iso.year}-W{iso.week:02d}'

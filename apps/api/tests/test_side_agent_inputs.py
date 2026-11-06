@@ -38,9 +38,18 @@ class FakeKIS:
     def __init__(self, fail_flows=False):
         self.fail_flows = fail_flows
         self.calls = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def _track(self):
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        await asyncio.sleep(0)
+        self.in_flight -= 1
 
     async def fetch_market_index_price(self, *, index_code):
         self.calls.append(('index', index_code))
+        await self._track()
         out = dict(KIS_INDEX)
         if index_code == '1001':
             out['bstp_nmix_prdy_ctrt'] = '-5.03'
@@ -54,6 +63,7 @@ class FakeKIS:
 
     async def fetch_overseas_quote(self, *, exchange, symbol):
         self.calls.append(('us', symbol))
+        await self._track()
         return {'output': KIS_QUOTE}
 
 
@@ -111,7 +121,7 @@ def _collect(kis=None, ecos=None, now=NOW, market_date=DAY, **kw):
             market_date, kis=kis or FakeKIS(), ecos=ecos or FakeECOS(), now=now,
             breadth_loader=kw.pop('breadth_loader', lambda d: breadth_rows()),
             fx_loader=kw.pop('fx_loader', lambda: {'status': 'ok', 'usd_krw': 1342.0}),
-            is_trading_day=lambda d: d.weekday() < 5, **kw,
+            is_trading_day=lambda d: d.weekday() < 5, kis_spacing_seconds=kw.pop('kis_spacing_seconds', 0), **kw,
         )
     )
 
@@ -272,3 +282,34 @@ def test_summarize_outcomes_counts_buckets_and_sample_sufficiency():
     short = out['agents']['short-term-decider']
     assert short['by_action']['wait']['n'] == 1  # watch_for_trigger is an observation, not a buy
     assert out['total_resolved'] == 3
+
+
+def test_kis_requests_are_sequential_never_concurrent():
+    kis = FakeKIS()
+    _collect(kis=kis)
+    assert len(kis.calls) == 12 and kis.max_in_flight == 1
+
+
+def test_live_legs_follow_the_latest_session_not_the_calendar_date():
+    trading = lambda d: d.weekday() < 5
+    # Saturday morning still describes Friday's close; Monday 08:00 too.
+    assert mi.latest_session_as_of(datetime(2026, 11, 7, 10, 0, tzinfo=KST), trading) == date(2026, 11, 6)
+    assert mi.latest_session_as_of(datetime(2026, 11, 9, 8, 0, tzinfo=KST), trading) == date(2026, 11, 6)
+    assert mi.latest_session_as_of(datetime(2026, 11, 9, 9, 5, tzinfo=KST), trading) == date(2026, 11, 9)
+    kis = FakeKIS()
+    out = _collect(kis=kis, now=datetime(2026, 11, 7, 0, 30, tzinfo=KST))  # after midnight, for Friday
+    assert out['live_legs_collected'] is True and kis.calls
+
+
+def test_postmortem_reports_distinct_dates_and_requires_them_for_sufficiency():
+    bars = {f'S{i}': session_bars() for i in range(25)}
+    decisions = [
+        {'market_date': date(2026, 11, 2), 'symbol': f'S{i}', 'agent_name': 'signal-decider', 'decision_action': 'wait', 'confidence_score_10': 5, 'tactical_action': None, 'preferred_action': None}
+        for i in range(25)
+    ]
+    out = pi.summarize_outcomes(decisions, bars, {})
+    agent = out['agents']['signal-decider']
+    assert agent['resolved'] == 25 and agent['distinct_decision_dates'] == 1
+    assert agent['sufficient_sample'] is False  # 25 same-day records are one market observation
+    assert agent['by_action']['wait']['distinct_dates'] == 1
+    assert out['missed_opportunity_threshold_pct'] == round(2 * pi.ROUND_TRIP_COST_PCT, 4) and 'independence_note' in out
