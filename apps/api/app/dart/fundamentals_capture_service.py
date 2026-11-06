@@ -63,6 +63,7 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
 DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
 DART_NO_DATA_STATUS = '013'
+DART_FILE_NOT_FOUND_STATUS = '014'
 UNSUPPORTED_CODE_REASON = 'code_unsupported:dart_lookup'
 UPDATED_ENTRIES_PREVIEW_LIMIT = 3
 UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE = 'initial_fundamentals_capture'
@@ -1003,6 +1004,9 @@ class DartFundamentalsCaptureService:
             or _load_share_issuance_activation_audit
         )
         self.event_timeout_seconds = settings.dart_fundamentals_event_timeout_seconds
+        self.annual_event_timeout_seconds = (
+            settings.dart_fundamentals_annual_event_timeout_seconds
+        )
         self.stale_run_minutes = settings.dart_fundamentals_stale_run_minutes
 
     async def capture_recent_fundamentals(
@@ -1315,6 +1319,7 @@ class DartFundamentalsCaptureService:
                         ),
                     ),
                 )
+                active_timeout_seconds = self.event_timeout_seconds
                 audit_diagnostics: dict[str, Any] | None = None
                 expected_recovery_candidate = (
                     event if legacy_cfs_no_data_recovery else None
@@ -1329,12 +1334,14 @@ class DartFundamentalsCaptureService:
                         event.get('filing_category') == 'annual_report'
                         and '사업보고서' in str(event.get('report_nm') or '')
                     ):
+                        active_timeout_seconds = self.annual_event_timeout_seconds
                         signal_result = await asyncio.wait_for(
                             self.signals_service.capture_signals_for_event(
                                 rcept_no=event['rcept_no'],
                             ),
-                            timeout=self.event_timeout_seconds,
+                            timeout=active_timeout_seconds,
                         )
+                        active_timeout_seconds = self.event_timeout_seconds
                         raw_audit_diagnostics = signal_result.get(
                             'audit_diagnostics'
                         )
@@ -1441,7 +1448,7 @@ class DartFundamentalsCaptureService:
                         success_result['telemetry_warning'] = warning
                 except asyncio.TimeoutError:
                     timeout_message = (
-                        f'Capture timed out after {self.event_timeout_seconds}s '
+                        f'Capture timed out after {active_timeout_seconds}s '
                         f'for event_id={event["id"]} rcept_no={event["rcept_no"]}'
                     )
                     status_write_drift = (
@@ -1583,7 +1590,15 @@ class DartFundamentalsCaptureService:
                         terminal_result['telemetry_warning'] = warning
                 except Exception as exc:
                     error_message = str(exc)
-                    if f'DART fundamentals returned [{DART_NO_DATA_STATUS}]' in error_message:
+                    if (
+                        f'DART fundamentals returned [{DART_NO_DATA_STATUS}]'
+                        in error_message
+                        # The provider no longer serves this filing's document
+                        # (typically an attachment-only amendment), so every
+                        # retry fails identically and leaves permanent debt.
+                        or f'DART request failed [{DART_FILE_NOT_FOUND_STATUS}]'
+                        in error_message
+                    ):
                         capture_status = CAPTURE_STATUS_NO_DATA
                         status_write_drift = (
                             self._mark_event_capture_terminal_if_current(
