@@ -1,0 +1,93 @@
+name: Signal lab and agent calibration
+
+# Runs on the owner's Mac (self-hosted runner labelled "kai-core") because the market
+# database is local. This repository is PUBLIC: this workflow therefore has no
+# pull_request trigger, only runs on main, and keeps every number out of the Actions
+# log (the report stays under var/alpha-lab on the runner). See docs/AGENT_IMPROVEMENT_LOOP.md.
+
+on:
+  schedule:
+    - cron: '0 0 * * 6' # Saturday 09:00 KST, after the week's last daily pipeline
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Create the calibration PR and issues (otherwise dry run)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signal-lab
+  cancel-in-progress: false
+
+jobs:
+  lab:
+    if: github.repository == 'kiseyno-AI/kai-trading-core'
+    runs-on: [self-hosted, kai-core]
+    timeout-minutes: 120
+    env:
+      KAI_CORE_HOME: ${{ vars.KAI_CORE_HOME || '/Users/shawn/kai-trading-core' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Evaluate signals (read-only, output stays on the runner)
+        id: lab
+        run: |
+          set -euo pipefail
+          OUT="$KAI_CORE_HOME/var/alpha-lab"
+          mkdir -p "$OUT"
+          RUN_ID="$(date +%Y%m%d-%H%M)"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          PY="$KAI_CORE_HOME/apps/api/.venv/bin/python"
+          (
+            set -a; source "$KAI_CORE_HOME/apps/api/.env" >/dev/null 2>&1; set +a
+            cd apps/api
+            DB_AUTO_UPGRADE=false PYTHONPATH="$PWD" "$PY" -m app.analytics.signal_lab --out-dir "$OUT" \
+              > "$OUT/last-run.log" 2>&1
+          )
+          REPORT="$(ls -t "$OUT"/report-*.json | head -1)"
+          echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+          echo "Signal lab finished; report kept on the runner."
+
+      - name: Derive findings (verdict history decides what is allowed)
+        id: findings
+        run: |
+          set -euo pipefail
+          OUT="$KAI_CORE_HOME/var/alpha-lab"
+          PY="$KAI_CORE_HOME/apps/api/.venv/bin/python"
+          FINDINGS="$OUT/findings-${{ steps.lab.outputs.run_id }}.json"
+          (
+            cd apps/api
+            PYTHONPATH="$PWD" "$PY" -m app.analytics.improvement_findings \
+              --report "${{ steps.lab.outputs.report }}" \
+              --history "$OUT/history.jsonl" \
+              --run-id "${{ steps.lab.outputs.run_id }}" \
+              --changelog ../../agent_rules/CHANGELOG.md \
+              --out "$FINDINGS" > "$OUT/last-findings.log" 2>&1
+          )
+          echo "findings=$FINDINGS" >> "$GITHUB_OUTPUT"
+          COUNT="$("$PY" -c "import json,sys;print(len(json.load(open(sys.argv[1]))['findings']))" "$FINDINGS")"
+          echo "$COUNT finding(s) after persistence and cooldown rules."
+
+      - name: Propose calibration (dry run unless enabled)
+        env:
+          APPLY_INPUT: ${{ inputs.apply }}
+          APPLY_VAR: ${{ vars.AGENT_RULES_AUTO_PR }}
+        run: |
+          set -euo pipefail
+          PY="$KAI_CORE_HOME/apps/api/.venv/bin/python"
+          ARGS=()
+          if [ "$APPLY_INPUT" = "true" ] || [ "$APPLY_VAR" = "true" ]; then ARGS+=(--apply); fi
+          # gh and git use the owner's stored login on the runner, so the PR it opens
+          # triggers CI, the guard and the Codex review like any other PR.
+          "$PY" scripts/agent_improvement_run.py \
+            --findings "${{ steps.findings.outputs.findings }}" \
+            --run-id "${{ steps.lab.outputs.run_id }}" "${ARGS[@]}" \
+            > "$KAI_CORE_HOME/var/alpha-lab/last-improvement.log" 2>&1 || true
+          "$PY" -c "import json,sys,re;t=open(sys.argv[1]).read();print('mode:',re.search(r'\"mode\": \"(\w+)\"',t).group(1) if re.search(r'\"mode\"',t) else 'unknown')" \
+            "$KAI_CORE_HOME/var/alpha-lab/last-improvement.log"
