@@ -14,10 +14,15 @@ the canonical file is the runtime provenance recorded with each decision.
 
 ## What changed in this revision
 
-- **Summarizers are now version-controlled.** Before, their workspace `AGENTS.md` was the generic assistant
-  template (diary, heartbeat, pasted tool notes) and only the request prompt defined the work. Each contract
-  now keeps the input-boundary and output rules and adds identity, an ordered method, Korean-market specifics,
-  calibration bands and a `details.house_view` structure.
+- **Summarizers are now version-controlled.** Their live workspace `AGENTS.md` files were short, unversioned
+  runtime contracts with no provenance check (Core only hashes the deciders). Each is now a canonical file in
+  this repository, keeps the old input-boundary and output rules, and adds identity (overriding the persona files
+  that sit beside it in the workspace), an ordered method, Korean-market specifics, calibration bands, a
+  playbook section and a `details.house_view` structure.
+- **Playbooks from external research** (stage analysis and trend template, breakout volume rule, probability-weighted
+  scenarios, liquidity impact, earnings preview/recap, invert-first, circle of competence, data-consistency checks,
+  pre-trade discipline checklist) are inlined into the contracts because these agents have no tools or skills.
+  Each playbook applies only when the request supplies the fields it needs.
 - **Deciders gained a "Professional standard" section** placed before `## Output contract`. It is add-only:
   every existing safety sentence is unchanged and the section states it never widens authority.
 - Summarizer `risk_flags` use a fixed code vocabulary (`code: 한국어 설명`) so flags can be counted and

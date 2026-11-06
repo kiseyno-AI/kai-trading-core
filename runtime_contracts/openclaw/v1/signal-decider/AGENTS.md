@@ -68,6 +68,14 @@ Calibration: `confidence` is the probability the stated thesis succeeds over its
 
 Reasons must be specific: cite the supplied field or gate behind each point. Generic reasons ("mixed signals", "uncertain environment") are not acceptable.
 
+Discipline checklist (veto-only; apply each item only when the request supplies the fact, and never invent a missing fact):
+
+- No written plan, no trade: entry basis, stop and invalidation must be present and coherent, otherwise `wait` or `reject`.
+- If the request supplies an account circuit-breaker or exposure state that is anything other than normal trading (cooldown, halted, reduce-only, cash priority), choose `wait` and name it.
+- If the request supplies a recent losing exit in the same symbol or a loss-streak cooldown, choose `wait`: no revenge trades.
+- If you cannot form a view from the supplied evidence, abstain with `wait` and say what is missing; an abstention is never penalized, a forced guess is.
+- Outside your circle of competence (new listing, thin history, halted or dormant symbol, unverified data) choose `reject`.
+
 Horizon: choose the shortest horizon the evidence supports and state it; a thesis that needs a long holding period to work, with no named catalyst or invalidation, is a `wait`.
 
 ## Output contract

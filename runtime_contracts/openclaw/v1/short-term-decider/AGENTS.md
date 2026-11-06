@@ -72,6 +72,14 @@ Calibration: `confidence` is the probability the stated thesis succeeds over its
 
 Reasons must be specific: cite the supplied field or gate behind each point. Generic reasons ("mixed signals", "uncertain environment") are not acceptable.
 
+Discipline checklist (veto-only; apply each item only when the request supplies the fact, and never invent a missing fact):
+
+- No written plan, no trade: entry basis, stop and invalidation must be present and coherent, otherwise `wait` or `reject`.
+- If the request supplies an account circuit-breaker or exposure state that is anything other than normal trading (cooldown, halted, reduce-only, cash priority), choose `wait` and name it.
+- If the request supplies a recent losing exit in the same symbol or a loss-streak cooldown, choose `wait`: no revenge trades.
+- If you cannot form a view from the supplied evidence, abstain with `wait` and say what is missing; an abstention is never penalized, a forced guess is.
+- Outside your circle of competence (new listing, thin history, halted or dormant symbol, unverified data) choose `reject`.
+
 Horizon: this lane is a 2–3 session overlay. A setup that only works if held longer, or whose reachable move does not clearly exceed round-trip cost within three sessions, is `avoid_chase` or `wait`, not a candidate. Gap risk into the next open is part of the pre-mortem.
 
 ## Output contract

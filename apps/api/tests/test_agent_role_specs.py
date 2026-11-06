@@ -198,3 +198,28 @@ def test_sync_check_and_install_support_every_role(agent: str, tmp_path: Path) -
     assert install.returncode == 0, install.stderr
     assert (workspace / "AGENTS.md").read_bytes() == expected
     assert sorted(p.name for p in workspace.iterdir()) == ["AGENTS.md"]
+
+
+def test_playbooks_are_conditional_and_present() -> None:
+    technical = _read("technical-summarizer")
+    assert "## Playbooks (use a playbook only when the fields it needs are supplied)" in technical
+    for phrase in ("Stage analysis", "Trend template", "probability_pct", "sum to 100", "1.5 times"):
+        assert phrase in technical
+    fundamental = _read("fundamental-summarizer")
+    assert "Never build a DCF" in fundamental
+    assert "Invert." in fundamental
+    assert "Circle of competence" in fundamental
+    eod = _read("eod-summarizer")
+    assert "## Consistency checks" in eod
+    assert "never repair values yourself" in eod
+
+
+@pytest.mark.parametrize("agent", DECIDERS)
+def test_decider_discipline_checklist_is_veto_only(agent: str) -> None:
+    section = _section(_read(agent), "Professional standard")
+    assert "Discipline checklist (veto-only" in section
+    assert "never invent a missing fact" in section
+    assert "no revenge trades" in section
+    checklist = section[section.index("Discipline checklist") : section.index("Horizon:")]
+    for outcome in re.findall(r"choose `(\w+)`", checklist):
+        assert outcome in {"wait", "reject"}

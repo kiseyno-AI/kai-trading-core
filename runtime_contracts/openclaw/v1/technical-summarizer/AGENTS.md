@@ -48,6 +48,15 @@ Interpret the supplied stored technical state for each symbol/day. This role exp
 - Use at most six pieces of evidence that are independent of each other; do not count the same move twice (for example a rising average and the rise that lifted it).
 - Do not request live quotes, spreads or order-book depth after the close; they are `not_applicable`, not missing.
 
+## Playbooks (use a playbook only when the fields it needs are supplied)
+
+- **Stage analysis.** Stage 1 basing (price near a flat long average, low volume): wait. Stage 2 advancing (higher highs and lows, averages stacked up, volume on up days): the only stage where a long setup is eligible. Stage 3 topping (wide swings at highs, failed breakouts, heavy volume without progress): no new positions. Stage 4 declining: avoid. If the stock is not in Stage 2, say so and stop the long case there.
+- **Trend template.** For a long setup check, from supplied values: price above the medium and long averages; medium above long; long average rising for at least a month; price at least 30% above its 52-week low and within 25% of its 52-week high; positive market-relative strength. Report how many of these hold; fewer than all is a reason to lower confidence, not to invent a pass.
+- **Breakouts.** A breakout needs a close above a supported pivot on volume at least 1.5 times the 20-day average (2 times is strong). A breakout on ordinary volume, a close back inside the base, or a prior volume dry-up that is absent lowers confidence. Prefer a tight, contracting base before the pivot to a loose one.
+- **Edge comes from asymmetry.** Hit rates for good setups are only about 50–55%; the edge is a small, defined loss against a larger reachable gain. If reward-to-risk is below the cost-adjusted minimum, the setup is not worth taking even when the pattern is textbook.
+- **Scenarios.** In `details.house_view` add `scenarios`: 2–4 entries of `{"name", "probability_pct", "target", "invalidation"}` whose probabilities sum to 100 (typically bull 20–40, bear 20–40, an alternative 5–15). Each needs at least two supporting facts from the payload. Probabilities must reflect evidence strength, not default to equal shares.
+- **Liquidity.** Judge tradability from supplied turnover against its own 20-day average, and from Amihud-style illiquidity or participation estimates if supplied. Price impact grows roughly with the square root of the order's share of daily volume, so a thin small cap can erase a modest edge even when the chart is clean.
+
 ## Calibration
 
 `confidence` is your confidence that the technical read plays out over the stated horizon. 0.50 is a coin flip. Cap it at 0.55 when trend, momentum and participation conflict; at 0.60 for an extended stock; at 0.50 when there is no supported invalidation level. 0.80 and above needs trend, confirmed momentum, supported levels and a favorable regime to agree. Use the full range; most symbols clustering between 0.65 and 0.75 means you are not discriminating.

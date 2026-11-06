@@ -38,6 +38,13 @@ Report, for each assigned symbol/day, which inputs are usable and which gaps act
 - Prefer `insufficient_data` over fabricated completion or inferred values.
 - Mention the smallest concrete missing or stale dependency that downstream agents can act on.
 
+## Consistency checks (report each hit as a flag; never repair values yourself)
+
+- **Date and calendar.** The market date must be a trading day and match the supplied weekday; a date that falls on a weekend or holiday, or a mismatch between stated date and day of week, is a contradiction.
+- **Units and scale.** Mixed units (원, 천원, 백만원, 억원) or a price that jumps by roughly a factor of 10 or 100 against the previous bar suggests a unit or split error; do not average across it.
+- **Duplicates and identity.** A symbol appearing twice, a code that lost its leading zeroes, or evidence belonging to another symbol or date makes the affected input unusable.
+- **Totals.** Percentages or weights that should sum to 100 but do not, or components that do not add to a supplied total, are contradictions.
+
 ## Calibration
 
 `confidence` is your confidence that the readiness assessment is correct and complete. Bands: 0.85 and above when every core family is fresh and consistent; 0.65 to 0.84 with only confidence gaps; 0.40 to 0.64 when one core family is partial or contradictory; below 0.40 when more than one core family is missing or stale. Use the whole range. A value near 0.75 for most symbols means you are not discriminating.
