@@ -48,7 +48,11 @@ class SideAgentClient:
         self._transport = transport
 
     def call(self, *, agent: str, task: str, payload: Mapping[str, Any], run_id: str | None = None) -> str:
-        session_key = f'agent:{agent}:side/{task}/{run_id or uuid.uuid4().hex}'
+        # OpenClaw canonicalizes session keys to lower case when it places a
+        # turn; a mixed-case key (e.g. ISO week "2026-W45") then fails on the
+        # model-fallback attempt with "session key does not match its
+        # placement". Send the canonical form ourselves.
+        session_key = f'agent:{agent}:side/{task}/{run_id or uuid.uuid4().hex}'.lower()
         headers = {
             'Content-Type': 'application/json',
             'x-openclaw-session-key': session_key,

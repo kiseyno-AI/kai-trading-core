@@ -56,8 +56,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.agent == NEWS_AGENT:
         outcomes = run_news_events(market_date, client=client, store=store, now=now, dry_run=args.dry_run)
     else:
-        iso = now.isocalendar()
-        summary = load_summary_file(args.summary) if args.summary else _default_summary_loader(now.date())
+        # --date (default: today KST) is the review's as-of day for both the
+        # outcome window and the ISO-week unit, so a manual re-run of a past
+        # week is labeled and windowed consistently.
+        iso = market_date.isocalendar()
+        summary = load_summary_file(args.summary) if args.summary else _default_summary_loader(market_date)
         outcomes = [run_postmortem(f'{iso.year}-W{iso.week:02d}', summary=summary, client=client, store=store, now=now, dry_run=args.dry_run)]
     print(json.dumps([vars(o) for o in outcomes], ensure_ascii=False))
     return 0 if all(o.status in {'ok', 'skipped'} for o in outcomes) else 1

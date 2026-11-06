@@ -149,6 +149,19 @@ def test_client_posts_agent_model_headers_and_returns_output_text():
     assert 'untrusted data' in seen['body']['input'] and '한글' in seen['body']['input']
 
 
+def test_client_sends_a_lower_case_session_key_for_iso_week_units():
+    # OpenClaw places turns under the lower-cased key; a mixed-case key
+    # failed the model-fallback attempt ("does not match its placement").
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen['key'] = request.headers['x-openclaw-session-key']
+        return httpx.Response(200, json=_ok_body('{"x": 1}'))
+
+    _gateway(handler).call(agent='postmortem-analyst', task='postmortem', payload={}, run_id='2026-W45')
+    assert seen['key'] == 'agent:postmortem-analyst:side/postmortem/2026-w45'
+
+
 @pytest.mark.parametrize('response', [httpx.Response(429, text='quota'), httpx.Response(503), httpx.Response(200, json={'output': []}), httpx.Response(200, text='nope')])
 def test_client_raises_dispatch_error_on_gateway_problems(response):
     with pytest.raises(SideAgentDispatchError):
@@ -341,3 +354,22 @@ def test_catch_up_run_writes_the_previous_session(tmp_path):
     gw = Gateway([market_output()])
     outcome = _run_due(tmp_path, gw, datetime(2026, 11, 10, 1, 30, tzinfo=runner.KST), only=['market-context-analyst']).outcomes[0]
     assert outcome.status == 'ok' and outcome.unit == '2026-11-09'
+
+
+def test_manual_postmortem_run_uses_the_requested_date_for_window_and_week(tmp_path, monkeypatch, capsys):
+    from app.side_agents import __main__ as cli
+
+    seen = {}
+
+    def fake_loader(as_of):
+        seen['as_of'] = as_of
+        return {'total_resolved': 5, 'period': {'from': '2026-09-19', 'to': as_of.isoformat()}}
+
+    monkeypatch.setattr(cli, '_default_summary_loader', fake_loader)
+    monkeypatch.setattr(cli, 'SideAgentStore', lambda: SideAgentStore(tmp_path))
+
+    assert cli.main(['run', '--agent', 'postmortem-analyst', '--date', '2026-10-31', '--dry-run']) == 0
+
+    assert seen['as_of'] == date(2026, 10, 31)
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert report[0]['unit'] == '2026-W44'
