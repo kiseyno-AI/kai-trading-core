@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     app_name: str = 'kai-trading-core-api'
     app_env: str = 'development'
     app_debug: bool = True
+    # Comma-separated browser origins allowed by CORS. The default '*' keeps the
+    # historical permissive behavior for local development; set explicit
+    # origins (for example the operator UI origin) before exposing the API.
+    cors_allowed_origins: str = '*'
     upstream_bearer_token: Optional[str] = None
     api_request_logging_enabled: bool = True
     upstream_http_logging_enabled: bool = True
