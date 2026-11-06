@@ -218,6 +218,17 @@ class Settings(BaseSettings):
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_global_share_issuance_enabled: bool = False
     dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=100, ge=0, le=500)
+    # Weekday market-hours gap fill (docs/DATA_GAP_FILL.md). Off by default; when
+    # enabled it only reports until data_gap_fill_apply is also set.
+    data_gap_fill_enabled: bool = False
+    data_gap_fill_apply: bool = False
+    data_gap_fill_lookback_trading_days: int = Field(default=10, ge=1, le=60)
+    data_gap_fill_window_start: str = Field(default='09:30', pattern=r'^\d{2}:\d{2}$')
+    data_gap_fill_window_end: str = Field(default='15:00', pattern=r'^\d{2}:\d{2}$')
+    data_gap_fill_min_interval_seconds: int = Field(default=1800, ge=60)
+    data_gap_fill_budget_seconds: int = Field(default=900, ge=30, le=3600)
+    data_gap_fill_failure_cooldown_seconds: int = Field(default=6 * 3600, ge=60)
+    data_gap_fill_provider_check_sessions: int = Field(default=2, ge=0, le=10)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
 
     sec_edgar_user_agent: str = ''

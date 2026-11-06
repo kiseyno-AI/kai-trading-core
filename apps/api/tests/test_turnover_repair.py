@@ -285,6 +285,165 @@ class DailyPriceBarTurnoverRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(len(session.calls), 1)
 
+    def _partial_call(self, session, *, expected, turnovers, volumes, ohlc, partial=True):
+        with patch(
+            'app.market_data_store.session_scope',
+            _session_scope_for(session),
+        ):
+            return repair_daily_price_bar_turnovers(
+                market_date='2026-08-19',
+                expected_symbols=expected,
+                turnover_by_symbol=turnovers,
+                provider_volume_by_symbol=volumes,
+                provider_ohlc_by_symbol=ohlc,
+                apply=True,
+                allow_partial_verified=partial,
+            )
+
+    def test_partial_mode_writes_only_rows_that_pass_when_a_bar_is_missing(self):
+        session = _FakeSession(
+            [SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1)]
+        )
+
+        result = self._partial_call(
+            session,
+            expected=['005930', '000660'],
+            turnovers={'005930': 10, '000660': 20},
+            volumes={'005930': 100, '000660': 100},
+            ohlc={
+                '005930': (100, 110, 90, 105),
+                '000660': (100, 110, 90, 105),
+            },
+        )
+
+        self.assertEqual(result['status'], 'completed_partial')
+        self.assertEqual(result['updated_count'], 1)
+        self.assertEqual(result['unverified_symbol_count'], 1)
+        self.assertEqual(result['missing_price_bar_symbols'], ['000660'])
+        self.assertEqual(result['partial_skipped_reasons'], ['missing_price_bars'])
+        self.assertEqual(result['blocked_reasons'], [])
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(
+            session.calls[1][1],
+            [{'repair_bar_id': 11, 'repair_volume': 100, 'repair_turnover': 10}],
+        )
+
+    def test_partial_mode_leaves_an_ohlc_mismatch_row_untouched(self):
+        session = _FakeSession(
+            [
+                SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1),
+                SimpleNamespace(bar_id=12, symbol='000660', volume=100, turnover=1),
+            ]
+        )
+
+        result = self._partial_call(
+            session,
+            expected=['005930', '000660'],
+            turnovers={'005930': 10, '000660': 20},
+            volumes={'005930': 100, '000660': 100},
+            ohlc={
+                '005930': (100, 110, 90, 105),
+                '000660': (101, 110, 90, 105),
+            },
+        )
+
+        self.assertEqual(result['status'], 'completed_partial')
+        self.assertEqual(
+            result['provider_stored_ohlc_mismatch_symbols'], ['000660']
+        )
+        self.assertEqual(
+            [item['repair_bar_id'] for item in session.calls[1][1]], [11]
+        )
+
+    def test_partial_mode_never_writes_a_row_whose_turnover_would_decrease(self):
+        session = _FakeSession(
+            [
+                SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1),
+                SimpleNamespace(bar_id=12, symbol='000660', volume=100, turnover=500),
+            ]
+        )
+
+        result = self._partial_call(
+            session,
+            expected=['005930', '000660'],
+            turnovers={'005930': 10, '000660': 20},
+            volumes={'005930': 100, '000660': 100},
+            ohlc={
+                '005930': (100, 110, 90, 105),
+                '000660': (100, 110, 90, 105),
+            },
+        )
+
+        self.assertEqual(result['status'], 'completed_partial')
+        self.assertEqual(result['provider_turnover_decrease_symbols'], ['000660'])
+        self.assertEqual(
+            [item['repair_bar_id'] for item in session.calls[1][1]], [11]
+        )
+
+    def test_partial_mode_still_blocks_a_provider_membership_mismatch(self):
+        session = _FakeSession(
+            [SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1)]
+        )
+
+        # The provider payload lacks volume/OHLC for an expected symbol.
+        result = self._partial_call(
+            session,
+            expected=['005930', '000660'],
+            turnovers={'005930': 10, '000660': 20},
+            volumes={'005930': 100},
+            ohlc={'005930': (100, 110, 90, 105)},
+        )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('provider_membership_mismatch', result['blocked_reasons'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_partial_mode_ignores_active_rows_outside_provider_membership(self):
+        session = _FakeSession(
+            [
+                SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1),
+                SimpleNamespace(
+                    bar_id=12, symbol='250030', volume=0, turnover=0, is_active=True
+                ),
+            ]
+        )
+
+        result = self._partial_call(
+            session,
+            expected=['005930'],
+            turnovers={'005930': 10},
+            volumes={'005930': 100},
+            ohlc={'005930': (100, 110, 90, 105)},
+        )
+
+        self.assertEqual(result['status'], 'completed_partial')
+        self.assertEqual(
+            result['active_stored_outside_membership_symbols'], ['250030']
+        )
+        self.assertEqual(
+            [item['repair_bar_id'] for item in session.calls[1][1]], [11]
+        )
+
+    def test_partial_mode_is_off_by_default(self):
+        session = _FakeSession(
+            [SimpleNamespace(bar_id=11, symbol='005930', volume=100, turnover=1)]
+        )
+
+        result = self._partial_call(
+            session,
+            expected=['005930', '000660'],
+            turnovers={'005930': 10, '000660': 20},
+            volumes={'005930': 100, '000660': 100},
+            ohlc={
+                '005930': (100, 110, 90, 105),
+                '000660': (100, 110, 90, 105),
+            },
+            partial=False,
+        )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(len(session.calls), 1)
+
     def test_active_stored_row_outside_membership_blocks_updates(self):
         session = _FakeSession(
             [
@@ -581,6 +740,32 @@ class DailyTurnoverRepairServiceTests(unittest.TestCase):
         )
         self.assertFalse(patch_calls[0]['apply'])
         self.assertEqual(result['membership_basis'], 'exact_market_date_ohlcv')
+
+    def test_partial_flag_is_forwarded_to_the_patcher_only_when_requested(self):
+        patch_calls: list[dict] = []
+
+        def patch_turnovers(**kwargs):
+            patch_calls.append(kwargs)
+            return {'status': 'ready', 'applied': False}
+
+        def make_service():
+            return DailyTurnoverRepairService(
+                trade_date_resolver=lambda **_kwargs: '2026-08-19',
+                market_ohlcv_loader=lambda _d, market: _FakeFrame(
+                    {'005930': 100} if market == 'KOSPI' else {'000660': 200}
+                ),
+                turnover_patcher=patch_turnovers,
+                lock_factory=_available_lock,
+                minimum_market_membership={'KOSPI': 1, 'KOSDAQ': 1},
+            )
+
+        make_service().repair_for_market_date(market_date='2026-08-19')
+        make_service().repair_for_market_date(
+            market_date='2026-08-19', allow_partial_verified=True
+        )
+
+        self.assertNotIn('allow_partial_verified', patch_calls[0])
+        self.assertTrue(patch_calls[1]['allow_partial_verified'])
 
     def test_exact_minimum_membership_boundary_reaches_database_patcher(self):
         patch_calls: list[dict] = []
