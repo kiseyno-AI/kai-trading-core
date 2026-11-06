@@ -289,6 +289,32 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         )
         return run, stages, eod_run
 
+    @classmethod
+    def _current_terminal_continuation_fixture(
+        cls,
+    ) -> tuple[SimpleNamespace, list[SimpleNamespace], SimpleNamespace]:
+        run, stages, eod_run = cls._terminal_continuation_fixture()
+        run.current_stage = 'next_open_execution_plan'
+        run.run_metadata['requested_stages'] = [
+            stage_id
+            for stage_id in run.run_metadata['requested_stages']
+            if stage_id != 'signal_decider_evaluations'
+        ]
+        run.run_metadata['resolved_stages'] = [
+            stage_id
+            for stage_id in run.run_metadata['resolved_stages']
+            if stage_id != 'signal_decider_evaluations'
+        ]
+        run.run_metadata['stage_statuses'].pop(
+            'signal_decider_evaluations'
+        )
+        stages = [
+            stage
+            for stage in stages
+            if stage.stage_id != 'signal_decider_evaluations'
+        ]
+        return run, stages, eod_run
+
     @staticmethod
     def _terminal_continuation_lineage(
         run_ids: tuple[int, ...] = (441, 442, 443, 444, 445, 456),
@@ -446,7 +472,6 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'resolved_stages': [
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 'resume_from_stage': 'signal_decider',
                 'reused_eod_collection_run_id': 581,
@@ -510,8 +535,8 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             details={'result_summary': {'status': 'completed'}},
         )
         current_stage_rows = [signal]
-        if current_checkpoint in {'during_plan', 'during_evaluation'}:
-            plan_completed = current_checkpoint == 'during_evaluation'
+        if current_checkpoint == 'during_plan':
+            plan_completed = False
             current_stage_rows.append(
                 SimpleNamespace(
                     id=2,
@@ -553,38 +578,8 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     ),
                 )
             )
-        if current_checkpoint == 'during_evaluation':
-            current_stage_rows.append(
-                SimpleNamespace(
-                    id=3,
-                    pipeline_run_id=593,
-                    market_date=source_date,
-                    stage_id='signal_decider_evaluations',
-                    status='interrupted',
-                    processed=0,
-                    total=0,
-                    succeeded=0,
-                    failed=0,
-                    remaining=0,
-                    current_step='core_restart_interrupted',
-                    current_activity='Evaluation stage',
-                    current_symbol=None,
-                    current_period=None,
-                    started_at=current_started_at + timedelta(minutes=2),
-                    updated_at=interrupted_at,
-                    completed_at=interrupted_at,
-                    error_message=interruption_reason,
-                    source_run_ids={},
-                    details={
-                        'resumable': True,
-                        'interrupted_reason': interruption_reason,
-                    },
-                )
-            )
         if current_checkpoint == 'during_plan':
             current.current_stage = 'next_open_execution_plan'
-        elif current_checkpoint == 'during_evaluation':
-            current.current_stage = 'signal_decider_evaluations'
         elif current_checkpoint != 'after_signal':
             raise AssertionError(
                 f'unknown current checkpoint: {current_checkpoint}'
@@ -594,7 +589,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             market_date=source_date,
             trigger='auto_eod_followup_resume',
             status='blocked',
-            current_stage='signal_decider_evaluations',
+            current_stage='next_open_execution_plan',
             started_at=source_completed_at - timedelta(minutes=10),
             completed_at=source_completed_at - timedelta(minutes=5),
             error_message=None,
@@ -611,7 +606,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             market_date=source_date,
             trigger='auto_eod_followup_resume',
             status='skipped',
-            current_stage='signal_decider_evaluations',
+            current_stage='next_open_execution_plan',
             started_at=source_completed_at - timedelta(minutes=1),
             completed_at=source_completed_at,
             error_message=None,
@@ -665,7 +660,6 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         for stage_id in (
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ):
             marker_evidence_rows.append(
                 SimpleNamespace(
@@ -765,27 +759,6 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                         }
                     },
                 ),
-                SimpleNamespace(
-                    id=202,
-                    pipeline_run_id=590,
-                    market_date=source_date,
-                    stage_id='signal_decider_evaluations',
-                    status='blocked',
-                    processed=0,
-                    total=0,
-                    succeeded=0,
-                    failed=0,
-                    remaining=0,
-                    completed_at=source_completed_at - timedelta(minutes=5),
-                    error_message=None,
-                    source_run_ids={},
-                    details={
-                        'result_summary': {
-                            'reason': 'declared_dependencies_incomplete',
-                            'incomplete_dependencies': ['signal_decider'],
-                        }
-                    },
-                ),
             ]
         )
         marker_evidence_result = MagicMock()
@@ -863,72 +836,55 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             {
                 'signal_decider': 'completed',
                 'next_open_execution_plan': 'pending',
-                'signal_decider_evaluations': 'pending',
             },
         )
         session.flush.assert_called_once()
 
-    def test_same_day_rearm_claim_accepts_lazy_plan_and_evaluation_shapes(
+    def test_same_day_rearm_claim_accepts_lazy_plan_shape(
         self,
     ) -> None:
-        for checkpoint, expected_resume, expected_persisted in (
-            (
-                'during_plan',
-                'next_open_execution_plan',
-                ['signal_decider'],
-            ),
-            (
-                'during_evaluation',
-                'signal_decider_evaluations',
-                ['signal_decider', 'next_open_execution_plan'],
-            ),
+        current, stage_rows, _, session, proof = (
+            self._same_day_rearm_claim_fixture(
+                current_checkpoint='during_plan'
+            )
+        )
+        context = MagicMock()
+        context.__enter__.return_value = session
+        with patch(
+            'app.eod.daily_pipeline_state.session_scope',
+            return_value=context,
         ):
-            with self.subTest(checkpoint=checkpoint):
-                current, stage_rows, _, session, proof = (
-                    self._same_day_rearm_claim_fixture(
-                        current_checkpoint=checkpoint
-                    )
+            result = (
+                DailyPipelineRunStateService()
+                .claim_same_day_intraday_watch_rearm_resume(
+                    pipeline_run_id=593,
+                    market_date='2026-10-27',
+                    reused_eod_collection_run_id=581,
+                    target_trade_date='2026-10-28',
+                    expected_summary_cutoff_proof=proof,
                 )
-                context = MagicMock()
-                context.__enter__.return_value = session
-                with patch(
-                    'app.eod.daily_pipeline_state.session_scope',
-                    return_value=context,
-                ):
-                    result = (
-                        DailyPipelineRunStateService()
-                        .claim_same_day_intraday_watch_rearm_resume(
-                            pipeline_run_id=593,
-                            market_date='2026-10-27',
-                            reused_eod_collection_run_id=581,
-                            target_trade_date='2026-10-28',
-                            expected_summary_cutoff_proof=proof,
-                        )
-                    )
-                self.assertTrue(result['claimed'], result)
-                self.assertEqual(result['resume_from_stage'], expected_resume)
-                self.assertEqual(
-                    list(result['persisted_stage_outcomes']),
-                    expected_persisted,
-                )
-                self.assertEqual(current.current_stage, expected_resume)
-                self.assertEqual(
-                    {
-                        row.stage_id: row.status
-                        for row in stage_rows
-                    },
-                    {
-                        stage_id: (
-                            'completed'
-                            if stage_id in expected_persisted
-                            else 'pending'
-                        )
-                        for stage_id in {
-                            row.stage_id for row in stage_rows
-                        }
-                    },
-                )
-                session.flush.assert_called_once()
+            )
+        self.assertTrue(result['claimed'], result)
+        self.assertEqual(
+            result['resume_from_stage'],
+            'next_open_execution_plan',
+        )
+        self.assertEqual(
+            list(result['persisted_stage_outcomes']),
+            ['signal_decider'],
+        )
+        self.assertEqual(
+            current.current_stage,
+            'next_open_execution_plan',
+        )
+        self.assertEqual(
+            {row.stage_id: row.status for row in stage_rows},
+            {
+                'signal_decider': 'completed',
+                'next_open_execution_plan': 'pending',
+            },
+        )
+        session.flush.assert_called_once()
 
     def test_same_day_rearm_claim_rejects_attempt_nine_and_cutoff_mismatch(
         self,
@@ -1852,6 +1808,128 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(
             unmarked_result['incomplete_stages'],
             {'pykrx_enrichment': 'completed'},
+        )
+
+    def test_converge_legacy_continuation_retires_evaluation_only_debt(
+        self,
+    ) -> None:
+        completed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        finalized_at = completed_at + timedelta(seconds=1)
+        legacy_resolved_stages = [
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+            'signal_decider_evaluations',
+        ]
+        archived_evaluation = self._terminal_continuation_stage(
+            stage_id='signal_decider_evaluations',
+            status='pending',
+            stage_row_id=54,
+        )
+        archived_evaluation.current_step = 'terminal_continuation_pending'
+        archived_evaluation.details = {}
+        evidence = {
+            'suffix_stages': {
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                }
+            }
+        }
+        run = SimpleNamespace(
+            id=458,
+            status='partial',
+            current_stage='signal_decider_evaluations',
+            error_message='Retired evaluation stage is still pending.',
+            completed_at=completed_at,
+            updated_at=completed_at,
+            run_metadata={
+                'requested_stages': list(legacy_resolved_stages),
+                'resolved_stages': list(legacy_resolved_stages),
+                'stage_statuses': {
+                    'agent_feedback_summaries': 'completed',
+                    'signal_decider': 'completed',
+                    'next_open_execution_plan': 'completed',
+                    'signal_decider_evaluations': 'pending',
+                },
+                'resumable': True,
+                'terminal_continuation_count': 1,
+                'terminal_continuation_version': 1,
+                'terminal_continuation_reason': (
+                    'summary_knowledge_cutoff_repair'
+                ),
+                'terminal_continuation_claimed_at': (
+                    '2026-09-20T08:55:00+00:00'
+                ),
+                'terminal_continuation_evidence': evidence,
+                'resume_from_stage': 'agent_feedback_summaries',
+            },
+        )
+        active_stages = [
+            self._terminal_continuation_stage(
+                stage_id=stage_id,
+                status='completed',
+                stage_row_id=stage_row_id,
+            )
+            for stage_row_id, stage_id in enumerate(
+                legacy_resolved_stages[:-1],
+                start=51,
+            )
+        ]
+        run_result = MagicMock()
+        run_result.scalar_one_or_none.return_value = run
+        stages_result = MagicMock()
+        stages_result.scalars.return_value = active_stages
+        session = MagicMock()
+        session.execute.side_effect = [run_result, stages_result]
+        session_context = MagicMock()
+        session_context.__enter__.return_value = session
+
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=session_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=finalized_at,
+            ),
+        ):
+            result = (
+                DailyPipelineRunStateService()
+                .converge_terminal_stages_run(
+                    pipeline_run_id=458,
+                    allow_satisfied_terminal=True,
+                )
+            )
+
+        current_stages = legacy_resolved_stages[:-1]
+        self.assertTrue(result['updated'], result)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['resolved_stages'], current_stages)
+        self.assertEqual(run.status, 'completed')
+        self.assertEqual(run.current_stage, 'next_open_execution_plan')
+        self.assertIsNone(run.error_message)
+        self.assertFalse(run.run_metadata['resumable'])
+        self.assertEqual(
+            run.run_metadata['requested_stages'],
+            current_stages,
+        )
+        self.assertEqual(
+            run.run_metadata['resolved_stages'],
+            current_stages,
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['stage_statuses'],
+        )
+        self.assertIs(
+            run.run_metadata['terminal_continuation_evidence'],
+            evidence,
+        )
+        self.assertEqual(archived_evaluation.status, 'pending')
+        self.assertEqual(
+            archived_evaluation.current_step,
+            'terminal_continuation_pending',
         )
 
     def test_converge_terminal_stages_run_derives_skipped_when_all_stages_skipped(
@@ -3844,7 +3922,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'completed_scope_proof': self.completed_scope_proof,
             },
         )
-        for stage in stages[1:]:
+        for stage in stages[1:4]:
             self.assertEqual(stage.status, 'pending')
             self.assertEqual(stage.processed, 0)
             self.assertEqual(stage.total, 0)
@@ -3855,7 +3933,29 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             self.assertIsNone(stage.error_message)
             self.assertEqual(stage.source_run_ids, {})
             self.assertEqual(stage.details, {})
+        legacy_evaluation = stages[4]
+        self.assertEqual(legacy_evaluation.status, 'blocked')
+        self.assertEqual(legacy_evaluation.processed, 1)
+        self.assertEqual(legacy_evaluation.total, 1)
+        self.assertIsNotNone(legacy_evaluation.completed_at)
+        self.assertEqual(
+            legacy_evaluation.details['result_summary']['reason'],
+            'declared_dependencies_incomplete',
+        )
         self.assertEqual(stages[0].status, 'completed')
+        self.assertEqual(
+            metadata['resolved_stages'],
+            [
+                'pykrx_enrichment',
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+            ],
+        )
+        self.assertEqual(
+            metadata['requested_stages'],
+            metadata['resolved_stages'],
+        )
         self.assertEqual(
             metadata['stage_statuses'],
             {
@@ -3863,8 +3963,120 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'agent_feedback_summaries': 'pending',
                 'signal_decider': 'pending',
                 'next_open_execution_plan': 'pending',
-                'signal_decider_evaluations': 'pending',
             },
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            result['pipeline_run']['stages'],
+        )
+
+    def test_claim_terminal_continuation_current_suffix_excludes_evaluations(
+        self,
+    ) -> None:
+        claimed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        resumed_at = claimed_at + timedelta(minutes=31)
+        run, stages, eod_run = (
+            self._current_terminal_continuation_fixture()
+        )
+
+        def build_session() -> MagicMock:
+            run_result = MagicMock()
+            run_result.scalar_one_or_none.return_value = run
+            lineage_result = MagicMock()
+            lineage_result.scalars.return_value = (
+                self._terminal_continuation_lineage()
+            )
+            active_result = MagicMock()
+            active_result.scalars.return_value = []
+            stages_result = MagicMock()
+            stages_result.scalars.return_value = stages
+            session = MagicMock()
+            session.execute.side_effect = [
+                MagicMock(),
+                run_result,
+                lineage_result,
+                active_result,
+                stages_result,
+            ]
+            session.get.return_value = eod_run
+            return session
+
+        service = DailyPipelineRunStateService()
+        first_session = build_session()
+        first_context = MagicMock()
+        first_context.__enter__.return_value = first_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=first_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=claimed_at,
+            ),
+        ):
+            claimed = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(claimed['claimed'])
+        evidence = run.run_metadata['terminal_continuation_evidence']
+        self.assertEqual(
+            list(evidence['suffix_stages']),
+            [
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+            ],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['resolved_stages'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['stage_statuses'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            {stage.stage_id for stage in stages},
+        )
+
+        second_session = build_session()
+        second_context = MagicMock()
+        second_context.__enter__.return_value = second_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=second_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=resumed_at,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state.settings.'
+                'eod_auto_pykrx_stale_run_minutes',
+                30,
+            ),
+        ):
+            resumed = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(resumed['claimed'])
+        self.assertTrue(resumed['resumed'])
+        self.assertEqual(
+            resumed['resume_from_stage'],
+            'agent_feedback_summaries',
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['stage_statuses'],
         )
 
     def test_claim_terminal_continuation_is_one_shot(self) -> None:
@@ -4009,12 +4221,151 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             fs_div='CFS',
             source_run_session=second_session,
         )
-        for stage in stages[1:]:
+        for stage in stages[1:4]:
             self.assertEqual(stage.status, 'pending')
             self.assertEqual(
                 stage.current_step,
                 'terminal_continuation_pending',
             )
+        self.assertEqual(stages[4].status, 'blocked')
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['resolved_stages'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['stage_statuses'],
+        )
+
+    def test_claim_terminal_continuation_resumes_persisted_legacy_claim(
+        self,
+    ) -> None:
+        claimed_at = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+        resumed_at = claimed_at + timedelta(minutes=31)
+        run, stages, eod_run = self._terminal_continuation_fixture()
+        lineage = self._terminal_continuation_lineage()
+
+        def build_session() -> MagicMock:
+            run_result = MagicMock()
+            run_result.scalar_one_or_none.return_value = run
+            lineage_result = MagicMock()
+            lineage_result.scalars.return_value = lineage
+            active_result = MagicMock()
+            active_result.scalars.return_value = []
+            stages_result = MagicMock()
+            stages_result.scalars.return_value = stages
+            session = MagicMock()
+            session.execute.side_effect = [
+                MagicMock(),
+                run_result,
+                lineage_result,
+                active_result,
+                stages_result,
+            ]
+            session.get.return_value = eod_run
+            return session
+
+        service = DailyPipelineRunStateService()
+        first_session = build_session()
+        first_context = MagicMock()
+        first_context.__enter__.return_value = first_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=first_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=claimed_at,
+            ),
+        ):
+            first = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+        self.assertTrue(first['claimed'])
+
+        # Recreate the persisted shape written before evaluation was retired
+        # from automatic continuation.  Its row remains audit evidence and
+        # must not be reset even when the interrupted claim is reclaimed.
+        legacy_evaluation = stages[4]
+        run.run_metadata['requested_stages'].append(
+            'signal_decider_evaluations'
+        )
+        run.run_metadata['resolved_stages'].append(
+            'signal_decider_evaluations'
+        )
+        run.run_metadata['stage_statuses'][
+            'signal_decider_evaluations'
+        ] = 'pending'
+        legacy_evaluation.status = 'pending'
+        legacy_evaluation.processed = 0
+        legacy_evaluation.total = 0
+        legacy_evaluation.succeeded = 0
+        legacy_evaluation.failed = 0
+        legacy_evaluation.remaining = 0
+        legacy_evaluation.current_step = 'terminal_continuation_pending'
+        legacy_evaluation.current_activity = 'Legacy evaluation audit row'
+        legacy_evaluation.started_at = claimed_at
+        legacy_evaluation.updated_at = claimed_at
+        legacy_evaluation.completed_at = None
+        legacy_evaluation.error_message = None
+        legacy_evaluation.source_run_ids = {}
+        legacy_evaluation.details = {}
+        legacy_evaluation_before_resume = deepcopy(vars(legacy_evaluation))
+
+        second_session = build_session()
+        second_context = MagicMock()
+        second_context.__enter__.return_value = second_session
+        with (
+            patch(
+                'app.eod.daily_pipeline_state.session_scope',
+                return_value=second_context,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state._utcnow',
+                return_value=resumed_at,
+            ),
+            patch(
+                'app.eod.daily_pipeline_state.settings.'
+                'eod_auto_pykrx_stale_run_minutes',
+                30,
+            ),
+        ):
+            resumed = service.claim_terminal_continuation(
+                pipeline_run_id=456,
+                market_date='2026-09-18',
+                reused_eod_collection_run_id=546,
+            )
+
+        self.assertTrue(resumed['claimed'], resumed)
+        self.assertTrue(resumed['resumed'])
+        self.assertEqual(
+            run.run_metadata['resolved_stages'],
+            [
+                'pykrx_enrichment',
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+            ],
+        )
+        self.assertEqual(
+            run.run_metadata['requested_stages'],
+            run.run_metadata['resolved_stages'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            run.run_metadata['stage_statuses'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            resumed['pipeline_run']['stages'],
+        )
+        self.assertEqual(
+            vars(legacy_evaluation),
+            legacy_evaluation_before_resume,
+        )
 
     def test_claim_terminal_continuation_rejects_fresh_claim_owner(
         self,
@@ -5077,10 +5428,11 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         )
         self.assertIn('FOR UPDATE', str(failed_child_statement))
         self.assertEqual(summary_stage.status, 'completed')
-        for stage in stages[2:]:
+        for stage in stages[2:4]:
             self.assertEqual(stage.status, 'pending')
             self.assertEqual(stage.processed, 0)
             self.assertEqual(stage.details, {})
+        self.assertEqual(stages[4].status, 'blocked')
 
         interrupted_at = failed_at + timedelta(minutes=1)
         run.status = 'interrupted'
@@ -5317,7 +5669,6 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         )
 
         def resolve_cutoff(**kwargs):
@@ -5368,7 +5719,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     )
                 self.assertTrue(first['claimed'])
 
-                suffix_stages = stages[1:]
+                suffix_stages = stages[1:4]
                 for stage in suffix_stages[:completed_prefix_size]:
                     stage.status = 'completed'
                     stage.processed = 1
@@ -5683,6 +6034,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     self.assertEqual(stage.status, 'pending')
                     self.assertEqual(stage.processed, 0)
                     self.assertEqual(stage.details, {})
+                self.assertEqual(stages[4].status, 'blocked')
                 self.assertEqual(
                     {
                         stage_id: run.run_metadata['stage_statuses'][stage_id]
@@ -5813,10 +6165,9 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         )
 
-        for skipped_prefix_size in (1, 2, 3):
+        for skipped_prefix_size in (1, 2):
             with self.subTest(skipped_prefix_size=skipped_prefix_size):
                 run, stages, eod_run = self._terminal_continuation_fixture()
                 service = DailyPipelineRunStateService()
@@ -5844,7 +6195,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                     )
                 self.assertTrue(claimed['claimed'])
 
-                suffix_stages = stages[1:]
+                suffix_stages = stages[1:4]
                 for stage in suffix_stages[:skipped_prefix_size]:
                     stage.status = 'skipped'
                     stage.processed = 0
@@ -5917,6 +6268,7 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 for stage in suffix_stages[:skipped_prefix_size]:
                     self.assertEqual(stage.status, 'skipped')
                     self.assertEqual(stage.source_run_ids, {})
+                self.assertEqual(stages[4].status, 'blocked')
 
     def test_expired_decision_skip_rejects_forged_market_context(
         self,
@@ -6412,6 +6764,17 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
                 'summary_cutoff_contract_repair_resume_count'
             ],
             1,
+        )
+        self.assertEqual(
+            run.run_metadata['resolved_stages'],
+            ['signal_decider', 'next_open_execution_plan'],
+        )
+        self.assertEqual(
+            run.run_metadata['stage_statuses'],
+            {
+                'signal_decider': 'pending',
+                'next_open_execution_plan': 'pending',
+            },
         )
         self.assertEqual(stage.status, 'pending')
         self.assertEqual(stage.current_step, 'cutoff_contract_repair_pending')

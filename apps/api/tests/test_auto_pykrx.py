@@ -31,10 +31,12 @@ from app.eod.pykrx_backfill import (
     AUTO_FOLLOWUP_PROVIDER_OUTAGE_RETRY_INTERVAL_SECONDS,
     AUTO_FOLLOWUP_RECOVERY_TRIGGER,
     FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
+    LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
     PYKRX_STAGE_SEQUENCE,
     TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
     PykrxBackfillService,
     PykrxSymbol,
+    _active_execution_pipeline_projection,
     _build_recovery_price_scope_outcome,
     _call_pykrx,
     _feedback_dispatch_rate_limit_backoff,
@@ -50,6 +52,7 @@ from app.eod.pykrx_backfill import (
     _resolve_followup_recovery_stages,
     _is_summary_cutoff_contract_repair_candidate,
     _is_terminal_followup_continuation_candidate,
+    _legacy_evaluation_only_completion_projection,
     _select_summary_cutoff_proof,
     _select_prior_signal_rearm_evidence,
     _signal_features_have_stale_prerequisite_ordering,
@@ -71,6 +74,7 @@ from app.eod.run_stage_support import (
     SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
     nonblocking_partial_progression_digest,
     pending_same_day_intraday_watch_rearm_marker,
+    validated_nonblocking_partial_progression_marker,
 )
 from app.eod.summary_cutoff_contract import (
     is_resumable_summary_cutoff_contract_repair,
@@ -1776,7 +1780,7 @@ class NextOpenExecutionPlanFollowupTests(TestCase):
 
         self.assertEqual(result['status'], 'skipped')
         self.assertEqual(result['reason'], 'next_open_window_expired')
-        run_retry_cycles.assert_not_called()
+        run_retry_cycles.assert_called_once()
 
 
 def _completed_factor_followup_result(*, market_date: str = '2026-04-03') -> dict:
@@ -1902,6 +1906,275 @@ class _FakeDeduplicatingDailyPipelineRunStateService(_FakeDailyPipelineRunStateS
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_terminal_followup_suffix_ends_at_execution_plan(self) -> None:
+        self.assertEqual(
+            TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+            (
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+            ),
+        )
+        self.assertEqual(
+            LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+            (
+                *TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+                'signal_decider_evaluations',
+            ),
+        )
+
+    def test_reload_filters_retired_evaluation_only_for_active_validation(
+        self,
+    ) -> None:
+        active_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+        pipeline_run = {
+            'id': 617,
+            'status': 'partial',
+            'current_stage': 'next_open_execution_plan',
+            'run_metadata': {
+                'resolved_stages': active_stages,
+                'terminal_continuation_count': 1,
+                'terminal_continuation_version': 1,
+                'terminal_continuation_reason': (
+                    'summary_knowledge_cutoff_repair'
+                ),
+                'terminal_continuation_claimed_at': (
+                    '2026-11-05T12:00:00+00:00'
+                ),
+                'resume_from_stage': 'agent_feedback_summaries',
+                'terminal_continuation_evidence': {
+                    'suffix_stages': {
+                        stage_id: {'status': 'completed'}
+                        for stage_id in (
+                            LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                        )
+                    }
+                },
+            },
+            'stages': {
+                stage_id: {'status': 'completed'}
+                for stage_id in active_stages
+            }
+            | {
+                'signal_decider_evaluations': {
+                    'status': 'blocked'
+                }
+            },
+        }
+
+        projected = _active_execution_pipeline_projection(pipeline_run)
+
+        self.assertEqual(set(projected['stages']), set(active_stages))
+        self.assertIn(
+            'signal_decider_evaluations',
+            pipeline_run['stages'],
+        )
+
+    def test_legacy_evaluation_only_debt_projects_completed_plan(self) -> None:
+        completed_stage = {
+            'status': 'completed',
+            'processed': 1,
+            'total': 1,
+            'succeeded': 1,
+            'failed': 0,
+        }
+        pipeline_run = {
+            'id': 617,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'current_stage': 'signal_decider_evaluations',
+            'market_date': '2026-11-05',
+            'run_metadata': {
+                'requested_stages': list(
+                    LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                ),
+                'resolved_stages': list(
+                    LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                ),
+                'stage_statuses': {
+                    stage_id: 'completed'
+                    for stage_id in (
+                        TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                    )
+                }
+                | {'signal_decider_evaluations': 'blocked'},
+                'resume_from_stage': 'agent_feedback_summaries',
+                'reused_eod_collection_run_id': 604,
+            },
+            'stages': {
+                stage_id: deepcopy(completed_stage)
+                for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            }
+            | {
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                    'details': {
+                        'result_summary': {
+                            'status': 'blocked',
+                            'reason': 'evaluation_source_unavailable',
+                        }
+                    },
+                }
+            },
+        }
+
+        projection = _legacy_evaluation_only_completion_projection(
+            pipeline_run
+        )
+
+        self.assertIsNotNone(projection)
+        self.assertEqual(projection['status'], 'completed')
+        self.assertEqual(
+            projection['resolved_stages'],
+            list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES),
+        )
+        self.assertEqual(
+            projection['pipeline_run']['current_stage'],
+            'next_open_execution_plan',
+        )
+        projected_metadata = projection['pipeline_run']['run_metadata']
+        self.assertEqual(
+            projected_metadata['requested_stages'],
+            list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES),
+        )
+        self.assertEqual(
+            projected_metadata['resolved_stages'],
+            list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES),
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            projected_metadata['stage_statuses'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            projection['stages'],
+        )
+
+        blocked_plan = deepcopy(pipeline_run)
+        blocked_plan['stages']['next_open_execution_plan']['status'] = (
+            'blocked'
+        )
+        self.assertIsNone(
+            _legacy_evaluation_only_completion_projection(blocked_plan)
+        )
+
+        malformed_plan = deepcopy(pipeline_run)
+        malformed_plan['stages']['next_open_execution_plan'] = None
+        self.assertIsNone(
+            _legacy_evaluation_only_completion_projection(malformed_plan)
+        )
+
+    def test_legacy_evaluation_only_debt_converges_without_retry(self) -> None:
+        completed_stage = {
+            'status': 'completed',
+            'processed': 1,
+            'total': 1,
+            'succeeded': 1,
+            'failed': 0,
+        }
+        pipeline_run = {
+            'id': 617,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'current_stage': 'signal_decider_evaluations',
+            'market_date': '2026-11-05',
+            'run_metadata': {
+                'resolved_stages': list(
+                    LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                ),
+                'resume_from_stage': 'agent_feedback_summaries',
+                'reused_eod_collection_run_id': 604,
+                'symbols': ['005930'],
+            },
+            'stages': {
+                stage_id: deepcopy(completed_stage)
+                for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            }
+            | {
+                'signal_decider_evaluations': {
+                    'status': 'blocked',
+                    'processed': 0,
+                    'total': 0,
+                    'succeeded': 0,
+                    'failed': 0,
+                }
+            },
+        }
+        latest_eod_run = {
+            'id': 604,
+            'trade_date': '2026-11-05',
+            'status': 'completed_with_errors',
+            'symbols_total': 1,
+            'symbols_succeeded': 1,
+            'symbols_failed': 0,
+            'run_metadata': {
+                'followup_recovery_required': True,
+                'requested_symbols': ['005930'],
+                'failed_symbols': [],
+                'unattempted_symbols': [],
+                'downstream_retry_symbols': [],
+            },
+        }
+        service = PykrxBackfillService()
+
+        with (
+            patch(
+                'app.eod.pykrx_backfill._current_krx_calendar_date',
+                return_value=date(2026, 11, 5),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill._resolve_followup_stage_debt_state',
+                return_value={'required': False, 'ready': False},
+            ),
+            patch.object(
+                service,
+                '_persist_successful_followup_recovery',
+                return_value={
+                    'updated': True,
+                    'reason': 'followup_recovery_persisted',
+                },
+            ) as persist_recovery,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+            ) as converge_pipeline,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as retry_pipeline,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-11-05',
+                latest_available_trade_date='2026-11-05',
+                latest_eod_run=latest_eod_run,
+                markets=('KOSPI',),
+            )
+
+        self.assertEqual(result['reason'], 'followup_recovery_state_converged')
+        retry_pipeline.assert_not_called()
+        converge_pipeline.assert_not_called()
+        recovery_result = persist_recovery.call_args.kwargs[
+            'recovery_result'
+        ]
+        self.assertEqual(recovery_result['status'], 'completed')
+        self.assertEqual(
+            recovery_result['resolved_stages'],
+            list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES),
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            recovery_result['stages'],
+        )
+
     def test_latest_pipeline_summary_proof_fails_closed_before_eod_fallback(
         self,
     ) -> None:
@@ -2259,11 +2532,7 @@ class PykrxBackfillServiceTests(TestCase):
         recovery_kwargs = resume_followups.call_args.kwargs
         self.assertEqual(
             recovery_kwargs['stages'],
-            [
-                'signal_decider',
-                'next_open_execution_plan',
-                'signal_decider_evaluations',
-            ],
+            list(AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER),
         )
         self.assertEqual(
             recovery_kwargs['resume_from_stage'],
@@ -5495,52 +5764,60 @@ class PykrxBackfillServiceTests(TestCase):
             ['005930', '000660'],
         )
 
-    def test_finalized_nonblocking_partial_suffix_reconciles_without_replay(
+    def test_reloaded_plan_only_partial_with_legacy_evaluation_audit_row(
         self,
     ) -> None:
+        from tests.test_eod_run_stage_support import (
+            EODRunStageSupportTests,
+        )
+
         service = PykrxBackfillService()
-        marker = {
-            'schema_version': 'nonblocking_partial_progression_v1',
-            'proof_digest': 'validated-by-shared-contract',
-            'retry_debt': {
-                'schema_version': 'nonblocking_feedback_retry_debt_v1',
-                'items': [
-                    {
-                        'stage': 'agent_feedback_summaries',
-                        'role': 'technical-summarizer',
-                        'symbol': '028050',
+        recovery_fixture = (
+            EODRunStageSupportTests
+            ._plan_only_nonblocking_partial_recovery_result()
+        )
+        pipeline_run = deepcopy(recovery_fixture['pipeline_run'])
+        stage_rows = deepcopy(recovery_fixture['stages'])
+        stage_rows['signal_decider_evaluations'] = {
+            'status': 'blocked',
+            'result': {
+                'status': 'blocked',
+                'reason': 'retired_legacy_audit_row',
+            },
+        }
+        pipeline_run['stages'] = stage_rows
+        pipeline_run['run_metadata'].update(
+            {
+                'terminal_continuation_count': 1,
+                'terminal_continuation_version': 1,
+                'terminal_continuation_reason': (
+                    'summary_knowledge_cutoff_repair'
+                ),
+                'terminal_continuation_claimed_at': (
+                    '2026-04-14T08:45:00+00:00'
+                ),
+                'resume_from_stage': 'agent_feedback_summaries',
+                'terminal_continuation_evidence': {
+                    'suffix_stages': {
+                        stage_id: {'status': 'completed'}
+                        for stage_id in (
+                            LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                        )
                     }
-                ],
-            },
-        }
-        resolved_stages = [
-            'signal_decider',
-            'next_open_execution_plan',
-            'signal_decider_evaluations',
-        ]
-        stage_rows = {
-            'signal_decider': {'status': 'partial'},
-            'next_open_execution_plan': {'status': 'completed'},
-            'signal_decider_evaluations': {'status': 'completed'},
-        }
-        pipeline_run = {
-            'id': 596,
-            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
-            'status': 'partial',
-            'market_date': '2026-10-28',
-            'current_stage': 'signal_decider_evaluations',
-            'completed_at': '2026-10-28T23:15:00+00:00',
-            'run_metadata': {
-                'resolved_stages': resolved_stages,
-                'reused_eod_collection_run_id': 582,
-                'resumable': False,
-                'nonblocking_partial_progression': marker,
-            },
-            'stages': stage_rows,
-        }
+                },
+            }
+        )
+        marker = deepcopy(
+            pipeline_run['run_metadata'][
+                'nonblocking_partial_progression'
+            ]
+        )
+        resolved_stages = list(
+            pipeline_run['run_metadata']['resolved_stages']
+        )
         latest_eod_run = {
-            'id': 582,
-            'trade_date': '2026-10-28',
+            'id': 7,
+            'trade_date': '2026-04-14',
             'status': 'completed_with_errors',
             'symbols_total': 1,
             'symbols_succeeded': 1,
@@ -5560,7 +5837,7 @@ class PykrxBackfillServiceTests(TestCase):
             patch(
                 'app.eod.pykrx_backfill.'
                 'validated_nonblocking_partial_progression_marker',
-                return_value=marker,
+                wraps=validated_nonblocking_partial_progression_marker,
             ) as validate_marker,
             patch(
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
@@ -5577,8 +5854,8 @@ class PykrxBackfillServiceTests(TestCase):
             ) as persist_recovery,
         ):
             result = service._resume_auto_daily_followups_if_due(
-                market_date='2026-10-28',
-                latest_available_trade_date='2026-10-28',
+                market_date='2026-04-14',
+                latest_available_trade_date='2026-04-14',
                 latest_eod_run=latest_eod_run,
                 markets=('KOSPI', 'KOSDAQ'),
             )
@@ -5587,21 +5864,47 @@ class PykrxBackfillServiceTests(TestCase):
         validate_marker.assert_called_once_with(
             {
                 'status': 'partial',
-                'pipeline_run_id': 596,
-                'pipeline_run': pipeline_run,
-                'market_date': '2026-10-28',
+                'pipeline_run_id': 96,
+                'pipeline_run': {
+                    **pipeline_run,
+                    'stages': {
+                        stage_id: stage_rows[stage_id]
+                        for stage_id in resolved_stages
+                    },
+                },
+                'market_date': '2026-04-14',
                 'resolved_stages': resolved_stages,
-                'stages': stage_rows,
+                'stages': {
+                    stage_id: stage_rows[stage_id]
+                    for stage_id in resolved_stages
+                },
             },
-            expected_eod_collection_run_id=582,
+            expected_eod_collection_run_id=7,
         )
         converge_pipeline.assert_not_called()
         replay_stages.assert_not_called()
         persist_recovery.assert_called_once()
         self.assertEqual(
             persist_recovery.call_args.kwargs['recovery_result']['stages'],
-            stage_rows,
+            {
+                stage_id: stage_rows[stage_id]
+                for stage_id in resolved_stages
+            },
         )
+        persisted_metadata = persist_recovery.call_args.kwargs[
+            'recovery_result'
+        ]['pipeline_run']['run_metadata']
+        self.assertEqual(
+            persisted_metadata['nonblocking_partial_progression'],
+            marker,
+        )
+        self.assertEqual(
+            persisted_metadata['nonblocking_partial_progression'][
+                'retry_debt'
+            ],
+            marker['retry_debt'],
+        )
+        self.assertIn('signal_decider_evaluations', pipeline_run['stages'])
 
     def test_point_in_time_followup_recovers_membership_from_retry_lineage(
         self,
@@ -6494,12 +6797,7 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertEqual(
             recovery_call['stages'],
-            [
-                'agent_feedback_summaries',
-                'signal_decider',
-                'next_open_execution_plan',
-                'signal_decider_evaluations',
-            ],
+            list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES),
         )
         self.assertTrue(recovery_call['force'])
         self.assertFalse(recovery_call['reuse_existing_feedback'])
@@ -11100,11 +11398,7 @@ class PykrxBackfillServiceTests(TestCase):
         recovery_kwargs = resume_followups.call_args.kwargs
         self.assertEqual(
             recovery_kwargs['stages'],
-            [
-                'signal_decider',
-                'next_open_execution_plan',
-                'signal_decider_evaluations',
-            ],
+            list(AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER),
         )
         self.assertEqual(
             recovery_kwargs['resume_from_stage'],
@@ -12451,21 +12745,6 @@ class PykrxBackfillServiceTests(TestCase):
                         }
                     },
                 },
-                'signal_decider_evaluations': {
-                    'status': 'blocked',
-                    'processed': 0,
-                    'total': 0,
-                    'succeeded': 0,
-                    'failed': 0,
-                    'remaining': 0,
-                    'source_run_ids': {},
-                    'details': {
-                        'result_summary': {
-                            'reason': 'declared_dependencies_incomplete',
-                            'incomplete_dependencies': ['signal_decider'],
-                        }
-                    },
-                },
             },
         }
         restart_reason = 'Core restarted during recovery.'
@@ -12940,13 +13219,6 @@ class PykrxBackfillServiceTests(TestCase):
             restart_checkpoint='during_plan',
         )
 
-    def test_pending_rearm_resumes_interrupted_evaluation_without_replay(
-        self,
-    ) -> None:
-        self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
-            restart_checkpoint='during_evaluation',
-        )
-
     def test_pending_rearm_post_signal_allows_attempt_eight_not_nine(
         self,
     ) -> None:
@@ -12995,7 +13267,6 @@ class PykrxBackfillServiceTests(TestCase):
                 'after_signal_completed_before_plan',
                 'next_open_execution_plan',
             ),
-            ('during_evaluation', 'signal_decider_evaluations'),
         ):
             with self.subTest(expiry_stage_id=expiry_stage_id):
                 self._assert_pending_rearm_retries_exact_signal_suffix_after_core_restart(
@@ -14470,6 +14741,21 @@ class PykrxBackfillServiceTests(TestCase):
             },
         }
 
+        for resolved_stage_ids in (stage_ids[:2], stage_ids):
+            resumable = deepcopy(interrupted_repair)
+            resumable['run_metadata']['resolved_stages'] = list(
+                resolved_stage_ids
+            )
+            resumable['stages'] = {
+                stage_ids[0]: deepcopy(
+                    interrupted_repair['stages'][stage_ids[0]]
+                )
+            }
+            self.assertTrue(
+                is_resumable_summary_cutoff_contract_repair(resumable),
+                resolved_stage_ids,
+            )
+
         self.assertFalse(
             is_resumable_summary_cutoff_contract_repair(
                 interrupted_repair
@@ -14658,6 +14944,11 @@ class PykrxBackfillServiceTests(TestCase):
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
                 'count_runs',
                 return_value=6,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'list_prior_followup_runs_for_lineage',
+                return_value=[],
             ),
             patch.object(
                 service,
@@ -15109,12 +15400,7 @@ class PykrxBackfillServiceTests(TestCase):
                 markets=('KOSPI', 'KOSDAQ'),
             )
 
-        expected_stages = [
-            'agent_feedback_summaries',
-            'signal_decider',
-            'next_open_execution_plan',
-            'signal_decider_evaluations',
-        ]
+        expected_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
         self.assertTrue(result['triggered'])
         self.assertEqual(
             result['reason'],
@@ -15394,6 +15680,19 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertTrue(
             _is_terminal_followup_continuation_candidate(claimed_run)
+        )
+
+        projected_claimed_run = deepcopy(claimed_run)
+        projected_claimed_run['run_metadata']['resolved_stages'].remove(
+            'signal_decider_evaluations'
+        )
+        projected_claimed_run['run_metadata']['stage_statuses'].pop(
+            'signal_decider_evaluations'
+        )
+        self.assertTrue(
+            _is_terminal_followup_continuation_candidate(
+                projected_claimed_run
+            )
         )
 
         malformed_completed_scope_proof = deepcopy(claimed_run)
@@ -17053,13 +17352,8 @@ class PykrxBackfillServiceTests(TestCase):
         )
 
     @patch('app.eod.pykrx_backfill.settings.openclaw_feedback_trigger_after_fundamentals_refresh', False)
-    @patch(
-        'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
-        return_value={'triggered': True, 'summary': {'not_computed_count': 0}},
-    )
     def test_run_collection_advances_exact_partial_cohorts_through_decider(
         self,
-        evaluation_followup,
     ) -> None:
         service = PykrxBackfillService()
         followup_order: list[str] = []
@@ -17445,7 +17739,7 @@ class PykrxBackfillServiceTests(TestCase):
             progress_callback=ANY,
             symbols=symbol_codes[2:3],
         )
-        evaluation_followup.assert_called_once_with(market_date='2026-04-03', enabled=True)
+        evaluation_followup.assert_not_called()
         self.assertEqual(
             result['factor_scoring_followup']['successful_stock_codes'],
             symbol_codes[2:3],
@@ -17482,10 +17776,7 @@ class PykrxBackfillServiceTests(TestCase):
             result['signal_decider_followup'],
             {'triggered': True, 'status': 'completed', 'decision_snapshots': 2},
         )
-        self.assertEqual(
-            result['signal_decider_evaluation_followup'],
-            {'triggered': True, 'status': 'completed', 'summary': {'computed_count': 4}},
-        )
+        self.assertNotIn('signal_decider_evaluation_followup', result)
 
     def test_primary_piotroski_partial_blocks_factors_and_signal_features(
         self,
@@ -18277,12 +18568,6 @@ class PykrxBackfillServiceTests(TestCase):
                     return_value={'triggered': False, 'reason': 'followup_disabled', 'market_date': '2026-04-03'},
                 )
             )
-            stack.enter_context(
-                patch(
-                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
-                    return_value={'triggered': True, 'status': 'completed', 'summary': {'computed_count': 4}},
-                )
-            )
             stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
 
             result = service._run_market_data_pipeline(
@@ -18321,7 +18606,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertIn('fundamentals_daily_refresh', fake_run_state_service.start_runs[0]['resolved_stages'])
         self.assertIn('momentum_factors', fake_run_state_service.start_runs[0]['resolved_stages'])
         self.assertIn('signal_decider', fake_run_state_service.start_runs[0]['resolved_stages'])
-        self.assertIn('signal_decider_evaluations', fake_run_state_service.start_runs[0]['resolved_stages'])
+        self.assertNotIn('signal_decider_evaluations', fake_run_state_service.start_runs[0]['resolved_stages'])
         stage_statuses = {
             (item['stage_id'], item['status'])
             for item in fake_run_state_service.stage_updates
@@ -18338,7 +18623,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertIn(('intraday_snapshots', 'running'), stage_statuses)
         self.assertIn(('intraday_snapshots', 'completed'), stage_statuses)
         self.assertIn(('signal_decider', 'blocked'), stage_statuses)
-        self.assertIn(('signal_decider_evaluations', 'blocked'), stage_statuses)
+        self.assertNotIn(('signal_decider_evaluations', 'blocked'), stage_statuses)
         factor_failure_update = next(
             item
             for item in fake_run_state_service.stage_updates
@@ -19245,11 +19530,7 @@ class PykrxBackfillServiceTests(TestCase):
 
         run_pipeline.assert_not_called()
 
-    @patch(
-        'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
-        return_value={'triggered': True, 'summary': {'not_computed_count': 0}},
-    )
-    def test_run_collection_skips_fundamentals_followup_when_dart_is_not_configured(self, evaluation_followup) -> None:
+    def test_run_collection_skips_fundamentals_followup_when_dart_is_not_configured(self) -> None:
         service = PykrxBackfillService()
 
         with ExitStack() as stack:
@@ -19356,12 +19637,6 @@ class PykrxBackfillServiceTests(TestCase):
             fundamentals_refresh = stack.enter_context(
                 patch('app.eod.pykrx_backfill.dart_fundamentals_capture_service.run_daily_incremental_refresh')
             )
-            evaluation_followup = stack.enter_context(
-                patch(
-                    'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_evaluation_followup',
-                    return_value={'triggered': True, 'status': 'warning', 'summary': {'not_computed_count': 1}},
-                )
-            )
             signal_decider_followup = stack.enter_context(
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_signal_decider_followup',
@@ -19428,7 +19703,6 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertIn('external_news_followup', result)
         signal_decider_followup.assert_not_called()
-        evaluation_followup.assert_not_called()
         self.assertEqual(
             result['signal_decider_followup'],
             {
@@ -19440,17 +19714,7 @@ class PykrxBackfillServiceTests(TestCase):
                 'stage': 'signal_decider',
             },
         )
-        self.assertEqual(
-            result['signal_decider_evaluation_followup'],
-            {
-                'triggered': False,
-                'status': 'blocked',
-                'reason': 'factor_scoring_followup_incomplete',
-                'market_date': '2026-04-03',
-                'upstream_status': 'blocked',
-                'stage': 'signal_decider_evaluations',
-            },
-        )
+        self.assertNotIn('signal_decider_evaluation_followup', result)
         fundamentals_refresh.assert_not_called()
 
     def test_run_market_data_pipeline_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:
@@ -20051,7 +20315,6 @@ class PykrxBackfillServiceTests(TestCase):
             'feedback_followup',
             'signal_decider_followup',
             'next_open_execution_plan_followup',
-            'signal_decider_evaluation_followup',
         ):
             self.assertEqual(result[result_key]['status'], 'blocked')
             self.assertEqual(
@@ -22510,13 +22773,6 @@ class PykrxBackfillServiceTests(TestCase):
                         return_value={'status': 'completed'},
                     )
                 ),
-                stack.enter_context(
-                    patch(
-                        'app.eod.pykrx_pipeline_runner.'
-                        '_run_daily_signal_decider_evaluation_followup',
-                        return_value={'status': 'completed'},
-                    )
-                ),
             ]
             complete_run = stack.enter_context(
                 patch('app.eod.pykrx_backfill.complete_eod_collection_run')
@@ -22565,7 +22821,6 @@ class PykrxBackfillServiceTests(TestCase):
             'feedback_followup',
             'signal_decider_followup',
             'next_open_execution_plan_followup',
-            'signal_decider_evaluation_followup',
         )
         for result_key in result_keys:
             self.assertEqual(result[result_key]['status'], 'blocked')

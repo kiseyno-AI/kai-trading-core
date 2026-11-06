@@ -148,7 +148,6 @@ AUTO_DAILY_FOLLOWUP_STAGE_ORDER: tuple[str, ...] = (
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
-    'signal_decider_evaluations',
 )
 AUTO_DAILY_TRACKED_STAGE_ORDER: tuple[str, ...] = (
     'price_collection',
@@ -6470,15 +6469,6 @@ def run_market_data_pipeline(
                 'next_open_execution_plan',
                 result['next_open_execution_plan_followup'],
             )
-            result['signal_decider_evaluation_followup'] = (
-                build_downstream_recovery_pending_result(
-                    'signal_decider_evaluations'
-                )
-            )
-            record_followup_result(
-                'signal_decider_evaluations',
-                result['signal_decider_evaluation_followup'],
-            )
         elif (
             point_in_time_recovery
             and chain_fundamentals_followup
@@ -6679,28 +6669,19 @@ def run_market_data_pipeline(
                         enabled=True,
                     ),
                 )
-                result['signal_decider_evaluation_followup'] = run_followup_stage(
-                    'signal_decider_evaluations',
-                    activity='Evaluating point-in-time recovery deciders',
-                    call=lambda: _run_daily_signal_decider_evaluation_followup(
-                        market_date=latest_trade_date,
-                        enabled=True,
+            else:
+                stage_result = build_blocked_followup_result(
+                    'next_open_execution_plan',
+                    'signal_decider_followup_incomplete',
+                    upstream_status=_resolve_result_status(
+                        result['signal_decider_followup']
                     ),
                 )
-            else:
-                for result_key, stage_id in (
-                    ('next_open_execution_plan_followup', 'next_open_execution_plan'),
-                    ('signal_decider_evaluation_followup', 'signal_decider_evaluations'),
-                ):
-                    stage_result = build_blocked_followup_result(
-                        stage_id,
-                        'signal_decider_followup_incomplete',
-                        upstream_status=_resolve_result_status(
-                            result['signal_decider_followup']
-                        ),
-                    )
-                    result[result_key] = stage_result
-                    record_followup_result(stage_id, stage_result)
+                result['next_open_execution_plan_followup'] = stage_result
+                record_followup_result(
+                    'next_open_execution_plan',
+                    stage_result,
+                )
         elif should_chain_fundamentals:
             fundamentals_refresh_kwargs = (
                 _build_daily_fundamentals_refresh_kwargs(
@@ -7004,14 +6985,6 @@ def run_market_data_pipeline(
                             enabled=True,
                         ),
                     )
-                    result['signal_decider_evaluation_followup'] = run_followup_stage(
-                        'signal_decider_evaluations',
-                        activity='Running signal-decider evaluation follow-up',
-                        call=lambda: _run_daily_signal_decider_evaluation_followup(
-                            market_date=latest_trade_date,
-                            enabled=True,
-                        ),
-                    )
                 else:
                     result['next_open_execution_plan_followup'] = build_blocked_followup_result(
                         'next_open_execution_plan',
@@ -7021,15 +6994,6 @@ def run_market_data_pipeline(
                     record_followup_result(
                         'next_open_execution_plan',
                         result['next_open_execution_plan_followup'],
-                    )
-                    result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
-                        'signal_decider_evaluations',
-                        'signal_decider_followup_incomplete',
-                        upstream_status=signal_decider_status,
-                    )
-                    record_followup_result(
-                        'signal_decider_evaluations',
-                        result['signal_decider_evaluation_followup'],
                     )
             else:
                 downstream_reason = (
@@ -7062,15 +7026,6 @@ def run_market_data_pipeline(
                 record_followup_result(
                     'next_open_execution_plan',
                     result['next_open_execution_plan_followup'],
-                )
-                result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
-                    'signal_decider_evaluations',
-                    downstream_reason,
-                    upstream_status=downstream_status,
-                )
-                record_followup_result(
-                    'signal_decider_evaluations',
-                    result['signal_decider_evaluation_followup'],
                 )
         elif (
             chain_fundamentals_followup
@@ -7157,15 +7112,6 @@ def run_market_data_pipeline(
             record_followup_result(
                 'next_open_execution_plan',
                 result['next_open_execution_plan_followup'],
-            )
-            result['signal_decider_evaluation_followup'] = build_blocked_followup_result(
-                'signal_decider_evaluations',
-                'factor_scoring_followup_incomplete',
-                upstream_status='blocked',
-            )
-            record_followup_result(
-                'signal_decider_evaluations',
-                result['signal_decider_evaluation_followup'],
             )
     except Exception as exc:
         daily_pipeline_tracker.finish_run_preserving_primary_error(

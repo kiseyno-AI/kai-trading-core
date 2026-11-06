@@ -8,9 +8,12 @@ from app.agent_context.run_modes import (
 )
 
 
-LEGACY_CUTOFF_REPAIR_STAGE_IDS = (
+CUTOFF_REPAIR_STAGE_IDS = (
     'signal_decider',
     'next_open_execution_plan',
+)
+LEGACY_CUTOFF_REPAIR_STAGE_IDS = (
+    *CUTOFF_REPAIR_STAGE_IDS,
     'signal_decider_evaluations',
 )
 SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION = 1
@@ -29,6 +32,24 @@ def normalize_symbol_codes(symbols: Sequence[object]) -> list[str]:
             normalized = normalized.zfill(6)
         deduped.setdefault(normalized, None)
     return list(deduped)
+
+
+def resolved_cutoff_repair_stage_ids(
+    resolved_stages: object,
+) -> tuple[str, ...] | None:
+    """Resolve only the current or persisted legacy repair contract."""
+
+    if not isinstance(resolved_stages, (list, tuple)):
+        return None
+    normalized = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stages
+    )
+    if normalized in {
+        CUTOFF_REPAIR_STAGE_IDS,
+        LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    }:
+        return normalized
+    return None
 
 
 def stage_result_summary(stage: object) -> Mapping[str, Any]:
@@ -378,21 +399,22 @@ def is_resumable_summary_cutoff_contract_repair(
         or proof_symbols != normalize_symbol_codes(proof_symbols)
     ):
         return False
-    resolved_stages = metadata.get('resolved_stages')
+    resolved_stages = resolved_cutoff_repair_stage_ids(
+        metadata.get('resolved_stages')
+    )
     persisted_stage_ids = set(stages)
     valid_stage_prefixes = {
         frozenset(),
-        frozenset(LEGACY_CUTOFF_REPAIR_STAGE_IDS[:1]),
+        frozenset(CUTOFF_REPAIR_STAGE_IDS[:1]),
     }
     if not (
-        isinstance(resolved_stages, (list, tuple))
-        and tuple(resolved_stages) == LEGACY_CUTOFF_REPAIR_STAGE_IDS
+        resolved_stages is not None
         and frozenset(persisted_stage_ids) in valid_stage_prefixes
     ):
         return False
     current_stage = str(pipeline_run.get('current_stage') or '').strip()
     expected_current_stage = (
-        LEGACY_CUTOFF_REPAIR_STAGE_IDS[len(persisted_stage_ids) - 1]
+        resolved_stages[len(persisted_stage_ids) - 1]
         if persisted_stage_ids
         else ''
     )

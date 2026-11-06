@@ -261,6 +261,9 @@ def _terminal_decider_completion_scope_proof(
         'knowledge_cutoff_at': '2026-10-07T08:00:00+00:00',
         'admitted_symbols': list(symbols),
         'completed_symbols': list(symbols),
+        'completed_symbols_by_role': {
+            role: list(symbols) for role in DECISION_SUPPORT_AGENT_NAMES
+        },
         'failed_symbols_by_role': {
             role: [] for role in DECISION_SUPPORT_AGENT_NAMES
         },
@@ -3110,6 +3113,103 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'partial',
         )
 
+    def test_evaluation_maintenance_state_does_not_gate_daily_readiness(
+        self,
+    ) -> None:
+        for evaluation_status in ('pending', 'running', 'failed'):
+            with self.subTest(evaluation_status=evaluation_status):
+                stages = {
+                    'next_open_execution_plan': {
+                        'task': 'next_open_execution_plan',
+                        'status': 'completed',
+                        'processed': 2,
+                        'total': 2,
+                        'succeeded': 2,
+                        'failed': 0,
+                        'remaining': 0,
+                        'details': {},
+                    },
+                    'signal_decider_evaluations': {
+                        'task': 'signal_decider_evaluations',
+                        'status': evaluation_status,
+                        'gate_status': 'blocked',
+                        'blocking_status': 'blocking',
+                        'details': {
+                            'gate_reason': 'historical_evaluation_incomplete',
+                        },
+                    },
+                }
+
+                self.assertEqual(
+                    EODPipelineStatusService._resolve_overall_status(stages),
+                    'completed',
+                )
+                self.assertEqual(
+                    EODPipelineStatusService._build_stage_summary(
+                        stages=stages,
+                    ),
+                    {
+                        'total_stages': 1,
+                        'completed_stages': 1,
+                        'skipped_stages': 0,
+                        'display_completed_stages': 1,
+                        'partial_stages': 0,
+                        'failed_stages': 0,
+                        'blocked_stages': 0,
+                        'running_stages': 0,
+                        'pending_stages': 0,
+                        'stage_status_counts': {'completed': 1},
+                        'current_stage': None,
+                        'current_stage_status': None,
+                    },
+                )
+                self.assertEqual(
+                    EODPipelineStatusService._build_gate_summary(
+                        stages=stages,
+                    )['status'],
+                    None,
+                )
+
+    def test_legacy_full_chain_evaluation_tail_is_not_active_execution(
+        self,
+    ) -> None:
+        for run_status in ('running', 'interrupted'):
+            with self.subTest(run_status=run_status):
+                self.assertFalse(
+                    EODPipelineStatusService
+                    ._official_run_tracks_execution_stage(
+                        {
+                            'status': run_status,
+                            'current_stage': (
+                                'signal_decider_evaluations'
+                            ),
+                            'run_metadata': {
+                                'requested_stages': [
+                                    'signal_decider',
+                                    'next_open_execution_plan',
+                                    'signal_decider_evaluations',
+                                ],
+                                'resolved_stages': [
+                                    'signal_decider',
+                                    'next_open_execution_plan',
+                                    'signal_decider_evaluations',
+                                ],
+                            },
+                            'stages': {
+                                'signal_decider': {
+                                    'status': 'completed'
+                                },
+                                'next_open_execution_plan': {
+                                    'status': 'completed'
+                                },
+                                'signal_decider_evaluations': {
+                                    'status': run_status
+                                },
+                            },
+                        }
+                    )
+                )
+
     def test_completed_stage_with_blocked_gate_makes_mixed_pipeline_partial(self) -> None:
         stages = {
             'technical_snapshots': {
@@ -4432,9 +4532,13 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
         self.assertEqual(result['market_date'], '2026-04-21')
         self.assertEqual(result['status'], 'pending')
-        self.assertEqual(result['total_stages'], 27)
+        self.assertEqual(result['total_stages'], 26)
+        self.assertEqual(
+            result['maintenance_stage_order'],
+            ['signal_decider_evaluations'],
+        )
         self.assertEqual(result['completed_stages'], 0)
-        self.assertEqual(result['pending_stages'], 27)
+        self.assertEqual(result['pending_stages'], 26)
         self.assertEqual(result['current_stage'], 'master_refresh')
         self.assertEqual(result['stages']['price_collection']['status'], 'pending')
         self.assertEqual(result['stages']['price_collection']['order'], 3)
@@ -4575,7 +4679,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'running')
-        self.assertEqual(result['total_stages'], 27)
+        self.assertEqual(result['total_stages'], 26)
         self.assertEqual(result['running_stages'], 1)
         self.assertEqual(result['current_stage'], 'market_risk_filter')
         self.assertEqual(result['official_run']['id'], 501)
@@ -4856,15 +4960,16 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(
-            result['current_stage'],
-            'signal_decider_evaluations',
-        )
-        self.assertEqual(result['current_stage_status'], 'partial')
-        self.assertEqual(result['partial_stages'], 1)
+        self.assertEqual(result['current_stage'], 'price_collection')
+        self.assertEqual(result['current_stage_status'], 'pending')
+        self.assertEqual(result['partial_stages'], 0)
         self.assertNotIn('warning', result['stage_status_counts'])
         stage = result['stages']['signal_decider_evaluations']
         self.assertEqual(stage['status'], 'partial')
+        self.assertEqual(
+            result['maintenance_stages']['signal_decider_evaluations'],
+            stage,
+        )
         self.assertEqual(stage['completed_at'], '2026-06-05T07:08:00+00:00')
         self.assertEqual(stage['details']['progress_source'], 'auto_eod_stage_progress')
         self.assertEqual(
@@ -5551,9 +5656,9 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         self.assertIsNone(result['official_run'])
-        self.assertEqual(result['status'], 'running')
-        self.assertEqual(result['running_stages'], 1)
-        self.assertEqual(result['current_stage'], 'signal_decider_evaluations')
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['running_stages'], 0)
+        self.assertNotEqual(result['current_stage'], 'signal_decider_evaluations')
         stage = result['stages']['signal_decider_evaluations']
         self.assertEqual(stage['status'], 'running')
         self.assertEqual(stage['processed'], 14)
@@ -5565,6 +5670,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(stage['details']['progress_source'], 'live_run_metadata')
         self.assertEqual(stage['details']['last_progress_at'], '2026-06-05T07:06:00+00:00')
         self.assertEqual(stage['details']['stale_running_threshold_minutes'], 30)
+        self.assertEqual(
+            result['maintenance_stages']['signal_decider_evaluations'],
+            stage,
+        )
 
     def test_read_downgrades_failed_pykrx_stage_when_progress_row_was_left_running(self):
         pykrx_run = {
@@ -5775,8 +5884,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 'agent_feedback_summaries',
                 'signal_decider',
                 'next_open_execution_plan',
-                'signal_decider_evaluations',
             ],
+        )
+        self.assertEqual(
+            result['maintenance_stage_order'],
+            ['signal_decider_evaluations'],
+        )
+        self.assertIn(
+            'signal_decider_evaluations',
+            result['maintenance_stages'],
         )
 
     def test_read_keeps_blocked_factor_stage_pending_when_stored_rows_exist_before_fundamentals(self):
@@ -6812,11 +6928,11 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read()
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['total_stages'], 27)
+        self.assertEqual(result['total_stages'], 26)
         self.assertEqual(result['stage_status_counts']['completed'], 16)
         self.assertEqual(result['skipped_stages'], 2)
         self.assertEqual(result['partial_stages'], 0)
-        self.assertEqual(result['pending_stages'], 9)
+        self.assertEqual(result['pending_stages'], 8)
         self.assertEqual(result['current_stage'], 'signal_features')
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(result['stages']['pykrx_universe_refresh']['status'], 'skipped')
@@ -6920,6 +7036,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 },
             },
         }
+        unbound_next_open_history = _completed_next_open_history_stage(
+            run_id=8,
+            market_date=market_date,
+            total=114,
+        )
+        unbound_next_open_history['stage']['details'].pop(
+            'completion_scope_proof',
+            None,
+        )
         service = EODPipelineStatusService(
             market_state_loader=lambda: _FakeMarketState(),
             pykrx_run_loader=lambda **_: pykrx_run,
@@ -6943,11 +7068,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     market_date=market_date,
                     total=570,
                 ),
-                'next_open_execution_plan': _completed_next_open_history_stage(
-                    run_id=8,
-                    market_date=market_date,
-                    total=114,
-                ),
+                'next_open_execution_plan': unbound_next_open_history,
             },
             signal_feature_counts_loader=lambda **_: {
                 'persisted': 2823,
@@ -6974,12 +7095,12 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         result = service.read(market_date=market_date)
 
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['total_stages'], 27)
+        self.assertEqual(result['total_stages'], 26)
         self.assertEqual(result['completed_stages'], 16)
         self.assertEqual(result['skipped_stages'], 2)
         self.assertEqual(result['display_completed_stages'], 18)
-        self.assertEqual(result['pending_stages'], 6)
-        self.assertEqual(result['partial_stages'], 2)
+        self.assertEqual(result['pending_stages'], 7)
+        self.assertEqual(result['partial_stages'], 1)
         self.assertEqual(result['running_stages'], 0)
         self.assertEqual(result['current_stage'], 'signal_features')
         self.assertEqual(result['current_stage_status'], 'partial')
@@ -7009,13 +7130,13 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['signal_decider']['details']['decision_snapshots'], 228)
         self.assertEqual(
             result['stages']['next_open_execution_plan']['status'],
-            'blocked',
+            'pending',
         )
         self.assertEqual(
             result['stages']['next_open_execution_plan']['details'][
-                'status_repair_reason'
+                'reason'
             ],
-            'signal_decider_completion_proof_unavailable_or_mismatched',
+            'Pending next-open execution plan refresh',
         )
         self.assertEqual(
             result['stages']['signal_decider_evaluations']['status'],
@@ -7119,14 +7240,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 self.assertEqual(stage['details']['features_failed'], 2)
                 self.assertTrue(stage['details']['historical_stage_state'])
                 self.assertEqual(stage['details']['progress_source'], 'official_stage_history')
-                self.assertEqual(
-                    result['current_stage'],
-                    (
-                        'signal_features'
-                        if official_status == 'partial'
-                        else 'signal_decider_evaluations'
-                    ),
-                )
+                self.assertEqual(result['current_stage'], 'signal_features')
                 self.assertEqual(
                     result['stages']['signal_decider_evaluations']['status'],
                     'partial',

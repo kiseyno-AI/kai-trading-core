@@ -235,6 +235,17 @@ TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
+)
+LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES = (
+    *TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+    'signal_decider_evaluations',
+)
+SIGNAL_DECIDER_RECOVERY_STAGES = (
+    'signal_decider',
+    'next_open_execution_plan',
+)
+LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES = (
+    *SIGNAL_DECIDER_RECOVERY_STAGES,
     'signal_decider_evaluations',
 )
 CURRENT_FEEDBACK_ORDERING_PREREQUISITE_STAGES = (
@@ -251,6 +262,109 @@ PYKRX_STAGE_SEQUENCE = (
     'signal_features',
     'market_risk_filter',
 )
+
+
+def _resolved_terminal_followup_continuation_stages(
+    resolved_stages: object,
+) -> tuple[str, ...] | None:
+    if not isinstance(resolved_stages, (list, tuple)):
+        return None
+    normalized = tuple(str(stage_id or '').strip() for stage_id in resolved_stages)
+    if not normalized or any(not stage_id for stage_id in normalized):
+        return None
+    for stage_order in (
+        LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+        TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+    ):
+        if normalized[-len(stage_order) :] == stage_order:
+            return stage_order
+    return None
+
+
+def _resolved_signal_decider_recovery_stages(
+    resolved_stages: object,
+) -> tuple[str, ...] | None:
+    if not isinstance(resolved_stages, (list, tuple)):
+        return None
+    normalized = tuple(str(stage_id or '').strip() for stage_id in resolved_stages)
+    if normalized == LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES:
+        return LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES
+    if normalized == SIGNAL_DECIDER_RECOVERY_STAGES:
+        return SIGNAL_DECIDER_RECOVERY_STAGES
+    return None
+
+
+def _legacy_signal_suffix_projection(
+    pipeline_run: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(pipeline_run, Mapping):
+        return None
+    metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    if not (
+        isinstance(metadata, Mapping)
+        and isinstance(stages, Mapping)
+        and tuple(metadata.get('resolved_stages') or ())
+        == LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES
+        and str(pipeline_run.get('current_stage') or '').strip()
+        == LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES[-1]
+        and set(stages) == set(LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES)
+    ):
+        return None
+    projected_metadata = dict(metadata)
+    projected_metadata['resolved_stages'] = list(
+        SIGNAL_DECIDER_RECOVERY_STAGES
+    )
+    return {
+        **dict(pipeline_run),
+        'current_stage': SIGNAL_DECIDER_RECOVERY_STAGES[-1],
+        'run_metadata': projected_metadata,
+        'stages': {
+            stage_id: stages[stage_id]
+            for stage_id in SIGNAL_DECIDER_RECOVERY_STAGES
+        },
+    }
+
+
+def _is_recoverable_same_day_intraday_watch_expiration_compatible(
+    pipeline_run: Mapping[str, Any] | None,
+    *,
+    current_market_date: date | str,
+) -> bool:
+    if is_recoverable_same_day_intraday_watch_expiration(
+        pipeline_run,
+        current_market_date=current_market_date,
+    ):
+        return True
+    projected_run = _legacy_signal_suffix_projection(pipeline_run)
+    if projected_run is None:
+        return False
+    return is_recoverable_same_day_intraday_watch_expiration(
+        projected_run,
+        current_market_date=current_market_date,
+    )
+
+
+def _is_canonical_same_day_signal_rearm_proof_compatible(
+    pipeline_run: Mapping[str, Any] | None,
+    *,
+    expected_eod_collection_run_id: int | None = None,
+) -> bool:
+    if is_canonical_same_day_signal_rearm_proof(
+        pipeline_run,
+        expected_eod_collection_run_id=expected_eod_collection_run_id,
+    ):
+        return True
+    projected_run = _legacy_signal_suffix_projection(pipeline_run)
+    return bool(
+        projected_run is not None
+        and is_canonical_same_day_signal_rearm_proof(
+            projected_run,
+            expected_eod_collection_run_id=(
+                expected_eod_collection_run_id
+            ),
+        )
+    )
 
 
 def _log_pykrx_fetch(operation: str, status: str, **fields) -> None:
@@ -629,11 +743,7 @@ def _is_retired_decider_cutoff_zero_work_run(
     if not isinstance(metadata, Mapping) or not isinstance(stages, Mapping):
         return False
     cutoff = metadata.get('feedback_knowledge_cutoff')
-    expected_stage_ids = (
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
-    )
+    expected_stage_ids = LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES
     if not (
         str(pipeline_run.get('trigger') or '').strip()
         == AUTO_FOLLOWUP_RECOVERY_TRIGGER
@@ -748,10 +858,8 @@ def _is_transparent_core_restart_signal_suffix_run(
     stages = pipeline_run.get('stages')
     if not isinstance(metadata, Mapping) or not isinstance(stages, Mapping):
         return False
-    expected_stage_ids = (
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
+    expected_stage_ids = _resolved_signal_decider_recovery_stages(
+        metadata.get('resolved_stages')
     )
     interruption_reason = str(
         metadata.get('interrupted_reason') or ''
@@ -761,8 +869,7 @@ def _is_transparent_core_restart_signal_suffix_run(
         == AUTO_FOLLOWUP_RECOVERY_TRIGGER
         and str(pipeline_run.get('status') or '').strip().lower()
         == 'interrupted'
-        and tuple(metadata.get('resolved_stages') or ())
-        == expected_stage_ids
+        and expected_stage_ids is not None
         and str(metadata.get('resume_from_stage') or '').strip()
         == 'signal_decider'
         and type(metadata.get('reused_eod_collection_run_id')) is int
@@ -842,8 +949,8 @@ def _is_resumable_same_day_intraday_watch_post_signal_restart(
     """Recognize one admitted PITR run whose signal result is already durable.
 
     This shape must be resumed in place.  Starting another signal suffix would
-    replay a completed decision, while starting only the remaining stages would
-    lose the exact three-stage recovery contract used to clear the durable EOD
+    replay a completed decision, while starting only the remaining stage would
+    lose the exact persisted recovery contract used to clear the durable EOD
     marker.
     """
 
@@ -851,7 +958,9 @@ def _is_resumable_same_day_intraday_watch_post_signal_restart(
         return False
     metadata = pipeline_run.get('run_metadata')
     stages = pipeline_run.get('stages')
-    expected_stage_ids = AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+    expected_stage_ids = _resolved_signal_decider_recovery_stages(
+        (metadata or {}).get('resolved_stages')
+    )
     interruption_reason = str(
         (metadata or {}).get('interrupted_reason') or ''
     ).strip()
@@ -859,13 +968,12 @@ def _is_resumable_same_day_intraday_watch_post_signal_restart(
         isinstance(metadata, Mapping)
         and isinstance(stages, Mapping)
         and bool(stages)
+        and expected_stage_ids is not None
         and set(stages).issubset(set(expected_stage_ids))
         and str(pipeline_run.get('trigger') or '').strip()
         == AUTO_FOLLOWUP_RECOVERY_TRIGGER
         and str(pipeline_run.get('status') or '').strip().lower()
         == 'interrupted'
-        and tuple(metadata.get('resolved_stages') or ())
-        == expected_stage_ids
         and str(metadata.get('resume_from_stage') or '').strip()
         == expected_stage_ids[0]
         and type(metadata.get('reused_eod_collection_run_id')) is int
@@ -1007,7 +1115,7 @@ def _select_prior_signal_rearm_evidence(
 
     recoverable_same_day_expiration = bool(
         current_market_date is not None
-        and is_recoverable_same_day_intraday_watch_expiration(
+        and _is_recoverable_same_day_intraday_watch_expiration_compatible(
             current_pipeline_run,
             current_market_date=current_market_date,
         )
@@ -1110,7 +1218,7 @@ def _select_prior_signal_rearm_evidence(
             continue
         prior_is_same_day_expiration = bool(
             current_market_date is not None
-            and is_recoverable_same_day_intraday_watch_expiration(
+            and _is_recoverable_same_day_intraday_watch_expiration_compatible(
                 prior_run,
                 current_market_date=current_market_date,
             )
@@ -1216,6 +1324,15 @@ def _is_terminal_followup_continuation_candidate(
     run_metadata = pipeline_run.get('run_metadata')
     if not isinstance(run_metadata, Mapping):
         return False
+    continuation_stages = _resolved_terminal_followup_continuation_stages(
+        run_metadata.get('resolved_stages')
+    )
+    if continuation_stages is None:
+        return False
+    legacy_continuation = (
+        continuation_stages
+        == LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+    )
     try:
         continuation_count = int(
             run_metadata.get('terminal_continuation_count') or 0
@@ -1231,6 +1348,8 @@ def _is_terminal_followup_continuation_candidate(
 
     terminal_evidence: Mapping[str, Any] | None = None
     evidence_suffix: Mapping[str, Any] | None = None
+    archived_continuation_stages = continuation_stages
+    archived_legacy_continuation = legacy_continuation
     if (
         pipeline_status in {'blocked', 'partial'}
         and continuation_count == 0
@@ -1253,6 +1372,32 @@ def _is_terminal_followup_continuation_candidate(
             if isinstance(terminal_evidence, Mapping)
             and isinstance(terminal_evidence.get('suffix_stages'), Mapping)
             else None
+        )
+        if isinstance(evidence_suffix, Mapping):
+            evidence_stage_ids = set(evidence_suffix)
+            if evidence_stage_ids == set(
+                LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            ):
+                archived_continuation_stages = (
+                    LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                )
+            elif evidence_stage_ids == set(
+                TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            ):
+                archived_continuation_stages = (
+                    TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+                )
+            else:
+                return False
+        if (
+            legacy_continuation
+            and archived_continuation_stages
+            != LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+        ):
+            return False
+        archived_legacy_continuation = (
+            archived_continuation_stages
+            == LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES
         )
         parent_evidence = (
             terminal_evidence.get('parent')
@@ -1323,7 +1468,7 @@ def _is_terminal_followup_continuation_candidate(
             ).strip()
             == 'summary_knowledge_cutoff_repair'
             and str(run_metadata.get('resume_from_stage') or '').strip()
-            == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            == continuation_stages[0]
             and _parse_activity_datetime(
                 run_metadata.get('terminal_continuation_claimed_at')
             )
@@ -1331,10 +1476,10 @@ def _is_terminal_followup_continuation_candidate(
             and str(parent_evidence.get('status') or '').strip().lower()
             == 'blocked'
             and str(parent_evidence.get('current_stage') or '').strip()
-            == 'signal_decider_evaluations'
+            == archived_continuation_stages[-1]
             and isinstance(evidence_suffix, Mapping)
             and set(evidence_suffix)
-            == set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            == set(archived_continuation_stages)
             and evidence_int(
                 lineage_evidence.get('reused_eod_collection_run_id')
             )
@@ -1403,21 +1548,27 @@ def _is_terminal_followup_continuation_candidate(
         for stage_id in raw_resolved_stages
         if str(stage_id or '').strip()
     ]
+    live_stage_ids = set(stages)
+    expected_live_stage_ids = set(resolved_stages)
+    if archived_legacy_continuation:
+        # The active contract no longer advertises evaluation, but an older
+        # claimed row is deliberately retained in storage for audit.  A fresh
+        # reload therefore contains that one retired row even though it is not
+        # executable or part of readiness.
+        expected_live_stage_ids.add('signal_decider_evaluations')
     if (
         len(resolved_stages) != len(raw_resolved_stages)
         or len(resolved_stages) != len(set(resolved_stages))
-        or tuple(
-            resolved_stages[-len(TERMINAL_FOLLOWUP_CONTINUATION_STAGES) :]
-        )
-        != TERMINAL_FOLLOWUP_CONTINUATION_STAGES
-        or set(stages) != set(resolved_stages)
+        or tuple(resolved_stages[-len(continuation_stages) :])
+        != continuation_stages
+        or live_stage_ids != expected_live_stage_ids
     ):
         return False
     stage_statuses = run_metadata.get('stage_statuses')
     if not isinstance(stage_statuses, Mapping):
         return False
     suffix_start_index = len(resolved_stages) - len(
-        TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+        continuation_stages
     )
     if any(
         str(stage_statuses.get(stage_id) or '').strip().lower()
@@ -1452,7 +1603,7 @@ def _is_terminal_followup_continuation_candidate(
             )
 
         satisfied_prefix: list[str] = []
-        for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+        for stage_id in continuation_stages:
             live_stage = stages.get(stage_id)
             if not (
                 isinstance(live_stage, Mapping)
@@ -1469,12 +1620,12 @@ def _is_terminal_followup_continuation_candidate(
             satisfied_prefix.append(stage_id)
 
         if len(satisfied_prefix) == len(
-            TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            continuation_stages
         ):
             return False
         metadata_prefix_size = 0
         metadata_pending_seen = False
-        for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+        for stage_id in continuation_stages:
             persisted_status = str(
                 stage_statuses.get(stage_id) or ''
             ).strip().lower()
@@ -1495,7 +1646,7 @@ def _is_terminal_followup_continuation_candidate(
         if metadata_prefix_size > len(satisfied_prefix):
             return False
         first_unfinished_index = len(satisfied_prefix)
-        first_unfinished_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[
+        first_unfinished_stage = continuation_stages[
             first_unfinished_index
         ]
         first_unfinished = stages.get(first_unfinished_stage)
@@ -1558,7 +1709,7 @@ def _is_terminal_followup_continuation_candidate(
             first_unfinished_is_valid = False
         if not first_unfinished_is_valid or any(
             not untouched_claim_stage(stages.get(stage_id))
-            for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES[
+            for stage_id in continuation_stages[
                 first_unfinished_index + 1 :
             ]
         ):
@@ -1632,26 +1783,27 @@ def _is_terminal_followup_continuation_candidate(
     ):
         return False
 
-    evaluations = terminal_stages.get('signal_decider_evaluations')
-    if not isinstance(evaluations, Mapping) or str(
-        evaluations.get('status') or ''
-    ).strip().lower() != 'blocked':
-        return False
-    evaluation_summary = _stage_result_summary(evaluations)
-    if (
-        str(evaluation_summary.get('reason') or '').strip()
-        != 'declared_dependencies_incomplete'
-        or str(evaluation_summary.get('status') or '')
-        .strip()
-        .lower()
-        != 'blocked'
-        or evaluation_summary.get('triggered') is not False
-        or evaluation_summary.get('incomplete_dependencies')
-        != ['signal_decider']
-    ):
-        return False
+    if archived_legacy_continuation:
+        evaluations = terminal_stages.get('signal_decider_evaluations')
+        if not isinstance(evaluations, Mapping) or str(
+            evaluations.get('status') or ''
+        ).strip().lower() != 'blocked':
+            return False
+        evaluation_summary = _stage_result_summary(evaluations)
+        if (
+            str(evaluation_summary.get('reason') or '').strip()
+            != 'declared_dependencies_incomplete'
+            or str(evaluation_summary.get('status') or '')
+            .strip()
+            .lower()
+            != 'blocked'
+            or evaluation_summary.get('triggered') is not False
+            or evaluation_summary.get('incomplete_dependencies')
+            != ['signal_decider']
+        ):
+            return False
 
-    allowed_incomplete = set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    allowed_incomplete = set(continuation_stages)
     for stage_id in resolved_stages:
         if stage_id in allowed_incomplete:
             continue
@@ -3743,6 +3895,9 @@ def _validated_followup_stage_debt_terminal_progression_result(
     pipeline_run_id = result.get('pipeline_run_id')
     pipeline_run = result.get('pipeline_run')
     resolved_stages = result.get('resolved_stages')
+    validated_resolved_stages = (
+        _resolved_terminal_followup_continuation_stages(resolved_stages)
+    )
     normalized_cohort = sorted(_dedupe_symbol_codes(cohort_symbols))
     if (
         not normalized_cohort
@@ -3752,7 +3907,8 @@ def _validated_followup_stage_debt_terminal_progression_result(
         or not isinstance(pipeline_run, Mapping)
         or pipeline_run.get('id') != pipeline_run_id
         or str(result.get('market_date') or '').strip() != market_date
-        or resolved_stages != list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+        or validated_resolved_stages is None
+        or resolved_stages != list(validated_resolved_stages)
     ):
         return None
     run_metadata = pipeline_run.get('run_metadata')
@@ -3761,7 +3917,7 @@ def _validated_followup_stage_debt_terminal_progression_result(
         and run_metadata.get('reused_eod_collection_run_id')
         == eod_collection_run_id
         and run_metadata.get('resolved_stages')
-        == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+        == list(validated_resolved_stages)
         and sorted(
             _dedupe_symbol_codes(run_metadata.get('symbols') or [])
         )
@@ -4789,16 +4945,26 @@ def _is_exact_signal_decider_retry_suffix(
         Mapping,
     ):
         return False
-    expected_stages = (
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
-    )
     resolved_stages = tuple(run_metadata.get('resolved_stages') or ())
     resume_from_stage = str(
         run_metadata.get('resume_from_stage') or ''
     ).strip()
     completed_prefix = ('agent_feedback_summaries',)
+    expected_stages = next(
+        (
+            stage_order
+            for stage_order in (
+                LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES,
+                SIGNAL_DECIDER_RECOVERY_STAGES,
+            )
+            if resolved_stages
+            in {stage_order, completed_prefix + stage_order}
+        ),
+        None,
+    )
+    if expected_stages is None:
+        return False
+    legacy_suffix = expected_stages == LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES
     exact_suffix_scope = bool(
         resolved_stages == expected_stages
         and resume_from_stage == expected_stages[0]
@@ -4846,18 +5012,192 @@ def _is_exact_signal_decider_retry_suffix(
             or ''
         ).strip()
         == 'signal_decider_stage_incomplete'
-        and str(
-            _stage_result_summary(
-                stages.get('signal_decider_evaluations')
-            ).get('reason')
-            or ''
-        ).strip()
-        == 'declared_dependencies_incomplete'
-        and _stage_result_summary(
-            stages.get('signal_decider_evaluations')
-        ).get('incomplete_dependencies')
-        == ['signal_decider']
+        and (
+            not legacy_suffix
+            or (
+                str(
+                    _stage_result_summary(
+                        stages.get('signal_decider_evaluations')
+                    ).get('reason')
+                    or ''
+                ).strip()
+                == 'declared_dependencies_incomplete'
+                and _stage_result_summary(
+                    stages.get('signal_decider_evaluations')
+                ).get('incomplete_dependencies')
+                == ['signal_decider']
+            )
+        )
     )
+
+
+def _legacy_evaluation_only_completion_projection(
+    pipeline_run: object,
+) -> dict[str, Any] | None:
+    """Project a completed legacy suffix onto the current execution boundary.
+
+    The retired evaluation stage graded historical outcomes after the execution
+    plan had already been persisted.  A terminal failure confined to that stage
+    must remain readable, but it is neither new BUY debt nor authority to rerun
+    the evaluation automatically.
+    """
+
+    if not isinstance(pipeline_run, Mapping):
+        return None
+    run_metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    pipeline_run_id = pipeline_run.get('id')
+    if (
+        not isinstance(run_metadata, Mapping)
+        or not isinstance(stages, Mapping)
+        or isinstance(pipeline_run_id, bool)
+        or not isinstance(pipeline_run_id, int)
+        or pipeline_run_id <= 0
+    ):
+        return None
+    raw_resolved_stages = run_metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return None
+    resolved_stages = tuple(
+        str(stage_id or '').strip() for stage_id in raw_resolved_stages
+    )
+    if (
+        not resolved_stages
+        or any(not stage_id for stage_id in resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+        or resolved_stages[-1] != 'signal_decider_evaluations'
+        or set(stages) != set(resolved_stages)
+        or str(pipeline_run.get('current_stage') or '').strip()
+        != 'signal_decider_evaluations'
+        or str(pipeline_run.get('status') or '').strip().lower()
+        in {'', 'queued', 'running', 'interrupted'}
+    ):
+        return None
+    legacy_suffix = _resolved_terminal_followup_continuation_stages(
+        resolved_stages
+    )
+    if legacy_suffix != LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+        legacy_signal_suffix = _resolved_signal_decider_recovery_stages(
+            resolved_stages
+        )
+        if legacy_signal_suffix != LEGACY_SIGNAL_DECIDER_RECOVERY_STAGES:
+            return None
+
+    evaluation_stage = stages.get('signal_decider_evaluations')
+    if not isinstance(evaluation_stage, Mapping) or (
+        daily_pipeline_outcome_is_satisfied(
+            {
+                **dict(evaluation_stage),
+                'stage': 'signal_decider_evaluations',
+            }
+        )
+    ):
+        return None
+    current_resolved_stages = resolved_stages[:-1]
+    if any(
+        not isinstance(stages.get(stage_id), Mapping)
+        for stage_id in current_resolved_stages
+    ):
+        return None
+    current_stages = {
+        stage_id: dict(stages[stage_id])
+        for stage_id in current_resolved_stages
+    }
+    if not all(
+        daily_pipeline_outcome_is_satisfied(
+            {**stage, 'stage': stage_id}
+        )
+        for stage_id, stage in current_stages.items()
+    ):
+        return None
+
+    projected_metadata = dict(run_metadata)
+    raw_requested_stages = projected_metadata.get('requested_stages')
+    if isinstance(raw_requested_stages, list):
+        requested_stages = [
+            str(stage_id or '').strip()
+            for stage_id in raw_requested_stages
+        ]
+        if requested_stages[-1:] == ['signal_decider_evaluations']:
+            requested_stages = requested_stages[:-1]
+        projected_metadata['requested_stages'] = requested_stages
+    projected_metadata['resolved_stages'] = list(current_resolved_stages)
+    projected_metadata['stage_statuses'] = {
+        stage_id: str(stage.get('status') or '').strip().lower()
+        for stage_id, stage in current_stages.items()
+    }
+    projected_pipeline_run = {
+        **dict(pipeline_run),
+        'status': 'completed',
+        'current_stage': current_resolved_stages[-1],
+        'run_metadata': projected_metadata,
+        'stages': current_stages,
+    }
+    return {
+        'status': 'completed',
+        'pipeline_status': 'completed',
+        'pipeline_run_id': pipeline_run_id,
+        'pipeline_run': projected_pipeline_run,
+        'market_date': pipeline_run.get('market_date'),
+        'resolved_stages': list(current_resolved_stages),
+        'stages': current_stages,
+        'legacy_evaluation_stage_retired': True,
+    }
+
+
+def _active_execution_pipeline_projection(
+    pipeline_run: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Hide one retained legacy evaluation row from active-stage validation.
+
+    Terminal-continuation claims preserve the old evaluation row in storage
+    for audit while projecting ``resolved_stages`` to the current execution
+    contract.  A reload therefore has one intentional extra row.  Only this
+    exact archived shape may be filtered, and only in the copy passed to
+    execution/readiness validators.
+    """
+
+    projected = dict(pipeline_run)
+    metadata = pipeline_run.get('run_metadata')
+    stages = pipeline_run.get('stages')
+    if not (
+        isinstance(metadata, Mapping)
+        and isinstance(stages, Mapping)
+        and terminal_continuation_marker_is_valid(metadata)
+    ):
+        return projected
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return projected
+    resolved_stages = [
+        str(stage_id or '').strip() for stage_id in raw_resolved_stages
+    ]
+    if (
+        not resolved_stages
+        or any(not stage_id for stage_id in resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+        or 'signal_decider_evaluations' in resolved_stages
+        or set(stages)
+        != {*resolved_stages, 'signal_decider_evaluations'}
+    ):
+        return projected
+    evidence = metadata.get('terminal_continuation_evidence')
+    evidence_suffix = (
+        evidence.get('suffix_stages')
+        if isinstance(evidence, Mapping)
+        and isinstance(evidence.get('suffix_stages'), Mapping)
+        else None
+    )
+    if not (
+        isinstance(evidence_suffix, Mapping)
+        and set(evidence_suffix)
+        == set(LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    ):
+        return projected
+    projected['stages'] = {
+        stage_id: stages[stage_id] for stage_id in resolved_stages
+    }
+    return projected
 
 
 def _feedback_retry_stage_id(pipeline_run: object) -> str:
@@ -7066,7 +7406,7 @@ class PykrxBackfillService:
             )
         )
         recoverable_same_day_expiration = (
-            is_recoverable_same_day_intraday_watch_expiration(
+            _is_recoverable_same_day_intraday_watch_expiration_compatible(
                 pipeline_run,
                 current_market_date=current_krx_calendar_date,
             )
@@ -7111,13 +7451,21 @@ class PykrxBackfillService:
         resolved_stage_list = list(
             run_metadata.get('resolved_stages') or []
         )
+        validation_pipeline_run = _active_execution_pipeline_projection(
+            pipeline_run
+        )
+        validation_stage_rows = (
+            validation_pipeline_run.get('stages')
+            if isinstance(validation_pipeline_run.get('stages'), Mapping)
+            else stage_rows
+        )
         persisted_recovery_result: dict[str, Any] = {
             'status': pipeline_status,
             'pipeline_run_id': pipeline_run.get('id'),
-            'pipeline_run': dict(pipeline_run),
+            'pipeline_run': validation_pipeline_run,
             'market_date': pipeline_run.get('market_date'),
             'resolved_stages': resolved_stage_list,
-            'stages': stage_rows,
+            'stages': validation_stage_rows,
         }
         persisted_nonblocking_marker = (
             validated_nonblocking_partial_progression_marker(
@@ -7130,6 +7478,9 @@ class PykrxBackfillService:
             == AUTO_FOLLOWUP_RECOVERY_TRIGGER
             and type(latest_eod_run.get('id')) is int
             else None
+        )
+        legacy_evaluation_only_completion = (
+            _legacy_evaluation_only_completion_projection(pipeline_run)
         )
         outcome_is_satisfied = (
             daily_pipeline_prefix_outcome_is_satisfied
@@ -7465,8 +7816,15 @@ class PykrxBackfillService:
                     and set(unrecorded_suffix_symbols).issubset(
                         set(cohort_symbols)
                     )
-                    and resolved_stage_list
-                    == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+                    and (
+                        _resolved_terminal_followup_continuation_stages(
+                            resolved_stage_list
+                        )
+                        in {
+                            TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+                            LEGACY_TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
+                        }
+                    )
                     and _validated_followup_stage_debt_terminal_progression_result(
                         persisted_recovery_result,
                         market_date=market_date,
@@ -7686,6 +8044,13 @@ class PykrxBackfillService:
                         'validated_nonblocking_partial_progression'
                     ),
                 }
+            elif legacy_evaluation_only_completion is not None:
+                pipeline_convergence = {
+                    'updated': False,
+                    'pipeline_run_id': pipeline_run.get('id'),
+                    'status': pipeline_status,
+                    'reason': 'legacy_evaluation_stage_retired',
+                }
             else:
                 convergence_kwargs: dict[str, Any] = {
                     'pipeline_run_id': int(pipeline_run['id']),
@@ -7701,7 +8066,8 @@ class PykrxBackfillService:
                     .converge_terminal_stages_run(**convergence_kwargs)
                 )
             pipeline_parent_finalized = bool(
-                pipeline_convergence.get('updated')
+                legacy_evaluation_only_completion is not None
+                or pipeline_convergence.get('updated')
                 or pipeline_convergence.get('reason')
                 == 'already_non_resumable'
                 or pipeline_convergence.get('reason')
@@ -7716,8 +8082,13 @@ class PykrxBackfillService:
                     pipeline_convergence.get('status') or pipeline_status
                 ).strip().lower()
                 convergence_result: dict[str, Any] = (
-                    persisted_recovery_result
+                    (
+                        legacy_evaluation_only_completion
+                        if legacy_evaluation_only_completion is not None
+                        else persisted_recovery_result
+                    )
                     if persisted_nonblocking_marker is not None
+                    or legacy_evaluation_only_completion is not None
                     else {
                         # Persisted terminal stage rows remain sufficient for
                         # the legacy non-rearm convergence path. A pending
@@ -7735,7 +8106,10 @@ class PykrxBackfillService:
                     convergence_result[
                         '_proven_resolved_downstream_symbols'
                     ] = persisted_recovery_symbols
-                if pending_same_day_rearm is not None:
+                if (
+                    pending_same_day_rearm is not None
+                    and legacy_evaluation_only_completion is None
+                ):
                     convergence_result.update(
                         {
                             'status': converged_status,
@@ -8121,7 +8495,7 @@ class PykrxBackfillService:
                 recoverable_same_day_expiration
                 or pending_same_day_rearm is not None
             )
-            and not is_canonical_same_day_signal_rearm_proof(
+            and not _is_canonical_same_day_signal_rearm_proof_compatible(
                 feedback_rearm_evidence_run
             )
         ):
@@ -9161,7 +9535,7 @@ class PykrxBackfillService:
             }
         elif nonblocking_partial_marker is not None:
             # The shared validator proves that every failed role/symbol pair
-            # was excluded before plan and evaluation. The run remains
+            # was excluded before the execution-plan tail. The run remains
             # truthfully partial, so the generic completed-only convergence
             # helper must not be used here.
             pipeline_convergence = {

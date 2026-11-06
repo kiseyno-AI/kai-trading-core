@@ -388,7 +388,7 @@ python3.11 -m app.internal.ops agent-signal-decider-evaluations-compute --market
 
 Use `RUNBOOK.md` for the full command catalog, stage dependencies, overnight runners, and recovery procedures.
 
-The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, a failed fundamentals, factor, news, feedback, decider, plan, or evaluation stage is resumed from the first incomplete follow-up without downloading prices again. A decider-only recovery reuses the exact completed summary run, its persisted feedback scope, knowledge cutoff, financial-statement division, and the symbol intersection actually completed by every summarizer instead of searching a different scope. Follow-up recovery waits at least five minutes between attempts and normally stops after five attempts for the exact EOD lineage; a legacy zero-work block caused only by the retired summary-scope lookup contract receives one bounded repair attempt. If that sixth repair is interrupted before durable work, it reclaims the same pipeline row and locked summary source rather than consuming another attempt or rebuilding historical membership. The skip reason and recovery metadata remain visible in the run result.
+The automatic close pipeline records price collection and every downstream stage separately. Once price collection is terminal, a failed fundamentals, factor, news, feedback, decider, or plan stage is resumed from the first incomplete follow-up without downloading prices again. A decider-only recovery reuses the exact completed summary run, its persisted feedback scope, knowledge cutoff, financial-statement division, and the symbol intersection actually completed by every summarizer instead of searching a different scope. Follow-up recovery waits at least five minutes between attempts and normally stops after five attempts for the exact EOD lineage; a legacy zero-work block caused only by the retired summary-scope lookup contract receives one bounded repair attempt. If that sixth repair is interrupted before durable work, it reclaims the same pipeline row and locked summary source rather than consuming another attempt or rebuilding historical membership. The skip reason and recovery metadata remain visible in the run result.
 
 The default daily stage order is:
 
@@ -399,8 +399,10 @@ master_refresh -> pykrx_universe_refresh -> price_collection -> pykrx_enrichment
 -> low_risk_factors -> beta_factors -> advanced_value_factors -> unified_value_factors
 -> quality_factors -> composite_factors -> signal_features -> external_news_collect
 -> external_news_enrich -> macro_context_refresh -> agent_feedback_summaries
--> signal_decider -> next_open_execution_plan -> signal_decider_evaluations
+-> signal_decider -> next_open_execution_plan
 ```
+
+`signal_decider_evaluations` is not part of the default automatic daily pipeline or execution readiness. It remains available as an explicit/manual maintenance stage, with bounded startup catch-up for mature evaluation horizons.
 
 Consumers must read `/eod/pipeline/stages` rather than hard-code this list. The PyKRX decision preflight requires same-day `sector_classification`, `investor_flow_symbol`, `short_selling`, and direct `valuation_snapshot` coverage; valuation must cover at least 95% of the fresh PyKRX KOSPI/KOSDAQ stock universe (excluding active-universe ETFs outside that feed), and the other required categories at least 99%.
 

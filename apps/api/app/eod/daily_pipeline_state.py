@@ -36,10 +36,11 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_resume_is_unconsumed,
 )
 from app.eod.summary_cutoff_contract import (
-    LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    CUTOFF_REPAIR_STAGE_IDS,
     completed_summary_scope_matches_parent,
     is_resumable_summary_cutoff_contract_repair,
     normalize_symbol_codes,
+    resolved_cutoff_repair_stage_ids,
     summary_cutoff_proof_from_stage,
 )
 from app.eod.run_stage_support import (
@@ -95,6 +96,15 @@ TERMINAL_DAILY_PIPELINE_STATUSES = {
 }
 SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS = 5 * 60 * 1000
 TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT = 6
+TERMINAL_CONTINUATION_STAGE_ORDER = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+)
+LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER = (
+    *TERMINAL_CONTINUATION_STAGE_ORDER,
+    'signal_decider_evaluations',
+)
 
 
 def _utcnow() -> datetime:
@@ -145,6 +155,90 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _resolved_terminal_continuation_stage_order(
+    resolved_stages: object,
+) -> tuple[str, ...] | None:
+    """Resolve the current suffix while retaining persisted legacy claims."""
+
+    if not isinstance(resolved_stages, (list, tuple)):
+        return None
+    normalized = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stages
+    )
+    if not normalized or any(not stage_id for stage_id in normalized):
+        return None
+    for stage_order in (
+        LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER,
+        TERMINAL_CONTINUATION_STAGE_ORDER,
+    ):
+        if normalized[-len(stage_order) :] == stage_order:
+            return stage_order
+    return None
+
+
+def _project_terminal_continuation_metadata_to_current_contract(
+    metadata: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str], bool] | None:
+    """Retire the legacy evaluation tail without erasing its audit evidence.
+
+    Version-1 continuation rows can still carry the former four-stage suffix.
+    Once that row is claimed, only the decision/plan suffix is executable.  The
+    immutable ``terminal_continuation_evidence`` keeps the original evaluation
+    row readable; active run metadata must not advertise it as retry debt.
+    """
+
+    raw_resolved_stages = metadata.get('resolved_stages')
+    persisted_suffix = _resolved_terminal_continuation_stage_order(
+        raw_resolved_stages
+    )
+    if persisted_suffix is None or not isinstance(
+        raw_resolved_stages,
+        (list, tuple),
+    ):
+        return None
+    resolved_stages = [
+        str(stage_id or '').strip() for stage_id in raw_resolved_stages
+    ]
+    if (
+        any(not stage_id for stage_id in resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+    ):
+        return None
+
+    legacy_projection = (
+        persisted_suffix == LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
+    )
+    active_resolved_stages = (
+        resolved_stages[:-1] if legacy_projection else resolved_stages
+    )
+    projected_metadata = dict(metadata)
+    projected_metadata['resolved_stages'] = list(active_resolved_stages)
+
+    raw_requested_stages = projected_metadata.get('requested_stages')
+    if isinstance(raw_requested_stages, (list, tuple)):
+        requested_stages = [
+            str(stage_id or '').strip() for stage_id in raw_requested_stages
+        ]
+        if legacy_projection and requested_stages[-1:] == [
+            'signal_decider_evaluations'
+        ]:
+            requested_stages = requested_stages[:-1]
+        projected_metadata['requested_stages'] = requested_stages
+
+    raw_stage_statuses = projected_metadata.get('stage_statuses')
+    if isinstance(raw_stage_statuses, Mapping):
+        active_stage_statuses = dict(raw_stage_statuses)
+        if legacy_projection:
+            active_stage_statuses.pop('signal_decider_evaluations', None)
+        projected_metadata['stage_statuses'] = active_stage_statuses
+
+    return (
+        projected_metadata,
+        active_resolved_stages,
+        legacy_projection,
+    )
 
 
 def _intraday_summary_cutoff_proof(
@@ -286,7 +380,7 @@ def _summary_cutoff_contract_repair_execution_context_error(
     ):
         return 'reused_eod_collection_run_id'
     if str(metadata.get('resume_from_stage') or '').strip() != (
-        LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+        CUTOFF_REPAIR_STAGE_IDS[0]
     ):
         return 'resume_from_stage'
 
@@ -1797,6 +1891,16 @@ class DailyPipelineRunStateService:
                     'cutoff_contract_repair_progress_invalid',
                     status=status,
                 )
+            persisted_repair_stage_ids = (
+                resolved_cutoff_repair_stage_ids(
+                    metadata.get('resolved_stages')
+                )
+            )
+            if persisted_repair_stage_ids is None:
+                return reject(
+                    'cutoff_contract_repair_stage_contract_invalid',
+                    status=status,
+                )
 
             repair_proof = dict(
                 metadata['summary_cutoff_contract_repair_proof']
@@ -1887,9 +1991,11 @@ class DailyPipelineRunStateService:
                     'summary_cutoff_contract_repair_resumed_from_status': (
                         status
                     ),
+                    'requested_stages': list(CUTOFF_REPAIR_STAGE_IDS),
+                    'resolved_stages': list(CUTOFF_REPAIR_STAGE_IDS),
                     'stage_statuses': {
                         stage_id: 'pending'
-                        for stage_id in LEGACY_CUTOFF_REPAIR_STAGE_IDS
+                        for stage_id in CUTOFF_REPAIR_STAGE_IDS
                     },
                     'resumable': True,
                 }
@@ -1915,7 +2021,7 @@ class DailyPipelineRunStateService:
                 stage_row.updated_at = now
 
             run_row.status = 'running'
-            run_row.current_stage = LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+            run_row.current_stage = CUTOFF_REPAIR_STAGE_IDS[0]
             run_row.completed_at = None
             run_row.error_message = None
             run_row.updated_at = now
@@ -1947,7 +2053,7 @@ class DailyPipelineRunStateService:
 
         The EOD marker authorizes no new decision pass.  This claim therefore
         preserves the completed signal row and resets only the first unfinished
-        plan/evaluation stage plus its untouched tail in the same pipeline run.
+        execution-plan stage plus its untouched tail in the same pipeline run.
         """
 
         normalized_pipeline_run_id = int(pipeline_run_id)
@@ -2465,12 +2571,6 @@ class DailyPipelineRunStateService:
         if normalized_reason != 'summary_knowledge_cutoff_repair':
             return reject('unsupported_terminal_continuation_reason')
 
-        continuation_suffix = (
-            'agent_feedback_summaries',
-            'signal_decider',
-            'next_open_execution_plan',
-            'signal_decider_evaluations',
-        )
         now = _utcnow()
         with session_scope(
             statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
@@ -2510,6 +2610,16 @@ class DailyPipelineRunStateService:
                 if isinstance(run_row.run_metadata, Mapping)
                 else {}
             )
+            continuation_suffix = (
+                _resolved_terminal_continuation_stage_order(
+                    metadata.get('resolved_stages')
+                )
+            )
+            if continuation_suffix is None:
+                return reject(
+                    'terminal_continuation_suffix_mismatch',
+                    status=current_status,
+                )
             if (
                 current_status in {'running', 'interrupted', 'failed'}
                 and _as_int(metadata.get('terminal_continuation_count')) == 1
@@ -2535,7 +2645,7 @@ class DailyPipelineRunStateService:
                 )
             if (
                 str(run_row.current_stage or '').strip()
-                != 'signal_decider_evaluations'
+                != continuation_suffix[-1]
             ):
                 return reject(
                     'terminal_stage_mismatch',
@@ -2960,38 +3070,43 @@ class DailyPipelineRunStateService:
                     status=current_status,
                 )
 
-            evaluation_stage = stage_rows_by_id[
-                'signal_decider_evaluations'
-            ]
-            evaluation_details = (
-                evaluation_stage.details
-                if isinstance(evaluation_stage.details, Mapping)
-                else {}
-            )
-            evaluation_result = (
-                evaluation_details.get('result_summary')
-                if isinstance(
-                    evaluation_details.get('result_summary'), Mapping
-                )
-                else {}
-            )
-            if not (
-                str(evaluation_stage.status or '').strip().lower()
-                == 'blocked'
-                and str(evaluation_result.get('status') or '')
-                .strip()
-                .lower()
-                == 'blocked'
-                and evaluation_result.get('triggered') is False
-                and str(evaluation_result.get('reason') or '').strip()
-                == 'declared_dependencies_incomplete'
-                and evaluation_result.get('incomplete_dependencies')
-                == ['signal_decider']
+            if (
+                continuation_suffix
+                == LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
             ):
-                return reject(
-                    'evaluation_block_reason_mismatch',
-                    status=current_status,
+                evaluation_stage = stage_rows_by_id[
+                    'signal_decider_evaluations'
+                ]
+                evaluation_details = (
+                    evaluation_stage.details
+                    if isinstance(evaluation_stage.details, Mapping)
+                    else {}
                 )
+                evaluation_result = (
+                    evaluation_details.get('result_summary')
+                    if isinstance(
+                        evaluation_details.get('result_summary'), Mapping
+                    )
+                    else {}
+                )
+                if not (
+                    str(evaluation_stage.status or '').strip().lower()
+                    == 'blocked'
+                    and str(evaluation_result.get('status') or '')
+                    .strip()
+                    .lower()
+                    == 'blocked'
+                    and evaluation_result.get('triggered') is False
+                    and str(evaluation_result.get('reason') or '')
+                    .strip()
+                    == 'declared_dependencies_incomplete'
+                    and evaluation_result.get('incomplete_dependencies')
+                    == ['signal_decider']
+                ):
+                    return reject(
+                        'evaluation_block_reason_mismatch',
+                        status=current_status,
+                    )
 
             summary_source_run_id = next(iter(summary_source_ids))
             cutoff_resolution = (
@@ -3098,6 +3213,10 @@ class DailyPipelineRunStateService:
                             'completed_at': _iso(run_row.completed_at),
                             'error_message': run_row.error_message,
                             'resume_from_stage': prior_resume_from_stage,
+                            'requested_stages': list(
+                                metadata.get('requested_stages') or []
+                            ),
+                            'resolved_stages': list(resolved_stages),
                             'stage_statuses': dict(
                                 prior_stage_statuses
                             ),
@@ -3108,13 +3227,29 @@ class DailyPipelineRunStateService:
                     },
                 }
             )
-            resumed_stage_statuses = dict(prior_stage_statuses)
+            active_projection = (
+                _project_terminal_continuation_metadata_to_current_contract(
+                    metadata
+                )
+            )
+            if active_projection is None:
+                return reject(
+                    'terminal_continuation_suffix_mismatch',
+                    status=current_status,
+                )
+            metadata, active_resolved_stages, _ = active_projection
+            resumed_stage_statuses = dict(
+                metadata.get('stage_statuses') or {}
+            )
             resumed_stage_statuses.update(
-                {stage_id: 'pending' for stage_id in continuation_suffix}
+                {
+                    stage_id: 'pending'
+                    for stage_id in TERMINAL_CONTINUATION_STAGE_ORDER
+                }
             )
             metadata['stage_statuses'] = resumed_stage_statuses
 
-            for stage_id in continuation_suffix:
+            for stage_id in TERMINAL_CONTINUATION_STAGE_ORDER:
                 stage_row = stage_rows_by_id[stage_id]
                 stage_row.status = 'pending'
                 stage_row.processed = 0
@@ -3146,7 +3281,10 @@ class DailyPipelineRunStateService:
 
             pipeline_run = self._serialize_run(
                 run_row,
-                [stage_rows_by_id[stage_id] for stage_id in resolved_stages],
+                [
+                    stage_rows_by_id[stage_id]
+                    for stage_id in active_resolved_stages
+                ],
             )
             return {
                 'claimed': True,
@@ -3372,11 +3510,32 @@ class DailyPipelineRunStateService:
             str(stage_row.stage_id or '').strip(): stage_row
             for stage_row in stage_rows
         }
+        archived_suffix_evidence = continuation_evidence.get(
+            'suffix_stages'
+        )
+        archived_legacy_continuation = bool(
+            isinstance(archived_suffix_evidence, Mapping)
+            and set(archived_suffix_evidence)
+            == set(LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER)
+        )
+        allowed_stage_row_ids = set(resolved_stages)
+        if archived_legacy_continuation:
+            allowed_stage_row_ids.add('signal_decider_evaluations')
         if (
             len(stage_rows_by_id) != len(stage_rows)
-            or set(stage_rows_by_id) != set(resolved_stages)
+            or set(stage_rows_by_id) != allowed_stage_row_ids
         ):
             return reject('resolved_stage_rows_mismatch')
+
+        active_projection = (
+            _project_terminal_continuation_metadata_to_current_contract(
+                metadata
+            )
+        )
+        if active_projection is None:
+            return reject('terminal_continuation_suffix_mismatch')
+        _, active_resolved_stages, _ = active_projection
+        active_continuation_suffix = TERMINAL_CONTINUATION_STAGE_ORDER
 
         stage_statuses = metadata.get('stage_statuses')
         if not isinstance(stage_statuses, Mapping):
@@ -3417,7 +3576,7 @@ class DailyPipelineRunStateService:
             return reject('stage_status_evidence_mismatch')
 
         satisfied_prefix: list[str] = []
-        for stage_id in continuation_suffix:
+        for stage_id in active_continuation_suffix:
             stage_row = stage_rows_by_id[stage_id]
             if not (
                 daily_pipeline_outcome_is_satisfied(
@@ -3429,11 +3588,11 @@ class DailyPipelineRunStateService:
                 break
             satisfied_prefix.append(stage_id)
 
-        if len(satisfied_prefix) == len(continuation_suffix):
+        if len(satisfied_prefix) == len(active_continuation_suffix):
             return reject('terminal_continuation_suffix_already_satisfied')
 
         first_unfinished_index = len(satisfied_prefix)
-        first_unfinished_stage = continuation_suffix[
+        first_unfinished_stage = active_continuation_suffix[
             first_unfinished_index
         ]
         first_unfinished_row = stage_rows_by_id[first_unfinished_stage]
@@ -3483,7 +3642,7 @@ class DailyPipelineRunStateService:
 
         metadata_prefix_size = 0
         metadata_pending_seen = False
-        for stage_id in continuation_suffix:
+        for stage_id in active_continuation_suffix:
             persisted_status = str(
                 stage_statuses.get(stage_id) or ''
             ).strip().lower()
@@ -3573,7 +3732,7 @@ class DailyPipelineRunStateService:
 
         untouched_tail = all(
             untouched_claim_stage(stage_rows_by_id[stage_id])
-            for stage_id in continuation_suffix[
+            for stage_id in active_continuation_suffix[
                 first_unfinished_index + 1 :
             ]
         )
@@ -3609,14 +3768,24 @@ class DailyPipelineRunStateService:
         parent_evidence = continuation_evidence.get('parent')
         suffix_evidence = continuation_evidence.get('suffix_stages')
         summary_proof = continuation_evidence.get('summary_proof')
+        legacy_continuation = bool(
+            continuation_suffix
+            == LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
+            or archived_legacy_continuation
+        )
+        archived_continuation_suffix = (
+            LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
+            if legacy_continuation
+            else TERMINAL_CONTINUATION_STAGE_ORDER
+        )
         if not (
             isinstance(parent_evidence, Mapping)
             and str(parent_evidence.get('status') or '').strip().lower()
             == 'blocked'
             and str(parent_evidence.get('current_stage') or '').strip()
-            == 'signal_decider_evaluations'
+            == archived_continuation_suffix[-1]
             and isinstance(suffix_evidence, Mapping)
-            and set(suffix_evidence) == set(continuation_suffix)
+            and set(suffix_evidence) == set(archived_continuation_suffix)
             and isinstance(summary_proof, Mapping)
             and summary_proof.get('ready') is True
         ):
@@ -3625,9 +3794,11 @@ class DailyPipelineRunStateService:
         archived_summary = suffix_evidence['agent_feedback_summaries']
         archived_decider = suffix_evidence['signal_decider']
         archived_plan = suffix_evidence['next_open_execution_plan']
-        archived_evaluations = suffix_evidence[
-            'signal_decider_evaluations'
-        ]
+        archived_evaluations = (
+            suffix_evidence.get('signal_decider_evaluations')
+            if legacy_continuation
+            else None
+        )
         archived_summary_sources = (
             archived_summary.get('source_run_ids')
             if isinstance(archived_summary, Mapping)
@@ -3772,22 +3943,32 @@ class DailyPipelineRunStateService:
                 archived_plan_result.get('upstream_status') or ''
             ).strip().lower()
             == 'failed'
-            and isinstance(archived_evaluations, Mapping)
-            and str(archived_evaluations.get('status') or '')
-            .strip()
-            .lower()
-            == 'blocked'
-            and str(archived_evaluation_result.get('status') or '')
-            .strip()
-            .lower()
-            == 'blocked'
-            and archived_evaluation_result.get('triggered') is False
-            and str(
-                archived_evaluation_result.get('reason') or ''
-            ).strip()
-            == 'declared_dependencies_incomplete'
-            and archived_evaluation_result.get('incomplete_dependencies')
-            == ['signal_decider']
+            and (
+                not legacy_continuation
+                or (
+                    isinstance(archived_evaluations, Mapping)
+                    and str(archived_evaluations.get('status') or '')
+                    .strip()
+                    .lower()
+                    == 'blocked'
+                    and str(
+                        archived_evaluation_result.get('status') or ''
+                    )
+                    .strip()
+                    .lower()
+                    == 'blocked'
+                    and archived_evaluation_result.get('triggered')
+                    is False
+                    and str(
+                        archived_evaluation_result.get('reason') or ''
+                    ).strip()
+                    == 'declared_dependencies_incomplete'
+                    and archived_evaluation_result.get(
+                        'incomplete_dependencies'
+                    )
+                    == ['signal_decider']
+                )
+            )
         ):
             return reject('terminal_continuation_archived_suffix_invalid')
 
@@ -4195,7 +4376,17 @@ class DailyPipelineRunStateService:
             stage_id: _stage_row_outcome(stage_rows_by_id[stage_id])
             for stage_id in satisfied_prefix
         }
-        resumed_stage_statuses = dict(stage_statuses)
+        active_projection = (
+            _project_terminal_continuation_metadata_to_current_contract(
+                metadata
+            )
+        )
+        if active_projection is None:
+            return reject('terminal_continuation_suffix_mismatch')
+        metadata, active_resolved_stages, _ = active_projection
+        resumed_stage_statuses = dict(
+            metadata.get('stage_statuses') or {}
+        )
         resumed_stage_statuses.update(
             {
                 stage_id: str(
@@ -4207,7 +4398,7 @@ class DailyPipelineRunStateService:
         resumed_stage_statuses.update(
             {
                 stage_id: 'pending'
-                for stage_id in continuation_suffix[
+                for stage_id in active_continuation_suffix[
                     first_unfinished_index:
                 ]
             }
@@ -4232,7 +4423,9 @@ class DailyPipelineRunStateService:
             metadata[
                 'terminal_continuation_feedback_lease_loss_run_id'
             ] = failed_lease_child_run_id
-        for stage_id in continuation_suffix[first_unfinished_index:]:
+        for stage_id in active_continuation_suffix[
+            first_unfinished_index:
+        ]:
             stage_row = stage_rows_by_id[stage_id]
             stage_row.status = 'pending'
             stage_row.processed = 0
@@ -4264,7 +4457,10 @@ class DailyPipelineRunStateService:
 
         pipeline_run = self._serialize_run(
             run_row,
-            [stage_rows_by_id[stage_id] for stage_id in resolved_stages],
+            [
+                stage_rows_by_id[stage_id]
+                for stage_id in active_resolved_stages
+            ],
         )
         return {
             'claimed': True,
@@ -4354,6 +4550,22 @@ class DailyPipelineRunStateService:
                     for stage_id in raw_resolved_stages
                 )
             )
+            continuation_marker_valid = (
+                terminal_continuation_marker_is_valid(metadata)
+            )
+            legacy_evaluation_retired = False
+            if continuation_marker_valid:
+                active_projection = (
+                    _project_terminal_continuation_metadata_to_current_contract(
+                        metadata
+                    )
+                )
+                if active_projection is not None:
+                    (
+                        metadata,
+                        resolved_stages,
+                        legacy_evaluation_retired,
+                    ) = active_projection
 
             stage_rows = list(
                 session.execute(
@@ -4390,7 +4602,7 @@ class DailyPipelineRunStateService:
             }
             outcome_is_satisfied = (
                 daily_pipeline_prefix_outcome_is_satisfied
-                if terminal_continuation_marker_is_valid(metadata)
+                if continuation_marker_valid
                 else daily_pipeline_outcome_is_satisfied
             )
             incomplete_stages = {
@@ -4436,9 +4648,15 @@ class DailyPipelineRunStateService:
                     and terminal_status == 'completed'
                     and warning_stage_ids
                 )
+                retired_evaluation_upgrade = bool(
+                    legacy_evaluation_retired
+                    and current_status == 'partial'
+                    and terminal_status == 'completed'
+                )
                 if (
                     terminal_status != current_status
                     and not optional_warning_upgrade
+                    and not retired_evaluation_upgrade
                 ):
                     return {
                         'updated': False,
@@ -4472,9 +4690,11 @@ class DailyPipelineRunStateService:
                         **warning_metadata,
                     }
                 )
-                if optional_warning_upgrade:
+                if optional_warning_upgrade or retired_evaluation_upgrade:
                     run_row.status = terminal_status
                     run_row.error_message = None
+                if legacy_evaluation_retired:
+                    run_row.current_stage = resolved_stages[-1]
                 run_row.updated_at = now
                 run_row.run_metadata = metadata
                 return {
@@ -4495,6 +4715,8 @@ class DailyPipelineRunStateService:
                 }
             )
             run_row.status = terminal_status
+            if legacy_evaluation_retired:
+                run_row.current_stage = resolved_stages[-1]
             run_row.error_message = None
             run_row.completed_at = now
             run_row.updated_at = now
