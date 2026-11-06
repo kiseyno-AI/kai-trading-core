@@ -174,7 +174,7 @@ class PlanAndApplyTests(unittest.TestCase):
         @contextmanager
         def guard(*, market_date):
             events.append(f'enter:{market_date}')
-            yield
+            yield True, None
             events.append('exit')
 
         def persister(rows, *, delete_rows_outside_scope):
@@ -201,7 +201,7 @@ class PlanAndApplyTests(unittest.TestCase):
     def test_apply_fails_when_persisted_count_differs(self) -> None:
         @contextmanager
         def guard(*, market_date):
-            yield
+            yield True, None
 
         with self.assertRaises(RuntimeError):
             backfill.apply_backfill(
@@ -214,13 +214,35 @@ class PlanAndApplyTests(unittest.TestCase):
                 stored_symbols_loader=lambda _d, _s: set(),
             )
 
+    def test_apply_writes_nothing_when_the_fence_reports_an_active_writer(self) -> None:
+        persisted: list[int] = []
+
+        @contextmanager
+        def guard(*, market_date):
+            yield False, 'active_daily_or_eod_writer'
+
+        result = backfill.apply_backfill(
+            '2026-11-02',
+            guard_factory=guard,
+            finality_validator=lambda value, **_kw: value,
+            service=_FakeService(),
+            persister=lambda rows, **_kw: persisted.append(len(rows)) or len(rows),
+            bar_symbols_loader=lambda _d: ['A00001'],
+            stored_symbols_loader=lambda _d, _s: set(),
+        )
+
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'active_daily_or_eod_writer')
+        self.assertFalse(result['applied'])
+        self.assertEqual(persisted, [])
+
     def test_apply_refuses_unfinalized_date_before_taking_the_fence(self) -> None:
         entered: list[bool] = []
 
         @contextmanager
         def guard(*, market_date):
             entered.append(True)
-            yield
+            yield True, None
 
         def reject(_value, **_kw):
             raise ValueError('same-day stored-data backfill is blocked')
