@@ -110,12 +110,24 @@ FILTER_STAGE_ORDER = (
     'market_risk_filter',
     'piotroski_filter',
 )
-PIPELINE_STAGE_ORDER = (
-    tuple(stage_id for stage_id in DAILY_STAGE_ORDER if stage_id != 'market_risk_snapshots')
+PIPELINE_STAGE_HISTORY_ORDER = tuple(
+    stage_id
+    for stage_id in DAILY_STAGE_ORDER
+    if stage_id != 'market_risk_snapshots'
+)
+PIPELINE_STAGE_ORDER = tuple(
+    stage_id
+    for stage_id in PIPELINE_STAGE_HISTORY_ORDER
+    if STAGE_DEFINITIONS[stage_id].default_selected
+)
+PIPELINE_MAINTENANCE_STAGE_ORDER = tuple(
+    stage_id
+    for stage_id in PIPELINE_STAGE_HISTORY_ORDER
+    if stage_id not in PIPELINE_STAGE_ORDER
 )
 LIVE_EOD_RUN_PROGRESS_FALLBACK_STAGE_IDS = tuple(
     stage_id
-    for stage_id in PIPELINE_STAGE_ORDER
+    for stage_id in PIPELINE_STAGE_HISTORY_ORDER
     if stage_id not in {*PYKRX_STAGE_ORDER, 'pykrx_enrichment'}
 )
 FACTOR_STAGE_MODELS = {
@@ -340,7 +352,7 @@ def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[st
             .join(DailyPipelineStageRun, DailyPipelineStageRun.pipeline_run_id == DailyPipelineRun.id)
             .where(DailyPipelineRun.market_date == normalized_market_date)
             .where(DailyPipelineStageRun.market_date == normalized_market_date)
-            .where(DailyPipelineStageRun.stage_id.in_(PIPELINE_STAGE_ORDER))
+            .where(DailyPipelineStageRun.stage_id.in_(PIPELINE_STAGE_HISTORY_ORDER))
             .order_by(
                 DailyPipelineStageRun.updated_at.desc().nullslast(),
                 DailyPipelineRun.started_at.desc().nullslast(),
@@ -1722,7 +1734,7 @@ class EODPipelineStatusService:
             if stage_id in stages
             and int(dict(row_count_stage_counts.get(stage_id) or {}).get('persisted') or 0) > 0
         }
-        for stage_id in PIPELINE_STAGE_ORDER:
+        for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             if stage_id in stages:
                 continue
             stages[stage_id] = self._build_generic_pending_stage(
@@ -1742,7 +1754,7 @@ class EODPipelineStatusService:
         )
         stages = {
             stage_id: stages[stage_id]
-            for stage_id in PIPELINE_STAGE_ORDER
+            for stage_id in PIPELINE_STAGE_HISTORY_ORDER
         }
         if official_stage_history:
             stages = self._overlay_official_stage_history(
@@ -1823,7 +1835,8 @@ class EODPipelineStatusService:
                 )
         stages = self._mark_preopen_stage_skips(stages=stages)
         stages = self._normalize_stage_contract(stages)
-        warning_metadata = daily_pipeline_warning_metadata(stages)
+        execution_stages = self._execution_stages(stages)
+        warning_metadata = daily_pipeline_warning_metadata(execution_stages)
         overall_status = self._resolve_overall_status(stages)
         if self._is_current_date_waiting_for_official_run(
             stages=stages,
@@ -1833,14 +1846,26 @@ class EODPipelineStatusService:
         ):
             overall_status = 'pending'
         official_run_status = str((official_run or {}).get('status') or '').strip().lower()
-        if official_run_status in {'running', 'interrupted', 'abandoned'}:
+        if (
+            official_run_status in {'running', 'interrupted', 'abandoned'}
+            and self._official_run_tracks_execution_stage(official_run)
+        ):
             overall_status = official_run_status
         summary = self._build_stage_summary(stages=stages)
         official_current_stage = str((official_run or {}).get('current_stage') or '').strip()
-        if official_run_status in {'running', 'interrupted', 'abandoned'} and official_current_stage in stages:
+        if (
+            official_run_status in {'running', 'interrupted', 'abandoned'}
+            and official_current_stage in PIPELINE_STAGE_ORDER
+            and official_current_stage in stages
+        ):
             summary['current_stage'] = official_current_stage
             summary['current_stage_status'] = stages[official_current_stage].get('status')
         gate_summary = self._build_gate_summary(stages=stages)
+        maintenance_stages = {
+            stage_id: stages[stage_id]
+            for stage_id in PIPELINE_MAINTENANCE_STAGE_ORDER
+            if stage_id in stages
+        }
         return {
             'market_date': resolved_market_date,
             'generated_at': _utcnow_iso(),
@@ -1860,11 +1885,65 @@ class EODPipelineStatusService:
             'status': overall_status,
             **warning_metadata,
             'stage_order': list(PIPELINE_STAGE_ORDER),
+            'maintenance_stage_order': list(PIPELINE_MAINTENANCE_STAGE_ORDER),
+            'maintenance_stages': maintenance_stages,
             **summary,
             'gate_summary': gate_summary,
             'stages': stages,
             'official_run': self._build_official_run_summary(official_run),
         }
+
+    @staticmethod
+    def _execution_stages(
+        stages: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            stage_id: stage
+            for stage_id, stage in stages.items()
+            if stage_id not in PIPELINE_MAINTENANCE_STAGE_ORDER
+        }
+
+    @staticmethod
+    def _official_run_tracks_execution_stage(
+        official_run: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(official_run, dict):
+            return False
+        current_stage = str(
+            official_run.get('current_stage') or ''
+        ).strip()
+        if current_stage in PIPELINE_MAINTENANCE_STAGE_ORDER:
+            # A legacy full-chain run can remain active only because its
+            # retired evaluation tail is still running or interrupted.  The
+            # earlier execution stages stay visible, but that maintenance
+            # tail must not override daily readiness.
+            return False
+        run_metadata = (
+            official_run.get('run_metadata')
+            if isinstance(official_run.get('run_metadata'), dict)
+            else {}
+        )
+        stage_ids = {
+            current_stage,
+            *(
+                str(stage_id).strip()
+                for field in ('requested_stages', 'resolved_stages')
+                for stage_id in (
+                    run_metadata.get(field)
+                    if isinstance(run_metadata.get(field), list)
+                    else []
+                )
+            ),
+            *(
+                str(stage_id).strip()
+                for stage_id in (
+                    official_run.get('stages')
+                    if isinstance(official_run.get('stages'), dict)
+                    else {}
+                )
+            ),
+        }
+        return bool(stage_ids.intersection(PIPELINE_STAGE_ORDER))
 
     @staticmethod
     def _stored_dependency_wait_is_stale(
@@ -1927,7 +2006,7 @@ class EODPipelineStatusService:
     @staticmethod
     def _normalize_stage_contract(stages: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         normalized: dict[str, dict[str, Any]] = {}
-        for index, stage_id in enumerate(PIPELINE_STAGE_ORDER, start=1):
+        for index, stage_id in enumerate(PIPELINE_STAGE_HISTORY_ORDER, start=1):
             definition = STAGE_DEFINITIONS[stage_id]
             stage = dict(stages.get(stage_id) or {})
             details = dict(stage.get('details') or {})
@@ -2156,6 +2235,7 @@ class EODPipelineStatusService:
 
     @staticmethod
     def _build_stage_summary(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        stages = EODPipelineStatusService._execution_stages(stages)
         status_counts: dict[str, int] = {}
         for stage in stages.values():
             status = str(stage.get('status') or 'pending').strip().lower()
@@ -2181,6 +2261,7 @@ class EODPipelineStatusService:
 
     @staticmethod
     def _build_gate_summary(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        stages = EODPipelineStatusService._execution_stages(stages)
         stage_gates: dict[str, dict[str, Any]] = {}
         ready_stage_ids: list[str] = []
         waiting_stage_ids: list[str] = []
@@ -2234,6 +2315,7 @@ class EODPipelineStatusService:
 
     @staticmethod
     def _resolve_current_stage(*, stages: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        stages = EODPipelineStatusService._execution_stages(stages)
         for preferred_status in ('running', 'partial', 'blocked', 'failed', 'interrupted', 'abandoned', 'pending'):
             for stage in stages.values():
                 if str(stage.get('status') or '').strip().lower() == preferred_status:
@@ -2496,7 +2578,7 @@ class EODPipelineStatusService:
         if not official_stages:
             return stages
         overlaid = dict(stages)
-        for stage_id in PIPELINE_STAGE_ORDER:
+        for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             official_stage = official_stages.get(stage_id)
             if not isinstance(official_stage, dict):
                 continue
@@ -2530,7 +2612,7 @@ class EODPipelineStatusService:
         market_date: str,
     ) -> dict[str, dict[str, Any]]:
         overlaid = dict(stages)
-        for stage_id in PIPELINE_STAGE_ORDER:
+        for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             fallback_stage = stages.get(stage_id) or {}
             history_item = stage_history.get(stage_id)
             if not isinstance(history_item, dict):
@@ -6896,12 +6978,13 @@ class EODPipelineStatusService:
 
         statuses = {
             str(stage.get('status') or 'pending').strip().lower()
-            for stage in stages.values()
+            for stage in EODPipelineStatusService._execution_stages(stages).values()
         }
         return 'pending' in statuses and statuses <= {'pending', 'completed', 'skipped'}
 
     @staticmethod
     def _resolve_overall_status(stages: dict[str, dict[str, Any]]) -> str:
+        stages = EODPipelineStatusService._execution_stages(stages)
         warning_stage_ids = set(
             daily_pipeline_nonblocking_warning_stage_ids(stages)
         )

@@ -28,7 +28,9 @@ from app.eod.run_stage_support import (
     nonblocking_partial_progression_digest,
 )
 from app.repositories.eod_run_repository import (
+    _automatic_terminal_continuation_resume_stage,
     _load_pipeline_recovery_candidates,
+    _resolved_terminal_continuation_suffix,
     AutoEODRecoveryTarget,
     advisory_eod_collection_lock,
     advisory_eod_collection_locks,
@@ -368,6 +370,49 @@ class DailyPriceBarRunProvenanceTests(unittest.TestCase):
 
 
 class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
+    def test_terminal_continuation_suffix_accepts_current_and_legacy_only(
+        self,
+    ) -> None:
+        current = (
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+        )
+        legacy = (*current, 'signal_decider_evaluations')
+
+        self.assertEqual(
+            _resolved_terminal_continuation_suffix(current),
+            current,
+        )
+        self.assertEqual(
+            _resolved_terminal_continuation_suffix(legacy),
+            legacy,
+        )
+        self.assertEqual(
+            _resolved_terminal_continuation_suffix(
+                ('price_collection', *current)
+            ),
+            current,
+        )
+        self.assertIsNone(
+            _resolved_terminal_continuation_suffix(
+                (*current, 'external_news_collect')
+            )
+        )
+        self.assertEqual(
+            _automatic_terminal_continuation_resume_stage(
+                legacy,
+                satisfied_prefix_count=2,
+            ),
+            'next_open_execution_plan',
+        )
+        self.assertIsNone(
+            _automatic_terminal_continuation_resume_stage(
+                legacy,
+                satisfied_prefix_count=3,
+            )
+        )
+
     def setUp(self) -> None:
         self.sqlite_engine = create_engine('sqlite+pysqlite:///:memory:')
         EODCollectionRun.__table__.create(self.sqlite_engine)
@@ -2115,7 +2160,6 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ]
         with self.session_factory.begin() as session:
             eod_run = EODCollectionRun(
@@ -2540,7 +2584,6 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                     'agent_feedback_summaries': 'completed',
                     'signal_decider': 'pending',
                     'next_open_execution_plan': 'pending',
-                    'signal_decider_evaluations': 'pending',
                 },
             }
             decider_stage = session.execute(
@@ -3194,60 +3237,32 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                         },
                     )
                 )
-                session.add_all(
-                    [
-                        DailyPipelineStageRun(
-                            pipeline_run_id=proof_pipeline_run.id,
-                            market_date=source_date,
-                            stage_id='next_open_execution_plan',
-                            status='blocked',
-                            processed=0,
-                            total=0,
-                            succeeded=0,
-                            failed=0,
-                            remaining=0,
-                            started_at=started_at + timedelta(minutes=4),
-                            completed_at=started_at + timedelta(minutes=4),
-                            source_run_ids={},
-                            details={
-                                'result_summary': {
-                                    'reason': (
-                                        'signal_decider_stage_incomplete'
-                                    )
-                                }
-                            },
-                        ),
-                        DailyPipelineStageRun(
-                            pipeline_run_id=proof_pipeline_run.id,
-                            market_date=source_date,
-                            stage_id='signal_decider_evaluations',
-                            status='blocked',
-                            processed=0,
-                            total=0,
-                            succeeded=0,
-                            failed=0,
-                            remaining=0,
-                            started_at=started_at + timedelta(minutes=4),
-                            completed_at=started_at + timedelta(minutes=4),
-                            source_run_ids={},
-                            details={
-                                'result_summary': {
-                                    'reason': (
-                                        'declared_dependencies_incomplete'
-                                    ),
-                                    'incomplete_dependencies': [
-                                        'signal_decider'
-                                    ],
-                                }
-                            },
-                        ),
-                    ]
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=proof_pipeline_run.id,
+                        market_date=source_date,
+                        stage_id='next_open_execution_plan',
+                        status='blocked',
+                        processed=0,
+                        total=0,
+                        succeeded=0,
+                        failed=0,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=4),
+                        completed_at=started_at + timedelta(minutes=4),
+                        source_run_ids={},
+                        details={
+                            'result_summary': {
+                                'reason': 'signal_decider_stage_incomplete'
+                            }
+                        },
+                    )
                 )
             false_skip = DailyPipelineRun(
                 market_date=source_date,
                 trigger='auto_eod_followup_resume',
                 status='skipped',
-                current_stage='signal_decider_evaluations',
+                current_stage=stage_ids[-1],
                 started_at=started_at + timedelta(minutes=5),
                 completed_at=started_at + timedelta(minutes=6),
                 run_metadata={

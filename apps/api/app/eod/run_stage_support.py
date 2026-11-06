@@ -113,7 +113,6 @@ EXPIRED_DECISION_REPLAY_STAGE_IDS: frozenset[str] = frozenset(
 AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER: tuple[str, ...] = (
     'signal_decider',
     'next_open_execution_plan',
-    'signal_decider_evaluations',
 )
 AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS: tuple[tuple[str, ...], ...] = (
     (
@@ -122,8 +121,24 @@ AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS: tuple[tuple[str, ...], ...] = (
     ),
     AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
 )
-NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION = (
+LEGACY_AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER: tuple[str, ...] = (
+    *AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    'signal_decider_evaluations',
+)
+LEGACY_AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS: tuple[
+    tuple[str, ...], ...
+] = (
+    (
+        'agent_feedback_summaries',
+        *LEGACY_AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    ),
+    LEGACY_AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+)
+LEGACY_NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION = (
     'nonblocking_partial_progression_v1'
+)
+NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION = (
+    'nonblocking_partial_progression_v2'
 )
 NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION = (
     'nonblocking_feedback_retry_debt_v1'
@@ -364,6 +379,48 @@ def nonblocking_partial_progression_digest(
         ensure_ascii=True,
     )
     return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+
+def validated_independent_role_symbol_scopes(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    admitted_symbols: Sequence[str],
+) -> dict[str, list[str]] | None:
+    """Validate exact per-role scopes against their admitted union."""
+
+    normalized_admitted = normalize_symbol_codes(admitted_symbols)
+    raw_role_symbol_scopes = progress_summary.get('role_symbol_scopes')
+    if not (
+        normalized_admitted
+        and normalized_admitted == list(admitted_symbols)
+        and isinstance(raw_role_symbol_scopes, Mapping)
+        and set(raw_role_symbol_scopes) == set(roles)
+    ):
+        return None
+
+    normalized_scopes: dict[str, list[str]] = {}
+    for role in roles:
+        raw_role_scope = raw_role_symbol_scopes.get(role)
+        if not isinstance(raw_role_scope, list):
+            return None
+        normalized_role_scope = normalize_symbol_codes(raw_role_scope)
+        if (
+            not normalized_role_scope
+            or normalized_role_scope != raw_role_scope
+            or not set(normalized_role_scope).issubset(
+                normalized_admitted
+            )
+        ):
+            return None
+        normalized_scopes[role] = normalized_role_scope
+
+    covered_symbols = set().union(
+        *(set(scope) for scope in normalized_scopes.values())
+    )
+    if covered_symbols != set(normalized_admitted):
+        return None
+    return normalized_scopes
 
 
 def validated_nonblocking_downstream_scope_proof(
@@ -644,8 +701,9 @@ def validated_nonblocking_partial_progression_marker(
 
     The pipeline remains truthfully ``partial``.  This marker only proves that
     every failed role/symbol pair was removed from the cohort that reached the
-    plan and evaluation stages, so the remaining retry debt need not freeze
-    unrelated symbols.
+    execution-plan stage, so the remaining retry debt need not freeze
+    unrelated symbols.  Legacy v1 markers additionally bind the retired daily
+    evaluation stage and remain readable for stored recovery history.
     """
 
     if not isinstance(recovery_result, Mapping):
@@ -666,9 +724,22 @@ def validated_nonblocking_partial_progression_marker(
     result_pipeline_run_id = recovery_result.get('pipeline_run_id')
     eod_run_id = metadata.get('reused_eod_collection_run_id')
     resolved_stages = metadata.get('resolved_stages')
-    if not (
-        marker.get('schema_version')
+    marker_schema_version = marker.get('schema_version')
+    legacy_marker = (
+        marker_schema_version
+        == LEGACY_NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION
+    )
+    current_marker = (
+        marker_schema_version
         == NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION
+    )
+    allowed_recovery_stage_orders = (
+        LEGACY_AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS
+        if legacy_marker
+        else AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS
+    )
+    if not (
+        (legacy_marker or current_marker)
         and marker.get('blocking_status') == 'non_blocking'
         and str(marker.get('proof_digest') or '')
         == nonblocking_partial_progression_digest(marker)
@@ -695,8 +766,7 @@ def validated_nonblocking_partial_progression_marker(
         and str(pipeline_run.get('completed_at') or '').strip()
         and not str(pipeline_run.get('error_message') or '').strip()
         and isinstance(resolved_stages, list)
-        and tuple(resolved_stages)
-        in AUTO_PITR_PREOPEN_RECOVERY_STAGE_ORDERS
+        and tuple(resolved_stages) in allowed_recovery_stage_orders
         and pipeline_run.get('current_stage') == resolved_stages[-1]
         and set(stages) == set(resolved_stages)
     ):
@@ -763,9 +833,13 @@ def validated_nonblocking_partial_progression_marker(
         'next_open_execution_plan',
         downstream.get('plan_scope_proof'),
     )
-    evaluation_scope_proof = validated_nonblocking_downstream_scope_proof(
-        'signal_decider_evaluations',
-        downstream.get('evaluation_scope_proof'),
+    evaluation_scope_proof = (
+        validated_nonblocking_downstream_scope_proof(
+            'signal_decider_evaluations',
+            downstream.get('evaluation_scope_proof'),
+        )
+        if legacy_marker
+        else None
     )
     summary_failed_scope = failed_scope(
         summary,
@@ -784,11 +858,10 @@ def validated_nonblocking_partial_progression_marker(
             decider_completed,
             actionable,
             plan_scope_proof,
-            evaluation_scope_proof,
             summary_failed_scope,
             decider_failed_scope,
         )
-    ):
+    ) or (legacy_marker and evaluation_scope_proof is None):
         return None
     if not (
         isinstance(raw_decider_completed_by_role, Mapping)
@@ -807,26 +880,74 @@ def validated_nonblocking_partial_progression_marker(
         decider_completed_by_role[role] = role_symbols
     summary_failed = summary_failed_scope[1]
     decider_failed = decider_failed_scope[1]
+    decider_admitted_by_role: dict[str, list[str]] = {}
+    for role in DECISION_SUPPORT_AGENT_NAMES:
+        completed_for_role = decider_completed_by_role[role]
+        failed_for_role = decider_failed_scope[0][role]
+        if set(completed_for_role).intersection(failed_for_role):
+            return None
+        role_scope = normalize_symbol_codes(
+            [*completed_for_role, *failed_for_role]
+        )
+        if (
+            not role_scope
+            or not set(role_scope).issubset(decider_admitted)
+        ):
+            return None
+        decider_admitted_by_role[role] = role_scope
+    if set().union(
+        *(set(scope) for scope in decider_admitted_by_role.values())
+    ) != set(decider_admitted):
+        return None
+
+    expected_downstream_keys = {
+        'plan_status',
+        'actionable_symbols',
+        'plan_scope_proof',
+    }
+    if legacy_marker:
+        expected_downstream_keys.update(
+            {'evaluation_status', 'evaluation_scope_proof'}
+        )
+    if set(downstream) != expected_downstream_keys:
+        return None
 
     raw_decision_identities = completion_authority.get(
         'decision_identities'
     )
+    completion_authority_keys = {
+        'schema_version',
+        'parent_run_id',
+        'parent_summary_run_id',
+        'completed_symbols',
+        'completed_symbols_by_role',
+        'decision_identities',
+        'signal_decider_proof_digest',
+        'next_open_execution_plan_proof_digest',
+        'next_open_manifest_digest',
+    }
+    if legacy_marker:
+        completion_authority_keys.add(
+            'signal_decider_evaluations_proof_digest'
+        )
+    completion_digest_fields = [
+        'signal_decider_proof_digest',
+        'next_open_execution_plan_proof_digest',
+        'next_open_manifest_digest',
+    ]
+    if legacy_marker:
+        completion_digest_fields.append(
+            'signal_decider_evaluations_proof_digest'
+        )
+    expected_completion_authority_version = (
+        'nonblocking_strict_completion_authority_v1'
+        if legacy_marker
+        else 'nonblocking_strict_completion_authority_v2'
+    )
     if not (
-        set(completion_authority)
-        == {
-            'schema_version',
-            'parent_run_id',
-            'parent_summary_run_id',
-            'completed_symbols',
-            'completed_symbols_by_role',
-            'decision_identities',
-            'signal_decider_proof_digest',
-            'next_open_execution_plan_proof_digest',
-            'signal_decider_evaluations_proof_digest',
-            'next_open_manifest_digest',
-        }
+        set(completion_authority) == completion_authority_keys
         and completion_authority.get('schema_version')
-        == 'nonblocking_strict_completion_authority_v1'
+        == expected_completion_authority_version
         and completion_authority.get('parent_run_id')
         == decider.get('source_run_id')
         and completion_authority.get('parent_summary_run_id')
@@ -838,12 +959,7 @@ def validated_nonblocking_partial_progression_marker(
         and all(
             isinstance(completion_authority.get(field), str)
             and len(str(completion_authority.get(field))) == 64
-            for field in (
-                'signal_decider_proof_digest',
-                'next_open_execution_plan_proof_digest',
-                'signal_decider_evaluations_proof_digest',
-                'next_open_manifest_digest',
-            )
+            for field in completion_digest_fields
         )
     ):
         return None
@@ -917,11 +1033,22 @@ def validated_nonblocking_partial_progression_marker(
         roles: Sequence[str],
         admitted_symbols: Sequence[str],
         failures_by_role: Mapping[str, Sequence[str]],
+        admitted_symbols_by_role: Mapping[
+            str,
+            Sequence[str],
+        ] | None = None,
     ) -> bool:
         total_items = payload.get('total_items')
         completed_items = payload.get('completed_items')
         failed_items = payload.get('failed_items')
-        expected_total = len(admitted_symbols) * len(roles)
+        expected_total = (
+            sum(
+                len(admitted_symbols_by_role[role])
+                for role in roles
+            )
+            if admitted_symbols_by_role is not None
+            else len(admitted_symbols) * len(roles)
+        )
         expected_failed = sum(
             len(failures_by_role[role]) for role in roles
         )
@@ -947,7 +1074,7 @@ def validated_nonblocking_partial_progression_marker(
         and set(decider_admitted) == set(summary_completed)
         and all(
             set(decider_completed_by_role[role])
-            == set(decider_admitted).difference(
+            == set(decider_admitted_by_role[role]).difference(
                 decider_failed_scope[0][role]
             )
             for role in DECISION_SUPPORT_AGENT_NAMES
@@ -963,9 +1090,15 @@ def validated_nonblocking_partial_progression_marker(
         and actionable == decider_completed
         and (summary_failed or decider_failed)
         and downstream.get('plan_status') == 'completed'
-        and downstream.get('evaluation_status') == 'completed'
-        and evaluation_scope_proof['requested_symbols']
-        == decider_completed_by_role['signal-decider']
+        and (
+            not legacy_marker
+            or (
+                downstream.get('evaluation_status') == 'completed'
+                and evaluation_scope_proof is not None
+                and evaluation_scope_proof['requested_symbols']
+                == decider_completed_by_role['signal-decider']
+            )
+        )
         and set(plan_scope_proof['active_symbols']) <= set(actionable)
         and retry_debt.get('schema_version')
         == NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION
@@ -984,6 +1117,7 @@ def validated_nonblocking_partial_progression_marker(
             roles=DECISION_SUPPORT_AGENT_NAMES,
             admitted_symbols=decider_admitted,
             failures_by_role=decider_failed_scope[0],
+            admitted_symbols_by_role=decider_admitted_by_role,
         )
     ):
         return None
@@ -1066,6 +1200,10 @@ def validated_nonblocking_partial_progression_marker(
         source_run_id: str,
         marker_payload: Mapping[str, Any],
         require_scope_authority: bool,
+        admitted_symbols_by_role: Mapping[
+            str,
+            Sequence[str],
+        ] | None = None,
     ) -> bool:
         if not exact_stage_source(stage, source_run_id):
             return False
@@ -1137,12 +1275,31 @@ def validated_nonblocking_partial_progression_marker(
                 if independent_roles
                 else resolve_terminal_role_success_intersection
             )
+            expected_role_symbol_scopes: dict[str, list[str]]
+            if independent_roles:
+                exact_role_scopes = (
+                    validated_independent_role_symbol_scopes(
+                        progress_summary=progress_summary,
+                        roles=roles,
+                        admitted_symbols=admitted_symbols,
+                    )
+                )
+                if exact_role_scopes is None:
+                    return False
+                if (
+                    admitted_symbols_by_role is None
+                    or exact_role_scopes != admitted_symbols_by_role
+                ):
+                    return False
+                expected_role_symbol_scopes = exact_role_scopes
+            else:
+                expected_role_symbol_scopes = {
+                    role: admitted_symbols for role in roles
+                }
             exact_resolution = resolver(
                 progress_summary=progress_summary,
                 roles=roles,
-                expected_role_symbol_scopes={
-                    role: admitted_symbols for role in roles
-                },
+                expected_role_symbol_scopes=expected_role_symbol_scopes,
             )
             if exact_resolution.get('ready') is True:
                 return bool(
@@ -1195,7 +1352,10 @@ def validated_nonblocking_partial_progression_marker(
     if not (
         stage_status('signal_decider') in {'completed', 'partial'}
         and stage_status('next_open_execution_plan') == 'completed'
-        and stage_status('signal_decider_evaluations') == 'completed'
+        and (
+            not legacy_marker
+            or stage_status('signal_decider_evaluations') == 'completed'
+        )
         and (
             'agent_feedback_summaries' not in resolved_stages
             or stage_status('agent_feedback_summaries')
@@ -1233,6 +1393,7 @@ def validated_nonblocking_partial_progression_marker(
             source_run_id=str(decider['source_run_id']),
             marker_payload=decider,
             require_scope_authority=True,
+            admitted_symbols_by_role=decider_admitted_by_role,
         )
     ):
         return None
@@ -1300,23 +1461,36 @@ def validated_nonblocking_partial_progression_marker(
         'next_open_execution_plan',
         parent_scope_proof=signal_completion_proof,
     )
-    evaluation_completion_proof = validated_completion_scope_proof(
-        'signal_decider_evaluations',
-        parent_scope_proof=signal_completion_proof,
+    evaluation_completion_proof = (
+        validated_completion_scope_proof(
+            'signal_decider_evaluations',
+            parent_scope_proof=signal_completion_proof,
+        )
+        if legacy_marker
+        else None
     )
     if not (
         isinstance(signal_completion_proof, Mapping)
         and isinstance(plan_completion_proof, Mapping)
-        and isinstance(evaluation_completion_proof, Mapping)
+        and (
+            not legacy_marker
+            or isinstance(evaluation_completion_proof, Mapping)
+        )
         and signal_completion_proof.get('proof_digest')
         == completion_authority.get('signal_decider_proof_digest')
         and plan_completion_proof.get('proof_digest')
         == completion_authority.get(
             'next_open_execution_plan_proof_digest'
         )
-        and evaluation_completion_proof.get('proof_digest')
-        == completion_authority.get(
-            'signal_decider_evaluations_proof_digest'
+        and (
+            not legacy_marker
+            or (
+                evaluation_completion_proof is not None
+                and evaluation_completion_proof.get('proof_digest')
+                == completion_authority.get(
+                    'signal_decider_evaluations_proof_digest'
+                )
+            )
         )
         and plan_completion_proof.get('manifest_digest')
         == completion_authority.get('next_open_manifest_digest')
@@ -1334,12 +1508,18 @@ def validated_nonblocking_partial_progression_marker(
         == completion_authority.get('parent_run_id')
         and plan_completion_proof.get('parent_completed_symbols')
         == actionable
-        and evaluation_completion_proof.get('parent_run_id')
-        == completion_authority.get('parent_run_id')
-        and evaluation_completion_proof.get(
-            'parent_completed_symbols'
+        and (
+            not legacy_marker
+            or (
+                evaluation_completion_proof is not None
+                and evaluation_completion_proof.get('parent_run_id')
+                == completion_authority.get('parent_run_id')
+                and evaluation_completion_proof.get(
+                    'parent_completed_symbols'
+                )
+                == decider_completed_by_role['signal-decider']
+            )
         )
-        == decider_completed_by_role['signal-decider']
     ):
         return None
 
@@ -1371,34 +1551,45 @@ def validated_nonblocking_partial_progression_marker(
         str,
         set[tuple[int, str]],
     ] = {}
-    for entry in evaluation_completion_proof['decision_horizon_scope']:
-        evaluation_identities_by_symbol.setdefault(
-            entry['symbol'],
-            set(),
-        ).add(
-            (
-                entry['snapshot_id'],
-                entry['decision_run_id'],
+    if legacy_marker and evaluation_completion_proof is not None:
+        for entry in evaluation_completion_proof[
+            'decision_horizon_scope'
+        ]:
+            evaluation_identities_by_symbol.setdefault(
+                entry['symbol'],
+                set(),
+            ).add(
+                (
+                    entry['snapshot_id'],
+                    entry['decision_run_id'],
+                )
             )
-        )
     if not (
         plan_completion_proof.get('parent_summary_run_id')
         == completion_authority.get('parent_summary_run_id')
         and plan_completion_proof.get('parent_admitted_symbols')
         == decider_admitted
         and plan_identity_by_key == expected_identity_by_key
-        and evaluation_completion_proof.get('parent_summary_run_id')
-        == completion_authority.get('parent_summary_run_id')
-        and evaluation_completion_proof.get('request_symbols')
-        == decider_completed_by_role['signal-decider']
-        and evaluation_completion_proof.get('decision_count')
-        == len(decider_completed_by_role['signal-decider'])
-        and evaluation_identities_by_symbol
-        == {
-            symbol: {identity}
-            for symbol, identity
-            in expected_signal_identity_by_symbol.items()
-        }
+        and (
+            not legacy_marker
+            or (
+                evaluation_completion_proof is not None
+                and evaluation_completion_proof.get(
+                    'parent_summary_run_id'
+                )
+                == completion_authority.get('parent_summary_run_id')
+                and evaluation_completion_proof.get('request_symbols')
+                == decider_completed_by_role['signal-decider']
+                and evaluation_completion_proof.get('decision_count')
+                == len(decider_completed_by_role['signal-decider'])
+                and evaluation_identities_by_symbol
+                == {
+                    symbol: {identity}
+                    for symbol, identity
+                    in expected_signal_identity_by_symbol.items()
+                }
+            )
+        )
     ):
         return None
 
@@ -1428,10 +1619,13 @@ def validated_nonblocking_partial_progression_marker(
     if not (
         stage_downstream_scope_proof('next_open_execution_plan')
         == plan_scope_proof
-        and stage_downstream_scope_proof(
-            'signal_decider_evaluations'
+        and (
+            not legacy_marker
+            or stage_downstream_scope_proof(
+                'signal_decider_evaluations'
+            )
+            == evaluation_scope_proof
         )
-        == evaluation_scope_proof
     ):
         return None
     return marker
@@ -1793,10 +1987,9 @@ def is_canonical_same_day_signal_rearm_proof(
 
     signal_stage = stages.get('signal_decider')
     plan_stage = stages.get('next_open_execution_plan')
-    evaluation_stage = stages.get('signal_decider_evaluations')
     if not all(
         isinstance(stage, Mapping)
-        for stage in (signal_stage, plan_stage, evaluation_stage)
+        for stage in (signal_stage, plan_stage)
     ):
         return False
     result_summary = stage_result_summary(signal_stage)
@@ -1834,7 +2027,6 @@ def is_canonical_same_day_signal_rearm_proof(
         if str(value or '').strip()
     }
     plan_summary = stage_result_summary(plan_stage)
-    evaluation_summary = stage_result_summary(evaluation_stage)
     try:
         total = int(signal_stage.get('total') or 0)
         processed = int(signal_stage.get('processed') or 0)
@@ -1861,14 +2053,8 @@ def is_canonical_same_day_signal_rearm_proof(
         and 'openclaw_dispatch_circuit_breaker' not in result_summary
         and str(plan_stage.get('status') or '').strip().lower()
         == 'blocked'
-        and str(evaluation_stage.get('status') or '').strip().lower()
-        == 'blocked'
         and str(plan_summary.get('reason') or '').strip()
         == 'signal_decider_stage_incomplete'
-        and str(evaluation_summary.get('reason') or '').strip()
-        == 'declared_dependencies_incomplete'
-        and evaluation_summary.get('incomplete_dependencies')
-        == ['signal_decider']
         and isinstance(prerequisites, Mapping)
         and prerequisites.get('ready') is True
         and isinstance(summary, Mapping)
@@ -1915,6 +2101,8 @@ def is_canonical_same_day_signal_rearm_proof(
         and pending_items == 0
         and retryable_failure_groups
     )
+
+
 def is_recoverable_same_day_intraday_watch_expiration(
     pipeline_run: Mapping[str, Any] | None,
     *,

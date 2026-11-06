@@ -82,6 +82,11 @@ def test_intraday_snapshots_is_an_official_pre_feedback_stage() -> None:
     assert 'intraday_snapshots' in resolved
     assert set(STAGE_DEFINITIONS) == set(DAILY_STAGE_ORDER)
     assert 'intraday_snapshots' in DEFAULT_DAILY_STAGE_ORDER
+    assert 'signal_decider_evaluations' in DAILY_STAGE_ORDER
+    assert 'signal_decider_evaluations' in STAGE_DEFINITIONS
+    assert 'signal_decider_evaluations' not in DEFAULT_DAILY_STAGE_ORDER
+    assert 'signal_decider_evaluations' not in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
+    assert 'signal_decider_evaluations' not in AUTO_DAILY_TRACKED_STAGE_ORDER
     assert (
         AUTO_DAILY_FOLLOWUP_STAGE_ORDER.index('macro_context_refresh')
         < AUTO_DAILY_FOLLOWUP_STAGE_ORDER.index('intraday_snapshots')
@@ -3296,7 +3301,6 @@ def test_final_reconciled_stage_debt_is_persisted_before_convergence() -> None:
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         )
     }
     suffix_result = {

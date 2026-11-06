@@ -44,9 +44,10 @@ from app.eod.daily_pipeline_outcomes import (
 )
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.summary_cutoff_contract import (
-    LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    CUTOFF_REPAIR_STAGE_IDS,
     SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION,
     completed_summary_scope_matches_parent,
+    resolved_cutoff_repair_stage_ids,
     summary_cutoff_proof_from_stage,
 )
 from app.eod.master import refresh_master_if_due
@@ -253,13 +254,11 @@ DEFAULT_DAILY_STAGE_ORDER: tuple[str, ...] = (
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
-    'signal_decider_evaluations',
 )
 TERMINAL_FEEDBACK_CONTINUATION_STAGE_ORDER: tuple[str, ...] = (
     'agent_feedback_summaries',
     'signal_decider',
     'next_open_execution_plan',
-    'signal_decider_evaluations',
 )
 DEFAULT_FEEDBACK_MAX_CYCLES = 3
 DEFAULT_FEEDBACK_OUTER_BATCH_SIZE = 20
@@ -768,7 +767,9 @@ STAGE_DEFINITIONS: dict[str, DailyStageDefinition] = {
         supports_force=True,
         inspect_routes=('/agent-context/signal-decider/evaluations', '/agent-context/signal-decider/diagnostics'),
         output_tables=('signal_decider_realized_outcomes', 'signal_decider_evaluations'),
-        default_selected=True,
+        # Historical outcome grading is an explicit maintenance operation.
+        # It must not extend or block the execution-critical daily chain.
+        default_selected=False,
     ),
     'next_open_execution_plan': DailyStageDefinition(
         id='next_open_execution_plan',
@@ -1454,10 +1455,13 @@ class DailyPipelineStageService:
                 'same-day intraday-watch rearm resume is outside its '
                 'target PREOPEN/OPEN session'
             )
+        cutoff_repair_stage_ids = resolved_cutoff_repair_stage_ids(
+            resolved_stages
+        )
         if summary_cutoff_contract_repair and not (
             trigger == 'auto_eod_followup_resume'
-            and tuple(resolved_stages) == LEGACY_CUTOFF_REPAIR_STAGE_IDS
-            and resume_from_stage == LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+            and cutoff_repair_stage_ids is not None
+            and resume_from_stage == CUTOFF_REPAIR_STAGE_IDS[0]
             and reused_eod_collection_run_id is not None
             and isinstance(normalized_summary_cutoff_proof, dict)
             and str(
@@ -1475,6 +1479,12 @@ class DailyPipelineStageService:
                 'summary cutoff contract repair requires the exact '
                 'automatic decider suffix and FAST summary proof'
             )
+        if summary_cutoff_contract_repair:
+            # A persisted repair may still advertise the retired evaluation
+            # tail.  It is readable for in-place recovery, but automatic
+            # execution always converges on the decision/plan contract.
+            requested_stages = list(CUTOFF_REPAIR_STAGE_IDS)
+            resolved_stages = list(CUTOFF_REPAIR_STAGE_IDS)
         feedback_prerequisite_stage_ids = (
             self._feedback_prerequisite_stage_ids(
                 point_in_time_recovery=point_in_time_recovery,
@@ -3978,6 +3988,12 @@ class DailyPipelineStageService:
             if isinstance(existing_run_metadata.get('stage_statuses'), dict)
             else {}
         )
+        if summary_cutoff_contract_repair:
+            existing_stage_statuses = {
+                stage_id: status
+                for stage_id, status in existing_stage_statuses.items()
+                if stage_id in CUTOFF_REPAIR_STAGE_IDS
+            }
         current_run_stage_outcomes = {
             stage_id: outcome
             for stage_id, outcome in stage_outcomes.items()
@@ -4174,22 +4190,10 @@ class DailyPipelineStageService:
             for role in DECISION_SUPPORT_AGENT_NAMES
         }
         actionable_symbols = list(decider_proof['completed_symbols'])
-        signal_evaluation_symbols = list(
-            decider_completed_symbols_by_role['signal-decider']
-        )
         plan_outcome = stage_outcomes.get('next_open_execution_plan')
-        evaluation_outcome = stage_outcomes.get(
-            'signal_decider_evaluations'
-        )
         plan_scope_proof = build_nonblocking_downstream_scope_proof(
             'next_open_execution_plan',
             (plan_outcome or {}).get('result'),
-        )
-        evaluation_scope_proof = (
-            build_nonblocking_downstream_scope_proof(
-                'signal_decider_evaluations',
-                (evaluation_outcome or {}).get('result'),
-            )
         )
         decider_completion_scope_proof = (
             DailyPipelineStageService
@@ -4205,28 +4209,13 @@ class DailyPipelineStageService:
                 parent_scope_proof=decider_completion_scope_proof,
             )
         )
-        evaluation_completion_scope_proof = (
-            DailyPipelineStageService
-            ._build_evaluations_completion_scope_proof(
-                (evaluation_outcome or {}).get('result') or {},
-                parent_scope_proof=decider_completion_scope_proof,
-            )
-        )
         if not (
             str((plan_outcome or {}).get('status') or '').strip().lower()
             == 'completed'
-            and str(
-                (evaluation_outcome or {}).get('status') or ''
-            ).strip().lower()
-            == 'completed'
             and actionable_symbols
             and isinstance(plan_scope_proof, Mapping)
-            and isinstance(evaluation_scope_proof, Mapping)
             and isinstance(decider_completion_scope_proof, Mapping)
             and isinstance(plan_completion_scope_proof, Mapping)
-            and isinstance(evaluation_completion_scope_proof, Mapping)
-            and evaluation_scope_proof.get('requested_symbols')
-            == signal_evaluation_symbols
             and set(plan_scope_proof.get('active_symbols') or [])
             <= set(actionable_symbols)
             and (
@@ -4311,14 +4300,12 @@ class DailyPipelineStageService:
             },
             'downstream': {
                 'plan_status': 'completed',
-                'evaluation_status': 'completed',
                 'actionable_symbols': actionable_symbols,
                 'plan_scope_proof': plan_scope_proof,
-                'evaluation_scope_proof': evaluation_scope_proof,
             },
             'completion_authority': {
                 'schema_version': (
-                    'nonblocking_strict_completion_authority_v1'
+                    'nonblocking_strict_completion_authority_v2'
                 ),
                 'parent_run_id': decider_completion_scope_proof[
                     'source_run_id'
@@ -4343,9 +4330,6 @@ class DailyPipelineStageService:
                 ),
                 'next_open_execution_plan_proof_digest': (
                     plan_completion_scope_proof['proof_digest']
-                ),
-                'signal_decider_evaluations_proof_digest': (
-                    evaluation_completion_scope_proof['proof_digest']
                 ),
                 'next_open_manifest_digest': (
                     plan_completion_scope_proof['manifest_digest']
@@ -9797,13 +9781,39 @@ class DailyPipelineStageService:
             == feedback_cutoff_resolution.get('completed_scope_proof')
         ):
             return None
+        raw_role_symbol_scopes = progress_summary.get(
+            'role_symbol_scopes'
+        )
+        if not (
+            isinstance(raw_role_symbol_scopes, Mapping)
+            and set(raw_role_symbol_scopes)
+            == set(DECISION_SUPPORT_AGENT_NAMES)
+        ):
+            return None
+        expected_role_symbol_scopes: dict[str, list[str]] = {}
+        for role in DECISION_SUPPORT_AGENT_NAMES:
+            raw_role_scope = raw_role_symbol_scopes.get(role)
+            if not isinstance(raw_role_scope, list):
+                return None
+            normalized_role_scope = normalize_symbol_codes(raw_role_scope)
+            if (
+                not normalized_role_scope
+                or normalized_role_scope != raw_role_scope
+                or not set(normalized_role_scope).issubset(
+                    normalized_expected_symbols
+                )
+            ):
+                return None
+            expected_role_symbol_scopes[role] = normalized_role_scope
+        if set().union(
+            *(set(scope) for scope in expected_role_symbol_scopes.values())
+        ) != set(normalized_expected_symbols):
+            return None
+
         resolution = resolve_terminal_independent_role_success(
             progress_summary=progress_summary,
             roles=DECISION_SUPPORT_AGENT_NAMES,
-            expected_role_symbol_scopes={
-                role: normalized_expected_symbols
-                for role in DECISION_SUPPORT_AGENT_NAMES
-            },
+            expected_role_symbol_scopes=expected_role_symbol_scopes,
         )
         completed_symbols = resolution.get('completed_symbols')
         completed_symbols_by_role = resolution.get(

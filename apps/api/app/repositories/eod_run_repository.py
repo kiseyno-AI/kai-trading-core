@@ -59,6 +59,48 @@ logger = logging.getLogger(__name__)
 
 KIS_FINAL_BAR_REPAIR_SOURCE = 'kis_final_bar_repair'
 
+_CURRENT_TERMINAL_CONTINUATION_SUFFIX = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+)
+_LEGACY_TERMINAL_CONTINUATION_SUFFIX = (
+    *_CURRENT_TERMINAL_CONTINUATION_SUFFIX,
+    'signal_decider_evaluations',
+)
+
+
+def _resolved_terminal_continuation_suffix(
+    resolved_stages: Sequence[str],
+) -> tuple[str, ...] | None:
+    normalized = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stages
+    )
+    if not normalized or any(not stage_id for stage_id in normalized):
+        return None
+    for suffix in (
+        _LEGACY_TERMINAL_CONTINUATION_SUFFIX,
+        _CURRENT_TERMINAL_CONTINUATION_SUFFIX,
+    ):
+        if normalized[-len(suffix) :] == suffix:
+            return suffix
+    return None
+
+
+def _automatic_terminal_continuation_resume_stage(
+    continuation_suffix: Sequence[str],
+    *,
+    satisfied_prefix_count: int,
+) -> str | None:
+    if not 0 <= satisfied_prefix_count < len(continuation_suffix):
+        return None
+    stage_id = str(
+        continuation_suffix[satisfied_prefix_count] or ''
+    ).strip()
+    if stage_id == 'signal_decider_evaluations':
+        return None
+    return stage_id or None
+
 
 def daily_price_bar_has_current_eod_run_provenance(
     run_id: int,
@@ -1850,17 +1892,13 @@ def _followup_recovery_is_reclaimable_feedback_lease_loss(
         for stage_id in raw_resolved_stages
         if str(stage_id or '').strip()
     ]
-    continuation_suffix = (
-        'agent_feedback_summaries',
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
+    continuation_suffix = _resolved_terminal_continuation_suffix(
+        resolved_stages
     )
     if (
         len(resolved_stages) != len(raw_resolved_stages)
         or len(resolved_stages) != len(set(resolved_stages))
-        or tuple(resolved_stages[-len(continuation_suffix) :])
-        != continuation_suffix
+        or continuation_suffix is None
     ):
         return False
 
@@ -1944,8 +1982,8 @@ def _followup_recovery_is_reclaimable_feedback_lease_loss(
         and not (stage.source_run_ids or {})
         and not (stage.details or {})
         for stage in (
-            stage_rows_by_id['next_open_execution_plan'],
-            stage_rows_by_id['signal_decider_evaluations'],
+            stage_rows_by_id[stage_id]
+            for stage_id in continuation_suffix[2:]
         )
     )
 
@@ -2033,17 +2071,13 @@ def _followup_recovery_is_resumable_terminal_continuation(
         for stage_id in raw_resolved_stages
         if str(stage_id or '').strip()
     ]
-    continuation_suffix = (
-        'agent_feedback_summaries',
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
+    continuation_suffix = _resolved_terminal_continuation_suffix(
+        resolved_stages
     )
     if (
         len(resolved_stages) != len(raw_resolved_stages)
         or len(resolved_stages) != len(set(resolved_stages))
-        or tuple(resolved_stages[-len(continuation_suffix) :])
-        != continuation_suffix
+        or continuation_suffix is None
     ):
         return False
 
@@ -2084,6 +2118,17 @@ def _followup_recovery_is_resumable_terminal_continuation(
             break
         satisfied_prefix.append(stage_id)
     if len(satisfied_prefix) == len(continuation_suffix):
+        return False
+
+    first_unfinished_index = len(satisfied_prefix)
+    first_unfinished_stage = _automatic_terminal_continuation_resume_stage(
+        continuation_suffix,
+        satisfied_prefix_count=first_unfinished_index,
+    )
+    if first_unfinished_stage is None:
+        # Historical evaluation-only debt is maintenance work, not an
+        # execution-readiness continuation.  Preserve the persisted row for
+        # audit without scheduling or resuming it automatically.
         return False
 
     recorded_prefix = metadata.get('terminal_continuation_completed_prefix')
@@ -2154,8 +2199,6 @@ def _followup_recovery_is_resumable_terminal_continuation(
             and not (stage.details or {})
         )
 
-    first_unfinished_index = len(satisfied_prefix)
-    first_unfinished_stage = continuation_suffix[first_unfinished_index]
     first_unfinished = stage_rows_by_id[first_unfinished_stage]
     first_status = str(first_unfinished.status or '').strip().lower()
     current_stage = str(pipeline_run.current_stage or '').strip()

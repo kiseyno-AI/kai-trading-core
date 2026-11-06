@@ -1,6 +1,6 @@
-import unittest
 import hashlib
 import json
+import unittest
 from copy import deepcopy
 from datetime import date
 from types import SimpleNamespace
@@ -15,7 +15,9 @@ from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
+from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.run_stage_support import (
+    LEGACY_NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
     NONBLOCKING_FEEDBACK_RETRY_DEBT_SCHEMA_VERSION,
     NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
     admits_previous_session_preopen_auto_recovery,
@@ -24,18 +26,140 @@ from app.eod.run_stage_support import (
     build_nonblocking_downstream_scope_proof,
     build_stage_counts,
     extract_fundamentals_refresh_metrics,
+    is_canonical_same_day_signal_rearm_proof,
     is_exact_auto_pitr_intraday_watch_recovery_request,
     is_recoverable_same_day_intraday_watch_expiration,
     normalize_run_status,
     nonblocking_partial_progression_digest,
     resolve_run_updated_at,
     select_preferred_eod_run,
+    validated_independent_role_symbol_scopes,
     validated_nonblocking_partial_progression_marker,
 )
-from app.eod.daily_pipeline_stages import DailyPipelineStageService
 
 
 class EODRunStageSupportTests(unittest.TestCase):
+    def test_independent_role_scopes_preserve_distinct_lane_boundaries(self):
+        admitted_symbols = ['000660', '005930', '035420']
+        progress_summary = {
+            'role_symbol_scopes': {
+                'signal-decider': ['000660', '005930'],
+                'short-term-decider': ['005930', '035420'],
+            }
+        }
+
+        scopes = validated_independent_role_symbol_scopes(
+            progress_summary=progress_summary,
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            admitted_symbols=admitted_symbols,
+        )
+
+        self.assertEqual(scopes, progress_summary['role_symbol_scopes'])
+        missing_union_member = deepcopy(progress_summary)
+        missing_union_member['role_symbol_scopes']['short-term-decider'] = [
+            '005930'
+        ]
+        self.assertIsNone(
+            validated_independent_role_symbol_scopes(
+                progress_summary=missing_union_member,
+                roles=DECISION_SUPPORT_AGENT_NAMES,
+                admitted_symbols=admitted_symbols,
+            )
+        )
+
+    def test_plan_only_same_day_signal_rearm_proof_is_canonical(self):
+        resolved_stages = [
+            'signal_decider',
+            'next_open_execution_plan',
+        ]
+        pipeline_run = {
+            'trigger': 'auto_eod_followup_resume',
+            'status': 'blocked',
+            'current_stage': 'next_open_execution_plan',
+            'run_metadata': {
+                'entrypoint': 'daily_pipeline_stage_service.run',
+                'allow_expired_analysis_replay': False,
+                'same_day_intraday_watch_continuation_admitted': True,
+                'point_in_time_recovery': True,
+                'reused_eod_collection_run_id': 7,
+                'force': False,
+                'reuse_existing_feedback': True,
+                'resume_from_stage': 'signal_decider',
+                'resolved_stages': resolved_stages,
+                'feedback_knowledge_cutoff': {
+                    'ready': True,
+                    'knowledge_cutoff_at': '2026-11-05T08:30:00+00:00',
+                    'source_run_id': 'summary-run',
+                    'feedback_scope_mode': (
+                        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+                    ),
+                    'requested_symbols': ['005930'],
+                },
+                'fs_div': 'CFS',
+            },
+            'stages': {
+                'signal_decider': {
+                    'status': 'partial',
+                    'processed': 2,
+                    'total': 2,
+                    'succeeded': 1,
+                    'failed': 1,
+                    'remaining': 0,
+                    'source_run_ids': {'run_id': 'decider-run'},
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'decider-run',
+                            'prerequisites': {'ready': True},
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 1,
+                                    'role_progress': {
+                                        'signal-decider': {
+                                            'retry_pending_symbols': 1,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        }
+                                    },
+                                    'failure_groups': {
+                                        'provider_timeout': {
+                                            'count': 1,
+                                            'retryable_count': 1,
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+                'next_open_execution_plan': {
+                    'status': 'blocked',
+                    'details': {
+                        'result_summary': {
+                            'reason': 'signal_decider_stage_incomplete',
+                        }
+                    },
+                },
+            },
+        }
+
+        self.assertTrue(
+            is_canonical_same_day_signal_rearm_proof(
+                pipeline_run,
+                expected_eod_collection_run_id=7,
+            )
+        )
+        unexpected_legacy_stage = deepcopy(pipeline_run)
+        unexpected_legacy_stage['stages'][
+            'signal_decider_evaluations'
+        ] = {'status': 'blocked'}
+        self.assertFalse(
+            is_canonical_same_day_signal_rearm_proof(
+                unexpected_legacy_stage,
+                expected_eod_collection_run_id=7,
+            )
+        )
+
     @staticmethod
     def _nonblocking_partial_recovery_result(
         *,
@@ -195,7 +319,9 @@ class EODRunStageSupportTests(unittest.TestCase):
             )
         )
         marker = {
-            'schema_version': NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
+            'schema_version': (
+                LEGACY_NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION
+            ),
             'blocking_status': 'non_blocking',
             'market_date': '2026-04-14',
             'pipeline_run_id': 96,
@@ -514,6 +640,96 @@ class EODRunStageSupportTests(unittest.TestCase):
             },
         }
 
+    @classmethod
+    def _plan_only_nonblocking_partial_recovery_result(cls):
+        recovery_result = deepcopy(
+            cls._nonblocking_partial_recovery_result()
+        )
+        marker = recovery_result['pipeline_run']['run_metadata'][
+            'nonblocking_partial_progression'
+        ]
+        marker['schema_version'] = (
+            NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION
+        )
+        marker['downstream'].pop('evaluation_status')
+        marker['downstream'].pop('evaluation_scope_proof')
+        marker['completion_authority']['schema_version'] = (
+            'nonblocking_strict_completion_authority_v2'
+        )
+        marker['completion_authority'].pop(
+            'signal_decider_evaluations_proof_digest'
+        )
+        marker['proof_digest'] = nonblocking_partial_progression_digest(
+            marker
+        )
+        resolved_stages = [
+            'signal_decider',
+            'next_open_execution_plan',
+        ]
+        recovery_result['resolved_stages'] = resolved_stages
+        recovery_result['pipeline_run']['current_stage'] = (
+            'next_open_execution_plan'
+        )
+        recovery_result['pipeline_run']['run_metadata'][
+            'resolved_stages'
+        ] = resolved_stages
+        recovery_result['stages'].pop('signal_decider_evaluations')
+        return recovery_result
+
+    def test_plan_only_v2_nonblocking_marker_is_valid(self):
+        recovery_result = self._plan_only_nonblocking_partial_recovery_result()
+
+        marker = validated_nonblocking_partial_progression_marker(
+            recovery_result,
+            expected_eod_collection_run_id=7,
+        )
+
+        self.assertIsNotNone(marker)
+        self.assertEqual(
+            marker['schema_version'],
+            NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
+        )
+        self.assertNotIn('evaluation_status', marker['downstream'])
+        self.assertNotIn(
+            'signal_decider_evaluations_proof_digest',
+            marker['completion_authority'],
+        )
+
+        unexpected_evaluation = deepcopy(recovery_result)
+        unexpected_evaluation['pipeline_run']['run_metadata'][
+            'resolved_stages'
+        ].append('signal_decider_evaluations')
+        unexpected_evaluation['pipeline_run']['current_stage'] = (
+            'signal_decider_evaluations'
+        )
+        unexpected_evaluation['stages']['signal_decider_evaluations'] = {
+            'status': 'completed'
+        }
+        self.assertIsNone(
+            validated_nonblocking_partial_progression_marker(
+                unexpected_evaluation,
+                expected_eod_collection_run_id=7,
+            )
+        )
+
+    def test_legacy_v1_nonblocking_marker_remains_valid(self):
+        recovery_result = self._nonblocking_partial_recovery_result()
+
+        marker = validated_nonblocking_partial_progression_marker(
+            recovery_result,
+            expected_eod_collection_run_id=7,
+        )
+
+        self.assertIsNotNone(marker)
+        self.assertEqual(
+            marker['schema_version'],
+            LEGACY_NONBLOCKING_PARTIAL_PROGRESSION_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            marker['downstream']['evaluation_status'],
+            'completed',
+        )
+
     def test_nonblocking_partial_marker_is_exactly_bound_to_durable_evidence(
         self,
     ):
@@ -764,7 +980,6 @@ class EODRunStageSupportTests(unittest.TestCase):
                 'agent_feedback_summaries',
                 'signal_decider',
                 'next_open_execution_plan',
-                'signal_decider_evaluations',
             ],
             'provider_admission_fence_owned': True,
             'existing_pipeline_run_id': None,
@@ -813,7 +1028,6 @@ class EODRunStageSupportTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         )
         request = {
             'market_date': '2026-09-11',
@@ -931,7 +1145,6 @@ class EODRunStageSupportTests(unittest.TestCase):
             'resolved_stages': [
                 'signal_decider',
                 'next_open_execution_plan',
-                'signal_decider_evaluations',
             ],
         }
 
@@ -946,10 +1159,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             'force': True,
             'reuse_existing_feedback': False,
             'resume_from_stage': 'next_open_execution_plan',
-            'resolved_stages': [
-                'next_open_execution_plan',
-                'signal_decider_evaluations',
-            ],
+            'resolved_stages': ['next_open_execution_plan'],
         }
         for field, invalid_value in invalid_values.items():
             with self.subTest(field=field):
@@ -965,7 +1175,6 @@ class EODRunStageSupportTests(unittest.TestCase):
         stage_ids = (
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         )
 
         def expired_stage(stage_id: str) -> dict:
@@ -995,7 +1204,7 @@ class EODRunStageSupportTests(unittest.TestCase):
             'market_date': '2026-10-26',
             'trigger': 'auto_eod_followup_resume',
             'status': 'skipped',
-            'current_stage': 'signal_decider_evaluations',
+            'current_stage': 'next_open_execution_plan',
             'completed_at': '2026-10-27T01:02:03+00:00',
             'error_message': None,
             'run_metadata': {
@@ -1026,7 +1235,7 @@ class EODRunStageSupportTests(unittest.TestCase):
         wrong_status['status'] = 'completed'
         invalid_runs.append(('status', wrong_status))
         wrong_current_stage = deepcopy(pipeline_run)
-        wrong_current_stage['current_stage'] = 'next_open_execution_plan'
+        wrong_current_stage['current_stage'] = 'signal_decider'
         invalid_runs.append(('current_stage', wrong_current_stage))
         unfinished = deepcopy(pipeline_run)
         unfinished['completed_at'] = None

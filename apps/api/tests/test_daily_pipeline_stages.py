@@ -1179,7 +1179,6 @@ class _FakeCutoffContractRepairRunStateService(
                     'stage_statuses': {
                         'signal_decider': 'pending',
                         'next_open_execution_plan': 'pending',
-                        'signal_decider_evaluations': 'pending',
                     },
                     'summary_cutoff_contract_repair_version': 1,
                     'summary_cutoff_contract_repair_proof': proof,
@@ -1433,10 +1432,21 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             payload['default_daily_stage_order'].index('signal_decider'),
             payload['default_daily_stage_order'].index('next_open_execution_plan'),
         )
-        self.assertLess(
-            payload['default_daily_stage_order'].index('next_open_execution_plan'),
-            payload['default_daily_stage_order'].index('signal_decider_evaluations'),
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            payload['default_daily_stage_order'],
         )
+        self.assertIn('signal_decider_evaluations', payload['stage_order'])
+        self.assertLess(
+            payload['stage_order'].index('next_open_execution_plan'),
+            payload['stage_order'].index('signal_decider_evaluations'),
+        )
+        evaluation_stage = next(
+            stage
+            for stage in payload['stages']
+            if stage['id'] == 'signal_decider_evaluations'
+        )
+        self.assertFalse(evaluation_stage['default_selected'])
         self.assertIn('unified_value_factors', payload['stage_order'])
         self.assertIn('quality_factors', payload['stage_order'])
 
@@ -2437,10 +2447,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     parent_run_id='signal-decider-completed',
                     completed_symbols=list(kwargs['symbols']),
                 )
-            if stage_id == 'signal_decider_evaluations':
-                return _completed_evaluation_result(
-                    symbols=list(kwargs['symbols'])
-                )
             return original_execute_stage(stage_id, **kwargs)
 
         with (
@@ -2500,7 +2506,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 symbols=parent_symbols,
                 fs_div='CFS',
@@ -2531,14 +2536,15 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             source_run_id='feedback-cycle-summary-same-run',
             requested_symbols=parent_symbols,
         )
-        completed_evaluation_call = next(
-            call
-            for call in execute_stage_mock.call_args_list
-            if call.args[0] == 'signal_decider_evaluations'
+        self.assertNotIn(
+            'signal_decider_evaluations',
+            result['stages'],
         )
-        self.assertEqual(
-            completed_evaluation_call.kwargs['symbols'],
-            completed_intersection,
+        self.assertFalse(
+            any(
+                call.args[0] == 'signal_decider_evaluations'
+                for call in execute_stage_mock.call_args_list
+            )
         )
 
     def test_same_run_partial_summary_advances_only_terminal_success_intersection(
@@ -2642,10 +2648,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     ),
                     completed_symbols=list(kwargs['symbols']),
                 )
-            if stage_id == 'signal_decider_evaluations':
-                return _completed_evaluation_result(
-                    symbols=list(kwargs['symbols'])
-                )
             return original_execute_stage(stage_id, **kwargs)
 
         with (
@@ -2705,7 +2707,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 symbols=parent_symbols,
                 fs_div='CFS',
@@ -2724,10 +2725,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             result['stages']['next_open_execution_plan']['status'],
             'completed',
         )
-        self.assertEqual(
-            result['stages']['signal_decider_evaluations']['status'],
-            'completed',
-        )
+        self.assertNotIn('signal_decider_evaluations', result['stages'])
         self.assertEqual(len(feedback_retry_service.calls), 2)
         self.assertEqual(
             feedback_retry_service.calls[1]['config'].symbols,
@@ -2739,14 +2737,11 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ],
             'feedback-cycle-summary-partial',
         )
-        evaluation_call = next(
-            call
-            for call in execute_stage_mock.call_args_list
-            if call.args[0] == 'signal_decider_evaluations'
-        )
-        self.assertEqual(
-            evaluation_call.kwargs['symbols'],
-            completed_intersection,
+        self.assertFalse(
+            any(
+                call.args[0] == 'signal_decider_evaluations'
+                for call in execute_stage_mock.call_args_list
+            )
         )
 
     def test_exact_previous_session_recovery_runs_only_during_preopen(
@@ -2780,10 +2775,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return _next_open_completion_result(
                     parent_run_id='signal-decider-completed',
                     completed_symbols=list(stage_kwargs['symbols']),
-                )
-            if stage_id == 'signal_decider_evaluations':
-                return _completed_evaluation_result(
-                    symbols=list(stage_kwargs['symbols'])
                 )
             raise AssertionError(stage_id)
 
@@ -2838,7 +2829,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 symbols=symbols,
                 resume_from_stage='agent_feedback_summaries',
@@ -2905,7 +2895,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ]
 
         def execute(stage_id, **stage_kwargs):
@@ -2935,10 +2924,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 return _next_open_completion_result(
                     parent_run_id='signal-decider-completed',
                     completed_symbols=list(stage_kwargs['symbols']),
-                )
-            if stage_id == 'signal_decider_evaluations':
-                return _completed_evaluation_result(
-                    symbols=list(stage_kwargs['symbols'])
                 )
             raise AssertionError(stage_id)
 
@@ -3494,7 +3479,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 symbols=['999999'],
@@ -3522,7 +3506,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'agent_feedback_summaries',
                 'signal_decider',
                 'next_open_execution_plan',
-                'signal_decider_evaluations',
             ],
         )
         self.assertTrue(all(stage_cutoff == cutoff for _, stage_cutoff in executed))
@@ -3623,7 +3606,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=546,
@@ -3728,7 +3710,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=546,
@@ -3776,10 +3757,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     parent_run_id='signal-decider-cutoff-repair',
                     completed_symbols=list(kwargs['symbols']),
                 )
-            if stage_id == 'signal_decider_evaluations':
-                return _completed_evaluation_result(
-                    symbols=list(kwargs['symbols'])
-                )
             return {'status': 'completed', 'stage_id': stage_id}
 
         with (
@@ -3818,7 +3795,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 stages=[
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 resume_from_stage='signal_decider',
@@ -3849,7 +3825,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             [
                 ('signal_decider', ['005930']),
                 ('next_open_execution_plan', ['005930']),
-                ('signal_decider_evaluations', ['005930']),
             ],
         )
         resolve_cutoff.assert_not_called()
@@ -3956,7 +3931,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ]
         for completed_prefix_size in range(1, len(suffix_ids)):
             with self.subTest(completed_prefix_size=completed_prefix_size):
@@ -4123,7 +4097,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=546,
@@ -4139,7 +4112,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             [
                 'signal_decider',
                 'next_open_execution_plan',
-                'signal_decider_evaluations',
             ],
         )
 
@@ -4230,7 +4202,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=546,
@@ -4270,7 +4241,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                         'agent_feedback_summaries',
                         'signal_decider',
                         'next_open_execution_plan',
-                        'signal_decider_evaluations',
                     ],
                     trigger='auto_eod_followup_resume',
                     point_in_time_recovery=True,
@@ -4304,7 +4274,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=546,
@@ -4441,6 +4410,9 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(executed_stage_ids[13], 'external_news_collect')
         self.assertEqual(executed_stage_ids[14], 'external_news_enrich')
         self.assertEqual(executed_stage_ids[15], 'macro_context_refresh')
+        self.assertNotIn('signal_decider_evaluations', result['resolved_stages'])
+        self.assertNotIn('signal_decider_evaluations', result['stages'])
+        self.assertNotIn('signal_decider_evaluations', executed_stage_ids)
 
     def test_master_failure_short_circuits_universe_price_and_derived_writes(
         self,
@@ -8040,7 +8012,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 resume_from_stage='agent_feedback_summaries',
                 trigger='auto_eod_followup_resume',
@@ -8169,7 +8140,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'agent_feedback_summaries',
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 resume_from_stage='agent_feedback_summaries',
                 trigger='auto_eod_followup_resume',
@@ -8340,6 +8310,20 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(
             validated['resolved_stages'],
             ['next_open_execution_plan'],
+        )
+
+    def test_signal_decider_evaluations_remains_explicitly_runnable(self) -> None:
+        service = DailyPipelineStageService()
+
+        validated = service.validate_run_request(
+            market_date='2026-04-14',
+            stages=['signal_decider_evaluations'],
+            resume_from_stage=None,
+        )
+
+        self.assertEqual(
+            validated['resolved_stages'],
+            ['signal_decider_evaluations'],
         )
 
     def test_direct_provider_selection_includes_only_provider_control_prefix(
@@ -11175,7 +11159,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         stages = [
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ]
 
         with (
@@ -11272,7 +11255,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         stages = [
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ]
 
         with (
@@ -11338,7 +11320,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'partial')
         self.assertEqual(len(feedback_retry_service.calls), 1)
         refresh_plan.assert_called_once()
-        self.assertEqual(len(evaluation_service.calls), 1)
+        self.assertEqual(evaluation_service.calls, [])
         self.assertTrue(
             all(
                 outcome['result'].get('reason')
@@ -11401,7 +11383,6 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 stages=[
                     'signal_decider',
                     'next_open_execution_plan',
-                    'signal_decider_evaluations',
                 ],
                 resume_from_stage='signal_decider',
                 trigger='auto_eod_followup_resume',
@@ -11422,7 +11403,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(
             [event['stage_id'] for event in run_state_service.stage_events
              if event['event'] == 'start_stage'],
-            ['next_open_execution_plan', 'signal_decider_evaluations'],
+            ['next_open_execution_plan'],
         )
         self.assertEqual(len(run_state_service.claim_calls), 1)
         self.assertEqual(
@@ -12440,11 +12421,13 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'short-term-decider': symbols,
             },
         )
-        self.assertEqual(
-            marker['downstream']['evaluation_scope_proof'][
-                'requested_symbols'
-            ],
-            [],
+        self.assertNotIn(
+            'evaluation_scope_proof',
+            marker['downstream'],
+        )
+        self.assertNotIn(
+            'signal_decider_evaluations_proof_digest',
+            marker['completion_authority'],
         )
 
     def test_evaluation_completion_proof_binds_exact_parent_scope(self) -> None:
@@ -12920,6 +12903,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'short-term-decider'
             ],
             ['005930'],
+        )
+        self.assertNotIn(
+            'evaluation_scope_proof',
+            marker['downstream'],
         )
         blocked_stages = deepcopy(result['stages'])
         blocked_stages['next_open_execution_plan']['status'] = 'blocked'
