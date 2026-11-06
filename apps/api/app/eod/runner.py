@@ -14,6 +14,7 @@ from app.eod.auto_pykrx import (
     RecoveryOnlyScheduleDisposition,
     auto_pykrx_eod_scheduler,
 )
+from app.eod.data_gap_fill import run_if_due as data_gap_fill_run_if_due
 from app.eod.master import refresh_master_if_due
 from app.market.clock import async_get_market_state
 from app.market.snapshot import market_snapshot_service
@@ -710,6 +711,15 @@ class EODBackgroundRunner:
                                 trigger=f'background_runner:{market.state.lower()}'
                             ),
                         )
+                        if settings.data_gap_fill_enabled and market.state == 'OPEN':
+                            # Weekday market hours are idle for Core. The job owns its
+                            # schedule, budget and writer fences (docs/DATA_GAP_FILL.md)
+                            # and is report-only unless DATA_GAP_FILL_APPLY is set.
+                            await self._run_blocking_step(
+                                'data_gap_fill_if_due',
+                                data_gap_fill_run_if_due,
+                                timeout_seconds=float(settings.data_gap_fill_budget_seconds) + 120.0,
+                            )
             except Exception as exc:
                 tick_failed = True
                 self._last_tick_error = {
