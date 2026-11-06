@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import nullcontext
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import and_, case, delete, func, or_, select, text, update
@@ -36,6 +36,11 @@ TERMINAL_CAPTURE_STATUSES = (
     CAPTURE_STATUS_MAPPING_FAILED,
 )
 USABLE_FUNDAMENTALS_SOURCE_STATUS = '000'
+# DART answers [014] when a filing's document file is not (yet) available. That is
+# terminal for the run, but files can be published late, so such events get a few
+# spaced rechecks instead of being given up on forever.
+FILE_NOT_FOUND_RECHECK_AFTER = timedelta(days=3)
+FILE_NOT_FOUND_MAX_ATTEMPTS = 3
 
 
 class FundamentalsCaptureCandidateDriftError(RuntimeError):
@@ -590,7 +595,19 @@ class DartFundamentalsRepository:
         with session_scope() as session:
             stmt = select(DartDisclosureEvent).where(DartDisclosureEvent.is_financial_report.is_(True))
             if not force:
-                stmt = stmt.where(DartDisclosureEvent.fundamentals_capture_status.in_(RETRYABLE_CAPTURE_STATUSES))
+                file_not_found_recheck = and_(
+                    DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_NO_DATA,
+                    func.coalesce(DartDisclosureEvent.fundamentals_last_error, '').like('%[014]%'),
+                    DartDisclosureEvent.fundamentals_capture_attempts < FILE_NOT_FOUND_MAX_ATTEMPTS,
+                    DartDisclosureEvent.fundamentals_last_attempt_at.is_not(None),
+                    DartDisclosureEvent.fundamentals_last_attempt_at < _utcnow() - FILE_NOT_FOUND_RECHECK_AFTER,
+                )
+                stmt = stmt.where(
+                    or_(
+                        DartDisclosureEvent.fundamentals_capture_status.in_(RETRYABLE_CAPTURE_STATUSES),
+                        file_not_found_recheck,
+                    )
+                )
             if stock_codes:
                 stmt = stmt.where(DartDisclosureEvent.stock_code.in_(stock_codes))
             if receipt_date_from:
