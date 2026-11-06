@@ -471,6 +471,25 @@ Local overrides:
 - The KRX next-open loader requires an explicit domestic market claim (`KRX`, `KOSPI`, `KOSDAQ`, or `KONEX`) in the persisted symbol context. Missing, US, unknown, or contradictory market claims are skipped rather than defaulted to KRX.
 - Use `GET /eod/status` to inspect the scheduler state and last result.
 
+## Daily data coverage audit
+
+Each daily stage reports its coverage against *its own* requested scope, so a derived table can hold a small fraction of the day's universe while every stage looks complete (on 2026-11-04 the factor tables held 82 rows for 2,769 price bars while the stages read 82/82). The audit compares every daily table's row count with the day's stored price bars. It is read-only (`SET TRANSACTION READ ONLY`) and changes no pipeline behavior.
+
+From `apps/api`:
+
+```bash
+python -m app.internal.daily_coverage_audit --last 5
+python -m app.internal.daily_coverage_audit --market-date 2026-11-04 --format json
+python -m app.internal.daily_coverage_audit --last 10 --min-ratio 0.95
+```
+
+- Each audited date prints the price-bar count and every table's rows, ratio, and status. A table is `low` below `--min-ratio` (default `0.90`), `empty` at zero rows, and a day without price bars is `degraded` (`no_baseline`) rather than silently ok. Tables flagged `low`/`empty` are marked `<--`.
+- Exit code `0` means every audited day is ok; `3` means at least one day or table is degraded (`2` is argparse usage errors). That makes it usable from a scheduler or a post-pipeline check.
+- The default `0.90` tolerates the roughly 5% of symbols that legitimately have no factors (preferred shares, SPACs, very recent listings). Raise it if you want to see those too.
+- Audited tables: price bars, technical snapshots, price contexts, action summaries, market-risk snapshots/filter results, Piotroski, the eight factor tables, and signal features.
+
+The audit only reports. To fill a hole, recompute the affected stage for that date, for example `python -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD`; the other factor stages have matching `eod-<name>-factors-compute` commands (see "pykrx EOD backfill"). That writes to the database, so review the dates the audit lists first.
+
 ## Audit logging
 
 - Default log directory: `apps/api/var/log`
