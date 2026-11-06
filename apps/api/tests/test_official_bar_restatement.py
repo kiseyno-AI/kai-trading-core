@@ -189,13 +189,72 @@ class OfficialReferenceTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as directory:
-            reference = OfficialReference.load([DAY], cache_dir=directory, fetcher=fetcher, minimum_rows=ONE_ROW)
+            reference = OfficialReference.load([DAY], cache_dir=directory, fetcher=fetcher, minimum_rows=ONE_ROW, min_fetch_interval_seconds=0.0)
             cached = sorted(path.name for path in Path(directory).iterdir())
 
         # One market failing means the date is not covered: never a half-reference.
         self.assertNotIn(DAY, reference.covered_dates)
         self.assertEqual(cached, [])
         self.assertEqual(len(calls), 2)
+
+
+class OfficialReferenceThrottleTests(unittest.TestCase):
+    @staticmethod
+    def _frame():
+        import pandas as pd
+
+        return pd.DataFrame(
+            {'시가': [1], '고가': [1], '저가': [1], '종가': [1], '거래량': [1], '거래대금': [1]},
+            index=['000660'],
+        )
+
+    def test_live_fetches_are_spaced_out_and_cached_dates_are_free(self) -> None:
+        import tempfile
+
+        clock = {'now': 0.0}
+        slept: list[float] = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            clock['now'] += seconds
+
+        calls: list[tuple[str, str]] = []
+
+        def fetcher(compact, market):
+            calls.append((compact, market))
+            return self._frame()
+
+        days = [date(2099, 9, 14), date(2099, 9, 15)]
+        with tempfile.TemporaryDirectory() as directory:
+            OfficialReference.load(
+                days, cache_dir=directory, fetcher=fetcher, minimum_rows=ONE_ROW,
+                min_fetch_interval_seconds=20.0, sleep=sleep, monotonic=lambda: clock['now'],
+            )
+            first_run_calls = len(calls)
+            OfficialReference.load(
+                days, cache_dir=directory, fetcher=fetcher, minimum_rows=ONE_ROW,
+                min_fetch_interval_seconds=20.0, sleep=sleep, monotonic=lambda: clock['now'],
+            )
+
+        self.assertEqual(first_run_calls, 4)  # 2 dates x 2 markets
+        self.assertEqual(len(calls), 4)  # the second run is served entirely from the cache
+        self.assertEqual(slept, [20.0, 20.0, 20.0])  # between the 4 live requests only
+
+    def test_circuit_opens_after_consecutive_failures_and_stops_requesting(self) -> None:
+        calls: list[str] = []
+
+        def failing(compact, market):
+            calls.append(compact)
+            raise ConnectionError('blocked')
+
+        days = [date(2099, 9, d) for d in range(14, 20)]
+        reference = OfficialReference.load(
+            days, fetcher=failing, minimum_rows=ONE_ROW,
+            min_fetch_interval_seconds=0.0, max_consecutive_fetch_failures=2,
+        )
+
+        self.assertEqual(len(calls), 2)  # two failures, then no more requests
+        self.assertEqual(reference.covered_dates, set())
 
 
 class OfficialReferenceFloorTests(unittest.TestCase):
@@ -209,7 +268,7 @@ class OfficialReferenceFloorTests(unittest.TestCase):
             )
 
         # Default floors (700 KOSPI / 1,200 KOSDAQ) apply: one row per market is not a market.
-        reference = OfficialReference.load([DAY], fetcher=fetcher)
+        reference = OfficialReference.load([DAY], fetcher=fetcher, min_fetch_interval_seconds=0.0)
 
         self.assertNotIn(DAY, reference.covered_dates)
 

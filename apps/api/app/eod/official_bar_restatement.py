@@ -32,6 +32,7 @@ from datetime import date
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.eod.kis_final_bar_repair import (
@@ -73,10 +74,21 @@ class OfficialReference:
         cache_dir: str | Path | None = None,
         fetcher: Callable[[str, str], Any] | None = None,
         minimum_rows: Mapping[str, int] | None = None,
+        min_fetch_interval_seconds: float = 20.0,
+        max_consecutive_fetch_failures: int = 2,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> 'OfficialReference':
         if fetcher is None:
             from app.eod.pykrx_backfill import _get_market_ohlcv_by_ticker as fetcher  # noqa: N813
+        # KRX Data Marketplace blocks an IP for a day when it sees bulk automated
+        # reads (observed 2026-11-07 after ~1,000 unthrottled historical requests
+        # and a fresh login per process). Historical frames never change once
+        # persisted, so read the cache first, space live fetches out, and stop at
+        # the first sign of trouble instead of retrying into a ban.
         floors = dict(minimum_rows or MINIMUM_MARKET_ROWS)
+        last_live_fetch: float | None = None
+        consecutive_failures = 0
         cache = Path(cache_dir) if cache_dir is not None else None
         rows: dict[tuple[str, date], Values] = {}
         covered: set[date] = set()
@@ -87,10 +99,20 @@ class OfficialReference:
                 path = cache / f'{compact}_{market}.csv' if cache is not None else None
                 frame_rows = _read_cached(path) if path is not None and path.exists() else None
                 if frame_rows is None:
+                    if consecutive_failures >= max_consecutive_fetch_failures:
+                        per_market = {}
+                        break  # circuit open: no further live requests this run
+                    if last_live_fetch is not None:
+                        wait = min_fetch_interval_seconds - (monotonic() - last_live_fetch)
+                        if wait > 0:
+                            sleep(wait)
+                    last_live_fetch = monotonic()
                     try:
                         frame_rows = _frame_to_rows(fetcher(compact, market))
+                        consecutive_failures = 0
                     except Exception:  # noqa: BLE001
                         frame_rows = None
+                        consecutive_failures += 1
                 if frame_rows is None or len(frame_rows) < floors[market]:
                     per_market = {}
                     break
