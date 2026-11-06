@@ -3,11 +3,14 @@
 Three OpenClaw analyst agents that run **beside** the per-symbol decision pipeline. They never feed the
 deciders, never touch orders, and their outputs are advisory files until a human or a guarded process uses them.
 
-| Agent | When (KST) | Input | Output |
+| Agent | When (KST) | Inputs (all computed in code) | Output |
 | --- | --- | --- | --- |
-| `market-context-analyst` | trading day, from 18:30 | stored market snapshot + macro context | regime, trend, volatility, rotation, drivers, event risk, posture hint |
-| `news-event-analyst` | trading day, from 19:00 | recent external news for up to 30 symbols (batches of 10) | per-symbol materiality, event type, direction, evidence grade, reaction check |
-| `postmortem-analyst` | Saturday, from 09:00 | latest `var/alpha-lab/report-*.json` | classification, calibration, patterns, up to 5 advisory proposals |
+| `market-context-analyst` | trading day, from 18:30 | KIS KOSPI/KOSDAQ index (level, range, advancers/decliners, limit moves, 52-week position), KIS market-level investor flows (foreign, institution, individual, sub-groups), KIS US ETF proxies (SPY, QQQ, SOXX, EWY, TLT, UUP, USO, GLD), Bank of Korea daily rates and USD/KRW, stored Korea Exim FX, stored breadth by market and sector from `daily_market_risk_snapshots` plus five-session history | regime, trend, volatility, rotation, drivers, event risk, posture hint |
+| `news-event-analyst` | trading day, from 19:00 | up to 30 symbols (news-driven and filing-driven interleaved): Naver headlines and snippets, official DART filing titles with an importance rule, 1d/5d price move and 20d volume ratio | per-symbol materiality, event type, direction, evidence grade, reaction check |
+| `postmortem-analyst` | Saturday, from 09:00 | six weeks of `signal_decider_decision_snapshots` joined to realized next-open-to-horizon-close returns: per agent and action, classification, confidence buckets, candidate baseline | classification, calibration, patterns, up to 5 advisory proposals |
+
+Each live leg is isolated and carries a status. A failing KIS or BOK call is reported to the agent as an error, never hidden
+and never filled in. For a past market date the live legs (index, flows, US proxies) are skipped by design.
 
 ## How it runs
 
@@ -35,10 +38,20 @@ Canonical contracts: `runtime_contracts/openclaw/v1/<agent>/AGENTS.md`, installe
 `~/.openclaw/openclaw.json` with the same restrictions as the summarizers (no tools, no skills, no sessions).
 Persona/knowledge files (`SOUL.md`, `IDENTITY.md`, `USER.md`) live only in the OpenClaw workspace.
 
+## Data coverage (checked 2026-11-07)
+
+Covered by APIs the system already uses: index, breadth, limit moves, market flows, US overnight proxies (ETFs, not index
+closes), Korean rates and FX, sector rotation, official filings, price reaction. **Not covered:** an economic or earnings
+calendar (reported to the agent as `not_available`), full news text (Naver gives headline and snippet only, so news
+evidence is capped), US index levels and VIX (ETF proxies stand in), FRED series (no key configured).
+The deciders produced no `buy` decisions in the six weeks before this was written, so the postmortem can judge
+abstentions only.
+
 ## Not done / not verified
 
 - Outputs have never been produced by a live model (Codex quota was exhausted when built); validators and the
   runner are covered by tests with a fake gateway only.
 - Nothing consumes the outputs yet. Feeding the market context to the deciders is deliberately a later,
   separately reviewed step once real outputs exist.
-- The postmortem input is the signal-lab JSON, which exists only once the signal lab is merged.
+- The postmortem uses a compact built-in outcome calculation (51 bp round trip, next-open entry), not the signal lab, which is a separate unmerged PR.
+- The market snapshot cache (`/market/snapshot`) was empty when checked; this package does not depend on it.

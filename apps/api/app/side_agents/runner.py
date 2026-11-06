@@ -15,8 +15,7 @@ from app.side_agents.payloads import (
     build_market_payload,
     build_news_payloads,
     build_postmortem_payload,
-    load_recent_news,
-    select_news_symbols,
+    load_news_inputs,
 )
 from app.side_agents.schemas import (
     MARKET_AGENT,
@@ -34,7 +33,7 @@ from app.side_agents.store import SideAgentStore
 logger = logging.getLogger(__name__)
 KST = ZoneInfo('Asia/Seoul')
 RETRY_GAP = timedelta(minutes=25)
-MAX_POSTMORTEM_BYTES = 120_000
+MAX_POSTMORTEM_BYTES = 120_000  # payload cap; larger inputs are skipped, never truncated
 MARKET_DUE_HHMM = (18, 30)
 NEWS_DUE_HHMM = (19, 0)
 POSTMORTEM_DUE_HHMM = (9, 0)
@@ -155,15 +154,14 @@ def run_market_context(
 
 def run_news_events(
     market_date: date, *, client: SideAgentClient, store: SideAgentStore, now: datetime,
-    news_loader: Callable[[], list[dict[str, Any]]] | None = None, dry_run: bool = False,
+    inputs_loader: Callable[[date, datetime], dict[str, dict[str, Any]]] = load_news_inputs, dry_run: bool = False,
 ) -> list[UnitOutcome]:
     key = market_date.isoformat()
     state = store.load_state(NEWS_AGENT, key)
-    items = news_loader() if news_loader else load_recent_news(now=now)
-    selected = select_news_symbols(items, max_symbols=settings.side_agents_news_max_symbols)
-    if not selected:
-        return [UnitOutcome(NEWS_AGENT, key, 'skipped', 'no_recent_news')]
-    payloads = build_news_payloads(market_date, selected, batch_size=settings.side_agents_news_batch_size)
+    inputs = inputs_loader(market_date, now)
+    if not inputs:
+        return [UnitOutcome(NEWS_AGENT, key, 'skipped', 'no_recent_news_or_filings')]
+    payloads = build_news_payloads(market_date, inputs, batch_size=settings.side_agents_news_batch_size)
     outcomes: list[UnitOutcome] = []
     for index, payload in enumerate(payloads):
         unit = f'{key}-b{index:02d}'
@@ -175,7 +173,7 @@ def run_news_events(
             outcomes.append(UnitOutcome(NEWS_AGENT, unit, 'blocked', why))
             break
         if dry_run:
-            outcomes.append(UnitOutcome(NEWS_AGENT, unit, 'skipped', f'dry_run symbols={len(payload["symbols"])}'))
+            outcomes.append(UnitOutcome(NEWS_AGENT, unit, 'skipped', f'dry_run symbols={len(payload["symbols"])} bytes={len(json.dumps(payload, default=str))}'))
             continue
         outcome = _dispatch_unit(
             agent=NEWS_AGENT, task='news_events', unit=unit, state_key=key, payload=payload,
@@ -199,33 +197,52 @@ def find_latest_summary(dirs: Sequence[Path]) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime, default=None)
 
 
+def load_summary_file(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_bytes()
+        summary = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if len(raw) > MAX_POSTMORTEM_BYTES or not isinstance(summary, dict):
+        return None
+    return summary
+
+
+def _default_summary_loader(today: date) -> dict[str, Any] | None:
+    from app.side_agents.postmortem_inputs import load_summary
+
+    return load_summary(today)
+
+
 def run_postmortem(
-    week_key: str, *, summary_path: Path | None, client: SideAgentClient, store: SideAgentStore,
-    now: datetime, dry_run: bool = False,
+    week_key: str, *, summary: dict[str, Any] | None, client: SideAgentClient, store: SideAgentStore,
+    now: datetime, dry_run: bool = False, known_agents: Sequence[str] | None = None,
 ) -> UnitOutcome:
     state = store.load_state(POSTMORTEM_AGENT, week_key)
     if week_key in state['done_units']:
         return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', 'already_done')
-    if summary_path is None:
+    if not summary:
         return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', 'no_summary')
+    total = summary.get('total_resolved')
+    if isinstance(total, int) and total < 1:
+        return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', 'no_resolved_outcomes')
     ok, why = _may_attempt(state, now)
     if not ok:
         return UnitOutcome(POSTMORTEM_AGENT, week_key, 'blocked', why)
-    try:
-        raw = summary_path.read_bytes()
-        summary = json.loads(raw)
-    except (OSError, ValueError) as exc:
-        return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', f'summary_unreadable: {type(exc).__name__}')
-    if len(raw) > MAX_POSTMORTEM_BYTES or not isinstance(summary, dict):
-        return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', 'summary_too_large_or_not_object')
     payload = build_postmortem_payload(summary)
+    size = len(json.dumps(payload, default=str))
+    if size > MAX_POSTMORTEM_BYTES:
+        return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', 'summary_too_large')
     if dry_run:
-        return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', f'dry_run summary_bytes={len(raw)}')
+        return UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', f'dry_run summary_bytes={size}')
+    agents = tuple(known_agents) if known_agents is not None else tuple(
+        sorted(set(POSTMORTEM_KNOWN_AGENTS) | set(summary.get('known_agents') or []))
+    )
     return _dispatch_unit(
         agent=POSTMORTEM_AGENT, task='postmortem', unit=week_key, state_key=week_key, payload=payload,
-        validate=lambda obj: validate_postmortem(obj, known_agents=POSTMORTEM_KNOWN_AGENTS),
+        validate=lambda obj: validate_postmortem(obj, known_agents=agents),
         client=client, store=store, state=state, now=now,
-        meta={'summary_file': summary_path.name, 'summary_sha256': hashlib.sha256(raw).hexdigest()},
+        meta={'summary_sha256': _payload_sha(payload), 'period': summary.get('period')},
     )
 
 
@@ -237,10 +254,11 @@ def _is_trading_day(day: date) -> bool:
 
 def run_due(
     *, client: SideAgentClient | None = None, store: SideAgentStore | None = None, now: datetime | None = None,
-    is_trading_day: Callable[[date], bool] = _is_trading_day, summary_dirs: Sequence[Path] | None = None,
+    is_trading_day: Callable[[date], bool] = _is_trading_day,
     dry_run: bool = False, only: Sequence[str] | None = None,
-    news_loader: Callable[[], list[dict[str, Any]]] | None = None,
+    news_inputs_loader: Callable[[date, datetime], dict[str, dict[str, Any]]] = load_news_inputs,
     payload_builder: Callable[[date], dict[str, Any]] = build_market_payload,
+    summary_loader: Callable[[date], dict[str, Any] | None] = _default_summary_loader,
 ) -> RunReport:
     current = (now or datetime.now(timezone.utc)).astimezone(KST)
     client = client or SideAgentClient()
@@ -253,15 +271,17 @@ def run_due(
         if MARKET_AGENT in wanted and hhmm >= MARKET_DUE_HHMM:
             report.add(run_market_context(today, client=client, store=store, now=current, payload_builder=payload_builder, dry_run=dry_run))
         if NEWS_AGENT in wanted and hhmm >= NEWS_DUE_HHMM:
-            for outcome in run_news_events(today, client=client, store=store, now=current, news_loader=news_loader, dry_run=dry_run):
+            for outcome in run_news_events(today, client=client, store=store, now=current, inputs_loader=news_inputs_loader, dry_run=dry_run):
                 report.add(outcome)
     if POSTMORTEM_AGENT in wanted and current.weekday() == 5 and hhmm >= POSTMORTEM_DUE_HHMM:
         iso = current.isocalendar()
-        dirs = list(summary_dirs) if summary_dirs is not None else [Path(__file__).resolve().parents[4] / 'var' / 'alpha-lab']
-        report.add(
-            run_postmortem(
-                f'{iso.year}-W{iso.week:02d}', summary_path=find_latest_summary(dirs), client=client,
-                store=store, now=current, dry_run=dry_run,
+        week_key = f'{iso.year}-W{iso.week:02d}'
+        if week_key in store.load_state(POSTMORTEM_AGENT, week_key)['done_units']:
+            report.add(UnitOutcome(POSTMORTEM_AGENT, week_key, 'skipped', 'already_done'))
+        else:
+            report.add(
+                run_postmortem(
+                    week_key, summary=summary_loader(today), client=client, store=store, now=current, dry_run=dry_run,
+                )
             )
-        )
     return report

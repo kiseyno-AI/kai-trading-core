@@ -1,42 +1,71 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from app.core.settings import settings
+from app.side_agents import market_inputs, news_inputs
 
 _NEWS_FIELDS = (
     'title', 'description', 'source', 'published_at', 'event_tags', 'event_type', 'sentiment',
     'materiality', 'materiality_bucket', 'materiality_reason', 'access_status', 'content_basis',
     'price_forecast_prohibited',
 )
+FILING_LOOKBACK_DAYS = 3
+
+
+def load_fx_snapshot() -> dict[str, Any] | None:
+    from sqlalchemy import text
+
+    from app.db import session_scope
+
+    with session_scope() as session:
+        row = session.execute(
+            text(
+                "select exchange_rate, effective_date, requested_date, fallback_applied, snapshot_status "
+                "from current_fx_rate_snapshots where currency_pair = 'USD/KRW' order by id desc limit 1"
+            )
+        ).mappings().first()
+    if row is None:
+        return None
+    return {
+        'status': 'ok', 'usd_krw': float(row['exchange_rate']), 'effective_date': row['effective_date'].isoformat(),
+        'fallback_applied': bool(row['fallback_applied']), 'provider': 'koreaexim', 'snapshot_status': row['snapshot_status'],
+    }
+
+
+def _calendar_is_open(day: date) -> bool:
+    from app.market.session import get_krx_calendar_day
+
+    return bool(get_krx_calendar_day(day, allow_fallback=True).is_open)
 
 
 def build_market_payload(
     market_date: date,
     *,
-    context_builder: Any | None = None,
-    macro_service: Any | None = None,
+    kis: Any | None = None,
+    ecos: Any | None = None,
+    now: datetime | None = None,
+    breadth_loader: Callable[[date], list[dict[str, Any]]] | None = None,
+    fx_loader: Callable[[], dict[str, Any] | None] | None = None,
+    is_trading_day: Callable[[date], bool] | None = None,
 ) -> dict[str, Any]:
-    if context_builder is None:
-        from app.agent_context.signal_decider_market_context import SignalDeciderMarketContextBuilder
+    if kis is None:
+        from app.brokers.kis.client import KISClient
 
-        context_builder = SignalDeciderMarketContextBuilder()
-    market_context = context_builder.build(market_date=market_date)
-    try:
-        if macro_service is None:
-            from app.macro_context.service import MacroContextService
+        kis = KISClient()
+    if ecos is None:
+        from app.integrations.bok.client import ECOSClient
 
-            macro_service = MacroContextService()
-        macro = macro_service.get_context(as_of_date=market_date)
-    except Exception as exc:  # macro data is optional context; a gap is reported, not hidden
-        macro = {'status': 'unavailable', 'reason': type(exc).__name__}
-    return {
-        'task': 'market_context',
-        'market_date': market_date.isoformat(),
-        'market_context': market_context,
-        'macro_context': macro,
+        ecos = ECOSClient()
+    kwargs: dict[str, Any] = {
+        'kis': kis, 'ecos': ecos, 'now': now, 'fx_loader': fx_loader or load_fx_snapshot,
+        'is_trading_day': is_trading_day or _calendar_is_open,
     }
+    if breadth_loader is not None:
+        kwargs['breadth_loader'] = breadth_loader
+    return asyncio.run(market_inputs.collect_market_inputs(market_date, **kwargs))
 
 
 def _trim_news_item(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -45,24 +74,6 @@ def _trim_news_item(item: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(trimmed.get(key), str):
             trimmed[key] = trimmed[key][:400]
     return trimmed
-
-
-def select_news_symbols(items: Sequence[Mapping[str, Any]], *, max_symbols: int) -> dict[str, list[dict[str, Any]]]:
-    """Group recent items by symbol, keeping symbols with material or unclassified news first."""
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for item in items:
-        symbol = item.get('symbol')
-        if not isinstance(symbol, str) or not symbol:
-            continue
-        grouped.setdefault(symbol, []).append(_trim_news_item(item))
-
-    def rank(entry: tuple[str, list[dict[str, Any]]]) -> tuple[int, int, str]:
-        symbol, news = entry
-        material = sum(1 for n in news if n.get('materiality') == 'material')
-        return (-material, -len(news), symbol)
-
-    ordered = sorted(grouped.items(), key=rank)
-    return {symbol: news[:5] for symbol, news in ordered[:max_symbols]}
 
 
 def load_recent_news(
@@ -77,14 +88,49 @@ def load_recent_news(
     return loader(published_since=since, published_before=resolved_now, limit=500)
 
 
-def build_news_payloads(
+def assemble_news_inputs(
     market_date: date,
-    news_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]],
+    news_items: Sequence[Mapping[str, Any]],
+    filings: Sequence[Mapping[str, Any]],
     *,
-    batch_size: int,
-    price_moves: Mapping[str, float] | None = None,
+    max_symbols: int,
+    price_loader: Callable[[Sequence[str], date], Mapping[str, Mapping[str, Any]]],
+    name_loader: Callable[[Sequence[str]], Mapping[str, str]],
+) -> dict[str, dict[str, Any]]:
+    news_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for item in news_items:
+        symbol = item.get('symbol')
+        if isinstance(symbol, str) and symbol:
+            news_by_symbol.setdefault(symbol, []).append(_trim_news_item(item))
+    filings_by_symbol = news_inputs.group_filings(filings)
+    chosen = news_inputs.select_symbols(news_by_symbol, filings_by_symbol, max_symbols=max_symbols)
+    prices = price_loader(chosen, market_date)
+    names = name_loader(chosen)
+    return {
+        symbol: {
+            'name_ko': names.get(symbol),
+            'news': news_by_symbol.get(symbol, [])[:5],
+            'official_filings': filings_by_symbol.get(symbol, []),
+            'price_context': dict(prices.get(symbol, {'status': 'unavailable'})),
+        }
+        for symbol in chosen
+    }
+
+
+def load_news_inputs(market_date: date, now: datetime) -> dict[str, dict[str, Any]]:
+    items = load_recent_news(now=now)
+    filings = news_inputs.load_dart_filings(market_date - timedelta(days=FILING_LOOKBACK_DAYS))
+    return assemble_news_inputs(
+        market_date, items, filings, max_symbols=settings.side_agents_news_max_symbols,
+        price_loader=lambda codes, day: news_inputs.load_price_contexts(codes, day),
+        name_loader=lambda codes: news_inputs.load_names(codes),
+    )
+
+
+def build_news_payloads(
+    market_date: date, inputs: Mapping[str, Mapping[str, Any]], *, batch_size: int
 ) -> list[dict[str, Any]]:
-    symbols = list(news_by_symbol)
+    symbols = list(inputs)
     payloads: list[dict[str, Any]] = []
     for start in range(0, len(symbols), max(1, batch_size)):
         batch = symbols[start : start + batch_size]
@@ -93,23 +139,11 @@ def build_news_payloads(
                 'task': 'news_events',
                 'market_date': market_date.isoformat(),
                 'symbols': batch,
-                'items': [
-                    {
-                        'symbol': symbol,
-                        'news': list(news_by_symbol[symbol]),
-                        **(
-                            {'price_move_since_publication_pct': round(float(price_moves[symbol]), 4)}
-                            if price_moves and symbol in price_moves
-                            else {}
-                        ),
-                    }
-                    for symbol in batch
-                ],
+                'items': [{'symbol': symbol, **inputs[symbol]} for symbol in batch],
             }
         )
     return payloads
 
 
 def build_postmortem_payload(summary: Mapping[str, Any]) -> dict[str, Any]:
-    """Wrap a pre-aggregated outcome summary (for example the signal-lab JSON)."""
     return {'task': 'postmortem', 'summary': dict(summary)}

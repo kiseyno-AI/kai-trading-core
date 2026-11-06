@@ -9,7 +9,8 @@ from pathlib import Path
 
 from app.side_agents.runner import (
     KST,
-    find_latest_summary,
+    _default_summary_loader,
+    load_summary_file,
     run_due,
     run_market_context,
     run_news_events,
@@ -29,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     one = sub.add_parser('run', help='run one agent now')
     one.add_argument('--agent', required=True, choices=SIDE_AGENT_NAMES)
     one.add_argument('--date', help='market date YYYY-MM-DD (default: today KST)')
-    one.add_argument('--summary', type=Path, help='postmortem summary JSON (default: latest alpha-lab report)')
+    one.add_argument('--summary', type=Path, help='postmortem summary JSON file (default: computed from stored decisions)')
     one.add_argument('--dry-run', action='store_true')
     sub.add_parser('status', help='list stored results')
     args = parser.parse_args(argv)
@@ -56,8 +57,8 @@ def main(argv: list[str] | None = None) -> int:
         outcomes = run_news_events(market_date, client=client, store=store, now=now, dry_run=args.dry_run)
     else:
         iso = now.isocalendar()
-        summary = args.summary or find_latest_summary([Path(__file__).resolve().parents[4] / 'var' / 'alpha-lab'])
-        outcomes = [run_postmortem(f'{iso.year}-W{iso.week:02d}', summary_path=summary, client=client, store=store, now=now, dry_run=args.dry_run)]
+        summary = load_summary_file(args.summary) if args.summary else _default_summary_loader(now.date())
+        outcomes = [run_postmortem(f'{iso.year}-W{iso.week:02d}', summary=summary, client=client, store=store, now=now, dry_run=args.dry_run)]
     print(json.dumps([vars(o) for o in outcomes], ensure_ascii=False))
     return 0 if all(o.status in {'ok', 'skipped'} for o in outcomes) else 1
 

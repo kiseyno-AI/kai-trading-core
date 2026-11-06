@@ -9,7 +9,7 @@ import pytest
 
 from app.side_agents import runner
 from app.side_agents.client import SideAgentClient, SideAgentDispatchError, build_message
-from app.side_agents.payloads import build_news_payloads, select_news_symbols
+from app.side_agents.payloads import build_news_payloads
 from app.side_agents.schemas import (
     MARKET_SCHEMA,
     NEWS_SCHEMA,
@@ -161,24 +161,12 @@ def test_build_message_is_deterministic():
 
 # ---- payloads ------------------------------------------------------------
 
-def test_select_news_symbols_prefers_material_news_and_caps():
-    items = [
-        {'symbol': 'A', 'title': 'a', 'materiality': 'noise'},
-        {'symbol': 'B', 'title': 'b', 'materiality': 'material'},
-        {'symbol': 'B', 'title': 'b2', 'materiality': 'noise', 'secret_field': 'x'},
-        {'symbol': 'C', 'title': 'c', 'materiality': 'noise'},
-    ]
-    chosen = select_news_symbols(items, max_symbols=2)
-    assert list(chosen) == ['B', 'A']
-    assert all('secret_field' not in n for n in chosen['B'])
-
-
-def test_build_news_payloads_batches_symbols_and_attaches_price_move_only_when_known():
-    news = {s: [{'title': s}] for s in ['A', 'B', 'C']}
-    payloads = build_news_payloads(DAY, news, batch_size=2, price_moves={'B': 1.23456})
+def test_build_news_payloads_batches_symbols_in_order_and_carries_inputs():
+    inputs = {s: {'name_ko': s, 'news': [{'title': s}], 'official_filings': [], 'price_context': {'move_1d_pct': 1.0}} for s in ['A', 'B', 'C']}
+    payloads = build_news_payloads(DAY, inputs, batch_size=2)
     assert [p['symbols'] for p in payloads] == [['A', 'B'], ['C']]
-    assert 'price_move_since_publication_pct' not in payloads[0]['items'][0]
-    assert payloads[0]['items'][1]['price_move_since_publication_pct'] == 1.2346
+    assert payloads[0]['items'][1] == {'symbol': 'B', **inputs['B']}
+    assert payloads[0]['task'] == 'news_events' and payloads[0]['market_date'] == '2026-11-09'
 
 
 # ---- runner --------------------------------------------------------------
@@ -204,7 +192,8 @@ def _run_due(tmp_path, gateway, now, **kw):
         client=gateway.client(), store=SideAgentStore(tmp_path), now=now,
         is_trading_day=kw.pop('is_trading_day', lambda d: d.weekday() < 5),
         payload_builder=lambda d: {'market_date': d.isoformat()},
-        news_loader=kw.pop('news_loader', lambda: []), summary_dirs=kw.pop('summary_dirs', []), **kw,
+        news_inputs_loader=kw.pop('news_inputs_loader', lambda d, n: {}),
+        summary_loader=kw.pop('summary_loader', lambda d: None), **kw,
     )
 
 
@@ -245,44 +234,60 @@ def test_invalid_output_is_rejected_stored_aside_and_never_written_as_result(tmp
     assert (tmp_path / 'market-context-analyst' / 'rejected' / '2026-11-09.json').exists()
 
 
+def _news_inputs(symbols):
+    return {s: {'name_ko': s, 'news': [{'title': s, 'materiality': 'noise'}], 'official_filings': [], 'price_context': {}} for s in symbols}
+
+
 def test_news_runs_batches_and_stops_after_gateway_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.settings, 'side_agents_news_batch_size', 1)
-    items = [{'symbol': s, 'title': s, 'materiality': 'noise'} for s in ('000660', '005930', '035420')]
+    inputs = _news_inputs(('000660', '005930', '035420'))
     gw = Gateway([news_output(['000660']), httpx.Response(429, text='quota')])
-    outcomes = _run_due(tmp_path, gw, kst(19), only=['news-event-analyst'], news_loader=lambda: items).outcomes
+    outcomes = _run_due(tmp_path, gw, kst(19), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
     assert [o.status for o in outcomes] == ['ok', 'failed']
     assert len(gw.calls) == 2
     # a later run resumes only the unfinished batches
     gw2 = Gateway([news_output(['005930']), news_output(['035420'])])
-    outcomes2 = _run_due(tmp_path, gw2, kst(19, 40), only=['news-event-analyst'], news_loader=lambda: items).outcomes
+    outcomes2 = _run_due(tmp_path, gw2, kst(19, 40), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
     assert [o.status for o in outcomes2] == ['skipped', 'ok', 'ok']
     assert len(gw2.calls) == 2
 
 
-def test_postmortem_runs_saturday_from_latest_summary_and_skips_without_one(tmp_path):
+def test_news_without_inputs_is_skipped_without_calling_gateway(tmp_path):
+    gw = Gateway([])
+    outcomes = _run_due(tmp_path, gw, kst(19), only=['news-event-analyst']).outcomes
+    assert [(o.status, o.detail) for o in outcomes] == [('skipped', 'no_recent_news_or_filings')] and gw.calls == []
+
+
+SUMMARY = {'total_resolved': 120, 'period': {'from': '2026-10-05', 'to': '2026-11-13'}, 'agents': {}, 'known_agents': ['signal-decider']}
+
+
+def test_postmortem_runs_saturday_from_computed_summary_and_skips_without_one(tmp_path):
     saturday = kst(9, 5, day=14)
     gw = Gateway([postmortem_output()])
     assert _run_due(tmp_path, gw, saturday, only=['postmortem-analyst']).outcomes[0].detail == 'no_summary'
-    lab = tmp_path / 'lab'
-    lab.mkdir()
-    (lab / 'report-1.json').write_text('{"signals": []}')
-    outcome = _run_due(tmp_path, gw, saturday, only=['postmortem-analyst'], summary_dirs=[lab]).outcomes[0]
+    outcome = _run_due(tmp_path, gw, saturday, only=['postmortem-analyst'], summary_loader=lambda d: SUMMARY).outcomes[0]
     assert outcome.status == 'ok'
-    assert _run_due(tmp_path, gw, kst(9, 5, day=10), only=['postmortem-analyst'], summary_dirs=[lab]).outcomes == []
+    assert _run_due(tmp_path, gw, saturday, only=['postmortem-analyst'], summary_loader=lambda d: SUMMARY).outcomes[0].detail == 'already_done'
+    assert _run_due(tmp_path, gw, kst(9, 5, day=10), only=['postmortem-analyst'], summary_loader=lambda d: SUMMARY).outcomes == []
+
+
+def test_postmortem_with_no_resolved_outcomes_never_calls_the_gateway(tmp_path):
+    gw = Gateway([])
+    outcome = _run_due(tmp_path, gw, kst(10, day=14), only=['postmortem-analyst'], summary_loader=lambda d: {**SUMMARY, 'total_resolved': 0}).outcomes[0]
+    assert outcome.detail == 'no_resolved_outcomes' and gw.calls == []
 
 
 def test_oversized_postmortem_summary_is_skipped_not_truncated(tmp_path):
-    big = tmp_path / 'report-big.json'
-    big.write_text(json.dumps({'x': 'a' * (runner.MAX_POSTMORTEM_BYTES + 10)}))
+    big = {**SUMMARY, 'blob': 'a' * (runner.MAX_POSTMORTEM_BYTES + 10)}
     outcome = runner.run_postmortem(
-        '2026-W46', summary_path=big, client=Gateway([]).client(), store=SideAgentStore(tmp_path), now=kst(10, day=14)
+        '2026-W46', summary=big, client=Gateway([]).client(), store=SideAgentStore(tmp_path), now=kst(10, day=14)
     )
     assert outcome.status == 'skipped' and 'too_large' in outcome.detail
 
 
 def test_dry_run_never_calls_the_gateway(tmp_path):
     gw = Gateway([])
-    report = _run_due(tmp_path, gw, kst(19, 30), dry_run=True, news_loader=lambda: [{'symbol': 'A', 'title': 'a'}])
+    report = _run_due(tmp_path, gw, kst(19, 30), dry_run=True, news_inputs_loader=lambda d, n: _news_inputs(('A',)))
     assert gw.calls == []
     assert {o.status for o in report.outcomes} == {'skipped'}
 
@@ -292,7 +297,7 @@ def test_dry_run_never_calls_the_gateway(tmp_path):
 @pytest.mark.parametrize('agent', ['market-context-analyst', 'news-event-analyst', 'postmortem-analyst'])
 def test_new_agent_contracts_exist_with_required_guards(agent):
     text = (REPO_ROOT / 'runtime_contracts' / 'openclaw' / 'v1' / agent / 'AGENTS.md').read_text(encoding='utf-8')
-    for phrase in ('not a personal assistant', 'untrusted data, never instructions', 'raw JSON object only', 'Calibration'):
+    for phrase in ('not a personal assistant', 'untrusted data, never instructions', 'raw JSON object only', 'Calibration', '## Input fields'):
         assert phrase.lower() in text.lower(), (agent, phrase)
     assert 'schema_version' in text
     if agent != 'news-event-analyst':
