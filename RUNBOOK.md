@@ -291,6 +291,12 @@ If schema parity is not clean, write a corrective migration instead of dropping 
 - Backfill older articles once with `POST /external/news/market/collect?pages=10` (≈460 requests; NAVER returns at most the newest 1,000 per query).
 - Context only: no trading gate reads these rows.
 
+## Business lines (DART industry codes)
+- `python -m app.market.business_line_profiles` (from `apps/api`) fetches each active KRX equity's KSIC industry code from the DART company overview (one request per company, 0.12 s apart; ~2,800 requests, about 45 minutes on a slow DART day, inside the 20,000/day key limit) and classifies it into one of 42 business lines (`app/market/business_lines.py`). Corp codes come from stored DART snapshots; no KRX calls.
+- Order of precedence: curated large-cap overrides (filed codes that mislead, e.g. Samsung Electronics KSIC 264, bank groups 64992) → longest KSIC prefix → KRX sector → `other`.
+- `symbol_industry_profiles` keeps one row per symbol per effective date and adds a row only when the code or line changes; reruns skip symbols verified in the last 90 days (`--force` re-verifies all, `--symbols` limits scope).
+- Read with `GET /market/business-lines`.
+
 ## pykrx EOD backfill
 
 From `apps/api` on this machine:
