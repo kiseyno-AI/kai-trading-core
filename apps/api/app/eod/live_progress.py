@@ -440,11 +440,17 @@ class DailyPipelineLiveProgress:
     def events_since(self, seq: int = 0, *, limit: int = 200) -> dict[str, Any]:
         with self._lock:
             items = [event for event in self._events if event['seq'] > seq]
+            page = items[: max(1, min(limit, MAX_EVENTS))]
             return {
                 'schema_version': SCHEMA_VERSION,
                 'last_seq': self._seq,
-                'events': items[: max(1, min(limit, MAX_EVENTS))],
-                'truncated': len(items) > limit,
+                # Resume from here: the last event on this page, not the
+                # newest event overall, so a truncated page loses nothing.
+                'next_since': page[-1]['seq'] if page else seq,
+                'events': page,
+                'truncated': len(items) > len(page),
+                # Events older than the in-memory window are gone.
+                'gap': bool(self._events) and seq + 1 < self._events[0]['seq'],
             }
 
     def read_best_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:

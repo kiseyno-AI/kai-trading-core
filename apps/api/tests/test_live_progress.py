@@ -313,3 +313,25 @@ class FactorHelperProgressTests(unittest.TestCase):
             self.assertEqual((stage['processed'], stage['succeeded'], stage['failed']), (3, 2, 1))
             self.assertEqual(stage['current_step'], 'compute_symbols_done')
             self.assertEqual(len(items), 2)
+
+
+class EventPagingTests(unittest.TestCase):
+    def test_paging_with_next_since_loses_no_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            live = DailyPipelineLiveProgress(
+                snapshot_path=Path(root) / 'c.json', event_log_path=Path(root) / 'e.jsonl'
+            )
+            for run_id in range(5):
+                live.publish_run(_run(run_id=run_id))
+
+            seen, since = [], 0
+            while True:
+                page = live.events_since(since, limit=2)
+                seen += [event['seq'] for event in page['events']]
+                since = page['next_since']
+                if not page['truncated']:
+                    break
+
+            self.assertEqual(seen, [1, 2, 3, 4, 5])
+            self.assertEqual(page['last_seq'], 5)
+            self.assertFalse(page['gap'])
