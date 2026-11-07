@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -144,6 +144,7 @@ class ExternalNewsService:
         freshness_cutoff: datetime | None = None,
         freshness_published_before: datetime | None = None,
         freshness_lookback_days: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         requested_symbols = _normalize_symbols(symbols)
         provider_status = self.provider.status()
@@ -218,6 +219,15 @@ class ExternalNewsService:
         consecutive_provider_failures = 0
         provider_circuit_open = False
         for index, symbol in enumerate(requested_symbols):
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        'processed': index,
+                        'total': len(requested_symbols),
+                        'current_symbol': symbol,
+                        'current_step': 'collect_symbol_news',
+                    }
+                )
             row = symbol_map.get(symbol)
             if row is None:
                 summary['items_skipped'] += 1
@@ -339,6 +349,7 @@ class ExternalNewsService:
         symbols: Sequence[str] | str | None = None,
         display: int | None = None,
         symbol_limit: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(str(market_date)) if not isinstance(market_date, date) else market_date
         requested_symbols = _normalize_symbols(symbols)
@@ -408,6 +419,7 @@ class ExternalNewsService:
             freshness_cutoff=freshness_cutoff,
             freshness_published_before=freshness_published_before,
             freshness_lookback_days=freshness_lookback_days,
+            progress_callback=progress_callback,
         )
         result.update(
             {

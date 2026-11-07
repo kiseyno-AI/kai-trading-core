@@ -284,6 +284,26 @@ If schema parity is not clean, write a corrective migration instead of dropping 
 - `external_news_enrich` inserts the current classifier version for legacy rows into `external_news_item_classifications`; it never rewrites an article. Replays are idempotent per article/version. Change the classifier version before changing classification semantics—existing versions must remain immutable.
 - Embedded `payload.classification` values have no trustworthy availability timestamp and are not exposed as decision evidence. After deployment, run the normal `external_news_enrich` stage once to create timestamped sidecars for recent legacy rows.
 
+## Daily pipeline live progress (no DB)
+Watch a running daily pipeline without querying Postgres:
+
+```bash
+curl -s -H "Authorization: Bearer $UPSTREAM_BEARER_TOKEN" http://127.0.0.1:8000/eod/pipeline/live | jq '.active_run | {run_id, current_stage, elapsed_seconds, stages: [.stages[] | {stage_id, status, processed, total, percent, eta_seconds, current_substep}]}'
+```
+
+```bash
+tail -f apps/api/var/log/daily-pipeline-live.jsonl
+```
+
+```bash
+jq '.active_run.current_stage' apps/api/var/pipeline-live/current.json
+```
+
+- Every run/stage start, per-item progress, heartbeat, sub-step and finish is mirrored into memory, the atomic snapshot `apps/api/var/pipeline-live/current.json` and the JSONL event log (milestones only). Operator CLI runs write the same snapshot, so the API endpoint shows them too (`origin: snapshot_file`).
+- A grouped `pykrx_universe_refresh,price_collection,pykrx_enrichment` call keeps only `pykrx_universe_refresh` "running" in `daily_pipeline_stage_runs` while it collects ~2,700 symbols (about 15–20 minutes); the live view's `collection_stage` and the mirrored `price_collection` counts show the real position, so do not treat that row as a hang.
+- `stale_suspected: true` means a running run has had no update or heartbeat for 15 minutes (for example a killed process). Check the process before acting; a killed operator run leaves `daily_pipeline_runs`/`eod_collection_runs` rows in `running`, which deduplicates (skips) the next run for that date until they are terminalized.
+- Override paths with `DAILY_PIPELINE_LIVE_DIR` / `DAILY_PIPELINE_LIVE_LOG`. Tests point both at a temp dir (`apps/api/conftest.py`).
+
 ## pykrx EOD backfill
 
 From `apps/api` on this machine:
