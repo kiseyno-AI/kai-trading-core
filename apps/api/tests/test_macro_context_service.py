@@ -890,3 +890,22 @@ def test_global_risk_labels_from_fred_drivers() -> None:
     assert caution['global_risk_label'] == 'global_risk_caution'
     assert caution['us_curve_label'] == 'curve_flat'
     assert caution['us_policy_label'] == 'us_policy_unknown'
+
+
+def test_stale_risk_series_do_not_produce_a_risk_on_label() -> None:
+    from app.macro_context.service import _global_labels
+
+    calm = {
+        'risk': {'status': 'available', 'latest_value': 12.0},
+        'credit': {'status': 'available', 'latest_value': 3.0},
+    }
+    assert _global_labels(calm)['global_risk_label'] == 'global_risk_on'
+
+    stale = {key: {**item, 'status': 'stale'} for key, item in calm.items()}
+    labels = _global_labels(stale)
+    assert labels['risk_label'] == 'risk_unknown'
+    assert labels['credit_label'] == 'credit_unknown'
+    assert labels['global_risk_label'] == 'global_risk_unknown'
+
+    one_stale = {'risk': calm['risk'], 'credit': {**calm['credit'], 'status': 'stale'}}
+    assert _global_labels(one_stale)['global_risk_label'] == 'global_risk_neutral'

@@ -318,7 +318,12 @@ def _band(value: float | None, unknown: str, bands: Sequence[tuple[float, str]],
 
 def _global_labels(series_by_key: dict[str, dict[str, Any]]) -> dict[str, str]:
     def value(key: str) -> float | None:
-        return _to_float(series_by_key.get(key, {}).get('latest_value'))
+        # Daily market drivers go stale fast: a stale or missing series is
+        # unknown, never a calm reading carried forward.
+        item = series_by_key.get(key) or {}
+        if item.get('status') != 'available':
+            return None
+        return _to_float(item.get('latest_value'))
 
     risk = _band(value('risk'), 'risk_unknown', ((30.0, 'risk_stress'), (20.0, 'risk_elevated'), (15.0, 'risk_normal')), 'risk_calm')
     credit = _band(value('credit'), 'credit_unknown', ((6.0, 'credit_stress'), (4.5, 'credit_widening'), (3.5, 'credit_normal')), 'credit_tight')
