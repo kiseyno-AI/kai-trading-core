@@ -274,3 +274,42 @@ class RunStateServiceHookTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FactorHelperProgressTests(unittest.TestCase):
+    def test_shared_factor_helper_reports_each_symbol_to_the_running_stage(self):
+        from app.signals import factor_coverage
+        from app.signals.factor_coverage import SymbolComputationError, build_symbol_results
+
+        with tempfile.TemporaryDirectory() as root:
+            live = DailyPipelineLiveProgress(
+                snapshot_path=Path(root) / 'current.json',
+                event_log_path=Path(root) / 'live.jsonl',
+            )
+            live.publish_run(_run())
+            live.publish_stage(_stage('momentum_factors', total=3))
+            seen = []
+
+            def build(symbol):
+                seen.append(live.snapshot()['active_run']['stages'][0]['current_symbol'])
+                if symbol == '000660':
+                    raise SymbolComputationError(ValueError('bad bars'))
+                return {'symbol': symbol}
+
+            original = factor_coverage.daily_pipeline_live_progress
+            factor_coverage.daily_pipeline_live_progress = live
+            try:
+                items, failed, _ = build_symbol_results(
+                    ['005930', '000660', '035420'],
+                    symbol_of=lambda symbol: symbol,
+                    build=build,
+                )
+            finally:
+                factor_coverage.daily_pipeline_live_progress = original
+
+            self.assertEqual(seen, ['005930', '000660', '035420'])
+            self.assertEqual(failed, ['000660'])
+            stage = live.snapshot()['active_run']['stages'][0]
+            self.assertEqual((stage['processed'], stage['succeeded'], stage['failed']), (3, 2, 1))
+            self.assertEqual(stage['current_step'], 'compute_symbols_done')
+            self.assertEqual(len(items), 2)

@@ -3,7 +3,13 @@
 ## Summary
 DB-free real-time view of the daily pipeline for dashboards and agents.
 
-Every write the daily pipeline makes to its run state (run start/finish, stage start, per-item progress, heartbeat, finish), the grouped PyKRX collection's per-symbol progress, derived-stage sub-steps (for example `technical_snapshots` → `price_contexts` then `technical_snapshots`) and in-memory per-symbol callbacks (technical snapshots, action summaries, external news collection) are mirrored into `app/eod/live_progress.py`. Nothing here queries the database, so it is safe to poll every second.
+Every write the daily pipeline makes to its run state (run start/finish, stage start, per-item progress, heartbeat, finish), the grouped PyKRX collection's per-symbol progress, derived-stage sub-steps (for example `technical_snapshots` → `price_contexts` then `technical_snapshots`) and in-memory per-item callbacks are mirrored into `app/eod/live_progress.py`. Per-item coverage (memory only, no DB write):
+- per symbol: technical snapshots, action summaries, external news collection, every factor stage plus Piotroski and the market risk filter (all compute through `app/signals/factor_coverage.build_symbol_results`), and signal-feature row building (after a `collect_kis_rankings_and_build_rows` sub-step);
+- per category: `pykrx_enrichment` (7 categories);
+- per period: `trending_ranks`;
+- per series: `macro_context_refresh` (World Bank and FRED).
+
+Nothing here queries the database, so it is safe to poll every second.
 
 Sources, newest wins:
 - Core API process memory;
