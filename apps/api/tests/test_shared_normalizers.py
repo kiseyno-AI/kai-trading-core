@@ -19,6 +19,10 @@ class FiniteFloatTests(unittest.TestCase):
         self.assertEqual(finite_float(3), 3.0)
         self.assertEqual(finite_float(Decimal('12.5')), 12.5)
         self.assertEqual(finite_float(' 1,234.5 '), 1234.5)
+        self.assertEqual(finite_float('-12,345,678'), -12345678.0)
+        for malformed in ('1,2', '12,34', '1,2345', ',123', '1,234,5'):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(finite_float(malformed))
         for value in (None, '', '  ', 'n/a', True, False, float('nan'), float('inf'), Decimal('NaN'), Decimal('sNaN'), object()):
             with self.subTest(value=value):
                 self.assertIsNone(finite_float(value))
