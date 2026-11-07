@@ -376,6 +376,51 @@ def _is_point_in_time_safe_skip_stage_row(
     )
 
 
+PYKRX_ENRICHMENT_MARKET_SCOPE_CATEGORIES = frozenset(
+    {'market_breadth', 'investor_flow_market'}
+)
+
+
+def _pykrx_enrichment_rows_cover_requested_scope(
+    *,
+    coverage: dict[str, Any],
+    category_rows: dict[str, Any],
+    requested_scope_count: int,
+) -> bool:
+    """Stored enrichment rows prove the requested symbol scope on their own.
+
+    True only when the coverage loader counted exactly the requested symbols
+    and every applicable per-symbol category has a row for each of them.
+    """
+
+    try:
+        loaded_scope_count = int(coverage.get('requested_symbol_count') or 0)
+    except (TypeError, ValueError):
+        return False
+    if requested_scope_count <= 0 or loaded_scope_count != requested_scope_count:
+        return False
+    symbol_categories = 0
+    for category, item in category_rows.items():
+        if not isinstance(item, dict):
+            return False
+        scope_type = str(item.get('scope_type') or '').strip().lower()
+        if scope_type == 'market' or (
+            not scope_type and category in PYKRX_ENRICHMENT_MARKET_SCOPE_CATEGORIES
+        ):
+            continue
+        if str(item.get('coverage_status') or '').strip().lower() == 'not_applicable':
+            continue
+        symbol_categories += 1
+        try:
+            present = int(item.get('present_rows') or 0)
+            expected = int(item.get('expected_rows') or 0)
+        except (TypeError, ValueError):
+            return False
+        if expected != requested_scope_count or present < requested_scope_count:
+            return False
+    return symbol_categories > 0
+
+
 AUTOMATIC_PIPELINE_TRIGGER_PREFIX = 'auto_'
 AUTOMATIC_PIPELINE_TRIGGERS = frozenset({'monitor_stale_continuation'})
 NON_EVIDENCE_STAGE_STATUSES = frozenset({'blocked', 'skipped'})
@@ -5356,6 +5401,22 @@ class EODPipelineStatusService:
             for stock_code in normalized_scope_symbols
             if stock_code not in successful_scope_set
         ]
+        # Without the run's per-symbol outcome manifest (past-date operator
+        # reruns and point-in-time recovery write none), the stored rows are
+        # the evidence: the coverage loader was scoped to exactly these
+        # symbols and every per-symbol category holds a row for each one.
+        stored_row_scope_complete = (
+            requested_scope_count > 0
+            and not exact_scope_loaded
+            and _pykrx_enrichment_rows_cover_requested_scope(
+                coverage=coverage,
+                category_rows=category_rows,
+                requested_scope_count=requested_scope_count,
+            )
+        )
+        if stored_row_scope_complete:
+            missing_scope_symbols = []
+        scope_evidence_loaded = exact_scope_loaded or stored_row_scope_complete
         requested_scope_coverage = None
         if requested_scope_count:
             nonready_category_gates = [
@@ -5384,28 +5445,39 @@ class EODPipelineStatusService:
             )
             scope_ready = (
                 status in {'completed', 'partial'}
-                and exact_scope_loaded
+                and scope_evidence_loaded
                 and not missing_scope_symbols
-                and scope_category_gate_ready
+                and (
+                    scope_category_gate_ready
+                    if exact_scope_loaded
+                    else gate_status == 'ready'
+                )
             )
             scope_waiting = status in {'pending', 'running', 'waiting'}
             requested_scope_coverage = {
                 'evidence_version': 'pykrx_enrichment_scope_coverage_v1',
-                'authoritative': exact_scope_loaded,
+                'authoritative': scope_evidence_loaded,
+                'evidence_source': (
+                    'run_scope_outcome_manifest'
+                    if exact_scope_loaded
+                    else 'stored_rows'
+                    if stored_row_scope_complete
+                    else None
+                ),
                 'requested_count': requested_scope_count,
                 'present_count': (
                     requested_scope_count - len(missing_scope_symbols)
-                    if exact_scope_loaded
+                    if scope_evidence_loaded
                     else 0
                 ),
                 'missing_count': (
                     len(missing_scope_symbols)
-                    if exact_scope_loaded
+                    if scope_evidence_loaded
                     else requested_scope_count
                 ),
                 'missing_symbols_sample': (
                     missing_scope_symbols
-                    if exact_scope_loaded
+                    if scope_evidence_loaded
                     else normalized_scope_symbols
                 )[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT],
             }

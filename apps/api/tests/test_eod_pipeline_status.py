@@ -2818,6 +2818,73 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             )
         )
 
+    def test_pykrx_stored_rows_prove_scope_when_run_has_no_manifest(self):
+        # A past-date operator rerun records no per-symbol outcome manifest;
+        # the scoped stored rows alone must still admit the symbols.
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2,
+            market_count=2,
+            updated_at='2026-11-06T20:31:00+09:00',
+        )
+        run = {
+            'id': 591,
+            'run_metadata': {
+                'stage_progress': {
+                    'pykrx_enrichment': {
+                        'status': 'completed',
+                        'processed': 7,
+                        'total': 7,
+                        'succeeded': 7,
+                        'failed': 0,
+                    }
+                }
+            },
+        }
+        service = EODPipelineStatusService()
+
+        stage = service._build_pykrx_enrichment_stage(
+            market_date='2026-11-06',
+            coverage=coverage,
+            run=run,
+            scope_symbols=['000080', '000810'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['blocking_status'], 'non_blocking')
+        scope = stage['details']['requested_scope_coverage']
+        self.assertTrue(scope['authoritative'])
+        self.assertEqual(scope['evidence_source'], 'stored_rows')
+        self.assertEqual(scope['missing_count'], 0)
+        self.assertTrue(
+            service._dependency_is_ready_for_scope(
+                stage=stage,
+                scope_symbols=['000080', '000810'],
+            )
+        )
+
+    def test_pykrx_stored_rows_missing_one_symbol_row_stay_blocked(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2,
+            market_count=2,
+            updated_at='2026-11-06T20:31:00+09:00',
+        )
+        coverage['categories']['short_selling'].update(
+            {'present_rows': 1, 'coverage_status': 'partial'}
+        )
+        service = EODPipelineStatusService()
+
+        stage = service._build_pykrx_enrichment_stage(
+            market_date='2026-11-06',
+            coverage=coverage,
+            scope_symbols=['000080', '000810'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'blocked')
+        scope = stage['details']['requested_scope_coverage']
+        self.assertFalse(scope['authoritative'])
+        self.assertIsNone(scope['evidence_source'])
+        self.assertEqual(scope['missing_count'], 2)
+
     def test_pykrx_exact_success_scope_isolates_symbol_only_global_gap(self):
         coverage = _full_pykrx_enrichment_coverage(
             symbol_count=2,
