@@ -208,7 +208,18 @@ def validate_news_events(
     return {'schema_version': NEWS_SCHEMA, 'market_date': market_date.isoformat(), 'results': results}
 
 
-def validate_postmortem(obj: Mapping[str, Any], *, known_agents: Sequence[str]) -> dict[str, Any]:
+def validate_postmortem(
+    obj: Mapping[str, Any],
+    *,
+    known_agents: Sequence[str],
+    measured_sufficient: Mapping[str, bool] | None = None,
+) -> dict[str, Any]:
+    """``measured_sufficient`` is Core's own per-agent sample check.
+
+    The model's ``sample.sufficient`` is only a claim; a proposal for an
+    agent whose measured sample is insufficient is rejected regardless.
+    """
+
     _require_schema(obj, POSTMORTEM_SCHEMA)
     period = obj.get('period')
     sample = obj.get('sample')
@@ -240,6 +251,12 @@ def validate_postmortem(obj: Mapping[str, Any], *, known_agents: Sequence[str]) 
         )
     if proposals and not sufficient:
         raise SideAgentValidationError('proposals require a sufficient sample')
+    if measured_sufficient is not None:
+        for proposal in proposals:
+            if measured_sufficient.get(proposal['target_agent']) is not True:
+                raise SideAgentValidationError(
+                    f"proposal for {proposal['target_agent']} lacks a sufficient measured sample"
+                )
     calibration = [
         {
             'bucket': _text(item.get('bucket'), 'calibration.bucket'),

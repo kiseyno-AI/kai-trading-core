@@ -262,8 +262,33 @@ def test_news_runs_batches_and_stops_after_gateway_failure(tmp_path, monkeypatch
     # a later run resumes only the unfinished batches
     gw2 = Gateway([news_output(['005930']), news_output(['035420'])])
     outcomes2 = _run_due(tmp_path, gw2, kst(22, 40), only=['news-event-analyst'], news_inputs_loader=lambda d, n: inputs).outcomes
-    assert [o.status for o in outcomes2] == ['skipped', 'ok', 'ok']
+    assert [o.status for o in outcomes2] == ['ok', 'ok']
     assert len(gw2.calls) == 2
+
+
+def test_news_retry_after_a_ranking_change_still_covers_new_symbols(tmp_path, monkeypatch):
+    # Review case: batches were tracked by index, so after re-ranking the
+    # finished index b00 hid a symbol that had never been analysed.
+    monkeypatch.setattr(runner.settings, 'side_agents_news_batch_size', 1)
+    first = _news_inputs(('000660', '005930'))
+    gw = Gateway([news_output(['000660']), httpx.Response(429, text='quota')])
+    _run_due(tmp_path, gw, kst(21, 30), only=['news-event-analyst'], news_inputs_loader=lambda d, n: first)
+
+    reranked = _news_inputs(('035420', '000660', '005930'))
+    gw2 = Gateway([news_output(['035420']), news_output(['005930'])])
+    outcomes = _run_due(tmp_path, gw2, kst(22, 40), only=['news-event-analyst'], news_inputs_loader=lambda d, n: reranked).outcomes
+
+    assert [o.status for o in outcomes] == ['ok', 'ok']
+    state = SideAgentStore(tmp_path).load_state('news-event-analyst', DAY.isoformat())
+    assert state['done_symbols'] == ['000660', '005930', '035420']
+
+
+def test_postmortem_proposal_needs_the_measured_sample_not_the_models_claim():
+    agents = ('signal-decider', 'short-term-decider')
+    claims_enough = postmortem_output()  # model says sample.sufficient = true
+    with pytest.raises(SideAgentValidationError):
+        validate_postmortem(claims_enough, known_agents=agents, measured_sufficient={'signal-decider': False})
+    assert validate_postmortem(claims_enough, known_agents=agents, measured_sufficient={'signal-decider': True})['proposals']
 
 
 def test_news_without_inputs_is_skipped_without_calling_gateway(tmp_path):
@@ -272,7 +297,7 @@ def test_news_without_inputs_is_skipped_without_calling_gateway(tmp_path):
     assert [(o.status, o.detail) for o in outcomes] == [('skipped', 'no_recent_news_or_filings')] and gw.calls == []
 
 
-SUMMARY = {'total_resolved': 120, 'period': {'from': '2026-10-05', 'to': '2026-11-13'}, 'agents': {}, 'known_agents': ['signal-decider']}
+SUMMARY = {'total_resolved': 120, 'period': {'from': '2026-10-05', 'to': '2026-11-13'}, 'agents': {'signal-decider': {'sufficient_sample': True}}, 'known_agents': ['signal-decider']}
 
 
 def test_postmortem_runs_saturday_from_computed_summary_and_skips_without_one(tmp_path):

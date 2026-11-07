@@ -168,13 +168,16 @@ def run_news_events(
     inputs = inputs_loader(market_date, now)
     if not inputs:
         return [UnitOutcome(NEWS_AGENT, key, 'skipped', 'no_recent_news_or_filings')]
-    payloads = build_news_payloads(market_date, inputs, batch_size=settings.side_agents_news_batch_size)
+    # Completion is tracked per symbol: a retry re-ranks the inputs, so a
+    # batch index from an earlier attempt can hold different symbols.
+    done_symbols = set(state.get('done_symbols') or [])
+    pending = {symbol: value for symbol, value in inputs.items() if symbol not in done_symbols}
+    if not pending:
+        return [UnitOutcome(NEWS_AGENT, key, 'skipped', 'already_done')]
+    payloads = build_news_payloads(market_date, pending, batch_size=settings.side_agents_news_batch_size)
     outcomes: list[UnitOutcome] = []
-    for index, payload in enumerate(payloads):
-        unit = f'{key}-b{index:02d}'
-        if unit in state['done_units']:
-            outcomes.append(UnitOutcome(NEWS_AGENT, unit, 'skipped', 'already_done'))
-            continue
+    for payload in payloads:
+        unit = f"{key}-{hashlib.sha256(','.join(payload['symbols']).encode()).hexdigest()[:10]}"
         ok, why = _may_attempt(state, now)
         if not ok:
             outcomes.append(UnitOutcome(NEWS_AGENT, unit, 'blocked', why))
@@ -191,6 +194,9 @@ def run_news_events(
             meta={'market_date': key, 'symbols': payload['symbols']},
         )
         outcomes.append(outcome)
+        if outcome.status == 'ok':
+            state['done_symbols'] = sorted(set(state.get('done_symbols') or []) | set(payload['symbols']))
+            store.save_state(NEWS_AGENT, key, state)
         if outcome.status == 'failed':
             break  # gateway/quota problem: do not burn the attempt budget on the remaining batches
     return outcomes
@@ -247,7 +253,14 @@ def run_postmortem(
     )
     return _dispatch_unit(
         agent=POSTMORTEM_AGENT, task='postmortem', unit=week_key, state_key=week_key, payload=payload,
-        validate=lambda obj: validate_postmortem(obj, known_agents=agents),
+        validate=lambda obj: validate_postmortem(
+            obj,
+            known_agents=agents,
+            measured_sufficient={
+                agent: bool(info.get('sufficient_sample'))
+                for agent, info in (summary.get('agents') or {}).items()
+            },
+        ),
         client=client, store=store, state=state, now=now,
         meta={'summary_sha256': _payload_sha(payload), 'period': summary.get('period')},
     )
