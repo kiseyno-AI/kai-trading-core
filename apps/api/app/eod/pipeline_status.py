@@ -343,9 +343,43 @@ def _load_pykrx_enrichment_coverage(
     ).get('coverage') or {}
 
 
+def _is_point_in_time_safe_skip_stage_row(
+    stage_row: Any,
+    *,
+    market_date: str,
+) -> bool:
+    """True for the orchestrator's admission-neutral past-date safe-skip.
+
+    A later run for a past market date (operator subset or point-in-time
+    recovery) records current-only stages as a canonical safe-skip. That
+    record proves nothing about the date's data, so it must not supersede an
+    earlier record that does.
+    """
+    from app.eod.pykrx_pipeline_runner import (
+        _is_canonical_point_in_time_current_only_skip,
+    )
+
+    if isinstance(stage_row, dict):
+        details = stage_row.get('details')
+        stage_id = stage_row.get('stage_id') or stage_row.get('id') or stage_row.get('stage')
+    else:
+        details = getattr(stage_row, 'details', None)
+        stage_id = getattr(stage_row, 'stage_id', None)
+    details = details if isinstance(details, dict) else {}
+    result_summary = details.get('result_summary')
+    if not isinstance(result_summary, dict) or not stage_id:
+        return False
+    return _is_canonical_point_in_time_current_only_skip(
+        result_summary,
+        stage_id=str(stage_id),
+        market_date=market_date,
+    )
+
+
 def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     latest_by_stage: dict[str, dict[str, Any]] = {}
+    safe_skip_fallback_by_stage: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
         rows = session.execute(
             select(DailyPipelineRun, DailyPipelineStageRun)
@@ -362,10 +396,21 @@ def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[st
         for run_row, stage_row in rows:
             if stage_row.stage_id in latest_by_stage:
                 continue
-            latest_by_stage[stage_row.stage_id] = {
+            entry = {
                 'run': daily_pipeline_run_state_service._serialize_run(run_row),
                 'stage': daily_pipeline_run_state_service._serialize_stage(stage_row),
             }
+            if _is_point_in_time_safe_skip_stage_row(
+                stage_row,
+                market_date=market_date,
+            ):
+                # Keep looking for an older record with real evidence; use
+                # the safe-skip only when the stage has nothing else.
+                safe_skip_fallback_by_stage.setdefault(stage_row.stage_id, entry)
+                continue
+            latest_by_stage[stage_row.stage_id] = entry
+    for stage_id, entry in safe_skip_fallback_by_stage.items():
+        latest_by_stage.setdefault(stage_id, entry)
     return latest_by_stage
 
 
@@ -2581,6 +2626,13 @@ class EODPipelineStatusService:
         for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             official_stage = official_stages.get(stage_id)
             if not isinstance(official_stage, dict):
+                continue
+            if _is_point_in_time_safe_skip_stage_row(
+                {'stage_id': stage_id, **official_stage},
+                market_date=market_date,
+            ):
+                # The latest run only safe-skipped this current-only stage
+                # for a past date; keep the earlier evidence-bearing state.
                 continue
             fallback_stage = stages.get(stage_id) or {}
             if self._recovery_state_is_newer(

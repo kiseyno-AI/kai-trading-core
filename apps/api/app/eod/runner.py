@@ -22,6 +22,7 @@ from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_serv
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
+from app.signals.overtime_ranking_capture import capture_overtime_rankings_if_due
 
 logger = logging.getLogger(__name__)
 PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
@@ -464,6 +465,15 @@ class EODBackgroundRunner:
             try:
                 market = await async_get_market_state()
                 await self._run_pending_session_cleanup()
+                if settings.background_runner_enabled:
+                    # Read-only after-hours ranking snapshot (17:45-18:30 KST).
+                    # It runs before the pipeline-active short-circuit so an
+                    # overlapping recovery run cannot starve it; failures are
+                    # recorded by the step wrapper and never block the tick.
+                    await self._run_async_step(
+                        'kis_overtime_ranking_capture_if_due',
+                        capture_overtime_rankings_if_due(market=market),
+                    )
                 pipeline_active = auto_pykrx_eod_scheduler.state.active_task
                 if pipeline_active and market.state not in {'PREOPEN', 'OPEN'}:
                     await asyncio.sleep(self.interval_seconds)

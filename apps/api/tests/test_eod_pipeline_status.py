@@ -4415,6 +4415,96 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertIn('daily_pipeline_stage_runs.market_date =', where_sql)
         self.assertIn('daily_pipeline_stage_runs.stage_id IN', where_sql)
 
+    @staticmethod
+    def _pitr_safe_skip(stage_id: str, market_date: str) -> dict:
+        return {
+            'triggered': False,
+            'skipped': True,
+            'safe_skip': True,
+            'status': 'skipped',
+            'reason': 'point_in_time_recovery_current_only_stage',
+            'market_date': market_date,
+            'stage': stage_id,
+        }
+
+    def test_stage_history_prefers_older_evidence_over_a_newer_past_date_safe_skip(self):
+        # Regression: an operator subset run for a past date safe-skips
+        # current-only stages; that newer record replaced the date's real
+        # DART outcome and blocked the agent prerequisite gate.
+        market_date = '2026-11-06'
+        skip_row = SimpleNamespace(
+            stage_id='fundamentals_daily_refresh',
+            details={'result_summary': self._pitr_safe_skip('fundamentals_daily_refresh', market_date)},
+            marker='skip',
+        )
+        evidence_row = SimpleNamespace(
+            stage_id='fundamentals_daily_refresh',
+            details={'result_summary': {'status': 'partial', 'reason': None}},
+            marker='evidence',
+        )
+        only_skip_row = SimpleNamespace(
+            stage_id='signal_features',
+            details={'result_summary': self._pitr_safe_skip('signal_features', market_date)},
+            marker='only-skip',
+        )
+        newer_run, older_run = SimpleNamespace(id=630), SimpleNamespace(id=619)
+
+        class _Result:
+            def all(self):
+                return [(newer_run, skip_row), (newer_run, only_skip_row), (older_run, evidence_row)]
+
+        class _Session:
+            def execute(self, statement):
+                return _Result()
+
+        @contextmanager
+        def _session_scope():
+            yield _Session()
+
+        with (
+            patch('app.eod.pipeline_status.session_scope', _session_scope),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_run',
+                side_effect=lambda row: {'id': row.id},
+            ),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_stage',
+                side_effect=lambda row: {'marker': row.marker},
+            ),
+        ):
+            result = _load_daily_pipeline_stage_history(market_date=market_date)
+
+        self.assertEqual(result['fundamentals_daily_refresh']['run'], {'id': 619})
+        self.assertEqual(result['fundamentals_daily_refresh']['stage'], {'marker': 'evidence'})
+        # With nothing better, the safe-skip is still reported.
+        self.assertEqual(result['signal_features']['stage'], {'marker': 'only-skip'})
+
+    def test_official_run_overlay_ignores_a_past_date_safe_skip_stage(self):
+        market_date = '2026-11-06'
+        service = EODPipelineStatusService()
+        fallback = {'status': 'partial', 'details': {'marker': 'evidence'}}
+        official_run = {
+            'id': 630,
+            'stages': {
+                'fundamentals_daily_refresh': {
+                    'status': 'completed',
+                    'details': {
+                        'result_summary': self._pitr_safe_skip(
+                            'fundamentals_daily_refresh', market_date
+                        ),
+                    },
+                },
+            },
+        }
+
+        overlaid = service._overlay_official_run_stages(
+            stages={'fundamentals_daily_refresh': fallback},
+            official_run=official_run,
+            market_date=market_date,
+        )
+
+        self.assertIs(overlaid['fundamentals_daily_refresh'], fallback)
+
     def test_load_latest_pipeline_pykrx_run_is_read_only_for_stale_looking_daily_run(self):
         historical_run = {
             'id': 900,
