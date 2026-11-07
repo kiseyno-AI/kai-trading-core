@@ -1,0 +1,129 @@
+"""Off-chain daily refresh of signal-decider evaluations.
+
+Historical outcome grading was removed from the execution-critical daily
+chain (``signal_decider_evaluations`` is ``default_selected=False``) so it can
+never delay or block the plan. Nothing scheduled it afterwards, and the
+evaluation table stopped updating on 2026-11-04, so the performance gates
+read stale grades. The background runner now calls this once per latest KRX
+session while no daily pipeline is active: late evening on a trading day, or
+any time on weekends and holidays.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+
+KST = ZoneInfo('Asia/Seoul')
+TRADING_DAY_EARLIEST = time(22, 30)
+MIN_ATTEMPT_INTERVAL = timedelta(minutes=30)
+MARKER_SCHEMA_VERSION = 'signal_decider_evaluation_refresh_v1'
+
+_last_attempt_at: dict[str, datetime] = {}
+
+
+def default_marker_dir() -> Path:
+    configured = os.environ.get('SIGNAL_DECIDER_EVALUATION_REFRESH_DIR', '').strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[2] / 'var' / 'decider-evaluation-refresh'
+
+
+def _load_marker(root: Path, market_date: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads((root / f'{market_date}.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get('schema_version') != MARKER_SCHEMA_VERSION:
+        return None
+    return payload
+
+
+def _save_marker(root: Path, market_date: str, payload: dict[str, Any]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.marker-', dir=str(root))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, default=str)
+        os.replace(tmp, root / f'{market_date}.json')
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _default_compute(market_date: str) -> dict[str, Any]:
+    from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
+    from app.agent_context.signal_decider_loop_service import (
+        DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+        SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
+        signal_decider_loop_service,
+    )
+
+    prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+        market_date=market_date,
+        required_stage_ids=SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
+    )
+    if not prerequisites['ready']:
+        return {
+            'summary': {'status': prerequisites['status'], 'gated': True},
+            'blocked_stage_ids': prerequisites.get('blocked_stage_ids'),
+            'waiting_stage_ids': prerequisites.get('waiting_stage_ids'),
+        }
+    return signal_decider_loop_service.compute_recent_evaluations(
+        as_of_market_date=market_date,
+        lookback_days=DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    )
+
+
+def refresh_signal_decider_evaluations_if_due(
+    *,
+    market: Any,
+    now: datetime | None = None,
+    compute: Callable[[str], dict[str, Any]] | None = None,
+    marker_dir: Path | None = None,
+) -> dict[str, Any]:
+    now_kst = (now or datetime.now(timezone.utc)).astimezone(KST)
+    state = getattr(market, 'state', None)
+    if state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
+        return {'status': 'skipped', 'reason': 'market_not_idle'}
+    if state == 'CLOSED' and now_kst.time() < TRADING_DAY_EARLIEST:
+        return {'status': 'skipped', 'reason': 'before_evening_window'}
+    market_date = str(getattr(market, 'latest_valid_trading_date', '') or '').strip()
+    if not market_date:
+        return {'status': 'skipped', 'reason': 'no_latest_trading_date'}
+    root = marker_dir or default_marker_dir()
+    marker = _load_marker(root, market_date)
+    if marker is not None and marker.get('status') == 'completed':
+        return {'status': 'skipped', 'reason': 'already_refreshed', 'market_date': market_date}
+    last = _last_attempt_at.get(market_date)
+    if last is not None and now_kst - last < MIN_ATTEMPT_INTERVAL:
+        return {'status': 'skipped', 'reason': 'attempt_interval', 'market_date': market_date}
+    _last_attempt_at[market_date] = now_kst
+
+    result = (compute or _default_compute)(market_date)
+    summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
+    gated = bool(summary.get('gated'))
+    status = 'gated' if gated else 'completed'
+    _save_marker(
+        root,
+        market_date,
+        {
+            'schema_version': MARKER_SCHEMA_VERSION,
+            'market_date': market_date,
+            'attempted_at': now_kst.isoformat(),
+            'status': status,
+            'summary': summary,
+            'blocked_stage_ids': result.get('blocked_stage_ids'),
+            'waiting_stage_ids': result.get('waiting_stage_ids'),
+        },
+    )
+    outcome = {'status': status, 'market_date': market_date, 'summary': summary}
+    logger.info('signal_decider_evaluation_refresh %s', outcome)
+    return outcome

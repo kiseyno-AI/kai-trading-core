@@ -4479,6 +4479,83 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         # With nothing better, the safe-skip is still reported.
         self.assertEqual(result['signal_features']['stage'], {'marker': 'only-skip'})
 
+    def _history_for(self, rows):
+        class _Result:
+            def all(self):
+                return rows
+
+        class _Session:
+            def execute(self, statement):
+                return _Result()
+
+        @contextmanager
+        def _session_scope():
+            yield _Session()
+
+        with (
+            patch('app.eod.pipeline_status.session_scope', _session_scope),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_run',
+                side_effect=lambda row: {'id': row.id},
+            ),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_stage',
+                side_effect=lambda row: {'marker': row.marker},
+            ),
+        ):
+            return _load_daily_pipeline_stage_history(market_date='2026-11-06')
+
+    def test_operator_run_blocked_or_skipped_stage_does_not_hide_earlier_evidence(self):
+        # Regression: an `eod-pipeline-run` test run left composite/signal
+        # stages "blocked: declared_dependencies_incomplete" and the agent
+        # gate then ignored the automatic run's real results.
+        operator_run = SimpleNamespace(id=631, trigger='internal_ops_cli')
+        auto_run = SimpleNamespace(id=619, trigger='auto_close_scheduler')
+
+        def row(stage_id, status, marker):
+            return SimpleNamespace(stage_id=stage_id, status=status, details={'result_summary': {'status': status}}, marker=marker)
+
+        result = self._history_for(
+            [
+                (operator_run, row('signal_features', 'blocked', 'operator-blocked')),
+                (operator_run, row('composite_factors', 'skipped', 'operator-skipped')),
+                (operator_run, row('technical_snapshots', 'completed', 'operator-completed')),
+                (auto_run, row('signal_features', 'partial', 'auto-signal')),
+                (auto_run, row('composite_factors', 'partial', 'auto-composite')),
+                (auto_run, row('technical_snapshots', 'completed', 'auto-technical')),
+            ]
+        )
+
+        self.assertEqual(result['signal_features']['stage'], {'marker': 'auto-signal'})
+        self.assertEqual(result['composite_factors']['stage'], {'marker': 'auto-composite'})
+        # Work an operator run actually did still counts as the latest state.
+        self.assertEqual(result['technical_snapshots']['stage'], {'marker': 'operator-completed'})
+
+    def test_automatic_run_blocked_stage_still_supersedes(self):
+        newer_auto = SimpleNamespace(id=628, trigger='auto_eod_followup_resume')
+        older_auto = SimpleNamespace(id=619, trigger='auto_close_scheduler')
+        result = self._history_for(
+            [
+                (newer_auto, SimpleNamespace(stage_id='signal_decider', status='blocked', details={}, marker='newer-blocked')),
+                (older_auto, SimpleNamespace(stage_id='signal_decider', status='completed', details={}, marker='older')),
+            ]
+        )
+        self.assertEqual(result['signal_decider']['stage'], {'marker': 'newer-blocked'})
+
+    def test_official_run_overlay_ignores_operator_blocked_stage(self):
+        service = EODPipelineStatusService()
+        fallback = {'status': 'partial', 'details': {'marker': 'evidence'}}
+        overlaid = service._overlay_official_run_stages(
+            stages={'signal_features': fallback},
+            official_run={
+                'id': 631,
+                'trigger': 'internal_ops_cli',
+                'stages': {'signal_features': {'status': 'blocked', 'details': {}}},
+            },
+            market_date='2026-11-06',
+        )
+        self.assertIs(overlaid['signal_features'], fallback)
+
     def test_official_run_overlay_ignores_a_past_date_safe_skip_stage(self):
         market_date = '2026-11-06'
         service = EODPipelineStatusService()

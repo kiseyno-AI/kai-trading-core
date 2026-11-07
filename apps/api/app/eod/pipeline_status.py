@@ -376,10 +376,50 @@ def _is_point_in_time_safe_skip_stage_row(
     )
 
 
+AUTOMATIC_PIPELINE_TRIGGER_PREFIX = 'auto_'
+AUTOMATIC_PIPELINE_TRIGGERS = frozenset({'monitor_stale_continuation'})
+NON_EVIDENCE_STAGE_STATUSES = frozenset({'blocked', 'skipped'})
+
+
+def _is_operator_pipeline_trigger(trigger: Any) -> bool:
+    normalized = str(trigger or '').strip()
+    if not normalized:
+        return False
+    return not (
+        normalized.startswith(AUTOMATIC_PIPELINE_TRIGGER_PREFIX)
+        or normalized in AUTOMATIC_PIPELINE_TRIGGERS
+    )
+
+
+def _stage_record_cannot_supersede(
+    stage_row: Any,
+    *,
+    run_trigger: Any,
+    market_date: str,
+) -> bool:
+    """A newer stage record that proves nothing about the date's data.
+
+    Two shapes qualify: the canonical past-date safe-skip, and a stage an
+    operator run (``eod-pipeline-run``, manual API, debug CLI) left blocked
+    or skipped without doing the work. Neither may hide an earlier record
+    for the same stage and date; an operator stage that actually completed
+    still supersedes as before.
+    """
+
+    if _is_point_in_time_safe_skip_stage_row(stage_row, market_date=market_date):
+        return True
+    if not _is_operator_pipeline_trigger(run_trigger):
+        return False
+    status = (
+        stage_row.get('status') if isinstance(stage_row, dict) else getattr(stage_row, 'status', None)
+    )
+    return str(status or '').strip().lower() in NON_EVIDENCE_STAGE_STATUSES
+
+
 def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     latest_by_stage: dict[str, dict[str, Any]] = {}
-    safe_skip_fallback_by_stage: dict[str, dict[str, Any]] = {}
+    non_evidence_fallback_by_stage: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
         rows = session.execute(
             select(DailyPipelineRun, DailyPipelineStageRun)
@@ -400,16 +440,17 @@ def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[st
                 'run': daily_pipeline_run_state_service._serialize_run(run_row),
                 'stage': daily_pipeline_run_state_service._serialize_stage(stage_row),
             }
-            if _is_point_in_time_safe_skip_stage_row(
+            if _stage_record_cannot_supersede(
                 stage_row,
+                run_trigger=getattr(run_row, 'trigger', None),
                 market_date=market_date,
             ):
                 # Keep looking for an older record with real evidence; use
-                # the safe-skip only when the stage has nothing else.
-                safe_skip_fallback_by_stage.setdefault(stage_row.stage_id, entry)
+                # this one only when the stage has nothing else.
+                non_evidence_fallback_by_stage.setdefault(stage_row.stage_id, entry)
                 continue
             latest_by_stage[stage_row.stage_id] = entry
-    for stage_id, entry in safe_skip_fallback_by_stage.items():
+    for stage_id, entry in non_evidence_fallback_by_stage.items():
         latest_by_stage.setdefault(stage_id, entry)
     return latest_by_stage
 
@@ -2627,12 +2668,14 @@ class EODPipelineStatusService:
             official_stage = official_stages.get(stage_id)
             if not isinstance(official_stage, dict):
                 continue
-            if _is_point_in_time_safe_skip_stage_row(
+            if _stage_record_cannot_supersede(
                 {'stage_id': stage_id, **official_stage},
+                run_trigger=official_run.get('trigger'),
                 market_date=market_date,
             ):
-                # The latest run only safe-skipped this current-only stage
-                # for a past date; keep the earlier evidence-bearing state.
+                # The latest run did not do this stage's work (past-date
+                # safe-skip, or an operator run that blocked/skipped it);
+                # keep the earlier evidence-bearing state.
                 continue
             fallback_stage = stages.get(stage_id) or {}
             if self._recovery_state_is_newer(

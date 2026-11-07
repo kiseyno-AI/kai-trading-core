@@ -217,7 +217,11 @@ class Settings(BaseSettings):
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_global_share_issuance_enabled: bool = False
-    dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=100, ge=0, le=500)
+    # Probe every symbol without fundamentals daily (~140 on 2026-11-06). A
+    # limit below that count left a rotating handful as retry debt each day,
+    # so the DART stage was partial every day and full-universe gates
+    # (decider evaluations) stayed blocked.
+    dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
 
     sec_edgar_user_agent: str = ''

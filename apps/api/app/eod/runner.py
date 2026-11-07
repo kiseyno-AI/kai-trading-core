@@ -22,6 +22,7 @@ from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_serv
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
+from app.agent_context.evaluation_refresh import refresh_signal_decider_evaluations_if_due
 from app.signals.overtime_ranking_capture import capture_overtime_rankings_if_due
 
 logger = logging.getLogger(__name__)
@@ -557,6 +558,16 @@ class EODBackgroundRunner:
                     if auto_pykrx_eod_scheduler.state.active_task:
                         await asyncio.sleep(self.interval_seconds)
                         continue
+                    if runtime_background_enabled:
+                        # Off-chain outcome grading, only while no daily
+                        # pipeline is active; never blocks the tick.
+                        idle_market = market
+                        await self._run_blocking_step(
+                            'signal_decider_evaluations_refresh_if_due',
+                            lambda: refresh_signal_decider_evaluations_if_due(
+                                market=idle_market
+                            ),
+                        )
                 if runtime_background_enabled and market.state == 'OPEN':
                     await self._run_buy_authority_critical_step(
                         name='refresh_master_if_due',
