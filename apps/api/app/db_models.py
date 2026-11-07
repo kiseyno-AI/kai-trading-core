@@ -3167,3 +3167,49 @@ class SymbolIndustryProfile(Base, TimestampMixin):
     effective_from: Mapped[date] = mapped_column(Date, nullable=False)
     last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MacroSeriesHistory(Base, TimestampMixin):
+    """Research history of macro series with the date each value became public.
+
+    ``released_on`` comes from ALFRED first releases where FRED serves them
+    (``release_basis='alfred_initial_release'``); dense daily market series
+    use the next calendar day (``'next_day_assumed'``).
+    """
+
+    __tablename__ = 'macro_series_history'
+    __table_args__ = (
+        UniqueConstraint('source', 'series_id', 'observation_date', name='uq_macro_series_history_obs'),
+        Index('ix_macro_series_history_series_released', 'series_id', 'released_on'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    observation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    value: Mapped[float] = mapped_column(Numeric(24, 8), nullable=False)
+    released_on: Mapped[date] = mapped_column(Date, nullable=False)
+    release_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BusinessLineDailyMetric(Base, TimestampMixin):
+    """Equal-weight daily return of one business line against the market."""
+
+    __tablename__ = 'business_line_daily_metrics'
+    __table_args__ = (
+        UniqueConstraint('trade_date', 'business_line', name='uq_business_line_daily_metrics_day_line'),
+        Index('ix_business_line_daily_metrics_line_day', 'business_line', 'trade_date'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    business_line: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbols: Mapped[int] = mapped_column(Integer, nullable=False)
+    ew_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    market_ew_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    excess_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    advancers_ratio: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False)
+    turnover: Mapped[float | None] = mapped_column(Numeric(24, 2))
+    turnover_share: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    classification_basis: Mapped[str] = mapped_column(String(32), nullable=False)
