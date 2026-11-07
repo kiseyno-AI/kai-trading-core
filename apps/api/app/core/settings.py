@@ -185,7 +185,7 @@ class Settings(BaseSettings):
     macro_context_world_bank_series: str = 'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG,SL.UEM.TOTL.ZS'
     macro_context_world_bank_mrnev: int = 1
     macro_context_fred_enabled: bool = True
-    macro_context_fred_series: str = 'DEXKOUS'
+    macro_context_fred_series: str = 'DEXKOUS,DFF,DGS10,DGS2,T10Y2Y,VIXCLS,BAMLH0A0HYM2,DCOILWTICO,CPIAUCSL,UNRATE'
     fred_api_key: str = ''
     fred_base_url: str = 'https://api.stlouisfed.org'
 
