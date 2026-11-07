@@ -202,6 +202,9 @@ class Settings(BaseSettings):
     external_news_context_limit: int = 3
     external_news_context_lookback_days: int = 14
     external_news_collect_throttle_seconds: float = 0.15
+    market_news_enabled: bool = True
+    market_news_collect_interval_minutes: int = 60
+    market_news_display: int = 50
 
     dart_api_key: str = ''
     dart_base_url: str = 'https://opendart.fss.or.kr/api'

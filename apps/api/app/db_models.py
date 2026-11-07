@@ -3113,3 +3113,31 @@ class DartDilutionSignal(Base, TimestampMixin):
     security_type: Mapped[str | None] = mapped_column(String(64))
     reason: Mapped[str | None] = mapped_column(String(255))
     payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MarketNewsItem(Base, TimestampMixin):
+    """One article returned for one market/business-line news topic.
+
+    ``first_seen_at`` is when Core first observed it (the point-in-time
+    cutoff); ``published_at`` is the publisher's time when known.
+    """
+
+    __tablename__ = 'market_news_items'
+    __table_args__ = (
+        UniqueConstraint('topic_key', 'url_hash', name='uq_market_news_items_topic_url'),
+        Index('ix_market_news_items_topic_published', 'topic_key', 'published_at'),
+        Index('ix_market_news_items_published_at', 'published_at'),
+        Index('ix_market_news_items_first_seen_at', 'first_seen_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSON)

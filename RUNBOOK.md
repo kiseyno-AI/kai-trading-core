@@ -284,6 +284,13 @@ If schema parity is not clean, write a corrective migration instead of dropping 
 - `external_news_enrich` inserts the current classifier version for legacy rows into `external_news_item_classifications`; it never rewrites an article. Replays are idempotent per article/version. Change the classifier version before changing classification semantics—existing versions must remain immutable.
 - Embedded `payload.classification` values have no trustworthy availability timestamp and are not exposed as decision evidence. After deployment, run the normal `external_news_enrich` stage once to create timestamped sidecars for recent legacy rows.
 
+## Market and business-line news topics
+- `app/market_news/catalog.py` holds 46 NAVER News Search queries (Korean market, US, global, Korean business lines). Each topic lists the business-line keys it speaks to.
+- The background runner collects them every `MARKET_NEWS_COLLECT_INTERVAL_MINUTES` (default 60) regardless of the trading pipeline; about 46 requests per run against NAVER's 25,000/day quota. Missing NAVER credentials skip collection.
+- Rows live in `market_news_items`, unique per topic and URL. `first_seen_at` is the point-in-time cutoff; reads (`GET /external/news/market`) never call NAVER.
+- Backfill older articles once with `POST /external/news/market/collect?pages=10` (≈460 requests; NAVER returns at most the newest 1,000 per query).
+- Context only: no trading gate reads these rows.
+
 ## pykrx EOD backfill
 
 From `apps/api` on this machine:
