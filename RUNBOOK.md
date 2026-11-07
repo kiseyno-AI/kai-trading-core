@@ -297,6 +297,11 @@ If schema parity is not clean, write a corrective migration instead of dropping 
 - `symbol_industry_profiles` keeps one row per symbol per effective date and adds a row only when the code or line changes; reruns skip symbols verified in the last 90 days (`--force` re-verifies all, `--symbols` limits scope).
 - Read with `GET /market/business-lines`.
 
+## Business-line metrics and FRED release history (research)
+- `python -m app.macro_context.history` loads FRED history since 2006 for the ten macro drivers into `macro_series_history`, each value with `released_on`, the date it became public: ALFRED first releases where available (CPI, unemployment, weekly USD/KRW, WTI, HY spread), the series' median publication lag before ALFRED's first vintage, and the next day for dense daily market series (`release_basis` says which). The ICE high-yield spread is limited to its last three years on FRED. About 20 FRED requests.
+- `python -m app.market.business_line_index --start 2007-01-01` rebuilds `business_line_daily_metrics` from stored daily bars in one SQL pass (no provider calls): per business line, equal-weight return, same-universe market return, excess return, advancers ratio, turnover share. History uses the current classification (`classification_basis='current_profile'`), so delisted companies are missing from older years.
+- Both are research inputs; no trading gate reads them.
+
 ## pykrx EOD backfill
 
 From `apps/api` on this machine:
