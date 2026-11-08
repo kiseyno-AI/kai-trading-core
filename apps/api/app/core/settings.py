@@ -238,6 +238,7 @@ class Settings(BaseSettings):
     # so the DART stage was partial every day.
     dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
+    dart_fundamentals_daily_stale_drain_limit: int = Field(default=100, ge=0, le=500)
 
     sec_edgar_user_agent: str = ''
     sec_edgar_data_base_url: str = 'https://data.sec.gov'
