@@ -6723,9 +6723,7 @@ class EODPipelineStatusService:
                     validated_scope_gap.get('decision_ready_count')
                 )
             )
-            failed_blocking_stages = details.get(
-                'failed_blocking_stages'
-            )
+            blocking_stages = details.get('blocking_stages')
             scope_isolated_pending = bool(
                 stage_id in FACTOR_STAGE_SCORE_FIELDS
                 and existing_status == 'pending'
@@ -6735,8 +6733,8 @@ class EODPipelineStatusService:
                 and validated_exact_universe_has_residual_debt
                 and requested_scope_decision_ready_count is not None
                 and requested_scope_decision_ready_count > 0
-                and isinstance(failed_blocking_stages, list)
-                and not failed_blocking_stages
+                and isinstance(blocking_stages, list)
+                and not blocking_stages
             )
             scope_can_isolate_aggregate_gap = (
                 scope_isolated_pending
