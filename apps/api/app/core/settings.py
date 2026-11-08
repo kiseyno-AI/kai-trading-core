@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     kis_token_issuance_lease_seconds: int = Field(default=90, ge=75, le=3600)
     kis_token_min_issue_interval_seconds: int = Field(default=60, ge=60, le=3600)
     kis_token_cache_directory: str = '~/.cache/kai-trading/kis-oauth-tokens'
+    # Minimum spacing between Core's KIS REST requests (seconds). 0 disables the
+    # limiter (historical behavior). KIS enforces a per-app-key rate limit that
+    # Core shares with kai-trading-exec, which spaces its own calls by 0.12s.
+    kis_min_request_interval_seconds: float = Field(default=0.0, ge=0, le=10, allow_inf_nan=False)
     kis_realtime_trending_cache_ttl_seconds: int = 20
     kis_realtime_order_notice_enabled: bool = True
     kis_realtime_price_enabled: bool = True
