@@ -200,6 +200,7 @@ class KISRealtimeOrderNoticeServiceTests(unittest.TestCase):
         self.assertEqual(order['filled_quantity'], Decimal('4'))
         self.assertEqual(order['remaining_quantity'], Decimal(remaining))
         self.assertEqual(order['average_fill_price'], Decimal('70010'))
+        self.assertEqual(order['last_fill_at'], datetime(2026, 4, 28, 0, 10, tzinfo=timezone.utc))
 
     def test_cancel_notice_preserves_prior_fill_quantity_and_average_price(self) -> None:
         self._assert_correction_preserves_prior_fill(
