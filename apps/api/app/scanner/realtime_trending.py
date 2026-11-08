@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -68,6 +69,8 @@ def _parse_number(value: Any, *, as_int: bool = False) -> int | float | None:
     try:
         parsed = float(normalized)
     except ValueError:
+        return None
+    if not math.isfinite(parsed):
         return None
     if as_int:
         return int(parsed)
