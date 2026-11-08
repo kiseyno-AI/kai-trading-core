@@ -55,3 +55,18 @@ Content-Type: application/json
   ]
 }
 ```
+
+## Availability
+
+`POST /trading/orders/buy`, `POST /trading/orders/sell`, and `POST /trading/orders/{client_order_id}/amend` are disabled by default and return:
+
+```json
+{
+  "detail": {
+    "error": "direct_order_api_disabled",
+    "message": "Direct broker order routes are disabled on Core. ..."
+  }
+}
+```
+
+with status `403`, before the request body is validated. Set `TRADING_DIRECT_ORDER_API_ENABLED=true` to enable them. Cancel is not gated.

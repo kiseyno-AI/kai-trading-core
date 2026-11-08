@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from app.core.settings import settings
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
     load_latest_available_daily_market_risk_filter_result_date,
+    load_symbols_without_recent_trading,
     replace_daily_market_risk_filter_results_exact_scope,
     upsert_daily_market_risk_filter_result,
     upsert_daily_market_risk_filter_results,
@@ -35,6 +38,7 @@ from app.signals.market_risk_snapshot import (
     normalize_symbols,
 )
 
+logger = logging.getLogger(__name__)
 
 MARKET_RISK_FILTER_SCOPE_MANIFEST_VERSION = (
     'market_risk_filter_scope_outcomes_v1'
@@ -66,6 +70,36 @@ def _public_filter_item(item: dict[str, Any]) -> dict[str, Any]:
 class DailyMarketRiskFilterService:
     def __init__(self, *, snapshot_service: DailyMarketRiskSnapshotService | None = None) -> None:
         self.snapshot_service = snapshot_service or daily_market_risk_snapshot_service
+
+    @staticmethod
+    def _load_dormant_symbols(
+        *,
+        market_date: Any,
+        snapshot_items: Sequence[Mapping[str, Any]],
+    ) -> set[str]:
+        """Symbols with no trading over the recent sessions; never raises.
+
+        A failure here must not fail the whole screening stage, so it degrades to
+        the previous behaviour and is logged for the operator.
+        """
+
+        symbols = [str(item.get('symbol') or '') for item in snapshot_items]
+        try:
+            return set(
+                load_symbols_without_recent_trading(
+                    market_date=market_date,
+                    symbols=symbols,
+                    lookback_trading_days=(
+                        settings.market_risk_dormant_lookback_trading_days
+                    ),
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                'dormant-symbol screening unavailable for %s; continuing without it',
+                market_date,
+            )
+            return set()
 
     @daily_price_bar_writer_admission
     async def rebuild_for_market_date(
@@ -114,6 +148,20 @@ class DailyMarketRiskFilterService:
         matched_symbols = list(snapshot_collection.get('matched_symbols') or [])
         missing_symbols = list(snapshot_collection.get('missing_symbols') or [])
 
+        dormant_symbols = self._load_dormant_symbols(
+            market_date=normalized_market_date,
+            snapshot_items=snapshot_items,
+        )
+
+        def build_result(snapshot: dict[str, Any]) -> dict[str, Any]:
+            if str(snapshot.get('symbol') or '') in dormant_symbols:
+                snapshot = {**snapshot, 'no_recent_trading': True}
+            return build_market_risk_filter_result_from_snapshot(
+                snapshot,
+                source=source,
+                eod_run_id=run_id,
+            )
+
         (
             items,
             computation_failed_symbols,
@@ -122,11 +170,7 @@ class DailyMarketRiskFilterService:
             snapshot_items,
             symbol_of=lambda snapshot: str(snapshot.get('symbol') or ''),
             build=lambda snapshot: run_symbol_computation(
-                lambda: build_market_risk_filter_result_from_snapshot(
-                    snapshot,
-                    source=source,
-                    eod_run_id=run_id,
-                )
+                lambda: build_result(snapshot)
             ),
         )
         items.sort(
