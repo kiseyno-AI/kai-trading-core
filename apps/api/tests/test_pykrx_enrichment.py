@@ -1820,6 +1820,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(details['errors'][0]['operation'], 'short_selling_value')
         self.assertEqual(rows[0]['payload']['missing_fields'], ['short_value'])
 
+    @patch('app.eod.pykrx_enrichment.stock.get_market_ticker_list')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
@@ -1828,6 +1829,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         get_shorting_volume_by_ticker_mock,
         get_shorting_value_by_ticker_mock,
         get_shorting_balance_by_ticker_mock,
+        get_market_ticker_list_mock,
     ):
         get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
             {'공매도': [1000], '매수': [20000], '비중': [5.0]},
@@ -1841,6 +1843,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             {'공매도잔고': [1], '상장주식수': [2], '비중': [50.0]},
             index=['888888'],
         )
+        get_market_ticker_list_mock.return_value = ['005930', '888888', '999999']
 
         service = PykrxEnrichmentService()
         service._request_pause_seconds = 0.0
