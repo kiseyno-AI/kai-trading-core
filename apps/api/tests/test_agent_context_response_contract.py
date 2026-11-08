@@ -7,7 +7,9 @@ from app.agent_context.response_contract import (
     AGENT_ROLE_CONTRACT_VERSION,
     build_agent_contract_provenance,
     build_contract_prompt_suffix,
+    decode_agent_json_object_with_structure_repair,
     normalize_agent_response,
+    repair_agent_json_structure,
 )
 
 
@@ -1875,6 +1877,102 @@ class AgentContextResponseContractTests(unittest.TestCase):
         self.assertEqual(result['next_day_open_action'], 'buy')
         self.assertEqual(result['entry_price_basis'], 'next_open')
         self.assertEqual(result['thesis_summary'], '다음 거래일 시가 대응은 매수 우위로 판단됩니다.')
+
+
+class AgentJsonStructureRepairTests(unittest.TestCase):
+    def _batch(self, *notes_tail):
+        return {
+            'items': [
+                {
+                    'symbol': '000080',
+                    'feedback': {
+                        'role': 'eod-summarizer',
+                        'summary': 'A "quoted" note, with } and ] inside a string.',
+                        'confidence': 0.7,
+                        'risk_flags': ['a'],
+                        'details': {'nested': {'x': [1, 2]}},
+                        'improvement_notes': ['n1'],
+                    },
+                },
+                {
+                    'symbol': '000590',
+                    'feedback': {
+                        'role': 'eod-summarizer',
+                        'summary': 'second',
+                        'confidence': 0.5,
+                        'risk_flags': [],
+                        'details': {'k': 'v'},
+                        'improvement_notes': ['n2'],
+                    },
+                },
+            ]
+        }
+
+    def test_inserts_object_closer_dropped_before_an_array_closer(self):
+        # Shape observed from a Claude Code CLI fallback: the last item's
+        # object was never closed before the items array closed.
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        assert text.endswith('}}]}')
+        broken = text[:-4] + '}]}'
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(broken)
+
+        decoded, failure, repair = decode_agent_json_object_with_structure_repair(broken)
+
+        self.assertIsNone(failure)
+        self.assertEqual(decoded, self._batch())
+        self.assertEqual(repair, {'applied': True, 'inserted_closers': 1, 'removed_trailing_commas': 0})
+
+    def test_removes_trailing_commas_only_outside_strings(self):
+        broken = '{"items": [{"symbol": "000080", "feedback": {"summary": "a, ]", "risk_flags": ["x",],},},]}'
+
+        decoded, failure, repair = decode_agent_json_object_with_structure_repair(broken)
+
+        self.assertIsNone(failure)
+        self.assertEqual(decoded['items'][0]['feedback'], {'summary': 'a, ]', 'risk_flags': ['x']})
+        self.assertEqual(repair['removed_trailing_commas'], 4)
+        self.assertEqual(repair['inserted_closers'], 0)
+
+    def test_appends_missing_final_closers_only_when_text_ends_on_a_closer(self):
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        decoded, failure, repair = decode_agent_json_object_with_structure_repair(text[:-1])
+        self.assertIsNone(failure)
+        self.assertEqual(decoded, self._batch())
+        self.assertEqual(repair['inserted_closers'], 1)
+
+    def test_refuses_truncated_or_ambiguous_text(self):
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        cases = {
+            'cut_mid_string': text[: text.index('second') + 3],
+            'cut_mid_value': text[: text.index('0.5') + 2],
+            'cut_after_comma': text[: text.index(', "risk_flags": []') + 1],
+            'extra_closer': text + '}',
+            # ends on a closer, but four containers are still open
+            'too_many_missing_closers': text[: text.rindex('"n2"]') + 5],
+            'not_json': 'I could not produce JSON.',
+        }
+        for name, broken in cases.items():
+            with self.subTest(case=name):
+                self.assertIsNone(repair_agent_json_structure(broken))
+                decoded, failure, repair = decode_agent_json_object_with_structure_repair(broken)
+                self.assertIsNone(decoded)
+                self.assertIsNone(repair)
+                self.assertIn(failure, {'json_decode_error', 'json_object_not_found'})
+
+    def test_valid_and_duplicate_key_inputs_are_left_to_the_strict_decoder(self):
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        self.assertEqual(decode_agent_json_object_with_structure_repair(text), (self._batch(), None, None))
+        duplicate = '{"items": [], "items": []}'
+        self.assertEqual(
+            decode_agent_json_object_with_structure_repair(duplicate),
+            (None, 'json_duplicate_key', None),
+        )
+        # A repair that would expose a duplicate key still fails closed.
+        duplicate_after_repair = '{"items": [{"a": 1, "a": 2]}'
+        self.assertEqual(
+            decode_agent_json_object_with_structure_repair(duplicate_after_repair),
+            (None, 'json_decode_error', None),
+        )
 
 
 if __name__ == '__main__':

@@ -42,6 +42,7 @@ from app.signals.factor_coverage import (
 from app.signals.preferred_share_fundamentals import (
     resolve_preferred_fundamentals_issuer_symbols,
 )
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
@@ -299,21 +300,6 @@ def _normalize_market_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
 
 
 def _matcher_values(key: str) -> set[str]:

@@ -5,6 +5,8 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
+from app.eod.live_progress import daily_pipeline_live_progress
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 
 
 FACTOR_COVERAGE_CONTRACT_VERSION = 'factor_usable_coverage_v1'
@@ -63,10 +65,21 @@ def build_symbol_results(
     items: list[dict[str, Any]] = []
     failed_symbols: list[str] = []
     failed_symbol_errors: list[dict[str, str]] = []
-    for input_row in inputs:
+    total = len(inputs)
+    for index, input_row in enumerate(inputs, start=1):
         symbol = _normalize_symbol(symbol_of(input_row))
         if not symbol:
             raise ValueError('symbol identity is required for isolated computation')
+        daily_pipeline_live_progress.thread_stage_progress(
+            {
+                'processed': index - 1,
+                'total': total,
+                'succeeded': len(items),
+                'failed': len(failed_symbols),
+                'current_symbol': symbol,
+                'current_step': 'compute_symbol',
+            }
+        )
         try:
             items.append(build(input_row))
         except SymbolComputationError as exc:
@@ -81,6 +94,15 @@ def build_symbol_results(
                     ),
                 }
             )
+    daily_pipeline_live_progress.thread_stage_progress(
+        {
+            'processed': total,
+            'total': total,
+            'succeeded': len(items),
+            'failed': len(failed_symbols),
+            'current_step': 'compute_symbols_done',
+        }
+    )
     return items, failed_symbols, failed_symbol_errors
 
 
@@ -293,13 +315,6 @@ def _coverage_ratio(*, available_count: int, universe_count: int) -> float:
     if universe_count <= 0:
         return 0.0
     return round(available_count / universe_count, 6)
-
-
-def _normalize_symbol(value: Any) -> str:
-    symbol = str(value or '').strip().upper()
-    if symbol.isdigit():
-        symbol = symbol.zfill(6)
-    return symbol
 
 
 def _build_persistence_scope_outcome(

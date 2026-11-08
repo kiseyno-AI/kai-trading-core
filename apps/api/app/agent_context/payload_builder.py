@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import and_, desc, func, or_, select
@@ -33,6 +32,7 @@ from app.market_data_store import (
     sanitize_daily_signal_feature_payload,
     sanitize_daily_signal_feature_metrics,
 )
+from app.core.numbers import finite_float as _to_float
 
 PARTICIPATION_CONTEXT_HISTORY_DAYS = DEFAULT_DERIVED_CONTEXT_HISTORY_DAYS
 
@@ -74,16 +74,6 @@ def _serialize_market_signal_feature(feature: Any, symbol: Symbol) -> dict[str, 
             feature.feature_payload
         ),
     }
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
 
 
 def _safe_date(value: date | None) -> str | None:

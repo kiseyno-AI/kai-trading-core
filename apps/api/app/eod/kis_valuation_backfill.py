@@ -13,6 +13,7 @@ from app.db import session_scope
 from app.db_models import DailyPriceBar, Symbol
 from app.eod.finality import validate_finalized_krx_write_date
 from app.repositories.eod_run_repository import advisory_eod_collection_lock
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 
 KIS_VALUATION_BACKFILL_SOURCE = 'kis_quote_valuation'
 
@@ -23,11 +24,6 @@ def _utcnow() -> datetime:
 
 def _normalize_market_date(value: str | date) -> date:
     return value if isinstance(value, date) else date.fromisoformat(value)
-
-
-def _normalize_symbol(value: str) -> str:
-    text = str(value or '').strip().upper()
-    return text.zfill(6) if text.isdigit() else text
 
 
 def _to_decimal(value: Any) -> Decimal | None:
