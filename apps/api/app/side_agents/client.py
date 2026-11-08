@@ -23,11 +23,19 @@ def build_message(task: str, payload: Mapping[str, Any]) -> str:
     return f'{_INSTRUCTION}\n\ntask: {task}\n\n```json\n{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n```'
 
 
-def extract_output_text(response_json: Mapping[str, Any]) -> str | None:
-    for item in response_json.get('output', []) or []:
+def extract_output_text(response_json: Any) -> str | None:
+    if not isinstance(response_json, Mapping):
+        return None
+    output = response_json.get('output')
+    if not isinstance(output, list):
+        return None
+    for item in output:
         if not isinstance(item, Mapping) or item.get('type') != 'message':
             continue
-        for content in item.get('content', []) or []:
+        contents = item.get('content')
+        if not isinstance(contents, list):
+            continue
+        for content in contents:
             if isinstance(content, Mapping) and content.get('type') == 'output_text' and content.get('text'):
                 return str(content['text'])
     return None
