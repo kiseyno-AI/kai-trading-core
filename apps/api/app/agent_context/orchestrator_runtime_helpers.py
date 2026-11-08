@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import uuid
 from datetime import date
 from typing import Any, Callable, Sequence
@@ -63,6 +64,69 @@ def batch_response_contract_failure(batch_result: dict[str, Any]) -> str | None:
     if response_correlation.get('item_count_matches') is not True:
         return 'batch_response_attribution_mismatch'
     return None
+
+
+# Batch-level failures that are fully explained by individual items: those
+# items fail, the rest of the batch is kept. Anything that makes symbol
+# attribution ambiguous (unexpected, duplicate or relabelled symbols) still
+# fails the whole batch.
+SALVAGEABLE_BATCH_FAILURE_CLASSES = frozenset(
+    {'batch_response_structure_mismatch', 'batch_response_attribution_mismatch'}
+)
+_ITEM_FEEDBACK_MISSING_FLAG = re.compile(r'^item_feedback_missing:(\d+)$')
+
+
+def item_contract_failure(
+    failure: str,
+    *,
+    flags: Sequence[str] | None = None,
+    snapshot: dict[str, Any] | None = None,
+    model_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        'failure': failure,
+        'flags': list(flags or []),
+        'snapshot': snapshot,
+        'model_identity': model_identity,
+    }
+
+
+def salvageable_batch_item_failures(
+    *,
+    batch_result: dict[str, Any],
+    batch_symbols: Sequence[str],
+    failure_class: str,
+) -> dict[str, dict[str, Any]] | None:
+    """Per-symbol failures when a batch failure is limited to some items, else None."""
+
+    if failure_class not in SALVAGEABLE_BATCH_FAILURE_CLASSES:
+        return None
+    correlation = batch_result.get('response_correlation')
+    if not isinstance(correlation, dict):
+        return None
+    if (
+        correlation.get('unexpected_symbols')
+        or correlation.get('duplicate_symbols')
+        or correlation.get('item_symbol_mismatches')
+    ):
+        return None
+    failed = {str(symbol).strip().upper() for symbol in correlation.get('missing_symbols') or []}
+    decoded = batch_result.get('decoded')
+    decoded_items = decoded.get('items') if isinstance(decoded, dict) else None
+    for flag in correlation.get('structure_mismatch_flags') or []:
+        match = _ITEM_FEEDBACK_MISSING_FLAG.match(str(flag))
+        if match is None or not isinstance(decoded_items, list):
+            return None
+        index = int(match.group(1))
+        item = decoded_items[index] if index < len(decoded_items) else None
+        symbol = str(item.get('symbol') or '').strip().upper() if isinstance(item, dict) else ''
+        if not symbol:
+            return None
+        failed.add(symbol)
+    keys = {str(symbol).strip().upper(): symbol for symbol in batch_symbols}
+    if not failed or not failed <= set(keys) or failed == set(keys):
+        return None
+    return {keys[symbol]: item_contract_failure(failure_class) for symbol in sorted(failed)}
 
 
 def normalized_feedback_contract_failure(

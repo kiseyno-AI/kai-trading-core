@@ -134,7 +134,11 @@ def decode_strict_agent_json_object(
 JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS = 3
 
 
-def repair_agent_json_structure(candidate_text: str | None) -> tuple[str, dict[str, Any]] | None:
+def repair_agent_json_structure(
+    candidate_text: str | None,
+    *,
+    mismatched_closer: str = 'insert',
+) -> tuple[str, dict[str, Any]] | None:
     """Repair only unambiguous container-nesting slips in agent JSON text.
 
     Runtimes that cannot emit a schema-checked client function call (for
@@ -148,12 +152,20 @@ def repair_agent_json_structure(candidate_text: str | None) -> tuple[str, dict[s
     - missing closers at the very end are appended only when the text already
       ends on a closer, so a response cut off mid-value is never completed.
 
+    With ``mismatched_closer='substitute'`` a closer of the wrong kind is
+    instead replaced by the one the innermost open container needs (``}``
+    typed where ``]`` was due, the slip seen most in summarizer output, e.g.
+    ``"risk_flags": ["a", "b"}, "details": {...}``). Substitutions count
+    toward the same limit.
+
     It never invents keys or values, never drops content, and refuses extra
     closers, unterminated strings, and more than
     ``JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS`` insertions. The repaired
     text must still pass ``decode_strict_agent_json_object`` and every
     downstream contract check, so a misplaced key fails closed there.
     """
+    if mismatched_closer not in {'insert', 'substitute'}:
+        raise ValueError(f'unknown mismatched_closer mode: {mismatched_closer}')
     text = str(candidate_text or '').strip()
     if not text or text[0] not in '{[':
         return None
@@ -162,6 +174,7 @@ def repair_agent_json_structure(candidate_text: str | None) -> tuple[str, dict[s
     in_string = False
     escaped = False
     inserted = 0
+    substituted = 0
     removed_commas = 0
 
     def _drop_trailing_comma() -> None:
@@ -193,6 +206,10 @@ def repair_agent_json_structure(candidate_text: str | None) -> tuple[str, dict[s
             continue
         if char in '}]':
             opener = '{' if char == '}' else '['
+            if mismatched_closer == 'substitute' and stack and stack[-1] != opener:
+                char = '}' if stack[-1] == '{' else ']'
+                opener = stack[-1]
+                substituted += 1
             if opener not in stack:
                 return None
             while stack[-1] != opener:
@@ -213,15 +230,18 @@ def repair_agent_json_structure(candidate_text: str | None) -> tuple[str, dict[s
             _drop_trailing_comma()
             out.append('}' if stack.pop() == '{' else ']')
             inserted += 1
-    if inserted > JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS:
+    if inserted + substituted > JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS:
         return None
-    if inserted == 0 and removed_commas == 0:
+    if inserted == 0 and substituted == 0 and removed_commas == 0:
         return None
-    return ''.join(out), {
+    info: dict[str, Any] = {
         'applied': True,
         'inserted_closers': inserted,
         'removed_trailing_commas': removed_commas,
     }
+    if substituted:
+        info['substituted_closers'] = substituted
+    return ''.join(out), info
 
 
 def decode_agent_json_object_with_structure_repair(
@@ -231,14 +251,17 @@ def decode_agent_json_object_with_structure_repair(
     decoded, failure_class = decode_strict_agent_json_object(candidate_text)
     if decoded is not None or failure_class != 'json_decode_error':
         return decoded, failure_class, None
-    repaired = repair_agent_json_structure(candidate_text)
-    if repaired is None:
-        return None, failure_class, None
-    repaired_text, repair_info = repaired
-    repaired_decoded, repaired_failure = decode_strict_agent_json_object(repaired_text)
-    if repaired_decoded is None:
-        return None, failure_class, None
-    return repaired_decoded, repaired_failure, repair_info
+    # A dropped closer first (the original, narrower repair); a closer of the
+    # wrong kind only when that does not produce a strictly valid object.
+    for mode in ('insert', 'substitute'):
+        repaired = repair_agent_json_structure(candidate_text, mismatched_closer=mode)
+        if repaired is None:
+            continue
+        repaired_text, repair_info = repaired
+        repaired_decoded, repaired_failure = decode_strict_agent_json_object(repaired_text)
+        if repaired_decoded is not None:
+            return repaired_decoded, repaired_failure, repair_info
+    return None, failure_class, None
 
 
 def _select_feedback_payload(parsed: dict[str, Any] | None, *, symbol: str | None = None) -> dict[str, Any] | None:
