@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.eod.agent_chain_gates import finished_partial_feeds_downstream
 from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
@@ -1336,32 +1337,15 @@ def _agent_followup_feeds_downstream(
 ) -> bool:
     """Whether an agent stage's result may start the next agent stage.
 
-    A fully satisfied result always may. A ``partial`` one may too once its
-    run has finished (nothing pending or in flight) with at least one symbol
-    completed: the next stage checks each symbol's own upstream rows and fails
-    only the symbols without them, so a handful of failed summaries no longer
-    leaves the whole day without decisions (2026-10-19: 101 of 108 symbols
-    summarized, zero decisions).
+    A fully satisfied result always may; a ``partial`` one follows the
+    first-run rule in ``app.eod.agent_chain_gates``.
     """
 
     if _is_satisfied_followup_result(result, stage_id=stage_id):
         return True
-    if _resolve_result_status(result, stage_id=stage_id) != 'partial':
-        return False
-    progress = result.get('progress') if isinstance(result.get('progress'), dict) else {}
-    summary = progress.get('summary') if isinstance(progress.get('summary'), dict) else {}
-
-    def _count(key: str) -> int:
-        try:
-            return int(summary.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    return (
-        summary.get('is_live') is not True
-        and _count('completed_symbols') > 0
-        and _count('pending_symbols') == 0
-        and _count('in_progress_symbols') == 0
+    return finished_partial_feeds_downstream(
+        result,
+        status=_resolve_result_status(result, stage_id=stage_id),
     )
 
 

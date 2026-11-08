@@ -11932,7 +11932,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             result,
         )
         self.assertEqual(outcome['status'], 'completed')
-        self.assertTrue(service._dependency_outcome_is_satisfied(outcome))
+        self.assertTrue(daily_pipeline_outcome_is_satisfied(outcome))
         self.assertEqual(
             service._extract_stage_counts(
                 stage_id='pykrx_enrichment',
@@ -12080,7 +12080,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(outcome['status'], 'partial')
                 self.assertFalse(
-                    service._dependency_outcome_is_satisfied(outcome)
+                    daily_pipeline_outcome_is_satisfied(outcome)
                 )
                 self.assertEqual(
                     service._extract_stage_counts(
