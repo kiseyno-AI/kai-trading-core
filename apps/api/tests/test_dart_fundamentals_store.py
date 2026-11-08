@@ -1,4 +1,6 @@
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
@@ -13,7 +15,7 @@ from app.dart.fundamentals_store import (
     is_usable_fundamentals_source_status,
     legacy_cfs_recovery_candidate_identity,
 )
-from app.db import session_scope
+from app.db import engine, session_scope
 from app.db_models import (
     DartDisclosureEvent,
     DartFundamentalsCaptureRun,
@@ -22,7 +24,7 @@ from app.db_models import (
     DartFundamentalsRow,
     DartFundamentalsSnapshot,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, select
 
 
 class FundamentalsSourceStatusTests(unittest.TestCase):
@@ -1017,6 +1019,70 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             self.assertEqual(fresh_run.status, 'running')
             self.assertEqual(stale_progress_run.status, 'failed')
             self.assertEqual(stale_no_progress_run.status, 'failed')
+
+    def test_stale_run_cleanup_preserves_concurrent_completion_and_progress(self):
+        now = datetime.now(timezone.utc)
+        for model, create_run, fail_stale in (
+            (
+                DartFundamentalsCaptureRun,
+                self._create_run,
+                self.repository.fail_stale_capture_runs,
+            ),
+            (
+                DartFundamentalsRefreshRun,
+                self._create_refresh_run,
+                self.repository.fail_stale_refresh_runs,
+            ),
+        ):
+            for update_kind in ('completion', 'progress'):
+                with self.subTest(model=model.__name__, update=update_kind):
+                    run_id = create_run(trigger='test_concurrent_stale')
+                    with session_scope() as session:
+                        row = session.get(model, run_id)
+                        row.started_at = now - timedelta(hours=3)
+
+                    candidates_read = threading.Event()
+                    main_thread = threading.get_ident()
+
+                    def after_read(_conn, _cursor, statement, _params, _context, _many):
+                        if (
+                            threading.get_ident() != main_thread
+                            and statement.lstrip().upper().startswith('SELECT')
+                            and f'FROM {model.__tablename__}' in statement
+                        ):
+                            candidates_read.set()
+
+                    event.listen(engine, 'after_cursor_execute', after_read)
+                    try:
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            with session_scope() as writer:
+                                row = writer.get(model, run_id)
+                                if update_kind == 'completion':
+                                    row.status = 'completed'
+                                else:
+                                    row.run_metadata = {'last_progress_at': now.isoformat()}
+                                writer.flush()
+                                future = executor.submit(
+                                    fail_stale,
+                                    stale_before=now - timedelta(hours=1),
+                                    error_message='stale',
+                                )
+                                # Hold the writer's row lock until the cleanup
+                                # query has observed the concurrent transaction.
+                                self.assertTrue(candidates_read.wait(timeout=5))
+                            failed_run_ids = future.result(timeout=5)
+                    finally:
+                        event.remove(engine, 'after_cursor_execute', after_read)
+
+                    self.assertNotIn(run_id, failed_run_ids)
+                    with session_scope() as session:
+                        row = session.get(model, run_id)
+                        self.assertEqual(
+                            row.status,
+                            'completed' if update_kind == 'completion' else 'running',
+                        )
+                        if update_kind == 'progress':
+                            self.assertEqual(row.run_metadata['last_progress_at'], now.isoformat())
 
     def test_list_symbol_fundamentals_states_ignores_failed_capture_snapshots(self):
         covered_stock_code = f'T{uuid4().hex[:10]}'
