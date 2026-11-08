@@ -1683,7 +1683,9 @@ def normalize_agent_response(
         'market_date': _normalize_iso_date(market_date),
         'summary': parsed.get('summary') if isinstance(parsed.get('summary'), str) else str(parsed.get('summary') or ''),
         'confidence': float(parsed['confidence']) if _is_raw_number(parsed.get('confidence')) else None,
-        'risk_flags': parsed.get('risk_flags') if isinstance(parsed.get('risk_flags'), list) else [],
+        'risk_flags': [
+            flag for flag in parsed['risk_flags'] if isinstance(flag, str)
+        ] if isinstance(parsed.get('risk_flags'), list) else [],
         'details': parsed.get('details') if isinstance(parsed.get('details'), dict) else {},
         'improvement_notes': parsed.get('improvement_notes') if isinstance(parsed.get('improvement_notes'), list) else [],
     }
