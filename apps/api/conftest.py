@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import urllib.request
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
@@ -37,6 +38,7 @@ def _install_http_boundary_guard(monkeypatch) -> None:
     request = requests.sessions.Session.request
     handle_request = httpx.HTTPTransport.handle_request
     handle_async_request = httpx.AsyncHTTPTransport.handle_async_request
+    do_open = urllib.request.AbstractHTTPHandler.do_open
 
     def guarded_request(self, method, url, *args, **kwargs):
         _require_loopback_http(url)
@@ -50,9 +52,15 @@ def _install_http_boundary_guard(monkeypatch) -> None:
         _require_loopback_http(request.url)
         return await handle_async_request(self, request)
 
+    def guarded_do_open(self, http_class, request, *args, **kwargs):
+        _require_loopback_http(request.full_url)
+        return do_open(self, http_class, request, *args, **kwargs)
+
     monkeypatch.setattr(requests.sessions.Session, 'request', guarded_request)
     monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', guarded_handle_request)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', guarded_handle_async_request)
+    # Guard below urlopen so aliases imported by application modules are covered.
+    monkeypatch.setattr(urllib.request.AbstractHTTPHandler, 'do_open', guarded_do_open)
 
 
 @pytest.fixture(autouse=True)

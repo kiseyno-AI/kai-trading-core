@@ -1,4 +1,6 @@
 import asyncio
+import urllib.request
+from urllib.request import urlopen
 
 import httpx
 import pytest
@@ -23,16 +25,22 @@ def recorded_http_boundaries(monkeypatch):
         calls.append(('httpx_async', request.method, str(request.url)))
         return httpx.Response(200)
 
+    def do_open(self, http_class, request, *args, **kwargs):
+        calls.append(('urllib', request.get_method(), request.full_url))
+        return 'recorded'
+
     # Even if a guard assertion fails, these originals cannot send traffic.
     monkeypatch.setattr(requests.sessions.Session, 'request', request)
     monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', handle_request)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', handle_async_request)
+    monkeypatch.setattr(urllib.request.AbstractHTTPHandler, 'do_open', do_open)
     _install_http_boundary_guard(monkeypatch)
     return calls
 
 
-def test_external_http_fails_before_reaching_any_network_boundary(recorded_http_boundaries):
-    url = 'https://provider.invalid/data'
+@pytest.mark.parametrize('scheme', ['http', 'https'])
+def test_external_http_fails_before_reaching_any_network_boundary(scheme, recorded_http_boundaries):
+    url = f'{scheme}://provider.invalid/data'
     with pytest.raises(pytest.fail.Exception, match='Unmocked external HTTP'):
         requests.Session().get(url)
     with httpx.HTTPTransport() as transport:
@@ -45,6 +53,8 @@ def test_external_http_fails_before_reaching_any_network_boundary(recorded_http_
                 await transport.handle_async_request(httpx.Request('GET', url))
 
     asyncio.run(request_async())
+    with pytest.raises(pytest.fail.Exception, match='Unmocked external HTTP'):
+        urlopen(url)
     assert recorded_http_boundaries == []
 
 
@@ -63,10 +73,14 @@ def test_loopback_http_keeps_the_original_boundary(url, recorded_http_boundaries
             return await transport.handle_async_request(httpx.Request('GET', url))
 
     assert asyncio.run(request_async()).status_code == 200
+    assert urllib.request.AbstractHTTPHandler().do_open(
+        None, urllib.request.Request(url)
+    ) == 'recorded'
     assert recorded_http_boundaries == [
         ('requests', 'GET', url),
         ('httpx', 'GET', url),
         ('httpx_async', 'GET', url),
+        ('urllib', 'GET', url),
     ]
 
 
