@@ -1569,6 +1569,11 @@ class PykrxEnrichmentService:
                 .order_by(DailyPriceBar.trade_date.desc())
                 .limit(1)
             )
+            normalized_markets = _normalize_markets(markets)
+            if normalized_markets:
+                stmt = stmt.join(Symbol, Symbol.id == DailyPriceBar.symbol_id).where(
+                    Symbol.market.in_(normalized_markets)
+                )
             return session.execute(stmt).scalar_one_or_none()
 
     def _daily_price_rows_for_fallback(

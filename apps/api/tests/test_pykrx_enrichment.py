@@ -6,9 +6,14 @@ from copy import deepcopy
 from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
+from uuid import uuid4
 
 import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from app.db import engine
+from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.pykrx_enrichment import (
     PykrxEnrichmentService,
     _market_ticker_membership_frame,
@@ -163,6 +168,66 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
         self.previous_krx_trading_date_mock = previous_trading_date_patcher.start()
         self.addCleanup(previous_trading_date_patcher.stop)
+
+    def test_valuation_fallback_ignores_newer_bars_from_other_markets(self):
+        service = PykrxEnrichmentService()
+        service._retry_count = 0
+        service._request_pause_seconds = 0
+        market_date = date(1990, 1, 9)
+        prior_date = date(1990, 1, 5)
+        with Session(engine) as session:
+            symbols = [
+                Symbol(symbol=uuid4().hex[:6].upper(), name_ko='Audit', market=market)
+                for market in ('KOSPI', 'KOSDAQ')
+            ]
+            session.add_all(symbols)
+            session.flush()
+
+            def add_bar(symbol, trade_date):
+                session.add(DailyPriceBar(
+                    symbol_id=symbol.id, trade_date=trade_date,
+                    open_price=100, high_price=100, low_price=100, close_price=100,
+                    volume=10, turnover=1000, per=12, pbr=1,
+                ))
+                session.flush()
+
+            @contextmanager
+            def test_session_scope(**_kwargs):
+                yield session
+
+            add_bar(symbols[0], prior_date)
+            with (
+                patch('app.eod.pykrx_enrichment.session_scope', new=test_session_scope),
+                patch('app.market_data_store.session_scope', new=test_session_scope),
+                patch(
+                    'app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker',
+                    side_effect=RuntimeError('provider unavailable'),
+                ),
+            ):
+                for other_market_bar in (False, True):
+                    with self.subTest(other_market_bar=other_market_bar):
+                        if other_market_bar:
+                            add_bar(symbols[1], date(1990, 1, 8))
+                        result = service.collect_for_market_date(
+                            market_date=market_date,
+                            markets=[' kospi '],
+                            symbols=[symbols[0].symbol],
+                            categories=['valuation_snapshot'],
+                        )
+                        self.assertEqual(result['status'], 'recovered')
+                        fallback = result['categories']['valuation_snapshot']['fallback']
+                        self.assertEqual(fallback['source_market_date'], prior_date.isoformat())
+                        self.assertEqual(fallback['rows_persisted'], 1)
+                        stored = session.scalar(select(DailyPykrxEnrichmentRow).where(
+                            DailyPykrxEnrichmentRow.market_date == market_date,
+                            DailyPykrxEnrichmentRow.symbol_id == symbols[0].id,
+                        ))
+                        self.assertEqual(stored.payload['per'], 12)
+                        self.assertEqual(stored.source, 'daily_price_bars_carry_forward')
+                        self.assertEqual(
+                            result['coverage']['categories']['valuation_snapshot']['present_rows'],
+                            0,
+                        )
 
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_valuation_collection_rejects_unfinalized_date_before_provider_work(
