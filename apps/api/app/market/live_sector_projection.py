@@ -360,7 +360,7 @@ class LiveSectorProjectionService:
         cohort: dict[str, Any],
         checked_at: datetime,
     ) -> tuple[dict[str, Any], bool]:
-        task: asyncio.Task[dict[str, Any]]
+        task: asyncio.Task[dict[str, Any]] | None
         async with self._cache_lock:
             self._prune_cache(checked_at)
             cached = self._cache.get(cache_key)
@@ -369,7 +369,12 @@ class LiveSectorProjectionService:
                 checked_at=checked_at,
             ):
                 return copy.deepcopy(cached.payload), True
-            task = self._inflight.get(cache_key)  # type: ignore[assignment]
+            task = self._inflight.get(cache_key)
+            if task is not None and task.done():
+                # A cancelled waiter may leave a finished build here. Only the
+                # timestamp-checked cache above may reuse completed results.
+                self._inflight.pop(cache_key, None)
+                task = None
             if task is None:
                 task = asyncio.create_task(
                     self._build_dynamic_projection(
