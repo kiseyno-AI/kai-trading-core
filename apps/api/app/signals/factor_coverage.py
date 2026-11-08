@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 
 
 FACTOR_COVERAGE_CONTRACT_VERSION = 'factor_usable_coverage_v1'
@@ -293,13 +294,6 @@ def _coverage_ratio(*, available_count: int, universe_count: int) -> float:
     if universe_count <= 0:
         return 0.0
     return round(available_count / universe_count, 6)
-
-
-def _normalize_symbol(value: Any) -> str:
-    symbol = str(value or '').strip().upper()
-    if symbol.isdigit():
-        symbol = symbol.zfill(6)
-    return symbol
 
 
 def _build_persistence_scope_outcome(

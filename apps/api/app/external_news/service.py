@@ -14,6 +14,7 @@ from app.core.settings import settings
 from app.external_news.provider import ExternalNewsProvider, NaverNewsSearchProvider
 from app.external_news.store import enrich_recent_external_news_classification, list_external_news_items, persist_external_news_items
 from app.market_data_store import load_symbols
+from app.market.symbol_codes import split_symbol_list as _normalize_symbols
 
 
 logger = logging.getLogger(__name__)
@@ -74,16 +75,6 @@ def _association_window_for_market_date(
         else next_midnight
     )
     return start, end
-
-
-def _normalize_symbols(symbols: Sequence[str] | str | None) -> list[str]:
-    if symbols is None:
-        return []
-    if isinstance(symbols, str):
-        values = symbols.split(',')
-    else:
-        values = symbols
-    return [str(item).strip() for item in values if str(item).strip()]
 
 
 def _news_freshness_cutoff(

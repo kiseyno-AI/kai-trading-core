@@ -33,6 +33,7 @@ from app.market_data_store import (
     load_daily_piotroski_filter_results,
 )
 from app.orders.domain import BrokerOrderStatus, OrderRequestSubmissionStatus
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 
 AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
     'market_risk_filter',
@@ -118,10 +119,6 @@ _ACTIVE_EXEC_WATCH_ELIGIBILITY_STATUSES = {
     'eligible',
     'monitor_candidate',
 }
-
-
-def _normalize_symbol(value: Any) -> str:
-    return str(value or '').strip().upper()
 
 
 def _normalize_symbol_scope(symbols: Sequence[str] | None) -> list[str] | None:
