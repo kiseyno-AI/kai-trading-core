@@ -2133,6 +2133,8 @@ class OpenClawAgentClient:
                             event = json.loads(line)
                         except json.JSONDecodeError:
                             event = {}
+                        if not isinstance(event, dict):
+                            continue
                         diagnostics['lookup_mode'] = 'trajectory_scan'
                         diagnostics['trajectory_file'] = str(trajectory_path)
                         diagnostics['session_id'] = event.get('sessionId')
@@ -2182,6 +2184,8 @@ class OpenClawAgentClient:
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
                         continue
                     if str(event.get('sessionKey') or '') != session_key:
                         continue
