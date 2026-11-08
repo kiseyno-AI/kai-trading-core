@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.audit_logging import exception_message
 from app.core.settings import settings
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.integrations.fred.client import FREDAPIError, FREDClient, FREDConfigurationError
 from app.integrations.world_bank.client import WorldBankAPIError, WorldBankClient
 from app.macro_context.store import MacroContextObservationRecord, MacroContextObservationStore, macro_context_observation_store
@@ -587,7 +588,15 @@ class MacroContextService:
         series_statuses: list[dict[str, Any]] = []
         observations_upserted = 0
         observations_failed = 0
-        for config in configs:
+        for index, config in enumerate(configs):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': index,
+                    'total': len(configs),
+                    'current_symbol': config.series_id,
+                    'current_step': f'fetch_{config.source}_series',
+                }
+            )
             try:
                 payload = await self.world_bank_client.fetch_indicator(
                     country=config.country_code or settings.macro_context_world_bank_country,
@@ -702,7 +711,15 @@ class MacroContextService:
         series_statuses: list[dict[str, Any]] = []
         observations_upserted = 0
         observations_failed = 0
-        for config in configs:
+        for index, config in enumerate(configs):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': index,
+                    'total': len(configs),
+                    'current_symbol': config.series_id,
+                    'current_step': f'fetch_{config.source}_series',
+                }
+            )
             try:
                 payload = await self.fred_client.fetch_latest_observations(series_id=config.series_id, limit=5)
                 row = self._select_first_numeric_fred_row(payload.get('observations') or [])

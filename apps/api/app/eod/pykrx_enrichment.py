@@ -29,6 +29,7 @@ from app.market_data_store import (
     upsert_daily_pykrx_enrichment_rows,
 )
 from app.repositories.eod_run_repository import list_eod_collection_runs
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol, split_symbol_list as _normalize_symbols
 
 logger = logging.getLogger(__name__)
@@ -793,7 +794,14 @@ class PykrxEnrichmentService:
             None if use_full_market_coverage else symbol_filter
         )
 
-        for category in resolved_categories:
+        for category_index, category in enumerate(resolved_categories):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': category_index,
+                    'total': len(resolved_categories),
+                    'current_step': f'collect_{category}',
+                }
+            )
             category_rows: list[dict[str, Any]]
             if category == 'sector_classification':
                 category_rows, details = self._collect_sector_classification_rows(

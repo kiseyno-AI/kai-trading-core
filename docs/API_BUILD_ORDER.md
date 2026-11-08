@@ -122,6 +122,8 @@
 - `GET /eod/status`
 - `GET /eod/freshness`
 - `GET /eod/pipeline/status?market_date=YYYY-MM-DD&fs_div=CFS&include_diagnostics=false&include_feedback_context=false`
+- `GET /eod/pipeline/live?events=40`
+- `GET /eod/pipeline/live/events?since=0&limit=200`
 - `GET /eod/pipeline/stages`
 - `POST /eod/pipeline/run`
 - `POST /eod/master/refresh-if-due?force=false`
@@ -398,6 +400,7 @@
 
 ## EOD pipeline status notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
+- `GET /eod/pipeline/live` is the DB-free real-time view of the daily pipeline: every run/stage start, per-symbol progress, heartbeat, sub-step and finish is mirrored into Core memory and into `apps/api/var/pipeline-live/current.json` (atomic, ≤1 write/s plus every status change), with milestone events appended to `apps/api/var/log/daily-pipeline-live.jsonl`. It returns this process's memory or the snapshot file when another process (an operator CLI run) is newer, with `percent`, `elapsed_seconds`, `eta_seconds`, `seconds_since_update` and `stale_suspected` computed at read time. `GET /eod/pipeline/live/events?since=<seq>` returns incremental events from this API process. Use it for polling dashboards and agents instead of `GET /eod/pipeline/status`, which reads the database.
 - `GET /eod/pipeline/status` is the operator-facing live status API for the post-close EOD pipeline. Its default read is polling-safe: expensive row-count missing diagnostics, PyKRX enrichment coverage scans, and feedback-run context are omitted unless `include_diagnostics=true` and/or `include_feedback_context=true` is passed.
 - It stays separate from `GET /eod/freshness`: freshness answers whether the stored data is available, while pipeline status answers which stage is running now and what work is currently in progress.
 - The payload now also includes both `market` and `market_session` blocks. `market` reflects the current exchange clock state, while `market_session` reflects the semantics of the requested `market_date`, including the latest valid trading date and whether quote or intraday data should be expected for that date.

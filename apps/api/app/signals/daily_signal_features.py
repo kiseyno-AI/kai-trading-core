@@ -43,6 +43,7 @@ from app.signals.signal_feature_readiness import (
     decision_usable_direct_signal_sources,
     quote_snapshot_is_decision_usable,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 
 SIGNAL_FEATURE_VERSION = 'daily_signal_features_v2'
 SIGNAL_FEATURE_SOURCE = 'kis_ranking'
@@ -1250,7 +1251,16 @@ def _expand_rows_with_owned_fallback(
 
     direct_map = {item['symbol']: item for item in direct_rows}
     items: list[dict[str, Any]] = []
-    for symbol in universe['target_symbols']:
+    target_total = len(universe['target_symbols'])
+    for index, symbol in enumerate(universe['target_symbols']):
+        daily_pipeline_live_progress.thread_stage_progress(
+            {
+                'processed': index,
+                'total': target_total,
+                'current_symbol': symbol,
+                'current_step': 'build_signal_feature_row',
+            }
+        )
         entry = direct_map.get(symbol)
         if entry is None:
             entry = _empty_feature_row(
@@ -1776,6 +1786,9 @@ class DailySignalFeatureService:
                     'authoritative signal-feature replacement cannot use '
                     'a narrowed admitted scope'
                 )
+        daily_pipeline_live_progress.publish_substep(
+            step='collect_kis_rankings_and_build_rows', status='running'
+        )
         collection = await self.collect_features(
             market_date=market_date,
             sources=sources,
@@ -1783,6 +1796,17 @@ class DailySignalFeatureService:
             overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
             exact_symbols=generation_symbols,
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='collect_kis_rankings_and_build_rows',
+            status='completed',
+            detail={
+                'rows': len(collection.items),
+                'source_errors': len(collection.source_errors or {}),
+            },
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='validate_and_persist_signal_features', status='running'
         )
 
         # Source health is an authority gate, not merely response metadata.
