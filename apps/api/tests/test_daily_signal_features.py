@@ -642,6 +642,44 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.source_errors, {})
         self.assertEqual(result.source_counts, {VOLUME_POWER: 1})
+        self.assertEqual(result.source_health[VOLUME_POWER]['status'], 'partial')
+        self.assertEqual(result.source_health[VOLUME_POWER]['reason'], 'segment_error')
+
+    async def test_refresh_marks_surviving_segment_rows_degraded_when_other_market_fails(self):
+        class PartialMarketClient(FakeKISRankingClient):
+            async def fetch_domestic_ranking_volume_power(self, **kwargs):
+                if kwargs['input_iscd'] == '1001':
+                    raise RuntimeError('kosdaq ranking down')
+                return await super().fetch_domestic_ranking_volume_power(**kwargs)
+
+        service = DailySignalFeatureService(client=PartialMarketClient())
+        with (
+            patch(
+                'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+                side_effect=lambda **kwargs: (
+                    [_ready_direct_feature_item(item['symbol']) for item in kwargs['direct_rows']],
+                    {'target_symbols': ['005930'], 'active_symbols': ['005930']},
+                ),
+            ),
+            patch('app.signals.daily_signal_features.upsert_daily_signal_features') as persist,
+            patch(
+                'app.signals.daily_signal_features.daily_market_participation_context_service.rebuild_for_market_date',
+                return_value={'captured_symbol_count': 1},
+            ),
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                sources=[VOLUME_POWER],
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['incomplete_sources'], [VOLUME_POWER])
+        self.assertEqual(result['successful_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertEqual(result['features_persisted'], 1)
+        readiness = persist.call_args.args[0][0]['feature_payload']['readiness']
+        self.assertEqual(readiness['quality_status'], 'degraded')
+        self.assertIn('source_incomplete', readiness['quality_reasons'])
 
     async def test_overtime_sources_use_the_same_day_after_hours_capture(self):
         self._save_capture(
