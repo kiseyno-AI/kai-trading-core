@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -10,6 +11,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.core.settings import settings
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.monitoring import trading_order_monitoring_service
@@ -26,6 +28,7 @@ from app.orders.service import (
 )
 
 router = APIRouter(prefix='/trading/orders', tags=['trading:orders'])
+logger = logging.getLogger(__name__)
 
 
 class TradingOrderSubmitRequest(BaseModel):
@@ -118,6 +121,45 @@ def _raise_order_http_error(exc: Exception) -> None:
     if isinstance(exc, TradingOrderUpstreamError):
         status_code = 503 if 'configured' in str(exc).lower() else 502
         raise HTTPException(status_code=status_code, detail=jsonable_encoder(exc.payload or {'detail': str(exc)})) from exc
+
+
+def _bounded_run_request(
+    *,
+    route: str,
+    requested_dry_run: bool | None,
+    requested_force: bool,
+    server_dry_run: bool,
+    server_enabled: bool,
+) -> tuple[bool | None, bool]:
+    """Bound an HTTP run request by the server-side safety settings.
+
+    ``dry_run``/``force`` in a request body may make a run *safer* but must not
+    lift what the operator configured on the server:
+
+    * a server configured for dry-run stays dry-run (``dry_run=false`` cannot
+      turn it into a live run);
+    * when the server has the feature disabled, ``force`` cannot bypass that
+      switch for a live run. ``force`` still overrides market-hours/calendar
+      checks as before.
+
+    The services keep their own signature; this only bounds what the HTTP
+    surface forwards to them.
+    """
+
+    dry_run = requested_dry_run
+    if server_dry_run and requested_dry_run is False:
+        dry_run = True
+        logger.warning(
+            'Ignoring dry_run=false on %s: the server is configured for dry-run', route
+        )
+    effective_live = (dry_run is False) or (dry_run is None and not server_dry_run)
+    force = requested_force
+    if force and effective_live and not server_enabled:
+        force = False
+        logger.warning(
+            'Ignoring force=true on %s: execution is disabled on the server', route
+        )
+    return dry_run, force
 
 
 @router.post('/buy')
@@ -306,6 +348,13 @@ async def run_next_open_execution_if_due(payload: TradingNextOpenExecutionRunReq
                 payload.target_trade_date,
             )
         )
+        dry_run, force = _bounded_run_request(
+            route='next-open-execution/run-if-due',
+            requested_dry_run=payload.dry_run,
+            requested_force=payload.force,
+            server_dry_run=bool(settings.signal_decider_next_open_dry_run),
+            server_enabled=bool(settings.signal_decider_next_open_enabled),
+        )
         if (
             signal_decider_exec_integration_service.should_delegate_execution()
             or signal_decider_exec_integration_service.should_manage_delegated_authority(
@@ -315,14 +364,14 @@ async def run_next_open_execution_if_due(payload: TradingNextOpenExecutionRunReq
             return await signal_decider_exec_integration_service.dispatch_next_open_plan(
                 target_trade_date=resolved_target_trade_date,
                 refresh_plan=True,
-                dry_run=payload.dry_run,
-                force=payload.force,
+                dry_run=dry_run,
+                force=force,
                 trigger='api',
             )
         return await signal_decider_next_open_execution_service.run_market_open_execution_if_due(
             target_trade_date=resolved_target_trade_date,
-            dry_run=payload.dry_run,
-            force=payload.force,
+            dry_run=dry_run,
+            force=force,
             trigger='api',
         )
     except ValueError as exc:
@@ -367,11 +416,18 @@ async def run_intraday_auto_sell_if_due(payload: TradingIntradayAutoSellRunReque
                 refresh=True,
                 trigger='api',
             )
+        dry_run, force = _bounded_run_request(
+            route='intraday-auto-sell/run-if-due',
+            requested_dry_run=payload.dry_run,
+            requested_force=payload.force,
+            server_dry_run=bool(settings.signal_decider_intraday_auto_sell_dry_run),
+            server_enabled=bool(settings.signal_decider_intraday_auto_sell_enabled),
+        )
         return await signal_decider_intraday_auto_sell_service.run_intraday_auto_sell_if_due(
             account_reference=payload.account_reference,
             symbol=payload.symbol,
-            dry_run=payload.dry_run,
-            force=payload.force,
+            dry_run=dry_run,
+            force=force,
             trigger='api',
         )
     except ValueError as exc:
