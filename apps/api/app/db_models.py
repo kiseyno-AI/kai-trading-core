@@ -3174,7 +3174,7 @@ class MacroSeriesHistory(Base, TimestampMixin):
 
     ``released_on`` comes from ALFRED first releases where FRED serves them
     (``release_basis='alfred_initial_release'``); dense daily market series
-    use the next calendar day (``'next_day_assumed'``).
+    are public the same US day after the close (``'same_day_close'``).
     """
 
     __tablename__ = 'macro_series_history'

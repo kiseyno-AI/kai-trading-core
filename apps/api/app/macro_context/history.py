@@ -2,11 +2,13 @@
 
     python -m app.macro_context.history            # 2006 onward, default series
 
-Monthly releases (CPI, unemployment) and weekly ones (USD/KRW H.10) come
-from ALFRED first releases, so ``released_on`` is the real publication
-date. Dense daily market series exceed ALFRED's 2,000-vintage limit; those
-use latest values released the next calendar day (US close, read in Korea
-the next morning). Research only: the live macro context is unchanged.
+``released_on`` is the US calendar date a value became public. Monthly
+releases (CPI, unemployment) and weekly ones (USD/KRW H.10) come from ALFRED
+first releases. Dense daily market series exceed ALFRED's 2,000-vintage
+limit; their close is public the same US day (``'same_day_close'``). Korea
+trades the next morning, so readers use values with ``released_on`` strictly
+before the Korean trading day. Research only: the live macro context is
+unchanged.
 """
 
 from __future__ import annotations
@@ -41,13 +43,13 @@ def history_rows(observations: list[dict[str, Any]], *, initial_release: bool) -
         if initial_release:
             released = date.fromisoformat(str(item.get('realtime_start'))[:10])
         else:
-            released = observed + timedelta(days=1)
+            released = observed  # US close, public that US evening
         rows.append(
             {
                 'observation_date': observed,
                 'value': value,
                 'released_on': max(released, observed),
-                'release_basis': 'alfred_initial_release' if initial_release else 'next_day_assumed',
+                'release_basis': 'alfred_initial_release' if initial_release else 'same_day_close',
             }
         )
     return rows
@@ -84,7 +86,7 @@ async def load_fred_history(
                 rows = await _backfill_before_first_release(client, series_id, start, rows)
             result[series_id] = {
                 'rows': store(series_id, rows, now),
-                'release_basis': 'alfred_initial_release' if initial else 'next_day_assumed',
+                'release_basis': 'alfred_initial_release' if initial else 'same_day_close',
                 'first': rows[0]['observation_date'].isoformat() if rows else None,
                 'last': rows[-1]['observation_date'].isoformat() if rows else None,
             }

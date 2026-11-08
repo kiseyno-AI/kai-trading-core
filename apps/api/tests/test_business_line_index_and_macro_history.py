@@ -46,9 +46,9 @@ class MacroHistoryTests(unittest.TestCase):
 
         self.assertEqual(result['CPIAUCSL']['release_basis'], 'alfred_initial_release')
         self.assertEqual(stored['CPIAUCSL'][0]['released_on'], date(2024, 2, 13))
-        self.assertEqual(result['DGS10']['release_basis'], 'next_day_assumed')
-        # '.' placeholder skipped; the value is public the next calendar day.
-        self.assertEqual([(r['observation_date'], r['released_on']) for r in stored['DGS10']], [(date(2024, 1, 2), date(2024, 1, 3))])
+        self.assertEqual(result['DGS10']['release_basis'], 'same_day_close')
+        # '.' placeholder skipped; a US close is public that US day.
+        self.assertEqual([(r['observation_date'], r['released_on']) for r in stored['DGS10']], [(date(2024, 1, 2), date(2024, 1, 2))])
         self.assertEqual(fred.calls, [('CPIAUCSL', True), ('DGS10', True), ('DGS10', False)])
 
     def test_dates_before_the_first_alfred_vintage_use_the_median_lag(self):
