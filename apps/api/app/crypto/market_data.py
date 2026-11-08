@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 from app.core.settings import settings
-from app.integrations.upbit.client import UpbitQuotationClient
+from app.integrations.upbit.client import UpbitQuotationAPIError, UpbitQuotationClient
 
 PROVIDER = 'upbit'
 VENUE = 'UPBIT'
@@ -40,7 +41,10 @@ def _split_market(market: str) -> tuple[str, str]:
 def _to_float(value: Any) -> float | None:
     if value in (None, ''):
         return None
-    return float(value)
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise UpbitQuotationAPIError('Upbit quotation response contained a nonfinite number')
+    return parsed
 
 
 def _to_int(value: Any) -> int | None:

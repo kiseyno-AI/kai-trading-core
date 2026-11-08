@@ -3780,6 +3780,36 @@ def run_market_data_pipeline(
         'details': {},
     }
 
+    def terminalize_run_failure(exc: Exception) -> None:
+        """Best-effort cleanup that preserves the original pipeline error."""
+
+        try:
+            dependencies.complete_eod_collection_run(
+                run_id,
+                status='failed',
+                symbols_succeeded=symbols_succeeded,
+                symbols_failed=symbols_failed,
+                error_message=str(exc),
+                run_metadata=run_metadata,
+            )
+        except Exception as cleanup_exc:  # pragma: no cover - defensive log
+            logger.warning(
+                'EOD cleanup failed after pipeline failure for run %s: %s',
+                run_id,
+                cleanup_exc,
+            )
+        try:
+            daily_pipeline_tracker.finish_run(
+                status='failed',
+                error_message=str(exc),
+            )
+        except Exception as cleanup_exc:  # bounded retry already occurred
+            logger.warning(
+                'Official pipeline cleanup failed after pipeline failure for run %s: %s',
+                run_id,
+                cleanup_exc,
+            )
+
     def terminalize_tracking_failure(
         exc: Exception,
         *,
@@ -3805,34 +3835,7 @@ def run_market_data_pipeline(
                 'bars_upserted': bars_upserted,
             },
         )
-        try:
-            dependencies.complete_eod_collection_run(
-                run_id,
-                status='failed',
-                symbols_succeeded=symbols_succeeded,
-                symbols_failed=symbols_failed,
-                error_message=str(exc),
-                run_metadata=run_metadata,
-            )
-        except Exception as cleanup_exc:  # pragma: no cover - defensive log
-            logger.warning(
-                'EOD cleanup failed after daily pipeline tracking setup '
-                'failure for run %s: %s',
-                run_id,
-                cleanup_exc,
-            )
-        try:
-            daily_pipeline_tracker.finish_run(
-                status='failed',
-                error_message=str(exc),
-            )
-        except Exception as cleanup_exc:  # bounded retry already occurred
-            logger.warning(
-                'Official pipeline cleanup failed after tracking setup '
-                'failure for run %s: %s',
-                run_id,
-                cleanup_exc,
-            )
+        terminalize_run_failure(exc)
 
     def complete_eod_run_or_fail_tracking(**kwargs: Any) -> None:
         try:
@@ -4573,7 +4576,10 @@ def run_market_data_pipeline(
             )
             if failed_symbols:
                 price_context_result.update(causal_price_skip)
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             price_context_result = build_stage_failure_result(
@@ -4824,7 +4830,10 @@ def run_market_data_pipeline(
                 downstream_preflight_status=preflight.get('status'),
                 downstream_allowed=bool(preflight.get('allowed')),
             )
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             pykrx_enrichment_result = build_stage_failure_result(
@@ -4916,7 +4925,10 @@ def run_market_data_pipeline(
                     **causal_price_skip,
                 },
             )
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             technical_snapshot_result = build_stage_failure_result(
@@ -5056,7 +5068,10 @@ def run_market_data_pipeline(
                     **causal_price_skip,
                 },
             )
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             action_summary_result = build_stage_failure_result(
@@ -5237,7 +5252,10 @@ def run_market_data_pipeline(
                 failed=trending_failed,
                 extra=_gap_policy_details(failed=trending_failed, total=trending_total),
             )
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             trending_rank_result = build_stage_failure_result(
@@ -5369,7 +5387,10 @@ def run_market_data_pipeline(
                     **_gap_policy_details(failed=signal_failed, total=signal_total),
                 },
             )
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             signal_feature_result = build_stage_failure_result(
@@ -5552,7 +5573,10 @@ def run_market_data_pipeline(
                     ),
                 },
             )
-        except (DailyPipelineTrackingWriteError, SQLAlchemyError):
+        except DailyPipelineTrackingWriteError:
+            raise
+        except SQLAlchemyError as exc:
+            terminalize_run_failure(exc)
             raise
         except Exception as exc:
             market_risk_filter_result = build_stage_failure_result(

@@ -182,6 +182,16 @@ def test_build_news_payloads_batches_symbols_in_order_and_carries_inputs():
     assert payloads[0]['task'] == 'news_events' and payloads[0]['market_date'] == '2026-11-09'
 
 
+@pytest.mark.parametrize('batch_size', [0, -1])
+def test_nonpositive_news_batch_size_still_preserves_each_symbol(batch_size):
+    inputs = {symbol: {'news': []} for symbol in ('A', 'B', 'C')}
+
+    payloads = build_news_payloads(DAY, inputs, batch_size=batch_size)
+
+    assert [payload['symbols'] for payload in payloads] == [['A'], ['B'], ['C']]
+    assert [item['symbol'] for payload in payloads for item in payload['items']] == ['A', 'B', 'C']
+
+
 # ---- runner --------------------------------------------------------------
 
 class Gateway:
@@ -209,6 +219,26 @@ def _run_due(tmp_path, gateway, now, **kw):
         summary_loader=kw.pop('summary_loader', lambda d: None),
         inputs_ready=kw.pop('inputs_ready', lambda d: (True, 'ready')), **kw,
     )
+
+
+@pytest.mark.parametrize('body', [
+    [],
+    None,
+    True,
+    {'output': 42},
+    {'output': [{'type': 'message', 'content': 42}]},
+])
+def test_malformed_gateway_envelope_preserves_retry_backoff(tmp_path, body):
+    gw = Gateway([httpx.Response(200, content=json.dumps(body))])
+    only = [runner.MARKET_AGENT]
+
+    result = _run_due(tmp_path, gw, kst(21, 30), only=only)
+
+    assert result.outcomes[0].status == 'failed'
+    assert SideAgentStore(tmp_path).load_state(runner.MARKET_AGENT, DAY.isoformat())['attempts'] == 1
+    retry = _run_due(tmp_path, gw, kst(21, 40), only=only)
+    assert retry.outcomes[0].detail == 'retry_gap'
+    assert len(gw.calls) == 1
 
 
 def test_run_due_waits_for_scheduled_time_and_skips_non_trading_days(tmp_path):

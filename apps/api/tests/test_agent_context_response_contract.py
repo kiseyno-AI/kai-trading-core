@@ -85,6 +85,37 @@ def _complete_short_term_decider_feedback(**overrides):
 
 
 class AgentContextResponseContractTests(unittest.TestCase):
+    def test_deciders_reject_non_finite_upgrade_prices_without_normalization_errors(self):
+        for builder in (
+            _complete_signal_decider_feedback,
+            _complete_short_term_decider_feedback,
+        ):
+            for value in (float('nan'), float('inf'), float('-inf')):
+                payload = builder(decision_delta={
+                    'upgrade_trigger': {
+                        'trigger_price': value,
+                        'chase_limit_price': 86000,
+                    },
+                })
+                with self.subTest(role=payload['role'], value=value):
+                    result = normalize_agent_response(
+                        role=payload['role'],
+                        output_text=json.dumps(payload),
+                        raw_response=payload,
+                        market_date=payload['market_date'],
+                        symbol=payload['symbol'],
+                        agent_name=payload['agent_name'],
+                    )
+
+                    self.assertFalse(result['response_contract_valid'])
+                    self.assertIn(
+                        'non_finite_number:decision_delta.upgrade_trigger.trigger_price',
+                        result['response_schema_violation_flags'],
+                    )
+                    self.assertIsNone(result['decision_delta']['upgrade_trigger']['trigger_price'])
+                    self.assertEqual(result['decision_delta']['upgrade_trigger']['chase_limit_price'], 86000)
+                    json.dumps(result, allow_nan=False)
+
     def test_signal_wait_preserves_monitoring_levels_and_synthesizes_buy_upgrade(self):
         payload = _complete_signal_decider_feedback(
             preferred_action='wait',

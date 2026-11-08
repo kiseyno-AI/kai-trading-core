@@ -1,0 +1,1335 @@
+{
+  "agent": "core_data_audit",
+  "base_commit": "2ee26af61fe3107797f41c34c174d59b5ab5a651",
+  "coverage_is_manual": "Reads and connected-flow reasoning only. Inventory/scans and test execution do not count as line-by-line review. Ranges reflect source at time of read; small fixes may shift later lines.",
+  "full": [
+    {
+      "path": "apps/api/app/eod/data_gap_fill.py",
+      "lines": 535
+    },
+    {
+      "path": "apps/api/app/eod/stored_signal_feature_backfill.py",
+      "lines": 211
+    },
+    {
+      "path": "apps/api/app/eod/finality.py",
+      "lines": 57
+    },
+    {
+      "path": "apps/api/app/eod/market_membership.py",
+      "lines": 116
+    },
+    {
+      "path": "apps/api/app/eod/auto_pykrx.py",
+      "lines": 545
+    },
+    {
+      "path": "apps/api/app/eod/stage_heartbeat.py",
+      "lines": 83
+    },
+    {
+      "path": "apps/api/app/eod/freshness_repository.py",
+      "lines": 86
+    },
+    {
+      "path": "apps/api/app/eod/kis_final_bar_repair.py",
+      "lines": 1422
+    },
+    {
+      "path": "apps/api/tests/test_data_gap_fill.py",
+      "lines": 364
+    },
+    {
+      "path": "apps/api/tests/test_data_gap_fill_detectors.py",
+      "lines": 292
+    },
+    {
+      "path": "apps/api/app/eod/runner.py",
+      "lines": 901
+    },
+    {
+      "path": "apps/api/app/core/test_database_safety.py",
+      "lines": 80
+    },
+    {
+      "path": "apps/api/app/signals/composite_factor.py",
+      "lines": 1239
+    },
+    {
+      "path": "apps/api/app/signals/quality_factor.py",
+      "lines": 1267
+    },
+    {
+      "path": "apps/api/app/signals/factor_coverage.py",
+      "lines": 661
+    },
+    {
+      "path": "apps/api/app/eod/scope_outcomes.py",
+      "lines": 502
+    },
+    {
+      "path": "apps/api/app/eod/daily_pipeline_tracking.py",
+      "lines": 241
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_pipeline_support.py",
+      "lines": 408
+    },
+    {
+      "path": "apps/api/app/eod/service.py",
+      "lines": 208
+    },
+    {
+      "path": "apps/api/app/eod/sink.py",
+      "lines": 20
+    },
+    {
+      "path": "apps/api/app/eod/state.py",
+      "lines": 68
+    },
+    {
+      "path": "apps/api/app/eod/universe.py",
+      "lines": 47
+    },
+    {
+      "path": "apps/api/app/eod/master.py",
+      "lines": 260
+    },
+    {
+      "path": "apps/api/app/eod/master_state.py",
+      "lines": 54
+    },
+    {
+      "path": "apps/api/tests/test_eod_service.py",
+      "lines": 239
+    },
+    {
+      "path": "apps/api/app/dart/backfill_current_universe.py",
+      "lines": 76
+    },
+    {
+      "path": "apps/api/app/dart/backfill_current_universe_runner.py",
+      "lines": 206
+    },
+    {
+      "path": "apps/api/app/dart/repair_legacy_cfs_no_data.py",
+      "lines": 178
+    },
+    {
+      "path": "apps/api/app/dart/fundamentals_history_service.py",
+      "lines": 299
+    },
+    {
+      "path": "apps/api/app/dart/service.py",
+      "lines": 1107
+    },
+    {
+      "path": "apps/api/app/eod/freshness.py",
+      "lines": 494
+    },
+    {
+      "path": "apps/api/app/eod/kis_valuation_backfill.py",
+      "lines": 317
+    },
+    {
+      "path": "apps/api/app/repositories/symbol_repository.py",
+      "lines": 379
+    },
+    {
+      "path": "apps/api/app/market/symbol_codes.py",
+      "lines": 79
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_import.py",
+      "lines": 153
+    },
+    {
+      "path": "apps/api/tests/test_dart_backfill_current_universe_cli.py",
+      "lines": 120
+    },
+    {
+      "path": "apps/api/tests/test_dart_backfill_current_universe_runner.py",
+      "lines": 128
+    },
+    {
+      "path": "apps/api/tests/test_kis_valuation_backfill.py",
+      "lines": 216
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_enrichment_gate.py",
+      "lines": 374
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_enrichment_coverage_policy.py",
+      "lines": 16
+    },
+    {
+      "path": "apps/api/app/eod/live_progress.py",
+      "lines": 705
+    },
+    {
+      "path": "apps/api/app/eod/pipeline_status_support.py",
+      "lines": 142
+    },
+    {
+      "path": "apps/api/app/eod/summary_cutoff_contract.py",
+      "lines": 493
+    },
+    {
+      "path": "apps/api/tests/test_symbol_repository.py",
+      "lines": 255
+    },
+    {
+      "path": "apps/api/tests/test_live_progress.py",
+      "lines": 363
+    },
+    {
+      "path": "apps/api/app/dart/store.py",
+      "lines": 358
+    },
+    {
+      "path": "apps/api/app/dart/share_issuance_audit.py",
+      "lines": 501
+    },
+    {
+      "path": "apps/api/app/dart/sync_service.py",
+      "lines": 2097
+    },
+    {
+      "path": "apps/api/app/dart/fundamentals_store.py",
+      "lines": 1802
+    },
+    {
+      "path": "apps/api/app/signals/market_risk_evaluators.py",
+      "lines": 184
+    },
+    {
+      "path": "apps/api/app/signals/signal_feature_readiness.py",
+      "lines": 374
+    },
+    {
+      "path": "apps/api/conftest.py",
+      "lines": 70
+    },
+    {
+      "path": "apps/api/tests/test_http_test_boundaries.py",
+      "lines": 104
+    },
+    {
+      "path": "apps/api/app/dart/fundamentals_capture_service.py",
+      "lines": 4526
+    },
+    {
+      "path": "apps/api/app/signals/market_risk_snapshot.py",
+      "lines": 706
+    },
+    {
+      "path": "apps/api/app/signals/market_risk_filter.py",
+      "lines": 412
+    },
+    {
+      "path": "apps/api/app/market/clock.py",
+      "lines": 104
+    },
+    {
+      "path": "apps/api/app/market/session.py",
+      "lines": 737
+    },
+    {
+      "path": "apps/api/app/signals/preferred_share_fundamentals.py",
+      "lines": 79
+    },
+    {
+      "path": "apps/api/app/signals/overtime_ranking_capture.py",
+      "lines": 225
+    },
+    {
+      "path": "apps/api/tests/test_overtime_ranking_capture.py",
+      "lines": 162
+    },
+    {
+      "path": "apps/api/app/market/business_lines.py",
+      "lines": 193
+    },
+    {
+      "path": "apps/api/app/market/business_line_index.py",
+      "lines": 146
+    },
+    {
+      "path": "apps/api/app/market/business_line_profiles.py",
+      "lines": 257
+    },
+    {
+      "path": "apps/api/app/market/business_line_conditions.py",
+      "lines": 419
+    },
+    {
+      "path": "apps/api/tests/test_business_line_conditions.py",
+      "lines": 76
+    },
+    {
+      "path": "apps/api/app/signals/beta_factor.py",
+      "lines": 933
+    },
+    {
+      "path": "apps/api/app/signals/low_risk_factor.py",
+      "lines": 900
+    },
+    {
+      "path": "apps/api/app/signals/pykrx_risk_filters.py",
+      "lines": 461
+    },
+    {
+      "path": "apps/api/app/signals/momentum_factor.py",
+      "lines": 1266
+    },
+    {
+      "path": "apps/api/app/signals/value_factor.py",
+      "lines": 801
+    },
+    {
+      "path": "apps/api/app/signals/unified_value_factor.py",
+      "lines": 1064
+    },
+    {
+      "path": "apps/api/app/signals/advanced_value_factor.py",
+      "lines": 1902
+    },
+    {
+      "path": "apps/api/app/macro_context/history.py",
+      "lines": 168
+    },
+    {
+      "path": "apps/api/tests/test_business_line_index_and_macro_history.py",
+      "lines": 186
+    },
+    {
+      "path": "apps/api/tests/test_momentum_factor.py",
+      "lines": 590
+    },
+    {
+      "path": "apps/api/app/market/snapshot_store.py",
+      "lines": 344
+    },
+    {
+      "path": "apps/api/app/eod/technical_snapshots.py",
+      "lines": 434
+    },
+    {
+      "path": "apps/api/app/eod/action_summaries.py",
+      "lines": 581
+    },
+    {
+      "path": "apps/api/app/eod/screening_results.py",
+      "lines": 623
+    },
+    {
+      "path": "apps/api/app/eod/turnover_repair.py",
+      "lines": 654
+    },
+    {
+      "path": "apps/api/app/eod/stale_collection_run_repair.py",
+      "lines": 1149
+    },
+    {
+      "path": "apps/api/app/repositories/eod_run_repository.py",
+      "lines": 3437
+    },
+    {
+      "path": "apps/api/app/eod/official_bar_restatement.py",
+      "lines": 383
+    },
+    {
+      "path": "apps/api/app/repositories/us_equity_repository.py",
+      "lines": 535
+    },
+    {
+      "path": "apps/api/app/repositories/__init__.py",
+      "lines": 2
+    },
+    {
+      "path": "apps/api/app/signals/__init__.py",
+      "lines": 1
+    },
+    {
+      "path": "apps/api/app/market/live_sector_projection.py",
+      "lines": 994
+    },
+    {
+      "path": "apps/api/tests/test_live_sector_projection.py",
+      "lines": 478
+    },
+    {
+      "path": "apps/api/tests/test_us_market_data.py",
+      "lines": 86
+    },
+    {
+      "path": "apps/api/tests/test_us_price_collection_service.py",
+      "lines": 106
+    },
+    {
+      "path": "apps/api/tests/test_us_equity_scheduler.py",
+      "lines": 251
+    },
+    {
+      "path": "apps/api/app/macro_context/__init__.py",
+      "lines": 1
+    },
+    {
+      "path": "apps/api/app/integrations/world_bank/client.py",
+      "lines": 80
+    },
+    {
+      "path": "apps/api/app/integrations/fred/client.py",
+      "lines": 125
+    },
+    {
+      "path": "apps/api/app/integrations/upbit/client.py",
+      "lines": 129
+    },
+    {
+      "path": "apps/api/app/integrations/sec_edgar/client.py",
+      "lines": 183
+    },
+    {
+      "path": "apps/api/app/integrations/dart/client.py",
+      "lines": 914
+    },
+    {
+      "path": "apps/api/app/integrations/nasdaq_trader/client.py",
+      "lines": 50
+    },
+    {
+      "path": "apps/api/app/integrations/bok/client.py",
+      "lines": 109
+    },
+    {
+      "path": "apps/api/app/integrations/fx/client.py",
+      "lines": 80
+    },
+    {
+      "path": "apps/api/app/integrations/kis_overseas_master/client.py",
+      "lines": 133
+    },
+    {
+      "path": "apps/api/app/integrations/sec_edgar/__init__.py",
+      "lines": 1
+    },
+    {
+      "path": "apps/api/app/integrations/nasdaq_trader/__init__.py",
+      "lines": 1
+    },
+    {
+      "path": "apps/api/app/integrations/kis_overseas_master/__init__.py",
+      "lines": 1
+    },
+    {
+      "path": "apps/api/app/integrations/bok/series_catalog.py",
+      "lines": 24
+    },
+    {
+      "path": "apps/api/app/us_equities/agent_analysis_service.py",
+      "lines": 538
+    },
+    {
+      "path": "apps/api/app/us_equities/sec_fundamentals.py",
+      "lines": 265
+    },
+    {
+      "path": "apps/api/app/us_equities/execution_plan_service.py",
+      "lines": 351
+    },
+    {
+      "path": "apps/api/app/us_equities/screening.py",
+      "lines": 249
+    },
+    {
+      "path": "apps/api/app/us_equities/scheduler.py",
+      "lines": 305
+    },
+    {
+      "path": "apps/api/app/us_equities/universe.py",
+      "lines": 156
+    },
+    {
+      "path": "apps/api/app/us_equities/universe_service.py",
+      "lines": 103
+    },
+    {
+      "path": "apps/api/app/us_equities/price_collection_service.py",
+      "lines": 260
+    },
+    {
+      "path": "apps/api/app/us_equities/fundamental_collection_service.py",
+      "lines": 181
+    },
+    {
+      "path": "apps/api/app/us_equities/kis_market_codes.py",
+      "lines": 54
+    },
+    {
+      "path": "apps/api/app/us_equities/symbols.py",
+      "lines": 141
+    },
+    {
+      "path": "apps/api/app/us_equities/__init__.py",
+      "lines": 1
+    },
+    {
+      "path": "apps/api/app/us_equities/market_data.py",
+      "lines": 142
+    },
+    {
+      "path": "apps/api/app/macro_context/service.py",
+      "lines": 1038
+    },
+    {
+      "path": "apps/api/app/macro_context/store.py",
+      "lines": 288
+    },
+    {
+      "path": "apps/api/app/market/snapshot.py",
+      "lines": 1667
+    },
+    {
+      "path": "apps/api/app/market/kis_intraday_snapshots.py",
+      "lines": 1145
+    },
+    {
+      "path": "apps/api/app/eod/exact_trending_repair.py",
+      "lines": 821
+    },
+    {
+      "path": "apps/api/tests/test_us_agent_analysis_service.py",
+      "lines": 651
+    },
+    {
+      "path": "apps/api/tests/test_us_sec_fundamentals.py",
+      "lines": 162
+    },
+    {
+      "path": "apps/api/tests/test_us_fundamental_collection_service.py",
+      "lines": 90
+    },
+    {
+      "path": "apps/api/app/eod/derived_stage_repair.py",
+      "lines": 1217
+    },
+    {
+      "path": "apps/api/app/eod/symbol_history_repair.py",
+      "lines": 1378
+    },
+    {
+      "path": "apps/api/app/dart/stale_sync_run_reconciliation.py",
+      "lines": 1077
+    },
+    {
+      "path": "apps/api/app/signals/daily_signal_features.py",
+      "lines": 2564
+    },
+    {
+      "path": "apps/api/app/eod/exact_factor_repair.py",
+      "lines": 1472
+    },
+    {
+      "path": "apps/api/app/signals/piotroski_filter.py",
+      "lines": 2292
+    },
+    {
+      "path": "apps/api/app/dart/signals_service.py",
+      "lines": 4128
+    },
+    {
+      "path": "apps/api/app/dart/exact_audit_signal_repair.py",
+      "lines": 1701
+    },
+    {
+      "path": "apps/api/app/eod/exact_factor_bulk_repair.py",
+      "lines": 2242
+    },
+    {
+      "path": "apps/api/app/eod/daily_pipeline_outcomes.py",
+      "lines": 1520
+    },
+    {
+      "path": "apps/api/app/eod/run_stage_support.py",
+      "lines": 2415
+    },
+    {
+      "path": "apps/api/app/eod/exact_signal_feature_repair.py",
+      "lines": 2012
+    },
+    {
+      "path": "apps/api/app/eod/eod581_feedback_lineage_repair.py",
+      "lines": 927
+    },
+    {
+      "path": "apps/api/app/eod/missing_bar_repair.py",
+      "lines": 3002
+    },
+    {
+      "path": "apps/api/app/eod/price_bar_repair_state.py",
+      "lines": 4913
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_enrichment.py",
+      "lines": 3431
+    },
+    {
+      "path": "apps/api/app/eod/daily_pipeline_state.py",
+      "lines": 5468
+    },
+    {
+      "path": "apps/api/app/market_data_store.py",
+      "lines": 6944
+    }
+  ],
+  "partial": [
+    {
+      "path": "apps/api/app/eod/pykrx_backfill.py",
+      "ranges": [
+        [
+          450,
+          520
+        ],
+        [
+          940,
+          1270
+        ],
+        [
+          6100,
+          6190
+        ],
+        [
+          6418,
+          6690
+        ],
+        [
+          11665,
+          11693
+        ],
+        [
+          12045,
+          12135
+        ]
+      ],
+      "note": "Line ranges mark actual read chunks; isolated truncated tail ranges are not counted beyond the last visible substantive code."
+    },
+    {
+      "path": "apps/api/tests/test_kis_final_bar_repair.py",
+      "ranges": [
+        [
+          1,
+          125
+        ],
+        [
+          515,
+          990
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_dart_fundamentals_capture_service.py",
+      "ranges": [
+        [
+          1,
+          400
+        ],
+        [
+          520,
+          830
+        ],
+        [
+          4100,
+          4359
+        ],
+        [
+          4600,
+          4772
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_pipeline_runner.py",
+      "ranges": [
+        [
+          2490,
+          2525
+        ],
+        [
+          2700,
+          2887
+        ],
+        [
+          2960,
+          3226
+        ],
+        [
+          3431,
+          3670
+        ],
+        [
+          3740,
+          3820
+        ],
+        [
+          3890,
+          4185
+        ],
+        [
+          4500,
+          4685
+        ],
+        [
+          6250,
+          6332
+        ],
+        [
+          6900,
+          7060
+        ],
+        [
+          7205,
+          7281
+        ]
+      ],
+      "note": "Line ranges mark actual read chunks; isolated truncated tail ranges are not counted beyond the last visible substantive code."
+    },
+    {
+      "path": "apps/api/tests/test_composite_factor.py",
+      "ranges": [
+        [
+          1,
+          220
+        ],
+        [
+          390,
+          455
+        ],
+        [
+          675,
+          759
+        ]
+      ],
+      "note": "Line ranges mark actual read chunks; isolated truncated tail ranges are not counted beyond the last visible substantive code."
+    },
+    {
+      "path": "apps/api/tests/test_quality_factor.py",
+      "ranges": [
+        [
+          1,
+          160
+        ],
+        [
+          490,
+          671
+        ]
+      ],
+      "note": "Line ranges mark actual read chunks; isolated truncated tail ranges are not counted beyond the last visible substantive code."
+    },
+    {
+      "path": "apps/api/tests/test_auto_pykrx.py",
+      "ranges": [
+        [
+          1,
+          165
+        ],
+        [
+          2745,
+          2900
+        ],
+        [
+          4154,
+          4195
+        ],
+        [
+          4470,
+          4750
+        ],
+        [
+          17180,
+          17390
+        ],
+        [
+          19545,
+          19753
+        ],
+        [
+          19755,
+          19915
+        ]
+      ],
+      "note": "Line ranges mark actual read chunks; isolated truncated tail ranges are not counted beyond the last visible substantive code."
+    },
+    {
+      "path": "apps/api/tests/test_eod_runner.py",
+      "ranges": [
+        [
+          1,
+          240
+        ],
+        [
+          400,
+          590
+        ],
+        [
+          595,
+          725
+        ],
+        [
+          1060,
+          1145
+        ],
+        [
+          1260,
+          1350
+        ],
+        [
+          1535,
+          1685
+        ],
+        [
+          2370,
+          2500
+        ]
+      ],
+      "note": "Line ranges mark actual read chunks; isolated truncated tail ranges are not counted beyond the last visible substantive code."
+    },
+    {
+      "path": "apps/api/app/brokers/kis/client.py",
+      "ranges": [
+        [
+          880,
+          925
+        ],
+        [
+          1041,
+          1070
+        ]
+      ],
+      "note": "KIS daily chart request construction only; rest belongs to another territory."
+    },
+    {
+      "path": "apps/api/app/api/routes_eod.py",
+      "ranges": [
+        [
+          294,
+          333
+        ],
+        [
+          760,
+          800
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/db.py",
+      "ranges": [
+        [
+          1,
+          190
+        ],
+        [
+          1,
+          195
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_dart_fundamentals_store.py",
+      "ranges": [
+        [
+          1,
+          220
+        ],
+        [
+          930,
+          1080
+        ],
+        [
+          1145,
+          1280
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_pykrx_enrichment.py",
+      "ranges": [
+        [
+          1,
+          105
+        ],
+        [
+          245,
+          286
+        ],
+        [
+          1280,
+          1385
+        ],
+        [
+          1790,
+          1890
+        ],
+        [
+          1,
+          270
+        ],
+        [
+          3510,
+          3775
+        ],
+        [
+          1,
+          295
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_market_risk_filter.py",
+      "ranges": [
+        [
+          1,
+          240
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/eod/daily_pipeline_stages.py",
+      "ranges": [
+        [
+          7471,
+          7551
+        ],
+        [
+          8070,
+          8220
+        ],
+        [
+          8305,
+          8440
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_daily_signal_features.py",
+      "ranges": [
+        [
+          1,
+          225
+        ],
+        [
+          550,
+          710
+        ],
+        [
+          1530,
+          1615
+        ],
+        [
+          1640,
+          1735
+        ]
+      ],
+      "note": "Ranges refer to pre-segment-fix source; authored 38-line regression addition also manually reviewed."
+    },
+    {
+      "path": "apps/api/app/core/audit_logging.py",
+      "ranges": [
+        [
+          440,
+          542
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_eod_master.py",
+      "ranges": [
+        [
+          1,
+          185
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/db_models.py",
+      "ranges": [
+        [
+          658,
+          714
+        ],
+        [
+          34,
+          90
+        ],
+        [
+          658,
+          815
+        ],
+        [
+          1623,
+          1685
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_value_factor.py",
+      "ranges": [
+        [
+          1,
+          180
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_exact_factor_ranking_scope.py",
+      "ranges": [
+        [
+          100,
+          145
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_factor_symbol_isolation.py",
+      "ranges": [
+        [
+          745,
+          800
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_official_bar_restatement.py",
+      "ranges": [
+        [
+          1,
+          274
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_macro_context_service.py",
+      "ranges": [
+        [
+          1,
+          240
+        ],
+        [
+          640,
+          820
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_exact_factor_repair.py",
+      "ranges": [
+        [
+          1,
+          175
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_eod_run_stage_support.py",
+      "ranges": [
+        [
+          1545,
+          1575
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_missing_bar_repair.py",
+      "ranges": [
+        [
+          1,
+          120
+        ],
+        [
+          535,
+          575
+        ],
+        [
+          1180,
+          1339
+        ]
+      ],
+      "note": "The current public wrong-date regression and all changed helper-call lines reviewed; other tests executed, not counted as full manual coverage."
+    },
+    {
+      "path": "apps/api/tests/test_price_bar_repair_state.py",
+      "ranges": [
+        [
+          1,
+          110
+        ],
+        [
+          530,
+          710
+        ],
+        [
+          1190,
+          1350
+        ],
+        [
+          3128,
+          3215
+        ],
+        [
+          463,
+          557
+        ],
+        [
+          3250,
+          3285
+        ]
+      ],
+      "note": "Ranges reflect source at read time; complete added public empty-factor regression and imports reviewed. Tests not counted as production coverage."
+    },
+    {
+      "path": "apps/api/tests/test_market_data_store.py",
+      "ranges": [
+        [
+          1,
+          110
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_daily_pipeline_state.py",
+      "ranges": [
+        [
+          1,
+          234
+        ],
+        [
+          2230,
+          2380
+        ],
+        [
+          2470,
+          2710
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/main.py",
+      "ranges": [
+        [
+          105,
+          145
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/eod/pipeline_status.py",
+      "ranges": [
+        [
+          1,
+          2300
+        ]
+      ]
+    }
+  ],
+  "commits": [
+    {
+      "sha": "bd7d37f",
+      "finding": "Signal coverage counts unrelated symbols",
+      "tests": "40 passed; PG; offline"
+    },
+    {
+      "sha": "03b7d20",
+      "finding": "Provider comparison caches mutable DB-derived counts",
+      "tests": "41 passed; PG; offline"
+    },
+    {
+      "sha": "a9403fd",
+      "finding": "Due DART file rechecks re-filtered by incremental lower date",
+      "tests": "119 passed; PG; offline"
+    },
+    {
+      "sha": "d63c01c",
+      "finding": "KIS repair admits a concurrent unseen downstream date and trusts stale locked-date scope",
+      "tests": "107 passed; PG; offline"
+    },
+    {
+      "sha": "eb75fde",
+      "finding": "Partial market provider frame cached across provider recovery",
+      "tests": "42 passed; PG; offline; provider stub"
+    },
+    {
+      "sha": "9b5f80e",
+      "finding": "Membership admission test leaks live provider reference-date lookup",
+      "tests": "1 passed; PG; offline; explicit date resolver mock"
+    },
+    {
+      "sha": "be95b59",
+      "finding": "KIS EOD persists empty or wrong-date rows under requested date",
+      "tests": "8 passed; offline; all provider and sink operations explicitly mocked"
+    },
+    {
+      "sha": "670c883",
+      "finding": "DART one-batch CLI exits zero for incomplete service outcomes",
+      "tests": "12 passed; offline; DART service mocked"
+    },
+    {
+      "sha": "264fcdf",
+      "finding": "DART admission test executes unrelated external context providers",
+      "tests": "1 passed; PG; offline; four context helpers mocked"
+    },
+    {
+      "sha": "fd7f8ae",
+      "finding": "Chunked symbol reads repeat identical rows when duplicate input symbols cross a chunk boundary",
+      "tests": "6 passed; PG; offline"
+    },
+    {
+      "sha": "e05e888",
+      "finding": "Retained old heartbeat masks newer progress timestamp in run and stage freshness display",
+      "tests": "14 passed; offline; deterministic clock"
+    },
+    {
+      "sha": "7464892",
+      "finding": "Stale DART run cleanup overwrites concurrent completion/progress after an unlocked candidate read",
+      "tests": "25 passed; real PG two-connection controlled overlap; offline"
+    },
+    {
+      "sha": "7fc2aad",
+      "finding": "Progress-failure regression leaves historical fundamentals and turnover providers unmocked",
+      "tests": "1 passed; PG; offline; explicit frames"
+    },
+    {
+      "sha": "d912936",
+      "finding": "Missing provider fixtures reach real HTTP boundaries during pytest",
+      "tests": "22 guard/provider/audit tests + 1 explicit PyKRX stub test passed; recorder originals prove no request reached transport"
+    },
+    {
+      "sha": "59be88d",
+      "finding": "Compound DART refresh completion reads a different overlapping run instead of its own run ID",
+      "tests": "122 passed; capture/store suite; PG; offline"
+    },
+    {
+      "sha": "743e155",
+      "finding": "Retained overtime source metadata is incorrectly relabeled with the other source latest capture time",
+      "tests": "9 passed; capture/store and two connected daily signal consumer tests; offline"
+    },
+    {
+      "sha": "40a452a",
+      "finding": "Snapshot force-window regression invokes unmocked KIS master downloader",
+      "tests": "1 passed including five time windows; explicit master refresh mock; offline"
+    },
+    {
+      "sha": "bb445cf",
+      "finding": "HTTP test guard omitted urllib imported aliases used by audited master downloads",
+      "tests": "50 passed; recorded fake originals prove http/https never reach network boundary; provider tests mocked; offline"
+    },
+    {
+      "sha": "33db040",
+      "finding": "Requested missing-bar momentum symbols outside the ranking population vanish from retry debt",
+      "tests": "51 passed; fresh PG admission lock; stored readers mocked; ranking scope unchanged"
+    },
+    {
+      "sha": "9853011",
+      "finding": "Recovered official reference frames do not replace unreadable cache files",
+      "tests": "22 passed; PG; offline; provider frames mocked; final regression red before fix"
+    },
+    {
+      "sha": "acbd593",
+      "finding": "Cancelled projection waiter leaves finished inflight task reusable past source freshness limit",
+      "tests": "10 passed; offline; controlled cancellation and clock; regression red"
+    },
+    {
+      "sha": "0245965",
+      "finding": "Non-finite US provider numeric fields abort a whole valid-history page or reach metrics",
+      "tests": "12 passed; offline; 6 fields x 4 invalid tokens; regression red"
+    },
+    {
+      "sha": "fe12c18",
+      "finding": "US stored dispatch context gains its own response through a shared mutable upstream map",
+      "tests": "31 passed; offline; sent and persisted input regression red"
+    },
+    {
+      "sha": "7c3466e",
+      "finding": "US failed prerequisite feedback persistence still authorizes downstream decider dispatch",
+      "tests": "32 passed; offline; failing writer regression red"
+    },
+    {
+      "sha": "8455ea0",
+      "finding": "Non-finite SEC facts can replace valid prior fundamentals or abort observation processing",
+      "tests": "10 passed; offline; finite-history regression red"
+    },
+    {
+      "sha": "68f9aff",
+      "finding": "A later US batch persistence failure double-counts already completed symbols as failures",
+      "tests": "33 passed; offline; public multi-symbol dispatch red; prerequisite gate retained"
+    },
+    {
+      "sha": "5b10aaf",
+      "finding": "One failed volume-power market segment is labeled complete when surviving rows are valid",
+      "tests": "54 passed; fresh PG; mocked provider; public collect and refresh red; successful rows preserved"
+    },
+    {
+      "sha": "9a9f7fc",
+      "finding": "Three open-loop scheduler tests omit master refresh provider fixture",
+      "tests": "47 connected EOD runner tests passed; guarded fresh PG; production unchanged"
+    },
+    {
+      "sha": "e2a091a",
+      "finding": "Required-volume short-selling authority test omits historical membership provider fixture",
+      "tests": "70 connected enrichment tests passed; guarded fresh PG; production unchanged"
+    },
+    {
+      "sha": "56cd04c",
+      "finding": "Snapshot-persistence failure regression omits historical fundamental and turnover provider fixtures",
+      "tests": "2 focused/control tests passed; guarded fresh PG; production unchanged"
+    },
+    {
+      "sha": "55de62f",
+      "finding": "Per-symbol fundamental repair fallback ignores returned date and relabels previous/future observations as requested day",
+      "tests": "46 connected missing-bar tests passed; PG; public mocked-provider regression red; valid same-day and explicit-empty behavior retained"
+    },
+    {
+      "sha": "815b9c3",
+      "finding": "Public price-bar repair verifier crashes on empty factor output after prior valid rebuild proof instead of reporting incomplete stage",
+      "tests": "152 connected tests passed; guarded fresh PG; public regression red before patch; dry/apply remain blocked with pending batch"
+    },
+    {
+      "sha": "9c11842",
+      "finding": "Valuation fallback date query ignores requested markets, so a newer unrelated-market bar hides eligible requested-market evidence",
+      "tests": "85 enrichment and gate tests passed; guarded PG; public collection regression red; ordinary fallback and strict valuation completeness preserved"
+    },
+    {
+      "sha": "b9cafb9",
+      "finding": "Prior enrichment fallback candidate dates ignore market scope and terminate on unrelated market dates",
+      "tests": "86 enrichment/gate tests passed; guarded PG; public regression red; carry-forward payload/source/date retained"
+    },
+    {
+      "sha": "42e38d6",
+      "finding": "Startup interruption overwrites terminal non-PyKRX run/stage completion committed after its initial scan",
+      "tests": "142 state/outcome tests passed; guarded PG; deterministic two-connection public-service race red; still-active interruption and provider-fence behavior preserved"
+    }
+  ],
+  "pending": [],
+  "unverified_leads": [
+    "Runner critical OPEN failure skips later readback/sells/reconcile. Existing timeout tests explicitly require skipping later order dispatch; no policy/threshold change made.",
+    "AutoPykrx asyncio.to_thread cancellation may leave worker active; DB fencing exists; no concrete defect reproduced, no change.",
+    "KIS valuation truthiness fallbacks discard explicit zero DPS/yield; zero-vs-missing provider semantics unproven. No financial-output change.",
+    "Market-risk filter loses blocked-credential envelope from snapshot service; deferred output-contract change pending caller proof.",
+    "Business-line profile refresh overwrites a prior classification with fallback when DART fails; comments permit fallback, no policy change.",
+    "Business-line metric UPSERT leaves obsolete groups after classification changes; full-scope replacement contract unproven.",
+    "News conditional statistics can label zero-count days as surge after a zero baseline; numerical-report output change deferred pending parent decision.",
+    "Conditional business-line report indexes latest macro feature when all rows are missing; missing-data output contract unestablished.",
+    "Macro numeric parser accepts non-finite provider values; real mocked-provider regression not yet added. No policy/label change.",
+    "US history loader does not bound provider rows to as_of; existing tests intentionally allow stale terminal bars, so freshness policy is not changed.",
+    "KIS intraday news timestamp constructs datetime outside date parse try; invalid HHMMSS may abort symbol capture, not yet reproduced."
+  ],
+  "remaining_scope": "All assigned Python files in signals, dart, market, us_equities, repositories, integrations, macro_context and market_data_store fully manually read. Remaining owned sources: daily_pipeline_stages, pipeline_status, pykrx_backfill (exact full/partial ledger applies). Root reassigned pykrx_pipeline_runner full review to core_research_audit; our earlier partial traces remain recorded. Tests and cross-territory caller traces count separately.",
+  "dismissed_leads": [
+    "Beta/low-risk non-finite close propagation: stored OHLC fields are BigInteger, so the proposed float NaN ingress was not demonstrated. No change.",
+    "US load_us_price_bars has no as-of bound but no production callers; no current call path demonstrated.",
+    "DART batch dilution writes omit the audit advisory lock, but all demonstrated production callers create a running sync row; repair guards fence run tables and reject active writers. No overlapping unguarded production path shown.",
+    "Exact-factor pre-stage stale count vs finalization: repair proof explicitly covers KOSPI/KOSDAQ with all_market_authority=False; writer only date-wide prunes with KOSPI/KOSDAQ/KONEX authority. Successful normal repair stages cannot delete the outside rows before explicit stale prune.",
+    "run_stage_support.resolve_run_updated_at deliberately prefers last_progress_at over completed_at; test_eod_run_stage_support.py 1551-1563 explicitly asserts the older progress value. No compatible defect established; contract preserved."
+  ],
+  "confirmed_deferred_issues": []
+}

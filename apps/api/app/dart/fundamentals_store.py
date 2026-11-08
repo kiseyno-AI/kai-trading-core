@@ -369,7 +369,9 @@ class DartFundamentalsRepository:
                     DartFundamentalsCaptureRun.id,
                     DartFundamentalsCaptureRun.started_at,
                     DartFundamentalsCaptureRun.run_metadata,
-                ).where(DartFundamentalsCaptureRun.status == 'running')
+                )
+                .where(DartFundamentalsCaptureRun.status == 'running')
+                .with_for_update(skip_locked=True)
             ).all()
             failed_run_ids: list[int] = []
             for run_id, started_at, run_metadata in rows:
@@ -525,7 +527,9 @@ class DartFundamentalsRepository:
     ) -> list[int]:
         with session_scope() as session:
             rows = session.execute(
-                select(DartFundamentalsRefreshRun).where(DartFundamentalsRefreshRun.status == 'running')
+                select(DartFundamentalsRefreshRun)
+                .where(DartFundamentalsRefreshRun.status == 'running')
+                .with_for_update(skip_locked=True)
             ).scalars().all()
             failed_run_ids: list[int] = []
             for row in rows:
@@ -547,6 +551,7 @@ class DartFundamentalsRepository:
         market_date: date | None = None,
         fs_div: str | None = None,
         statuses: Sequence[str] | None = None,
+        run_id: int | None = None,
         exclude_run_id: int | None = None,
     ) -> dict[str, Any] | None:
         with session_scope() as session:
@@ -557,6 +562,8 @@ class DartFundamentalsRepository:
                 stmt = stmt.where(DartFundamentalsRefreshRun.fs_div == fs_div)
             if statuses:
                 stmt = stmt.where(DartFundamentalsRefreshRun.status.in_(statuses))
+            if run_id is not None:
+                stmt = stmt.where(DartFundamentalsRefreshRun.id == run_id)
             if exclude_run_id is not None:
                 stmt = stmt.where(
                     DartFundamentalsRefreshRun.id != exclude_run_id

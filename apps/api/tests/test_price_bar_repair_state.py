@@ -6,8 +6,18 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, MagicMock, patch
+from uuid import uuid4
 
-from app.db_models import DailyMomentumFactorResult
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db import engine
+from app.db_models import (
+    DailyMomentumFactorResult,
+    DailyPriceBar,
+    DailyPriceBarRepairBatch,
+    Symbol,
+)
 from app.eod.exact_signal_feature_repair import (
     PRICE_HISTORY_ROWS,
     SOURCE_COMPONENTS,
@@ -21,6 +31,8 @@ from app.eod.price_bar_repair_state import (
     EXACT_SIGNAL_REPAIR_IMPLEMENTATION_CONTRACT,
     EXACT_SIGNAL_REPAIR_METADATA_SCHEMA_VERSION,
     _causal_raw_dependency_watermarks,
+    _daily_price_input_fingerprint,
+    _derived_output_fingerprint,
     _exact_factor_stage_evidence,
     _expected_price_counts,
     _full_coverage_stage_evidence,
@@ -462,6 +474,75 @@ class PriceBarRepairStoredMembershipLineageTests(unittest.TestCase):
 
 
 class PriceBarRepairFactorEvidenceTests(unittest.TestCase):
+    def test_public_verifier_reports_factor_rows_removed_after_rebuild(self) -> None:
+        market_date = date(2040, 1, 9)
+        symbol_code = '9999' + uuid4().hex[:2].upper()
+        batch_id = 'audit-missing-factor-' + uuid4().hex
+        with Session(engine) as session:
+            symbol = session.scalar(select(Symbol).where(Symbol.symbol == symbol_code))
+            if symbol is None:
+                symbol = Symbol(symbol=symbol_code, name_ko='Audit', market='KOSPI')
+                session.add(symbol)
+                session.flush()
+            session.add(DailyPriceBar(
+                symbol_id=symbol.id, trade_date=market_date,
+                open_price=100, high_price=100, low_price=100, close_price=100,
+                volume=10, turnover=1000,
+                captured_at=UTC_NOW - timedelta(minutes=30),
+            ))
+            factor = DailyMomentumFactorResult(
+                symbol_id=symbol.id, market_date=market_date, close_price=100,
+                factor_payload={}, captured_at=UTC_NOW, updated_at=UTC_NOW,
+            )
+            session.add(factor)
+            session.flush()
+            input_hash, _ = _daily_price_input_fingerprint(
+                session, market_date=market_date, symbols=[symbol_code],
+            )
+            output_hash, _ = _derived_output_fingerprint(
+                session, model=DailyMomentumFactorResult,
+                market_date=market_date, symbols=[symbol_code],
+            )
+            batch = DailyPriceBarRepairBatch(
+                repair_batch_id=batch_id, status='pending',
+                affected_symbols=[symbol_code],
+                affected_trade_dates=[market_date.isoformat()],
+                required_rebuild_trade_dates=[market_date.isoformat()],
+                required_evaluation_market_date_from=market_date,
+                required_evaluation_market_date_to=market_date,
+                repaired_row_count=1,
+                created_at=UTC_NOW - timedelta(hours=1),
+                factor_rebuild_metadata=_factor_rebuild_metadata(
+                    market_date=market_date, symbols=[symbol_code],
+                    rebuilt_at=UTC_NOW - timedelta(minutes=10),
+                    input_sha256=input_hash, output_sha256=output_hash,
+                ),
+            )
+            session.add(batch)
+            session.flush()
+            with patch(
+                'app.eod.price_bar_repair_state.session_scope',
+                side_effect=lambda **_kwargs: _session_scope_for(session),
+            ):
+                before = verify_pending_price_bar_rebuilds()
+                before_batch = next(item for item in before['batches'] if item['repair_batch_id'] == batch_id)
+                self.assertTrue(before_batch['stages'][FACTOR_STAGE_ID]['ready'])
+
+                session.delete(factor)
+                session.flush()
+                for apply in (False, True):
+                    with self.subTest(apply=apply):
+                        result = verify_pending_price_bar_rebuilds(apply=apply)
+                        self.assertEqual(result['status'], 'blocked')
+                        self.assertFalse(result['applied'])
+                        evidence = next(item for item in result['batches'] if item['repair_batch_id'] == batch_id)
+                        stage = evidence['stages'][FACTOR_STAGE_ID]
+                        self.assertFalse(stage['ready'])
+                        self.assertEqual(stage['dates'][0]['observed'], 0)
+                        self.assertEqual(stage['dates'][0]['observed_output_row_count'], 0)
+                        self.assertIn('momentum_factors_incomplete_or_stale', evidence['issues'])
+                        self.assertEqual(batch.status, 'pending')
+
     def test_conflicting_frozen_signal_scopes_fail_closed(self) -> None:
         def pending_batch(repair_batch_id, symbols):
             return {

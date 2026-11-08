@@ -1,6 +1,8 @@
 import asyncio
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import delete
@@ -9,6 +11,7 @@ from app.brokers.kis.client import KISAPIError, KISTimeoutError
 from app.db import engine, session_scope
 from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
 from app.orders.service import (
+    TradingOrderIdempotencyConflictError,
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
     TradingOrderValidationError,
@@ -16,9 +19,11 @@ from app.orders.service import (
     TradingOrderService,
 )
 from app.orders.store import (
+    append_broker_order_event,
     list_broker_order_events,
     load_broker_order,
     load_order_request,
+    upsert_broker_order,
 )
 
 
@@ -142,6 +147,71 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order_row['current_status'], 'submitted')
         self.assertEqual(order_row['broker_order_id'], '0000123456')
         self.assertEqual([item['event_type'] for item in events], ['submit_request', 'submit_response'])
+
+    async def test_nonfinite_submit_values_fail_before_persistence_or_broker_call(self) -> None:
+        for field in ('quantity', 'price', 'condition_price'):
+            for value in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+                with (
+                    self.subTest(field=field, value=value),
+                    patch(
+                        'app.orders.service.create_order_request_if_absent',
+                        side_effect=AssertionError('invalid values must not be persisted'),
+                    ) as persist,
+                ):
+                    payload = {
+                        'account_number': self.account_number,
+                        'account_product_code': self.account_product_code,
+                        'symbol': self.symbol,
+                        'quantity': Decimal('10'),
+                        'price': Decimal('70000'),
+                        field: Decimal(value),
+                    }
+                    with self.assertRaises(TradingOrderValidationError):
+                        await self.service.submit_buy_order(**payload)
+                    persist.assert_not_called()
+                    self.assertEqual(self.fake_client.submit_calls, 0)
+
+    async def test_submit_without_broker_identity_remains_unconfirmed_and_is_not_retried(self) -> None:
+        self.fake_client.submit_result = {'rt_cd': '0', 'output': {}}
+
+        with self.assertRaises(TradingOrderPendingSubmissionError):
+            await self._submit_buy_order()
+
+        request = load_order_request(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        order = load_broker_order(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        self.assertEqual(request['submission_status'], 'submitting')
+        self.assertEqual(order['current_status'], 'pending_submit')
+        self.assertIsNone(order['broker_order_id'])
+
+        replay = await self._submit_buy_order()
+
+        self.assertTrue(replay['idempotent_replay'])
+        self.assertEqual(self.fake_client.submit_calls, 1)
+
+    async def test_submit_replay_compares_all_broker_order_terms(self) -> None:
+        payload = {
+            'client_order_id': self.client_order_id,
+            'account_number': self.account_number,
+            'account_product_code': self.account_product_code,
+            'symbol': self.symbol, 'quantity': Decimal('10'),
+            'price': Decimal('70000'), 'order_type': 'limit',
+            'sell_type': '01', 'condition_price': Decimal('70000'),
+        }
+        await self.service.submit_sell_order(**payload)
+        for field, changed_value in (
+            ('sell_type', '02'),
+            ('condition_price', Decimal('71000')),
+        ):
+            with self.subTest(field=field):
+                replay = await self.service.submit_sell_order(**payload)
+                self.assertTrue(replay['idempotent_replay'])
+                with self.assertRaises(TradingOrderIdempotencyConflictError):
+                    await self.service.submit_sell_order(**{**payload, field: changed_value})
+        self.assertEqual(self.fake_client.submit_calls, 1)
 
     async def test_submit_rejection_persists_rejected_state(self) -> None:
         self.fake_client.submit_exception = KISAPIError(
@@ -276,6 +346,145 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['order']['remaining_quantity'], Decimal('6'))
         self.assertEqual(result['events'][-1]['event_type'], 'partial_fill')
 
+    async def test_refresh_metadata_preserves_a_fill_committed_after_the_inquiry_snapshot(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.daily_fill_result['output1'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'ord_qty': '10',
+            'tot_ccld_qty': '4', 'rmn_qty': '6', 'avg_prvs': '70100',
+        }]
+        fill_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        injected = False
+
+        def save_with_concurrent_fill(snapshot, **kwargs):
+            nonlocal injected
+            saved = upsert_broker_order(snapshot, **kwargs)
+            if not injected and 'last_reconciled_at' not in snapshot:
+                injected = True
+                append_broker_order_event({
+                    'account_reference': self.account_reference,
+                    'client_order_id': self.client_order_id,
+                    'event_type': 'fill', 'source': 'ws_notice',
+                    'event_dedup_key': f'concurrent-fill:{self.client_order_id}',
+                    'event_occurred_at': fill_at, 'resulting_status': 'filled',
+                    'cumulative_filled_quantity': Decimal('10'),
+                    'remaining_quantity': Decimal('0'),
+                    'fill_price': Decimal('70200'),
+                    'average_fill_price': Decimal('70160'),
+                    'raw_payload': {'notice': 'newer fill'},
+                    'normalized_payload': {'status': 'filled'},
+                })
+            return saved
+
+        with patch('app.orders.service.upsert_broker_order', side_effect=save_with_concurrent_fill):
+            result = await self.service.get_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                refresh=True,
+            )
+
+        self.assertTrue(injected)
+        self.assertEqual(result['order']['current_status'], 'filled')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('10'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('0'))
+        self.assertEqual(result['order']['average_fill_price'], Decimal('70160'))
+        self.assertEqual(result['order']['last_fill_at'], fill_at)
+        self.assertEqual(result['order']['raw_latest_payload'], {'notice': 'newer fill'})
+        self.assertIsNotNone(result['order']['last_reconciled_at'])
+
+    async def test_refresh_does_not_overwrite_a_fill_received_during_inquiry(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.daily_fill_result['output1'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'ord_qty': '10',
+            'tot_ccld_qty': '4', 'rmn_qty': '6', 'avg_prvs': '70100',
+        }]
+        fill_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+        async def receive_fill_during_inquiry(**kwargs):
+            append_broker_order_event({
+                'account_reference': self.account_reference,
+                'client_order_id': self.client_order_id,
+                'event_type': 'fill', 'source': 'ws_notice',
+                'event_dedup_key': f'inquiry-fill:{self.client_order_id}',
+                'event_occurred_at': fill_at, 'resulting_status': 'filled',
+                'cumulative_filled_quantity': Decimal('10'),
+                'remaining_quantity': Decimal('0'),
+                'fill_price': Decimal('70200'),
+                'average_fill_price': Decimal('70160'),
+                'raw_payload': {'notice': 'fill during inquiry'},
+                'normalized_payload': {'status': 'filled'},
+            })
+            return self.fake_client.cancelable_result
+
+        with patch.object(
+            self.fake_client, 'fetch_domestic_cancelable_orders',
+            side_effect=receive_fill_during_inquiry,
+        ):
+            result = await self.service.get_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                refresh=True,
+            )
+
+        self.assertEqual(result['order']['current_status'], 'filled')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('10'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('0'))
+        self.assertEqual(result['order']['average_fill_price'], Decimal('70160'))
+        self.assertEqual(result['order']['last_fill_at'], fill_at)
+        self.assertEqual(result['order']['raw_latest_payload'], {'notice': 'fill during inquiry'})
+
+    async def test_refresh_ignores_unrelated_orders_with_self_referencing_origin_ids(self) -> None:
+        await self._submit_buy_order()
+        target = {
+            'odno': '0000123456', 'pdno': self.symbol, 'ord_qty': '10',
+            'tot_ccld_qty': '0', 'rmn_qty': '10', 'cncl_yn': 'N',
+        }
+        unrelated = {
+            **target, 'odno': '0000999999', 'orgn_odno': '0000999999',
+            'tot_ccld_qty': '10', 'rmn_qty': '0',
+        }
+        self.fake_client.daily_fill_result['output1'] = [target, unrelated]
+        self.fake_client.cancelable_result['output'] = [
+            {**unrelated, 'psbl_qty': '0'}, {**target, 'psbl_qty': '10'},
+        ]
+
+        result = await self.service.get_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            refresh=True,
+        )
+
+        self.assertEqual(result['order']['current_status'], 'accepted')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('0'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('10'))
+        self.assertEqual(
+            result['order']['raw_latest_payload']['cancelable_order']['odno'],
+            target['odno'],
+        )
+
+    async def test_refresh_matches_a_child_order_by_its_origin_order_id(self) -> None:
+        await self._submit_buy_order()
+        child = {
+            'odno': '0000456789', 'orgn_odno': '0000123456', 'pdno': self.symbol,
+            'ord_qty': '10', 'tot_ccld_qty': '4', 'rmn_qty': '6',
+            'avg_prvs': '70100', 'cncl_yn': 'N',
+        }
+        self.fake_client.daily_fill_result['output1'] = [child]
+        self.fake_client.cancelable_result['output'] = [{**child, 'psbl_qty': '6'}]
+
+        result = await self.service.get_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            refresh=True,
+        )
+
+        self.assertEqual(result['order']['current_status'], 'partial_fill')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('4'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('6'))
+        self.assertEqual(
+            result['order']['raw_latest_payload']['cancelable_order']['odno'],
+            child['odno'],
+        )
+
     async def test_manual_reconcile_repairs_missed_notice_fill_state(self) -> None:
         await self._submit_buy_order()
         self.fake_client.daily_fill_result = {
@@ -375,6 +584,62 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
             len([item for item in events if item['event_type'] == 'fill' and item['source'] == 'poll_reconcile']),
             1,
         )
+
+    async def test_cancel_rejects_zero_broker_quantity_despite_local_remaining_quantity(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.cancelable_result['output'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'psbl_qty': '0',
+        }]
+
+        with self.assertRaises(TradingOrderValidationError):
+            await self.service.cancel_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                all_remaining=True,
+            )
+
+        self.assertEqual(self.fake_client.cancel_replace_calls, 0)
+        order = load_broker_order(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        self.assertEqual(order['current_status'], 'submitted')
+
+    async def test_amend_rejects_zero_broker_quantity_despite_local_remaining_quantity(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.cancelable_result['output'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'psbl_qty': '0',
+        }]
+
+        with self.assertRaises(TradingOrderValidationError):
+            await self.service.amend_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                quantity=Decimal('5'),
+                price=Decimal('71000'),
+            )
+
+        self.assertEqual(self.fake_client.cancel_replace_calls, 0)
+        order = load_broker_order(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        self.assertEqual(order['current_status'], 'submitted')
+
+    async def test_amend_retains_local_quantity_fallback_when_broker_quantity_is_absent(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.cancelable_result['output'] = [{
+            'odno': '0000123456', 'pdno': self.symbol,
+        }]
+
+        result = await self.service.amend_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            quantity=Decimal('5'),
+            price=Decimal('71000'),
+        )
+
+        self.assertEqual(self.fake_client.cancel_replace_calls, 1)
+        self.assertEqual(result['order']['current_status'], 'replace_pending')
+        self.assertEqual(result['order']['requested_quantity'], Decimal('5'))
 
     async def test_cancel_order_sets_cancel_pending_and_persists_request_events(self) -> None:
         await self._submit_buy_order()

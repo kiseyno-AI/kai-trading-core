@@ -2135,6 +2135,8 @@ class OpenClawAgentClient:
                             event = json.loads(line)
                         except json.JSONDecodeError:
                             event = {}
+                        if not isinstance(event, dict):
+                            continue
                         diagnostics['lookup_mode'] = 'trajectory_scan'
                         diagnostics['trajectory_file'] = str(trajectory_path)
                         diagnostics['session_id'] = event.get('sessionId')
@@ -2184,6 +2186,8 @@ class OpenClawAgentClient:
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
                         continue
                     if str(event.get('sessionKey') or '') != session_key:
                         continue
@@ -7588,6 +7592,7 @@ class AgentFeedbackOrchestrator:
                         lifecycle_stage='batch_persisted',
                         current_role=role,
                         status='running',
+                        persistence_guard=persistence_guard,
                     )
                     indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
                     queue: list[tuple[int, list[dict[str, Any]]]] = []

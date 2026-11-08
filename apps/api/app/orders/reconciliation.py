@@ -399,7 +399,7 @@ class TradingOrderReconciliationService:
 
         if last_reconcile_status in {'', 'repaired', 'stale_pending', 'not_found', 'missing_fill_detail', 'error'}:
             return True
-        if status in _ACTIVE_STATUSES:
+        if status in _ACTIVE_STATUSES or status == BrokerOrderStatus.PARTIAL_FILL.value:
             return True
         if status in _TERMINAL_STATUSES:
             if last_reconciled_at is None:
@@ -436,33 +436,13 @@ class TradingOrderReconciliationService:
         updated_row = upsert_broker_order(
             {
                 'id': order_row['id'],
-                'order_request_id': order_row.get('order_request_id'),
                 'broker_name': order_row['broker_name'],
                 'client_order_id': order_row['client_order_id'],
-                'broker_order_id': order_row.get('broker_order_id'),
                 'account_reference': order_row['account_reference'],
-                'symbol': order_row['symbol'],
-                'side': order_row['side'],
-                'order_type': order_row['order_type'],
-                'requested_quantity': order_row['requested_quantity'],
-                'requested_price': order_row.get('requested_price'),
-                'accepted_quantity': order_row.get('accepted_quantity'),
-                'accepted_price': order_row.get('accepted_price'),
-                'filled_quantity': order_row.get('filled_quantity'),
-                'remaining_quantity': order_row.get('remaining_quantity'),
-                'average_fill_price': order_row.get('average_fill_price'),
-                'time_in_force': order_row.get('time_in_force'),
-                'current_status': order_row['current_status'],
-                'status_reason': order_row.get('status_reason'),
-                'first_submitted_at': order_row.get('first_submitted_at'),
-                'last_broker_update_at': order_row.get('last_broker_update_at'),
-                'last_fill_at': order_row.get('last_fill_at'),
                 'last_reconciled_at': reconciled_at,
                 'last_reconcile_status': 'error',
                 'last_reconcile_trigger': trigger,
                 'last_reconcile_payload': error_payload,
-                'raw_latest_payload': order_row.get('raw_latest_payload'),
-                'snapshot_payload': order_row.get('snapshot_payload'),
             }
         )
         return {

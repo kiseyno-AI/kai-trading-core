@@ -116,7 +116,7 @@ class OvertimeRankingCaptureStore:
             return None
         return rows, {
             'origin': 'after_hours_capture',
-            'captured_at': payload.get('captured_at'),
+            'captured_at': entry.get('captured_at') or payload.get('captured_at'),
             'summary_rows': entry.get('summary_rows') or [],
             'page_count': entry.get('page_count'),
             'max_pages_reached': entry.get('max_pages_reached'),

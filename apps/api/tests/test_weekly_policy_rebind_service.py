@@ -232,6 +232,31 @@ def test_prepare_saturday_binds_exact_friday_cohort_and_decider_scopes() -> None
     }
 
 
+def test_prepare_supports_run_state_adapter_without_list_runs() -> None:
+    service, run_state = _service(
+        as_of_date=date(2026, 10, 17),
+        source_market_date=date(2026, 10, 16),
+        target_trade_date=date(2026, 10, 19),
+        artifact_week_end=date(2026, 10, 16),
+    )
+    expected = service.prepare(as_of_date=date(2026, 10, 17))
+    run_state.find_calls.clear()
+    service.run_state_service = SimpleNamespace(
+        find_latest_run=run_state.find_latest_run,
+        get_run=run_state.get_run,
+    )
+
+    result = service.prepare(as_of_date=date(2026, 10, 17))
+
+    assert result == expected
+    assert run_state.find_calls == [{
+        'market_date': date(2026, 10, 16),
+        'requested_roles': list(DECISION_SUPPORT_AGENT_NAMES),
+        'request_modes': [DAILY_RETRY_CYCLE_MODE],
+        'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+    }]
+
+
 def test_prepare_preserves_broad_scope_under_newer_targeted_patch() -> None:
     service, run_state = _service(
         as_of_date=date(2026, 10, 17),

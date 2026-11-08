@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import httpx
@@ -167,6 +168,43 @@ def _sanitize_audit_value(
     return _truncate_string(str(value))
 
 
+def _redact_secret_values(value: str, secret_values: Iterable[str] | None) -> str:
+    variants = {
+        variant
+        for secret in secret_values or ()
+        if secret
+        for variant in (secret, quote(secret, safe=''), quote_plus(secret, safe=''))
+    }
+    for variant in sorted(variants, key=len, reverse=True):
+        pattern = re.sub(
+            r'%[0-9a-fA-F]{2}',
+            lambda match: f'(?i:{match.group(0)})',
+            re.escape(variant),
+        )
+        value = re.sub(pattern, '[REDACTED]', value)
+    return value
+
+
+def _upstream_secret_values(
+    url: str,
+    *,
+    headers: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | None = None,
+    secret_values: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    values = list(secret_values or ())
+    for pairs in (
+        parse_qsl(urlsplit(url).query, keep_blank_values=True),
+        (headers or {}).items(),
+        (params or {}).items(),
+    ):
+        for key, value in pairs:
+            if _is_sensitive_key(str(key)):
+                items = value if isinstance(value, (list, tuple)) else (value,)
+                values.extend(str(item) for item in items if item is not None)
+    return tuple(values)
+
+
 def redact_url(url: str, *, secret_values: Iterable[str] | None = None) -> str:
     parsed = urlsplit(url)
     if not parsed.query:
@@ -177,10 +215,7 @@ def redact_url(url: str, *, secret_values: Iterable[str] | None = None) -> str:
             query.append((key, '[REDACTED]' if _is_sensitive_key(key) else value))
         redacted_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
-    for secret_value in secret_values or ():
-        if secret_value:
-            redacted_url = redacted_url.replace(secret_value, '[REDACTED]')
-    return redacted_url
+    return _redact_secret_values(redacted_url, secret_values)
 
 
 def sanitize_headers(headers: Mapping[str, str] | None) -> dict[str, Any]:
@@ -366,6 +401,9 @@ async def request_with_audit(
         request_headers['X-Request-ID'] = get_request_id() or ''
 
     request = client.build_request(method, url, headers=request_headers, params=params, json=json_body)
+    secrets = _upstream_secret_values(
+        str(request.url), headers=request.headers, secret_values=secret_values,
+    )
     started_at = time.perf_counter()
     error: Exception | None = None
     response: httpx.Response | None = None
@@ -378,7 +416,7 @@ async def request_with_audit(
         raise
     finally:
         duration_ms = (time.perf_counter() - started_at) * 1000
-        sanitized_url = redact_url(str(request.url), secret_values=secret_values)
+        sanitized_url = redact_url(str(request.url), secret_values=secrets)
         payload = {
             'event': 'upstream_request',
             'request_id': get_request_id(),
@@ -386,7 +424,7 @@ async def request_with_audit(
             'method': request.method,
             'url': sanitized_url,
             'target_host': request.url.host,
-            'path': request.url.path,
+            'path': httpx.URL(sanitized_url).path,
             'request_headers': sanitize_headers(request.headers),
             'request_content_length': _request_content_length(request),
             'request_content_type': request.headers.get('content-type'),
@@ -395,7 +433,7 @@ async def request_with_audit(
             'response_content_length': response.headers.get('content-length') if response else None,
             'response_content_type': response.headers.get('content-type') if response else None,
             'error_type': type(error).__name__ if error else None,
-            'error_message': exception_message(error) if error else None,
+            'error_message': _redact_secret_values(exception_message(error), secrets) if error else None,
         }
         log_upstream_event(payload)
 
@@ -437,6 +475,12 @@ async def request_read_with_retry_and_audit(
     if not 1 <= max_attempts <= _MAX_READ_ATTEMPTS:
         raise ValueError(f'max_attempts must be between 1 and {_MAX_READ_ATTEMPTS}')
 
+    secret_values = _upstream_secret_values(
+        url,
+        headers={**client.headers, **(headers or {})},
+        params={**client.params, **(params or {})},
+        secret_values=secret_values,
+    )
     for attempt in range(1, max_attempts + 1):
         try:
             response = await request_with_audit(
@@ -465,7 +509,7 @@ async def request_read_with_retry_and_audit(
                 max_attempts=max_attempts,
                 retry_delay_seconds=delay,
                 error_type=type(exc).__name__,
-                error_message=exception_message(exc),
+                error_message=_redact_secret_values(exception_message(exc), secret_values),
             )
             await asyncio.sleep(delay)
             continue
@@ -520,6 +564,7 @@ def download_bytes_with_audit(*, service: str, url: str, timeout: float) -> byte
         raise
     finally:
         duration_ms = (time.perf_counter() - started_at) * 1000
+        secrets = _upstream_secret_values(url)
         log_upstream_event(
             {
                 'event': 'upstream_request',
@@ -537,6 +582,6 @@ def download_bytes_with_audit(*, service: str, url: str, timeout: float) -> byte
                 'response_content_length': response_headers.get('content-length') if response_headers else len(payload) or None,
                 'response_content_type': response_headers.get('content-type') if response_headers else None,
                 'error_type': type(error).__name__ if error else None,
-                'error_message': exception_message(error) if error else None,
+                'error_message': _redact_secret_values(exception_message(error), secrets) if error else None,
             }
         )

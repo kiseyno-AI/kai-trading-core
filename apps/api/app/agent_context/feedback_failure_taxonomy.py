@@ -269,7 +269,8 @@ def classify_feedback_failure(
         )
 
     if (
-        'readtimeout' in haystack
+        'openclaw_transport_timeout' in haystack
+        or 'readtimeout' in haystack
         or 'connecttimeout' in haystack
         or 'writetimeout' in haystack
         or 'pooltimeout' in haystack
@@ -339,7 +340,8 @@ def classify_feedback_failure(
         )
 
     if (
-        'batch_response_missing_items' in haystack
+        'openclaw_response_contract' in haystack
+        or 'batch_response_missing_items' in haystack
         or 'batch_response_attribution_mismatch' in haystack
         or 'missing_batch_feedback' in haystack
     ):

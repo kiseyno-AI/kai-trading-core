@@ -317,6 +317,15 @@ class CliTests(unittest.TestCase):
         self.assertIn('market_date=2026-11-05 price_bars=2769 status=OK', output)
         self.assertIn('market_date=2026-11-04 price_bars=2769 status=DEGRADED', output)
 
+    def test_no_available_dates_cannot_report_a_successful_audit(self) -> None:
+        code, output = _run_main(
+            ['--format', 'json'],
+            date_loader=lambda _limit: [],
+        )
+
+        self.assertEqual(code, EXIT_DEGRADED)
+        self.assertEqual(json.loads(output), [])
+
     def test_json_format_is_machine_readable(self) -> None:
         code, output = _run_main(
             ['--market-date', '2026-11-04', '--format', 'json'],

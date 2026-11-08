@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import date
 from typing import Any
 
@@ -72,15 +73,11 @@ def _normalize_text_list(value: Any) -> list[str]:
 def _normalize_number(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        normalized = value.strip()
-        if not normalized:
-            return None
+    if isinstance(value, (int, float, str)):
         try:
-            return float(normalized)
-        except ValueError:
+            normalized = float(value)
+            return normalized if math.isfinite(normalized) else None
+        except (OverflowError, ValueError):
             return None
     return None
 
@@ -468,8 +465,8 @@ def _auto_persistence_trend(
                 return 'worsening'
         return 'persistent' if not changed_fields else 'changed'
 
-    previous_wait_code = _normalize_wait_reason(previous_reference.get('wait_reason') or {}).get('code')
-    current_wait_code = _normalize_wait_reason(current_reference.get('wait_reason') or {}).get('code')
+    previous_wait_code = (_normalize_wait_reason(previous_reference.get('wait_reason')) or {}).get('code')
+    current_wait_code = (_normalize_wait_reason(current_reference.get('wait_reason')) or {}).get('code')
     if previous_wait_code != current_wait_code:
         return 'changed'
     if confidence_delta is not None:

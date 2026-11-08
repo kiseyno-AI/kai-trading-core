@@ -799,7 +799,7 @@ class KISRealtimeOrderNoticeService:
             'cumulative_filled_quantity': cumulative_filled_quantity,
             'remaining_quantity': remaining_quantity,
             'average_fill_price': average_fill_price,
-            'fill_price': fill_price,
+            'fill_price': fill_price if notice_kind == 'fill' else None,
             'source': BrokerOrderEventSource.WS_NOTICE.value,
             'event_dedup_key': event_dedup_key,
             'raw_payload': raw_payload,

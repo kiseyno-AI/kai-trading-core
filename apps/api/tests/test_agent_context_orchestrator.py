@@ -7068,6 +7068,45 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(len(read_service.calls), 1)
 
+    def test_role_preparation_failure_checks_persistence_guard_before_writing(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = RecordingBatchClient()
+        failure_service = RecordingFailureService()
+        guard_calls = []
+
+        def reject_stale_owner(**kwargs):
+            guard_calls.append(kwargs)
+            raise RuntimeError('feedback retry lease lost')
+
+        caught_error = None
+        with (
+            patch.object(orchestrator_module, 'runtime_feedback_state_store', RuntimeFeedbackStateStore()),
+            patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', RecordingRunStateService()),
+            patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()),
+            patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service),
+            patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', FakeSessionCleanupService()),
+            patch.object(orchestrator_module, 'build_fundamental_input_fingerprint_payload_from_context', return_value={}),
+            _patch_feedback_eligibility('005930'),
+        ):
+            try:
+                service.dispatch_for_symbols(
+                    market_date='2026-04-14',
+                    symbols=['005930'],
+                    roles=['fundamental-summarizer'],
+                    reuse_existing=False,
+                    persistence_guard=reject_stale_owner,
+                    knowledge_cutoff_at='2026-04-14T06:00:00+00:00',
+                )
+            except RuntimeError as exc:
+                caught_error = exc
+
+        self.assertEqual(failure_service.recorded, [])
+        self.assertIsNotNone(caught_error)
+        self.assertEqual(str(caught_error), 'feedback retry lease lost')
+        self.assertEqual(guard_calls[0]['stage'], 'before_feedback_persistence')
+        self.assertEqual(guard_calls[0]['reason'], 'role_prepared:fundamental-summarizer')
+        self.assertEqual(service.client.calls, [])
+
     def test_symbol_dispatch_checkpoints_each_persisted_batch_and_leaves_final_flush_as_safety(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
@@ -7171,6 +7210,39 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['request']['parallel_subtasks'], 3)
         self.assertEqual(result['request']['role_parallel_subtasks'], 3)
         self.assertEqual(result['summary']['completed'], 6)
+
+    def test_subagent_storage_failure_does_not_reclassify_completed_symbols(self):
+        class FailingSecondFeedbackService(FakeFeedbackService):
+            def submit_feedback(self, **kwargs):
+                if kwargs['symbol'] == '000660':
+                    raise RuntimeError('feedback storage unavailable')
+                return super().submit_feedback(**kwargs)
+
+        service = AgentFeedbackOrchestrator()
+        service.client = RecordingBatchClient()
+        feedback_service = FailingSecondFeedbackService()
+        cleanup_service = FakeSessionCleanupService()
+
+        with (
+            patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()),
+            patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service),
+            patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service),
+            _patch_feedback_eligibility('005930', '000660'),
+        ):
+            result = service.dispatch_for_symbols_via_subagents(
+                market_date='2026-04-14',
+                symbols=['005930', '000660'],
+                roles=['eod-summarizer'],
+                per_role_parallelism=1,
+            )
+
+        self.assertEqual([row['symbol'] for row in feedback_service.submitted], ['005930'])
+        self.assertEqual(result['summary']['status'], 'partial')
+        self.assertEqual(result['summary']['completed'], 1)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual([item['symbol'] for item in result['items']], ['005930'])
+        self.assertEqual([item['symbol'] for item in result['failures']], ['000660'])
+        self.assertEqual(len(cleanup_service.targets), 1)
 
     def test_subagent_dispatch_uses_requested_per_role_parallelism(self):
         service = AgentFeedbackOrchestrator()

@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import AsyncMock
 
 from app.crypto.market_data import CryptoMarketDataValidationError, UpbitCryptoMarketDataService
+from app.integrations.upbit.client import UpbitQuotationAPIError
 
 
 class FakeUpbitClient:
@@ -140,6 +142,23 @@ class UpbitCryptoMarketDataServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(CryptoMarketDataValidationError, 'unit must be one of'):
             await service.get_candles(market='KRW-BTC', interval='minute', unit=2, count=1)
+
+    async def test_nonfinite_provider_prices_are_rejected(self):
+        for value in ('NaN', 'Infinity', '-Infinity', '1e10000'):
+            with self.subTest(value=value):
+                client = FakeUpbitClient()
+                ticker_rows = await client.fetch_tickers(markets=['KRW-BTC'])
+                candle_rows = await client.fetch_day_candles(market='KRW-BTC', count=1)
+                ticker_rows[0]['trade_price'] = value
+                candle_rows[0]['trade_price'] = value
+                client.fetch_tickers = AsyncMock(return_value=ticker_rows)
+                client.fetch_day_candles = AsyncMock(return_value=candle_rows)
+                service = UpbitCryptoMarketDataService(client=client)
+
+                with self.assertRaises(UpbitQuotationAPIError):
+                    await service.get_tickers(markets='KRW-BTC')
+                with self.assertRaises(UpbitQuotationAPIError):
+                    await service.get_candles(market='KRW-BTC', interval='day', count=1)
 
 
 if __name__ == '__main__':

@@ -63,6 +63,38 @@ class EvaluationRefreshTests(unittest.TestCase):
         later = datetime(2026, 11, 9, 23, 15, tzinfo=KST)
         self.assertEqual(self._run(_market('CLOSED', '2026-11-09'), later, ok)['status'], 'completed')
 
+    def test_failed_or_partial_evaluations_remain_retryable(self):
+        for day, status in enumerate(('failed', 'partial'), start=9):
+            with self.subTest(status=status):
+                market_date = f'2026-11-{day:02d}'
+                compute = MagicMock(side_effect=[
+                    {'summary': {'status': status, 'failed_count': 1}},
+                    {'summary': {'status': 'completed'}},
+                ])
+                now = datetime(2026, 11, day, 22, 40, tzinfo=KST)
+
+                first = self._run(_market('CLOSED', market_date), now, compute)
+                self.assertEqual(first['status'], status)
+                self.assertEqual(refresh._load_marker(self.root, market_date)['status'], status)
+
+                later = now.replace(hour=23, minute=15)
+                retry = self._run(_market('CLOSED', market_date), later, compute)
+                self.assertEqual(retry['status'], 'completed')
+                self.assertEqual(compute.call_count, 2)
+
+    def test_old_completed_marker_with_failed_summary_does_not_hide_retry_debt(self):
+        refresh._save_marker(self.root, '2026-11-06', {
+            'schema_version': refresh.MARKER_SCHEMA_VERSION,
+            'status': 'completed',
+            'summary': {'status': 'failed', 'retry_debt_count': 1},
+        })
+        compute = MagicMock(return_value={'summary': {'status': 'completed'}})
+
+        result = self._run(_market('WEEKEND'), datetime(2026, 11, 7, 9, 0, tzinfo=KST), compute)
+
+        self.assertEqual(result['status'], 'completed')
+        compute.assert_called_once_with('2026-11-06')
+
     def test_evaluation_gate_only_needs_price_derived_readiness(self):
         # Evaluations read decision snapshots and later price bars only.
         self.assertEqual(SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS, ('technical_snapshots',))

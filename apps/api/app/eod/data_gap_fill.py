@@ -260,15 +260,18 @@ def detect_signal_features_missing(market_date: str) -> Gap | None:
     from sqlalchemy import func, select
 
     from app.db import session_scope
-    from app.db_models import DailySignalFeature
+    from app.db_models import DailyPriceBar, DailySignalFeature
     from app.market_data_store import list_symbols_with_daily_bar_on_date
 
     bar_symbols = len(set(list_symbols_with_daily_bar_on_date(market_date)))
     with session_scope() as session:
         stored = int(
             session.scalar(
-                select(func.count()).select_from(DailySignalFeature).where(
-                    DailySignalFeature.market_date == date.fromisoformat(market_date)
+                select(func.count()).select_from(DailySignalFeature).join(
+                    DailyPriceBar, DailyPriceBar.symbol_id == DailySignalFeature.symbol_id
+                ).where(
+                    DailySignalFeature.market_date == date.fromisoformat(market_date),
+                    DailyPriceBar.trade_date == date.fromisoformat(market_date),
                 )
             )
             or 0
@@ -351,11 +354,14 @@ def _load_provider_frame(market_date: str) -> dict[str, tuple[int, int, int, int
 
     compact = market_date.replace('-', '')
     provider: dict[str, tuple[int, int, int, int]] = {}
+    complete = True
     for market in ('KOSPI', 'KOSDAQ'):
         frame = _get_market_ohlcv_by_ticker(compact, market)
+        if frame.empty:
+            complete = False
         for code, row in frame.iterrows():
             provider[str(code)] = tuple(int(row[key]) for key in ('시가', '고가', '저가', '종가'))
-    if provider:  # never cache an empty (failed or blocked) read
+    if provider and complete:  # retry an empty or incomplete market read
         while len(_PROVIDER_FRAME_CACHE) >= _PROVIDER_FRAME_CACHE_MAX:
             _PROVIDER_FRAME_CACHE.pop(next(iter(_PROVIDER_FRAME_CACHE)))
         _PROVIDER_FRAME_CACHE[market_date] = provider
@@ -372,13 +378,10 @@ class _ProviderComparison:
     ) -> None:
         self._recent_sessions = recent_sessions
         self._frame_loader = frame_loader
-        self._cache: dict[str, dict[str, int]] = {}
 
     def compare(self, market_date: str) -> dict[str, int] | None:
         if market_date not in set(self._recent_sessions()):
             return None
-        if market_date in self._cache:
-            return self._cache[market_date]
         from sqlalchemy import select
 
         from app.db import session_scope
@@ -408,7 +411,6 @@ class _ProviderComparison:
             'missing_bars': sum(1 for symbol in provider if symbol not in stored),
             'provisional_bars': sum(1 for symbol, ohlc in provider.items() if symbol in stored and stored[symbol] != ohlc),
         }
-        self._cache[market_date] = result
         return result
 
 

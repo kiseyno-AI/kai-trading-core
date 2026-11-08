@@ -7311,6 +7311,111 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'stage checkpoint unavailable',
             )
 
+    def test_grouped_control_stage_start_failure_terminalizes_parent_run(
+        self,
+    ) -> None:
+        for failed_stage, master_status in (
+            ('master_refresh', 'completed'),
+            ('pykrx_universe_refresh', 'completed'),
+            ('price_collection', 'failed'),
+        ):
+            with self.subTest(failed_stage=failed_stage):
+                state = _FakePipelineRunStateService()
+                original_start_stage = state.start_stage
+                checkpoint_error = RuntimeError(
+                    f'{failed_stage} checkpoint unavailable'
+                )
+
+                def start_stage(**kwargs):
+                    if kwargs['stage_id'] == failed_stage:
+                        raise checkpoint_error
+                    return original_start_stage(**kwargs)
+
+                state.start_stage = MagicMock(side_effect=start_stage)
+                pykrx_runner = MagicMock()
+                service = DailyPipelineStageService(
+                    pykrx_service=pykrx_runner,
+                    run_state_service=state,
+                )
+                with (
+                    patch.object(
+                        service,
+                        '_execute_stage',
+                        return_value={
+                            'status': master_status,
+                            'symbols_refreshed': 2,
+                        },
+                    ) as execute_stage,
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    service.run(
+                        market_date='2026-04-14',
+                        stages=['price_collection'],
+                    )
+
+                self.assertIs(raised.exception, checkpoint_error)
+                self.assertEqual(state.runs[-1]['status'], 'failed')
+                self.assertEqual(
+                    state.runs[-1]['finish']['error_message'],
+                    str(checkpoint_error),
+                )
+                pykrx_runner.run_daily_pipeline_stages.assert_not_called()
+                self.assertEqual(
+                    execute_stage.call_count,
+                    0 if failed_stage == 'master_refresh' else 1,
+                )
+
+    def test_malformed_symbol_scope_is_rejected_before_run_admission(self) -> None:
+        service = DailyPipelineStageService()
+        with (
+            patch.object(
+                self.run_state_service,
+                'start_run',
+                wraps=self.run_state_service.start_run,
+            ) as start_run,
+            patch.object(
+                service,
+                '_execute_stage',
+                return_value={'status': 'completed', 'results_persisted': 2},
+            ) as execute_stage,
+        ):
+            for symbols in (
+                ['not-a-symbol'],
+                ['005930', 'not-a-symbol'],
+                [' '],
+            ):
+                with self.subTest(symbols=symbols), self.assertRaisesRegex(
+                    ValueError, 'invalid KRX symbol'
+                ):
+                    service.run(
+                        market_date='2026-04-14',
+                        stages=['value_factors'],
+                        symbols=symbols,
+                    )
+
+            start_run.assert_not_called()
+            execute_stage.assert_not_called()
+
+    def test_valid_symbol_scope_keeps_normalization_and_unscoped_calls(self) -> None:
+        service = DailyPipelineStageService()
+        for symbols, expected in (
+            (['5930', '0017j0', '005930'], ['005930', '0017J0']),
+            (None, None),
+            ([], None),
+        ):
+            with self.subTest(symbols=symbols), patch.object(
+                service,
+                '_execute_stage',
+                return_value={'status': 'completed', 'results_persisted': 2},
+            ) as execute_stage:
+                service.run(
+                    market_date='2026-04-14',
+                    stages=['value_factors'],
+                    symbols=symbols,
+                )
+
+                self.assertEqual(execute_stage.call_args.kwargs['symbols'], expected)
+
     def test_final_run_checkpoint_retries_transient_failures(self) -> None:
         self.run_state_service.finish_run = MagicMock(
             side_effect=[

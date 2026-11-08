@@ -2560,6 +2560,8 @@ class SignalDeciderLoopRepository:
             )
             if target is None:
                 return None
+            if target.status == 'retired':
+                raise ValueError('retired policy versions cannot be re-activated')
 
             previously_active_rows = [
                 row

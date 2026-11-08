@@ -41,6 +41,23 @@ class DartBackfillCurrentUniverseCliTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'failed')
         self.assertEqual(payload['error'], 'boom')
 
+    def test_main_exit_code_reflects_incomplete_service_results(self):
+        for status, expected_code in (('completed', 0), ('partial', 1), ('failed', 1)):
+            result = {'status': status, 'capture': {'run_id': 10}}
+            with (
+                self.subTest(status=status),
+                patch(
+                    'app.dart.backfill_current_universe.dart_fundamentals_capture_service.backfill_current_universe_fundamentals',
+                    new=AsyncMock(return_value=result),
+                ),
+                patch('sys.stdout.write') as stdout_write,
+            ):
+                exit_code = main(['--symbol-limit', '10'])
+
+                self.assertEqual(exit_code, expected_code)
+                written = ''.join(call.args[0] for call in stdout_write.call_args_list)
+                self.assertEqual(json.loads(written), result)
+
     def test_main_passes_exact_symbol_manifest(self):
         result = {
             'scope': 'targeted_active_universe',

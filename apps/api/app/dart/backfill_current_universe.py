@@ -69,7 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(json.dumps(result, ensure_ascii=False))
-    return 0
+    return 1 if result.get('status') in {'partial', 'failed'} else 0
 
 
 if __name__ == '__main__':

@@ -1360,6 +1360,10 @@ def test_invalid_failure_cache_records_fail_closed(tmp_path) -> None:
                 payload['credential_fingerprint'] = 'hmac-sha256:' + ('0' * 64)
             elif case == 'boolean-schema':
                 payload['schema_version'] = True
+            elif case == 'list-error-kind':
+                payload['error_kind'] = ['http']
+            elif case == 'object-error-kind':
+                payload['error_kind'] = {'kind': 'http'}
             else:
                 raise AssertionError(case)
             store.failure_path.write_text(json.dumps(payload), encoding='utf-8')
@@ -1393,6 +1397,8 @@ def test_invalid_failure_cache_records_fail_closed(tmp_path) -> None:
             'boolean-status',
             'wrong-identity',
             'boolean-schema',
+            'list-error-kind',
+            'object-error-kind',
         )
     ):
         result, call_count = asyncio.run(exercise(case, index))

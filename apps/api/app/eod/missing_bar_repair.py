@@ -1125,6 +1125,7 @@ def _extract_symbol_fundamental(
     frame: object,
     *,
     symbol: str,
+    market_date: date,
 ) -> dict[str, Decimal | None] | None:
     """Read an exact-date per-symbol fallback, preserving explicit absence."""
 
@@ -1147,7 +1148,12 @@ def _extract_symbol_fundamental(
         raise ValueError(
             f'{symbol} exact-date fundamental payload must contain one row'
         )
-    _, row = rows[0]
+    returned_date, row = rows[0]
+    if _normalize_market_date(returned_date) != market_date:
+        raise ValueError(
+            f'{symbol} exact-date fundamental payload does not match '
+            f'{market_date.isoformat()}'
+        )
     return {
         FUNDAMENTAL_COLUMNS[column]: _coerce_optional_decimal(
             row[column],
@@ -2567,6 +2573,7 @@ class MissingDailyBarRepairService:
                         fallback_values = _extract_symbol_fundamental(
                             fallback_frame,
                             symbol=symbol,
+                            market_date=normalized_date,
                         )
                     except Exception as exc:  # noqa: BLE001
                         return self._blocked_result(

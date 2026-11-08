@@ -1,0 +1,838 @@
+[
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "fa272f442640dc90329fe8b466a8d0778a5caf21",
+    "remote_commit": "d6e41e4894a982c94a8c00ad0fdb0193d2df94cd",
+    "verified_tree": "011ca092a50793ebe22f2ae9bb6f710f6de6afac",
+    "message": "fix(auth): reject malformed bearer tokens without server errors\n\nCompare UTF-8 bytes in constant time so non-ASCII request credentials receive the existing 401 response. Preserve existing Bearer scheme and OPTIONS rules and request audit behavior. Regression reproduced TypeError before the fix; 105 internal-ops, audit-logging, and CORS tests pass in isolated PostgreSQL under the offline audit harness.",
+    "files": [
+      "apps/api/app/main.py",
+      "apps/api/tests/test_internal_ops.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "db6b74cbc7059c1603568c772991bfdac69a13c5",
+    "remote_commit": "bf0fc79c750157d77e3e7892edab84c7ad882625",
+    "verified_tree": "1cb37ea9248681e462143c8685c1761f4e070755",
+    "message": "fix(eod): count signal coverage within daily bar membership",
+    "files": [
+      "apps/api/app/eod/data_gap_fill.py",
+      "apps/api/tests/test_data_gap_fill_detectors.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "433a2e10c5d618733eccfbe63e4a7cc853443ce8",
+    "remote_commit": "f13b909fcc8110dc7d81d6f5d64485eb1d88c4b2",
+    "verified_tree": "464c7cc41981cb5f426eb119aa1666efa2e270eb",
+    "message": "fix(eod): refresh provider gap counts after stored bar repairs",
+    "files": [
+      "apps/api/app/eod/data_gap_fill.py",
+      "apps/api/tests/test_data_gap_fill_detectors.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "8cbbfb4322f81c11eccf9b9d662e5b4f65838e21",
+    "remote_commit": "3b7871145ce2f9a51130cb2360b71d992752bd39",
+    "verified_tree": "914ac2674936328e70b56231bcc9d7bb7200af97",
+    "message": "fix(dart): capture due file rechecks outside the incremental window",
+    "files": [
+      "apps/api/app/dart/fundamentals_capture_service.py",
+      "apps/api/tests/test_dart_fundamentals_capture_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "bc8011671b91636ad5e7d0bba5113e8ed3268e93",
+    "remote_commit": "9e66e2ad6e4a3d080c1d4052b7e0b9f7b02c6e00",
+    "verified_tree": "9701fea156f8f80a350b2339cc086a1f47de7c85",
+    "message": "fix: import retry mode for weekly rebind fallback",
+    "files": [
+      "apps/api/app/agent_context/weekly_policy_rebind_service.py",
+      "apps/api/tests/test_weekly_policy_rebind_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "c19339a6e51b2702e6203d69c3c187225856d8e6",
+    "remote_commit": "c0a4689a6797fe0461e4e7dcf84e8ef81684ba91",
+    "verified_tree": "21a7eaecca4253fc3e7ad2778c80927ea4db3bed",
+    "message": "fix: pin improvement guard to the fetched base commit",
+    "files": [
+      "apps/api/tests/test_agent_improvement_run.py",
+      "scripts/agent_improvement_run.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "692724fe39f6d5a68fc82af49b5322754754cd95",
+    "remote_commit": "3d910da22ce6ad0cfa4cfd132e8b399536033486",
+    "verified_tree": "bc802c11a85c499977382a854b7b460255db6c1b",
+    "message": "fix: ignore replacement objects in agent rule guard",
+    "files": [
+      "apps/api/tests/test_agent_improvement_run.py",
+      "scripts/agent_improvement_run.py",
+      "scripts/agent_rules_guard.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "d66bf7206737ed502a9384bae6e5da4d0e2650bd",
+    "remote_commit": "8c4aac81a1c978836a77e93c4b58d2552bf500ce",
+    "verified_tree": "38919ac8d664d8749190c2c9792c92762262404e",
+    "message": "fix(logging): redact secrets in upstream audit paths\n\nBuild the logged decoded path from the already-redacted URL. A regression shows an ECOS-style path credential was hidden in url but copied verbatim into path. Existing upstream request/response and retry behavior is unchanged; all 12 audit logging tests and the Core app import pass offline.",
+    "files": [
+      "apps/api/app/core/audit_logging.py",
+      "apps/api/tests/test_audit_logging.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "b04a9cddf8b42f5a939a17c449b7821358d1f882",
+    "remote_commit": "7b998c91f53f0b78df6368aeff292ea614c81298",
+    "verified_tree": "d5942812be279022057d2c24a29b00c6170fe2f7",
+    "message": "fix(logging): redact encoded upstream credentials\n\nRedact literal and URL-encoded forms of explicitly supplied secrets, including lowercase percent escapes, before deriving audit paths. Keep nonsecret URL metadata and HTTP behavior unchanged. The encoded-path regression fails before this fix; all 13 audit logging tests and app import pass offline.",
+    "files": [
+      "apps/api/app/core/audit_logging.py",
+      "apps/api/tests/test_audit_logging.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "8e5a17ed552d87c1682b0a47e55252728e6aa1d9",
+    "remote_commit": "1495e5d5d19551bb4806a86aabe4cefe36d1a3bb",
+    "verified_tree": "4ddd67c7a2385a2fe9f4a073102ac7289613bc82",
+    "message": "fix(eod): fence downstream date growth during final bar repairs",
+    "files": [
+      "apps/api/app/eod/kis_final_bar_repair.py",
+      "apps/api/tests/test_kis_final_bar_repair.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "d1fb6d001300730399840ecf68541f2b170d83d0",
+    "remote_commit": "610cb2a976612d3822b5dfc971c97f4bc5cf0bc8",
+    "verified_tree": "4781ee6ecbe49c6eeededee07f2052e01400b701",
+    "message": "fix: handle null significance when grouping improvement issues",
+    "files": [
+      "apps/api/tests/test_agent_improvement_run.py",
+      "scripts/agent_improvement_run.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "9c3eb272322eaa70b2d98f564a0b5f17122c15c2",
+    "remote_commit": "b817a0a9226236ac0625e345bd7fd89aef1ab219",
+    "verified_tree": "a248ab0019047455b004b7646e28dfe98d6fd5ea",
+    "message": "fix: retain failed evaluation refreshes as retry debt",
+    "files": [
+      "apps/api/app/agent_context/evaluation_refresh.py",
+      "apps/api/tests/test_evaluation_refresh.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "ad6287db9bfac4f47c54ccdb638ab01938300ed9",
+    "remote_commit": "f32933b80d85708805777f229c2b18f143a53968",
+    "verified_tree": "253a3effefd87c3377f620017125274f3686b6f4",
+    "message": "fix(logging): redact credentials in upstream error diagnostics\n\nCollect sensitive URL, query and header values once and redact transport/retry/download error fields. Preserve HTTP calls, retry counts, original exceptions, and nonsecret diagnostics. Materialize explicit secrets so a generator also protects later attempts. Both new regressions fail before the fix; all 15 audit tests and the Core app import pass offline.",
+    "files": [
+      "apps/api/app/core/audit_logging.py",
+      "apps/api/tests/test_audit_logging.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "2c6e2e50a879c3805ddf18b2279babab5887add9",
+    "remote_commit": "8889a23c7d9fa86773b3faee3947c9479a6012f0",
+    "verified_tree": "3effa963311e0f2fa4fee260151b046d4a66955d",
+    "message": "fix: serialize stale feedback cleanup with active writers",
+    "files": [
+      "apps/api/app/agent_context/run_state_service.py",
+      "apps/api/tests/test_agent_context_run_state_concurrency.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "676720ef6c29dc43a471eb5ae9f2dcba9e57b687",
+    "remote_commit": "f653b7e652c5db9980a426f1a1bdd580afd27fd1",
+    "verified_tree": "641c489d249cd45d28f307143f67490a31ca3aad",
+    "message": "fix: serialize retry takeover with active heartbeats",
+    "files": [
+      "apps/api/app/agent_context/retry_service.py",
+      "apps/api/tests/test_feedback_retry_admission_concurrency.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "cbd37eb9d848938ed23bb8a2fcf487125959019f",
+    "remote_commit": "a1cacc1c962b7de20c1d5ecde104698c68c0e0f2",
+    "verified_tree": "5e23a530bff1b68c6b6cd5a38e644131c6482635",
+    "message": "fix: bind retry completion checks to the requested cutoff",
+    "files": [
+      "apps/api/app/agent_context/retry_service.py",
+      "apps/api/tests/test_feedback_retry_knowledge_cutoff.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "c9dacb31376abe6ccf51850fcf219f9318ce9051",
+    "remote_commit": "4c2ba521cfd2e8cd2608a7ffb6a230ffb8146b44",
+    "verified_tree": "9d72d13dd004961a4a2d22f5fb2c1aa6a209f1ba",
+    "message": "fix: reject nonfinite order values before submission",
+    "files": [
+      "apps/api/app/orders/service.py",
+      "apps/api/tests/test_trading_order_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "edb9d4cd62742a91f9574276ddee6a0016b3fe2f",
+    "remote_commit": "7bf626e98fd4b4f9bd413cb88827128f3b5e6343",
+    "verified_tree": "f2ec70ad70891fc888afa3a9347ceb8a38a6a034",
+    "message": "test(eod): isolate membership admission from provider date lookup",
+    "files": [
+      "apps/api/tests/test_auto_pykrx.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "cca96f47b05df4822f03723ee5c84f277a70aabf",
+    "remote_commit": "54f15b6ab3bb9f7e5838616844d46e475d93bda3",
+    "verified_tree": "5090765361a5d2ecde4702b964b75ce98601efdd",
+    "message": "fix(eod): require the requested date in KIS daily snapshots",
+    "files": [
+      "apps/api/app/eod/service.py",
+      "apps/api/tests/test_eod_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "d780cfb46f4e520161ed7c66ff5a2bb12fdbf318",
+    "remote_commit": "3319337ba526f486664c363ffc7655a97bdb20f4",
+    "verified_tree": "d44b7eaac62f8c3c530328a0416bdb6f869c0b4a",
+    "message": "fix(dart): return a failing exit code for incomplete backfills",
+    "files": [
+      "apps/api/app/dart/backfill_current_universe.py",
+      "apps/api/tests/test_dart_backfill_current_universe_cli.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "c99ac4e2be51887fc5a2d6704f5638698189cb92",
+    "remote_commit": "2ae332d539c7f45b70c6f327091a9d75c2b8bb3c",
+    "verified_tree": "6875fefe19d060d0348ab6de2292bb5ce8c8b0ec",
+    "message": "test(eod): isolate optional context during DART admission checks",
+    "files": [
+      "apps/api/tests/test_auto_pykrx.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "9b757ed649e0275d435c2800b80196c9981e31d9",
+    "remote_commit": "609ce71d096edd0fdc5244f91f8b589caa757570",
+    "verified_tree": "d6d1cfc8eef8d75295eff801782ace291ca0a461",
+    "message": "fix(symbols): deduplicate symbol scopes before chunked reads",
+    "files": [
+      "apps/api/app/repositories/symbol_repository.py",
+      "apps/api/tests/test_symbol_repository.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "27f9a8c049e1ff4aefd8d619066d29e6823cb52b",
+    "remote_commit": "974df60ddfe45d9e0f56f60448e4cd2b7f5b4d2a",
+    "verified_tree": "f9b90a6613df5764108384a569086357e55f419d",
+    "message": "fix(eod): use the latest progress timestamp for freshness",
+    "files": [
+      "apps/api/app/eod/live_progress.py",
+      "apps/api/tests/test_live_progress.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "68a8add6972d35c058304d8e399fda5ec37c7343",
+    "remote_commit": "0601758eb048ccea6396f336f37c6a1f3d47260e",
+    "verified_tree": "120501544e8464741912377e2498f22b00dafdcf",
+    "message": "fix(dart): lock stale run candidates before marking them failed",
+    "files": [
+      "apps/api/app/dart/fundamentals_store.py",
+      "apps/api/tests/test_dart_fundamentals_store.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "b7251ba6b0865d8c73cf2151e5fe7309d4ceb07b",
+    "remote_commit": "0c7f52d77c0e77b84a53df52fa00f5d268c7f010",
+    "verified_tree": "ea257ad1607308225cc0da91b9f7db8cebc923c8",
+    "message": "test(eod): isolate provider data in progress-failure regression",
+    "files": [
+      "apps/api/tests/test_auto_pykrx.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "cf6e2799cf7b69cd0cef01bcb89a77bb5b381f81",
+    "remote_commit": "25aa45aceee60964fbf1ce236d33cc1e718ffc08",
+    "verified_tree": "927d061876d1043e55a5cdae953ab48bd4879d21",
+    "message": "test: block unmocked external HTTP before network transports",
+    "files": [
+      "apps/api/conftest.py",
+      "apps/api/tests/test_http_test_boundaries.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "010dc40713bc84776abaf47f93fabdc78879be02",
+    "remote_commit": "6bc2ff12416fe8509719f03ac4ef8177de7d98d1",
+    "verified_tree": "44bb568990a55fb36c8100a93377bae806181730",
+    "message": "fix(dart): retain exact refresh run identity during compound completion",
+    "files": [
+      "apps/api/app/dart/fundamentals_capture_service.py",
+      "apps/api/app/dart/fundamentals_store.py",
+      "apps/api/tests/test_dart_fundamentals_capture_service.py",
+      "apps/api/tests/test_dart_fundamentals_store.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "3555ed2f36dd1641365724d42352c48f4d3440dc",
+    "remote_commit": "7b613765cfc44472c0457ff6188e103b5f4da207",
+    "verified_tree": "4ba1462587d657bc6916e127451629d59bc2327e",
+    "message": "fix(signals): preserve the timestamp of each retained overtime source",
+    "files": [
+      "apps/api/app/signals/overtime_ranking_capture.py",
+      "apps/api/tests/test_overtime_ranking_capture.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "e71b25ae8aca4c00051d6687cf3759a739f41231",
+    "remote_commit": "db281107e6261bce0ecf5537dca77fadfbd36e1e",
+    "verified_tree": "23bb5d35673b1789c4e70fc293d81f4e4819c733",
+    "message": "test(eod): isolate master refresh in snapshot scheduling regression",
+    "files": [
+      "apps/api/tests/test_eod_runner.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "0ae21d43c966daf004d517ba7b766e924bc53e07",
+    "remote_commit": "a6f03ced7e7ce4768238ce95474bfcc445f7b858",
+    "verified_tree": "89849d9a668d05732c310efe2bbf67946ed175f8",
+    "message": "test: guard urllib downloads before HTTP connections",
+    "files": [
+      "apps/api/conftest.py",
+      "apps/api/tests/test_http_test_boundaries.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "fb3f6a7c389731c8c51bba9834a38890b540c0df",
+    "remote_commit": "181c03926fd33ccf9d170973b2cf0925aaaf6823",
+    "verified_tree": "524f03cc697cfe4b1845a6fc2521655a71e3dcf6",
+    "message": "fix(signals): retain missing targets in momentum rebuild debt",
+    "files": [
+      "apps/api/app/signals/momentum_factor.py",
+      "apps/api/tests/test_momentum_factor.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "ba705c244fe9ac2ab82ee6d115fd450d33a1f8e6",
+    "remote_commit": "bed314ec86d939e7afc72b4c23d3e9a842d1e234",
+    "verified_tree": "408caf78dda190d946e6ebbbd8da2a26d3683c91",
+    "message": "fix: recheck retired policy status before activation",
+    "files": [
+      "apps/api/app/agent_context/signal_decider_loop_service.py",
+      "apps/api/tests/test_signal_decider_policy_races.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "620b46edac79603cd12b6f7e66b1658be8e2cdb4",
+    "remote_commit": "a924a3528b5a31bdfcd3a7418ff49ecc9d405430",
+    "verified_tree": "01e1b880d5ab406f94aa5fc98934f414744636f9",
+    "message": "fix: validate dates in automated rule changelog entries",
+    "files": [
+      "apps/api/tests/test_agent_rules_guard.py",
+      "scripts/agent_rules_guard.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "c8a7a0dc8c3c0f4abbdcc595b419aac2675f8e8a",
+    "remote_commit": "2ea45e057c13b0cfcd87505eed7ffe6d6e7a7aca",
+    "verified_tree": "44e3e322cf4932088582eb8471cb1e187ceacad7",
+    "message": "fix: match KIS inquiry rows against the requested order identity",
+    "files": [
+      "apps/api/app/orders/service.py",
+      "apps/api/tests/test_trading_order_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "987b08408f70957a7512b92b610f473459bd266f",
+    "remote_commit": "4250bf55a17c2cc89161b4543efa502f718864ec",
+    "verified_tree": "490b03ddac128cf01a2f125f4184b5530b42ea34",
+    "message": "fix(eod): retry provider frames after an incomplete market response",
+    "files": [
+      "apps/api/app/eod/data_gap_fill.py",
+      "apps/api/tests/test_data_gap_fill_detectors.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "9cf561f3adb9c4f67621676367abd86fb55355cf",
+    "remote_commit": "3013f321a7ae949c5daaa2a6b76bb0cf73065976",
+    "verified_tree": "dbdc950cd5322f043ce4fa3c442098dcd074ffcc",
+    "message": "fix: reject malformed risk flags without normalization errors",
+    "files": [
+      "apps/api/app/agent_context/response_contract.py",
+      "apps/api/tests/test_agent_context_response_risk_flags.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "771e980650f843dc7425724e21b7fa7ccabdf4f9",
+    "remote_commit": "bb5dfa65b900284003c50a57d28386930fd7a492",
+    "verified_tree": "6b5b4f86a1b596f98376e772f9cdd06aeeb1779b",
+    "message": "fix: handle non-finite decision delta prices safely",
+    "files": [
+      "apps/api/app/agent_context/decision_delta.py",
+      "apps/api/tests/test_agent_context_response_contract.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "d4453c690ebc98fcfa9f875f7b17f2d89b901133",
+    "remote_commit": "ff8d9389f1f555abdef4049d433de0d91ae69190",
+    "verified_tree": "7f6dc95cc8053891c513cce4a540d2010d654cab",
+    "message": "fix: compare wait decisions with missing historical reasons",
+    "files": [
+      "apps/api/app/agent_context/decision_delta.py",
+      "apps/api/tests/test_decision_delta_legacy_wait.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "7d50f3c5eed114145f3fcfdfe1c3432b26ca86e8",
+    "remote_commit": "5a2a2227d7d79556f78cfae3e1d9d34d081875e0",
+    "verified_tree": "fcd433650e8f04892bc40d0346697342dea457cf",
+    "message": "fix: preserve empty role scopes in feedback progress",
+    "files": [
+      "apps/api/app/agent_context/progress_service.py",
+      "apps/api/tests/test_agent_context_progress_empty_scope.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "efdf17bd76e4ae348f280d3f407eae727ffe53d7",
+    "remote_commit": "53be6fe57eb5e305ddd77e137c050ed83e562359",
+    "verified_tree": "dbf8d4881c7ad87403426d4d9f83f7d8d24b71e9",
+    "message": "fix: omit unsanitized containers at the feedback log depth limit",
+    "files": [
+      "apps/api/app/agent_context/logging.py",
+      "apps/api/tests/test_agent_context_log_redaction.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "d2ea545d522efaaafbcde4e453b4a263314279f6",
+    "remote_commit": "bff3800891ecb9c7c5d800e60101373f5140a2a9",
+    "verified_tree": "79949e0e258e54e686db3eed2370d322557bc957",
+    "message": "fix: preserve canonical feedback failure classifications",
+    "files": [
+      "apps/api/app/agent_context/feedback_failure_taxonomy.py",
+      "apps/api/tests/test_agent_context_feedback_failure_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "cc8ea10eb696f87efebe336ad385b3df915921d7",
+    "remote_commit": "a4e0cd4d5a3d6e88d5079d9b0894ff06ea8fa5bb",
+    "verified_tree": "de4840ab0e66dd22f983eeeb9a10bb6ce1e5ad40",
+    "message": "fix: keep completed feedback out of subagent batch failures",
+    "files": [
+      "apps/api/app/agent_context/orchestrator_runtime_helpers.py",
+      "apps/api/tests/test_agent_context_orchestrator.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "d0b15e7631ef2b80f0f86f514c4b82f42d29ca9a",
+    "remote_commit": "bdfeffd31a6f19f66aa579e10f70bb1d6de997b3",
+    "verified_tree": "5ef32a7de9b501bec506b2e5ce060d1a26f3ff2b",
+    "message": "fix: close SQLite readers after session cleanup checks",
+    "files": [
+      "apps/api/app/agent_context/session_cleanup_service.py",
+      "apps/api/tests/test_agent_feedback_session_cleanup_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "36d519508cef7bb213c828c1eeca903dac31126a",
+    "remote_commit": "0fb8437e5ca6c8f782fa4f90f50b6cb03a6e2280",
+    "verified_tree": "0ddabcf7ed3badd38246a3ceaecf40d9e01e6588",
+    "message": "fix: preserve zero broker quantities for cancel and amend checks",
+    "files": [
+      "apps/api/app/orders/service.py",
+      "apps/api/tests/test_trading_order_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "57a06992c58a3bfdfb83b7d4793143955b86f5ce",
+    "remote_commit": "89ce2547d721d09a7cd97071d2b0eb80577ee5e4",
+    "verified_tree": "9e718f7556cdda41aa9bd3b0a6dbc46131de662c",
+    "message": "fix(eod): replace unreadable official reference cache after recovery",
+    "files": [
+      "apps/api/app/eod/official_bar_restatement.py",
+      "apps/api/tests/test_official_bar_restatement.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "4f733c3fb5c644e5cf30818519c57beed7881ead",
+    "remote_commit": "43d6a8da063f698963da01027d421a9f98667e93",
+    "verified_tree": "d922f9ed491800623df500ac1d71aa0b8ff535df",
+    "message": "fix(market): revalidate projections left by cancelled requests",
+    "files": [
+      "apps/api/app/market/live_sector_projection.py",
+      "apps/api/tests/test_live_sector_projection.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "4ff9c7cacc0d02e9e97ab1016bd53052bdb4b4e2",
+    "remote_commit": "de107ea361216cf0d8a2d21ba245e4ac5fe4916f",
+    "verified_tree": "1e366e06842fe7b2d88da47aa730afc235777402",
+    "message": "fix(us-data): skip non-finite price observations",
+    "files": [
+      "apps/api/app/us_equities/market_data.py",
+      "apps/api/tests/test_us_market_data.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "5f52ce8185e9699c61dd59e87cd292c67cf1473c",
+    "remote_commit": "8dfe0eb7f7ca3ed6b61876d5435359c19e92ea4e",
+    "verified_tree": "2fec72135bdf6920d6a9ad8730ac6722874393e9",
+    "message": "fix(us-agents): preserve the dispatched feedback context",
+    "files": [
+      "apps/api/app/us_equities/agent_analysis_service.py",
+      "apps/api/tests/test_us_agent_analysis_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "86d81be55474eed4ebea6c6c0edfae8beb33c71b",
+    "remote_commit": "718e2ee0bce8b543571ded9821b97faa78b273f6",
+    "verified_tree": "a17fb9e866b5af4c06104eb50a656e1f4d745fc0",
+    "message": "fix(us-agents): publish feedback only after persistence succeeds",
+    "files": [
+      "apps/api/app/us_equities/agent_analysis_service.py",
+      "apps/api/tests/test_us_agent_analysis_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "00e2abbf9850611a06fcac6c0d31f70e98248d3c",
+    "remote_commit": "59e250fd1f1aa5f000ab0b4dd51f1354f00c5f55",
+    "verified_tree": "ded4814f26bc7842d6af9f050f80c42307189dde",
+    "message": "fix(us-data): exclude non-finite SEC observations",
+    "files": [
+      "apps/api/app/us_equities/sec_fundamentals.py",
+      "apps/api/tests/test_us_sec_fundamentals.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "6b7c6c53a25b5f6352c77fe97923ff0a1d709ed9",
+    "remote_commit": "36c77e4d6b076c68293ed7619107e4d259421046",
+    "verified_tree": "1488cd93139a9452895d65351e8292a18bb20020",
+    "message": "fix(us-agents): retain successful batch results after a later write failure",
+    "files": [
+      "apps/api/app/us_equities/agent_analysis_service.py",
+      "apps/api/tests/test_us_agent_analysis_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "8b7cf9586405a6bc4b669409f70e66563bd1512d",
+    "remote_commit": "5b3caaee96c262036b4628d9ea3826a8ebf8c243",
+    "verified_tree": "f94a26d100ef7e59cc7c4327e44ce75f1a3af87d",
+    "message": "fix: guard prerequisite failure writes against lost retry leases",
+    "files": [
+      "apps/api/app/agent_context/orchestrator.py",
+      "apps/api/tests/test_agent_context_orchestrator.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "a78bb17ac6444e64d7a4db2a03f743a3393ba56e",
+    "remote_commit": "927123e269293ff615ab8116af506e7d6c74845b",
+    "verified_tree": "7f6507d2375789fdfd8a4519fbdba8f9884777a4",
+    "message": "fix: reject malformed replay schema versions consistently",
+    "files": [
+      "apps/api/app/agent_context/decider_replay_service.py",
+      "apps/api/tests/test_decider_replay_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "17b721ecab1a305c350b7ed8eb68f5cfbc6d655a",
+    "remote_commit": "5f03d18a7e9f9e5d39e04457d197cb2ea4ef51f8",
+    "verified_tree": "13b64246a75e0ae3331faa5cacc015b573dee5bf",
+    "message": "fix: preserve turnover baseline coverage provenance",
+    "files": [
+      "apps/api/app/agent_context/read_service.py",
+      "apps/api/tests/test_agent_context_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "9e59680582d22661f704f865b274b1c1b48f70fc",
+    "remote_commit": "dc291d5ed97b74f554e20c9c5ee5292bf3221658",
+    "verified_tree": "55cf30ea519701abfe24020fb154b1a868319d9c",
+    "message": "fix: preserve fill state when order events omit numeric evidence",
+    "files": [
+      "apps/api/app/orders/store.py",
+      "apps/api/tests/test_kis_realtime_order_notice_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "1408a0da187f891f067d0a3192000560eed0412e",
+    "remote_commit": "00f4c855f63072c3fa08f72cf48d3969caee8031",
+    "verified_tree": "9f77a48b46682e5f467b97f5113956cbbce154f5",
+    "message": "fix: update last fill time only for execution notices",
+    "files": [
+      "apps/api/app/orders/kis_realtime_order_notices.py",
+      "apps/api/tests/test_kis_realtime_order_notice_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "350136b9f3aadbba379e65e4ba5416cb3fd2a38b",
+    "remote_commit": "6799fd5c1bb6bb29bed036e39642c4e27575b4de",
+    "verified_tree": "e348bbb2782b02229a349ca5a355a859a924f118",
+    "message": "fix: continue reconciling partially filled orders after a match",
+    "files": [
+      "apps/api/app/orders/reconciliation.py",
+      "apps/api/tests/test_trading_order_reconciliation_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "eb35b75efea6888e3a3a711d11931cfe3afb3ee5",
+    "remote_commit": "c6ce53fdb5aca013ce84fe38f610fa417a351526",
+    "verified_tree": "fc4d3e993cf51701ca18a9ef86043afcfda58327",
+    "message": "fix: preserve concurrent broker truth when recording inquiry errors",
+    "files": [
+      "apps/api/app/orders/reconciliation.py",
+      "apps/api/tests/test_trading_order_reconciliation_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "4d79520820db8dba03fad4242d915bb01df272d8",
+    "remote_commit": "decf34e1339a0cbe27979bd15746e1273fb58e53",
+    "verified_tree": "708b727917a8eb95c2e7ca557b55e68641c99126",
+    "message": "fix: reject nonfinite buying-power inquiry prices",
+    "files": [
+      "apps/api/app/orders/account_inquiry_service.py",
+      "apps/api/tests/test_trading_account_inquiry_service.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "bd9302fe89fde628e9520b402b29aeb0de8619b9",
+    "remote_commit": "b9934faa0c0cce4dec7f10fe46f10d1e69d5df4f",
+    "verified_tree": "8d9130aa21d46a08bae216e12354ed566484490f",
+    "message": "fix: preserve percent-encoded URLs in Alembic configuration",
+    "files": [
+      "apps/api/app/db.py",
+      "apps/api/tests/test_database_url.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "3290cfd3421bac7baa1b9c14ed6fc852d6758892",
+    "remote_commit": "3c2c1c598cc4a7cce24536b77977bfa7f355b64c",
+    "verified_tree": "5e8bbdc2e04b33a4e8819ceb7201628f196ab9a8",
+    "message": "fix: encode component database credentials without changing their values",
+    "files": [
+      "apps/api/app/db.py",
+      "apps/api/tests/test_database_url.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "f2dc33b87060018e1444d9b5c4184fb2ec675d0c",
+    "remote_commit": "0b66094d537b796be861f9d54e64e281e5087b8e",
+    "verified_tree": "167c63acf2aaef04d1f7d981288535fc70954577",
+    "message": "fix(signals): report missing volume-power market segments as partial",
+    "files": [
+      "apps/api/app/signals/daily_signal_features.py",
+      "apps/api/tests/test_daily_signal_features.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "9ae15b448d2ec3098dd3b5bf77d8695d93ce43c0",
+    "remote_commit": "f78302f9c4e055ce9c0b487be93fef41a65575b9",
+    "verified_tree": "75ba57171e0276ed9e6d1641a326c7f886bc51b5",
+    "message": "test(eod): isolate master refresh in open-loop execution checks",
+    "files": [
+      "apps/api/tests/test_eod_runner.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "3729ec5d0b625dec5b199c98ce3ce6b97216611e",
+    "remote_commit": "6da945db8fd3ab6515329d4930c678496420ba85",
+    "verified_tree": "0aefaea39dda37d67fad100fea2d903505d8d66f",
+    "message": "test(eod): isolate short-volume historical membership lookup",
+    "files": [
+      "apps/api/tests/test_pykrx_enrichment.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "bae06a9cf679a103c51734c0122251098b4fbcc5",
+    "remote_commit": "0314f44ceaf0cf27204bd25496bba5aeec0f381e",
+    "verified_tree": "94246e21c09fc2bb3e9403685fb5cd3c4c778ffd",
+    "message": "test(eod): isolate provider frames in snapshot-failure regression",
+    "files": [
+      "apps/api/tests/test_auto_pykrx.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "1c8eaeca741780f77c2b37207b62291bb5da5dd9",
+    "remote_commit": "78fc195ebfe9e656900b8436772443edb337eea7",
+    "verified_tree": "d1ab669e0ce3b92f68c832e3142c94f5cf341777",
+    "message": "fix(eod): validate the date of fundamental repair fallbacks",
+    "files": [
+      "apps/api/app/eod/missing_bar_repair.py",
+      "apps/api/tests/test_missing_bar_repair.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "43e8919b2e70ca1572475c762b9e2c2d7b38e540",
+    "remote_commit": "7dceada29207396158870cecd5599880e178c03a",
+    "verified_tree": "4400c523ed1dec43d7db8453b3ea0fa1d300f983",
+    "message": "fix(eod): report empty factor results as incomplete repair evidence",
+    "files": [
+      "apps/api/app/eod/price_bar_repair_state.py",
+      "apps/api/tests/test_price_bar_repair_state.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "aa7ec63789c42eb3e720594863a3e0fcc44ed6ce",
+    "remote_commit": "e348b97dc91098e9b8f29a604da515643242f408",
+    "verified_tree": "b365b1c9956719b5220f2fa57e3bafbfa6b4db30",
+    "message": "fix(eod): scope valuation fallback dates to requested markets",
+    "files": [
+      "apps/api/app/eod/pykrx_enrichment.py",
+      "apps/api/tests/test_pykrx_enrichment.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "cadd53c0ade879b3ce6e0070c0eb59143c5eac7a",
+    "remote_commit": "93a930dc1e49dbad8055eaadd727141b26e4ddb4",
+    "verified_tree": "8cde19a45e82299b80190f99cbb48a10fd0ba927",
+    "message": "fix(eod): scope prior enrichment fallback dates to requested markets",
+    "files": [
+      "apps/api/app/eod/pykrx_enrichment.py",
+      "apps/api/tests/test_pykrx_enrichment.py"
+    ]
+  },
+  {
+    "repository": "kiseyno-AI/kai-trading-core",
+    "branch": "codex/core-incremental-audit-20261108",
+    "local_commit": "c0d3f7197e85e23a2ec37d8fe7e9d222d0d00f92",
+    "remote_commit": "ad11fc038848a1782f7dc3e15644fbdbf69f4f9c",
+    "verified_tree": "f1333e4705d0f9b2b8979385aaaae97808451641",
+    "message": "fix: skip non-object trajectory recovery records",
+    "files": [
+      "apps/api/app/agent_context/orchestrator.py",
+      "apps/api/tests/test_agent_context_trajectory_recovery.py"
+    ]
+  }
+]

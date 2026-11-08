@@ -5019,11 +5019,13 @@ class DailyPipelineRunStateService:
                     if not lock_acquired:
                         provider_lock_owned_run_ids.append(int(run_row.id))
                         continue
-                    session.refresh(run_row, with_for_update=True)
-                    for stage_row in stage_rows:
-                        session.refresh(stage_row, with_for_update=True)
-                    if run_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
-                        continue
+                # A run can finish after the initial scan, including parents
+                # without a PyKRX provider fence.
+                session.refresh(run_row, with_for_update=True)
+                for stage_row in stage_rows:
+                    session.refresh(stage_row, with_for_update=True)
+                if run_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                    continue
 
                 linked_eod_ids: list[int] = []
                 metadata_eod_run_id = _as_int(

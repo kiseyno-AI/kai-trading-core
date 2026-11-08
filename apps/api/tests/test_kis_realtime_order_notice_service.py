@@ -172,6 +172,46 @@ class KISRealtimeOrderNoticeServiceTests(unittest.TestCase):
         self.assertEqual(order_row['average_fill_price'], Decimal('70010'))
         self.assertEqual([event['event_type'] for event in events], ['accept', 'partial_fill'])
 
+    def _assert_correction_preserves_prior_fill(
+        self, *, correction: str, status: str, remaining: str,
+    ) -> None:
+        self._seed_order()
+        received_at = datetime(2026, 4, 28, 0, 20, tzinfo=timezone.utc)
+        self.service.ingest_notice_fields(
+            self._build_notice(
+                cntg_yn='2', stock_cntg_hour='091000',
+                cntg_qty='4', cntg_unpr='70010',
+            ),
+            received_at=received_at,
+        )
+        correction_result = self.service.ingest_notice_fields(
+            self._build_notice(
+                cntg_yn='1', stock_cntg_hour='091100',
+                cntg_qty='6', cntg_unpr='0', rctf_cls=correction,
+            ),
+            received_at=received_at,
+        )
+        order = load_broker_order(
+            account_reference=self.account_reference, broker_order_id=self.broker_order_id,
+        )
+
+        self.assertTrue(correction_result['inserted'])
+        self.assertEqual(order['current_status'], status)
+        self.assertEqual(order['filled_quantity'], Decimal('4'))
+        self.assertEqual(order['remaining_quantity'], Decimal(remaining))
+        self.assertEqual(order['average_fill_price'], Decimal('70010'))
+        self.assertEqual(order['last_fill_at'], datetime(2026, 4, 28, 0, 10, tzinfo=timezone.utc))
+
+    def test_cancel_notice_preserves_prior_fill_quantity_and_average_price(self) -> None:
+        self._assert_correction_preserves_prior_fill(
+            correction='02', status='canceled', remaining='0',
+        )
+
+    def test_replace_notice_preserves_prior_fill_quantity_and_average_price(self) -> None:
+        self._assert_correction_preserves_prior_fill(
+            correction='01', status='replaced', remaining='6',
+        )
+
     def test_duplicate_and_older_notice_do_not_regress_filled_snapshot(self) -> None:
         self._seed_order()
         received_at = datetime(2026, 4, 28, 0, 20, tzinfo=timezone.utc)

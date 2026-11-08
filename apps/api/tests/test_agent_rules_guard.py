@@ -112,6 +112,20 @@ class GuardTests(unittest.TestCase):
         violations = guard.validate({**changed('- new note'), CHANGELOG: (base, rewritten)})
         self.assertTrue(any('changelog_not_append_only' in v for v in violations))
 
+    def test_changelog_entries_require_a_valid_leading_calendar_date(self) -> None:
+        for entry in (
+            '- report:r finding:f signal-decider: evidence note',
+            '- report:r finding:f signal-decider: 2026-11-08 evidence note',
+            '- 2026-02-29 report:r finding:f signal-decider: evidence note',
+            '- 2026-13-01 report:r finding:f signal-decider: evidence note',
+        ):
+            with self.subTest(entry=entry):
+                files = {**changed('- new note'), CHANGELOG: (CL_BASE, CL_BASE + entry + '\n')}
+                self.assertTrue(any('changelog_entry' in v for v in guard.validate(files)))
+
+        leap_day = CL_BASE + '- 2024-02-29 report:r finding:f signal-decider: evidence note\n'
+        self.assertEqual(guard.validate({**changed('- new note'), CHANGELOG: (CL_BASE, leap_day)}), [])
+
     def test_no_change_at_all_is_a_pass(self) -> None:
         self.assertEqual(guard.validate({}), [])
 

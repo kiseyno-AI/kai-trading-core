@@ -194,7 +194,9 @@ async def audit_and_require_upstream_bearer_token(request: Request, call_next):
     try:
         if configured_token and request.method != 'OPTIONS':
             scheme, _, credentials = request.headers.get('Authorization', '').partition(' ')
-            if scheme != 'Bearer' or not credentials or not compare_digest(credentials, configured_token):
+            if scheme != 'Bearer' or not credentials or not compare_digest(
+                credentials.encode('utf-8'), configured_token.encode('utf-8')
+            ):
                 response = JSONResponse(
                     status_code=401,
                     content={'detail': 'Unauthorized'},

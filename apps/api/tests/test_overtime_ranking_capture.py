@@ -129,6 +129,14 @@ class OvertimeRankingCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(later['improved_sources'], [OVERTIME_FLUCTUATION_SOURCE])
         self.assertEqual(len(self.store.usable_rows('2026-11-06', OVERTIME_VOLUME_SOURCE)[0]), 20)
         self.assertEqual(len(self.store.usable_rows('2026-11-06', OVERTIME_FLUCTUATION_SOURCE)[0]), 30)
+        self.assertEqual(
+            self.store.usable_rows('2026-11-06', OVERTIME_VOLUME_SOURCE)[1]['captured_at'],
+            _kst(17, 50).isoformat(),
+        )
+        self.assertEqual(
+            self.store.usable_rows('2026-11-06', OVERTIME_FLUCTUATION_SOURCE)[1]['captured_at'],
+            _kst(17, 56).isoformat(),
+        )
 
     async def test_one_failing_source_does_not_block_the_other(self):
         client = _client(GOOD_VOLUME, GOOD_FLUCT)

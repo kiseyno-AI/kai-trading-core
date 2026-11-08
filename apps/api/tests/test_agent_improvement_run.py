@@ -60,6 +60,15 @@ class SelectionTests(unittest.TestCase):
         _, issues = run.split_findings([weaker, ISSUE])
         self.assertEqual([f['id'] for f in issues], [ISSUE['id']])
 
+    def test_issue_selection_accepts_null_significance_from_a_report(self) -> None:
+        unknown = {**ISSUE, 'horizon': 1, 'evidence': {**ISSUE['evidence'], 't_hac': None}}
+        for findings in ([unknown, ISSUE], [ISSUE, unknown]):
+            with self.subTest(findings=findings):
+                _, issues = run.split_findings(findings)
+                self.assertEqual(issues, [ISSUE])
+        _, issues = run.split_findings([unknown, {**unknown, 'horizon': 10}])
+        self.assertEqual(issues, [unknown])
+
     def test_at_most_one_text_change_per_agent_per_run(self) -> None:
         other = {**TEXT, 'id': 'persistent_no_skill:signal_decider_conf|5', 'rule': 'persistent_no_skill'}
         chosen = run.cap_text_changes([TEXT, other])
@@ -118,7 +127,9 @@ class ApplyPathTests(unittest.TestCase):
         def runner(cmd, *, input=None, check=True, cwd=None):
             calls.append(list(cmd))
             self.cwds.append(cwd)
-            if cmd[:2] == ['git', 'show']:
+            if cmd[:2] == ['git', 'rev-parse']:
+                return _Done(0, 'a' * 40 + '\n')
+            if cmd[:3] == ['git', '--no-replace-objects', 'show']:
                 return _Done(0, base_guard)
             if cmd[:2] == ['codex', 'exec'] and codex_fails:
                 raise RuntimeError('codex crashed')
@@ -196,9 +207,12 @@ class IsolationTests(unittest.TestCase):
         self.assertFalse(guard[2].startswith(worktree + '/'))
         self.assertFalse(guard[2].startswith('/tmp/repo/'))
         self.assertEqual(self.guard_seen, 'def main():\n    return 1  # main copy\n')
-        show = calls.index(['git', 'show', 'origin/main:scripts/agent_rules_guard.py'])
+        base_sha = 'a' * 40
+        show = calls.index(['git', '--no-replace-objects', 'show', f'{base_sha}:scripts/agent_rules_guard.py'])
         codex = next(i for i, c in enumerate(calls) if c[:2] == ['codex', 'exec'])
         self.assertLess(show, codex)
+        self.assertEqual(guard[-2:], ['--base', base_sha])
+        self.assertEqual(next(c for c in calls if c[:3] == ['git', 'worktree', 'add'])[-1], base_sha)
 
     def test_the_live_checkout_never_changes_branch(self) -> None:
         for kwargs in ({}, {'guard_rc': 1}, {'staged_clean': True}):
@@ -283,6 +297,70 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertEqual(self._git(self.live, 'status', '--porcelain'), '')
         self.assertNotIn('e2e', self._git(self.live, 'branch', '--list'))
         self.assertEqual(self._git(self.live, 'worktree', 'list').count('\n'), 1)
+
+
+    def test_a_candidate_cannot_hide_changes_by_moving_origin_main(self) -> None:
+        external: list[list[str]] = []
+
+        def runner(cmd, *, input=None, check=True, cwd=None):
+            if cmd[:2] == ['codex', 'exec']:
+                tree = Path(cmd[cmd.index('--cd') + 1])
+                contract = tree / self.CONTRACT
+                contract.write_text(contract.read_text().replace('# rules', '# weakened rules'))
+                self._git(tree, 'add', '-A')
+                self._git(tree, 'commit', '-q', '-m', 'outside-block edit')
+                self._git(tree, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+                contract.write_text(contract.read_text().replace('- be careful', '- Require clear evidence.'))
+                changelog = tree / 'agent_rules' / 'CHANGELOG.md'
+                changelog.write_text(changelog.read_text() + '- 2026-11-08 report:e2e finding:example signal-decider: clarify evidence\n')
+                return _Done(0)
+            if cmd[0] == 'gh' or cmd[:2] == ['git', 'push']:
+                external.append(list(cmd))
+                return _Done(0, '[]')
+            return run._default_runner(cmd, input=input, check=check, cwd=cwd)
+
+        result = run.execute(
+            findings=[TEXT], run_id='e2e', apply=True, runner=runner, policy_text=POLICY,
+            contract_blocks={'signal-decider': '- be careful'}, repo_dir=str(self.live), work_root=str(self.root),
+        )
+
+        self.assertEqual(result['pull_request'], 'blocked_by_guard')
+        self.assertIn('outside_calibration_block', result['guard_output'])
+        self.assertEqual(external, [])
+        self.assertEqual(self._git(self.live, 'branch', '--show-current').strip(), 'main')
+        self.assertEqual(self._git(self.live, 'status', '--porcelain'), '')
+
+
+    def test_a_candidate_cannot_rewrite_the_base_through_git_replace(self) -> None:
+        external: list[list[str]] = []
+        original_base = self._git(self.live, 'rev-parse', 'HEAD').strip()
+
+        def runner(cmd, *, input=None, check=True, cwd=None):
+            if cmd[:2] == ['codex', 'exec']:
+                tree = Path(cmd[cmd.index('--cd') + 1])
+                contract = tree / self.CONTRACT
+                contract.write_text(contract.read_text().replace('# rules', '# weakened rules'))
+                self._git(tree, 'add', '-A')
+                replacement_tree = self._git(tree, 'write-tree').strip()
+                replacement = self._git(tree, 'commit-tree', replacement_tree, '-m', 'replacement base').strip()
+                self._git(tree, 'replace', original_base, replacement)
+                contract.write_text(contract.read_text().replace('- be careful', '- Require clear evidence.'))
+                changelog = tree / 'agent_rules' / 'CHANGELOG.md'
+                changelog.write_text(changelog.read_text() + '- 2026-11-08 report:e2e finding:example signal-decider: clarify evidence\n')
+                return _Done(0)
+            if cmd[0] == 'gh' or cmd[:2] == ['git', 'push']:
+                external.append(list(cmd))
+                return _Done(0, '[]')
+            return run._default_runner(cmd, input=input, check=check, cwd=cwd)
+
+        result = run.execute(
+            findings=[TEXT], run_id='e2e', apply=True, runner=runner, policy_text=POLICY,
+            contract_blocks={'signal-decider': '- be careful'}, repo_dir=str(self.live), work_root=str(self.root),
+        )
+
+        self.assertEqual(result['pull_request'], 'blocked_by_guard')
+        self.assertIn('outside_calibration_block', result['guard_output'])
+        self.assertEqual(external, [])
 
 
 if __name__ == '__main__':

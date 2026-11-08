@@ -128,6 +128,21 @@ class DetectorSqlTests(unittest.TestCase):
             self._with_session(setup, lambda: gap_fill.detect_signal_features_missing(D1.isoformat()))
         )
 
+    def test_unrelated_features_do_not_hide_missing_bar_members(self) -> None:
+        def setup(session):
+            missing, complete, unrelated = [self._symbol(session) for _ in range(3)]
+            self._bar(session, missing, D1)
+            self._bar(session, complete, D1)
+            self._feature(session, complete, D1)
+            self._feature(session, unrelated, D1)
+            self._feature(session, missing, D2)
+
+        gap = self._with_session(setup, lambda: gap_fill.detect_signal_features_missing(D1.isoformat()))
+
+        self.assertIsNotNone(gap)
+        self.assertEqual(gap.count, 1)
+        self.assertEqual(gap.detail, {'bar_symbols': 2, 'stored_rows': 1})
+
     def test_participation_missing_or_stale_is_a_gap_and_matching_is_not(self) -> None:
         def make(captured):
             def setup(session):
@@ -174,6 +189,42 @@ class DetectorSqlTests(unittest.TestCase):
 
         self.assertEqual((gap.kind, gap.count), ('turnover_incomplete', 1))
 
+    def test_provider_comparison_observes_bars_repaired_between_checks(self) -> None:
+        state = {}
+
+        def setup(session):
+            missing = self._symbol(session)
+            provisional = self._symbol(session)
+            self._bar(session, provisional, D1)
+            session.flush()
+            bar = session.query(DailyPriceBar).filter_by(symbol_id=provisional.id, trade_date=D1).one()
+            bar.close_price = 104
+            state.update(session=session, missing=missing, provisional=provisional, bar=bar)
+
+        def check():
+            provider = {
+                state['missing'].symbol: (100, 110, 90, 105),
+                state['provisional'].symbol: (100, 110, 90, 105),
+            }
+            comparison = gap_fill._ProviderComparison(
+                lambda: [D1.isoformat()], frame_loader=lambda _date: provider
+            )
+            self.assertEqual(
+                comparison.compare(D1.isoformat()),
+                {'provider_symbols': 2, 'missing_bars': 1, 'provisional_bars': 1},
+            )
+
+            self._bar(state['session'], state['missing'], D1)
+            state['bar'].close_price = 105
+            state['session'].flush()
+
+            self.assertEqual(
+                comparison.compare(D1.isoformat()),
+                {'provider_symbols': 2, 'missing_bars': 0, 'provisional_bars': 0},
+            )
+
+        self._with_session(setup, check)
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -214,3 +265,28 @@ def test_empty_provider_frames_are_not_cached(monkeypatch):
     assert module._load_provider_frame('2026-11-05') == {}
     module._load_provider_frame('2026-11-05')
     assert len(calls) == 4 and module._PROVIDER_FRAME_CACHE == {}
+
+
+def test_partial_market_frame_is_retried_until_both_markets_are_available(monkeypatch):
+    import pandas as pd
+
+    from app.eod import data_gap_fill as module
+
+    def frame(symbol):
+        return pd.DataFrame({'시가': [1], '고가': [2], '저가': [1], '종가': [2]}, index=[symbol])
+
+    kosdaq_responses = iter([pd.DataFrame(), frame('000660')])
+    calls = []
+
+    def provider(_date, market):
+        calls.append(market)
+        return frame('005930') if market == 'KOSPI' else next(kosdaq_responses)
+
+    monkeypatch.setattr(module, '_PROVIDER_FRAME_CACHE', {})
+    monkeypatch.setattr('app.eod.pykrx_backfill._get_market_ohlcv_by_ticker', provider)
+
+    assert module._load_provider_frame('2026-11-05') == {'005930': (1, 2, 1, 2)}
+    complete = {'005930': (1, 2, 1, 2), '000660': (1, 2, 1, 2)}
+    assert module._load_provider_frame('2026-11-05') == complete
+    assert module._load_provider_frame('2026-11-05') == complete
+    assert calls == ['KOSPI', 'KOSDAQ', 'KOSPI', 'KOSDAQ']

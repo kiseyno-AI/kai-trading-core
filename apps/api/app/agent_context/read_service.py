@@ -2954,7 +2954,7 @@ def _build_market_open_drive_context(
     provider_prior_turnover = _finite_int(market_row.get('prior_trading_value'))
     provider_prior_unit = str(market_row.get('prior_trading_value_unit') or '').strip().lower()
     baseline_date: date | None = None
-    coverage_ratio: float | None = None
+    baseline_coverage_ratio: float | None = None
     baseline_source: str | None = None
     baseline_source_table: str | None = None
     baseline_provider_field: str | None = None
@@ -2974,7 +2974,7 @@ def _build_market_open_drive_context(
         candidate_prior_turnover = _finite_int(baseline_payload.get('turnover_krw'))
         baseline_observed_symbol_count = _finite_int(baseline_payload.get('observed_symbol_count'))
         baseline_expected_symbol_count = _finite_int(baseline_payload.get('expected_symbol_count'))
-        coverage_ratio = _finite_float(baseline_payload.get('coverage_ratio'))
+        baseline_coverage_ratio = _finite_float(baseline_payload.get('coverage_ratio'))
         eod_run_id = _finite_int(baseline_payload.get('eod_run_id'))
         eod_completed_at = _open_drive_datetime(baseline_payload.get('eod_run_completed_at'))
         coverage_proof = _maybe_dict(baseline_payload.get('coverage_proof'))
@@ -3010,7 +3010,7 @@ def _build_market_open_drive_context(
                 candidate_prior_turnover,
                 baseline_observed_symbol_count,
                 baseline_expected_symbol_count,
-                coverage_ratio,
+                baseline_coverage_ratio,
                 eod_run_id,
                 eod_completed_at,
             )
@@ -3023,7 +3023,7 @@ def _build_market_open_drive_context(
         ):
             baseline_validation_reason = 'baseline_values_invalid'
         elif (
-            coverage_ratio != 1.0
+            baseline_coverage_ratio != 1.0
             or baseline_observed_symbol_count != baseline_expected_symbol_count
         ):
             baseline_validation_reason = 'baseline_coverage_invalid'
@@ -3278,7 +3278,7 @@ def _build_market_open_drive_context(
             'baseline_provider_field': baseline_provider_field,
             'baseline_relative_session': baseline_relative_session,
             'baseline_market_date': baseline_date.isoformat() if baseline_date is not None else None,
-            'baseline_coverage_ratio': coverage_ratio,
+            'baseline_coverage_ratio': baseline_coverage_ratio,
             'breadth_completeness': {
                 'status': 'verified' if breadth_complete else 'unverified',
                 'expected_symbol_count': expected_symbol_count,

@@ -2319,6 +2319,7 @@ def _claim_feedback_retry_run(
             .where(
                 AgentContextFeedbackRun.market_date == market_date,
             )
+            .with_for_update()
             .order_by(
                 AgentContextFeedbackRun.started_at.desc(),
                 AgentContextFeedbackRun.id.desc(),
@@ -3114,6 +3115,7 @@ class AgentFeedbackRetryService:
                 market_date=market_date,
                 roles=expected_roles,
                 symbols=symbols,
+                knowledge_cutoff_at=knowledge_cutoff_at,
             )
         incomplete: list[str] = []
         for symbol in symbols:

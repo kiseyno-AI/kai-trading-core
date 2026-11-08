@@ -823,6 +823,7 @@ def _inspect_runtime_schema_drift(
             matches = [candidate for candidate in column_matches if candidate.get('name') == required_name]
         else:
             matches = column_matches
+        matches = [candidate for candidate in matches if candidate.get('where') is None]
 
         ready = bool(matches)
         check = {
@@ -1288,6 +1289,8 @@ def collect_deploy_smoke_check(
             try:
                 response = client.get(path)
                 payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError('Expected a JSON object')
             except Exception as exc:
                 checks[name] = {
                     'ok': False,
@@ -1300,7 +1303,8 @@ def collect_deploy_smoke_check(
 
             if name == 'health':
                 app_status = payload.get('status')
-                database_connected = bool((payload.get('database') or {}).get('connected'))
+                database = payload.get('database')
+                database_connected = isinstance(database, dict) and database.get('connected') is True
                 ok = response.status_code == 200 and app_status == 'ok' and database_connected
                 checks[name] = {
                     'ok': ok,

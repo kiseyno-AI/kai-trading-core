@@ -84,6 +84,8 @@ def _to_decimal(
         normalized = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
         raise TradingOrderValidationError(f'{field} must be numeric') from exc
+    if not normalized.is_finite():
+        raise TradingOrderValidationError(f'{field} must be finite')
     if positive and normalized <= Decimal('0'):
         raise TradingOrderValidationError(f'{field} must be greater than zero')
     if non_negative and normalized < Decimal('0'):
@@ -263,7 +265,9 @@ class TradingOrderService:
                 ),
             )
 
-        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty')) or _safe_decimal(order_row.get('remaining_quantity'))
+        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty'))
+        if possible_quantity is None:
+            possible_quantity = _safe_decimal(order_row.get('remaining_quantity'))
         if possible_quantity is None or possible_quantity <= Decimal('0'):
             raise TradingOrderValidationError('order has no cancelable quantity remaining')
 
@@ -569,7 +573,9 @@ class TradingOrderService:
         if amended_quantity == _safe_decimal(order_row.get('requested_quantity')) and broker_order_price == (_safe_decimal(order_row.get('requested_price')) or Decimal('0')) and amended_order_type == str(order_row['order_type']):
             raise TradingOrderValidationError('amend request does not change the order quantity, price, or type')
 
-        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty')) or base_quantity
+        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty'))
+        if possible_quantity is None:
+            possible_quantity = base_quantity
         if possible_quantity is not None and amended_quantity > possible_quantity:
             raise TradingOrderValidationError('amended quantity exceeds KIS amendable quantity')
 
@@ -1039,6 +1045,12 @@ class TradingOrderService:
                 condition_price=_decimal_to_text(normalized.condition_price) or '',
             )
             broker_order_id = _normalize_optional_text(_pick_first(response_payload.get('output'), 'ODNO', 'odno'))
+            if broker_order_id is None:
+                raise KISTransportError(
+                    'KIS order response did not confirm a broker order id',
+                    payload=response_payload,
+                    ambiguous_submission=True,
+                )
             forward_orgno = _normalize_optional_text(
                 _pick_first(response_payload.get('output'), 'KRX_FWDG_ORD_ORGNO', 'krx_fwdg_ord_orgno')
             )
@@ -1396,6 +1408,8 @@ class TradingOrderService:
             'time_in_force': normalized.time_in_force,
             'exchange_id': normalized.exchange_id,
             'broker_order_code': normalized.broker_order_code,
+            'sell_type': normalized.sell_type,
+            'condition_price': _decimal_to_text(normalized.condition_price),
         }
         comparable_existing = {
             key: existing_payload.get(key)
@@ -1623,7 +1637,7 @@ class TradingOrderService:
             }
 
         append_result = append_broker_order_event(event)
-        refreshed_row = upsert_broker_order(desired_order)
+        refreshed_row = upsert_broker_order(desired_order, observed_at=now)
         local_after = self._build_order_state_snapshot(refreshed_row)
         missing_fill_detail_after = self._has_missing_fill_detail(refreshed_row)
         repair_applied = broker_truth_found and bool(mismatch_reasons)
@@ -1661,33 +1675,13 @@ class TradingOrderService:
         refreshed_row = upsert_broker_order(
             {
                 'id': refreshed_row['id'],
-                'order_request_id': refreshed_row['order_request_id'],
                 'broker_name': refreshed_row['broker_name'],
                 'client_order_id': refreshed_row['client_order_id'],
-                'broker_order_id': refreshed_row['broker_order_id'],
                 'account_reference': refreshed_row['account_reference'],
-                'symbol': refreshed_row['symbol'],
-                'side': refreshed_row['side'],
-                'order_type': refreshed_row['order_type'],
-                'requested_quantity': refreshed_row['requested_quantity'],
-                'requested_price': refreshed_row['requested_price'],
-                'accepted_quantity': refreshed_row['accepted_quantity'],
-                'accepted_price': refreshed_row['accepted_price'],
-                'filled_quantity': refreshed_row['filled_quantity'],
-                'remaining_quantity': refreshed_row['remaining_quantity'],
-                'average_fill_price': refreshed_row['average_fill_price'],
-                'time_in_force': refreshed_row.get('time_in_force'),
-                'current_status': refreshed_row['current_status'],
-                'status_reason': refreshed_row.get('status_reason'),
-                'first_submitted_at': refreshed_row.get('first_submitted_at'),
-                'last_broker_update_at': refreshed_row.get('last_broker_update_at'),
-                'last_fill_at': refreshed_row.get('last_fill_at'),
                 'last_reconciled_at': now,
                 'last_reconcile_status': reconcile_status,
                 'last_reconcile_trigger': trigger,
                 'last_reconcile_payload': reconcile_summary,
-                'raw_latest_payload': refreshed_row.get('raw_latest_payload'),
-                'snapshot_payload': refreshed_row.get('snapshot_payload'),
             }
         )
         broker_inquiry['reconcile'] = reconcile_summary
@@ -1735,7 +1729,7 @@ class TradingOrderService:
         for row in inquiry_rows:
             row_order_id = str(_pick_first(row, 'odno') or '')
             row_origin_order_id = str(_pick_first(row, 'orgn_odno') or '')
-            if broker_order_id and row_order_id not in {broker_order_id, row_origin_order_id}:
+            if broker_order_id and broker_order_id not in {row_order_id, row_origin_order_id}:
                 continue
             if client_symbol and str(_pick_first(row, 'pdno') or '') not in {'', client_symbol}:
                 continue
@@ -1753,7 +1747,7 @@ class TradingOrderService:
         for row in cancelable_rows:
             row_order_id = str(_pick_first(row, 'odno') or '')
             row_origin_order_id = str(_pick_first(row, 'orgn_odno') or '')
-            if broker_order_id and row_order_id not in {broker_order_id, row_origin_order_id}:
+            if broker_order_id and broker_order_id not in {row_order_id, row_origin_order_id}:
                 continue
             if client_symbol and str(_pick_first(row, 'pdno') or '') not in {'', client_symbol}:
                 continue

@@ -4,6 +4,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.eod import daily_pipeline_state as state_module
 from app.eod.live_progress import DailyPipelineLiveProgress
@@ -210,6 +211,31 @@ class LiveProgressTests(unittest.TestCase):
         run = self.live.snapshot(now=later)['active_run']
 
         self.assertTrue(run['stale_suspected'])
+
+    def test_new_progress_is_not_masked_by_an_older_heartbeat(self):
+        old = datetime(2026, 11, 6, 11, 10, tzinfo=timezone.utc)
+        self.live.publish_run(_run())
+        self.live.publish_stage(_stage('price_collection', total=10))
+        with patch('app.eod.live_progress._now', return_value=old):
+            self.live.publish_heartbeat(
+                pipeline_run_id=700,
+                stage_id='price_collection',
+                alive=True,
+            )
+        self.live.publish_stage(
+            _stage(
+                'price_collection',
+                processed=5,
+                total=10,
+                updated_at=(old + timedelta(minutes=30)).isoformat(),
+            )
+        )
+
+        run = self.live.snapshot(now=old + timedelta(minutes=31))['active_run']
+
+        self.assertFalse(run['stale_suspected'])
+        self.assertEqual(run['seconds_since_update'], 60.0)
+        self.assertEqual(run['stages'][0]['seconds_since_update'], 60.0)
 
     def test_publishing_never_raises_on_bad_input(self):
         for call in (

@@ -4311,6 +4311,52 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata['feedback_followup'], feedback_result)
         self.assertEqual(metadata['compound_status'], 'completed')
 
+    async def test_compound_refresh_preserves_its_run_metadata_when_a_newer_run_exists(self):
+        service, repository = self._build_global_followup_service()
+        own_run = {
+            'id': 188,
+            'symbols_checked': 1,
+            'events_captured': 2,
+            'run_metadata': {'test_run_identity': 'original'},
+        }
+        newer_run = {
+            'id': 189,
+            'symbols_checked': 99,
+            'events_captured': 88,
+            'run_metadata': {'test_run_identity': 'newer'},
+        }
+        repository.get_latest_refresh_run = Mock(
+            side_effect=lambda **kwargs: (
+                own_run if kwargs.get('run_id') == own_run['id'] else newer_run
+            ),
+        )
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'completed',
+                'scan_status': 'completed',
+                'coverage_ready_stock_codes': ['005930'],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': [],
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(repository.completed_refresh_runs)
+        for run_id, values in repository.completed_refresh_runs:
+            self.assertEqual(run_id, own_run['id'])
+            self.assertEqual(values['symbols_checked'], 1)
+            self.assertEqual(values['events_captured'], 2)
+            self.assertEqual(values['run_metadata']['test_run_identity'], 'original')
+
     async def test_compound_refresh_runs_followups_only_for_ready_subset(self):
         service, repository = self._build_global_followup_service(
             ['000660', '005930']
@@ -4700,7 +4746,7 @@ class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
             'corp_code': '00000077',
             'corp_name': '재확인',
             'stock_code': '111111',
-            'report_nm': '분기보고서 (2025.12)',
+            'report_nm': '분기보고서 (2025.09)',
             'filing_category': 'quarterly_report',
             'fundamentals_capture_status': 'no_data',
             'receipt_date': '2026-03-01',
@@ -4708,13 +4754,27 @@ class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
 
         class RecheckRepository(FakeCaptureRepository):
             def list_capture_candidates(self, **kwargs):
-                return []
+                self.candidate_call_kwargs.append(kwargs)
+                if recheck_event['id'] not in (kwargs.get('event_ids') or []):
+                    return []
+                receipt_date = date.fromisoformat(recheck_event['receipt_date'])
+                if kwargs.get('receipt_date_from') and receipt_date < kwargs['receipt_date_from']:
+                    return []
+                if kwargs.get('receipt_date_to') and receipt_date > kwargs['receipt_date_to']:
+                    return []
+                return [recheck_event]
 
             def list_file_not_found_rechecks(self, *, stock_codes, limit=20):
                 self.recheck_call = {'stock_codes': list(stock_codes), 'limit': limit}
                 return [recheck_event]
 
         repository = RecheckRepository()
+        repository.symbol_states['111111'] = {
+            'stock_code': '111111',
+            'has_fundamentals': True,
+            'latest_fundamentals_receipt_date': '2026-04-01',
+            'latest_resolved_fundamentals_receipt_date': '2026-04-01',
+        }
         service = DartFundamentalsCaptureService(
             client=FakeCaptureClient(),
             repository=repository,
@@ -4735,13 +4795,21 @@ class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
             'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
             False,
         ):
-            await service.run_daily_incremental_refresh(
+            result = await service.run_daily_incremental_refresh(
                 market_date=date(2026, 4, 14), capture_limit=10, fs_div='CFS', trigger='test_daily',
+                run_piotroski_followup=False, run_feedback_followup=False,
             )
 
         self.assertEqual(repository.recheck_call, {'stock_codes': ['111111'], 'limit': 10})
         metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
         self.assertGreaterEqual(int(metadata.get('events_detected') or repository.completed_refresh_runs[-1][1].get('events_detected') or 0), 1)
+        self.assertEqual(result['capture']['events_captured'], 1)
+        self.assertEqual(repository.successes, [77])
+        self.assertEqual(repository.snapshots[0]['snapshot_payload']['rcept_no'], recheck_event['rcept_no'])
+        capture_queries = [call for call in repository.candidate_call_kwargs if call.get('event_ids')]
+        self.assertEqual(len(capture_queries), 1)
+        self.assertEqual(capture_queries[0]['event_ids'], [77])
+        self.assertEqual(capture_queries[0]['receipt_date_to'], date(2026, 4, 14))
 
 
 def test_bounded_rotation_visits_every_candidate_on_weekday_runs():

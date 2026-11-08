@@ -17,6 +17,7 @@ an allowed path, so the automation cannot edit its own guard.
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import re
 import subprocess
 import sys
@@ -48,6 +49,17 @@ FORBIDDEN = tuple(
     )
 )
 CHANGELOG_ENTRY = re.compile(r'report:\S+.*finding:\S+|finding:\S+.*report:\S+')
+
+
+def _valid_changelog_entry(line: str) -> bool:
+    dated_entry = re.match(r'^- (\d{4}-\d{2}-\d{2}) ', line)
+    if dated_entry is None or CHANGELOG_ENTRY.search(line) is None:
+        return False
+    try:
+        date.fromisoformat(dated_entry.group(1))
+    except ValueError:
+        return False
+    return True
 
 
 def _split(text: str) -> tuple[str, str, str] | None:
@@ -94,8 +106,8 @@ def validate(
             else:
                 added = head[len(base):]
                 lines = [line for line in added.split('\n') if line.strip()]
-                if not lines or not all(CHANGELOG_ENTRY.search(line) for line in lines):
-                    violations.append('changelog_entry must name report:<id> and finding:<id> on every added line')
+                if not lines or not all(_valid_changelog_entry(line) for line in lines):
+                    violations.append('changelog_entry must start with a valid - YYYY-MM-DD date and name report:<id> and finding:<id> on every added line')
             continue
         if not CONTRACT_PATH.match(path):
             violations.append(f'path_not_allowed: {path}')
@@ -120,11 +132,11 @@ def validate(
 
 # ------------------------------------------------------------------------- git glue
 def _git(*args: str) -> str:
-    return subprocess.run(['git', *args], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(['git', '--no-replace-objects', *args], check=True, capture_output=True, text=True).stdout
 
 
 def _read(ref: str, path: str) -> str:
-    result = subprocess.run(['git', 'show', f'{ref}:{path}'], capture_output=True, text=True)
+    result = subprocess.run(['git', '--no-replace-objects', 'show', f'{ref}:{path}'], capture_output=True, text=True)
     return result.stdout if result.returncode == 0 else ''
 
 

@@ -395,6 +395,50 @@ class DailyMomentumFactorServiceTests(unittest.TestCase):
         self.assertEqual(persisted['momentum_percentile'], 0.5)
         self.assertEqual(persisted['factor_payload']['ranking']['ranked_universe_size'], 3)
 
+    def test_subset_rebuild_retains_missing_targets_outside_the_day_universe(self) -> None:
+        histories = {
+            '005930': list(reversed(_build_bars([100] + [150] * 252))),
+            '000660': list(reversed(_build_bars([100] + [120] * 252))),
+        }
+        cases = (
+            (histories, ['005930', '035420'], ['005930']),
+            ({}, ['035420'], []),
+        )
+        for available_histories, requested, successful in cases:
+            with self.subTest(requested=requested):
+                service = DailyMomentumFactorService()
+                with (
+                    patch(
+                        'app.signals.momentum_factor.list_symbols_with_daily_bar_on_date',
+                        return_value=list(available_histories),
+                    ),
+                    patch(
+                        'app.signals.momentum_factor.load_recent_price_bars_by_symbol',
+                        return_value=available_histories,
+                    ) as load_histories,
+                    patch('app.signals.momentum_factor.upsert_daily_momentum_factor_results'),
+                ):
+                    result = service.rebuild_for_market_date(
+                        market_date='2025-09-10', symbols=requested,
+                    )
+
+                self.assertEqual(result['failed_symbols'], ['035420'])
+                self.assertEqual(result['results_failed'], 1)
+                self.assertEqual(result['missing_market_date_bar_count'], 1)
+                self.assertEqual(result['requested_symbol_count'], len(requested))
+                self.assertEqual(result['successful_stock_codes'], successful)
+                self.assertEqual(result['retry_debt_stock_codes'], ['035420'])
+                self.assertEqual([item['symbol'] for item in result['items']], successful)
+                load_histories.assert_called_once_with(
+                    market_date='2025-09-10', symbols=list(available_histories),
+                    history_days=service.history_window,
+                )
+                if successful:
+                    self.assertEqual(result['items'][0]['momentum_rank'], 1)
+                    self.assertEqual(
+                        result['items'][0]['factor_payload']['ranking']['ranked_universe_size'], 2,
+                    )
+
     def test_evaluate_symbol_uses_requested_universe_for_cross_sectional_rank(self) -> None:
         service = DailyMomentumFactorService()
         histories = {

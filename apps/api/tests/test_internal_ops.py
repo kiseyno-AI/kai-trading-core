@@ -42,6 +42,30 @@ class FakeDailyPipelineRunStateService:
 
 
 class InternalAPIClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_ascii_bearer_token_is_rejected_without_calling_route(self) -> None:
+        app = FastAPI()
+        app.middleware('http')(audit_and_require_upstream_bearer_token)
+        route_called = False
+
+        @app.post('/protected')
+        async def protected() -> dict:
+            nonlocal route_called
+            route_called = True
+            return {'ok': True}
+
+        with patch.object(settings, 'upstream_bearer_token', 'internal-secret'):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url='http://testserver'
+            ) as client:
+                response = await client.post(
+                    '/protected', headers={b'Authorization': b'Bearer invalid-\xff'}
+                )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers['www-authenticate'], 'Bearer')
+        self.assertEqual(response.json(), {'detail': 'Unauthorized'})
+        self.assertFalse(route_called)
+
     async def test_client_attaches_bearer_token_for_internal_http_calls(self) -> None:
         original_token = settings.upstream_bearer_token
         settings.upstream_bearer_token = 'internal-secret'
@@ -2237,6 +2261,27 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_stages.call_args.kwargs['markets'], ['KOSPI', 'KOSDAQ'])
         self.assertEqual(run_stages.call_args.kwargs['feedback_max_cycles'], 4)
         self.assertFalse(run_stages.call_args.kwargs['reuse_existing_feedback'])
+
+    def test_blank_explicit_pipeline_scope_is_rejected_before_admission(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.daily_pipeline_stage_service.run_state_service,
+                'start_run',
+                side_effect=AssertionError('invalid scope reached run admission'),
+            ) as start_run,
+        ):
+            for symbols in ('', ' ', ','):
+                with self.subTest(symbols=symbols), self.assertRaisesRegex(
+                    ValueError, 'invalid KRX symbol'
+                ):
+                    ops.run_daily_pipeline_stages(
+                        market_date='2026-04-14',
+                        stages='value_factors',
+                        symbols=symbols,
+                    )
+
+            start_run.assert_not_called()
 
     def test_compute_signal_decider_evaluations_uses_direct_service_call(self) -> None:
         with (

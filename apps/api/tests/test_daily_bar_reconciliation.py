@@ -247,6 +247,39 @@ class NaverFetchTests(unittest.TestCase):
         self.assertEqual(bars, {})
         self.assertIn('ValueError', errors['005930'])
 
+    def test_malformed_numeric_row_does_not_abort_other_symbols(self) -> None:
+        for bad_value in (None, 'not-a-price'):
+            with self.subTest(bad_value=bad_value):
+                def opener(request, timeout):
+                    if 'symbol=000660' in request.full_url:
+                        return _Response(repr([
+                            ['date', 'open', 'high', 'low', 'close', 'volume'],
+                            ['20261106', 100, 110, 90, bad_value, 1000],
+                        ]))
+                    return _Response(NAVER_BODY)
+
+                bars, errors = recon.fetch_naver_bars(
+                    ['000660', '005930'], DAY, opener=opener, sleep=lambda _: None
+                )
+
+                self.assertEqual(bars, {'005930': (5050, 5250, 4980, 5110, 189025)})
+                self.assertEqual(set(errors), {'000660'})
+                self.assertIn('Error:', errors['000660'])
+
+    def test_incomplete_ohlcv_row_is_an_error_instead_of_a_bar(self) -> None:
+        def opener(request, timeout):
+            if 'symbol=000660' in request.full_url:
+                return _Response("[['date'], ['20261106', 100, 110, 90, 105]]")
+            return _Response(NAVER_BODY)
+
+        bars, errors = recon.fetch_naver_bars(
+            ['000660', '005930'], DAY, opener=opener, sleep=lambda _: None
+        )
+
+        self.assertEqual(bars, {'005930': (5050, 5250, 4980, 5110, 189025)})
+        self.assertEqual(set(errors), {'000660'})
+        self.assertIn('ValueError:', errors['000660'])
+
 
 class DatabaseReaderTests(unittest.TestCase):
     """The DB readers against the test database (rolled back)."""

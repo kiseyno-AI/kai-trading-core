@@ -119,7 +119,7 @@ def sanitize_log_value(value: Any, *, key: str | None = None, depth: int = 0) ->
     if isinstance(value, str):
         return _truncate_string(value)
     if depth >= _MAX_LOG_DEPTH:
-        return _truncate_string(str(value))
+        return '[TRUNCATED: max depth]'
     if isinstance(value, Mapping):
         if key and 'headers' in key.lower():
             header_values = {

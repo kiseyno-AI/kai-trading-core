@@ -1,5 +1,6 @@
 import unittest
 from datetime import date
+from decimal import Decimal
 from unittest.mock import patch
 
 from app.quotes.cache import quote_cache
@@ -106,6 +107,38 @@ class DisplayPriceTests(unittest.TestCase):
         self.assertEqual(result['price_status'], 'unavailable')
         self.assertFalse(result['display_price_available'])
         load_daily_bars.assert_called_once_with('000660', end_date=date(2026, 4, 29), limit=2)
+
+    def test_nonfinite_prices_preserve_daily_close_fallback(self) -> None:
+        for text in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+            for value in (text, Decimal(text)):
+                with (
+                    self.subTest(value=value),
+                    patch(
+                        'app.quotes.display_prices.load_current_quote',
+                        return_value={
+                            'price': value,
+                            'trade_date': '2026-04-30',
+                        },
+                    ),
+                    patch(
+                        'app.quotes.display_prices.load_daily_bars_for_symbol',
+                        return_value=[{
+                            'close_price': 180000,
+                            'trade_date': '2026-04-30',
+                        }],
+                    ),
+                ):
+                    realtime_fields = self._unavailable_realtime_fields()
+                    realtime_fields['current_price'] = value
+                    result = build_display_price_fields(
+                        '000660',
+                        market_date=date(2026, 4, 30),
+                        realtime_fields=realtime_fields,
+                    )
+
+                    self.assertEqual(result['current_price'], 180000)
+                    self.assertEqual(result['price_source'], 'daily_close')
+                    self.assertTrue(result['display_price_available'])
 
 
 if __name__ == '__main__':

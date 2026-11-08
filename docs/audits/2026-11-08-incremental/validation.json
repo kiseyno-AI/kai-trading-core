@@ -1,0 +1,15 @@
+{
+  "status": "in_progress",
+  "checkpointed_at_utc": "2026-11-08T19:44:31.714919+00:00",
+  "source_baseline": "2ee26af61fe3107797f41c34c174d59b5ab5a651",
+  "checkpoint_local_parent": "b535596f6aa0bc1639b7400f0e145077e33237a9",
+  "baseline_full_suite": {
+    "production_source": "2ee26af61fe3107797f41c34c174d59b5ab5a651",
+    "test_only_isolation_changes": true,
+    "result": "5223 passed, 14 warnings in 198.20s (0:03:18)",
+    "exit_code": 0
+  },
+  "aggregate_feature_full_suite": "pending",
+  "method": "Offline providers and brokers; fresh disposable PostgreSQL migrated to head. No production database or live order validation.",
+  "manual_coverage": "See per-reviewer records and inventory. Passing tests and static scans are not counted as manual line review."
+}

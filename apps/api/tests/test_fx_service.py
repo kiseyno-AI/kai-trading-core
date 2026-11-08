@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import AsyncMock
 
 from app.core.settings import settings
 from app.fx.service import KoreaEximRateNotFoundError, KoreaEximService
+from app.integrations.fx.client import KoreaEximAPIError
 
 
 class FakeFXClient:
@@ -75,6 +77,18 @@ class KoreaEximServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(KoreaEximRateNotFoundError):
             await service.get_exchange_rates(search_date='20260406', currency='EUR', fallback_days=1)
+
+    async def test_get_exchange_rates_rejects_nonfinite_provider_values(self):
+        for value in ('NaN', 'Infinity', '-Infinity', '1e10000'):
+            with self.subTest(value=value):
+                client = FakeFXClient()
+                client.fetch_exchange_rates = AsyncMock(
+                    return_value=[{'cur_unit': 'USD', 'deal_bas_r': value}],
+                )
+                service = KoreaEximService(client=client)
+
+                with self.assertRaises(KoreaEximAPIError):
+                    await service.get_exchange_rates(search_date='20260406', currency='USD')
 
 
 if __name__ == '__main__':

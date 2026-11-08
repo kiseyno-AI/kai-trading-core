@@ -183,13 +183,16 @@ def fetch_naver_bars(
                 text = response.read().decode('utf-8', 'replace')
             rows = ast.literal_eval(text.strip())
             row = next((item for item in rows[1:] if str(item[0]) == compact), None)
+            if row is None:
+                errors[symbol] = 'no_row_for_date'
+                continue
+            values = tuple(int(value) for value in row[1:6])
+            if len(values) != len(FIELDS):
+                raise ValueError('reference row must contain five OHLCV values')
         except Exception as exc:  # noqa: BLE001
             errors[symbol] = f'{type(exc).__name__}: {exc}'[:200]
             continue
-        if row is None:
-            errors[symbol] = 'no_row_for_date'
-            continue
-        bars[symbol] = tuple(int(value) for value in row[1:6])  # type: ignore[assignment]
+        bars[symbol] = values  # type: ignore[assignment]
     return bars, errors
 
 

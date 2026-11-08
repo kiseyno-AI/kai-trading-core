@@ -404,7 +404,7 @@ class USAgentAnalysisService:
                         })
                         continue
                     context = dict(prepared['contexts'][symbol])
-                    context['upstream_agent_feedback'] = feedback_by_symbol.get(symbol, {})
+                    context['upstream_agent_feedback'] = dict(feedback_by_symbol.get(symbol, {}))
                     context['request_run_id'] = run_id
                     context['session_key'] = batch_session_key
                     context['session_reuse_mode'] = 'fresh_per_batch'
@@ -470,7 +470,6 @@ class USAgentAnalysisService:
                         )
                     else:
                         for context, symbol, normalized in staged_feedback:
-                            feedback_by_symbol.setdefault(symbol, {})[role] = normalized
                             feedback_id = None
                             if persist:
                                 feedback_id = upsert_us_agent_feedback(
@@ -482,11 +481,16 @@ class USAgentAnalysisService:
                                     response_payload=jsonable_encoder(batch_result),
                                     normalized_feedback_payload=normalized,
                                 )
+                            feedback_by_symbol.setdefault(symbol, {})[role] = normalized
                             completed.append({'role': role, 'symbol': symbol, 'feedback_id': feedback_id})
                 except Exception as exc:
+                    completed_symbols = {
+                        item['symbol'] for item in completed if item['role'] == role
+                    }
                     failures.extend(
-                        {'role': role, 'symbol': symbol, 'error': f'{type(exc).__name__}: {exc}'}
-                        for symbol in batch_symbols
+                        {'role': role, 'symbol': str(context['symbol']), 'error': f'{type(exc).__name__}: {exc}'}
+                        for context in batch_items
+                        if str(context['symbol']) not in completed_symbols
                     )
                 finally:
                     session_cleanup.append(

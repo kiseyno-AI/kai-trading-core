@@ -3661,6 +3661,37 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_daily_board_preserves_unknown_activity_for_overflowing_counts(self) -> None:
+        summaries = [
+            json.loads('{"counts": {"open_orders": 1e309}}'),
+            json.loads('{"counts": {"active_execution_jobs": -1e309}}'),
+            {'symbols': {'filled_today_counts': {'buy': {'quantity': 10**400}}}},
+        ]
+        for summary in summaries:
+            with self.subTest(summary=summary), patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc),
+            ):
+                board = self.service._build_runtime_daily_board_payload(
+                    market_date=date(2026, 8, 29),
+                    refresh=False,
+                    overview={
+                        'integration': self.integration,
+                        'runtime': {
+                            'status': 'ok',
+                            'payload': {**self._current_exec_payload(), **summary},
+                            'error': None,
+                        },
+                        'items': [],
+                    },
+                    refresh_state={'requested': False, 'status': 'not_requested'},
+                    served_from_cache=False,
+                )
+
+                self.assertEqual(board['activity_coverage']['status'], 'unavailable')
+                self.assertIsNone(board['activity_coverage']['exec_activity_detected'])
+                self.assertEqual(board['freshness']['status'], 'unavailable')
+
     def test_execution_identity_accepts_exact_broker_id_when_order_has_internal_id(self) -> None:
         executions, mismatches = self.service._match_remote_executions(
             row=SimpleNamespace(symbol='005930'),
@@ -9446,6 +9477,86 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['preview_group_count'], 1)
         self.assertEqual(result['dispatch']['groups'][0]['dispatch_status'], 'preview')
         self.assertEqual(len(self.client.post_calls), 0)
+
+    async def test_dry_run_default_does_not_resend_pending_write_ahead(self) -> None:
+        with patch.object(
+            self.service,
+            '_synchronize_open_buy_authority',
+            return_value={'applies': False, 'accounts': {}, 'errors': []},
+        ):
+            with patch.object(
+                self.client,
+                'post_execution_plan',
+                side_effect=SystemExit('simulated crash before remote send'),
+            ):
+                with self.assertRaises(SystemExit):
+                    await self.service.dispatch_next_open_plan(
+                        target_trade_date=self.target_trade_date,
+                        refresh_plan=False,
+                        dry_run=False,
+                        force=True,
+                    )
+
+            settings.signal_decider_next_open_dry_run = True
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=False,
+                force=True,
+            )
+
+        self.assertTrue(result['request']['dry_run'])
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(self.client.activation_calls, [])
+
+    async def test_dry_run_does_not_activate_accepted_pending_write_ahead(self) -> None:
+        original_post = self.client.post_execution_plan
+
+        async def accept_and_publish_readback(payload: dict) -> dict:
+            response = await original_post(payload)
+            self.client.plan_response = {'items': [{
+                **copy.deepcopy(response),
+                'external_plan_id': payload['plan_id'],
+                'status': 'accepted',
+            }]}
+            return response
+
+        with patch.object(
+            self.service,
+            '_synchronize_open_buy_authority',
+            return_value={'applies': False, 'accounts': {}, 'errors': []},
+        ):
+            with patch.object(
+                self.client,
+                'post_execution_plan',
+                side_effect=accept_and_publish_readback,
+            ), patch.object(
+                self.service,
+                '_persist_dispatch_success',
+                side_effect=SystemExit('simulated crash after remote ACK'),
+            ):
+                with self.assertRaises(SystemExit):
+                    await self.service.dispatch_next_open_plan(
+                        target_trade_date=self.target_trade_date,
+                        refresh_plan=False,
+                        dry_run=False,
+                        force=True,
+                    )
+
+            with patch.object(
+                signal_decider_next_open_execution_service,
+                'refresh_plan_items',
+                return_value={'enrichment_preflight': {'allowed': True}},
+            ):
+                result = await self.service.dispatch_next_open_plan(
+                    target_trade_date=self.target_trade_date,
+                    refresh_plan=True,
+                    dry_run=True,
+                    force=True,
+                )
+
+        self.assertTrue(result['request']['dry_run'])
+        self.assertEqual(len(self.client.post_calls), 1)
+        self.assertEqual(self.client.activation_calls, [])
 
     async def test_dispatch_next_open_plan_refreshes_closed_market_eod_into_pending_live_cost_gate(self) -> None:
         with session_scope() as session:

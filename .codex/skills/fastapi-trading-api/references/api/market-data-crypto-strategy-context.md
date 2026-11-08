@@ -3,6 +3,8 @@
 ## Summary
 Returns deterministic paper/research strategy context for whitelisted Upbit KRW crypto markets. The endpoint uses public Upbit ticker and daily-candle data only, labels the result as decision support, and returns explicit `partial` or `unavailable` states when source data is incomplete.
 
+Nonfinite provider numeric fields are rejected by the quotation service and produce an upstream error (`502`) before strategy calculations run.
+
 ## Example request
 ```http
 GET /market-data/crypto/strategy-context?markets=KRW-BTC,KRW-ETH&count=30

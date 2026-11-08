@@ -4574,6 +4574,11 @@ class PykrxBackfillServiceTests(TestCase):
         with (
             patch.object(
                 service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-07',
+            ) as resolve_trade_date,
+            patch.object(
+                service,
                 'fetch_recent_universe_snapshot',
                 return_value=_point_in_time_universe_snapshot(
                     symbols,
@@ -4595,6 +4600,7 @@ class PykrxBackfillServiceTests(TestCase):
                     mode='historical_backfill',
                 )
 
+        resolve_trade_date.assert_called_once_with(end_date='20260407')
         metadata = create_run.call_args.kwargs['run_metadata']
         membership = metadata['universe_snapshot']['market_membership']
         self.assertEqual(membership['schema_version'], 'pykrx_market_membership_v1')
@@ -6483,6 +6489,30 @@ class PykrxBackfillServiceTests(TestCase):
         )
         fetch_snapshot.assert_called_once_with(markets=('KOSPI',), limit=None)
         persist_universe.assert_called_once_with(snapshot['symbols'], deactivate_missing=False)
+
+    def test_fundamental_mapping_rejects_non_finite_values_and_keeps_finite_values(self) -> None:
+        service = PykrxBackfillService()
+        trade_date = date(2026, 4, 3)
+        prices = pd.DataFrame(
+            [{'시가': 100, '고가': 110, '저가': 90, '종가': 105,
+              '거래량': 10, '거래대금': 1050}],
+            index=pd.to_datetime([trade_date]),
+        )
+        for invalid in (float('inf'), float('-inf'), float('nan'), '1e999'):
+            with self.subTest(invalid=invalid):
+                fundamentals = pd.DataFrame(
+                    [{'PER': invalid, 'PBR': 0, 'BPS': 1250.5,
+                      'EPS': -25, 'DIV': 0.0, 'DPS': 10}],
+                    index=pd.to_datetime([trade_date]),
+                )
+                result = service._map_symbol_bars(prices, fundamentals_frame=fundamentals)
+                self.assertEqual(len(result), 1)
+                self.assertIsNone(result[0]['per'])
+                self.assertEqual(
+                    {key: result[0][key] for key in ('pbr', 'bps', 'eps', 'dividend_yield', 'dps')},
+                    {'pbr': 0.0, 'bps': 1250.5, 'eps': -25.0, 'dividend_yield': 0.0, 'dps': 10.0},
+                )
+                self.assertEqual(result[0]['close_price'], 105)
 
     def test_load_active_universe_filters_inactive_symbols_at_query_boundary(self) -> None:
         service = PykrxBackfillService()
@@ -10968,6 +10998,41 @@ class PykrxBackfillServiceTests(TestCase):
                 blocked_exact_retry_run
             )
         )
+        for result_summary in (
+            {},
+            {'status': 'blocked', 'reason': 'feedback_prerequisites_not_ready'},
+            {'run_id': None},
+            {'run_id': ''},
+        ):
+            with self.subTest(result_summary=result_summary):
+                no_child_run = deepcopy(blocked_exact_retry_run)
+                no_child_run['stages']['agent_feedback_summaries'][
+                    'details'
+                ]['result_summary'] = result_summary
+                with patch(
+                    'app.eod.pykrx_backfill.'
+                    'agent_context_feedback_run_state_service.get_run',
+                    return_value=parent_feedback_run,
+                ) as get_parent_feedback_run:
+                    recovered_config = _retryable_feedback_rearm_config(
+                        no_child_run,
+                        market_date='2026-04-03',
+                    )
+                get_parent_feedback_run.assert_called_once_with(
+                    run_id='feedback-cycle-test'
+                )
+                self.assertIsNotNone(recovered_config)
+                self.assertEqual(
+                    recovered_config['source_run_id'],
+                    'feedback-cycle-test',
+                )
+                self.assertEqual(
+                    recovered_config['requested_symbols'], parent_symbols
+                )
+                self.assertEqual(
+                    recovered_config['knowledge_cutoff_at'], parent_cutoff
+                )
+
         advanced_exact_retry_run = deepcopy(failed_exact_retry_run)
         advanced_exact_retry_run['stages'][
             'agent_feedback_summaries'
@@ -17226,6 +17291,14 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value=_point_in_time_universe_snapshot(symbols),
             ),
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch(
+                'app.eod.pykrx_backfill._get_market_fundamental_by_date',
+                return_value=pd.DataFrame(),
+            ) as fundamentals,
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame({'거래대금': [4]}, index=['005930']),
+            ) as market_ohlcv,
             patch.object(service, '_map_symbol_bars', return_value=[{
                 'trade_date': '2026-04-03',
                 'open_price': 1,
@@ -17305,6 +17378,8 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['action_summaries']['action_summaries_persisted'], 1)
         self.assertEqual(result['trending_ranks']['reason'], 'stage_not_requested')
         self.assertEqual(result['market_risk_filter']['reason'], 'stage_not_requested')
+        fundamentals.assert_called_once_with('20260403', '20260403', '005930')
+        market_ohlcv.assert_called_once_with('20260403', 'KOSPI')
         self.assertFalse(persist_bars.call_args.kwargs['update_current_symbol_state'])
         price_contexts.assert_called_once_with(
             market_date='2026-04-03',
@@ -19541,6 +19616,20 @@ class PykrxBackfillServiceTests(TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', ''))
+            context_followups = {
+                name: stack.enter_context(
+                    patch(
+                        f'app.eod.pykrx_pipeline_runner.{name}',
+                        return_value={'triggered': True, 'status': 'completed'},
+                    )
+                )
+                for name in (
+                    '_run_daily_external_news_followup',
+                    '_run_daily_external_news_enrichment_followup',
+                    '_run_daily_macro_context_followup',
+                    '_run_daily_intraday_snapshot_followup',
+                )
+            }
             stack.enter_context(
                 patch.object(
                     service,
@@ -19722,6 +19811,15 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertNotIn('signal_decider_evaluation_followup', result)
         fundamentals_refresh.assert_not_called()
+        for name, followup in context_followups.items():
+            followup.assert_called_once_with(
+                market_date='2026-04-03',
+                enabled=(
+                    bool(settings.kis_intraday_snapshot_enabled)
+                    if name == '_run_daily_intraday_snapshot_followup'
+                    else True
+                ),
+            )
 
     def test_run_market_data_pipeline_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:
         service = PykrxBackfillService()
@@ -19738,6 +19836,14 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value=_point_in_time_universe_snapshot(symbols),
             ),
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch(
+                'app.eod.pykrx_backfill._get_market_fundamental_by_date',
+                return_value=pd.DataFrame(),
+            ) as fundamentals,
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame({'거래대금': [4]}, index=['005930']),
+            ) as market_ohlcv,
             patch.object(service, '_map_symbol_bars', return_value=[{
                 'trade_date': '2026-04-03',
                 'open_price': 1,
@@ -19824,6 +19930,8 @@ class PykrxBackfillServiceTests(TestCase):
             )
 
         self.assertEqual(result['status'], 'completed_with_errors')
+        fundamentals.assert_called_once_with('20260403', '20260403', '005930')
+        market_ohlcv.assert_called_once_with('20260403', 'KOSPI')
         rebuild_action_summaries.assert_not_called()
         self.assertEqual(result['action_summaries']['status'], 'skipped')
         self.assertEqual(

@@ -259,6 +259,16 @@ class TradingAccountInquiryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.buying_power_calls[0]['order_division_code'], '01')
         self.assertEqual(self.client.buying_power_calls[0]['include_cma_evaluation'], 'Y')
 
+    async def test_get_buying_power_rejects_nonfinite_prices_before_broker_inquiry(self) -> None:
+        for price in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+            with self.subTest(price=price):
+                with self.assertRaises(TradingAccountInquiryValidationError):
+                    await self.service.get_buying_power(
+                        account_reference=self.account_reference,
+                        symbol='005930', price=price, order_type='limit',
+                    )
+                self.assertEqual(self.client.buying_power_calls, [])
+
     async def test_get_buying_power_rejects_non_buy_side(self) -> None:
         with self.assertRaises(TradingAccountInquiryValidationError):
             await self.service.get_buying_power(

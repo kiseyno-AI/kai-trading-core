@@ -23,6 +23,31 @@ def _flow_units(annual: int, current_q1: int, prior_q1: int) -> dict:
 
 
 class USSECFundamentalTests(unittest.TestCase):
+    def test_non_finite_fact_does_not_replace_the_latest_valid_observation(self):
+        for value in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+            with self.subTest(value=value):
+                companyfacts = {'facts': {'us-gaap': {
+                    'Assets': {'units': {'USD': [
+                        {
+                            'end': '2025-03-31', 'val': 2000, 'accn': 'q1',
+                            'form': '10-Q', 'filed': '2025-05-01',
+                        },
+                        {
+                            'end': '2025-06-30', 'val': value, 'accn': 'q2',
+                            'form': '10-Q', 'filed': '2025-08-01',
+                        },
+                    ]}},
+                }}}
+                snapshot = parse_sec_fundamental_snapshot(
+                    symbol='TEST', cik='0000000001',
+                    companyfacts=companyfacts, submissions={},
+                    market_date=date(2025, 8, 2),
+                )
+
+                self.assertIsNotNone(snapshot)
+                self.assertEqual(snapshot.assets_usd, Decimal('2000'))
+                self.assertEqual(snapshot.metrics.total_assets, Decimal('2000'))
+
     def test_builds_ttm_metrics_and_dilution_from_companyfacts(self):
         companyfacts = {
             'entityName': 'Example Inc.',

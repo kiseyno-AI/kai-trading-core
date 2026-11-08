@@ -1,5 +1,6 @@
 import json
 import unittest
+from copy import deepcopy
 from datetime import date
 from unittest.mock import patch
 
@@ -221,6 +222,117 @@ class USAgentAnalysisServiceTests(unittest.TestCase):
         )
         self.default_cleanup_patcher.start()
         self.addCleanup(self.default_cleanup_patcher.stop)
+
+    def test_persisted_context_keeps_the_feedback_actually_sent_to_each_role(self):
+        sent_contexts = {}
+        saved_contexts = {}
+
+        class RecordingDispatcher(FakeDispatcher):
+            def dispatch_batch(self, *, spec, market_date, batch_items):
+                sent_contexts[spec.agent_name] = deepcopy(batch_items[0])
+                return super().dispatch_batch(
+                    spec=spec, market_date=market_date, batch_items=batch_items,
+                )
+
+        def save_feedback(**kwargs):
+            saved_contexts[kwargs['agent_name']] = deepcopy(kwargs['context_payload'])
+            return len(saved_contexts)
+
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: RecordingDispatcher(),
+        )
+        with patch(
+            'app.us_equities.agent_analysis_service.upsert_us_agent_feedback',
+            side_effect=save_feedback,
+        ):
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['signal-decider'],
+                persist=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['completed'], 4)
+        for role, sent_context in sent_contexts.items():
+            with self.subTest(role=role):
+                self.assertEqual(saved_contexts[role], sent_context)
+                self.assertNotIn(role, saved_contexts[role]['upstream_agent_feedback'])
+
+    def test_decider_does_not_use_feedback_whose_persistence_failed(self):
+        dispatcher = SessionCapturingDispatcher()
+        saved_roles = []
+
+        def save_feedback(**kwargs):
+            if kwargs['agent_name'] == 'fundamental-summarizer':
+                raise RuntimeError('feedback write failed')
+            saved_roles.append(kwargs['agent_name'])
+            return len(saved_roles)
+
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: dispatcher,
+        )
+        with patch(
+            'app.us_equities.agent_analysis_service.upsert_us_agent_feedback',
+            side_effect=save_feedback,
+        ):
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['signal-decider'],
+                persist=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['completed'], 2)
+        self.assertEqual(result['failed'], 2)
+        self.assertEqual(saved_roles, ['eod-summarizer', 'technical-summarizer'])
+        self.assertNotIn('signal-decider', [call['role'] for call in dispatcher.calls])
+        self.assertTrue(any(
+            item['role'] == 'signal-decider'
+            and item['error'] == 'missing_upstream_feedback:fundamental-summarizer'
+            for item in result['failures']
+        ))
+
+    def test_partial_batch_write_does_not_fail_an_already_completed_symbol(self):
+        dispatcher = SessionCapturingDispatcher()
+
+        def save_feedback(**kwargs):
+            if kwargs['agent_name'] == 'eod-summarizer' and kwargs['symbol_id'] == 2:
+                raise RuntimeError('second symbol write failed')
+            return kwargs['symbol_id']
+
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0), _candidate(1)],
+            dispatcher_getter=lambda: dispatcher,
+        )
+        with patch(
+            'app.us_equities.agent_analysis_service.upsert_us_agent_feedback',
+            side_effect=save_feedback,
+        ):
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['signal-decider'],
+                persist=True,
+                batch_size=2,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['completed'], 6)
+        self.assertEqual(result['failed'], 2)
+        self.assertEqual(
+            result['completed'] + result['failed'],
+            sum(result['role_counts'].values()),
+        )
+        self.assertEqual(
+            {(item['role'], item['symbol']) for item in result['failures']},
+            {('eod-summarizer', 'U00001'), ('signal-decider', 'U00001')},
+        )
+        decider_call = next(call for call in dispatcher.calls if call['role'] == 'signal-decider')
+        self.assertEqual([item['symbol'] for item in decider_call['batch_items']], ['U00000'])
 
     def test_ten_thousand_candidates_are_deterministically_bounded_by_role_caps(self):
         rows = [_candidate(index) for index in range(10_000)]

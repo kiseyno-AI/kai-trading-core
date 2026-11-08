@@ -10,6 +10,21 @@ from app.us_equities.market_data import (
 
 
 class USMarketDataTests(unittest.TestCase):
+    def test_skips_non_finite_provider_rows_without_losing_valid_history(self):
+        valid = {
+            'xymd': '20260818', 'open': '10', 'high': '11', 'low': '9',
+            'clos': '10.25', 'tvol': '100', 'tamt': '1025',
+        }
+        for field in ('open', 'high', 'low', 'clos', 'tvol', 'tamt'):
+            for value in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+                with self.subTest(field=field, value=value):
+                    invalid = {**valid, 'xymd': '20260819', field: value}
+                    bars = parse_kis_daily_price_payload(
+                        {'output2': [invalid, valid]}, symbol='TEST',
+                    )
+                    self.assertEqual([bar.trade_date for bar in bars], [date(2026, 8, 18)])
+                    self.assertEqual(bars[0].close_price, Decimal('10.25'))
+
     def test_parses_kis_daily_price_rows_as_decimal_without_losing_precision(self):
         payload = {
             'output2': [

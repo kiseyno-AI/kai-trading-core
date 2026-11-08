@@ -1536,7 +1536,7 @@ def run_daily_pipeline_stages(
 ) -> dict[str, Any]:
     bootstrap_runtime()
     parsed_stages = [item.strip() for item in stages.split(',') if item.strip()] if stages else None
-    parsed_symbols = [item.strip() for item in symbols.split(',') if item.strip()] if symbols else None
+    parsed_symbols = [item.strip() for item in symbols.split(',')] if symbols is not None else None
     parsed_markets = [item.strip() for item in markets.split(',') if item.strip()] if markets else None
     return daily_pipeline_stage_service.run(
         market_date=market_date,

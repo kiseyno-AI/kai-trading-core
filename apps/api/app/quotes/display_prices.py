@@ -64,11 +64,12 @@ def _safe_decimal(value: Any) -> Decimal | None:
     if value in (None, ''):
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value).replace(',', ''))
+        parsed = Decimal(str(value).replace(',', ''))
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _to_json_number(value: Decimal | None) -> int | float | None:

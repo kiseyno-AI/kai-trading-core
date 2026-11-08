@@ -1,8 +1,11 @@
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
+from threading import Event, get_ident
+from time import monotonic
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -5022,6 +5025,95 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(row.eligibility_status, ELIGIBILITY_BLOCKED)
                     self.assertEqual(row.submission_payload, guarded_payload)
                     self.assertEqual(row.last_evaluated_at, prior_last_evaluated_at)
+
+    @unittest.skipUnless(engine.dialect.name == 'postgresql', 'requires PostgreSQL row locks')
+    def test_enrichment_blocker_preserves_concurrently_submitted_row(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+        ):
+            initial = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='seed')
+        row_id = initial['items'][0]['plan_item_id']
+        self.assertEqual(initial['items'][0]['eligibility_status'], ELIGIBILITY_ELIGIBLE)
+        preflight = {'allowed': False, 'failed_categories': ['investor_flow_symbol']}
+        query_started = Event()
+        query_returned = Event()
+        release_query = Event()
+        worker_identity: dict[str, int] = {}
+
+        def is_worker_select(statement: str) -> bool:
+            return (
+                get_ident() == worker_identity.get('thread')
+                and statement.lstrip().upper().startswith('SELECT ')
+                and 'FROM signal_decider_execution_plan_items' in statement
+            )
+
+        def before_select(connection, _cursor, statement, _parameters, _context, _many):
+            if is_worker_select(statement):
+                worker_identity['pid'] = connection.connection.driver_connection.info.backend_pid
+                query_started.set()
+
+        def after_select(_connection, _cursor, statement, _parameters, _context, _many):
+            if is_worker_select(statement):
+                query_returned.set()
+                if not release_query.wait(10):
+                    raise AssertionError('Timed out waiting for the concurrent dispatch commit')
+
+        def block_preflight() -> None:
+            worker_identity['thread'] = get_ident()
+            service.block_existing_plan_rows_for_enrichment_preflight(
+                target_trade_date=self.target_trade_date,
+                source_market_date=self.market_date,
+                preflight=preflight,
+            )
+
+        event.listen(engine, 'before_cursor_execute', before_select)
+        event.listen(engine, 'after_cursor_execute', after_select)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                try:
+                    with session_scope() as writer:
+                        row = writer.execute(
+                            select(SignalDeciderExecutionPlanItem)
+                            .where(SignalDeciderExecutionPlanItem.id == row_id)
+                            .with_for_update()
+                        ).scalar_one()
+                        row.execution_status = EXECUTION_STATUS_SUBMITTED
+                        row.submission_payload = {'sentinel': 'concurrent_dispatch'}
+                        prior_evaluated_at = row.last_evaluated_at
+                        writer.flush()
+                        writer_pid = writer.execute(text('SELECT pg_backend_pid()')).scalar_one()
+                        future = executor.submit(block_preflight)
+                        self.assertTrue(query_started.wait(5))
+                        deadline = monotonic() + 5
+                        with session_scope() as observer:
+                            while not query_returned.is_set():
+                                blockers = observer.execute(
+                                    text('SELECT pg_blocking_pids(:pid)'),
+                                    {'pid': worker_identity['pid']},
+                                ).scalar_one()
+                                if writer_pid in blockers:
+                                    break
+                                self.assertLess(monotonic(), deadline, 'Preflight SELECT did not progress')
+                                query_returned.wait(0.01)
+                    # Commit the submitted state before allowing a stale SELECT
+                    # result to reach the helper's status check and flush.
+                finally:
+                    release_query.set()
+                future.result(timeout=10)
+        finally:
+            event.remove(engine, 'before_cursor_execute', before_select)
+            event.remove(engine, 'after_cursor_execute', after_select)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            self.assertEqual(row.execution_status, EXECUTION_STATUS_SUBMITTED)
+            self.assertEqual(row.eligibility_status, ELIGIBILITY_ELIGIBLE)
+            self.assertEqual(row.submission_payload, {'sentinel': 'concurrent_dispatch'})
+            self.assertEqual(row.last_evaluated_at, prior_evaluated_at)
 
     def test_refresh_plan_items_keeps_short_term_watch_rows_when_pykrx_preflight_blocks_signal_buys(self) -> None:
         self._seed_snapshot(symbol='900001')

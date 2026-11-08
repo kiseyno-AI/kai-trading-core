@@ -1,7 +1,8 @@
+import asyncio
 import hashlib
 import unittest
 from copy import deepcopy
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -152,6 +153,81 @@ def _realtime_quotes() -> dict[str, dict]:
 
 
 class LiveSectorProjectionServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_waiter_does_not_leave_a_reusable_stale_projection(self) -> None:
+        checked_at = CHECKED_AT
+        started = asyncio.Event()
+        release = asyncio.Event()
+        builds = []
+
+        async def load_snapshot() -> dict:
+            builds.append(asyncio.current_task())
+            started.set()
+            await release.wait()
+            return _snapshot()
+
+        service = LiveSectorProjectionService(
+            sector_rows_loader=FakeRowsLoader(_sector_rows()),
+            market_state_loader=lambda: _async_value(_market_state()),
+            market_snapshot_loader=load_snapshot,
+            realtime_price_service=FakeRealtimePriceService(_realtime_quotes()),
+            quote_client=FakeQuoteClient(),
+            now=lambda: checked_at,
+        )
+        request = asyncio.create_task(
+            service.get_projection(symbol='000001', source_market_date=SOURCE_DATE)
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        request.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await request
+        release.set()
+        self.assertEqual((await builds[0])['status'], 'ready')
+
+        checked_at += timedelta(minutes=7)
+        result = await service.get_projection(
+            symbol='000001', source_market_date=SOURCE_DATE,
+        )
+
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertEqual(result['reason'], 'current_session_market_benchmark_unavailable')
+        self.assertEqual(len(builds), 2)
+        self.assertIsNone(result['projection']['sector_return_pct'])
+
+    async def test_completed_request_keeps_the_existing_projection_cache(self) -> None:
+        checked_at = CHECKED_AT
+        snapshots_loaded = []
+
+        async def load_snapshot() -> dict:
+            snapshots_loaded.append(checked_at)
+            return _snapshot()
+
+        service = LiveSectorProjectionService(
+            sector_rows_loader=FakeRowsLoader(_sector_rows()),
+            market_state_loader=lambda: _async_value(_market_state()),
+            market_snapshot_loader=load_snapshot,
+            realtime_price_service=FakeRealtimePriceService(_realtime_quotes()),
+            quote_client=FakeQuoteClient(),
+            now=lambda: checked_at,
+        )
+        first = await service.get_projection(
+            symbol='000001', source_market_date=SOURCE_DATE,
+        )
+        cached = await service.get_projection(
+            symbol='000002', source_market_date=SOURCE_DATE,
+        )
+
+        self.assertEqual(first['projection'], cached['projection'])
+        self.assertTrue(cached['served_from_cache'])
+        self.assertEqual(len(snapshots_loaded), 1)
+
+        checked_at += timedelta(seconds=31)
+        refreshed = await service.get_projection(
+            symbol='000001', source_market_date=SOURCE_DATE,
+        )
+        self.assertEqual(refreshed['projection'], first['projection'])
+        self.assertFalse(refreshed['served_from_cache'])
+        self.assertEqual(len(snapshots_loaded), 2)
+
     async def test_ready_projection_uses_only_current_session_evidence(self) -> None:
         realtime = FakeRealtimePriceService(_realtime_quotes())
         rest = FakeQuoteClient()

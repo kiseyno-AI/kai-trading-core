@@ -239,6 +239,7 @@ def upgrade() -> None:
                 }
             )
             existing_versions.add(policy_version)
+            active_exists = active_exists or status == 'active'
 
     if _table_exists(inspector, 'signal_decider_decision_snapshots'):
         snapshots_table = sa.Table('signal_decider_decision_snapshots', sa.MetaData(), autoload_with=bind)

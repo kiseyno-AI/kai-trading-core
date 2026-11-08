@@ -71,6 +71,27 @@ class FakeKISRankingClient:
 
 
 class RealtimeTrendingServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_realtime_trending_treats_nonfinite_metrics_as_missing(self) -> None:
+        for value in ('NaN', 'Infinity', '-Infinity', '1e10000'):
+            with self.subTest(value=value):
+                fake_client = FakeKISRankingClient()
+                fake_client.fetch_domestic_volume_rank = AsyncMock(return_value={
+                    'output': [{
+                        'mksc_shrn_iscd': '005930',
+                        'stck_prpr': value,
+                        'prdy_ctrt': value,
+                        'acml_vol': '250000',
+                    }],
+                })
+                service = RealtimeTrendingService(client=fake_client, cache_ttl_seconds=0)
+
+                result = await service.get_realtime_trending(sources='volume-rank')
+
+                self.assertEqual(result['status'], 'ok')
+                self.assertIsNone(result['items'][0]['price'])
+                self.assertIsNone(result['items'][0]['change_pct'])
+                self.assertEqual(result['items'][0]['volume'], 250000)
+
     async def test_realtime_trending_merges_sources_and_normalizes_metrics(self) -> None:
         fake_client = FakeKISRankingClient()
         service = RealtimeTrendingService(client=fake_client, cache_ttl_seconds=0)

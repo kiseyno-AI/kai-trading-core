@@ -1,8 +1,13 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime
 from decimal import Decimal
+from threading import Event, current_thread
+from unittest.mock import patch
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, event as sqlalchemy_event, func, select
 
 from app.db import engine, session_scope
 from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
@@ -382,6 +387,82 @@ class OrderStorePersistenceTests(unittest.TestCase):
                     'normalized_payload': {'status': 'partial_fill'},
                 }
             )
+
+    def test_concurrent_older_event_cannot_replace_a_newer_fill_snapshot(self) -> None:
+        self._seed_broker_order()
+        newer_flushed = Event()
+        older_selected = Event()
+        commit_newer = Event()
+
+        @contextmanager
+        def delayed_commit_scope():
+            with session_scope() as session:
+                yield session
+                if current_thread().name.startswith('newer-fill'):
+                    session.flush()
+                    newer_flushed.set()
+                    self.assertTrue(commit_newer.wait(timeout=5))
+
+        def observe_older_select(_conn, _cursor, statement, _parameters, _context, _many):
+            if (
+                current_thread().name.startswith('older-fill')
+                and statement.lstrip().upper().startswith('SELECT')
+                and 'FROM broker_orders' in statement
+            ):
+                older_selected.set()
+
+        def fill_event(*, key: str, quantity: str, occurred_at: str) -> dict:
+            return {
+                'broker_name': 'kis',
+                'account_reference': self.account_reference,
+                'client_order_id': self.client_order_id,
+                'broker_order_id': self.broker_order_id,
+                'event_type': 'partial_fill',
+                'event_occurred_at': occurred_at,
+                'cumulative_filled_quantity': quantity,
+                'remaining_quantity': str(10 - int(quantity)),
+                'resulting_status': 'partial_fill',
+                'source': 'ws_notice',
+                'event_dedup_key': key,
+                'raw_payload': {'trade_id': key},
+                'normalized_payload': {'status': 'partial_fill'},
+            }
+
+        sqlalchemy_event.listen(engine, 'after_cursor_execute', observe_older_select)
+        try:
+            with (
+                patch('app.orders.store.session_scope', delayed_commit_scope),
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='newer-fill') as newer_pool,
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='older-fill') as older_pool,
+            ):
+                try:
+                    newer = newer_pool.submit(
+                        append_broker_order_event,
+                        fill_event(key='newer', quantity='8', occurred_at='2026-04-28T00:06:00+00:00'),
+                    )
+                    self.assertTrue(newer_flushed.wait(timeout=5))
+                    older = older_pool.submit(
+                        append_broker_order_event,
+                        fill_event(key='older', quantity='4', occurred_at='2026-04-28T00:05:00+00:00'),
+                    )
+                    self.assertTrue(older_selected.wait(timeout=5))
+                finally:
+                    commit_newer.set()
+                self.assertTrue(newer.result(timeout=5)['inserted'])
+                self.assertTrue(older.result(timeout=5)['inserted'])
+        finally:
+            sqlalchemy_event.remove(engine, 'after_cursor_execute', observe_older_select)
+
+        loaded = load_broker_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+        )
+        self.assertEqual(loaded['filled_quantity'], Decimal('8'))
+        self.assertEqual(loaded['remaining_quantity'], Decimal('2'))
+        self.assertEqual(loaded['last_broker_update_at'], datetime.fromisoformat('2026-04-28T00:06:00+00:00'))
+        self.assertEqual(loaded['raw_latest_payload'], {'trade_id': 'newer'})
+        events = list_broker_order_events(account_reference=self.account_reference)
+        self.assertEqual([item['event_dedup_key'] for item in events], ['older', 'newer'])
 
     def test_append_broker_order_event_normalizes_symbol_for_symbol_filtered_reads(self) -> None:
         self._seed_broker_order(symbol='AAPL')

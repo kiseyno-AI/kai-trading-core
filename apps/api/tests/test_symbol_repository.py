@@ -15,6 +15,7 @@ from app.repositories.symbol_repository import (
     SYMBOL_UNIVERSE_UPSERT_BATCH_SIZE,
     _build_symbol_universe_rows,
     _iter_symbol_universe_chunks,
+    load_symbols,
     upsert_master_symbols,
     upsert_symbol_universe,
 )
@@ -121,6 +122,44 @@ def test_master_upsert_requests_existing_lifecycle_preservation() -> None:
         source='kis_master',
         preserve_existing_lifecycle=True,
     )
+
+
+def test_chunked_symbol_reads_keep_the_same_membership_as_one_query() -> None:
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        session = Session(bind=connection)
+        session.add_all([
+            Symbol(symbol='989981', name_ko='Audit Alpha', market='KOSPI', source='audit_data', is_active=True),
+            Symbol(symbol='989982', name_ko='Audit Beta', market='KOSDAQ', source='audit_data', is_active=True),
+            Symbol(symbol='989983', name_ko='Audit Inactive', market='KOSPI', source='audit_data', is_active=False),
+        ])
+        session.flush()
+
+        @contextmanager
+        def rollback_only_session_scope():
+            yield session
+
+        try:
+            with patch(
+                'app.repositories.symbol_repository.session_scope',
+                rollback_only_session_scope,
+            ):
+                expected = load_symbols(
+                    symbols=['989981', '989982', '989983'],
+                    is_active=True,
+                    source='audit_data',
+                )
+                actual = load_symbols(
+                    symbols=['989981'] * 501 + ['989982', '989983'],
+                    is_active=True,
+                    source='audit_data',
+                )
+
+            assert [row['symbol'] for row in expected] == ['989982', '989981']
+            assert actual == expected
+        finally:
+            session.close()
+            transaction.rollback()
 
 
 def test_preserved_lifecycle_keeps_external_state_and_reactivates_owned_rows() -> None:

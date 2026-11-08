@@ -441,6 +441,53 @@ Run "openclaw doctor --fix" to remove stale entries.
             },
         )
 
+    def test_native_identity_readers_close_sqlite_connections(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        connections = []
+        read_only_sqlite = service._read_only_sqlite
+
+        def capture_connection(*args, **kwargs):
+            connection = read_only_sqlite(*args, **kwargs)
+            connections.append(connection)
+            return connection
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = session_cleanup_module.Path(directory)
+                target, fixture = self._create_native_fixture(root)
+                with (
+                    patch.object(session_cleanup_module.settings, 'openclaw_state_dir', str(root)),
+                    patch.object(service, '_read_only_sqlite', side_effect=capture_connection),
+                ):
+                    captured = service._capture_native_cleanup_identity(target=target)
+                    owners = service._binding_owner_entry_keys(thread_id=fixture['thread_id'])
+
+                self.assertTrue(captured['ok'])
+                self.assertEqual(owners, [captured['identity']['binding_entry_key']])
+                self.assertEqual(len(connections), 4)
+                for connection in connections:
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        connection.execute('SELECT 1')
+        finally:
+            for connection in connections:
+                connection.close()
+
+    def test_native_thread_reader_closes_connection_after_query_error(self) -> None:
+        service = AgentFeedbackSessionCleanupService()
+        connection = sqlite3.connect(':memory:')
+        try:
+            with patch.object(service, '_read_only_sqlite', return_value=connection):
+                with self.assertRaises(sqlite3.OperationalError):
+                    service._native_thread_record(
+                        state_db=session_cleanup_module.Path('unused.sqlite'),
+                        thread_id='missing-thread',
+                    )
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute('SELECT 1')
+        finally:
+            connection.close()
+
     def test_read_only_sqlite_bounds_busy_timeout_by_cleanup_deadline(self) -> None:
         connection = MagicMock()
 

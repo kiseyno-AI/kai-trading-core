@@ -5,10 +5,13 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.schema import CreateSchema, DropSchema
 
+from app.db import engine
 from app.agent_context.lease_loss_evidence import (
     terminal_feedback_completed_run_evidence_error,
 )
@@ -93,6 +96,76 @@ def _completed_feedback_summary_stage(proof: dict) -> dict:
 
 
 class DailyPipelineRunStateServiceTests(unittest.TestCase):
+    def test_startup_interrupt_preserves_completion_committed_after_initial_scan(self):
+        schema = 'audit_pipeline_state_' + uuid4().hex
+        with engine.begin() as connection:
+            connection.execute(CreateSchema(schema))
+        self.addCleanup(self._drop_test_schema, schema)
+        test_engine = engine.execution_options(schema_translate_map={None: schema})
+        DailyPipelineRun.__table__.create(test_engine)
+        DailyPipelineStageRun.__table__.create(test_engine)
+        sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
+        service = DailyPipelineRunStateService()
+        market_date = date(2040, 1, 9)
+        complete_after_stage_read = False
+        completed_run = None
+
+        def complete_from_other_connection(_session, row):
+            nonlocal complete_after_stage_read, completed_run
+            if not complete_after_stage_read or not isinstance(row, DailyPipelineStageRun):
+                return
+            complete_after_stage_read = False
+            service.finish_stage(
+                pipeline_run_id=row.pipeline_run_id,
+                stage_id=row.stage_id,
+                market_date=market_date,
+                status='completed', processed=1, total=1, succeeded=1, failed=0,
+            )
+            completed_run = service.finish_run(
+                pipeline_run_id=row.pipeline_run_id, status='completed',
+            )
+
+        @contextmanager
+        def test_session_scope(**_kwargs):
+            with sessions.begin() as session:
+                if complete_after_stage_read:
+                    event.listen(session, 'loaded_as_persistent', complete_from_other_connection)
+                yield session
+
+        with patch('app.eod.daily_pipeline_state.session_scope', new=test_session_scope):
+            for race_with_completion in (True, False):
+                with self.subTest(race_with_completion=race_with_completion):
+                    run = service.start_run(
+                        market_date=market_date, trigger='manual',
+                        requested_stages=['technical_snapshots'],
+                        resolved_stages=['technical_snapshots'],
+                    )
+                    service.start_stage(
+                        pipeline_run_id=run['id'], stage_id='technical_snapshots',
+                        market_date=market_date, total=1,
+                    )
+                    complete_after_stage_read = race_with_completion
+                    result = service.mark_active_runs_interrupted(reason='Core restarted.')
+                    latest = service.get_latest_run(market_date=market_date)
+                    if race_with_completion:
+                        self.assertIsNotNone(completed_run)
+                        self.assertEqual(result['run_ids'], [])
+                        self.assertEqual(latest['status'], 'completed')
+                        self.assertEqual(
+                            datetime.fromisoformat(latest['completed_at']),
+                            datetime.fromisoformat(completed_run['completed_at']),
+                        )
+                        self.assertEqual(latest['stages']['technical_snapshots']['status'], 'completed')
+                    else:
+                        self.assertEqual(result['run_ids'], [run['id']])
+                        self.assertEqual(latest['status'], 'interrupted')
+                        self.assertEqual(latest['stages']['technical_snapshots']['status'], 'interrupted')
+
+    @staticmethod
+    def _drop_test_schema(schema):
+        with engine.begin() as connection:
+            connection.execute(DropSchema(schema, cascade=True))
+
     def setUp(self) -> None:
         self.terminal_cutoff = datetime(
             2026,

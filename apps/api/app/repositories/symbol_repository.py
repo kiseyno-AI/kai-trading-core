@@ -254,6 +254,7 @@ def load_symbols(
     limit: int | None = None,
 ) -> list[dict]:
     if symbols and len(symbols) > 500 and limit is None:
+        symbols = list(dict.fromkeys(symbols))
         items: list[dict] = []
         for start in range(0, len(symbols), 500):
             items.extend(

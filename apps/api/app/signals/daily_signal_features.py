@@ -1768,6 +1768,13 @@ class DailySignalFeatureService:
                 if (collection.get(source) or {}).get('max_pages_reached') is True
             ),
         )
+        if (
+            (collection.get(VOLUME_POWER) or {}).get('segment_errors')
+            and source_health.get(VOLUME_POWER, {}).get('status') == 'available'
+        ):
+            source_health[VOLUME_POWER].update(
+                {'status': 'partial', 'reason': 'segment_error'}
+            )
         provider_symbols = sorted(
             {
                 symbol
