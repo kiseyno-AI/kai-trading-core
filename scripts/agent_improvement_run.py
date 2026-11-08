@@ -175,7 +175,7 @@ def _propose_change(
         in_repo(['git', 'fetch', 'origin', 'main'])
         base_sha = in_repo(['git', 'rev-parse', '--verify', 'origin/main^{commit}']).stdout.strip()
         # Pin the fetched commit before the model can change shared Git refs.
-        base_guard = getattr(in_repo(['git', 'show', f'{base_sha}:scripts/agent_rules_guard.py']), 'stdout', '') or ''
+        base_guard = getattr(in_repo(['git', '--no-replace-objects', 'show', f'{base_sha}:scripts/agent_rules_guard.py']), 'stdout', '') or ''
         if 'def main' not in base_guard:
             return 'guard_unavailable'
         guard_copy.write_text(base_guard, encoding='utf-8')

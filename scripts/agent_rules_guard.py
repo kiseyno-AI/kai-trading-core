@@ -120,11 +120,11 @@ def validate(
 
 # ------------------------------------------------------------------------- git glue
 def _git(*args: str) -> str:
-    return subprocess.run(['git', *args], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(['git', '--no-replace-objects', *args], check=True, capture_output=True, text=True).stdout
 
 
 def _read(ref: str, path: str) -> str:
-    result = subprocess.run(['git', 'show', f'{ref}:{path}'], capture_output=True, text=True)
+    result = subprocess.run(['git', '--no-replace-objects', 'show', f'{ref}:{path}'], capture_output=True, text=True)
     return result.stdout if result.returncode == 0 else ''
 
 

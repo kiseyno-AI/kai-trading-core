@@ -120,7 +120,7 @@ class ApplyPathTests(unittest.TestCase):
             self.cwds.append(cwd)
             if cmd[:2] == ['git', 'rev-parse']:
                 return _Done(0, 'a' * 40 + '\n')
-            if cmd[:2] == ['git', 'show']:
+            if cmd[:3] == ['git', '--no-replace-objects', 'show']:
                 return _Done(0, base_guard)
             if cmd[:2] == ['codex', 'exec'] and codex_fails:
                 raise RuntimeError('codex crashed')
@@ -199,7 +199,7 @@ class IsolationTests(unittest.TestCase):
         self.assertFalse(guard[2].startswith('/tmp/repo/'))
         self.assertEqual(self.guard_seen, 'def main():\n    return 1  # main copy\n')
         base_sha = 'a' * 40
-        show = calls.index(['git', 'show', f'{base_sha}:scripts/agent_rules_guard.py'])
+        show = calls.index(['git', '--no-replace-objects', 'show', f'{base_sha}:scripts/agent_rules_guard.py'])
         codex = next(i for i, c in enumerate(calls) if c[:2] == ['codex', 'exec'])
         self.assertLess(show, codex)
         self.assertEqual(guard[-2:], ['--base', base_sha])
@@ -320,6 +320,38 @@ class RealRepositoryTests(unittest.TestCase):
         self.assertEqual(external, [])
         self.assertEqual(self._git(self.live, 'branch', '--show-current').strip(), 'main')
         self.assertEqual(self._git(self.live, 'status', '--porcelain'), '')
+
+
+    def test_a_candidate_cannot_rewrite_the_base_through_git_replace(self) -> None:
+        external: list[list[str]] = []
+        original_base = self._git(self.live, 'rev-parse', 'HEAD').strip()
+
+        def runner(cmd, *, input=None, check=True, cwd=None):
+            if cmd[:2] == ['codex', 'exec']:
+                tree = Path(cmd[cmd.index('--cd') + 1])
+                contract = tree / self.CONTRACT
+                contract.write_text(contract.read_text().replace('# rules', '# weakened rules'))
+                self._git(tree, 'add', '-A')
+                replacement_tree = self._git(tree, 'write-tree').strip()
+                replacement = self._git(tree, 'commit-tree', replacement_tree, '-m', 'replacement base').strip()
+                self._git(tree, 'replace', original_base, replacement)
+                contract.write_text(contract.read_text().replace('- be careful', '- Require clear evidence.'))
+                changelog = tree / 'agent_rules' / 'CHANGELOG.md'
+                changelog.write_text(changelog.read_text() + '- 2026-11-08 report:e2e finding:example signal-decider: clarify evidence\n')
+                return _Done(0)
+            if cmd[0] == 'gh' or cmd[:2] == ['git', 'push']:
+                external.append(list(cmd))
+                return _Done(0, '[]')
+            return run._default_runner(cmd, input=input, check=check, cwd=cwd)
+
+        result = run.execute(
+            findings=[TEXT], run_id='e2e', apply=True, runner=runner, policy_text=POLICY,
+            contract_blocks={'signal-decider': '- be careful'}, repo_dir=str(self.live), work_root=str(self.root),
+        )
+
+        self.assertEqual(result['pull_request'], 'blocked_by_guard')
+        self.assertIn('outside_calibration_block', result['guard_output'])
+        self.assertEqual(external, [])
 
 
 if __name__ == '__main__':
