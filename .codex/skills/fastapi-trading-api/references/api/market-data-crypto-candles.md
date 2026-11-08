@@ -3,6 +3,8 @@
 ## Summary
 Returns Upbit public day or minute candles for one whitelisted crypto market. This is a read-only paper/research endpoint and never implies live crypto order authority in core.
 
+Nonfinite provider numeric fields produce an upstream error (`502`); they are not returned as JSON numbers.
+
 ## Example request
 ```http
 GET /market-data/crypto/candles?market=KRW-BTC&interval=minute&unit=15&count=30

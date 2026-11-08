@@ -273,6 +273,7 @@
 
 ## Crypto market-data notes
 - `GET /market-data/crypto/markets`, `GET /market-data/crypto/tickers`, and `GET /market-data/crypto/candles` expose read-only Upbit public quotation data for the explicit crypto whitelist (`KRW-BTC`, `KRW-ETH` by default).
+- Nonfinite Upbit prices and other numeric quotation fields are rejected as upstream errors (`502`) before they can enter ticker, candle, or derived strategy-context responses.
 - Crypto payloads carry `provider="upbit"`, `venue="UPBIT"`, `asset_class="crypto"`, `instrument_type="spot_crypto_pair"`, quote/base currency fields, `usage_scope="paper_research_only"`, and `trading_enabled_in_core=false` so consumers can distinguish them from KRX/KIS equity flows.
 - `GET /market-data/crypto/strategy-context` derives deterministic BTC/ETH paper-research context from public Upbit ticker and daily-candle data only. The read model labels `decision_support_only=true`, `private_api_used=false`, and `account_data_used=false`; missing or incomplete candles/tickers produce explicit `partial` or `unavailable` states instead of fabricated trend, momentum, volatility, liquidity, drawdown, or level fields.
 - Core does not add Upbit account, balance, order, cancel, amend, deposit, or withdrawal calls. Crypto data is strategy/research input only; live crypto execution remains outside `kai-trading-core`.

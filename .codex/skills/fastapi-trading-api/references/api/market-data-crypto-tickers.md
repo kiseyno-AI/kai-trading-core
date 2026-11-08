@@ -3,6 +3,8 @@
 ## Summary
 Returns current Upbit public ticker snapshots for whitelisted crypto markets. If `markets` is omitted, the configured whitelist is used. Unsupported markets are rejected instead of inferred from KRX/KIS symbols.
 
+Nonfinite provider numeric fields produce an upstream error (`502`); they are not returned as JSON numbers.
+
 ## Example request
 ```http
 GET /market-data/crypto/tickers?markets=KRW-BTC,KRW-ETH
