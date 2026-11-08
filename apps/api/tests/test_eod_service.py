@@ -6,6 +6,8 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
 from app.eod.service import EODService
+from app.eod.state import EODJobState
+from app.eod.universe import UniverseSymbol
 from app.market.clock import MarketState
 
 
@@ -151,3 +153,87 @@ class EODServiceLockTests(IsolatedAsyncioTestCase):
                 await service.capture_market_date('2026-09-23')
 
         capture_locked.assert_not_awaited()
+
+
+class EODServiceDailyRowTests(IsolatedAsyncioTestCase):
+    async def test_capture_does_not_persist_a_missing_requested_date_row(self) -> None:
+        service = EODService()
+        symbol = UniverseSymbol(symbol='005930')
+        for rows in ([], [{'stck_bsop_date': '20260922'}], [{}]):
+            with (
+                self.subTest(rows=rows),
+                patch('app.eod.service.job_state', EODJobState()),
+                patch('app.eod.service.universe_service.iter_symbols', return_value=[symbol]),
+                patch('app.eod.service.create_eod_collection_run', return_value=42),
+                patch('app.eod.service.complete_eod_collection_run') as complete_run,
+                patch(
+                    'app.eod.service.kis_client.fetch_domestic_daily_chart',
+                    new=AsyncMock(return_value={'output2': rows}),
+                ),
+                patch('app.eod.service.snapshot_sink.persist') as persist,
+            ):
+                result = await service._capture_market_date_locked(
+                    '2026-09-23',
+                    trigger='test',
+                )
+
+                persist.assert_not_called()
+                self.assertEqual(result['items'], [])
+                self.assertEqual(result['job']['symbols_succeeded'], 0)
+                self.assertEqual(result['job']['symbols_failed'], 1)
+                complete_run.assert_called_once_with(
+                    42,
+                    status='completed_with_errors',
+                    symbols_succeeded=0,
+                    symbols_failed=1,
+                )
+
+    async def test_fetch_uses_the_requested_date_row(self) -> None:
+        service = EODService()
+        requested_row = {
+            'stck_bsop_date': '20260923',
+            'stck_oprc': '100',
+            'stck_hgpr': '110',
+            'stck_lwpr': '90',
+            'stck_clpr': '105',
+            'acml_vol': '10',
+            'acml_tr_pbmn': '1050',
+        }
+        for rows in (
+            [requested_row],
+            [{'stck_bsop_date': '20260922', 'stck_clpr': '999'}, requested_row],
+        ):
+            with (
+                self.subTest(rows=rows),
+                patch(
+                    'app.eod.service.kis_client.fetch_domestic_daily_chart',
+                    new=AsyncMock(return_value={'output2': rows}),
+                ) as fetch_chart,
+            ):
+                snapshot = await service.fetch_symbol_eod(
+                    item=UniverseSymbol(symbol='005930'),
+                    market_date='2026-09-23',
+                )
+
+            self.assertEqual(
+                snapshot.to_dict(),
+                {
+                    'symbol': '005930',
+                    'market': 'J',
+                    'business_date': '2026-09-23',
+                    'open_price': 100,
+                    'high_price': 110,
+                    'low_price': 90,
+                    'close_price': 105,
+                    'volume': 10,
+                    'turnover': 1050,
+                    'source': 'kis',
+                    'persisted': False,
+                },
+            )
+            fetch_chart.assert_awaited_once_with(
+                symbol='005930',
+                market_code='J',
+                start_date='20260923',
+                end_date='20260923',
+            )

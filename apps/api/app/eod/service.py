@@ -179,7 +179,16 @@ class EODService:
             end_date=market_date.replace('-', ''),
         )
         output = raw.get('output2', []) if isinstance(raw, dict) else []
-        latest = output[0] if output else {}
+        latest = next(
+            (
+                row for row in output
+                if isinstance(row, dict)
+                and str(row.get('stck_bsop_date') or '').strip() == market_date.replace('-', '')
+            ),
+            None,
+        )
+        if latest is None:
+            raise ValueError(f'KIS daily chart has no row for {item.symbol} on {market_date}')
         return EODSnapshot(
             symbol=item.symbol,
             market=item.market,
