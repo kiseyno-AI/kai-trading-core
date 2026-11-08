@@ -133,6 +133,25 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('/StatisticSearch/[REDACTED]/json/', event['path'])
         self.assertNotIn('test-key', json.dumps(event))
 
+    async def test_upstream_logging_redacts_url_encoded_path_credentials(self):
+        for encoded in ('private%2Fkey', 'private%2fkey'):
+            with self.subTest(encoded=encoded):
+                transport = httpx.MockTransport(
+                    lambda request: httpx.Response(200, json={}, request=request)
+                )
+                async with httpx.AsyncClient(transport=transport) as client:
+                    response = await audit_logging.request_with_audit(
+                        client, 'test_service', 'GET',
+                        f'https://example.test/api/{encoded}/data?symbol=005930',
+                        secret_values=['private/key'],
+                    )
+                self.assertEqual(response.status_code, 200)
+                event = self._read_log_lines('upstream-http.log')[-1]
+                self.assertNotIn(encoded, json.dumps(event))
+                self.assertNotIn('private/key', json.dumps(event))
+                self.assertEqual(event['path'], '/api/[REDACTED]/data')
+                self.assertIn('symbol=005930', event['url'])
+
     async def test_read_retry_retries_transport_failure_and_audits_each_attempt(self):
         attempts = 0
 

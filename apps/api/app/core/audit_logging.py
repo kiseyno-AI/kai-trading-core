@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import httpx
@@ -167,6 +168,23 @@ def _sanitize_audit_value(
     return _truncate_string(str(value))
 
 
+def _redact_secret_values(value: str, secret_values: Iterable[str] | None) -> str:
+    variants = {
+        variant
+        for secret in secret_values or ()
+        if secret
+        for variant in (secret, quote(secret, safe=''), quote_plus(secret, safe=''))
+    }
+    for variant in sorted(variants, key=len, reverse=True):
+        pattern = re.sub(
+            r'%[0-9a-fA-F]{2}',
+            lambda match: f'(?i:{match.group(0)})',
+            re.escape(variant),
+        )
+        value = re.sub(pattern, '[REDACTED]', value)
+    return value
+
+
 def redact_url(url: str, *, secret_values: Iterable[str] | None = None) -> str:
     parsed = urlsplit(url)
     if not parsed.query:
@@ -177,10 +195,7 @@ def redact_url(url: str, *, secret_values: Iterable[str] | None = None) -> str:
             query.append((key, '[REDACTED]' if _is_sensitive_key(key) else value))
         redacted_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
-    for secret_value in secret_values or ():
-        if secret_value:
-            redacted_url = redacted_url.replace(secret_value, '[REDACTED]')
-    return redacted_url
+    return _redact_secret_values(redacted_url, secret_values)
 
 
 def sanitize_headers(headers: Mapping[str, str] | None) -> dict[str, Any]:
