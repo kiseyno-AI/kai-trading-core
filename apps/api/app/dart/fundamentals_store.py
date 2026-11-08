@@ -551,6 +551,7 @@ class DartFundamentalsRepository:
         market_date: date | None = None,
         fs_div: str | None = None,
         statuses: Sequence[str] | None = None,
+        run_id: int | None = None,
         exclude_run_id: int | None = None,
     ) -> dict[str, Any] | None:
         with session_scope() as session:
@@ -561,6 +562,8 @@ class DartFundamentalsRepository:
                 stmt = stmt.where(DartFundamentalsRefreshRun.fs_div == fs_div)
             if statuses:
                 stmt = stmt.where(DartFundamentalsRefreshRun.status.in_(statuses))
+            if run_id is not None:
+                stmt = stmt.where(DartFundamentalsRefreshRun.id == run_id)
             if exclude_run_id is not None:
                 stmt = stmt.where(
                     DartFundamentalsRefreshRun.id != exclude_run_id

@@ -2790,6 +2790,7 @@ class DartFundamentalsCaptureService:
         )
         if run_id is not None:
             latest_run = self.repository.get_latest_refresh_run(
+                run_id=int(run_id),
                 market_date=resolved_market_date,
                 fs_div=(
                     fs_div or settings.dart_fundamentals_default_fs_div

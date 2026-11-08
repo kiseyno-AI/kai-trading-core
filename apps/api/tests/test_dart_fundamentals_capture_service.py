@@ -4311,6 +4311,52 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata['feedback_followup'], feedback_result)
         self.assertEqual(metadata['compound_status'], 'completed')
 
+    async def test_compound_refresh_preserves_its_run_metadata_when_a_newer_run_exists(self):
+        service, repository = self._build_global_followup_service()
+        own_run = {
+            'id': 188,
+            'symbols_checked': 1,
+            'events_captured': 2,
+            'run_metadata': {'test_run_identity': 'original'},
+        }
+        newer_run = {
+            'id': 189,
+            'symbols_checked': 99,
+            'events_captured': 88,
+            'run_metadata': {'test_run_identity': 'newer'},
+        }
+        repository.get_latest_refresh_run = Mock(
+            side_effect=lambda **kwargs: (
+                own_run if kwargs.get('run_id') == own_run['id'] else newer_run
+            ),
+        )
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'completed',
+                'scan_status': 'completed',
+                'coverage_ready_stock_codes': ['005930'],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': [],
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(repository.completed_refresh_runs)
+        for run_id, values in repository.completed_refresh_runs:
+            self.assertEqual(run_id, own_run['id'])
+            self.assertEqual(values['symbols_checked'], 1)
+            self.assertEqual(values['events_captured'], 2)
+            self.assertEqual(values['run_metadata']['test_run_identity'], 'original')
+
     async def test_compound_refresh_runs_followups_only_for_ready_subset(self):
         service, repository = self._build_global_followup_service(
             ['000660', '005930']

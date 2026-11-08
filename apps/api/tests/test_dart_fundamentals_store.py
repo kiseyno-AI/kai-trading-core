@@ -1262,3 +1262,20 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
             self.assertEqual(stale_no_progress_run.status, 'failed')
             self.assertEqual(stale_progress_run.run_metadata['stale_failure_reason'], 'stale')
             self.assertIn('stale_failed_at', stale_progress_run.run_metadata)
+
+    def test_latest_refresh_query_can_select_the_exact_older_run(self):
+        original_id = self._create_refresh_run(trigger='test_original_refresh')
+        newer_id = self._create_refresh_run(trigger='test_newer_refresh')
+
+        latest = self.repository.get_latest_refresh_run(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+        )
+        original = self.repository.get_latest_refresh_run(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            run_id=original_id,
+        )
+
+        self.assertEqual(latest['id'], newer_id)
+        self.assertEqual(original['id'], original_id)
