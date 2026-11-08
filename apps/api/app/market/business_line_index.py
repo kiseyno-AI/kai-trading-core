@@ -1,6 +1,9 @@
 """Daily equal-weight returns per business line from stored daily bars.
 
-    python -m app.market.business_line_index --start 2007-01-01
+    python -m app.market.business_line_index --start 2014-01-01
+
+Stored daily bars cover the whole universe only from 2014 (one or two
+symbols per day before that), so earlier years add nothing.
 
 No provider calls: one SQL pass over ``daily_price_bars`` (close-to-close
 return per symbol, moves beyond ±35 % dropped as data errors — KRX limits
@@ -113,7 +116,7 @@ def store_daily_metrics(rows: list[dict[str, Any]], *, session_factory=session_s
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Rebuild business-line daily metrics from stored bars.')
-    parser.add_argument('--start', default='2007-01-01')
+    parser.add_argument('--start', default='2014-01-01')
     parser.add_argument('--end', default=date.today().isoformat())
     args = parser.parse_args()
     end = date.fromisoformat(args.end)
