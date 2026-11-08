@@ -156,3 +156,31 @@ class BusinessLineIndexTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_index_cli_defaults_to_the_korean_date():
+    import sys
+    from datetime import datetime
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
+
+    from app.market import business_line_index as index
+
+    seen = {}
+    with (
+        patch.object(sys, 'argv', ['business_line_index']),
+        patch.object(index, 'profiles_as_of', side_effect=lambda day: seen.setdefault('day', day) and {}),
+    ):
+        index.main()
+
+    assert seen['day'] == datetime.now(ZoneInfo('Asia/Seoul')).date()
+
+
+def test_index_cli_splits_the_range_by_calendar_year():
+    from app.market.business_line_index import year_chunks
+
+    assert year_chunks(date(2024, 6, 1), date(2026, 2, 3)) == [
+        (date(2024, 6, 1), date(2024, 12, 31)),
+        (date(2025, 1, 1), date(2025, 12, 31)),
+        (date(2026, 1, 1), date(2026, 2, 3)),
+    ]
