@@ -296,6 +296,11 @@ class EODBackgroundRunner:
             )
             if fail_closed:
                 raise RuntimeError(f'blocking step timed out: {name}')
+        except Exception as exc:
+            # See _run_async_step: only fail-closed steps may abort the tick.
+            if fail_closed:
+                raise
+            self._record_step_failure(name, exc)
 
     def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
         if self._blocking_step_tasks.get(name) is task:
@@ -358,7 +363,23 @@ class EODBackgroundRunner:
             if fail_closed:
                 raise RuntimeError(f'async step timed out: {name}')
             return False
+        except Exception as exc:
+            # A best-effort step must not abort the rest of the tick (order
+            # reconciliation, protective exits, portfolio refresh). The done
+            # callback has already logged the failure; surface it through the
+            # runner status and let fail-closed steps keep propagating.
+            if fail_closed:
+                raise
+            self._record_step_failure(name, exc)
+            return False
         return task.result() if return_task_result else True
+
+    def _record_step_failure(self, name: str, exc: BaseException) -> None:
+        if self._last_tick_error is None:
+            self._last_tick_error = {
+                'type': type(exc).__name__,
+                'message': f'{name}: {exc}'[:512],
+            }
 
     def _finalize_async_step(self, name: str, task: asyncio.Task) -> None:
         if self._async_step_tasks.get(name) is task:

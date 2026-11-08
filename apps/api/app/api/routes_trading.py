@@ -166,7 +166,8 @@ async def inspect_reconcile_state(
     stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
 ) -> dict[str, Any]:
     try:
-        return trading_order_reconciliation_service.inspect_orders(
+        return await run_in_threadpool(
+            trading_order_reconciliation_service.inspect_orders,
             account_reference=account_reference,
             symbol=symbol,
             limit=limit,
@@ -185,7 +186,8 @@ async def get_lifecycle_view(
     stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
 ) -> dict[str, Any]:
     try:
-        return trading_order_monitoring_service.lifecycle_view(
+        return await run_in_threadpool(
+            trading_order_monitoring_service.lifecycle_view,
             account_reference=account_reference,
             symbol=symbol,
             limit=limit,
@@ -204,7 +206,8 @@ async def get_order_mismatches(
     stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
 ) -> dict[str, Any]:
     try:
-        return trading_order_monitoring_service.mismatches_view(
+        return await run_in_threadpool(
+            trading_order_monitoring_service.mismatches_view,
             account_reference=account_reference,
             symbol=symbol,
             limit=limit,
@@ -223,7 +226,8 @@ async def get_stale_pending_orders(
     stale_after_minutes: int | None = Query(default=None, ge=1, le=1440),
 ) -> dict[str, Any]:
     try:
-        return trading_order_monitoring_service.stale_pending_view(
+        return await run_in_threadpool(
+            trading_order_monitoring_service.stale_pending_view,
             account_reference=account_reference,
             symbol=symbol,
             limit=limit,
@@ -237,7 +241,7 @@ async def get_stale_pending_orders(
 @router.get('/realtime-health')
 async def get_realtime_health() -> dict[str, Any]:
     try:
-        return trading_order_monitoring_service.realtime_health()
+        return await run_in_threadpool(trading_order_monitoring_service.realtime_health)
     except Exception as exc:
         _raise_order_http_error(exc)
         raise HTTPException(status_code=500, detail=f'Trading order realtime health read failed: {exc}') from exc
@@ -464,7 +468,8 @@ async def list_orders(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict[str, Any]:
     try:
-        return trading_order_service.list_orders(
+        return await run_in_threadpool(
+            trading_order_service.list_orders,
             account_reference=account_reference,
             symbol=symbol,
             statuses=status,
