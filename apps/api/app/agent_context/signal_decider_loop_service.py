@@ -60,6 +60,11 @@ DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
+# Evaluations only read stored decision snapshots and the price bars after
+# each decision, so they gate on price-derived readiness instead of the full
+# feedback prerequisite set (DART, Piotroski, factors). The full set kept this
+# stage blocked every day by unrelated partial fundamentals coverage.
+SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS: tuple[str, ...] = ('technical_snapshots',)
 # Keep each transaction deliberately small because signal-decider rows contain
 # large JSON payloads and maintain several indexes. Every chunk is committed by
 # its own session_scope, releasing locks and memory before the next write.
