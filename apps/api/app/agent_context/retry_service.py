@@ -2319,6 +2319,7 @@ def _claim_feedback_retry_run(
             .where(
                 AgentContextFeedbackRun.market_date == market_date,
             )
+            .with_for_update()
             .order_by(
                 AgentContextFeedbackRun.started_at.desc(),
                 AgentContextFeedbackRun.id.desc(),
