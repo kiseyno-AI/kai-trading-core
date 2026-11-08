@@ -1,0 +1,199 @@
+{
+  "source_commit": "5a0ce6b4260d47c7cc8177f67be5b29f1811f2c7",
+  "graph_sha256": "ed42c5f8b994b7a74a907eb153e1a47b9e9c14e414f5eca2eeba22189df7266d",
+  "graphify_version": "0.9.103",
+  "method": "Count EXTRACTED Graphify links whose endpoint source files both belong to apps/api/app, grouping by the immediate module. Count each cross-group link once; exclude within-group links, inferred links, tests, migrations, and scripts. Symmetric matrix cells show the same count. This is static source structure, not runtime call frequency.",
+  "metrics": {
+    "nodes": 17846,
+    "edges": 59648,
+    "communities": 475,
+    "extracted_edges": 53954,
+    "inferred_edges": 5694,
+    "self_loops": 69,
+    "dangling_endpoints": 0,
+    "application_nodes": 7149,
+    "cross_group_extracted_edges": 2961
+  },
+  "groups": [
+    {
+      "id": "entry",
+      "label": "Entry & shared",
+      "modules": [
+        "main",
+        "api",
+        "internal",
+        "core",
+        "schemas",
+        "brokers"
+      ],
+      "nodes": 605
+    },
+    {
+      "id": "storage",
+      "label": "Persistence",
+      "modules": [
+        "db",
+        "db_models",
+        "market_data_store",
+        "repositories",
+        "db_pool_watchdog"
+      ],
+      "nodes": 407
+    },
+    {
+      "id": "eod",
+      "label": "EOD & factors",
+      "modules": [
+        "eod",
+        "signals"
+      ],
+      "nodes": 2039
+    },
+    {
+      "id": "agents",
+      "label": "Agents & analytics",
+      "modules": [
+        "agent_context",
+        "side_agents",
+        "analytics"
+      ],
+      "nodes": 1746
+    },
+    {
+      "id": "orders",
+      "label": "Orders & Exec",
+      "modules": [
+        "orders"
+      ],
+      "nodes": 1059
+    },
+    {
+      "id": "markets",
+      "label": "Market services",
+      "modules": [
+        "market",
+        "quotes",
+        "scanner",
+        "us_equities",
+        "crypto"
+      ],
+      "nodes": 566
+    },
+    {
+      "id": "evidence",
+      "label": "External evidence",
+      "modules": [
+        "dart",
+        "integrations",
+        "external_news",
+        "macro_context",
+        "market_news",
+        "external_context",
+        "fx"
+      ],
+      "nodes": 727
+    }
+  ],
+  "links": [
+    {
+      "a": "agents",
+      "b": "entry",
+      "count": 137
+    },
+    {
+      "a": "agents",
+      "b": "eod",
+      "count": 79
+    },
+    {
+      "a": "agents",
+      "b": "evidence",
+      "count": 37
+    },
+    {
+      "a": "agents",
+      "b": "markets",
+      "count": 77
+    },
+    {
+      "a": "agents",
+      "b": "orders",
+      "count": 51
+    },
+    {
+      "a": "agents",
+      "b": "storage",
+      "count": 306
+    },
+    {
+      "a": "entry",
+      "b": "eod",
+      "count": 285
+    },
+    {
+      "a": "entry",
+      "b": "evidence",
+      "count": 166
+    },
+    {
+      "a": "entry",
+      "b": "markets",
+      "count": 121
+    },
+    {
+      "a": "entry",
+      "b": "orders",
+      "count": 68
+    },
+    {
+      "a": "entry",
+      "b": "storage",
+      "count": 40
+    },
+    {
+      "a": "eod",
+      "b": "evidence",
+      "count": 35
+    },
+    {
+      "a": "eod",
+      "b": "markets",
+      "count": 170
+    },
+    {
+      "a": "eod",
+      "b": "orders",
+      "count": 16
+    },
+    {
+      "a": "eod",
+      "b": "storage",
+      "count": 750
+    },
+    {
+      "a": "evidence",
+      "b": "markets",
+      "count": 80
+    },
+    {
+      "a": "evidence",
+      "b": "storage",
+      "count": 153
+    },
+    {
+      "a": "markets",
+      "b": "orders",
+      "count": 71
+    },
+    {
+      "a": "markets",
+      "b": "storage",
+      "count": 90
+    },
+    {
+      "a": "orders",
+      "b": "storage",
+      "count": 229
+    }
+  ]
+}
