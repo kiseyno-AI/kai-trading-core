@@ -5592,7 +5592,7 @@ def _retryable_feedback_rearm_source_run_id(
         else None
     )
     source_run_id = str(
-        result_summary.get('run_id')
+        result_summary.get('run_id') or ''
         if isinstance(result_summary, Mapping)
         else ''
     ).strip()

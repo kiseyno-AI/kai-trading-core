@@ -10974,6 +10974,41 @@ class PykrxBackfillServiceTests(TestCase):
                 blocked_exact_retry_run
             )
         )
+        for result_summary in (
+            {},
+            {'status': 'blocked', 'reason': 'feedback_prerequisites_not_ready'},
+            {'run_id': None},
+            {'run_id': ''},
+        ):
+            with self.subTest(result_summary=result_summary):
+                no_child_run = deepcopy(blocked_exact_retry_run)
+                no_child_run['stages']['agent_feedback_summaries'][
+                    'details'
+                ]['result_summary'] = result_summary
+                with patch(
+                    'app.eod.pykrx_backfill.'
+                    'agent_context_feedback_run_state_service.get_run',
+                    return_value=parent_feedback_run,
+                ) as get_parent_feedback_run:
+                    recovered_config = _retryable_feedback_rearm_config(
+                        no_child_run,
+                        market_date='2026-04-03',
+                    )
+                get_parent_feedback_run.assert_called_once_with(
+                    run_id='feedback-cycle-test'
+                )
+                self.assertIsNotNone(recovered_config)
+                self.assertEqual(
+                    recovered_config['source_run_id'],
+                    'feedback-cycle-test',
+                )
+                self.assertEqual(
+                    recovered_config['requested_symbols'], parent_symbols
+                )
+                self.assertEqual(
+                    recovered_config['knowledge_cutoff_at'], parent_cutoff
+                )
+
         advanced_exact_retry_run = deepcopy(failed_exact_retry_run)
         advanced_exact_retry_run['stages'][
             'agent_feedback_summaries'
