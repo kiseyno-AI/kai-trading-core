@@ -571,6 +571,7 @@ def dispatch_for_symbols_via_subagents(
         }
         for future in concurrent.futures.as_completed(future_map):
             spec, batch = future_map[future]
+            completed_symbols: set[str] = set()
             try:
                 batch_result = future.result()
                 batch_contract_failure = batch_response_contract_failure(batch_result)
@@ -687,8 +688,11 @@ def dispatch_for_symbols_via_subagents(
                             session_ref=batch_result.get('session_ref'),
                         )
                     )
+                    completed_symbols.add(symbol)
             except Exception as exc:  # noqa: BLE001
                 for source_item in batch:
+                    if source_item['symbol'] in completed_symbols:
+                        continue
                     failures.append(
                         build_failed_dispatch_item(
                             role=spec.role,
