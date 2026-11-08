@@ -1408,6 +1408,8 @@ class TradingOrderService:
             'time_in_force': normalized.time_in_force,
             'exchange_id': normalized.exchange_id,
             'broker_order_code': normalized.broker_order_code,
+            'sell_type': normalized.sell_type,
+            'condition_price': _decimal_to_text(normalized.condition_price),
         }
         comparable_existing = {
             key: existing_payload.get(key)

@@ -11,6 +11,7 @@ from app.brokers.kis.client import KISAPIError, KISTimeoutError
 from app.db import engine, session_scope
 from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
 from app.orders.service import (
+    TradingOrderIdempotencyConflictError,
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
     TradingOrderValidationError,
@@ -189,6 +190,27 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         replay = await self._submit_buy_order()
 
         self.assertTrue(replay['idempotent_replay'])
+        self.assertEqual(self.fake_client.submit_calls, 1)
+
+    async def test_submit_replay_compares_all_broker_order_terms(self) -> None:
+        payload = {
+            'client_order_id': self.client_order_id,
+            'account_number': self.account_number,
+            'account_product_code': self.account_product_code,
+            'symbol': self.symbol, 'quantity': Decimal('10'),
+            'price': Decimal('70000'), 'order_type': 'limit',
+            'sell_type': '01', 'condition_price': Decimal('70000'),
+        }
+        await self.service.submit_sell_order(**payload)
+        for field, changed_value in (
+            ('sell_type', '02'),
+            ('condition_price', Decimal('71000')),
+        ):
+            with self.subTest(field=field):
+                replay = await self.service.submit_sell_order(**payload)
+                self.assertTrue(replay['idempotent_replay'])
+                with self.assertRaises(TradingOrderIdempotencyConflictError):
+                    await self.service.submit_sell_order(**{**payload, field: changed_value})
         self.assertEqual(self.fake_client.submit_calls, 1)
 
     async def test_submit_rejection_persists_rejected_state(self) -> None:
