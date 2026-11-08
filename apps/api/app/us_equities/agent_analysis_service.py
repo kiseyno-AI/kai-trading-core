@@ -484,9 +484,13 @@ class USAgentAnalysisService:
                             feedback_by_symbol.setdefault(symbol, {})[role] = normalized
                             completed.append({'role': role, 'symbol': symbol, 'feedback_id': feedback_id})
                 except Exception as exc:
+                    completed_symbols = {
+                        item['symbol'] for item in completed if item['role'] == role
+                    }
                     failures.extend(
-                        {'role': role, 'symbol': symbol, 'error': f'{type(exc).__name__}: {exc}'}
-                        for symbol in batch_symbols
+                        {'role': role, 'symbol': str(context['symbol']), 'error': f'{type(exc).__name__}: {exc}'}
+                        for context in batch_items
+                        if str(context['symbol']) not in completed_symbols
                     )
                 finally:
                     session_cleanup.append(

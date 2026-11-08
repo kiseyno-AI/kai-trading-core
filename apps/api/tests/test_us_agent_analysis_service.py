@@ -296,6 +296,44 @@ class USAgentAnalysisServiceTests(unittest.TestCase):
             for item in result['failures']
         ))
 
+    def test_partial_batch_write_does_not_fail_an_already_completed_symbol(self):
+        dispatcher = SessionCapturingDispatcher()
+
+        def save_feedback(**kwargs):
+            if kwargs['agent_name'] == 'eod-summarizer' and kwargs['symbol_id'] == 2:
+                raise RuntimeError('second symbol write failed')
+            return kwargs['symbol_id']
+
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0), _candidate(1)],
+            dispatcher_getter=lambda: dispatcher,
+        )
+        with patch(
+            'app.us_equities.agent_analysis_service.upsert_us_agent_feedback',
+            side_effect=save_feedback,
+        ):
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['signal-decider'],
+                persist=True,
+                batch_size=2,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['completed'], 6)
+        self.assertEqual(result['failed'], 2)
+        self.assertEqual(
+            result['completed'] + result['failed'],
+            sum(result['role_counts'].values()),
+        )
+        self.assertEqual(
+            {(item['role'], item['symbol']) for item in result['failures']},
+            {('eod-summarizer', 'U00001'), ('signal-decider', 'U00001')},
+        )
+        decider_call = next(call for call in dispatcher.calls if call['role'] == 'signal-decider')
+        self.assertEqual([item['symbol'] for item in decider_call['batch_items']], ['U00000'])
+
     def test_ten_thousand_candidates_are_deterministically_bounded_by_role_caps(self):
         rows = [_candidate(index) for index in range(10_000)]
         service = USAgentAnalysisService(candidate_loader=lambda **kwargs: rows)
