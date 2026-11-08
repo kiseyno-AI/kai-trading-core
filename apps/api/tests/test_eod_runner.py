@@ -479,6 +479,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     patch('app.eod.runner.settings.background_runner_enabled', True),
                     patch('app.eod.runner.async_get_market_state', return_value=market_state),
+                    patch('app.eod.runner.refresh_master_if_due') as refresh_master,
                     patch(
                         'app.eod.runner.signal_decider_exec_integration_service.should_delegate_execution',
                         return_value=False,
@@ -512,6 +513,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                     runner._running = True
                     await runner._run_loop()
 
+                refresh_master.assert_called_once_with()
                 refresh_snapshot.assert_awaited_once_with(
                     trigger='background_runner:open',
                     force_index=expected_force,
