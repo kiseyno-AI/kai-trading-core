@@ -551,6 +551,7 @@ class MarketRegimeContextTests(unittest.TestCase):
         self.assertEqual(result['provenance']['baseline_source'], 'kis_market_snapshot_v1')
         self.assertEqual(result['provenance']['baseline_provider_field'], 'prdy_tr_pbmn')
         self.assertEqual(result['provenance']['baseline_relative_session'], 'previous')
+        self.assertIsNone(result['provenance']['baseline_coverage_ratio'])
         regime = _build_market_regime_context(
             requested_market_date=date(2026, 4, 29),
             market='KOSPI',
@@ -644,6 +645,8 @@ class MarketRegimeContextTests(unittest.TestCase):
         self.assertEqual(result['market_breadth_context']['up_count'], 700)
         self.assertEqual(result['market_breadth_context']['down_count'], 200)
         self.assertEqual(result['market_breadth_context']['flat_count'], 50)
+        self.assertEqual(result['market_breadth_context']['coverage_ratio'], round(950 / 970, 6))
+        self.assertEqual(result['provenance']['baseline_coverage_ratio'], 1.0)
         self.assertEqual(
             result['market_breadth_provenance']['source_provider'],
             'kis_market_snapshot_v1',
