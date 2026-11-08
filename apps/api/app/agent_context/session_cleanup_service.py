@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -573,10 +574,10 @@ class AgentFeedbackSessionCleanupService:
             agent_name=agent_name,
             session_key=session_key,
         )
-        with self._read_only_sqlite(
+        with closing(self._read_only_sqlite(
             paths['openclaw_agent_db'],
             deadline_monotonic=deadline_monotonic,
-        ) as connection:
+        )) as connection:
             placeholders = ','.join('?' for _ in candidates)
             rows = connection.execute(
                 f'''
@@ -663,10 +664,10 @@ class AgentFeedbackSessionCleanupService:
         shared_state_db: Path,
         deadline_monotonic: float | None = None,
     ) -> dict[str, Any] | None:
-        with self._read_only_sqlite(
+        with closing(self._read_only_sqlite(
             shared_state_db,
             deadline_monotonic=deadline_monotonic,
-        ) as connection:
+        )) as connection:
             row = connection.execute(
                 '''
                 SELECT value_json
@@ -991,10 +992,10 @@ class AgentFeedbackSessionCleanupService:
     ) -> list[str]:
         state_root = Path(settings.openclaw_state_dir).expanduser().resolve(strict=True)
         shared_state_db = state_root / 'state' / 'openclaw.sqlite'
-        with self._read_only_sqlite(
+        with closing(self._read_only_sqlite(
             shared_state_db,
             deadline_monotonic=deadline_monotonic,
-        ) as connection:
+        )) as connection:
             rows = connection.execute(
                 '''
                 SELECT entry_key, value_json
@@ -1024,10 +1025,10 @@ class AgentFeedbackSessionCleanupService:
         thread_id: str,
         deadline_monotonic: float | None = None,
     ) -> dict[str, Any] | None:
-        with self._read_only_sqlite(
+        with closing(self._read_only_sqlite(
             state_db,
             deadline_monotonic=deadline_monotonic,
-        ) as connection:
+        )) as connection:
             row = connection.execute(
                 'SELECT id, rollout_path FROM threads WHERE id = ?',
                 (thread_id,),
