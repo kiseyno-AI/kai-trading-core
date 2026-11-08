@@ -5,7 +5,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Sequence
 
-from sqlalchemy import inspect, select
+from sqlalchemy import func, inspect, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.db import session_scope
@@ -1931,6 +1932,14 @@ class SignalDeciderExecutionOutcomeService:
                 SignalDeciderActualExecutionOutcome.entry_plan_item_id == int(item['entry_plan_item_id'])
             )
         ).scalar_one_or_none()
+        if row is None and session.get_bind().dialect.name == 'postgresql':
+            statement = pg_insert(SignalDeciderActualExecutionOutcome).values(**item)
+            row = session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[SignalDeciderActualExecutionOutcome.entry_plan_item_id],
+                    set_={**item, 'updated_at': func.now()},
+                ).returning(SignalDeciderActualExecutionOutcome)
+            ).scalar_one()
         if row is None:
             row = SignalDeciderActualExecutionOutcome(
                 decision_snapshot_id=int(item['decision_snapshot_id']),

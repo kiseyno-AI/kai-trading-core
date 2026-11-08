@@ -1,13 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from threading import Event, get_ident
+from time import monotonic
 from types import SimpleNamespace
 import unittest
 from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, select, text
 
 from app.api import routes_agent_context
 from app.db import engine, session_scope
@@ -433,6 +436,141 @@ class SignalDeciderExecutionOutcomeServiceTests(unittest.TestCase):
                 },
             }
             row.submitted_at = datetime(2026, 4, 30, 0, 1, tzinfo=timezone.utc)
+
+    @unittest.skipUnless(engine.dialect.name == 'postgresql', 'requires PostgreSQL row locks')
+    def test_concurrent_initial_syncs_share_one_outcome(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id=None,
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='planned',
+        )
+        first_selected = Event()
+        release_first = Event()
+        second_started = Event()
+        second_selected = Event()
+        workers: dict[str, int] = {}
+
+        def before_select(connection, _cursor, statement, _parameters, _context, _many):
+            if not statement.lstrip().upper().startswith('SELECT '):
+                return
+            if 'FROM signal_decider_execution_plan_items' not in statement:
+                return
+            if get_ident() == workers.get('first_thread'):
+                workers['first_pid'] = connection.connection.driver_connection.info.backend_pid
+            elif get_ident() == workers.get('second_thread'):
+                workers['second_pid'] = connection.connection.driver_connection.info.backend_pid
+                second_started.set()
+
+        def after_select(_connection, _cursor, statement, _parameters, _context, _many):
+            if not statement.lstrip().upper().startswith('SELECT '):
+                return
+            if 'FROM signal_decider_actual_execution_outcomes' not in statement:
+                return
+            if get_ident() == workers.get('first_thread'):
+                first_selected.set()
+                if not release_first.wait(10):
+                    raise AssertionError('Timed out waiting for the competing outcome sync')
+            elif get_ident() == workers.get('second_thread'):
+                second_selected.set()
+
+        def sync_by_entry() -> dict:
+            workers['first_thread'] = get_ident()
+            return signal_decider_execution_outcome_service.sync_entry_plan_item(
+                entry_plan_item_id=entry_id,
+            )
+
+        def sync_by_snapshot() -> list[dict]:
+            workers['second_thread'] = get_ident()
+            return signal_decider_execution_outcome_service.sync_for_decision_snapshot_ids(
+                decision_snapshot_ids=[snapshot_id],
+            )
+
+        event.listen(engine, 'before_cursor_execute', before_select)
+        event.listen(engine, 'after_cursor_execute', after_select)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(sync_by_entry)
+                try:
+                    self.assertTrue(first_selected.wait(5))
+                    second = executor.submit(sync_by_snapshot)
+                    self.assertTrue(second_started.wait(5))
+                    deadline = monotonic() + 5
+                    with session_scope() as observer:
+                        while not second_selected.is_set():
+                            blockers = observer.execute(
+                                text('SELECT pg_blocking_pids(:pid)'),
+                                {'pid': workers['second_pid']},
+                            ).scalar_one()
+                            if workers['first_pid'] in blockers:
+                                break
+                            self.assertLess(monotonic(), deadline, 'Competing outcome sync did not progress')
+                            second_selected.wait(0.01)
+                    if second_selected.is_set():
+                        # Without serialization, both lookups see no outcome.
+                        # Commit the second insert before releasing the first.
+                        second.result(timeout=5)
+                finally:
+                    release_first.set()
+                first_result = first.result(timeout=10)
+                second_result = second.result(timeout=10)
+        finally:
+            event.remove(engine, 'before_cursor_execute', before_select)
+            event.remove(engine, 'after_cursor_execute', after_select)
+
+        self.assertEqual(first_result['outcome_id'], second_result[0]['outcome_id'])
+        self.assertEqual(first_result['lifecycle_status'], 'planned')
+        with session_scope() as session:
+            rows = session.execute(
+                select(SignalDeciderActualExecutionOutcome).where(
+                    SignalDeciderActualExecutionOutcome.entry_plan_item_id == entry_id,
+                )
+            ).scalars().all()
+            self.assertEqual(len(rows), 1)
+
+    def test_existing_outcome_sync_updates_fill_fields_without_changing_identity(self) -> None:
+        snapshot_id = self._seed_snapshot()
+        entry_id = self._seed_plan_item(
+            execution_window='next_open',
+            snapshot_id=snapshot_id,
+            planned_side='buy',
+            client_order_id=None,
+            order_request_id=None,
+            broker_order_row_id=None,
+            execution_status='submitted',
+        )
+        initial = signal_decider_execution_outcome_service.sync_entry_plan_item(
+            entry_plan_item_id=entry_id,
+        )
+        self.assertEqual(initial['lifecycle_status'], 'planned')
+        self.assertIsNone(initial['realized_pnl_krw'])
+        self._attach_closed_exec_readback_submission(entry_plan_item_id=entry_id)
+
+        updated = signal_decider_execution_outcome_service.sync_for_decision_snapshot_ids(
+            decision_snapshot_ids=[snapshot_id],
+        )[0]
+
+        self.assertEqual(updated['outcome_id'], initial['outcome_id'])
+        self.assertEqual(updated['created_at'], initial['created_at'])
+        self.assertGreater(updated['updated_at'], initial['updated_at'])
+        self.assertEqual(updated['lifecycle_status'], 'closed')
+        self.assertEqual(updated['exit_reason'], 'target_hit')
+        self.assertEqual(Decimal(updated['closed_quantity']), Decimal('5'))
+        self.assertEqual(Decimal(updated['realized_pnl_krw']), Decimal('20000'))
+        self.assertEqual(updated['entry_average_fill_price'], 50000)
+        self.assertEqual(updated['exit_average_fill_price'], 54000)
+        for key in (
+            'exit_plan_item_id',
+            'entry_order_request_id',
+            'entry_broker_order_row_id',
+            'exit_order_request_id',
+            'exit_broker_order_row_id',
+        ):
+            self.assertIsNone(updated[key], key)
 
     def test_list_outcomes_refresh_persists_closed_target_hit_trade(self) -> None:
         snapshot_id = self._seed_snapshot()
