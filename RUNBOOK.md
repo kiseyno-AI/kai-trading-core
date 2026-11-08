@@ -592,6 +592,7 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 - `DART_FUNDAMENTALS_DEFAULT_REPORT_CODE` defaults the fundamentals slice to `11011` (annual report).
 - `DART_FUNDAMENTALS_DEFAULT_FS_DIV` defaults the fundamentals slice to `CFS` (consolidated statements).
 - `DART_FUNDAMENTALS_EVENT_TIMEOUT_SECONDS` bounds one fundamentals-capture event before it is marked failed and the batch moves on.
+- `DART_FUNDAMENTALS_ANNUAL_EVENT_TIMEOUT_SECONDS` (default 240) replaces that limit for the audit-document step of annual-report (`사업보고서`) events. Measured on 2026-11-06, large financial-holding amended annual reports take 73–120s to download and parse, so the generic 60s limit made them time out on every retry and kept their symbols in `scope_retry_debt` indefinitely. A provider `[014]` (document no longer exists, typically an attachment-only amendment) is recorded as terminal `no_data` instead of retryable debt; other provider errors, including `[020]` quota, stay retryable. A document that exceeds the archive size limit is still retryable and is not changed here.
 - `DART_FUNDAMENTALS_STALE_RUN_MINUTES` marks abandoned `running` capture runs as failed before a new capture batch starts.
 
 ## Korea Exim FX notes

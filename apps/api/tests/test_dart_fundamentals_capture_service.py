@@ -1301,6 +1301,84 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repository.failures[0][0], 1)
         self.assertIn('timed out', repository.failures[0][1])
 
+    async def test_annual_report_audit_step_uses_the_longer_annual_timeout(self):
+        default_result = self.mock_capture_dart_signals.return_value
+
+        async def slow_signals(**_kwargs):
+            await asyncio.sleep(0.2)
+            return default_result
+
+        self.mock_capture_dart_signals.side_effect = slow_signals
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+        # The generic limit would cut this audit step off; the annual one must not.
+        service.event_timeout_seconds = 0.05
+        service.annual_event_timeout_seconds = 5
+
+        slow_result = await service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+        self.assertEqual(slow_result['events_failed'], 0)
+        self.assertEqual(slow_result['events_captured'], 1)
+
+        # Same slow step, annual limit too small -> failure that names the
+        # limit that was actually applied (not the generic one).
+        failing_repository = FakeCaptureRepository()
+        failing_service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=failing_repository,
+        )
+        failing_service.event_timeout_seconds = 5
+        failing_service.annual_event_timeout_seconds = 0.001
+        failed_result = await failing_service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+        self.assertEqual(failed_result['events_failed'], 1)
+        self.assertIn('timed out after 0.001s', failing_repository.failures[0][1])
+
+    async def test_missing_provider_document_is_terminal_not_permanent_retry_debt(self):
+        self.mock_capture_dart_signals.side_effect = RuntimeError(
+            'DART request failed [014]: 파일이 존재하지 않습니다.'
+        )
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+
+        self.assertEqual(result['events_failed'], 0)
+        self.assertEqual(result['events_skipped'], 1)
+        self.assertEqual(result['results'][0]['status'], 'no_data')
+        self.assertEqual(repository.terminals[0][0], 1)
+        self.assertEqual(repository.terminals[0][1], 'no_data')
+        self.assertIn('[014]', repository.terminals[0][2])
+        self.assertEqual(repository.failures, [])
+
+    async def test_other_provider_errors_stay_retryable(self):
+        self.mock_capture_dart_signals.side_effect = RuntimeError(
+            'DART request failed [020]: 사용한도를 초과하였습니다.'
+        )
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1, force=False, trigger='test', fs_div='CFS'
+        )
+
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(repository.terminals, [])
+        self.assertEqual(repository.failures[0][0], 1)
+
     async def test_capture_recent_fundamentals_marks_dart_no_data_terminal(self):
         client = FakeCaptureClient()
         repository = FakeCaptureRepository()
@@ -4610,6 +4688,60 @@ class BuildRowPayloadsTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daily_refresh_captures_a_due_014_event_outside_the_window(self):
+        # Review case: the [014] recheck lived only in the windowed candidate
+        # query, which the daily refresh never reaches for a resolved event.
+        recheck_event = {
+            'id': 77,
+            'rcept_no': '20260301000077',
+            'corp_code': '00000077',
+            'corp_name': '재확인',
+            'stock_code': '111111',
+            'report_nm': '분기보고서 (2025.12)',
+            'filing_category': 'quarterly_report',
+            'fundamentals_capture_status': 'no_data',
+            'receipt_date': '2026-03-01',
+        }
+
+        class RecheckRepository(FakeCaptureRepository):
+            def list_capture_candidates(self, **kwargs):
+                return []
+
+            def list_file_not_found_rechecks(self, *, stock_codes, limit=20):
+                self.recheck_call = {'stock_codes': list(stock_codes), 'limit': limit}
+                return [recheck_event]
+
+        repository = RecheckRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '111111'}],
+        )
+
+        async def fake_sync(**kwargs):
+            return {
+                'run_id': 1, 'status': 'completed', 'financial_report_events': 0,
+                'corporations_processed': len(kwargs['corporations']), 'corporations_failed': 0,
+                'corporation_errors': [],
+            }
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            side_effect=fake_sync,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
+            False,
+        ):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14), capture_limit=10, fs_div='CFS', trigger='test_daily',
+            )
+
+        self.assertEqual(repository.recheck_call, {'stock_codes': ['111111'], 'limit': 10})
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertGreaterEqual(int(metadata.get('events_detected') or repository.completed_refresh_runs[-1][1].get('events_detected') or 0), 1)
 
 
 def test_bounded_rotation_visits_every_candidate_on_weekday_runs():

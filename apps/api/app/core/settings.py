@@ -235,6 +235,10 @@ class Settings(BaseSettings):
     dart_fundamentals_default_fs_div: str = 'CFS'
     dart_fundamentals_daily_retry_cycles: int = 3
     dart_fundamentals_event_timeout_seconds: int = 60
+    # Annual-report capture downloads and parses the audit document first. Large
+    # filings (financial holdings' amended reports) measured 73-120s, so the
+    # generic 60s limit made them time out on every retry, forever.
+    dart_fundamentals_annual_event_timeout_seconds: int = Field(default=240, ge=1, le=900)
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_global_share_issuance_enabled: bool = False
