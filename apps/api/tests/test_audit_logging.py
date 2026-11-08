@@ -130,6 +130,8 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         event = self._read_log_lines('upstream-http.log')[-1]
         self.assertIn('/StatisticSearch/[REDACTED]/json/', event['url'])
+        self.assertIn('/StatisticSearch/[REDACTED]/json/', event['path'])
+        self.assertNotIn('test-key', json.dumps(event))
 
     async def test_read_retry_retries_transport_failure_and_audits_each_attempt(self):
         attempts = 0

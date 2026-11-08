@@ -386,7 +386,7 @@ async def request_with_audit(
             'method': request.method,
             'url': sanitized_url,
             'target_host': request.url.host,
-            'path': request.url.path,
+            'path': httpx.URL(sanitized_url).path,
             'request_headers': sanitize_headers(request.headers),
             'request_content_length': _request_content_length(request),
             'request_content_type': request.headers.get('content-type'),
