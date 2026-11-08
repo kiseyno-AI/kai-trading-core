@@ -485,7 +485,7 @@ class MacroContextServiceTests(unittest.TestCase):
 
     def test_invalid_fred_date_isolated_from_sibling_series(self) -> None:
         settings.macro_context_world_bank_enabled = False
-        settings.macro_context_fred_series = 'DEXKOUS,CPIAUCSL'
+        settings.macro_context_fred_series = 'DEXKOUS,UNRATE'
         settings.fred_api_key = 'test-fred-key'
         service = MacroContextService(
             store=MacroContextObservationStore(),
@@ -796,3 +796,116 @@ def test_partial_refresh_retries_failed_series_with_prior_success_inside_cooldow
     ]
     assert [call['indicator'] for call in retry_calls] == [failed_series_id]
     assert store.records[(WORLD_BANK_SOURCE, failed_series_id)].status_detail is None
+
+
+class _SeriesFredClient:
+    """Returns per-series FRED observations (newest first)."""
+
+    def __init__(self, observations: dict[str, list[tuple[str, str]]]) -> None:
+        self.observations = observations
+        self.limits: dict[str, int] = {}
+
+    async def fetch_latest_observations(self, *, series_id: str, limit: int = 1):
+        self.limits[series_id] = limit
+        return {
+            'observations': [
+                {'date': day, 'value': value}
+                for day, value in self.observations[series_id]
+            ]
+        }
+
+
+def _global_macro_refresh(observations: dict[str, list[tuple[str, str]]]):
+    client = _SeriesFredClient(observations)
+    service = MacroContextService(
+        store=_InMemoryMacroStore(),
+        world_bank_client=FakeWorldBankClient(),
+        fred_client=client,
+    )
+    with (
+        patch.object(settings, 'macro_context_enabled', True),
+        patch.object(settings, 'macro_context_world_bank_enabled', False),
+        patch.object(settings, 'macro_context_fred_enabled', True),
+        patch.object(settings, 'fred_api_key', 'test-fred-key'),
+        patch.object(settings, 'macro_context_fred_series', ','.join(observations)),
+    ):
+        result = service.refresh_context(force=True, trigger='unit_test')
+    return client, result
+
+
+def test_us_cpi_is_stored_as_year_over_year_change_not_index_level() -> None:
+    monthly = [(f'2026-{month:02d}-01', str(320.0 + month)) for month in range(9, 0, -1)]
+    monthly += [(f'2025-{month:02d}-01', str(310.0 + month)) for month in range(12, 8, -1)]
+    client, result = _global_macro_refresh({'CPIAUCSL': monthly})
+
+    assert result['observations_failed'] == 0
+    assert client.limits['CPIAUCSL'] == 15
+    cpi = next(item for item in result['context']['series'] if item['series_id'] == 'CPIAUCSL')
+    # 2026-09 = 329.0 against 2025-09 = 319.0
+    assert cpi['latest_value'] == round((329.0 / 319.0 - 1) * 100, 3)
+    assert cpi['unit'] == 'percent YoY'
+    assert result['context']['macro_regime_summary']['us_inflation_label'] == 'us_inflation_above_target'
+
+
+def test_us_cpi_without_a_base_month_fails_that_series_only() -> None:
+    _, result = _global_macro_refresh(
+        {
+            'CPIAUCSL': [('2026-09-01', '329.0'), ('2026-08-01', '328.0')],
+            'UNRATE': [('2026-09-01', '4.3')],
+        }
+    )
+
+    statuses = {item['series_id']: item for item in result['series_statuses']}
+    assert statuses['CPIAUCSL']['status'] == 'failed'
+    assert 'YoY' in statuses['CPIAUCSL']['reason']
+    assert statuses['UNRATE']['status'] == 'available'
+
+
+def test_global_risk_labels_from_fred_drivers() -> None:
+    def labels(vix: str, hy: str, curve: str) -> dict:
+        _, result = _global_macro_refresh(
+            {
+                'VIXCLS': [('2026-11-05', vix)],
+                'BAMLH0A0HYM2': [('2026-11-05', hy)],
+                'T10Y2Y': [('2026-11-05', curve)],
+                'DGS10': [('2026-11-05', '4.84')],
+                'DCOILWTICO': [('2026-11-03', '.'), ('2026-11-02', '61.5')],
+            }
+        )
+        return result['context']['macro_regime_summary']
+
+    stressed = labels('31.2', '3.1', '-0.2')
+    assert stressed['risk_label'] == 'risk_stress'
+    assert stressed['global_risk_label'] == 'global_risk_off'
+    assert stressed['us_curve_label'] == 'curve_inverted'
+    assert stressed['us_10y_label'] == 'us_10y_high'
+    # FRED's '.' placeholder is skipped for the latest numeric value.
+    assert stressed['oil_label'] == 'oil_normal'
+
+    calm = labels('13.0', '3.0', '0.8')
+    assert calm['global_risk_label'] == 'global_risk_on'
+    assert calm['us_curve_label'] == 'curve_normal'
+
+    caution = labels('22.0', '4.0', '0.3')
+    assert caution['global_risk_label'] == 'global_risk_caution'
+    assert caution['us_curve_label'] == 'curve_flat'
+    assert caution['us_policy_label'] == 'us_policy_unknown'
+
+
+def test_stale_risk_series_do_not_produce_a_risk_on_label() -> None:
+    from app.macro_context.service import _global_labels
+
+    calm = {
+        'risk': {'status': 'available', 'latest_value': 12.0},
+        'credit': {'status': 'available', 'latest_value': 3.0},
+    }
+    assert _global_labels(calm)['global_risk_label'] == 'global_risk_on'
+
+    stale = {key: {**item, 'status': 'stale'} for key, item in calm.items()}
+    labels = _global_labels(stale)
+    assert labels['risk_label'] == 'risk_unknown'
+    assert labels['credit_label'] == 'credit_unknown'
+    assert labels['global_risk_label'] == 'global_risk_unknown'
+
+    one_stale = {'risk': calm['risk'], 'credit': {**calm['credit'], 'status': 'stale'}}
+    assert _global_labels(one_stale)['global_risk_label'] == 'global_risk_neutral'
