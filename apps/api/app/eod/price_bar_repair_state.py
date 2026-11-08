@@ -313,15 +313,56 @@ def record_pending_exact_signal_repair_proof(
     }
 
 
+PENDING_REBUILD_CLOSEOUT_HINT = (
+    'Core stays down while any batch is pending. From apps/api, finish the '
+    'closeout: run `python -m app.eod.price_bar_repair_state --rebuild-evaluations`, '
+    'then `python -m app.eod.price_bar_repair_state` (verify only), then '
+    '`python -m app.eod.price_bar_repair_state --complete` once every required '
+    'numeric rebuild has finished (README.md, "Bounded numeric data repair").'
+)
+
+
+def format_pending_rebuild_block_message(
+    pending: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Describe why startup is blocked, how long it has been, and how to unblock it.
+
+    The leading sentence and batch-id list are unchanged so existing log searches
+    keep matching; the age and the closeout steps are appended.
+    """
+
+    batch_ids = [str(item['repair_batch_id']) for item in pending]
+    message = (
+        'Core startup blocked because repaired daily price bars still require '
+        f'derived-data rebuild verification: {batch_ids}'
+    )
+    oldest_created_at = None
+    for item in pending:
+        try:
+            created_at = datetime.fromisoformat(str(item.get('created_at')))
+        except (TypeError, ValueError):
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if oldest_created_at is None or created_at < oldest_created_at:
+            oldest_created_at = created_at
+    if oldest_created_at is not None:
+        reference = now or datetime.now(timezone.utc)
+        age_hours = max((reference - oldest_created_at).total_seconds(), 0.0) / 3600
+        message += (
+            f'. {len(batch_ids)} pending batch(es); the oldest was created '
+            f'{oldest_created_at.isoformat()} ({age_hours:.1f}h ago)'
+        )
+    return f'{message}. {PENDING_REBUILD_CLOSEOUT_HINT}'
+
+
 def assert_no_pending_price_bar_rebuilds() -> None:
     pending = load_pending_price_bar_rebuild_batches()
     if not pending:
         return
-    batch_ids = [str(item['repair_batch_id']) for item in pending]
-    raise PendingPriceBarRebuildError(
-        'Core startup blocked because repaired daily price bars still require '
-        f'derived-data rebuild verification: {batch_ids}'
-    )
+    raise PendingPriceBarRebuildError(format_pending_rebuild_block_message(pending))
 
 
 def _stable_numeric(value: object) -> str | None:
