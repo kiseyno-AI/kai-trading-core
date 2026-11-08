@@ -7311,6 +7311,60 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'stage checkpoint unavailable',
             )
 
+    def test_grouped_control_stage_start_failure_terminalizes_parent_run(
+        self,
+    ) -> None:
+        for failed_stage, master_status in (
+            ('master_refresh', 'completed'),
+            ('pykrx_universe_refresh', 'completed'),
+            ('price_collection', 'failed'),
+        ):
+            with self.subTest(failed_stage=failed_stage):
+                state = _FakePipelineRunStateService()
+                original_start_stage = state.start_stage
+                checkpoint_error = RuntimeError(
+                    f'{failed_stage} checkpoint unavailable'
+                )
+
+                def start_stage(**kwargs):
+                    if kwargs['stage_id'] == failed_stage:
+                        raise checkpoint_error
+                    return original_start_stage(**kwargs)
+
+                state.start_stage = MagicMock(side_effect=start_stage)
+                pykrx_runner = MagicMock()
+                service = DailyPipelineStageService(
+                    pykrx_service=pykrx_runner,
+                    run_state_service=state,
+                )
+                with (
+                    patch.object(
+                        service,
+                        '_execute_stage',
+                        return_value={
+                            'status': master_status,
+                            'symbols_refreshed': 2,
+                        },
+                    ) as execute_stage,
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    service.run(
+                        market_date='2026-04-14',
+                        stages=['price_collection'],
+                    )
+
+                self.assertIs(raised.exception, checkpoint_error)
+                self.assertEqual(state.runs[-1]['status'], 'failed')
+                self.assertEqual(
+                    state.runs[-1]['finish']['error_message'],
+                    str(checkpoint_error),
+                )
+                pykrx_runner.run_daily_pipeline_stages.assert_not_called()
+                self.assertEqual(
+                    execute_stage.call_count,
+                    0 if failed_stage == 'master_refresh' else 1,
+                )
+
     def test_final_run_checkpoint_retries_transient_failures(self) -> None:
         self.run_state_service.finish_run = MagicMock(
             side_effect=[

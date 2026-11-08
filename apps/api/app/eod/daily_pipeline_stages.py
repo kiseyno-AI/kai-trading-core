@@ -3115,19 +3115,12 @@ class DailyPipelineStageService:
                             for symbol in official_membership_symbols
                             if symbol in merged_successful
                         ]
-            try:
-                self._start_tracked_stage(
-                    pipeline_run_id=pipeline_run_id,
-                    stage_id=stage_id,
-                    market_date=resolved_market_date,
-                    symbols=stage_symbols,
-                )
-            except Exception as exc:
-                self._finish_run_after_stage_start_failure(
-                    pipeline_run_id=pipeline_run_id,
-                    error_message=str(exc),
-                )
-                raise
+            self._start_tracked_stage(
+                pipeline_run_id=pipeline_run_id,
+                stage_id=stage_id,
+                market_date=resolved_market_date,
+                symbols=stage_symbols,
+            )
             if incomplete_dependencies and stage_id != 'next_open_execution_plan':
                 stage_result = {
                     'triggered': False,
@@ -4429,23 +4422,30 @@ class DailyPipelineStageService:
         symbols: list[str] | None,
     ) -> None:
         definition = STAGE_DEFINITIONS[stage_id]
-        self.run_state_service.start_stage(
-            pipeline_run_id=pipeline_run_id,
-            stage_id=stage_id,
-            market_date=market_date,
-            current_step=f'{stage_id}_started',
-            current_activity=f'Running {definition.label}',
-            processed=0,
-            total=len(symbols or []),
-            succeeded=0,
-            failed=0,
-            details={
-                'group': definition.group,
-                'depends_on': list(definition.depends_on),
-                'output_tables': list(definition.output_tables),
-                'inspect_routes': list(definition.inspect_routes),
-            },
-        )
+        try:
+            self.run_state_service.start_stage(
+                pipeline_run_id=pipeline_run_id,
+                stage_id=stage_id,
+                market_date=market_date,
+                current_step=f'{stage_id}_started',
+                current_activity=f'Running {definition.label}',
+                processed=0,
+                total=len(symbols or []),
+                succeeded=0,
+                failed=0,
+                details={
+                    'group': definition.group,
+                    'depends_on': list(definition.depends_on),
+                    'output_tables': list(definition.output_tables),
+                    'inspect_routes': list(definition.inspect_routes),
+                },
+            )
+        except Exception as exc:
+            self._finish_run_after_stage_start_failure(
+                pipeline_run_id=pipeline_run_id,
+                error_message=str(exc),
+            )
+            raise
 
     def _finish_run_after_stage_start_failure(
         self,
