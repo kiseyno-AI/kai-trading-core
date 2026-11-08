@@ -3115,6 +3115,7 @@ class AgentFeedbackRetryService:
                 market_date=market_date,
                 roles=expected_roles,
                 symbols=symbols,
+                knowledge_cutoff_at=knowledge_cutoff_at,
             )
         incomplete: list[str] = []
         for symbol in symbols:
