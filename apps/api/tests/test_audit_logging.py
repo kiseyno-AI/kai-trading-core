@@ -152,6 +152,53 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(event['path'], '/api/[REDACTED]/data')
                 self.assertIn('symbol=005930', event['url'])
 
+    async def test_read_retry_redacts_credentials_in_exception_audit_fields(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectError(
+                    f"cannot reach {request.url}; auth={request.headers['authorization']}",
+                    request=request,
+                )
+            return httpx.Response(200, json={'ok': True}, request=request)
+
+        with patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                response = await audit_logging.request_read_with_retry_and_audit(
+                    client, 'test_service', 'GET',
+                    'https://example.test/api/private%2Fkey/data',
+                    params={'authkey': 'query-secret', 'symbol': '005930'},
+                    headers={'Authorization': 'Bearer header-secret'},
+                    secret_values=iter(['private/key']),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attempts, 2)
+        events = self._read_log_lines('upstream-http.log')
+        for event in events:
+            for secret in ('private/key', 'private%2Fkey', 'query-secret', 'header-secret'):
+                self.assertNotIn(secret, json.dumps(event))
+        errors = [event for event in events if event.get('error_message')]
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all('symbol=005930' in event['error_message'] for event in errors))
+
+    async def test_download_redacts_credentials_in_exception_audit_fields(self):
+        url = 'https://example.test/master.zip?token=download-secret&symbol=005930'
+        failure = OSError(f'cannot download {url}')
+        with patch('app.core.audit_logging.urlopen', side_effect=failure):
+            with self.assertRaises(OSError) as raised:
+                audit_logging.download_bytes_with_audit(
+                    service='test_service', url=url, timeout=1,
+                )
+
+        self.assertIs(raised.exception, failure)
+        event = self._read_log_lines('upstream-http.log')[-1]
+        self.assertNotIn('download-secret', json.dumps(event))
+        self.assertIn('symbol=005930', event['error_message'])
+
     async def test_read_retry_retries_transport_failure_and_audits_each_attempt(self):
         attempts = 0
 
