@@ -652,16 +652,16 @@ def _apply_event_snapshot_patch(
     if resulting_status is not None:
         row.current_status = resulting_status
 
-    if 'cumulative_filled_quantity' in event:
+    if event.get('cumulative_filled_quantity') is not None:
         row.filled_quantity = _normalize_decimal(
             event.get('cumulative_filled_quantity'),
             field='cumulative_filled_quantity',
         ) or Decimal('0')
 
-    if 'remaining_quantity' in event:
+    if event.get('remaining_quantity') is not None:
         row.remaining_quantity = _normalize_decimal(event.get('remaining_quantity'), field='remaining_quantity')
 
-    if 'average_fill_price' in event:
+    if event.get('average_fill_price') is not None:
         row.average_fill_price = _normalize_decimal(event.get('average_fill_price'), field='average_fill_price')
 
     if event.get('fill_price') is not None:
