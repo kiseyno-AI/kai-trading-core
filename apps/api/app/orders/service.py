@@ -84,6 +84,8 @@ def _to_decimal(
         normalized = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
         raise TradingOrderValidationError(f'{field} must be numeric') from exc
+    if not normalized.is_finite():
+        raise TradingOrderValidationError(f'{field} must be finite')
     if positive and normalized <= Decimal('0'):
         raise TradingOrderValidationError(f'{field} must be greater than zero')
     if non_negative and normalized < Decimal('0'):

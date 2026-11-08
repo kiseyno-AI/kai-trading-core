@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy import delete
@@ -142,6 +143,29 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order_row['current_status'], 'submitted')
         self.assertEqual(order_row['broker_order_id'], '0000123456')
         self.assertEqual([item['event_type'] for item in events], ['submit_request', 'submit_response'])
+
+    async def test_nonfinite_submit_values_fail_before_persistence_or_broker_call(self) -> None:
+        for field in ('quantity', 'price', 'condition_price'):
+            for value in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+                with (
+                    self.subTest(field=field, value=value),
+                    patch(
+                        'app.orders.service.create_order_request_if_absent',
+                        side_effect=AssertionError('invalid values must not be persisted'),
+                    ) as persist,
+                ):
+                    payload = {
+                        'account_number': self.account_number,
+                        'account_product_code': self.account_product_code,
+                        'symbol': self.symbol,
+                        'quantity': Decimal('10'),
+                        'price': Decimal('70000'),
+                        field: Decimal(value),
+                    }
+                    with self.assertRaises(TradingOrderValidationError):
+                        await self.service.submit_buy_order(**payload)
+                    persist.assert_not_called()
+                    self.assertEqual(self.fake_client.submit_calls, 0)
 
     async def test_submit_rejection_persists_rejected_state(self) -> None:
         self.fake_client.submit_exception = KISAPIError(
