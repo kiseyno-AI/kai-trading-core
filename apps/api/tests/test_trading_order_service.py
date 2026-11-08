@@ -300,6 +300,59 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['order']['remaining_quantity'], Decimal('6'))
         self.assertEqual(result['events'][-1]['event_type'], 'partial_fill')
 
+    async def test_refresh_ignores_unrelated_orders_with_self_referencing_origin_ids(self) -> None:
+        await self._submit_buy_order()
+        target = {
+            'odno': '0000123456', 'pdno': self.symbol, 'ord_qty': '10',
+            'tot_ccld_qty': '0', 'rmn_qty': '10', 'cncl_yn': 'N',
+        }
+        unrelated = {
+            **target, 'odno': '0000999999', 'orgn_odno': '0000999999',
+            'tot_ccld_qty': '10', 'rmn_qty': '0',
+        }
+        self.fake_client.daily_fill_result['output1'] = [target, unrelated]
+        self.fake_client.cancelable_result['output'] = [
+            {**unrelated, 'psbl_qty': '0'}, {**target, 'psbl_qty': '10'},
+        ]
+
+        result = await self.service.get_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            refresh=True,
+        )
+
+        self.assertEqual(result['order']['current_status'], 'accepted')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('0'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('10'))
+        self.assertEqual(
+            result['order']['raw_latest_payload']['cancelable_order']['odno'],
+            target['odno'],
+        )
+
+    async def test_refresh_matches_a_child_order_by_its_origin_order_id(self) -> None:
+        await self._submit_buy_order()
+        child = {
+            'odno': '0000456789', 'orgn_odno': '0000123456', 'pdno': self.symbol,
+            'ord_qty': '10', 'tot_ccld_qty': '4', 'rmn_qty': '6',
+            'avg_prvs': '70100', 'cncl_yn': 'N',
+        }
+        self.fake_client.daily_fill_result['output1'] = [child]
+        self.fake_client.cancelable_result['output'] = [{**child, 'psbl_qty': '6'}]
+
+        result = await self.service.get_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            refresh=True,
+        )
+
+        self.assertEqual(result['order']['current_status'], 'partial_fill')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('4'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('6'))
+        self.assertEqual(
+            result['order']['raw_latest_payload']['cancelable_order']['odno'],
+            child['odno'],
+        )
+
     async def test_manual_reconcile_repairs_missed_notice_fill_state(self) -> None:
         await self._submit_buy_order()
         self.fake_client.daily_fill_result = {

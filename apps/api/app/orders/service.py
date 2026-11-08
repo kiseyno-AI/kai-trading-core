@@ -1737,7 +1737,7 @@ class TradingOrderService:
         for row in inquiry_rows:
             row_order_id = str(_pick_first(row, 'odno') or '')
             row_origin_order_id = str(_pick_first(row, 'orgn_odno') or '')
-            if broker_order_id and row_order_id not in {broker_order_id, row_origin_order_id}:
+            if broker_order_id and broker_order_id not in {row_order_id, row_origin_order_id}:
                 continue
             if client_symbol and str(_pick_first(row, 'pdno') or '') not in {'', client_symbol}:
                 continue
@@ -1755,7 +1755,7 @@ class TradingOrderService:
         for row in cancelable_rows:
             row_order_id = str(_pick_first(row, 'odno') or '')
             row_origin_order_id = str(_pick_first(row, 'orgn_odno') or '')
-            if broker_order_id and row_order_id not in {broker_order_id, row_origin_order_id}:
+            if broker_order_id and broker_order_id not in {row_order_id, row_origin_order_id}:
                 continue
             if client_symbol and str(_pick_first(row, 'pdno') or '') not in {'', client_symbol}:
                 continue
