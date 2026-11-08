@@ -644,6 +644,41 @@ class KISFinalBarRepairServiceTests(unittest.IsolatedAsyncioTestCase):
             result['required_follow_up'],
         )
 
+    async def test_apply_fences_a_writer_for_a_not_yet_stored_date(self) -> None:
+        from app.market_data_store import advisory_eod_collection_lock
+
+        writer_admissions = []
+
+        async def provider_loader(_symbol, **_kwargs):
+            return _payload()
+
+        def repairer(**_kwargs):
+            with advisory_eod_collection_lock(
+                market='KRX',
+                trade_date=(MARKET_DATE + timedelta(days=1)).isoformat(),
+                source='daily_price_bars',
+            ) as acquired:
+                writer_admissions.append(acquired)
+            return {'status': 'completed', 'applied': True, 'updated_count': 0}
+
+        service = KISFinalBarRepairService(
+            page_loader=lambda **_kwargs: TargetPage(
+                symbols=('005930',), rows=(_stored(),), has_more=False
+            ),
+            provider_loader=provider_loader,
+            repairer=repairer,
+            rebuild_date_loader=lambda **_kwargs: (MARKET_DATE,),
+            pending_batch_loader=lambda: [],
+            now_factory=_after_settle,
+        )
+
+        result = await service.repair_page(
+            start_date=MARKET_DATE, end_date=MARKET_DATE, apply=True
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(writer_admissions, [False])
+
     async def test_apply_rejects_same_day_before_nxt_settle(self) -> None:
         same_day = date(2026, 9, 23)
         service = KISFinalBarRepairService(
@@ -673,6 +708,62 @@ class KISFinalBarRepairServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KISFinalBarRepositoryPostgresTests(unittest.TestCase):
+    def test_apply_rejects_a_new_downstream_date_before_writing(self) -> None:
+        symbol_code = uuid4().hex[:6].upper()
+        batch_id = str(uuid4())
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            session = Session(bind=connection)
+
+            @contextmanager
+            def rollback_only_session_scope(**_kwargs):
+                yield session
+
+            try:
+                symbol = Symbol(
+                    symbol=symbol_code, name_ko='repair scope drift', market='KOSPI',
+                    instrument_type='equity', source='test', is_active=True,
+                )
+                session.add(symbol)
+                session.flush()
+                bar = DailyPriceBar(
+                    symbol_id=symbol.id, trade_date=MARKET_DATE,
+                    open_price=100, high_price=105, low_price=95, close_price=101,
+                    volume=100, turnover=10_000, source='test',
+                )
+                session.add(bar)
+                session.flush()
+                with patch('app.eod.kis_final_bar_repair.session_scope', rollback_only_session_scope):
+                    page = load_target_page(
+                        start_date=MARKET_DATE, end_date=MARKET_DATE,
+                        selected_symbols=[symbol_code],
+                    )
+                    # Model a new stored date after the caller selected its lock scope.
+                    session.add(DailyPriceBar(
+                        symbol_id=symbol.id, trade_date=MARKET_DATE + timedelta(days=1),
+                        open_price=100, high_price=105, low_price=95, close_price=101,
+                        volume=100, turnover=10_000, source='test',
+                    ))
+                    session.flush()
+                    with self.assertRaisesRegex(RuntimeError, 'rebuild scope'):
+                        repair_existing_final_bars(
+                            start_date=MARKET_DATE, end_date=MARKET_DATE,
+                            selected_symbols=[symbol_code], initial_rows=page.rows,
+                            provider_bars={(symbol_code, MARKET_DATE): _provider(symbol=symbol_code)},
+                            required_rebuild_trade_dates=[MARKET_DATE],
+                            repair_batch_id=batch_id, apply=True,
+                        )
+
+                session.refresh(bar)
+                self.assertEqual(bar.close_price, 101)
+                self.assertIsNone(session.get(DailyPriceBarRepairBatch, batch_id))
+                self.assertEqual(session.scalars(select(DailyPriceBarRepairAudit).where(
+                    DailyPriceBarRepairAudit.repair_batch_id == batch_id
+                )).all(), [])
+            finally:
+                session.close()
+                transaction.rollback()
+
     def test_apply_updates_values_and_records_truthful_repair_lineage(self) -> None:
         symbol_code = uuid4().hex[:6].upper()
         with engine.connect() as connection:

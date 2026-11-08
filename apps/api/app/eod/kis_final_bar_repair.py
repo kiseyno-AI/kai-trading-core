@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from functools import partial
 import json
 import re
 import sys
@@ -682,6 +683,12 @@ def repair_existing_final_bars(
             raise RuntimeError(
                 'repair dates are missing from the durable rebuild scope'
             )
+        if required_rebuild_trade_dates is not None and not set(
+            _required_rebuild_trade_dates(session, from_date=changed_trade_dates[0])
+        ).issubset(required_rebuild_dates):
+            raise RuntimeError(
+                'stored downstream dates expanded beyond the locked rebuild scope'
+            )
         affected_symbols = sorted({provider.symbol for _, provider in updates})
         evaluation_market_date_from = _required_evaluation_market_date_from(
             session,
@@ -989,7 +996,9 @@ class KISFinalBarRepairService:
                 **kwargs,
             )
         else:
-            self.lock_set_factory = advisory_eod_collection_locks
+            self.lock_set_factory = partial(
+                advisory_eod_collection_locks, exclusive_admission=True
+            )
         self.rebuild_date_loader = (
             rebuild_date_loader or load_required_rebuild_trade_dates
         )
