@@ -682,7 +682,11 @@ class AgentContextProgressService:
                     sanitized_role_progress[role] = role_summary
                     continue
                 role_payload = dict(role_summary)
-                role_total = int(role_payload.get('total_symbols') or total_symbols or 0)
+                role_total = int(
+                    total_symbols
+                    if role_payload.get('total_symbols') is None
+                    else role_payload['total_symbols']
+                )
                 role_completed = int(role_payload.get('completed_symbols') or 0)
                 role_processed = int(role_payload.get('processed_symbols') or 0)
                 role_failed = int(role_payload.get('failed_items') or 0)
@@ -934,7 +938,11 @@ class AgentContextProgressService:
         for agent_name in expected_agents:
             role_summary = role_progress.get(agent_name) if isinstance(role_progress.get(agent_name), dict) else {}
             roles_payload[agent_name] = {
-                'requested_count': int(role_summary.get('total_symbols') or total_symbols),
+                'requested_count': int(
+                    total_symbols
+                    if role_summary.get('total_symbols') is None
+                    else role_summary['total_symbols']
+                ),
                 'completed_count': int(role_summary.get('completed_symbols') or 0),
                 'error_count': int(role_summary.get('failed_items') or 0),
             }
