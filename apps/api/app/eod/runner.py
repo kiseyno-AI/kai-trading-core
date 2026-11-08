@@ -14,6 +14,7 @@ from app.eod.auto_pykrx import (
     RecoveryOnlyScheduleDisposition,
     auto_pykrx_eod_scheduler,
 )
+from app.eod.data_gap_fill import run_if_due as data_gap_fill_run_if_due
 from app.eod.master import refresh_master_if_due
 from app.market.clock import async_get_market_state
 from app.market.snapshot import market_snapshot_service
@@ -396,6 +397,16 @@ class EODBackgroundRunner:
             if fail_closed:
                 raise
             self._record_step_failure(name, exc)
+
+    def _start_background_thread_step(self, name: str, func) -> None:
+        """Run a blocking job in a thread without awaiting it; one in flight per name."""
+
+        running = self._blocking_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(asyncio.to_thread(func), name=f'eod-background-blocking:{name}')
+        self._blocking_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_blocking_step(name, completed))
 
     def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
         if self._blocking_step_tasks.get(name) is task:
@@ -861,6 +872,16 @@ class EODBackgroundRunner:
                                 trigger=f'background_runner:{market.state.lower()}'
                             ),
                         )
+                        if settings.data_gap_fill_enabled and market.state == 'OPEN':
+                            # Weekday market hours are idle for Core. The job owns its
+                            # schedule, budget and writer fences (docs/DATA_GAP_FILL.md)
+                            # and is report-only unless DATA_GAP_FILL_APPLY is set.
+                            # Started in the background: a budgeted fill can take
+                            # many minutes and must never hold the OPEN tick.
+                            self._start_background_thread_step(
+                                'data_gap_fill_if_due',
+                                data_gap_fill_run_if_due,
+                            )
                     if self._daily_coverage_audit_due(market):
                         await self._run_daily_coverage_audit()
             except Exception as exc:
