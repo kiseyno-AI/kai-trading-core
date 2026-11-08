@@ -6490,6 +6490,30 @@ class PykrxBackfillServiceTests(TestCase):
         fetch_snapshot.assert_called_once_with(markets=('KOSPI',), limit=None)
         persist_universe.assert_called_once_with(snapshot['symbols'], deactivate_missing=False)
 
+    def test_fundamental_mapping_rejects_non_finite_values_and_keeps_finite_values(self) -> None:
+        service = PykrxBackfillService()
+        trade_date = date(2026, 4, 3)
+        prices = pd.DataFrame(
+            [{'시가': 100, '고가': 110, '저가': 90, '종가': 105,
+              '거래량': 10, '거래대금': 1050}],
+            index=pd.to_datetime([trade_date]),
+        )
+        for invalid in (float('inf'), float('-inf'), float('nan'), '1e999'):
+            with self.subTest(invalid=invalid):
+                fundamentals = pd.DataFrame(
+                    [{'PER': invalid, 'PBR': 0, 'BPS': 1250.5,
+                      'EPS': -25, 'DIV': 0.0, 'DPS': 10}],
+                    index=pd.to_datetime([trade_date]),
+                )
+                result = service._map_symbol_bars(prices, fundamentals_frame=fundamentals)
+                self.assertEqual(len(result), 1)
+                self.assertIsNone(result[0]['per'])
+                self.assertEqual(
+                    {key: result[0][key] for key in ('pbr', 'bps', 'eps', 'dividend_yield', 'dps')},
+                    {'pbr': 0.0, 'bps': 1250.5, 'eps': -25.0, 'dividend_yield': 0.0, 'dps': 10.0},
+                )
+                self.assertEqual(result[0]['close_price'], 105)
+
     def test_load_active_universe_filters_inactive_symbols_at_query_boundary(self) -> None:
         service = PykrxBackfillService()
         with patch('app.eod.pykrx_backfill.load_symbols', return_value=[]) as load_symbol_rows:

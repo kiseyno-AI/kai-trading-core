@@ -12144,7 +12144,7 @@ class PykrxBackfillService:
             converted = float(value)
         except (TypeError, ValueError):
             return None
-        if converted != converted:
+        if not math.isfinite(converted):
             return None
         return converted
 
