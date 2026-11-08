@@ -2483,6 +2483,8 @@ def _exact_factor_stage_evidence(
                 market_date=market_date,
                 symbols=observed_symbols,
             )
+            if observed_symbols
+            else (_stable_json_sha256([]), 0)
         )
         result = {
             'market_date': date_key,
