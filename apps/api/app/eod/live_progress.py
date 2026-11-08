@@ -650,7 +650,10 @@ class DailyPipelineLiveProgress:
         ended = _parse(run.get('completed_at')) if run.get('status') in TERMINAL_STATUSES else None
         if started:
             run['elapsed_seconds'] = round(((ended or now) - started).total_seconds(), 1)
-        last = _parse(entry.get('heartbeat_at')) or _parse(run.get('updated_at'))
+        last = _parse(entry.get('heartbeat_at'))
+        updated = _parse(run.get('updated_at'))
+        if updated is not None and (last is None or updated > last):
+            last = updated
         if run.get('status') not in TERMINAL_STATUSES and last is not None:
             idle = (now - last).total_seconds()
             run['seconds_since_update'] = round(idle, 1)
@@ -674,7 +677,10 @@ class DailyPipelineLiveProgress:
                 item['eta_seconds'] = round((total - processed) / rate, 1)
         if processed is not None and total:
             item['percent'] = round(min(processed / total, 1.0) * 100, 1)
-        last = _parse(item.get('heartbeat_at')) or _parse(item.get('updated_at'))
+        last = _parse(item.get('heartbeat_at'))
+        updated = _parse(item.get('updated_at'))
+        if updated is not None and (last is None or updated > last):
+            last = updated
         if status == 'running' and last is not None:
             item['seconds_since_update'] = round((now - last).total_seconds(), 1)
         return item
