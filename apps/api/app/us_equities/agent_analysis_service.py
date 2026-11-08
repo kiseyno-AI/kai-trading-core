@@ -404,7 +404,7 @@ class USAgentAnalysisService:
                         })
                         continue
                     context = dict(prepared['contexts'][symbol])
-                    context['upstream_agent_feedback'] = feedback_by_symbol.get(symbol, {})
+                    context['upstream_agent_feedback'] = dict(feedback_by_symbol.get(symbol, {}))
                     context['request_run_id'] = run_id
                     context['session_key'] = batch_session_key
                     context['session_reuse_mode'] = 'fresh_per_batch'

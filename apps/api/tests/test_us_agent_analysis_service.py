@@ -1,5 +1,6 @@
 import json
 import unittest
+from copy import deepcopy
 from datetime import date
 from unittest.mock import patch
 
@@ -221,6 +222,43 @@ class USAgentAnalysisServiceTests(unittest.TestCase):
         )
         self.default_cleanup_patcher.start()
         self.addCleanup(self.default_cleanup_patcher.stop)
+
+    def test_persisted_context_keeps_the_feedback_actually_sent_to_each_role(self):
+        sent_contexts = {}
+        saved_contexts = {}
+
+        class RecordingDispatcher(FakeDispatcher):
+            def dispatch_batch(self, *, spec, market_date, batch_items):
+                sent_contexts[spec.agent_name] = deepcopy(batch_items[0])
+                return super().dispatch_batch(
+                    spec=spec, market_date=market_date, batch_items=batch_items,
+                )
+
+        def save_feedback(**kwargs):
+            saved_contexts[kwargs['agent_name']] = deepcopy(kwargs['context_payload'])
+            return len(saved_contexts)
+
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: RecordingDispatcher(),
+        )
+        with patch(
+            'app.us_equities.agent_analysis_service.upsert_us_agent_feedback',
+            side_effect=save_feedback,
+        ):
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['signal-decider'],
+                persist=True,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['completed'], 4)
+        for role, sent_context in sent_contexts.items():
+            with self.subTest(role=role):
+                self.assertEqual(saved_contexts[role], sent_context)
+                self.assertNotIn(role, saved_contexts[role]['upstream_agent_feedback'])
 
     def test_ten_thousand_candidates_are_deterministically_bounded_by_role_caps(self):
         rows = [_candidate(index) for index in range(10_000)]
