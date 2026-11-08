@@ -19547,6 +19547,20 @@ class PykrxBackfillServiceTests(TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', ''))
+            context_followups = {
+                name: stack.enter_context(
+                    patch(
+                        f'app.eod.pykrx_pipeline_runner.{name}',
+                        return_value={'triggered': True, 'status': 'completed'},
+                    )
+                )
+                for name in (
+                    '_run_daily_external_news_followup',
+                    '_run_daily_external_news_enrichment_followup',
+                    '_run_daily_macro_context_followup',
+                    '_run_daily_intraday_snapshot_followup',
+                )
+            }
             stack.enter_context(
                 patch.object(
                     service,
@@ -19728,6 +19742,15 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertNotIn('signal_decider_evaluation_followup', result)
         fundamentals_refresh.assert_not_called()
+        for name, followup in context_followups.items():
+            followup.assert_called_once_with(
+                market_date='2026-04-03',
+                enabled=(
+                    bool(settings.kis_intraday_snapshot_enabled)
+                    if name == '_run_daily_intraday_snapshot_followup'
+                    else True
+                ),
+            )
 
     def test_run_market_data_pipeline_keeps_retryable_status_when_snapshot_persistence_has_failures(self) -> None:
         service = PykrxBackfillService()
