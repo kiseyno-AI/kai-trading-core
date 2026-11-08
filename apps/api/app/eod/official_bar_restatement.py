@@ -107,6 +107,7 @@ class OfficialReference:
         for trade_date in sorted(set(dates)):
             compact = trade_date.strftime('%Y%m%d')
             per_market: dict[str, dict[str, Values]] = {}
+            fetched_markets: set[str] = set()
             for market in MARKETS:
                 path = cache / f'{compact}_{market}.csv' if cache is not None else None
                 frame_rows = _read_cached(path) if path is not None and path.exists() else None
@@ -121,6 +122,7 @@ class OfficialReference:
                     last_live_fetch = monotonic()
                     try:
                         frame_rows = _frame_to_rows(fetcher(compact, market))
+                        fetched_markets.add(market)
                         consecutive_failures = 0
                     except Exception:  # noqa: BLE001
                         frame_rows = None
@@ -135,7 +137,7 @@ class OfficialReference:
                 cache.mkdir(parents=True, exist_ok=True)
                 for market, frame_rows in per_market.items():
                     path = cache / f'{compact}_{market}.csv'
-                    if not path.exists():
+                    if market in fetched_markets or not path.exists():
                         _write_cache(path, frame_rows)
             for frame_rows in per_market.values():
                 for symbol, values in frame_rows.items():

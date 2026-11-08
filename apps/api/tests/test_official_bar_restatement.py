@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -157,6 +157,39 @@ class PlannerTests(unittest.TestCase):
 
 
 class OfficialReferenceTests(unittest.TestCase):
+    def test_a_fresh_reference_replaces_an_unreadable_cache_file(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        import pandas as pd
+
+        def fetcher(_compact_date, market):
+            code = '000660' if market == 'KOSPI' else '203650'
+            return pd.DataFrame(
+                {'시가': [100], '고가': [110], '저가': [90], '종가': [105], '거래량': [10], '거래대금': [1050]},
+                index=[code],
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '20990914_KOSPI.csv'
+            path.write_text('code,시가\n000660,100\n', encoding='utf-8')
+            first = OfficialReference.load(
+                [DAY], cache_dir=directory, fetcher=fetcher,
+                minimum_rows=ONE_ROW, min_fetch_interval_seconds=0,
+            )
+            self.assertTrue(first.covers(DAY))
+
+            unavailable_fetcher = Mock(side_effect=ConnectionError('provider unavailable'))
+            second = OfficialReference.load(
+                [DAY], cache_dir=directory, fetcher=unavailable_fetcher,
+                minimum_rows=ONE_ROW, min_fetch_interval_seconds=0,
+            )
+
+            self.assertTrue(second.covers(DAY))
+            self.assertEqual(second.get('000660', DAY), first.get('000660', DAY))
+            self.assertEqual(second.get('203650', DAY), first.get('203650', DAY))
+            unavailable_fetcher.assert_not_called()
+
     def test_loads_from_the_cache_without_fetching(self) -> None:
         import csv
         import tempfile
