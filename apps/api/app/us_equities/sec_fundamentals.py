@@ -53,9 +53,10 @@ def _date(value: Any) -> date | None:
 
 def _decimal(value: Any) -> Decimal | None:
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _fact_entries(
