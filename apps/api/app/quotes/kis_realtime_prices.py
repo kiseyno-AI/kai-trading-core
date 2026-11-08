@@ -147,9 +147,10 @@ def _parse_decimal(value: Any) -> Decimal | None:
     if not normalized:
         return None
     try:
-        return Decimal(normalized)
+        parsed = Decimal(normalized)
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _to_json_number(value: Decimal | None) -> int | float | None:

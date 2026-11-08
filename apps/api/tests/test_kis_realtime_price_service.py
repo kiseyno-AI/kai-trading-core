@@ -360,6 +360,23 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('persist_quote_snapshot', source)
         self.assertNotIn('session_scope', source)
 
+    async def test_nonfinite_price_fields_do_not_break_monitored_snapshots(self) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        for value in ('NaN', 'sNaN', 'Infinity', '-Infinity'):
+            with self.subTest(value=value):
+                fields = _price_fields(price=value)
+                fields['PRDY_CTRT'] = value
+
+                result = service.ingest_price_message(_message_for_rows([fields]))
+
+                self.assertIsNone(result[0]['current_price'])
+                self.assertIsNone(result[0]['change_pct'])
+                self.assertEqual(result[0]['bid_price'], 71400)
+                snapshot = service.monitored_snapshot()
+                self.assertFalse(snapshot['items'][0]['display_price_available'])
+                json.dumps(snapshot, allow_nan=False)
+
     async def test_price_status_marks_stale_when_snapshot_exceeds_threshold(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
         stale_received_at = datetime.now(timezone.utc) - timedelta(seconds=90)
