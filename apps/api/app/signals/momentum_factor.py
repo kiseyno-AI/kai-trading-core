@@ -30,6 +30,7 @@ from app.signals.factor_coverage import (
     persist_symbol_items_with_isolation,
     run_symbol_computation,
 )
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 MOMENTUM_FACTOR_VERSION = 'price_momentum_v1'
 MOMENTUM_FACTOR_SOURCE = 'daily_price_bars'
@@ -46,30 +47,6 @@ def _normalize_market_date(value: str | date) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return date.fromisoformat(value).isoformat()
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in symbols:
-        normalized_symbol = _normalize_symbol(item)
-        if normalized_symbol in seen:
-            continue
-        seen.add(normalized_symbol)
-        normalized.append(normalized_symbol)
-    return normalized
 
 
 def _round(value: float | None, digits: int = 6) -> float | None:

@@ -74,6 +74,18 @@ def evaluate_trade_halt_reasons(snapshot: dict[str, Any]) -> tuple[list[str], li
     return blocking, watchlist
 
 
+def evaluate_dormancy_reasons(snapshot: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Block symbols with no trading over the recent sessions.
+
+    The KIS snapshot only reports an explicit halt flag; symbols suspended for
+    months or in wind-down often carry no flag at all yet cannot trade.
+    """
+
+    blocking: list[str] = []
+    _append_reason(blocking, 'no_recent_trading', when=bool(snapshot.get('no_recent_trading')))
+    return blocking, []
+
+
 def evaluate_watchlist_signal_reasons(snapshot: dict[str, Any]) -> tuple[list[str], list[str]]:
     watchlist: list[str] = []
     _append_reason(watchlist, 'investment_caution', when=bool(snapshot.get('is_investment_caution')))
@@ -98,6 +110,7 @@ def evaluate_market_risk_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         evaluate_volatility_interruption_reasons,
         evaluate_disclosure_reasons,
         evaluate_trade_halt_reasons,
+        evaluate_dormancy_reasons,
     ):
         blocking, watchlist = evaluator(snapshot)
         for reason in blocking:

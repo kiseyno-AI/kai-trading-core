@@ -94,7 +94,7 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
         }
         summarizers = _rows(
             session,
-            """select agent_name, market_date, symbol, (feedback_payload::jsonb->>'confidence')::float
+            """select agent_name, market_date, symbol, (feedback_payload::jsonb->>'confidence')::float, received_at
                from agent_context_feedback
                where agent_name in ('eod-summarizer','technical-summarizer','fundamental-summarizer')
                  and market_date between :a and :b""",
@@ -103,7 +103,10 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
         )
         decisions = _rows(
             session,
-            """select agent_name, market_date, symbol, decision_action, confidence_score_10, conviction_score_10, expected_return_pct
+            # The later of storing, receiving and last updating the row: a value that
+            # changed after the open is not what a trader saw at the open.
+            """select agent_name, market_date, symbol, decision_action, confidence_score_10, conviction_score_10, expected_return_pct,
+                      greatest(created_at, coalesce(feedback_received_at, created_at), updated_at)
                from signal_decider_decision_snapshots where market_date between :a and :b""",
             a=start,
             b=end_date,
@@ -130,20 +133,23 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
         frame[column] = pd.to_numeric(frame[column], errors='coerce')
         panel = panel.merge(frame.drop_duplicates(['symbol', 'd']), on=['symbol', 'd'], how='left')
 
+    sessions = bars['d'].unique()
+    point_in_time: dict[str, dict[str, int]] = {}
     rename = {'eod-summarizer': 'eod_conf', 'technical-summarizer': 'tech_conf', 'fundamental-summarizer': 'fund_conf'}
-    summ = pd.DataFrame(summarizers, columns=['agent', 'd', 'symbol', 'conf'])
+    summ = pd.DataFrame(summarizers, columns=['agent', 'd', 'symbol', 'conf', 'known_at'])
     summ['d'] = pd.to_datetime(summ['d'])
     summ['conf'] = pd.to_numeric(summ['conf'], errors='coerce')
     for agent, column in rename.items():
-        part = summ[summ['agent'] == agent].drop_duplicates(['symbol', 'd'], keep='last')[['symbol', 'd', 'conf']].rename(columns={'conf': column})
+        part, point_in_time[agent] = ev.admit_before_next_open(summ[summ['agent'] == agent], sessions)
+        part = part[['symbol', 'd', 'conf']].rename(columns={'conf': column})
         panel = panel.merge(part, on=['symbol', 'd'], how='left')
 
-    dec = pd.DataFrame(decisions, columns=['agent', 'd', 'symbol', 'act', 'conf', 'conv', 'expret'])
+    dec = pd.DataFrame(decisions, columns=['agent', 'd', 'symbol', 'act', 'conf', 'conv', 'expret', 'known_at'])
     dec['d'] = pd.to_datetime(dec['d'])
     for col in ('conf', 'conv', 'expret'):
         dec[col] = pd.to_numeric(dec[col], errors='coerce')
     for agent, prefix in (('signal-decider', 'sig'), ('short-term-decider', 'st')):
-        part = dec[dec['agent'] == agent].drop_duplicates(['symbol', 'd'], keep='last')
+        part, point_in_time[agent] = ev.admit_before_next_open(dec[dec['agent'] == agent], sessions)
         part = part[['symbol', 'd', 'act', 'conf', 'conv', 'expret']].rename(
             columns={'act': f'{prefix}_act', 'conf': f'{prefix}_conf', 'conv': f'{prefix}_conv', 'expret': f'{prefix}_expret'}
         )
@@ -152,7 +158,9 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
         if column not in panel:
             panel[column] = np.nan
     panel['placebo'] = np.random.default_rng(20260101).normal(size=len(panel))
-    return panel.reset_index(drop=True)
+    panel = panel.reset_index(drop=True)
+    panel.attrs['point_in_time'] = point_in_time
+    return panel
 
 
 def forward_panel(bars: pd.DataFrame, horizons: Sequence[int]) -> pd.DataFrame:
@@ -209,6 +217,7 @@ def evaluate_panel(
                 }
             rows.append(row)
     return {
+        'point_in_time': dict(panel.attrs.get('point_in_time') or {}),
         'entry_timing': entry_timing(panel),
         'n_tests': n_tests,
         'required_t': _round(ev.required_t(n_tests)),
@@ -296,6 +305,13 @@ def render_markdown(result: Mapping[str, Any], *, start: str, end: str, universe
             f"| {row['signal']} | {row['family']} | {row['horizon']} | {row['days']} | {row['mean_ic']} | {row['t_hac']} | "
             f"{row['t_nonoverlap']} | {row['first_half_ic']} / {row['second_half_ic']} | {row['partial_ic_vs_vol']} | **{row['verdict']}** |"
         )
+    admission = result.get('point_in_time') or {}
+    if admission:
+        lines += ['', '## Agent rows admitted (stored before the next session open, 09:00 KST)', '',
+                  '| agent | rows | admitted | stored at/after the open | no stored time | no next session yet |',
+                  '|---|---|---|---|---|---|']
+        for agent, c in admission.items():
+            lines.append(f"| {agent} | {c['rows']} | {c['admitted']} | {c['late']} | {c['unknown_time']} | {c['no_next_session']} |")
     timing = result.get('entry_timing') or {}
     if timing:
         lines += ['', '## Entry timing: the session we buy in, open to its own close', '',

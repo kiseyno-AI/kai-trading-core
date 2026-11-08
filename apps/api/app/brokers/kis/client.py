@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import re
+import threading
+import time
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -131,6 +133,26 @@ class KISClient:
             'generation': '',
         }
         self._token_failure: tuple[str, datetime, KISClientError] | None = None
+        # A plain lock + monotonic timestamp (not an asyncio.Lock) so the limiter
+        # works across the several event loops Core uses.
+        self._request_slot_lock = threading.Lock()
+        self._next_request_slot_at = 0.0
+
+    def _reserve_request_slot_delay(self) -> float:
+        """Reserve the next request slot and return how long to wait for it."""
+        interval = float(settings.kis_min_request_interval_seconds or 0)
+        if interval <= 0:
+            return 0.0
+        with self._request_slot_lock:
+            now = time.monotonic()
+            start = max(now, self._next_request_slot_at)
+            self._next_request_slot_at = start + interval
+            return start - now
+
+    async def _wait_for_request_slot(self) -> None:
+        delay = self._reserve_request_slot_delay()
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     def _environment(self) -> str:
         return 'demo' if self.use_mock else 'real'
@@ -690,6 +712,7 @@ class KISClient:
         if tr_cont:
             headers['tr_cont'] = tr_cont
         if use_hashkey and json_body:
+            await self._wait_for_request_slot()
             try:
                 hashkey = await self._issue_hashkey(headers=headers, payload=json_body)
             except KISHTTPError as exc:
@@ -703,6 +726,7 @@ class KISClient:
             if hashkey:
                 headers['hashkey'] = hashkey
 
+        await self._wait_for_request_slot()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
             try:
                 response = await request_with_audit(

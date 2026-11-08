@@ -2,6 +2,7 @@ import logging
 from datetime import date
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from app.market_data_store import replace_tracked_symbols
@@ -64,7 +65,7 @@ async def get_realtime_trending(
 async def update_tracked_symbols(payload: TrackedSymbolsUpdate) -> dict:
     snapshot = scanner_state.update(payload.symbols)
     try:
-        replace_tracked_symbols(payload.symbols)
+        await run_in_threadpool(replace_tracked_symbols, payload.symbols)
     except Exception as exc:
         logger.warning('Tracked symbol persistence failed: %s', exc)
     return snapshot

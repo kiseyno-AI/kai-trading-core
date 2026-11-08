@@ -1,10 +1,12 @@
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes_trading
+from app.core.settings import settings
 from app.orders.service import (
     TradingOrderRejectedError,
 )
@@ -238,8 +240,12 @@ class TradingOrderRouteTests(unittest.TestCase):
         routes_trading.signal_decider_next_open_execution_service = self.next_open_service
         routes_trading.signal_decider_intraday_auto_sell_service = self.intraday_auto_sell_service
         routes_trading.signal_decider_exec_integration_service = self.exec_integration_service
+        # These tests exercise the direct order routes themselves.
+        self._direct_order_api_patch = patch.object(settings, 'trading_direct_order_api_enabled', True)
+        self._direct_order_api_patch.start()
 
     def tearDown(self) -> None:
+        self._direct_order_api_patch.stop()
         routes_trading.trading_order_service = self.original_service
         routes_trading.trading_order_monitoring_service = self.original_monitoring_service
         routes_trading.trading_order_reconciliation_service = self.original_reconcile_service

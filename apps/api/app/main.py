@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -41,6 +42,7 @@ from app.core.audit_logging import (
     reset_request_id,
     set_request_id,
 )
+from app.core.app_logging import configure_application_logging
 from app.core.settings import settings
 from app.db import check_database, init_database, pool_status
 from app.db_pool_watchdog import db_pool_watchdog
@@ -59,8 +61,25 @@ from app.us_equities.scheduler import us_equity_pipeline_scheduler
 from app.scanner.state import scanner_state
 
 configure_file_logging()
+configure_application_logging(settings.app_log_level)
 logger = logging.getLogger(__name__)
 STARTUP_MAINTENANCE_TIMEOUT_SECONDS = 30
+# A caller-supplied X-Request-ID is copied into audit logs and forwarded to
+# upstream services, so accept only a short, header-safe token.
+_REQUEST_ID_PATTERN = re.compile(r'[A-Za-z0-9._:\-]{1,128}')
+
+
+def _resolve_request_id(raw_value: str | None) -> str:
+    candidate = (raw_value or '').strip()
+    if candidate and _REQUEST_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return str(uuid.uuid4())
+
+
+def _cors_allowed_origins(raw_value: str | None) -> list[str]:
+    """Parse CORS_ALLOWED_ORIGINS; an empty value keeps the permissive default."""
+    origins = [item.strip() for item in (raw_value or '').split(',') if item.strip()]
+    return origins or ['*']
 
 
 async def _run_startup_maintenance_step(name: str, factory: Callable[[], Awaitable[object]]) -> None:
@@ -155,7 +174,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title=settings.app_name, debug=settings.app_debug, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=_cors_allowed_origins(settings.cors_allowed_origins),
     allow_credentials=False,
     allow_methods=['*'],
     allow_headers=['*'],
@@ -164,7 +183,7 @@ app.add_middleware(
 
 @app.middleware('http')
 async def audit_and_require_upstream_bearer_token(request: Request, call_next):
-    request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
+    request_id = _resolve_request_id(request.headers.get('X-Request-ID'))
     request.state.request_id = request_id
     request_token = set_request_id(request_id)
     started_at = time.perf_counter()
