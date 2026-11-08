@@ -7,6 +7,8 @@ can be tested with synthetic data.
 Conventions (see docs/SIGNAL_EVALUATION_LAB.md):
 
 * A signal value on date ``D`` may only use information available at the ``D`` close.
+  Agent rows carry the time Core stored them; ``admit_before_next_open`` keeps only
+  rows stored strictly before the open of the session the return enters at.
 * The return it is judged on enters at the **next session's open** and exits at the
   **close of the ``h``-th session after ``D``** (``r{h}``, in percent). Entries on a
   halted/zero-volume day, and bars that are missing on the session calendar, give NaN.
@@ -19,11 +21,61 @@ Conventions (see docs/SIGNAL_EVALUATION_LAB.md):
 
 from __future__ import annotations
 
+from datetime import time
 from statistics import NormalDist
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+
+
+# --------------------------------------------------------------------- point in time
+KRX_OPEN_KST = time(9, 0)
+
+
+def admit_before_next_open(
+    frame: pd.DataFrame,
+    session_dates: Iterable[Any],
+    *,
+    keys: Sequence[str] = ('symbol', 'd'),
+    known_at: str = 'known_at',
+    open_time: time = KRX_OPEN_KST,
+    tz: str = 'Asia/Seoul',
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Keep rows that were stored before the open the return would enter at.
+
+    A score for market date ``D`` is judged on a return that enters at the open of the
+    next session after ``D``. A row stored at or after that open could not have been
+    traded on, so it is dropped (``late``); so is a row without a stored time
+    (``unknown_time``) and a row whose date has no next session yet
+    (``no_next_session``). Of the admitted rows the latest stored one per ``keys`` wins,
+    which is what a trader would have seen at the open.
+    """
+
+    counts = {'rows': int(len(frame)), 'admitted': 0, 'late': 0, 'unknown_time': 0, 'no_next_session': 0}
+    if frame.empty:
+        return frame.copy(), counts
+    sessions = np.array(sorted({pd.Timestamp(day).normalize() for day in session_dates}), dtype='datetime64[ns]')
+    days = pd.to_datetime(frame['d']).dt.normalize().to_numpy(dtype='datetime64[ns]')
+    position = np.searchsorted(sessions, days, side='right')
+    has_next = position < len(sessions)
+    next_session = pd.Series(pd.NaT, index=frame.index, dtype='datetime64[ns]')
+    next_session[has_next] = sessions[position[has_next]]
+    offset = pd.Timedelta(hours=open_time.hour, minutes=open_time.minute)
+    cutoff = (next_session + offset).dt.tz_localize(tz)
+    stored = pd.to_datetime(frame[known_at], utc=True, errors='coerce')
+
+    unknown = stored.isna()
+    no_next = ~unknown & ~pd.Series(has_next, index=frame.index)
+    late = ~unknown & ~no_next & (stored >= cutoff)
+    admitted_mask = ~unknown & ~no_next & ~late
+    counts.update(
+        admitted=int(admitted_mask.sum()), late=int(late.sum()),
+        unknown_time=int(unknown.sum()), no_next_session=int(no_next.sum()),
+    )
+    admitted = frame[admitted_mask].assign(**{known_at: stored[admitted_mask]})
+    admitted = admitted.sort_values(known_at, kind='stable').drop_duplicates(list(keys), keep='last')
+    return admitted, counts
 
 
 # --------------------------------------------------------------------------- returns

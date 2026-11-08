@@ -32,6 +32,43 @@ def _panel(n_days=60, n_names=40, seed=7, signal_strength=0.0, vol_strength=0.0)
     return pd.concat(frames, ignore_index=True)
 
 
+class PointInTimeAdmissionTests(unittest.TestCase):
+    # Friday 2026-11-06 -> next session Monday 2026-11-09 (09:00 KST = 00:00 UTC)
+    sessions = pd.to_datetime(['2026-11-05', '2026-11-06', '2026-11-09'])
+
+    def _frame(self, rows):
+        frame = pd.DataFrame(rows, columns=['symbol', 'd', 'score', 'known_at'])
+        frame['d'] = pd.to_datetime(frame['d'])
+        return frame
+
+    def test_rows_stored_at_or_after_the_next_open_are_dropped(self) -> None:
+        frame = self._frame([
+            ('A', '2026-11-06', 1.0, '2026-11-07T10:00:00+09:00'),  # weekend: still before Monday open
+            ('B', '2026-11-06', 2.0, '2026-11-09T08:59:59+09:00'),  # one second before the open
+            ('C', '2026-11-06', 3.0, '2026-11-09T00:00:00+00:00'),  # exactly the open, given in UTC
+            ('D', '2026-11-06', 4.0, None),
+            ('E', '2026-11-09', 5.0, '2026-11-09T16:00:00+09:00'),  # no next session in the calendar yet
+        ])
+        admitted, counts = ev.admit_before_next_open(frame, self.sessions)
+        self.assertEqual(sorted(admitted['symbol']), ['A', 'B'])
+        self.assertEqual(counts, {'rows': 5, 'admitted': 2, 'late': 1, 'unknown_time': 1, 'no_next_session': 1})
+
+    def test_a_late_revision_does_not_replace_what_was_known_at_the_open(self) -> None:
+        frame = self._frame([
+            ('A', '2026-11-05', 9.0, '2026-11-06T10:00:00+09:00'),  # revised after the open
+            ('A', '2026-11-05', 1.0, '2026-11-05T17:00:00+09:00'),
+            ('A', '2026-11-05', 2.0, '2026-11-05T20:00:00+09:00'),
+        ])
+        admitted, counts = ev.admit_before_next_open(frame, self.sessions)
+        self.assertEqual(admitted['score'].tolist(), [2.0])
+        self.assertEqual(counts['late'], 1)
+
+    def test_empty_frame(self) -> None:
+        admitted, counts = ev.admit_before_next_open(self._frame([]), self.sessions)
+        self.assertTrue(admitted.empty)
+        self.assertEqual(counts['rows'], 0)
+
+
 class ForwardReturnTests(unittest.TestCase):
     def test_entry_is_next_session_open_and_exit_is_horizon_close(self) -> None:
         bars = _bars(

@@ -9,6 +9,13 @@ would?* It scores deterministic factors, the stored factor tables and the agents
 
 * A signal on date `D` may only use information available at the `D` close (the pipeline runs after
   20:10 KST, so factor tables and agent feedback for `D` qualify).
+* Agent rows are admitted by when Core stored them, not by their `market_date`. A summarizer row counts
+  only if `received_at` is before 09:00 KST of the session after `D` (the open the return enters at); a
+  decider row uses the latest of `created_at`, `feedback_received_at` and `updated_at`, so a value revised
+  after the open is not scored as if it had been known. Of the admitted rows per symbol and date the latest
+  stored one wins. Rows stored at or after the open, rows without a stored time and dates with no next
+  session yet are dropped and counted per agent in the report. On the production sample about a fifth of
+  decider rows were stored after the next open; without this rule they were scored with look-ahead.
 * The judged return enters at the **next session's open** and exits at the **close of the h-th session
   after `D`** (`r1`, `r5`, `r10`, percent). Entry on a halted day, a missing bar, or a non-positive price
   gives NaN. Alignment is on the market calendar, so one missing bar never shifts a symbol's returns.

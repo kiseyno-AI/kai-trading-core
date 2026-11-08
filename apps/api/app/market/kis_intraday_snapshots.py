@@ -15,6 +15,7 @@ from app.market_data_store import (
     persist_kis_intraday_snapshot,
 )
 from app.scanner.state import scanner_state
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 KIS_INTRADAY_SNAPSHOT_SOURCE = 'kis_intraday_snapshot_v1'
 DEFAULT_MARKET_CODE = 'J'
@@ -185,19 +186,6 @@ def _extract_list(payload: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             return [value]
     return []
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    return normalized.zfill(6) if normalized.isdigit() else normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
 
 
 def _normalize_market_code(value: str | None) -> str:

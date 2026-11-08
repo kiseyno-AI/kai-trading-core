@@ -81,6 +81,17 @@ class EvaluatePanelTests(unittest.TestCase):
         self.assertNotIn('quality_pct', {row['signal'] for row in result['signals']})
 
 
+class PointInTimeReportTests(unittest.TestCase):
+    def test_admission_counts_flow_from_the_panel_into_the_report(self) -> None:
+        panel = _synthetic(n_days=30)
+        counts = {'rows': 10, 'admitted': 7, 'late': 2, 'unknown_time': 1, 'no_next_session': 0}
+        panel.attrs['point_in_time'] = {'signal-decider': counts}
+        result = lab.evaluate_panel(panel, horizons=(1,))
+        self.assertEqual(result['point_in_time'], {'signal-decider': counts})
+        markdown = lab.render_markdown(result, start='a', end='b', universe_days=30)
+        self.assertIn('| signal-decider | 10 | 7 | 2 | 1 | 0 |', markdown)
+
+
 class LoaderSmokeTests(unittest.TestCase):
     def test_load_panel_on_an_empty_window_returns_an_empty_frame(self) -> None:
         self.assertTrue(lab.load_panel('2099-01-01', '2099-01-31').empty)

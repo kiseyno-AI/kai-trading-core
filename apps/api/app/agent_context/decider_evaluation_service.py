@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Sequence
@@ -21,6 +20,7 @@ from app.db_models import (
 )
 from app.market.session import next_krx_trading_date
 from app.market_data_store import load_daily_bars_for_symbol_range
+from app.core.numbers import finite_float as _to_float
 
 DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS = 5
 DECIDER_EVALUATION_ENGINE_VERSION = 'decider_post_decision_eval_v3'
@@ -170,29 +170,6 @@ def _to_int(value: Any) -> int | None:
             return None
         try:
             return int(float(normalized))
-        except ValueError:
-            return None
-    return None
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, int):
-        resolved = float(value)
-        return resolved if math.isfinite(resolved) else None
-    if isinstance(value, Decimal):
-        resolved = float(value)
-        return resolved if math.isfinite(resolved) else None
-    if isinstance(value, str):
-        normalized = value.strip()
-        if not normalized:
-            return None
-        try:
-            resolved = float(normalized)
-            return resolved if math.isfinite(resolved) else None
         except ValueError:
             return None
     return None
