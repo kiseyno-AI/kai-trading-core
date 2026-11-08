@@ -20,6 +20,7 @@ from app.quotes.kis_realtime_prices import (
     KISRealtimePriceService,
     kis_realtime_price_service,
 )
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 LIVE_SECTOR_PROJECTION_SCHEMA_VERSION = 'live_sector_projection_v1'
@@ -919,11 +920,6 @@ def _value(value: Any, key: str) -> Any:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _normalize_symbol(value: Any) -> str:
-    text = str(value or '').strip().upper()
-    return text.zfill(6) if text.isdigit() else text
 
 
 def _row_symbol(row: Mapping[str, Any]) -> str:

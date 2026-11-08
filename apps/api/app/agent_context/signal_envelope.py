@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
 from typing import Any, Sequence
+from app.core.numbers import finite_float as _to_float
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 
 SIGNAL_ENVELOPE_SCHEMA_VERSION = 'signal_envelope_v1'
 DEFAULT_SIGNAL_ENVELOPE_HORIZON = '5d'
@@ -105,10 +106,6 @@ def _normalize_market_date(value: str | date) -> str:
     return date.fromisoformat(str(value)).isoformat()
 
 
-def _normalize_symbol(value: Any) -> str:
-    return str(value or '').strip().upper()
-
-
 def _normalize_horizon(value: Any, *, default: str = DEFAULT_SIGNAL_ENVELOPE_HORIZON) -> str:
     text = str(value or '').strip().lower()
     return text or default
@@ -140,24 +137,6 @@ def _round_score(value: float) -> float:
 
 def _round_confidence(value: float) -> float:
     return round(_clip_float(value, min_value=0.0, max_value=1.0), 4)
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip().replace(',', '')
-        if not text:
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            return None
-    return None
 
 
 def _to_int(value: Any) -> int | None:

@@ -10,6 +10,7 @@ from app.core.settings import settings
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
 from app.market.snapshot import market_snapshot_service, normalize_market_snapshot_payload
+from app.core.numbers import finite_float as _to_float
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +32,6 @@ HISTORICAL_VOLATILE_SESSION_FIELDS: tuple[str, ...] = (
     'current_calendar_source_status',
     'current_calendar_source_error',
 )
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value.strip())
-        except ValueError:
-            return None
-    return None
 
 
 def _to_int(value: Any) -> int | None:

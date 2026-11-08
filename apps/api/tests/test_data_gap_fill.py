@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
+import asyncio
 import unittest
 
 from app.eod.data_gap_fill import (
@@ -332,6 +333,31 @@ class RolloutSafetyTests(unittest.TestCase):
         # The step must sit inside the non-weekend/holiday branch, after the
         # portfolio refresh, so it can never precede trading-critical steps.
         self.assertLess(source.index('portfolio_summary_refresh_if_due'), source.index(gate))
+
+
+class BackgroundThreadStepTests(unittest.IsolatedAsyncioTestCase):
+    async def test_step_returns_immediately_and_keeps_one_run_in_flight(self) -> None:
+        import threading
+
+        from app.eod.runner import EODBackgroundRunner
+
+        runner = EODBackgroundRunner()
+        release = threading.Event()
+        calls: list[int] = []
+
+        def slow_job() -> None:
+            calls.append(1)
+            release.wait(5)
+
+        runner._start_background_thread_step('gap', slow_job)
+        runner._start_background_thread_step('gap', slow_job)
+        task = runner._blocking_step_tasks['gap']
+        self.assertFalse(task.done())
+        release.set()
+        await task
+        await asyncio.sleep(0)
+        self.assertEqual(calls, [1])
+        self.assertNotIn('gap', runner._blocking_step_tasks)
 
 
 if __name__ == '__main__':

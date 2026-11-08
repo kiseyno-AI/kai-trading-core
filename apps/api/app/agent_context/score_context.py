@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
 from typing import Any
 
 from app.signals.momentum_factor import (
@@ -36,6 +35,7 @@ from app.signals.unified_value_factor import (
     UNIFIED_VALUE_STATUS_MISSING_METRIC,
     UNIFIED_VALUE_STATUS_SCORED,
 )
+from app.core.numbers import finite_float as _to_float
 
 SCORE_FAMILY_KEYS: tuple[str, ...] = ('unified_value', 'quality', 'momentum')
 
@@ -59,19 +59,6 @@ _MOMENTUM_COMPONENT_KEYS: tuple[str, ...] = (
     'trend_confirmation',
     'recent_overheat_guard',
 )
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _to_int(value: Any) -> int | None:

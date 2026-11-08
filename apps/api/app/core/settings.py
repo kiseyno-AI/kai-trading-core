@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     app_name: str = 'kai-trading-core-api'
     app_env: str = 'development'
     app_debug: bool = True
+    # Comma-separated browser origins allowed by CORS. The default '*' keeps the
+    # historical permissive behavior for local development; set explicit
+    # origins (for example the operator UI origin) before exposing the API.
+    cors_allowed_origins: str = '*'
     upstream_bearer_token: Optional[str] = None
     api_request_logging_enabled: bool = True
     upstream_http_logging_enabled: bool = True
@@ -24,6 +28,10 @@ class Settings(BaseSettings):
     api_log_rotation_backup_count: int = 10
     startup_maintenance_enabled: bool = True
     background_runner_enabled: bool = True
+    # Hourly read-only check that the latest trading day's derived tables cover the
+    # price-bar universe (see app/internal/daily_coverage_audit.py). It only logs and
+    # reports through the runner snapshot; it never changes pipeline behavior.
+    daily_coverage_audit_enabled: bool = True
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None
@@ -185,7 +193,7 @@ class Settings(BaseSettings):
     macro_context_world_bank_series: str = 'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG,SL.UEM.TOTL.ZS'
     macro_context_world_bank_mrnev: int = 1
     macro_context_fred_enabled: bool = True
-    macro_context_fred_series: str = 'DEXKOUS'
+    macro_context_fred_series: str = 'DEXKOUS,DFF,DGS10,DGS2,T10Y2Y,VIXCLS,BAMLH0A0HYM2,DCOILWTICO,CPIAUCSL,UNRATE'
     fred_api_key: str = ''
     fred_base_url: str = 'https://api.stlouisfed.org'
 
@@ -202,6 +210,9 @@ class Settings(BaseSettings):
     external_news_context_limit: int = 3
     external_news_context_lookback_days: int = 14
     external_news_collect_throttle_seconds: float = 0.15
+    market_news_enabled: bool = True
+    market_news_collect_interval_minutes: int = 60
+    market_news_display: int = 50
 
     dart_api_key: str = ''
     dart_base_url: str = 'https://opendart.fss.or.kr/api'
@@ -217,7 +228,10 @@ class Settings(BaseSettings):
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_global_share_issuance_enabled: bool = False
-    dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=100, ge=0, le=500)
+    # Probe every symbol without fundamentals daily (~140 on 2026-11-06). A
+    # limit below that count left a rotating handful as retry debt each day,
+    # so the DART stage was partial every day.
+    dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
     # Weekday market-hours gap fill (docs/DATA_GAP_FILL.md). Off by default; when
     # enabled it only reports until data_gap_fill_apply is also set.
     data_gap_fill_enabled: bool = False
@@ -264,6 +278,13 @@ class Settings(BaseSettings):
     openclaw_signal_decider_expected_model: str = 'openai/gpt-6.1-sol'
     openclaw_short_term_decider_expected_model: str = 'openai/gpt-6.1-sol'
     openclaw_agent_timeout_seconds: float = 0.0
+
+    side_agents_output_dir: str = ''
+    side_agents_timeout_seconds: float = 900.0
+    side_agents_max_daily_attempts: int = 3
+    side_agents_news_max_symbols: int = 30
+    side_agents_news_batch_size: int = 10
+    side_agents_news_lookback_hours: int = 36
     openclaw_agent_max_retries: int = 0
     openclaw_agent_retry_backoff_seconds: float = 30.0
     openclaw_agent_min_dispatch_interval_seconds: float = Field(

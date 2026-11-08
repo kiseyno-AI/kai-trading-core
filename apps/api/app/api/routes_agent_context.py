@@ -8,7 +8,7 @@ from typing import Any
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -2171,14 +2171,36 @@ class CoreControlRequest(BaseModel):
 
     action: str = Field(default='kill', pattern=r'^(kill|restart)$')
     signal_name: str = Field(default='SIGKILL', pattern=r'^SIG(?:TERM|KILL)$')
-    port: int = Field(default=8000, ge=1, le=65535)
+    # Optional for backward compatibility. The endpoint may only ever act on the
+    # port this API instance is serving; any other value is rejected so the
+    # control route cannot be used to signal unrelated local services (for
+    # example the Exec runtime).
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+
+def _own_server_port(request: Request) -> int:
+    server = request.scope.get('server')
+    if isinstance(server, (tuple, list)) and len(server) >= 2 and server[1]:
+        return int(server[1])
+    return int(os.environ.get('PORT', '8000'))
 
 
 @router.post('/internal/core/control')
-async def control_core_api(payload: CoreControlRequest) -> dict:
+async def control_core_api(payload: CoreControlRequest, request: Request) -> dict:
+    own_port = _own_server_port(request)
+    if payload.port is not None and payload.port != own_port:
+        raise HTTPException(
+            status_code=422,
+            detail=f'port must match the port this API is serving ({own_port})',
+        )
+    payload = payload.model_copy(update={'port': own_port})
     try:
-        result = subprocess.run(
-            ['lsof', '-ti', f':{payload.port}'],
+        # Only the listening process owns the port. A plain ``lsof -i :PORT``
+        # also matches client connections, which would signal unrelated
+        # processes (such as a web server holding a keep-alive connection).
+        result = await run_in_threadpool(
+            subprocess.run,
+            ['lsof', '-nP', '-ti', f'TCP:{payload.port}', '-sTCP:LISTEN'],
             check=False,
             capture_output=True,
             text=True,
@@ -2198,8 +2220,20 @@ async def control_core_api(payload: CoreControlRequest) -> dict:
         if payload.action == 'restart':
             plist = Path(__file__).resolve().parents[2] / 'com.kiseyno.kai-trading-core-api.plist'
             uid = str(os.getuid())
-            subprocess.run(['launchctl', 'bootout', f'gui/{uid}', str(plist)], check=False, capture_output=True, text=True)
-            restarted = subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], check=True, capture_output=True, text=True)
+            await run_in_threadpool(
+                subprocess.run,
+                ['launchctl', 'bootout', f'gui/{uid}', str(plist)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            restarted = await run_in_threadpool(
+                subprocess.run,
+                ['launchctl', 'bootstrap', f'gui/{uid}', str(plist)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': target_pids, 'self_targeted': self_targeted})
             return {
                 'status': 'restarted',
