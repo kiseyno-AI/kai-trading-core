@@ -223,7 +223,7 @@ def session_scope(
 def get_alembic_config() -> Config:
     config = Config(str(Path(__file__).resolve().parent.parent / 'alembic.ini'))
     config.set_main_option('script_location', str(Path(__file__).resolve().parent.parent / 'db_migrations'))
-    config.set_main_option('sqlalchemy.url', DATABASE_URL)
+    config.set_main_option('sqlalchemy.url', DATABASE_URL.replace('%', '%%'))
     return config
 
 
