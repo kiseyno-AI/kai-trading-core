@@ -804,11 +804,19 @@ def test_inspect_feedback_prerequisites_allows_pykrx_enrichment_above_minimum_co
     assert [item['category'] for item in warning_categories] == ['investor_flow_symbol', 'valuation_snapshot']
 
 
-def test_pykrx_enrichment_uses_lower_valuation_coverage_floor_only_for_valuation():
+def test_pykrx_enrichment_uses_lower_coverage_floor_only_for_valuation_and_investor_flow():
+    # valuation_snapshot and investor_flow_symbol have a 95% floor (stable
+    # structural gaps); every other required category keeps the 99% default.
     category_payloads = _pykrx_enrichment_stage(
         status='completed',
         category_overrides={
             'investor_flow_symbol': {
+                'present_rows': 2648,
+                'expected_rows': 2762,
+                'coverage_ratio': 0.958726,
+                'coverage_status': 'partial',
+            },
+            'short_selling': {
                 'present_rows': 2734,
                 'expected_rows': 2762,
                 'coverage_ratio': 0.989862,
@@ -833,8 +841,10 @@ def test_pykrx_enrichment_uses_lower_valuation_coverage_floor_only_for_valuation
     }
     assert gates['valuation_snapshot']['gate_status'] == 'ready'
     assert gates['valuation_snapshot']['reason'] == 'required_pykrx_enrichment_category_near_complete'
-    assert gates['investor_flow_symbol']['gate_status'] == 'blocked'
-    assert gates['investor_flow_symbol']['reason'] == 'incomplete_required_pykrx_enrichment_category'
+    assert gates['investor_flow_symbol']['gate_status'] == 'ready'
+    assert gates['investor_flow_symbol']['reason'] == 'required_pykrx_enrichment_category_near_complete'
+    assert gates['short_selling']['gate_status'] == 'blocked'
+    assert gates['short_selling']['reason'] == 'incomplete_required_pykrx_enrichment_category'
 
 
 def test_pykrx_category_row_counts_block_when_price_bar_universe_is_partial():

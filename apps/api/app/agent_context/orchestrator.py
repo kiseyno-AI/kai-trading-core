@@ -76,8 +76,10 @@ from app.agent_context.orchestrator_runtime_helpers import (
     build_pending_feedback_row as _build_pending_feedback_row,
     dispatch_and_store as _dispatch_and_store_helper,
     dispatch_for_symbols_via_subagents as _dispatch_for_symbols_via_subagents_helper,
+    item_contract_failure as _item_contract_failure,
     normalize_symbol_feedback as _normalize_symbol_feedback,
     normalized_feedback_contract_failure as _normalized_feedback_contract_failure,
+    salvageable_batch_item_failures as _salvageable_batch_item_failures,
     response_failure_audit as _response_failure_audit,
     resolve_batch_dispatch_context as _resolve_batch_dispatch_context,
 )
@@ -7768,6 +7770,18 @@ class AgentFeedbackOrchestrator:
                                         else {}
                                     )
                                     contract_failure = _batch_response_contract_failure(batch_result)
+                                    # Per-symbol contract failures: only that symbol fails; the rest of
+                                    # the batch is still accepted (one bad item used to fail all 20).
+                                    item_contract_failures: dict[str, dict[str, Any]] = {}
+                                    if contract_failure is not None:
+                                        salvaged_item_failures = _salvageable_batch_item_failures(
+                                            batch_result=batch_result,
+                                            batch_symbols=[source_item['symbol'] for source_item in batch],
+                                            failure_class=contract_failure,
+                                        )
+                                        if salvaged_item_failures is not None:
+                                            item_contract_failures.update(salvaged_item_failures)
+                                            contract_failure = None
                                     contract_mismatch_flags: list[str] = []
                                     contract_snapshot: dict[str, Any] | None = None
                                     contract_model_identity: dict[str, Any] | None = None
@@ -7775,11 +7789,15 @@ class AgentFeedbackOrchestrator:
                                     if contract_failure is None:
                                         for source_item in batch:
                                             symbol = source_item['symbol']
+                                            if symbol in item_contract_failures:
+                                                continue
                                             symbol_key = str(symbol).strip().upper()
                                             feedback_candidate = by_symbol.get(symbol_key, {}).get('feedback')
                                             if not isinstance(feedback_candidate, dict):
-                                                contract_failure = 'response_contract_invalid:feedback_missing'
-                                                break
+                                                item_contract_failures[symbol] = _item_contract_failure(
+                                                    'response_contract_invalid:feedback_missing'
+                                                )
+                                                continue
                                             normalized_feedback = _normalize_symbol_feedback(
                                                 normalize_agent_response=normalize_agent_response,
                                                 role=spec.role,
@@ -7818,22 +7836,17 @@ class AgentFeedbackOrchestrator:
                                                 normalized_feedback
                                             )
                                             if normalized_contract_failure is not None:
-                                                contract_failure = normalized_contract_failure
-                                                contract_mismatch_flags = _extract_response_mismatch_flags(
-                                                    normalized_feedback
+                                                item_contract_failures[symbol] = _item_contract_failure(
+                                                    normalized_contract_failure,
+                                                    flags=_extract_response_mismatch_flags(normalized_feedback),
+                                                    snapshot=build_normalized_feedback_snapshot(normalized_feedback),
+                                                    model_identity=(
+                                                        normalized_feedback.get('model_identity')
+                                                        if isinstance(normalized_feedback.get('model_identity'), dict)
+                                                        else None
+                                                    ),
                                                 )
-                                                contract_snapshot = build_normalized_feedback_snapshot(
-                                                    normalized_feedback
-                                                )
-                                                contract_model_identity = (
-                                                    normalized_feedback.get('model_identity')
-                                                    if isinstance(
-                                                        normalized_feedback.get('model_identity'),
-                                                        dict,
-                                                    )
-                                                    else None
-                                                )
-                                                break
+                                                continue
                                             staged_feedback.append(
                                                 (source_item, feedback_candidate, normalized_feedback)
                                             )
@@ -7910,113 +7923,139 @@ class AgentFeedbackOrchestrator:
                                             }
 
                                     if contract_failure is not None:
+                                        failed_entries = [
+                                            (
+                                                source_item,
+                                                _item_contract_failure(
+                                                    contract_failure,
+                                                    flags=contract_mismatch_flags,
+                                                    snapshot=contract_snapshot,
+                                                    model_identity=contract_model_identity,
+                                                ),
+                                            )
+                                            for source_item in batch
+                                        ]
+                                    else:
+                                        failed_entries = [
+                                            (source_item, item_contract_failures[source_item['symbol']])
+                                            for source_item in batch
+                                            if source_item['symbol'] in item_contract_failures
+                                        ]
+                                    diagnostics = (
+                                        response_correlation.get('response_recovery')
+                                        if isinstance(response_correlation.get('response_recovery'), dict)
+                                        else None
+                                    )
+                                    for source_item, item_failure in failed_entries:
+                                        item_contract_failure = item_failure['failure']
+                                        contract_mismatch_flags = item_failure['flags']
+                                        contract_snapshot = item_failure['snapshot']
+                                        contract_model_identity = item_failure['model_identity']
                                         failure_class = (
                                             'response_identity_mismatch'
-                                            if contract_failure.startswith('response_identity_mismatch:')
-                                            else contract_failure
+                                            if item_contract_failure.startswith('response_identity_mismatch:')
+                                            else item_contract_failure
                                         )
                                         failure_kind = failure_class
-                                        failure_mode = response_correlation.get('failure_mode') or failure_class
-                                        diagnostics = (
-                                            response_correlation.get('response_recovery')
-                                            if isinstance(response_correlation.get('response_recovery'), dict)
-                                            else None
+                                        failure_mode = (
+                                            response_correlation.get('failure_mode') or failure_class
+                                            if contract_failure is not None
+                                            else failure_class
                                         )
-                                        for source_item in batch:
-                                            symbol = source_item['symbol']
-                                            dispatch_context = _resolve_batch_dispatch_context(
-                                                batch_result=batch_result,
-                                                source_item=source_item,
-                                                batch=batch,
-                                                slot=slot,
-                                            )
-                                            dispatch_id = dispatch_context['dispatch_id']
-                                            attempt_id = dispatch_context['attempt_id']
-                                            batch_symbols = dispatch_context['batch_symbols']
-                                            session_key = dispatch_context['session_key']
-                                            session_id = dispatch_context.get('session_id')
-                                            response_id = dispatch_context.get('response_id')
-                                            request_marker = dispatch_context.get('request_marker')
-                                            failure_context = {
-                                                **source_item,
-                                                'contract_failure': contract_failure,
-                                                'response_correlation': response_correlation or None,
-                                                'response_audit': _response_failure_audit(batch_result),
-                                                'model_identity': contract_model_identity,
-                                            }
-                                            if contract_mismatch_flags:
-                                                failure_context['mismatch_flags'] = contract_mismatch_flags
-                                            if contract_snapshot is not None:
-                                                failure_context['normalized_feedback_snapshot'] = contract_snapshot
-                                            failure = _build_failed_dispatch_item(
-                                                role=role,
-                                                agent_name=spec.agent_name,
-                                                symbol=symbol,
-                                                error=str(failure_class),
-                                                retryable=True,
-                                                failure_kind=str(failure_kind),
-                                                context=failure_context,
-                                                dispatch_id=dispatch_id,
-                                                attempt_id=attempt_id,
-                                                slot=slot,
-                                                session_key=session_key,
-                                                session_id=session_id,
-                                                response_id=response_id,
-                                                request_marker=request_marker,
-                                                diagnostics=diagnostics,
-                                                batch_symbols=batch_symbols,
-                                            )
-                                            all_failures.append(failure)
-                                            log_agent_feedback_event(
-                                                'normalized_response_rejected',
-                                                status='rejected',
-                                                market_date=normalized_market_date.isoformat(),
-                                                request_run_id=request_run_id,
-                                                dispatch_id=dispatch_id,
-                                                attempt_id=attempt_id,
-                                                role=role,
-                                                agent_name=spec.agent_name,
-                                                symbol=symbol,
-                                                batch_symbols=batch_symbols,
-                                                slot=slot,
-                                                session_key=session_key,
-                                                session_id=session_id,
-                                                response_id=response_id,
-                                                request_marker=request_marker,
-                                                error_type=(
-                                                    'ResponseIdentityMismatch'
-                                                    if failure_class == 'response_identity_mismatch'
-                                                    else 'ResponseContractInvalid'
-                                                ),
-                                                error_message=str(failure_class),
-                                                failure_class=failure_class,
-                                                failure_mode=failure_mode,
-                                                contract_failure=contract_failure,
-                                                mismatch_flags=contract_mismatch_flags,
-                                                response_symbols=response_symbols,
-                                                attribution_status=response_correlation.get('attribution_status'),
-                                                response_correlation=response_correlation or None,
-                                                normalized_feedback_snapshot=contract_snapshot,
-                                            )
-                                            buffer_failure(
-                                                role,
-                                                symbol,
-                                                str(failure_class),
-                                                True,
-                                                failure_kind=str(failure_kind),
-                                                context=failure_context,
-                                                agent_name=spec.agent_name,
-                                                dispatch_id=dispatch_id,
-                                                attempt_id=attempt_id,
-                                                slot=slot,
-                                                session_key=session_key,
-                                                session_id=session_id,
-                                                response_id=response_id,
-                                                request_marker=request_marker,
-                                                diagnostics=diagnostics,
-                                                batch_symbols=batch_symbols,
-                                            )
-                                    else:
+                                        symbol = source_item['symbol']
+                                        dispatch_context = _resolve_batch_dispatch_context(
+                                            batch_result=batch_result,
+                                            source_item=source_item,
+                                            batch=batch,
+                                            slot=slot,
+                                        )
+                                        dispatch_id = dispatch_context['dispatch_id']
+                                        attempt_id = dispatch_context['attempt_id']
+                                        batch_symbols = dispatch_context['batch_symbols']
+                                        session_key = dispatch_context['session_key']
+                                        session_id = dispatch_context.get('session_id')
+                                        response_id = dispatch_context.get('response_id')
+                                        request_marker = dispatch_context.get('request_marker')
+                                        failure_context = {
+                                            **source_item,
+                                            'contract_failure': item_contract_failure,
+                                            'response_correlation': response_correlation or None,
+                                            'response_audit': _response_failure_audit(batch_result),
+                                            'model_identity': contract_model_identity,
+                                        }
+                                        if contract_mismatch_flags:
+                                            failure_context['mismatch_flags'] = contract_mismatch_flags
+                                        if contract_snapshot is not None:
+                                            failure_context['normalized_feedback_snapshot'] = contract_snapshot
+                                        failure = _build_failed_dispatch_item(
+                                            role=role,
+                                            agent_name=spec.agent_name,
+                                            symbol=symbol,
+                                            error=str(failure_class),
+                                            retryable=True,
+                                            failure_kind=str(failure_kind),
+                                            context=failure_context,
+                                            dispatch_id=dispatch_id,
+                                            attempt_id=attempt_id,
+                                            slot=slot,
+                                            session_key=session_key,
+                                            session_id=session_id,
+                                            response_id=response_id,
+                                            request_marker=request_marker,
+                                            diagnostics=diagnostics,
+                                            batch_symbols=batch_symbols,
+                                        )
+                                        all_failures.append(failure)
+                                        log_agent_feedback_event(
+                                            'normalized_response_rejected',
+                                            status='rejected',
+                                            market_date=normalized_market_date.isoformat(),
+                                            request_run_id=request_run_id,
+                                            dispatch_id=dispatch_id,
+                                            attempt_id=attempt_id,
+                                            role=role,
+                                            agent_name=spec.agent_name,
+                                            symbol=symbol,
+                                            batch_symbols=batch_symbols,
+                                            slot=slot,
+                                            session_key=session_key,
+                                            session_id=session_id,
+                                            response_id=response_id,
+                                            request_marker=request_marker,
+                                            error_type=(
+                                                'ResponseIdentityMismatch'
+                                                if failure_class == 'response_identity_mismatch'
+                                                else 'ResponseContractInvalid'
+                                            ),
+                                            error_message=str(failure_class),
+                                            failure_class=failure_class,
+                                            failure_mode=failure_mode,
+                                            contract_failure=item_contract_failure,
+                                            mismatch_flags=contract_mismatch_flags,
+                                            response_symbols=response_symbols,
+                                            attribution_status=response_correlation.get('attribution_status'),
+                                            response_correlation=response_correlation or None,
+                                            normalized_feedback_snapshot=contract_snapshot,
+                                        )
+                                        buffer_failure(
+                                            role,
+                                            symbol,
+                                            str(failure_class),
+                                            True,
+                                            failure_kind=str(failure_kind),
+                                            context=failure_context,
+                                            agent_name=spec.agent_name,
+                                            dispatch_id=dispatch_id,
+                                            attempt_id=attempt_id,
+                                            slot=slot,
+                                            session_key=session_key,
+                                            session_id=session_id,
+                                            response_id=response_id,
+                                            request_marker=request_marker,
+                                            diagnostics=diagnostics,
+                                            batch_symbols=batch_symbols,
+                                        )
+                                    if contract_failure is None:
                                         for source_item, feedback_candidate, normalized_feedback in staged_feedback:
                                             symbol = source_item['symbol']
                                             dispatch_context = _resolve_batch_dispatch_context(

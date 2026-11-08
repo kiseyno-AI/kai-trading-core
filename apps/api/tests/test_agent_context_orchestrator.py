@@ -4745,10 +4745,38 @@ class DuplicateAttributionBatchClient(RecordingBatchClient):
         return result
 
 
+SALVAGE_SYMBOLS = ['005930', '000660', '035720']
+
+
 class MissingFeedbackBatchClient(RecordingBatchClient):
     def dispatch_batch(self, **kwargs):
         result = super().dispatch_batch(**kwargs)
         result['decoded']['items'][0]['feedback'] = None
+        return result
+
+
+class _OneMissingItemClient(RecordingBatchClient):
+    """The response omits the second symbol entirely."""
+
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        dropped = result['decoded']['items'].pop(1)['symbol']
+        correlation = result['response_correlation']
+        correlation['missing_symbols'] = [dropped]
+        correlation['parsed_symbols'] = [s for s in correlation['parsed_symbols'] if s != dropped]
+        correlation['response_symbols'] = list(correlation['parsed_symbols'])
+        correlation['item_count_matches'] = False
+        correlation['attribution_status'] = 'mismatch'
+        correlation['failure_class'] = 'batch_response_attribution_mismatch'
+        return result
+
+
+class _InvalidConfidenceClient(RecordingBatchClient):
+    """The first item carries an out-of-range confidence (a per-item contract failure)."""
+
+    def dispatch_batch(self, **kwargs):
+        result = super().dispatch_batch(**kwargs)
+        result['decoded']['items'][0]['feedback']['confidence'] = 7
         return result
 
 
@@ -12513,7 +12541,9 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(len(cleanup_service.targets), 1)
 
-    def test_dispatch_for_symbols_rejects_whole_batch_when_one_feedback_is_missing(self):
+    def test_dispatch_for_symbols_fails_only_the_item_whose_feedback_is_missing(self):
+        # Since 2026-11-08 one bad item no longer fails its whole batch: the item
+        # with no feedback object fails, the well-formed one is stored.
         service = AgentFeedbackOrchestrator()
         service.client = MissingFeedbackBatchClient()
         feedback_service = FakeFeedbackService()
@@ -12534,15 +12564,45 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                                     reuse_existing=False,
                                 )
 
-        self.assertEqual(feedback_service.bulk_calls, [])
-        self.assertEqual(result['summary']['completed'], 0)
-        self.assertEqual(result['summary']['failed'], 2)
-        self.assertEqual(len(failure_service.recorded), 2)
-        self.assertEqual(
-            {failure['failure_kind'] for failure in failure_service.recorded},
-            {'response_contract_invalid:feedback_missing'},
-        )
+        stored_symbols = [row['symbol'] for call in feedback_service.bulk_calls for row in call]
+        self.assertEqual(stored_symbols, ['000660'])
+        self.assertEqual(result['summary']['completed'], 1)
+        self.assertEqual(result['summary']['failed'], 1)
+        self.assertEqual(len(failure_service.recorded), 1)
+        self.assertEqual(failure_service.recorded[0]['symbol'], '005930')
+        self.assertEqual(failure_service.recorded[0]['failure_kind'], 'response_contract_invalid:feedback_missing')
         self.assertEqual(len(cleanup_service.targets), 1)
+
+    def _dispatch_three(self, client):
+        service = AgentFeedbackOrchestrator()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        failure_service = RecordingFailureService()
+        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=3, openclaw_agent_parallel_subtasks=1)
+        with patch.object(orchestrator_module, 'settings', fake_settings), \
+                patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()), \
+                patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service), \
+                patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service), \
+                patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', FakeSessionCleanupService()), \
+                _patch_feedback_eligibility(*SALVAGE_SYMBOLS):
+            result = service.dispatch_for_symbols(
+                market_date='2026-04-14', symbols=SALVAGE_SYMBOLS, roles=['eod-summarizer'], reuse_existing=False,
+            )
+        stored = sorted(row['symbol'] for call in feedback_service.bulk_calls for row in call)
+        failed = {row['symbol']: row['failure_kind'] for row in failure_service.recorded}
+        return result, stored, failed
+
+    def test_a_missing_item_fails_alone_and_the_rest_are_stored(self):
+        result, stored, failed = self._dispatch_three(_OneMissingItemClient())
+        self.assertEqual(stored, ['005930', '035720'])
+        self.assertEqual(failed, {'000660': 'batch_response_attribution_mismatch'})
+        self.assertEqual((result['summary']['completed'], result['summary']['failed']), (2, 1))
+
+    def test_a_per_item_contract_failure_fails_alone(self):
+        result, stored, failed = self._dispatch_three(_InvalidConfidenceClient())
+        self.assertEqual(stored, ['000660', '035720'])
+        self.assertEqual(list(failed), ['005930'])
+        self.assertTrue(failed['005930'].startswith('response_contract_invalid'))
 
     def test_dispatch_for_symbols_times_out_hung_batch_and_finishes(self):
         service = AgentFeedbackOrchestrator()

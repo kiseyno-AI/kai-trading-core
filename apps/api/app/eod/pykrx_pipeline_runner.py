@@ -1329,6 +1329,42 @@ def _is_satisfied_followup_result(
     return daily_pipeline_outcome_is_satisfied(outcome)
 
 
+def _agent_followup_feeds_downstream(
+    result: dict[str, Any],
+    *,
+    stage_id: str,
+) -> bool:
+    """Whether an agent stage's result may start the next agent stage.
+
+    A fully satisfied result always may. A ``partial`` one may too once its
+    run has finished (nothing pending or in flight) with at least one symbol
+    completed: the next stage checks each symbol's own upstream rows and fails
+    only the symbols without them, so a handful of failed summaries no longer
+    leaves the whole day without decisions (2026-10-19: 101 of 108 symbols
+    summarized, zero decisions).
+    """
+
+    if _is_satisfied_followup_result(result, stage_id=stage_id):
+        return True
+    if _resolve_result_status(result, stage_id=stage_id) != 'partial':
+        return False
+    progress = result.get('progress') if isinstance(result.get('progress'), dict) else {}
+    summary = progress.get('summary') if isinstance(progress.get('summary'), dict) else {}
+
+    def _count(key: str) -> int:
+        try:
+            return int(summary.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return (
+        summary.get('is_live') is not True
+        and _count('completed_symbols') > 0
+        and _count('pending_symbols') == 0
+        and _count('in_progress_symbols') == 0
+    )
+
+
 def _extract_raw_result_counts(
     result: dict[str, Any],
     *,
@@ -6719,7 +6755,7 @@ def run_market_data_pipeline(
                     result['feedback_followup'],
                 )
 
-            if _is_satisfied_followup_result(
+            if _agent_followup_feeds_downstream(
                 result['feedback_followup'],
                 stage_id='agent_feedback_summaries',
             ):
@@ -6751,7 +6787,7 @@ def run_market_data_pipeline(
                     'signal_decider', result['signal_decider_followup']
                 )
 
-            if _is_satisfied_followup_result(
+            if _agent_followup_feeds_downstream(
                 result['signal_decider_followup'],
                 stage_id='signal_decider',
             ):
@@ -7041,7 +7077,7 @@ def run_market_data_pipeline(
                     ),
                 )
                 feedback_status = _resolve_result_status(result['feedback_followup'])
-                if _is_satisfied_followup_result(
+                if _agent_followup_feeds_downstream(
                     result['feedback_followup'],
                     stage_id='agent_feedback_summaries',
                 ):
@@ -7067,7 +7103,7 @@ def run_market_data_pipeline(
                     )
                     record_followup_result('signal_decider', result['signal_decider_followup'])
                     signal_decider_status = 'blocked'
-                if _is_satisfied_followup_result(
+                if _agent_followup_feeds_downstream(
                     result['signal_decider_followup'],
                     stage_id='signal_decider',
                 ):

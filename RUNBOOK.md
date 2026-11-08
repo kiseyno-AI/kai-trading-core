@@ -555,6 +555,17 @@ The background runner checks every session the next day: once per finalized sess
 
 The check only reports. On a mismatch, compare the sample rows with a second regular-session source before changing anything.
 
+## Daily progression under partial failures (since 2026-11-08)
+
+A review of 2026-09-28..11-06 found that small, partial failures stopped the whole day: 6 of 26 sessions finished cleanly, five had no decisions at all, many finished after the next open. What changed:
+
+- **Agent batches fail per symbol.** One item with a contract violation, no feedback object, or missing from the response used to fail its whole batch of up to 20 symbols; now only that symbol fails and the rest are stored. Responses whose symbol attribution is ambiguous (unexpected, duplicate or relabelled symbols) still fail the whole batch.
+- **Summarizer JSON with a wrong-kind closer is repaired** (`"risk_flags": ["a"}` typed for `["a"]`, the most common cause of `response_contract_invalid:core_generated_fallback`, 410 rows in 15 days). Decider output is still never repaired.
+- **A finished partial agent stage feeds the next one.** When the summary (or decider) run has finished all its attempts with some symbols completed, the daily follow-up chain starts the decider (or the next-open plan) instead of blocking it; the next stage fails only the symbols without their own upstream rows. Before: 2026-10-19 had 317 of 324 summaries and zero decisions.
+- **Per-symbol investor flows need 95% coverage, not 99%.** KRX does not publish them for a stable ~4% of the universe, so the old floor blocked every downstream stage on ordinary days (2026-10-02, 10-12, 10-20).
+
+Not changed: the stage executor used by resume runs keeps its stricter summary-cutoff proof, and an OpenClaw gateway outage still fails every dispatch.
+
 ## Known ways a daily table ends up partially populated
 
 These are behaviors of the current code, each observed in production data. Use `python -m app.internal.daily_coverage_audit` (see "Daily data coverage audit") to detect them; none of them is fixed by the audit itself.
