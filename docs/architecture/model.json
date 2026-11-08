@@ -5942,7 +5942,7 @@
       "notes": [
         "Health reads local configuration and runtime snapshots; it does not probe the remote broker. Token and quote operations can make KIS requests.",
         "The token route requires the configured upstream bearer token and returns presence, type, expiry and cache metadata rather than the access token.",
-        "KIS_MIN_REQUEST_INTERVAL_SECONDS defaults to 0.0, which disables the request-slot limiter. Positive values pace regular KISClient requests and required hashkey calls within that client instance, not across Core and Exec processes.",
+        "KIS_MIN_REQUEST_INTERVAL_SECONDS defaults to 0.1 (since 2026-11-08; 0 disables the request-slot limiter). Positive values pace regular KISClient requests and required hashkey calls within that client instance, not across Core and Exec processes.",
         "No account contents, tokens, live provider responses or deployment settings were accessed during this source analysis."
       ],
       "coverage": [
@@ -7148,7 +7148,7 @@
         }
       ],
       "notes": [
-        "The launchd template checks hourly; the wrapper admits one scheduled run per ISO week on Saturday from 09:00 KST. Installation and apply mode are opt-in, and deployed scheduling was not inspected.",
+        "Core's background runner checks hourly and starts the wrapper once per ISO week on Saturday from 09:00 KST (app/analytics/improvement_loop_schedule.py); apply mode is opt-in through var/alpha-lab/loop.env.",
         "Findings require persistent report verdicts. Decider text changes additionally observe a global cooldown; summarizer changes and qualifying deterministic factors become code issues. Positive agent-skill observations are logged only.",
         "Codex works in a temporary worktree of origin/main. The local runner saves the base branch guard outside that worktree and runs it with python -I before pushing.",
         "Only the marked AUTO-CALIBRATION block in the two decider contracts and the append-only changelog may change. Execution, risk, order and gate code are outside the allowed paths.",

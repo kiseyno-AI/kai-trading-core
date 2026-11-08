@@ -44,6 +44,21 @@ GET /eod/status
       "stale_after_seconds": 180,
       "is_stale": false
     },
+    "daily_bar_reconciliation": {
+      "market_date": "2026-04-14",
+      "checked_at": "2026-04-15T08:01:00+09:00",
+      "status": "ok",
+      "reference": "naver_daily_chart",
+      "warnings": [],
+      "sample_count": 200,
+      "compared_count": 200,
+      "price_mismatch_count": 0,
+      "volume_only_mismatch_count": 0,
+      "mismatch_by_field": {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0},
+      "mismatch_symbols": [],
+      "reference_error_count": 0,
+      "attempt": 1
+    },
     "label": "Background orchestration runner",
     "scope": "runtime_background_orchestration"
   },
@@ -78,3 +93,10 @@ signal for the current automatic daily pipeline. Use `pykrx_auto` for the
 daily-pipeline scheduler and `background_runner` for process-local orchestration
 health. A runner with `status="stale"`, `staleness.is_stale=true`, or
 `task_alive=false` while enabled needs operator investigation.
+
+`background_runner.daily_bar_reconciliation` is the next-day comparison of a
+date-seeded sample of the latest finalized session's stored bars with Naver's
+regular-session daily chart (`null` until the first check in this process).
+`status` is `ok`, `mismatch` (a stored price differs) or `reference_unavailable`.
+`warnings` may include `stored_prices_differ_from_reference` and
+`stored_volume_differs_from_reference` (volume only; status stays `ok`).

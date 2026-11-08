@@ -21889,7 +21889,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(completed_metadata['failed_symbols'], ['472220'])
         self.assertEqual(completed_metadata['downstream_retry_symbols'], [])
 
-    def test_daily_price_collection_reads_alphanumeric_symbol_from_official_market_frame(self) -> None:
+    def test_daily_price_collection_recovers_alphanumeric_symbol_from_exact_market_frame(self) -> None:
         service = PykrxBackfillService()
         service.symbol_pause_seconds = 0
         symbols = [
@@ -21982,13 +21982,7 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertEqual(result['symbols_succeeded'], 1)
         self.assertEqual(result['symbols_failed'], 0)
         self.assertEqual(result['price_retry_symbols'], [])
-        # The official market frame is the primary source now, so nothing needs
-        # recovering and the per-symbol feed is never consulted for this symbol.
-        self.assertEqual(result['price_recovery']['recovered_symbols'], [])
-        self.assertEqual(
-            result['price_source'],
-            {'official_market_frame_bars': 1, 'per_symbol_bars': 0},
-        )
+        self.assertEqual(result['price_recovery']['recovered_symbols'], ['0017J0'])
         exact_market_fetch.assert_called_once_with('20260403', 'KOSPI')
         persisted = persist_bars.call_args.args[1]
         self.assertEqual(
@@ -22005,193 +21999,6 @@ class PykrxBackfillServiceTests(TestCase):
                 },
             ],
         )
-
-    def _collect_one_day(
-        self,
-        *,
-        symbols: list,
-        per_symbol_bar: dict | None,
-        market_frame,
-        market_frame_error: Exception | None = None,
-    ):
-        """Run one daily_auto price_collection and return (result, persisted, per_symbol_mock)."""
-
-        service = PykrxBackfillService()
-        service.symbol_pause_seconds = 0
-        persisted_by_symbol: dict[str, list] = {}
-
-        def persist(symbol, bars, **_kwargs):
-            persisted_by_symbol[symbol] = bars
-            return len(bars)
-
-        scope_symbols = [item.symbol for item in symbols]
-        with (
-            patch.object(service, 'load_active_universe', return_value=symbols),
-            patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
-            patch('app.eod.pykrx_backfill.create_eod_collection_run', return_value=13),
-            patch(
-                'app.eod.pykrx_backfill._get_market_ohlcv_by_date',
-                return_value=SimpleNamespace(empty=per_symbol_bar is None),
-            ) as per_symbol_fetch,
-            patch.object(
-                service,
-                '_map_symbol_bars',
-                return_value=[per_symbol_bar] if per_symbol_bar else [],
-            ),
-            patch(
-                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
-                return_value=market_frame,
-                side_effect=market_frame_error,
-            ),
-            patch('app.eod.pykrx_backfill.persist_daily_price_bars', side_effect=persist),
-            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'),
-            patch(
-                'app.eod.pykrx_backfill.daily_price_context_service.rebuild_for_market_date',
-                return_value={
-                    'requested_symbols': len(scope_symbols),
-                    'contexts_persisted': len(scope_symbols),
-                    'contexts_failed': 0,
-                    '_retry_metadata': {'failed_symbols': []},
-                    **_atomic_exact_scope_proof(
-                        manifest_version='price_contexts_scope_outcomes_v1',
-                        selected_symbols=scope_symbols,
-                        successful_symbols=scope_symbols,
-                        retry_debt_symbols=[],
-                    ),
-                },
-            ),
-            patch('app.eod.pykrx_backfill.complete_eod_collection_run'),
-        ):
-            result = service._run_market_data_pipeline(
-                start_date='20260403',
-                end_date='20260403',
-                markets=('KOSPI',),
-                trigger='test',
-                refresh_universe=False,
-                mode='daily_auto',
-                selected_stages=('price_collection',),
-                chain_fundamentals_followup=False,
-            )
-        return result, persisted_by_symbol, per_symbol_fetch
-
-    @staticmethod
-    def _official_frame(rows: dict[str, tuple[int, int, int, int, int, int]]):
-        return pd.DataFrame(
-            {
-                '시가': [row[0] for row in rows.values()],
-                '고가': [row[1] for row in rows.values()],
-                '저가': [row[2] for row in rows.values()],
-                '종가': [row[3] for row in rows.values()],
-                '거래량': [row[4] for row in rows.values()],
-                '거래대금': [row[5] for row in rows.values()],
-            },
-            index=list(rows),
-        )
-
-    def test_daily_price_collection_prefers_official_frame_over_the_per_symbol_feed(self) -> None:
-        symbols = [PykrxSymbol(symbol='000660', market='KOSPI', name_ko='SK Hynix')]
-        # The per-symbol feed disagrees on close/low/turnover; the official table wins.
-        per_symbol = {
-            'trade_date': '2026-04-03',
-            'open_price': 1320000,
-            'high_price': 1320000,
-            'low_price': 1250000,
-            'close_price': 1262000,
-            'volume': 4281006,
-            'turnover': 0,
-        }
-        frame = self._official_frame({'000660': (1320000, 1320000, 1250000, 1264000, 4281006, 5478348796620)})
-
-        result, persisted, per_symbol_fetch = self._collect_one_day(
-            symbols=symbols, per_symbol_bar=per_symbol, market_frame=frame
-        )
-
-        per_symbol_fetch.assert_not_called()
-        self.assertEqual(result['price_source'], {'official_market_frame_bars': 1, 'per_symbol_bars': 0})
-        self.assertEqual(
-            persisted['000660'],
-            [
-                {
-                    'trade_date': date(2026, 4, 3),
-                    'open_price': 1320000,
-                    'high_price': 1320000,
-                    'low_price': 1250000,
-                    'close_price': 1264000,
-                    'volume': 4281006,
-                    'turnover': 5478348796620,
-                }
-            ],
-        )
-
-    def test_daily_price_collection_falls_back_per_symbol_when_the_official_frame_lacks_the_symbol(self) -> None:
-        symbols = [
-            PykrxSymbol(symbol='000660', market='KOSPI', name_ko='SK Hynix'),
-            PykrxSymbol(symbol='005930', market='KOSPI', name_ko='Samsung'),
-        ]
-        per_symbol = {
-            'trade_date': '2026-04-03',
-            'open_price': 100,
-            'high_price': 110,
-            'low_price': 90,
-            'close_price': 105,
-            'volume': 10,
-            'turnover': 1050,
-        }
-        frame = self._official_frame({'000660': (1320000, 1320000, 1250000, 1264000, 4281006, 5478348796620)})
-
-        result, persisted, per_symbol_fetch = self._collect_one_day(
-            symbols=symbols, per_symbol_bar=per_symbol, market_frame=frame
-        )
-
-        self.assertEqual(result['price_source'], {'official_market_frame_bars': 1, 'per_symbol_bars': 1})
-        self.assertEqual(per_symbol_fetch.call_count, 1)
-        self.assertEqual(persisted['000660'][0]['close_price'], 1264000)
-        self.assertEqual(persisted['005930'][0]['close_price'], 105)
-
-    def test_daily_price_collection_uses_per_symbol_feed_when_the_official_frame_is_incoherent(self) -> None:
-        symbols = [PykrxSymbol(symbol='000660', market='KOSPI', name_ko='SK Hynix')]
-        per_symbol = {
-            'trade_date': '2026-04-03',
-            'open_price': 100,
-            'high_price': 110,
-            'low_price': 90,
-            'close_price': 105,
-            'volume': 10,
-            'turnover': 1050,
-        }
-        # Traded volume with zero trading value is not a trustworthy official row.
-        frame = self._official_frame({'000660': (100, 110, 90, 105, 10, 0)})
-
-        result, persisted, _ = self._collect_one_day(
-            symbols=symbols, per_symbol_bar=per_symbol, market_frame=frame
-        )
-
-        self.assertEqual(result['price_source']['official_market_frame_bars'], 0)
-        self.assertEqual(result['price_source']['per_symbol_bars'], 1)
-
-    def test_daily_price_collection_keeps_working_when_the_official_frame_cannot_be_fetched(self) -> None:
-        symbols = [PykrxSymbol(symbol='000660', market='KOSPI', name_ko='SK Hynix')]
-        per_symbol = {
-            'trade_date': '2026-04-03',
-            'open_price': 100,
-            'high_price': 110,
-            'low_price': 90,
-            'close_price': 105,
-            'volume': 10,
-            'turnover': 1050,
-        }
-
-        result, persisted, per_symbol_fetch = self._collect_one_day(
-            symbols=symbols,
-            per_symbol_bar=per_symbol,
-            market_frame=None,
-            market_frame_error=ConnectionError('krx unavailable'),
-        )
-
-        per_symbol_fetch.assert_called_once()
-        self.assertEqual(result['price_source'], {'official_market_frame_bars': 0, 'per_symbol_bars': 1})
-        self.assertEqual(persisted['000660'][0]['close_price'], 105)
-        self.assertGreaterEqual(result['turnover_coverage']['market_fetch_failures'], 1)
 
     def test_symbol_local_price_gaps_do_not_trigger_provider_outage_early_abort(self) -> None:
         service = PykrxBackfillService()

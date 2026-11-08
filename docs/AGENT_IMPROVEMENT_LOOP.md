@@ -11,7 +11,7 @@ after trading costs. `app.analytics.improvement_findings` prints, for every simu
 net monthly edge would just pay the bill (`breakeven_capital_krw`), or `null` when there is no positive edge at any
 capital. Today most signals have none, so the loop also reports honestly when the agents are not paying for themselves.
 
-## Flow (`scripts/run_agent_improvement_local.sh` via launchd, Saturday from 09:00 KST)
+## Flow (`scripts/run_agent_improvement_local.sh`, started by Core's background runner, Saturday from 09:00 KST)
 
 1. **Evaluate** (`app.analytics.signal_lab`, read-only) every signal with the same rules.
 2. **Decide** (`app.analytics.improvement_findings`, deterministic): a finding exists only if a verdict persisted over
@@ -49,10 +49,12 @@ capital. Today most signals have none, so the loop also reports honestly when th
 
 ## Setup the owner must do once (cannot be done from the repository)
 
-1. **Install the launchd job on this Mac:** `scripts/install_agent_improvement_launchd.sh` (uninstall with
-   `--uninstall`). It checks hourly and runs once per ISO week on Saturday from 09:00 KST against the live main
-   checkout; everything (report, findings, logs) stays under `var/alpha-lab/`. No GitHub runner is involved, so the
-   public repository never reaches this machine.
+1. **Schedule (nothing to install):** Core's background runner checks hourly and starts the script once per ISO week
+   on Saturday from 09:00 KST (`app/analytics/improvement_loop_schedule.py`, step `agent_improvement_loop`) against
+   the live main checkout; everything (report, findings, logs) stays under `var/alpha-lab/`. A run that does not
+   finish leaves no `.done-<week>` marker and is retried on the next hourly check that Saturday.
+   `AGENT_IMPROVEMENT_LOOP_ENABLED=false` turns it off. No GitHub runner is involved, so the public repository never
+   reaches this machine. (A separate launchd job was used before 2026-11-08 and has been removed.)
 2. **Applying is opt-in:** create `var/alpha-lab/loop.env` with `AGENT_RULES_AUTO_PR=true` (or run the script with
    `--apply`). The PR it opens goes through CI, the rules guard and the Codex review like any other PR.
 3. **Manual run:** `scripts/run_agent_improvement_local.sh --force` (dry run unless applying is enabled).

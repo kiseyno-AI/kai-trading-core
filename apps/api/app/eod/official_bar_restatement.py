@@ -1,6 +1,15 @@
 """Restate stored daily bars to the official KRX values.
 
-Why this exists: until the collection fix, daily bars were built from PyKRX's
+DO NOT APPLY (2026-11-08). The premise below turned out to be wrong: the PyKRX
+market-wide frame this tool treats as "official" is not the KRX regular session
+(000660 on 2026-11-06: frame close 1,132,000 / volume 7,907,029; the regular
+session, the stored bar and Naver: 1,176,000 / 7,789,034), and the stored
+per-symbol bars matched Naver on 36/36 sampled symbol-dates. ``--apply`` is
+therefore refused (``restatement_reference_not_regular_session``); dry runs still
+work for investigation. Bars are checked daily by
+``app.eod.daily_bar_reconciliation`` against a regular-session reference instead.
+
+Why this exists (original, superseded): until the collection fix, daily bars were built from PyKRX's
 per-symbol range endpoint, which differs from the official market-wide table
 (and from KIS history, which matches the official table exactly) on close/high/
 low for most symbols, and carried no or partial trading value. Those bars are not
@@ -77,6 +86,11 @@ class OfficialReference:
 
     def covers(self, trade_date: date) -> bool:
         return trade_date in self.covered_dates
+
+    def rows_for(self, trade_date: date) -> dict[str, Values]:
+        """Every official row of one date (empty when the date is not covered)."""
+
+        return {symbol: values for (symbol, day), values in self._rows.items() if day == trade_date}
 
     @classmethod
     def load(
@@ -326,6 +340,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.set_defaults(apply=False)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    if args.apply:
+        print(json.dumps({
+            'status': 'blocked',
+            'applied': False,
+            'reason': 'restatement_reference_not_regular_session',
+            'hint': 'the market-wide frame is not the KRX regular session; stored bars match it, see module docstring',
+        }, ensure_ascii=False, sort_keys=True))
+        return 2
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
     try:

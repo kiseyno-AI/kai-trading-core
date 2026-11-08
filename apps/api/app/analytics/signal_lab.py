@@ -64,12 +64,23 @@ def _rows(session: Any, sql: str, **params: Any) -> list[Any]:
     return list(session.execute(text(sql), params).all())
 
 
-def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: Sequence[int] = DEFAULT_HORIZONS) -> pd.DataFrame:
-    """Build the symbol x date panel with forward returns, factor scores and agent scores."""
+def load_panel(
+    start: str = DEFAULT_START,
+    end: str | None = None,
+    *,
+    horizons: Sequence[int] = DEFAULT_HORIZONS,
+    agent_start: str | None = None,
+) -> pd.DataFrame:
+    """Build the symbol x date panel with forward returns, factor scores and agent scores.
+
+    ``agent_start`` limits agent rows (summaries and decisions) to the current agent
+    generation; universe signals always use the full ``start``..``end`` window.
+    """
 
     from app.db import session_scope
 
     end_date = end or date.today().isoformat()
+    agent_from = max(start, agent_start) if agent_start else start
     warmup_start = (pd.Timestamp(start) - pd.Timedelta(days=60)).date().isoformat()
     with session_scope(statement_timeout_ms=900_000) as session:
         session.execute(text('SET TRANSACTION READ ONLY'))
@@ -98,7 +109,7 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
                from agent_context_feedback
                where agent_name in ('eod-summarizer','technical-summarizer','fundamental-summarizer')
                  and market_date between :a and :b""",
-            a=start,
+            a=agent_from,
             b=end_date,
         )
         decisions = _rows(
@@ -108,7 +119,7 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
             """select agent_name, market_date, symbol, decision_action, confidence_score_10, conviction_score_10, expected_return_pct,
                       greatest(created_at, coalesce(feedback_received_at, created_at), updated_at)
                from signal_decider_decision_snapshots where market_date between :a and :b""",
-            a=start,
+            a=agent_from,
             b=end_date,
         )
 
@@ -160,6 +171,7 @@ def load_panel(start: str = DEFAULT_START, end: str | None = None, *, horizons: 
     panel['placebo'] = np.random.default_rng(20260101).normal(size=len(panel))
     panel = panel.reset_index(drop=True)
     panel.attrs['point_in_time'] = point_in_time
+    panel.attrs['agent_rows_from'] = agent_from
     return panel
 
 
@@ -294,6 +306,8 @@ def render_markdown(result: Mapping[str, Any], *, start: str, end: str, universe
         f'* returns: next-session open to the close h sessions after the decision date; top-{result["k"]} simulation '
         f'rebalances every h sessions with an assumed round-trip cost of {result["roundtrip_cost_bps"]:.0f} bp',
         '* the sample is one market regime; a label is a screening result, not proof of a lasting edge',
+        f'* agent rows (summaries, decisions) from: {result.get("agent_rows_from") or start} '
+        '(current agent generation only; universe signals use the whole window)',
         '',
         '## Signals (rank IC within date, Newey-West t)',
         '',
@@ -344,14 +358,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument('--k', type=int, default=5)
     parser.add_argument('--cost-bps', type=float, default=DEFAULT_ROUNDTRIP_COST_BPS)
     parser.add_argument('--out-dir', default='var/alpha-lab')
+    parser.add_argument(
+        '--agent-start',
+        default=None,
+        help='first date of agent rows (default: AGENT_GENERATION_START_DATE; "all" pools every generation)',
+    )
     args = parser.parse_args(argv)
     horizons = tuple(int(item) for item in args.horizons.split(',') if item.strip())
     end = args.end or date.today().isoformat()
-    panel = load_panel(args.start, end, horizons=horizons)
+    if args.agent_start == 'all':
+        agent_start = None
+    elif args.agent_start:
+        agent_start = args.agent_start
+    else:
+        from app.core.settings import settings
+
+        configured = settings.agent_generation_start_date
+        agent_start = configured.isoformat() if configured else None
+    panel = load_panel(args.start, end, horizons=horizons, agent_start=agent_start)
     if panel.empty:
         print(json.dumps({'status': 'no_data'}))
         return 1
     result = evaluate_panel(panel, horizons=horizons, k=args.k, roundtrip_cost_bps=args.cost_bps)
+    result['agent_rows_from'] = panel.attrs.get('agent_rows_from')
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d-%H%M')

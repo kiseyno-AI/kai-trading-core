@@ -153,14 +153,33 @@ def summarize_outcomes(
     }
 
 
-def load_summary(today: date, *, weeks: int = 6, session_scope: Callable[..., Any] | None = None) -> dict[str, Any]:
+def load_summary(
+    today: date,
+    *,
+    weeks: int = 6,
+    session_scope: Callable[..., Any] | None = None,
+    generation_start: date | None | str = 'settings',
+) -> dict[str, Any]:
+    """Outcomes of the agents' decisions over the last ``weeks``, current generation only.
+
+    Decisions made before ``generation_start`` (default: AGENT_GENERATION_START_DATE)
+    came from replaced personas and contracts, so they are left out rather than pooled.
+    """
+
     from sqlalchemy import text
+
+    if generation_start == 'settings':
+        from app.core.settings import settings
+
+        generation_start = settings.agent_generation_start_date
 
     if session_scope is None:
         from app.db import session_scope as default_scope
 
         session_scope = default_scope
     start = today - timedelta(weeks=weeks)
+    if isinstance(generation_start, date) and generation_start > start:
+        start = generation_start
     far = today + timedelta(days=1)
     with session_scope() as session:
         session.execute(text("SET LOCAL statement_timeout = '120s'"))
@@ -172,6 +191,10 @@ def load_summary(today: date, *, weeks: int = 6, session_scope: Callable[..., An
                 bars[r['symbol']].append(dict(r))
         medians = {r['d']: float(r['med']) for r in session.execute(text(MEDIAN_SQL), {'a': start - timedelta(days=7), 'b': far, 'c': start}).mappings().all()}
     summary = summarize_outcomes(decisions, bars, medians)
-    summary['period'] = {'from': start.isoformat(), 'to': today.isoformat()}
+    summary['period'] = {
+        'from': start.isoformat(),
+        'to': today.isoformat(),
+        'agent_generation_start': generation_start.isoformat() if isinstance(generation_start, date) else None,
+    }
     summary['known_agents'] = sorted({d['agent_name'] for d in decisions})
     return summary

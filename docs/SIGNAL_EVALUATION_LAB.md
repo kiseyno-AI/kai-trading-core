@@ -33,6 +33,10 @@ would?* It scores deterministic factors, the stored factor tables and the agents
 * Agent decisions are compared with the same-day universe and, within the agent's own pool, `buy` and
   `reject` against `wait`.
 
+## Agent generations
+
+Agent scores are only comparable within one generation of personas and contracts. `AGENT_GENERATION_START_DATE` (default 2026-11-07, when the personas and decider contracts were replaced in #705/#707) is the first market date of the current generation: the lab reads summaries and decisions from that date on (`--agent-start YYYY-MM-DD` overrides it, `--agent-start all` pools every generation), while the universe signals (factors, volatility, trend) keep the whole `--start` window because they do not depend on the agents. The postmortem analyst's summary uses the same date. Move it forward whenever the agents are replaced again. Expect "no evidence" for agent rows until a few weeks of the new generation exist.
+
 ## What it does not prove
 
 One market regime (2026-04..11, weak, defensive), at most ~140 sessions, long-only returns with no
