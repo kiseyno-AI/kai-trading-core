@@ -314,12 +314,13 @@ class SpecApplyTests(unittest.TestCase):
 
 
 class RolloutSafetyTests(unittest.TestCase):
-    def test_defaults_are_off_and_report_only(self) -> None:
+    def test_defaults_are_on_with_repair(self) -> None:
+        # Operator decision 2026-11-08: detect and repair Tier A gaps by default.
         from app.core.settings import Settings
 
         defaults = Settings(_env_file=None)
-        self.assertFalse(defaults.data_gap_fill_enabled)
-        self.assertFalse(defaults.data_gap_fill_apply)
+        self.assertTrue(defaults.data_gap_fill_enabled)
+        self.assertTrue(defaults.data_gap_fill_apply)
 
     def test_runner_step_is_gated_by_the_flag_and_an_open_market(self) -> None:
         import inspect

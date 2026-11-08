@@ -524,7 +524,7 @@ Account queries expose summaries, positions and buying power. Broker operations 
 
 - Health reads local configuration and runtime snapshots; it does not probe the remote broker. Token and quote operations can make KIS requests.
 - The token route requires the configured upstream bearer token and returns presence, type, expiry and cache metadata rather than the access token.
-- KIS_MIN_REQUEST_INTERVAL_SECONDS defaults to 0.0, which disables the request-slot limiter. Positive values pace regular KISClient requests and required hashkey calls within that client instance, not across Core and Exec processes.
+- KIS_MIN_REQUEST_INTERVAL_SECONDS defaults to 0.1 (since 2026-11-08; 0 disables the request-slot limiter). Positive values pace regular KISClient requests and required hashkey calls within that client instance, not across Core and Exec processes.
 - No account contents, tokens, live provider responses or deployment settings were accessed during this source analysis.
 
 **HTTP coverage:** `/trading/accounts`, `/broker/kis`.

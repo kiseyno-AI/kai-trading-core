@@ -88,10 +88,11 @@ class Settings(BaseSettings):
     kis_token_issuance_lease_seconds: int = Field(default=90, ge=75, le=3600)
     kis_token_min_issue_interval_seconds: int = Field(default=60, ge=60, le=3600)
     kis_token_cache_directory: str = '~/.cache/kai-trading/kis-oauth-tokens'
-    # Minimum spacing between Core's KIS REST requests (seconds). 0 disables the
-    # limiter (historical behavior). KIS enforces a per-app-key rate limit that
-    # Core shares with kai-trading-exec, which spaces its own calls by 0.12s.
-    kis_min_request_interval_seconds: float = Field(default=0.0, ge=0, le=10, allow_inf_nan=False)
+    # Minimum spacing between Core's KIS REST requests (seconds); 0 disables the
+    # limiter. KIS enforces a per-app-key rate limit (about 20 requests/s) that Core
+    # shares with kai-trading-exec, which spaces its own calls by 0.12s (~8/s); 0.1s
+    # keeps Core at ~10/s so the two together stay under the limit.
+    kis_min_request_interval_seconds: float = Field(default=0.1, ge=0, le=10, allow_inf_nan=False)
     kis_realtime_trending_cache_ttl_seconds: int = 20
     kis_realtime_order_notice_enabled: bool = True
     kis_realtime_price_enabled: bool = True
@@ -251,10 +252,11 @@ class Settings(BaseSettings):
     # limit below that count left a rotating handful as retry debt each day,
     # so the DART stage was partial every day.
     dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
-    # Weekday market-hours gap fill (docs/DATA_GAP_FILL.md). Off by default; when
-    # enabled it only reports until data_gap_fill_apply is also set.
-    data_gap_fill_enabled: bool = False
-    data_gap_fill_apply: bool = False
+    # Weekday market-hours gap fill (docs/DATA_GAP_FILL.md). On by default since
+    # 2026-11-08 (operator decision): detects gaps and repairs the Tier A kinds
+    # under the existing writer fences; Tier B price rewrites stay report-only.
+    data_gap_fill_enabled: bool = True
+    data_gap_fill_apply: bool = True
     data_gap_fill_lookback_trading_days: int = Field(default=10, ge=1, le=60)
     data_gap_fill_window_start: str = Field(default='09:30', pattern=r'^\d{2}:\d{2}$')
     data_gap_fill_window_end: str = Field(default='15:00', pattern=r'^\d{2}:\d{2}$')

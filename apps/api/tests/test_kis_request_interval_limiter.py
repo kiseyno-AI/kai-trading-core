@@ -9,8 +9,8 @@ from app.core.settings import Settings, settings
 
 
 class KISRequestIntervalLimiterTests(unittest.IsolatedAsyncioTestCase):
-    def test_limiter_is_off_by_default(self) -> None:
-        self.assertEqual(Settings.model_fields['kis_min_request_interval_seconds'].default, 0.0)
+    def test_limiter_defaults_to_a_tenth_of_a_second_and_zero_disables_it(self) -> None:
+        self.assertEqual(Settings.model_fields['kis_min_request_interval_seconds'].default, 0.1)
         client = KISClient(use_mock=True)
         with patch.object(settings, 'kis_min_request_interval_seconds', 0.0):
             self.assertEqual([client._reserve_request_slot_delay() for _ in range(3)], [0.0, 0.0, 0.0])

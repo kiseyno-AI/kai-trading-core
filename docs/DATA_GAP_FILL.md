@@ -80,8 +80,8 @@ All of the following must hold, otherwise the tick is a no-op:
 * A fixer that fails or is blocked puts its `(kind, session)` in a cooldown
   (`DATA_GAP_FILL_FAILURE_COOLDOWN_SECONDS`, default 6 h). One failure never stops
   the other gaps.
-* `DATA_GAP_FILL_APPLY=false` (default): detect and report only. No fixer is
-  called.
+* `DATA_GAP_FILL_APPLY=false`: detect and report only. No fixer is called.
+  Both flags default to `true` since 2026-11-08.
 * The module also has a CLI: `python -m app.eod.data_gap_fill` (dry-run) and
   `--apply`. The CLI ignores the schedule window and the interval but keeps every
   other rule.
@@ -107,9 +107,8 @@ All of the following must hold, otherwise the tick is a no-op:
 
 ## Rollout
 
-1. Merge with `DATA_GAP_FILL_ENABLED=false`.
-2. Enable with `DATA_GAP_FILL_APPLY=false` for a few weekdays; read the reports.
-3. Enable apply. Tier B kinds stay report-only.
+1. Merged with `DATA_GAP_FILL_ENABLED=false`.
+2. On 2026-11-08 the operator enabled detection and apply together by default (the report-only trial was skipped); set `DATA_GAP_FILL_APPLY=false` to go back to report-only. Tier B kinds stay report-only.
 4. A later change may persist run records in a table; this version keeps the last
    result in memory (runner snapshot) and in the log.
 
