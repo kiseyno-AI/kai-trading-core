@@ -189,6 +189,42 @@ class DetectorSqlTests(unittest.TestCase):
 
         self.assertEqual((gap.kind, gap.count), ('turnover_incomplete', 1))
 
+    def test_provider_comparison_observes_bars_repaired_between_checks(self) -> None:
+        state = {}
+
+        def setup(session):
+            missing = self._symbol(session)
+            provisional = self._symbol(session)
+            self._bar(session, provisional, D1)
+            session.flush()
+            bar = session.query(DailyPriceBar).filter_by(symbol_id=provisional.id, trade_date=D1).one()
+            bar.close_price = 104
+            state.update(session=session, missing=missing, provisional=provisional, bar=bar)
+
+        def check():
+            provider = {
+                state['missing'].symbol: (100, 110, 90, 105),
+                state['provisional'].symbol: (100, 110, 90, 105),
+            }
+            comparison = gap_fill._ProviderComparison(
+                lambda: [D1.isoformat()], frame_loader=lambda _date: provider
+            )
+            self.assertEqual(
+                comparison.compare(D1.isoformat()),
+                {'provider_symbols': 2, 'missing_bars': 1, 'provisional_bars': 1},
+            )
+
+            self._bar(state['session'], state['missing'], D1)
+            state['bar'].close_price = 105
+            state['session'].flush()
+
+            self.assertEqual(
+                comparison.compare(D1.isoformat()),
+                {'provider_symbols': 2, 'missing_bars': 0, 'provisional_bars': 0},
+            )
+
+        self._with_session(setup, check)
+
 
 if __name__ == '__main__':
     unittest.main()

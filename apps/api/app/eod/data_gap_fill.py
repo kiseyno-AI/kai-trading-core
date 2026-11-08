@@ -375,13 +375,10 @@ class _ProviderComparison:
     ) -> None:
         self._recent_sessions = recent_sessions
         self._frame_loader = frame_loader
-        self._cache: dict[str, dict[str, int]] = {}
 
     def compare(self, market_date: str) -> dict[str, int] | None:
         if market_date not in set(self._recent_sessions()):
             return None
-        if market_date in self._cache:
-            return self._cache[market_date]
         from sqlalchemy import select
 
         from app.db import session_scope
@@ -411,7 +408,6 @@ class _ProviderComparison:
             'missing_bars': sum(1 for symbol in provider if symbol not in stored),
             'provisional_bars': sum(1 for symbol, ohlc in provider.items() if symbol in stored and stored[symbol] != ohlc),
         }
-        self._cache[market_date] = result
         return result
 
 
