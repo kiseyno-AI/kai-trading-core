@@ -7586,6 +7586,7 @@ class AgentFeedbackOrchestrator:
                         lifecycle_stage='batch_persisted',
                         current_role=role,
                         status='running',
+                        persistence_guard=persistence_guard,
                     )
                     indexed_batches = [dispatch_items[i:i + batch_size] for i in range(0, len(dispatch_items), batch_size)]
                     queue: list[tuple[int, list[dict[str, Any]]]] = []

@@ -7040,6 +7040,45 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(len(read_service.calls), 1)
 
+    def test_role_preparation_failure_checks_persistence_guard_before_writing(self):
+        service = AgentFeedbackOrchestrator()
+        service.client = RecordingBatchClient()
+        failure_service = RecordingFailureService()
+        guard_calls = []
+
+        def reject_stale_owner(**kwargs):
+            guard_calls.append(kwargs)
+            raise RuntimeError('feedback retry lease lost')
+
+        caught_error = None
+        with (
+            patch.object(orchestrator_module, 'runtime_feedback_state_store', RuntimeFeedbackStateStore()),
+            patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', RecordingRunStateService()),
+            patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()),
+            patch.object(orchestrator_module, 'agent_context_feedback_failure_service', failure_service),
+            patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', FakeSessionCleanupService()),
+            patch.object(orchestrator_module, 'build_fundamental_input_fingerprint_payload_from_context', return_value={}),
+            _patch_feedback_eligibility('005930'),
+        ):
+            try:
+                service.dispatch_for_symbols(
+                    market_date='2026-04-14',
+                    symbols=['005930'],
+                    roles=['fundamental-summarizer'],
+                    reuse_existing=False,
+                    persistence_guard=reject_stale_owner,
+                    knowledge_cutoff_at='2026-04-14T06:00:00+00:00',
+                )
+            except RuntimeError as exc:
+                caught_error = exc
+
+        self.assertEqual(failure_service.recorded, [])
+        self.assertIsNotNone(caught_error)
+        self.assertEqual(str(caught_error), 'feedback retry lease lost')
+        self.assertEqual(guard_calls[0]['stage'], 'before_feedback_persistence')
+        self.assertEqual(guard_calls[0]['reason'], 'role_prepared:fundamental-summarizer')
+        self.assertEqual(service.client.calls, [])
+
     def test_symbol_dispatch_checkpoints_each_persisted_batch_and_leaves_final_flush_as_safety(self):
         service = AgentFeedbackOrchestrator()
         client = RecordingBatchClient()
