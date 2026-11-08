@@ -48,7 +48,7 @@ LOG="$OUT/loop-$RUN_ID.log"
   ARGS=()
   [ "$APPLY" = "true" ] && ARGS+=(--apply)
   ( cd "$ROOT" && "$PY" scripts/agent_improvement_run.py --findings "$FINDINGS" --run-id "$RUN_ID" ${ARGS[@]+"${ARGS[@]}"} ) \
-    > "$OUT/last-improvement.log" 2>&1 || echo "improvement run returned non-zero; see last-improvement.log"
+    > "$OUT/last-improvement.log" 2>&1 || { echo "improvement run failed; see last-improvement.log"; exit 1; }
   touch "$MARKER"
   echo "done"
 } >> "$LOG" 2>&1
