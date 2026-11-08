@@ -4574,6 +4574,11 @@ class PykrxBackfillServiceTests(TestCase):
         with (
             patch.object(
                 service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-07',
+            ) as resolve_trade_date,
+            patch.object(
+                service,
                 'fetch_recent_universe_snapshot',
                 return_value=_point_in_time_universe_snapshot(
                     symbols,
@@ -4595,6 +4600,7 @@ class PykrxBackfillServiceTests(TestCase):
                     mode='historical_backfill',
                 )
 
+        resolve_trade_date.assert_called_once_with(end_date='20260407')
         metadata = create_run.call_args.kwargs['run_metadata']
         membership = metadata['universe_snapshot']['market_membership']
         self.assertEqual(membership['schema_version'], 'pykrx_market_membership_v1')
