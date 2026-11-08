@@ -48,14 +48,16 @@ GET /eod/status
       "market_date": "2026-04-14",
       "checked_at": "2026-04-15T08:01:00+09:00",
       "status": "ok",
+      "reference": "naver_daily_chart",
       "warnings": [],
-      "compared_count": 2769,
-      "mismatch_count": 0,
-      "mismatch_by_field": {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "turnover": 0},
+      "sample_count": 200,
+      "compared_count": 200,
+      "price_mismatch_count": 0,
+      "volume_only_mismatch_count": 0,
+      "mismatch_by_field": {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0},
       "mismatch_symbols": [],
-      "official_not_stored_count": 12,
-      "attempt": 1,
-      "collection_price_source": {"official_market_frame_bars": 2769, "per_symbol_bars": 0}
+      "reference_error_count": 0,
+      "attempt": 1
     },
     "label": "Background orchestration runner",
     "scope": "runtime_background_orchestration"
@@ -92,9 +94,9 @@ daily-pipeline scheduler and `background_runner` for process-local orchestration
 health. A runner with `status="stale"`, `staleness.is_stale=true`, or
 `task_alive=false` while enabled needs operator investigation.
 
-`background_runner.daily_bar_reconciliation` is the next-day comparison of the
-latest finalized session's stored bars with the official KRX table (`null` until
-the first check in this process). `status` is `ok`, `mismatch` (stored bars differ;
-restate them, see `docs/TARGETED_REPAIR_TOOLING.md`) or `reference_unavailable`.
-`warnings` may include `collection_used_per_symbol_fallback` (the collection fell
-back to provisional per-symbol bars) and `collection_price_source_unrecorded`.
+`background_runner.daily_bar_reconciliation` is the next-day comparison of a
+date-seeded sample of the latest finalized session's stored bars with Naver's
+regular-session daily chart (`null` until the first check in this process).
+`status` is `ok`, `mismatch` (a stored price differs) or `reference_unavailable`.
+`warnings` may include `stored_prices_differ_from_reference` and
+`stored_volume_differs_from_reference` (volume only; status stays `ok`).

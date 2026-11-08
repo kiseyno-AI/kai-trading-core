@@ -45,7 +45,7 @@ DAILY_COVERAGE_AUDIT_MARKET_STATES = frozenset(
 )
 DAILY_BAR_RECONCILIATION_STEP = 'daily_bar_reconciliation'
 # The job is a cheap no-op once a session is settled; this only spaces out retries
-# when the official frame could not be read.
+# when the KIS reference could not be read.
 DAILY_BAR_RECONCILIATION_MIN_INTERVAL = timedelta(minutes=30)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
@@ -363,7 +363,7 @@ class EODBackgroundRunner:
         return True
 
     def _reconcile_daily_bars_sync(self) -> dict | None:
-        """Compare the latest finalized session's bars with the official table."""
+        """Compare a sample of the latest finalized session's bars with KIS."""
 
         from app.eod.daily_bar_reconciliation import run_if_due, summarize
 
@@ -373,7 +373,7 @@ class EODBackgroundRunner:
         return summary
 
     def _start_daily_bar_reconciliation(self, *, now: datetime | None = None) -> None:
-        # Two spaced KRX reads can outlast a blocking-step timeout, so this runs
+        # A few hundred rate-limited KIS reads outlast a blocking-step timeout, so this runs
         # in its own thread and never holds the tick.
         self._last_daily_bar_reconciliation_at = now or datetime.now(timezone.utc)
         self._start_background_thread_step(
