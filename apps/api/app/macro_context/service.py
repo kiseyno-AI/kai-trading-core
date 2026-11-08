@@ -40,6 +40,9 @@ class MacroSeriesConfig:
     unit: str | None = None
     frequency: str | None = None
     regime_key: str | None = None
+    # 'yoy_percent': store the change against the observation 12 periods
+    # earlier (monthly index levels such as CPI) instead of the raw level.
+    transform: str | None = None
 
 
 DEFAULT_WORLD_BANK_SERIES: dict[str, MacroSeriesConfig] = {
@@ -72,16 +75,36 @@ DEFAULT_WORLD_BANK_SERIES: dict[str, MacroSeriesConfig] = {
     ),
 }
 
-DEFAULT_FRED_SERIES: dict[str, MacroSeriesConfig] = {
-    'DEXKOUS': MacroSeriesConfig(
+
+
+def _fred(series_id: str, name: str, unit: str, frequency: str, regime_key: str, transform: str | None = None) -> MacroSeriesConfig:
+    return MacroSeriesConfig(
         source=FRED_SOURCE,
-        series_id='DEXKOUS',
-        series_name='USD/KRW exchange rate from FRED',
-        country_code=None,
-        unit='KRW per USD',
-        frequency='daily',
-        regime_key='fx',
-    ),
+        series_id=series_id,
+        series_name=name,
+        unit=unit,
+        frequency=frequency,
+        regime_key=regime_key,
+        transform=transform,
+    )
+
+
+# US/global drivers of Korean equities: rates, curve, risk appetite, credit,
+# oil, US inflation/labor, and the won.
+DEFAULT_FRED_SERIES: dict[str, MacroSeriesConfig] = {
+    config.series_id: config
+    for config in (
+        _fred('DEXKOUS', 'USD/KRW exchange rate from FRED', 'KRW per USD', 'daily', 'fx'),
+        _fred('DFF', 'US effective federal funds rate', 'percent', 'daily', 'us_policy_rate'),
+        _fred('DGS10', 'US 10-year Treasury yield', 'percent', 'daily', 'us_10y'),
+        _fred('DGS2', 'US 2-year Treasury yield', 'percent', 'daily', 'us_2y'),
+        _fred('T10Y2Y', 'US 10y minus 2y Treasury spread', 'percentage points', 'daily', 'us_curve'),
+        _fred('VIXCLS', 'CBOE VIX volatility index', 'index', 'daily', 'risk'),
+        _fred('BAMLH0A0HYM2', 'US high-yield option-adjusted spread', 'percent', 'daily', 'credit'),
+        _fred('DCOILWTICO', 'WTI crude oil spot price', 'USD per barrel', 'daily', 'oil'),
+        _fred('CPIAUCSL', 'US CPI inflation (year over year)', 'percent YoY', 'monthly', 'us_inflation', 'yoy_percent'),
+        _fred('UNRATE', 'US unemployment rate', 'percent', 'monthly', 'us_labor'),
+    )
 }
 
 
@@ -283,6 +306,53 @@ def _label_fx(value: float | None) -> str:
     return 'usdkrw_normal'
 
 
+def _band(value: float | None, unknown: str, bands: Sequence[tuple[float, str]], otherwise: str) -> str:
+    """First label whose lower bound the value reaches; bands are high to low."""
+
+    if value is None:
+        return unknown
+    for floor, label in bands:
+        if value >= floor:
+            return label
+    return otherwise
+
+
+def _global_labels(series_by_key: dict[str, dict[str, Any]]) -> dict[str, str]:
+    def value(key: str) -> float | None:
+        # Daily market drivers go stale fast: a stale or missing series is
+        # unknown, never a calm reading carried forward.
+        item = series_by_key.get(key) or {}
+        if item.get('status') != 'available':
+            return None
+        return _to_float(item.get('latest_value'))
+
+    risk = _band(value('risk'), 'risk_unknown', ((30.0, 'risk_stress'), (20.0, 'risk_elevated'), (15.0, 'risk_normal')), 'risk_calm')
+    credit = _band(value('credit'), 'credit_unknown', ((6.0, 'credit_stress'), (4.5, 'credit_widening'), (3.5, 'credit_normal')), 'credit_tight')
+    curve_value = value('us_curve')
+    curve = _band(curve_value, 'curve_unknown', ((1.5, 'curve_steep'), (0.5, 'curve_normal'), (0.0, 'curve_flat')), 'curve_inverted')
+    if 'stress' in risk or 'stress' in credit:
+        global_risk = 'global_risk_off'
+    elif risk == 'risk_elevated' or credit == 'credit_widening':
+        global_risk = 'global_risk_caution'
+    elif risk == 'risk_calm' and credit == 'credit_tight':
+        global_risk = 'global_risk_on'
+    elif 'unknown' in risk and 'unknown' in credit:
+        global_risk = 'global_risk_unknown'
+    else:
+        global_risk = 'global_risk_neutral'
+    return {
+        'us_policy_label': _band(value('us_policy_rate'), 'us_policy_unknown', ((4.0, 'us_policy_restrictive'), (2.0, 'us_policy_neutral')), 'us_policy_accommodative'),
+        'us_10y_label': _band(value('us_10y'), 'us_10y_unknown', ((4.5, 'us_10y_high'), (3.0, 'us_10y_normal')), 'us_10y_low'),
+        'us_curve_label': curve,
+        'risk_label': risk,
+        'credit_label': credit,
+        'oil_label': _band(value('oil'), 'oil_unknown', ((90.0, 'oil_high'), (60.0, 'oil_normal')), 'oil_low'),
+        'us_inflation_label': _band(value('us_inflation'), 'us_inflation_unknown', ((3.5, 'us_inflation_hot'), (2.5, 'us_inflation_above_target'), (1.5, 'us_inflation_on_target')), 'us_inflation_soft'),
+        'us_labor_label': _band(value('us_labor'), 'us_labor_unknown', ((5.0, 'us_labor_weak'), (4.0, 'us_labor_balanced')), 'us_labor_tight'),
+        'global_risk_label': global_risk,
+    }
+
+
 def _composite_label(*, growth_label: str, inflation_label: str, labor_label: str) -> str:
     if growth_label == 'growth_slowdown' and inflation_label == 'inflation_pressure':
         return 'macro_stagflation_watch'
@@ -312,6 +382,7 @@ def _build_regime_summary(series_by_key: dict[str, dict[str, Any]], *, context_s
         'inflation_label': inflation_label,
         'labor_label': labor_label,
         'fx_label': _label_fx(fx),
+        **_global_labels(series_by_key),
         'composite_label': _composite_label(
             growth_label=growth_label,
             inflation_label=inflation_label,
@@ -721,13 +792,11 @@ class MacroContextService:
                 }
             )
             try:
-                payload = await self.fred_client.fetch_latest_observations(series_id=config.series_id, limit=5)
-                row = self._select_first_numeric_fred_row(payload.get('observations') or [])
-                if row is None:
-                    raise FREDAPIError('FRED returned no numeric observations')
-                value = _to_float(row.get('value'))
-                if value is None:
-                    raise FREDAPIError('FRED returned an empty latest value')
+                payload = await self.fred_client.fetch_latest_observations(
+                    series_id=config.series_id,
+                    limit=15 if config.transform == 'yoy_percent' else 5,
+                )
+                row, value = self._fred_latest_value(config, payload.get('observations') or [])
                 period = str(row.get('date') or '').strip()
                 if not period:
                     raise FREDAPIError('FRED returned an empty observation date')
@@ -870,6 +939,37 @@ class MacroContextService:
             if isinstance(row, dict) and _to_float(row.get('value')) is not None:
                 return row
         return None
+
+    @classmethod
+    def _fred_latest_value(
+        cls,
+        config: MacroSeriesConfig,
+        rows: Sequence[dict[str, Any]],
+    ) -> tuple[dict[str, Any], float]:
+        row = cls._select_first_numeric_fred_row(rows)
+        if row is None:
+            raise FREDAPIError('FRED returned no numeric observations')
+        value = _to_float(row.get('value'))
+        if value is None:
+            raise FREDAPIError('FRED returned an empty latest value')
+        if config.transform != 'yoy_percent':
+            return row, value
+        try:
+            latest = date.fromisoformat(str(row.get('date') or '')[:10])
+        except ValueError as exc:
+            raise FREDAPIError('FRED returned an invalid observation date') from exc
+        base_date = latest.replace(year=latest.year - 1).isoformat()
+        base = next(
+            (
+                _to_float(item.get('value'))
+                for item in rows
+                if isinstance(item, dict) and str(item.get('date') or '')[:10] == base_date
+            ),
+            None,
+        )
+        if not base:
+            raise FREDAPIError(f'FRED returned no base observation for {base_date} to compute YoY')
+        return {**row, 'level': row.get('value'), 'base_date': base_date, 'base_level': base}, round((value / base - 1.0) * 100.0, 3)
 
     @staticmethod
     def _select_first_numeric_fred_row(rows: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
