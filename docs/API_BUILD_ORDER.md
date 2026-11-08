@@ -53,6 +53,9 @@
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930,000660&market_code=J&max_ranking_pages=2&max_news_items=5&include_news=true`
 - `GET /broker/kis/intraday-snapshots?symbols=005930,000660&limit=100`
 - `GET /external/news/health`
+- `GET /external/news/market/topics`
+- `POST /external/news/market/collect?topics=line_hbm&pages=1`
+- `GET /external/news/market?topics=line_hbm&as_of=...&limit=50`
 - `POST /external/news/collect?symbols=005930,000660&display=5`
 - `GET /external/news?symbols=005930,000660&limit=100`
 - `POST /trading/orders/buy`

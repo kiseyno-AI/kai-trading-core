@@ -22,6 +22,7 @@ from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_serv
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
+from app.market_news.service import market_news_service
 from app.signals.overtime_ranking_capture import capture_overtime_rankings_if_due
 
 logger = logging.getLogger(__name__)
@@ -454,6 +455,19 @@ class EODBackgroundRunner:
                 exc,
             )
 
+    def _start_market_news_collect_if_due(self) -> None:
+        # Context only: started in the background so a ~20 s collection never
+        # delays a tick's trading steps; one collection in flight at a time.
+        name = 'market_news_collect_if_due'
+        if not settings.market_news_enabled:
+            return
+        running = self._async_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(market_news_service.collect_if_due(), name=f'eod-background-async:{name}')
+        self._async_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
+
     def _start_overtime_ranking_capture_if_due(self, market: object) -> None:
         # Read-only after-hours ranking snapshot (17:45-18:30 KST), started in
         # the background so a slow or failing KIS call never delays or fails
@@ -484,6 +498,7 @@ class EODBackgroundRunner:
                 market = await async_get_market_state()
                 await self._run_pending_session_cleanup()
                 self._start_overtime_ranking_capture_if_due(market)
+                self._start_market_news_collect_if_due()
                 pipeline_active = auto_pykrx_eod_scheduler.state.active_task
                 if pipeline_active and market.state not in {'PREOPEN', 'OPEN'}:
                     await asyncio.sleep(self.interval_seconds)

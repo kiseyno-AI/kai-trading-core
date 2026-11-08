@@ -304,6 +304,13 @@ jq '.active_run.current_stage' apps/api/var/pipeline-live/current.json
 - `stale_suspected: true` means a running run has had no update or heartbeat for 15 minutes (for example a killed process). Check the process before acting; a killed operator run leaves `daily_pipeline_runs`/`eod_collection_runs` rows in `running`, which deduplicates (skips) the next run for that date until they are terminalized.
 - Override paths with `DAILY_PIPELINE_LIVE_DIR` / `DAILY_PIPELINE_LIVE_LOG`. Tests point both at a temp dir (`apps/api/conftest.py`).
 
+## Market and business-line news topics
+- `app/market_news/catalog.py` holds 46 NAVER News Search queries (Korean market, US, global, Korean business lines). Each topic lists the business-line keys it speaks to.
+- The background runner collects them every `MARKET_NEWS_COLLECT_INTERVAL_MINUTES` (default 60) regardless of the trading pipeline; about 46 requests per run against NAVER's 25,000/day quota. Missing NAVER credentials skip collection.
+- Rows live in `market_news_items`, unique per topic and URL. `first_seen_at` is the point-in-time cutoff; reads (`GET /external/news/market`) never call NAVER.
+- Backfill older articles once with `POST /external/news/market/collect?pages=10` (≈460 requests; NAVER returns at most the newest 1,000 per query).
+- Context only: no trading gate reads these rows.
+
 ## pykrx EOD backfill
 
 From `apps/api` on this machine:
