@@ -188,6 +188,13 @@ def legacy_cfs_recovery_candidate_manifest_sha256(
     ).hexdigest()
 
 
+def _weekday_index(day: date) -> int:
+    """Monday-Friday count since 0001-01-01 (a Monday); weekends do not advance it."""
+
+    weeks, weekday = divmod(day.toordinal() - 1, 7)
+    return weeks * 5 + min(weekday, 5)
+
+
 def _bounded_missing_probe_codes(
     candidates: list[str],
     *,
@@ -197,9 +204,34 @@ def _bounded_missing_probe_codes(
     if not candidates or probe_limit <= 0:
         return []
     resolved_limit = min(int(probe_limit), len(candidates))
-    rotation_start = (market_date.toordinal() * resolved_limit) % len(candidates)
+    # Rotate by weekday count, not calendar days: the job runs on weekdays,
+    # and a calendar step skips two windows every weekend, which can leave
+    # some candidates unvisited forever (e.g. 7 windows, weekday runs only).
+    rotation_start = (_weekday_index(market_date) * resolved_limit) % len(candidates)
     rotated = candidates[rotation_start:] + candidates[:rotation_start]
     return rotated[:resolved_limit]
+
+
+def _daily_stale_drain_candidate(
+    state: dict[str, Any] | None,
+    *,
+    min_start_date: date,
+) -> bool:
+    """True when the daily check window for this symbol starts before the lookback floor.
+
+    Such symbols used to be skipped every day (``stale_incremental_backfill_deferred``) and
+    only a manual backfill could recover them, so any gap longer than the lookback window
+    stayed open forever. They are now drained a bounded number per day.
+    """
+
+    if not state:
+        return False
+    latest_resolved = _parse_optional_iso_date(
+        state.get('latest_resolved_fundamentals_receipt_date')
+    ) or _parse_optional_iso_date(state.get('latest_fundamentals_receipt_date'))
+    if latest_resolved is None:
+        return False
+    return _date_after(latest_resolved) < min_start_date
 
 
 def _bounded_baseline_repair_codes(
@@ -3245,6 +3277,25 @@ class DartFundamentalsCaptureService:
             if not initial_backfill_enabled
             else []
         )
+        stale_drain_limit = max(
+            0,
+            int(getattr(settings, 'dart_fundamentals_daily_stale_drain_limit', 100) or 0),
+        )
+        stale_drain_candidates = sorted(
+            stock_code
+            for stock_code in selected_stock_codes
+            if _daily_stale_drain_candidate(
+                states.get(stock_code),
+                min_start_date=daily_incremental_min_start_date,
+            )
+        )
+        bounded_stale_drain_codes = set(
+            _bounded_missing_probe_codes(
+                stale_drain_candidates,
+                probe_limit=stale_drain_limit,
+                market_date=resolved_market_date,
+            )
+        )
         run_metadata: dict[str, Any] = {
             'scope': 'daily_incremental_fundamentals_refresh',
             'market_date': resolved_market_date.isoformat(),
@@ -3259,6 +3310,10 @@ class DartFundamentalsCaptureService:
             'bounded_missing_symbol_probe_limit': missing_probe_limit,
             'bounded_missing_symbol_probe_count': len(bounded_missing_probe_codes),
             'bounded_missing_symbol_probe_sample': _limited_sample(sorted(bounded_missing_probe_codes)),
+            'bounded_stale_drain_limit': stale_drain_limit,
+            'bounded_stale_drain_candidate_count': len(stale_drain_candidates),
+            'bounded_stale_drain_count': len(bounded_stale_drain_codes),
+            'bounded_stale_drain_sample': _limited_sample(sorted(bounded_stale_drain_codes)),
             'retry_cycles_requested': resolved_retry_cycles,
             'scope_outcome_manifest_version': (
                 'dart_fundamentals_scope_outcomes_v1'
@@ -3464,7 +3519,10 @@ class DartFundamentalsCaptureService:
                     symbol_result['state'] = 'missing_recent_probe_deferred'
                     symbol_result['deferred_until_bounded_probe'] = True
                     continue
-                if check_start_date < daily_incremental_min_start_date:
+                if (
+                    check_start_date < daily_incremental_min_start_date
+                    and stock_code not in bounded_stale_drain_codes
+                ):
                     symbol_result['state'] = 'stale_incremental_backfill_deferred'
                     symbol_result['deferred_until_backfill'] = True
                     symbol_result['daily_incremental_min_start_date'] = daily_incremental_min_start_date.isoformat()

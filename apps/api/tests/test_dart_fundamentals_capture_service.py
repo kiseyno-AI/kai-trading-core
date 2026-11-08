@@ -1,6 +1,6 @@
 import unittest
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -2700,15 +2700,116 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(deferred), 2)
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['successful_stock_codes'], ['222222'])
+        # Weekday-based rotation: 2026-04-14 picks the third symbol.
+        self.assertEqual(result['successful_stock_codes'], ['333333'])
         self.assertEqual(
             result['retry_debt_stock_codes'],
-            ['111111', '333333'],
+            ['111111', '222222'],
         )
         self.assertIn('scope_retry_debt', result['partial_reasons'])
         self.mock_piotroski_filter.assert_called_once_with(
             market_date=date(2026, 4, 14),
-            symbols=['222222'],
+            symbols=['333333'],
+        )
+
+    async def test_daily_incremental_refresh_drains_a_bounded_number_of_stale_symbols(self):
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            stock_code: {
+                'stock_code': stock_code,
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2025-01-01',
+                'latest_resolved_fundamentals_receipt_date': '2025-01-01',
+                'latest_snapshot': {'id': index},
+                'latest_terminal_fundamentals_event': None,
+            }
+            for index, stock_code in enumerate(('000660', '005930'), start=1)
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}, {'symbol': '000660'}],
+        )
+
+        with patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            45,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_stale_drain_limit',
+            1,
+        ), patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 41,
+                'status': 'completed',
+                'events_seen': 0,
+                'corporations_failed': 0,
+                'failed_stock_codes': [],
+                'unattempted_stock_codes': [],
+                'corporation_errors': [],
+            },
+        ) as sync_disclosures:
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        # Exactly one stale symbol is checked, from its real gap start (not the lookback floor).
+        sync_disclosures.assert_called_once()
+        call = sync_disclosures.call_args.kwargs
+        self.assertEqual(len(call['corporations']), 1)
+        self.assertEqual(call['start_date'], date(2025, 1, 2))
+        drained_code = call['corporations'][0]['stock_code']
+        deferred_code = ({'000660', '005930'} - {drained_code}).pop()
+        symbol_states = result['state_histogram']
+        self.assertEqual(symbol_states.get('stale_incremental_backfill_deferred'), 1)
+        self.assertEqual(
+            result['maintenance_deferred_stock_codes'],
+            [deferred_code],
+        )
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['bounded_stale_drain_limit'], 1)
+        self.assertEqual(metadata['bounded_stale_drain_candidate_count'], 2)
+        self.assertEqual(metadata['bounded_stale_drain_sample'], [drained_code])
+
+    def test_stale_drain_rotates_so_no_symbol_is_starved(self):
+        from app.dart.fundamentals_capture_service import _bounded_missing_probe_codes
+
+        candidates = [f'{index:06d}' for index in range(1, 11)]
+        seen: set[str] = set()
+        for offset in range(10):
+            seen |= set(
+                _bounded_missing_probe_codes(
+                    candidates,
+                    probe_limit=3,
+                    market_date=date(2026, 4, 1) + timedelta(days=offset),
+                )
+            )
+        self.assertEqual(seen, set(candidates))
+
+    def test_stale_drain_candidate_requires_a_gap_beyond_the_lookback_floor(self):
+        from app.dart.fundamentals_capture_service import _daily_stale_drain_candidate
+
+        floor = date(2026, 3, 1)
+        self.assertFalse(_daily_stale_drain_candidate(None, min_start_date=floor))
+        self.assertFalse(
+            _daily_stale_drain_candidate(
+                {'latest_resolved_fundamentals_receipt_date': None}, min_start_date=floor
+            )
+        )
+        self.assertFalse(
+            _daily_stale_drain_candidate(
+                {'latest_resolved_fundamentals_receipt_date': '2026-03-05'}, min_start_date=floor
+            )
+        )
+        self.assertTrue(
+            _daily_stale_drain_candidate(
+                {'latest_resolved_fundamentals_receipt_date': '2026-01-05'}, min_start_date=floor
+            )
         )
 
     async def test_daily_incremental_refresh_admits_persisted_stale_symbols_without_provider_refresh(self):
@@ -2739,6 +2840,9 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
             45,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_stale_drain_limit',
+            0,
         ):
             result = await service.run_daily_incremental_refresh(
                 market_date=date(2026, 4, 14),
@@ -4638,3 +4742,22 @@ class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repository.recheck_call, {'stock_codes': ['111111'], 'limit': 10})
         metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
         self.assertGreaterEqual(int(metadata.get('events_detected') or repository.completed_refresh_runs[-1][1].get('events_detected') or 0), 1)
+
+
+def test_bounded_rotation_visits_every_candidate_on_weekday_runs():
+    # Review case: with a calendar-day rotation and weekday-only runs, seven
+    # windows meant two of them were never reached.
+    from datetime import date, timedelta
+
+    from app.dart.fundamentals_capture_service import _bounded_missing_probe_codes
+
+    candidates = [f'{i:06d}' for i in range(70)]
+    seen = set()
+    day = date(2026, 11, 2)  # Monday
+    runs = 0
+    while runs < 7:
+        if day.weekday() < 5:
+            seen.update(_bounded_missing_probe_codes(candidates, probe_limit=10, market_date=day))
+            runs += 1
+        day += timedelta(days=1)
+    assert seen == set(candidates)
