@@ -564,7 +564,7 @@ A review of 2026-09-28..11-06 found that small, partial failures stopped the who
 - **A finished partial agent stage feeds the next one.** When the summary (or decider) run has finished all its attempts with some symbols completed, the daily follow-up chain starts the decider (or the next-open plan) instead of blocking it; the next stage fails only the symbols without their own upstream rows. Before: 2026-10-19 had 317 of 324 summaries and zero decisions.
 - **Per-symbol investor flows need 95% coverage, not 99%.** KRX does not publish them for a stable ~4% of the universe, so the old floor blocked every downstream stage on ordinary days (2026-10-02, 10-12, 10-20).
 
-Not changed: the stage executor used by resume runs keeps its stricter summary-cutoff proof, and an OpenClaw gateway outage still fails every dispatch.
+Not changed: the stage executor used by resume runs keeps its stricter summary-cutoff proof, and an OpenClaw gateway outage still fails every dispatch. Both rules for the summaries -> deciders edge (first run: finished partial; resume: exact lineage proof) live side by side in `app/eod/agent_chain_gates.py`.
 
 ## Known ways a daily table ends up partially populated
 
