@@ -30,10 +30,15 @@ CALENDAR_SOURCE_STATUS_MISSING_DATE = 'missing_date'
 
 KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
 DEFAULT_KRX_CALENDAR_CACHE_TTL = timedelta(hours=6)
+DEFAULT_KRX_CALENDAR_FALLBACK_CACHE_TTL = timedelta(seconds=60)
 DEFAULT_KRX_CALENDAR_SCAN_DAYS = 370
 
 
 class KrxCalendarUnavailableError(RuntimeError):
+    pass
+
+
+class KrxCalendarAsyncLookupRequiredError(RuntimeError):
     pass
 
 
@@ -117,74 +122,138 @@ class KisKrxTradingCalendarProvider:
         *,
         client: KISCalendarClientProtocol | None = None,
         cache: InMemoryKrxCalendarCache | None = None,
+        fallback_cache: InMemoryKrxCalendarCache | None = None,
         max_pages: int = 1,
         max_scan_days: int = DEFAULT_KRX_CALENDAR_SCAN_DAYS,
     ) -> None:
         self._client = client
         self.cache = cache or InMemoryKrxCalendarCache()
+        # Keep non-authoritative rows isolated so strict callers can only fail closed.
+        self._fallback_cache = (
+            fallback_cache
+            if fallback_cache is not None
+            else InMemoryKrxCalendarCache(
+                ttl=DEFAULT_KRX_CALENDAR_FALLBACK_CACHE_TTL
+            )
+        )
         self.max_pages = max_pages
         self.max_scan_days = max_scan_days
 
     def lookup_day(self, value: date, *, allow_fallback: bool = True) -> KrxCalendarDay:
-        cached = self.cache.load_day(value)
+        cached = self._load_cached_day(value, allow_fallback=allow_fallback)
         if cached is not None:
             return cached
 
         try:
             self._fetch_and_cache(value)
         except Exception as exc:
-            if allow_fallback:
-                return self._exchange_calendar_fallback(
+            fallback = (
+                self._exchange_calendar_fallback(
                     value,
                     status=CALENDAR_SOURCE_STATUS_FALLBACK,
                     error=str(exc),
                 )
+                if isinstance(exc, KrxCalendarAsyncLookupRequiredError)
+                else self._cache_fallback(
+                    value,
+                    status=CALENDAR_SOURCE_STATUS_FALLBACK,
+                    error=str(exc),
+                )
+            )
+            if allow_fallback:
+                return fallback
             raise KrxCalendarUnavailableError(f'KIS KRX calendar unavailable for {value.isoformat()}: {exc}') from exc
 
-        cached = self.cache.load_day(value)
+        cached = self._load_cached_day(value, allow_fallback=allow_fallback)
         if cached is not None:
             return cached
 
         message = f'KIS chk-holiday response did not include {value.isoformat()}'
+        fallback = self._cache_fallback(
+            value,
+            status=CALENDAR_SOURCE_STATUS_MISSING_DATE,
+            error=message,
+        )
         if allow_fallback:
-            return self._exchange_calendar_fallback(
-                value,
-                status=CALENDAR_SOURCE_STATUS_MISSING_DATE,
-                error=message,
-            )
+            return fallback
         raise KrxCalendarUnavailableError(message)
 
     async def lookup_day_async(self, value: date, *, allow_fallback: bool = True) -> KrxCalendarDay:
-        cached = self.cache.load_day(value)
+        cached = self._load_cached_day(value, allow_fallback=allow_fallback)
         if cached is not None:
             return cached
 
         try:
             await self._fetch_and_cache_async(value)
         except Exception as exc:
+            fallback = self._cache_fallback(
+                value,
+                status=CALENDAR_SOURCE_STATUS_FALLBACK,
+                error=str(exc),
+            )
             if allow_fallback:
-                return self._exchange_calendar_fallback(
-                    value,
-                    status=CALENDAR_SOURCE_STATUS_FALLBACK,
-                    error=str(exc),
-                )
+                return fallback
             raise KrxCalendarUnavailableError(f'KIS KRX calendar unavailable for {value.isoformat()}: {exc}') from exc
 
-        cached = self.cache.load_day(value)
+        cached = self._load_cached_day(value, allow_fallback=allow_fallback)
         if cached is not None:
             return cached
 
         message = f'KIS chk-holiday response did not include {value.isoformat()}'
+        fallback = self._cache_fallback(
+            value,
+            status=CALENDAR_SOURCE_STATUS_MISSING_DATE,
+            error=message,
+        )
         if allow_fallback:
-            return self._exchange_calendar_fallback(
-                value,
-                status=CALENDAR_SOURCE_STATUS_MISSING_DATE,
-                error=message,
-            )
+            return fallback
         raise KrxCalendarUnavailableError(message)
 
     def clear_cache(self) -> None:
         self.cache.clear()
+        self._fallback_cache.clear()
+
+    def _load_cached_day(
+        self,
+        value: date,
+        *,
+        allow_fallback: bool,
+    ) -> KrxCalendarDay | None:
+        cached = self.cache.load_day(value)
+        if cached is not None:
+            if (
+                cached.calendar_source == CALENDAR_SOURCE_KIS_CHK_HOLIDAY
+                and cached.calendar_source_status == CALENDAR_SOURCE_STATUS_OK
+            ):
+                return cached
+            # A replaceable cache implementation may contain legacy or
+            # otherwise non-authoritative rows.  Ignore them here so they
+            # cannot inherit the authoritative cache TTL; provider-owned
+            # fallbacks live in the short retry cache below.
+        fallback = self._fallback_cache.load_day(value)
+        if fallback is None:
+            return None
+        if allow_fallback:
+            return fallback
+        detail = fallback.calendar_source_error or fallback.calendar_source_status
+        raise KrxCalendarUnavailableError(
+            f'KIS KRX calendar unavailable for {value.isoformat()}: {detail}'
+        )
+
+    def _cache_fallback(
+        self,
+        value: date,
+        *,
+        status: str,
+        error: str,
+    ) -> KrxCalendarDay:
+        fallback = self._exchange_calendar_fallback(
+            value,
+            status=status,
+            error=error,
+        )
+        self._fallback_cache.store_days([fallback])
+        return fallback
 
     def _client_for_request(self) -> KISCalendarClientProtocol:
         if self._client is None:
@@ -234,7 +303,9 @@ def _run_maybe_async(value: Any) -> Any:
     if running_loop.is_running():
         if inspect.iscoroutine(value):
             value.close()
-        raise RuntimeError('KIS KRX calendar lookup must be awaited from async callers')
+        raise KrxCalendarAsyncLookupRequiredError(
+            'KIS KRX calendar lookup must be awaited from async callers'
+        )
     return asyncio.run(value)
 
 

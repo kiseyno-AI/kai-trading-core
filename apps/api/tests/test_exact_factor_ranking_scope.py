@@ -157,12 +157,20 @@ def test_composite_loads_only_exact_factor_rows_for_ranking() -> None:
         'beta': {},
     }
     with (
+        patch(
+            'app.signals.composite_factor.list_symbols_with_daily_bar_on_date',
+            return_value=EXACT_SYMBOLS,
+        ),
         patch.object(
             service,
             '_load_factor_rows',
             return_value=factor_rows,
         ) as load_factor_rows,
         patch('app.signals.composite_factor.load_symbols', return_value=[]),
+        patch(
+            'app.signals.composite_factor.upsert_daily_composite_factor_results',
+            return_value=1,
+        ),
     ):
         service.rebuild_for_market_date(
             market_date='2026-09-23',

@@ -899,6 +899,9 @@ class AgentContextProgressServiceTests(unittest.TestCase):
                     'reused_feedback_count': 0,
                     'stale_feedback_count': 0,
                     'failed_items': 1,
+                    'failed_symbols_by_role': {
+                        'technical-summarizer': ['005930'],
+                    },
                     'role_progress': {
                         'technical-summarizer': {
                             'status': role_status,
@@ -939,6 +942,10 @@ class AgentContextProgressServiceTests(unittest.TestCase):
 
                 self.assertEqual(merged['completed_feedback_count'], 1)
                 self.assertEqual(merged['failed_items'], 1)
+                self.assertEqual(
+                    merged['failed_symbols_by_role'],
+                    {'technical-summarizer': ['005930']},
+                )
                 self.assertEqual(merged['stale_feedback_count'], 0)
                 self.assertEqual(
                     merged['role_progress']['technical-summarizer']['total_symbols'],

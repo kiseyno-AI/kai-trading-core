@@ -92,6 +92,9 @@ EXPECTED_ROLES: tuple[str, ...] = DEFAULT_AGENT_NAMES
 CHILD_RUN_LINEAGE_SCHEMA_VERSION = 'agent_feedback_child_run_lineage_v1'
 REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION = 'agent_feedback_reuse_evidence_v1'
 _LEASE_LOSS_REUSABLE_PARENT_STATUS = 'abandoned_lease_loss_reusable'
+_POINT_IN_TIME_MODE_MISMATCH_CHILD_STATUS = (
+    'point_in_time_recovery_mode_mismatch'
+)
 WEEKLY_POLICY_REBIND_SCHEMA_VERSION = 'weekly_policy_rebind_v1'
 WEEKLY_POLICY_REBIND_RETRY_LINEAGE_SCHEMA_VERSION = (
     'weekly_policy_rebind_retry_lineage_v1'
@@ -124,9 +127,355 @@ def _ordered_symbol_union(symbol_scopes: Sequence[Sequence[str]]) -> list[str]:
     return ordered
 
 
+def _resolve_terminal_role_success_scopes(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    expected_role_symbol_scopes: Mapping[
+        str,
+        Sequence[str],
+    ] | None = None,
+) -> dict[str, Any]:
+    """Validate exact terminal success/failure partitions for every role.
+
+    A terminal partial run may contain useful results, but aggregate coverage
+    is not enough to authorize downstream work.  This validator reconciles
+    each role's admitted scope, exact failed-symbol partition, and terminal
+    counts without choosing intersection or independent-lane semantics.
+    Any missing or contradictory evidence fails closed.
+    """
+
+    normalized_roles = tuple(
+        str(role or '').strip().lower() for role in roles
+    )
+    base_result: dict[str, Any] = {
+        'ready': False,
+        'reason': 'terminal_role_scope_unproven',
+        'completed_symbols': [],
+        'admitted_symbols': [],
+    }
+    if (
+        not normalized_roles
+        or len(set(normalized_roles)) != len(normalized_roles)
+        or not isinstance(progress_summary, Mapping)
+    ):
+        return base_result
+
+    run_status = str(
+        progress_summary.get('run_status') or ''
+    ).strip().lower()
+    run_table_status = str(
+        progress_summary.get('run_table_status') or ''
+    ).strip().lower()
+    try:
+        run_completed_at = _normalize_admission_knowledge_cutoff(
+            progress_summary.get('run_completed_at')
+        )
+    except (TypeError, ValueError):
+        run_completed_at = None
+    if (
+        run_status not in {'completed', 'partial'}
+        or run_table_status != run_status
+        or progress_summary.get('is_live') is not False
+        or run_completed_at is None
+    ):
+        return {**base_result, 'reason': 'terminal_role_scope_not_finalized'}
+
+    role_scopes = progress_summary.get('role_symbol_scopes')
+    role_counts = progress_summary.get('role_symbol_counts')
+    role_progress = progress_summary.get('role_progress')
+    failed_by_role = progress_summary.get('failed_symbols_by_role')
+    if not (
+        isinstance(role_scopes, Mapping)
+        and set(role_scopes) == set(normalized_roles)
+        and isinstance(role_counts, Mapping)
+        and set(role_counts) == set(normalized_roles)
+        and isinstance(role_progress, Mapping)
+        and set(role_progress) == set(normalized_roles)
+        and isinstance(failed_by_role, Mapping)
+        and set(failed_by_role).issubset(normalized_roles)
+    ):
+        return base_result
+
+    def strict_nonnegative_int(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    normalized_expected_role_scopes: dict[str, list[str]] | None = None
+    if expected_role_symbol_scopes is not None:
+        if not (
+            isinstance(expected_role_symbol_scopes, Mapping)
+            and set(expected_role_symbol_scopes) == set(normalized_roles)
+        ):
+            return base_result
+        normalized_expected_role_scopes = {}
+        for role in normalized_roles:
+            raw_expected_scope = expected_role_symbol_scopes.get(role)
+            if isinstance(raw_expected_scope, (str, bytes)) or not isinstance(
+                raw_expected_scope,
+                Sequence,
+            ):
+                return base_result
+            expected_scope = _normalize_optional_symbol_scope(
+                raw_expected_scope
+            )
+            if (
+                not expected_scope
+                or len(expected_scope) != len(raw_expected_scope)
+            ):
+                return base_result
+            normalized_expected_role_scopes[role] = expected_scope
+
+    completed_symbols_by_role: dict[str, list[str]] = {}
+    admitted_scopes: list[list[str]] = []
+    total_items = 0
+    completed_items = 0
+    failed_items = 0
+    normalized_failed_by_role: dict[str, list[str]] = {}
+
+    for role in normalized_roles:
+        raw_scope = role_scopes.get(role)
+        raw_failed = failed_by_role.get(role, [])
+        role_state = role_progress.get(role)
+        if not (
+            isinstance(raw_scope, list)
+            and isinstance(raw_failed, list)
+            and isinstance(role_state, Mapping)
+        ):
+            return base_result
+        scope = _normalize_optional_symbol_scope(raw_scope)
+        failed_symbols = _normalize_optional_symbol_scope(raw_failed)
+        if (
+            raw_scope != scope
+            or raw_failed != failed_symbols
+            or not scope
+            or not set(failed_symbols).issubset(scope)
+            or (
+                normalized_expected_role_scopes is not None
+                and set(scope)
+                != set(normalized_expected_role_scopes[role])
+            )
+        ):
+            return base_result
+
+        total = strict_nonnegative_int(role_state.get('total_symbols'))
+        processed = strict_nonnegative_int(
+            role_state.get('processed_symbols')
+        )
+        completed = strict_nonnegative_int(
+            role_state.get('completed_symbols')
+        )
+        terminal = strict_nonnegative_int(
+            role_state.get('terminal_symbols')
+        )
+        failed = strict_nonnegative_int(role_state.get('failed_items'))
+        in_progress = strict_nonnegative_int(
+            role_state.get('in_progress_symbols')
+        )
+        pending = strict_nonnegative_int(
+            role_state.get('pending_symbols')
+        )
+        retry_pending = strict_nonnegative_int(
+            role_state.get('retry_pending_symbols')
+        )
+        persisted_role_count = strict_nonnegative_int(
+            role_counts.get(role)
+        )
+        if any(
+            value is None
+            for value in (
+                total,
+                processed,
+                completed,
+                terminal,
+                failed,
+                in_progress,
+                pending,
+                retry_pending,
+                persisted_role_count,
+            )
+        ):
+            return base_result
+        expected_role_status = (
+            'completed'
+            if failed == 0
+            else 'completed_with_failures'
+            if completed > 0
+            else 'failed'
+        )
+        if not (
+            str(role_state.get('role') or '').strip().lower() == role
+            and str(role_state.get('status') or '').strip().lower()
+            == expected_role_status
+            and str(
+                role_state.get('boundary_status') or ''
+            ).strip().lower()
+            == expected_role_status
+            and total == len(scope)
+            and persisted_role_count == total
+            and processed == total
+            and terminal == total
+            and completed + failed == total
+            and failed == len(failed_symbols)
+            and in_progress == 0
+            and pending == 0
+            and retry_pending <= failed
+        ):
+            return base_result
+
+        admitted_scopes.append(scope)
+        completed_symbols_by_role[role] = sorted(
+            set(scope) - set(failed_symbols)
+        )
+        normalized_failed_by_role[role] = failed_symbols
+        total_items += total
+        completed_items += completed
+        failed_items += failed
+
+    expected_total = strict_nonnegative_int(
+        progress_summary.get('expected_feedback_count')
+    )
+    reported_completed = strict_nonnegative_int(
+        progress_summary.get('completed_feedback_count')
+    )
+    reported_failed = strict_nonnegative_int(
+        progress_summary.get('failed_items')
+    )
+    if not (
+        expected_total == total_items
+        and reported_completed == completed_items
+        and reported_failed == failed_items
+        and completed_items + failed_items == total_items
+    ):
+        return base_result
+
+    expected_run_status = (
+        'completed'
+        if failed_items == 0
+        else 'partial'
+        if completed_items > 0
+        else 'failed'
+    )
+    if run_status != expected_run_status:
+        return base_result
+
+    admitted_symbols = sorted(set().union(*map(set, admitted_scopes)))
+    return {
+        'ready': True,
+        'reason': 'terminal_role_success_scopes',
+        'completed_symbols_by_role': completed_symbols_by_role,
+        'admitted_symbols': admitted_symbols,
+        'failed_symbols_by_role': normalized_failed_by_role,
+        'total_items': total_items,
+        'completed_items': completed_items,
+        'failed_items': failed_items,
+    }
+
+
+def resolve_terminal_role_success_intersection(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    expected_role_symbol_scopes: Mapping[
+        str,
+        Sequence[str],
+    ] | None = None,
+) -> dict[str, Any]:
+    """Prove the exact symbols completed by every required role."""
+
+    resolution = _resolve_terminal_role_success_scopes(
+        progress_summary=progress_summary,
+        roles=roles,
+        expected_role_symbol_scopes=expected_role_symbol_scopes,
+    )
+    if resolution.get('ready') is not True:
+        return resolution
+    completed_by_role = resolution.get('completed_symbols_by_role')
+    if not isinstance(completed_by_role, Mapping) or not completed_by_role:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_unproven',
+            'completed_symbols': [],
+            'admitted_symbols': [],
+        }
+    completed_intersection = sorted(
+        set.intersection(
+            *(set(symbols) for symbols in completed_by_role.values())
+        )
+    )
+    if not completed_intersection:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_zero_work',
+            'completed_symbols': [],
+            'admitted_symbols': [],
+        }
+    return {
+        key: value
+        for key, value in {
+            **resolution,
+            'reason': 'terminal_role_success_intersection',
+            'completed_symbols': completed_intersection,
+        }.items()
+        if key != 'completed_symbols_by_role'
+    }
+
+
+def resolve_terminal_independent_role_success(
+    *,
+    progress_summary: Mapping[str, Any],
+    roles: Sequence[str],
+    expected_role_symbol_scopes: Mapping[
+        str,
+        Sequence[str],
+    ] | None = None,
+) -> dict[str, Any]:
+    """Prove exact terminal successes while keeping role lanes independent."""
+
+    resolution = _resolve_terminal_role_success_scopes(
+        progress_summary=progress_summary,
+        roles=roles,
+        expected_role_symbol_scopes=expected_role_symbol_scopes,
+    )
+    if resolution.get('ready') is not True:
+        return resolution
+    completed_by_role = resolution.get('completed_symbols_by_role')
+    if not isinstance(completed_by_role, Mapping) or not completed_by_role:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_unproven',
+            'completed_symbols': [],
+            'completed_symbols_by_role': {},
+            'admitted_symbols': [],
+        }
+    completed_union = sorted(
+        {
+            symbol
+            for symbols in completed_by_role.values()
+            for symbol in symbols
+        }
+    )
+    if not completed_union:
+        return {
+            'ready': False,
+            'reason': 'terminal_role_scope_zero_work',
+            'completed_symbols': [],
+            'completed_symbols_by_role': dict(completed_by_role),
+            'admitted_symbols': list(
+                resolution.get('admitted_symbols') or []
+            ),
+        }
+    return {
+        **resolution,
+        'reason': 'terminal_independent_role_success',
+        'completed_symbols': completed_union,
+    }
+
+
 def _exact_completed_summary_scope(
     payload: Mapping[str, Any],
-) -> tuple[list[str], int] | None:
+) -> tuple[list[str], int, dict[str, list[str]]] | None:
     """Return symbols completed by every summarizer plus role-item total."""
 
     raw_symbols = payload.get('symbols')
@@ -145,17 +494,20 @@ def _exact_completed_summary_scope(
         return None
 
     role_scopes: list[set[str]] = []
+    canonical_role_scopes: dict[str, list[str]] = {}
     role_item_total = 0
     for role in SUMMARIZER_AGENT_NAMES:
         role_symbols = normalized_role_scopes.get(role)
         if not isinstance(role_symbols, list):
             return None
-        normalized_symbols = set(
+        normalized_symbol_list = sorted(
             _normalize_optional_symbol_scope(role_symbols)
         )
-        if len(normalized_symbols) != len(role_symbols):
+        if len(normalized_symbol_list) != len(role_symbols):
             return None
+        normalized_symbols = set(normalized_symbol_list)
         role_scopes.append(normalized_symbols)
+        canonical_role_scopes[role] = normalized_symbol_list
         role_item_total += len(normalized_symbols)
 
     dispatched_symbols = set(
@@ -184,7 +536,7 @@ def _exact_completed_summary_scope(
                 return None
 
     completed_scope = set.intersection(*role_scopes)
-    return sorted(completed_scope), role_item_total
+    return sorted(completed_scope), role_item_total, canonical_role_scopes
 
 
 def _feedback_retry_admission_lock_key(
@@ -246,6 +598,32 @@ def _previous_run_matches_knowledge_cutoff(
         )
     except (TypeError, ValueError):
         return False
+
+
+def _request_payload_matches_point_in_time_recovery(
+    request_payload: Mapping[str, Any],
+    point_in_time_recovery: bool,
+) -> bool:
+    persisted = request_payload.get('point_in_time_recovery', False)
+    return type(persisted) is bool and persisted is bool(
+        point_in_time_recovery
+    )
+
+
+def _previous_run_matches_point_in_time_recovery(
+    previous_run: dict[str, Any] | None,
+    point_in_time_recovery: bool,
+) -> bool:
+    if not isinstance(previous_run, dict):
+        return False
+    request_payload = previous_run.get('request_payload')
+    return bool(
+        isinstance(request_payload, Mapping)
+        and _request_payload_matches_point_in_time_recovery(
+            request_payload,
+            point_in_time_recovery,
+        )
+    )
 
 
 def _normalize_feedback_fs_div(value: str | None) -> str:
@@ -742,6 +1120,7 @@ def _previous_run_matches_retry_contract(
     feedback_scope_mode: str,
     outer_batch_size: int,
     idempotency_key: str | None,
+    point_in_time_recovery: bool,
 ) -> bool:
     if not isinstance(previous_run, dict):
         return False
@@ -778,6 +1157,10 @@ def _previous_run_matches_retry_contract(
         and prior_role_symbol_scopes == role_symbol_scopes
         and prior_scope_mode == feedback_scope_mode
         and prior_outer_batch_size == outer_batch_size
+        and _request_payload_matches_point_in_time_recovery(
+            request_payload,
+            point_in_time_recovery,
+        )
         and (
             str(request_payload.get('idempotency_key') or '').strip()
             or None
@@ -1109,6 +1492,7 @@ def resolve_latest_completed_summary_knowledge_cutoff(
                 }
 
     exact_summary_item_total: int | None = None
+    completed_role_scopes: list[dict[str, list[str]]] = []
     if normalized_source_run_id is not None:
         completed_scope_evidence = [
             _exact_completed_summary_scope(payload)
@@ -1131,12 +1515,20 @@ def resolve_latest_completed_summary_knowledge_cutoff(
             for evidence in completed_scope_evidence
             if evidence is not None
         ]
+        completed_role_scopes = [
+            evidence[2]
+            for evidence in completed_scope_evidence
+            if evidence is not None
+        ]
         if any(
             scope != completed_scopes[0]
             for scope in completed_scopes[1:]
         ) or any(
             item_total != completed_item_totals[0]
             for item_total in completed_item_totals[1:]
+        ) or any(
+            role_scopes != completed_role_scopes[0]
+            for role_scopes in completed_role_scopes[1:]
         ):
             return {
                 **base_result,
@@ -1169,7 +1561,13 @@ def resolve_latest_completed_summary_knowledge_cutoff(
 
     status = str(latest_run.get('status') or '').strip().lower()
     completed_at = latest_run.get('completed_at')
-    if completed_at is None:
+    try:
+        normalized_completed_at = _normalize_admission_knowledge_cutoff(
+            completed_at
+        )
+    except (TypeError, ValueError):
+        normalized_completed_at = None
+    if normalized_completed_at is None:
         return {**base_result, 'reason': 'summary_run_not_finalized'}
     raw_counts = (
         latest_run.get('symbols_total'),
@@ -1179,18 +1577,73 @@ def resolve_latest_completed_summary_knowledge_cutoff(
     if any(type(value) is not int or value < 0 for value in raw_counts):
         return {**base_result, 'reason': 'summary_run_counts_invalid'}
     symbols_total, completed_count, failed_count = raw_counts
-    if (
-        status != 'completed'
-        or failed_count != 0
-        or completed_count != symbols_total
-    ):
-        return {**base_result, 'reason': 'summary_run_incomplete'}
     if normalized_source_run_id is not None and (
         symbols_total <= 0
         or exact_summary_item_total is None
         or symbols_total != exact_summary_item_total
     ):
         return {**base_result, 'reason': 'summary_run_counts_invalid'}
+    if status == 'completed':
+        if failed_count != 0 or completed_count != symbols_total:
+            return {**base_result, 'reason': 'summary_run_incomplete'}
+    elif status == 'partial' and normalized_source_run_id is not None:
+        progress_summary = summary_payload.get('progress_summary')
+        terminal_scope = resolve_terminal_role_success_intersection(
+            progress_summary=(
+                progress_summary
+                if isinstance(progress_summary, Mapping)
+                else {}
+            ),
+            roles=SUMMARIZER_AGENT_NAMES,
+            expected_role_symbol_scopes=completed_role_scopes[0],
+        )
+        if not (
+            terminal_scope.get('ready') is True
+            and terminal_scope.get('total_items') == symbols_total
+            and terminal_scope.get('completed_items') == completed_count
+            and terminal_scope.get('failed_items') == failed_count
+            and completed_count > 0
+            and failed_count > 0
+            and completed_count + failed_count == symbols_total
+        ):
+            return {**base_result, 'reason': 'summary_run_incomplete'}
+        completed_scope = terminal_scope['completed_symbols']
+        admitted_scope = (
+            represented_symbol_scopes[0]
+            if represented_symbol_scopes
+            else None
+        )
+        if not (
+            isinstance(admitted_scope, list)
+            and admitted_scope
+            and set(completed_scope).issubset(admitted_scope)
+        ):
+            return {
+                **base_result,
+                'reason': 'summary_run_symbol_scope_mismatch',
+            }
+        base_result['requested_symbols'] = list(completed_scope)
+        base_result['completed_scope_proof'] = {
+            'schema_version': (
+                COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
+            ),
+            'completed_symbols': list(completed_scope),
+            'admitted_symbols': list(admitted_scope),
+        }
+        base_result['terminal_role_scope_proof'] = {
+            'schema_version': 'terminal_role_success_intersection_v1',
+            'failed_symbols_by_role': {
+                role: list(symbols)
+                for role, symbols in terminal_scope[
+                    'failed_symbols_by_role'
+                ].items()
+            },
+            'total_items': terminal_scope['total_items'],
+            'completed_items': terminal_scope['completed_items'],
+            'failed_items': terminal_scope['failed_items'],
+        }
+    else:
+        return {**base_result, 'reason': 'summary_run_incomplete'}
 
     try:
         represented_cutoffs: list[str] = []
@@ -1501,6 +1954,7 @@ def feedback_retry_run_is_complete_for_weekly_policy_rebind(
     *,
     idempotency_key: str,
     role_symbol_scopes: Mapping[str, Sequence[str]],
+    point_in_time_recovery: bool = False,
 ) -> bool:
     if not isinstance(run, Mapping):
         return False
@@ -1521,6 +1975,10 @@ def feedback_retry_run_is_complete_for_weekly_policy_rebind(
         == str(idempotency_key or '').strip()
         and str(policy_binding.get('idempotency_key') or '').strip()
         == str(idempotency_key or '').strip()
+        and _request_payload_matches_point_in_time_recovery(
+            payload,
+            point_in_time_recovery,
+        )
     ):
         return False
     try:
@@ -1737,6 +2195,7 @@ def _claim_feedback_retry_run(
     role_symbol_scopes: Mapping[str, Sequence[str]] | None = None,
     fs_div: str | None = None,
     scope_authority: Mapping[str, Any] | None = None,
+    point_in_time_recovery: bool = False,
 ) -> dict[str, Any]:
     """Atomically claim a durable retry scope without holding a pool slot."""
 
@@ -1775,6 +2234,7 @@ def _claim_feedback_retry_run(
         requested_symbols=normalized_symbols,
     )
     normalized_fs_div = _normalize_feedback_fs_div(fs_div)
+    normalized_point_in_time_recovery = bool(point_in_time_recovery)
     requested_scope = _normalized_admission_scope(
         roles=normalized_roles,
         symbols=normalized_symbols,
@@ -1834,6 +2294,10 @@ def _claim_feedback_retry_run(
             and payload.get('role_symbol_scopes')
             == normalized_role_symbol_scopes
             and normalized_fs_div == active_fs_div
+            and _request_payload_matches_point_in_time_recovery(
+                payload,
+                normalized_point_in_time_recovery,
+            )
             and payload.get('scope_authority')
             == (
                 dict(scope_authority)
@@ -2017,6 +2481,9 @@ def _claim_feedback_retry_run(
                     ),
                     'idempotency_key': normalized_idempotency_key,
                     'role_symbol_scopes': normalized_role_symbol_scopes,
+                    'point_in_time_recovery': (
+                        normalized_point_in_time_recovery
+                    ),
                     'admission_scope_by_role': admission_scope_payload,
                     **(
                         {'idempotency_attempt': idempotency_attempt}
@@ -2520,6 +2987,7 @@ class FeedbackRetryCycleConfig:
     outer_batch_size: int = 20
     reuse_existing: bool = True
     force_recompute: bool = False
+    point_in_time_recovery: bool = False
     reuse_parent_run_id: str | None = None
     scope_authority: Mapping[str, Any] | None = None
     role_symbol_scopes: Mapping[str, Sequence[str]] | None = None
@@ -3152,6 +3620,74 @@ class AgentFeedbackRetryService:
             ),
         }
 
+    @staticmethod
+    def _exact_retry_parent_failed_scope(
+        *,
+        containers: Sequence[Mapping[str, Any]],
+        failed_count: int,
+        all_scope_keys: set[tuple[str, str]],
+        normalized_roles: set[str],
+    ) -> set[tuple[str, str]] | None:
+        def parse_field(
+            field: str,
+        ) -> tuple[bool, set[tuple[str, str]] | None]:
+            parsed_values: list[set[tuple[str, str]]] = []
+            for container in containers:
+                if field not in container:
+                    continue
+                raw_by_role = container.get(field)
+                if not isinstance(raw_by_role, dict):
+                    return True, None
+                parsed: set[tuple[str, str]] = set()
+                for raw_role, raw_symbols in raw_by_role.items():
+                    role = str(raw_role or '').strip().lower()
+                    if role not in normalized_roles or not isinstance(
+                        raw_symbols,
+                        list,
+                    ):
+                        return True, None
+                    for raw_symbol in raw_symbols:
+                        symbol = str(raw_symbol or '').strip().upper()
+                        key = (symbol, role)
+                        if (
+                            not symbol
+                            or key not in all_scope_keys
+                            or key in parsed
+                        ):
+                            return True, None
+                        parsed.add(key)
+                parsed_values.append(parsed)
+            if not parsed_values:
+                return False, None
+            first = parsed_values[0]
+            if any(value != first for value in parsed_values[1:]):
+                return True, None
+            return True, first
+
+        canonical_present, canonical = parse_field(
+            'failed_symbols_by_role'
+        )
+        if canonical_present:
+            return (
+                canonical
+                if canonical is not None
+                and len(canonical) == failed_count
+                else None
+            )
+        if failed_count == 0:
+            return set()
+
+        # Older retry-parent checkpoints persisted only the immutable
+        # first-pass set.  Accept it as final failure evidence only when the
+        # raw scope is exact and its unique cardinality matches the durable
+        # aggregate count.  Any conflict remains fail-closed.
+        legacy_present, legacy = parse_field(
+            'first_pass_failed_symbols_by_role'
+        )
+        if not legacy_present or legacy is None:
+            return None
+        return legacy if len(legacy) == failed_count else None
+
     def _load_reuse_lineage_context(
         self,
         *,
@@ -3161,10 +3697,12 @@ class AgentFeedbackRetryService:
         current_parent_run_id: str,
         current_parent_started_at: datetime,
         required_prior_parent_run_id: str | None = None,
+        point_in_time_recovery: bool = False,
     ) -> tuple[
         dict[tuple[str, str], tuple[str, str]],
         dict[str, str | None],
         dict[tuple[str, str, str], tuple[str, str]],
+        dict[tuple[str, str, str], dict[str, Any]],
     ]:
         normalized_roles = {
             str(role or '').strip().lower()
@@ -3191,30 +3729,52 @@ class AgentFeedbackRetryService:
                     AgentContextFeedbackRun.id.desc(),
                 )
             ).scalars().all()
-            rows = [
-                {
-                    'id': int(row.id),
-                    'run_id': str(row.run_id or ''),
-                    'request_payload': (
-                        dict(row.request_payload)
-                        if isinstance(row.request_payload, dict)
-                        else {}
-                    ),
-                    'status': str(row.status or '').strip().lower(),
-                    'market_date': row.market_date,
-                    'symbols_total': row.symbols_total,
-                    'completed_count': row.completed_count,
-                    'failed_count': max(0, int(row.failed_count or 0)),
-                    'summary_payload': (
-                        dict(row.summary_payload)
-                        if isinstance(row.summary_payload, dict)
-                        else {}
-                    ),
-                    'started_at': row.started_at,
-                    'completed_at': row.completed_at,
-                }
-                for row in persisted_rows
-            ]
+            rows = []
+            for row in persisted_rows:
+                raw_request_payload = row.request_payload
+                request_payload_is_mapping = isinstance(
+                    raw_request_payload,
+                    Mapping,
+                )
+                request_payload = (
+                    dict(raw_request_payload)
+                    if request_payload_is_mapping
+                    else {}
+                )
+                rows.append(
+                    {
+                        'id': int(row.id),
+                        'run_id': str(row.run_id or ''),
+                        'request_payload': request_payload,
+                        'point_in_time_recovery_matches': (
+                            request_payload_is_mapping
+                            and _request_payload_matches_point_in_time_recovery(
+                                request_payload,
+                                point_in_time_recovery,
+                            )
+                        ),
+                        'status': str(row.status or '').strip().lower(),
+                        'market_date': row.market_date,
+                        'symbols_total': row.symbols_total,
+                        'completed_count': row.completed_count,
+                        'failed_count': max(0, int(row.failed_count or 0)),
+                        'summary_payload': (
+                            dict(row.summary_payload)
+                            if isinstance(row.summary_payload, dict)
+                            else {}
+                        ),
+                        'started_at': row.started_at,
+                        'completed_at': row.completed_at,
+                    }
+                )
+
+        mode_matches_by_run_id = {
+            str(row['run_id'] or '').strip(): bool(
+                row['point_in_time_recovery_matches']
+            )
+            for row in rows
+            if str(row['run_id'] or '').strip()
+        }
 
         def scopes_for_payload(payload: dict[str, Any]) -> dict[str, list[str]]:
             scopes: dict[str, list[str]] = {}
@@ -3281,6 +3841,10 @@ class AgentFeedbackRetryService:
             tuple[str, str, str],
             tuple[str, str],
         ] = {}
+        reuse_attestation_by_parent_key: dict[
+            tuple[str, str, str],
+            dict[str, Any],
+        ] = {}
         current_parent_row_id = next(
             (
                 int(row['id'])
@@ -3313,36 +3877,96 @@ class AgentFeedbackRetryService:
             )
             if isinstance(progress_summary, dict):
                 containers.append(progress_summary)
-            failed_keys: set[tuple[str, str]] = set()
-            for container in containers:
-                raw_by_role = container.get('failed_symbols_by_role')
-                if not isinstance(raw_by_role, dict):
+            failed_count = max(0, int(row.get('failed_count') or 0))
+            if row.get('status') == 'failed':
+                return all_scope_keys
+            exact_failed_keys = self._exact_retry_parent_failed_scope(
+                containers=containers,
+                failed_count=failed_count,
+                all_scope_keys=all_scope_keys,
+                normalized_roles=normalized_roles,
+            )
+            return (
+                exact_failed_keys
+                if exact_failed_keys is not None
+                else all_scope_keys
+            )
+
+        def reused_evidence_by_key_for_run(
+            *,
+            row: dict[str, Any],
+            scopes: dict[str, list[str]],
+        ) -> dict[tuple[str, str], dict[str, Any]]:
+            summary_payload = row.get('summary_payload')
+            if not isinstance(summary_payload, dict):
+                return {}
+            raw_reused_by_role = summary_payload.get(
+                'reused_symbols_by_role'
+            )
+            raw_evidence_by_role = summary_payload.get(
+                'reused_feedback_evidence_by_role'
+            )
+            if not isinstance(raw_reused_by_role, dict) or not isinstance(
+                raw_evidence_by_role,
+                dict,
+            ):
+                return {}
+
+            reused_evidence_by_key: dict[
+                tuple[str, str],
+                dict[str, Any],
+            ] = {}
+            for role, scoped_symbols in scopes.items():
+                raw_reused_symbols = raw_reused_by_role.get(role)
+                role_evidence = raw_evidence_by_role.get(role)
+                if not isinstance(raw_reused_symbols, list) or not isinstance(
+                    role_evidence,
+                    dict,
+                ):
                     continue
-                for raw_role, raw_symbols in raw_by_role.items():
-                    role = str(raw_role or '').strip().lower()
-                    if role not in normalized_roles or not isinstance(
-                        raw_symbols,
-                        list,
+                reused_symbols = _normalize_optional_symbol_scope(
+                    raw_reused_symbols
+                )
+                if (
+                    len(reused_symbols) != len(raw_reused_symbols)
+                    or not set(reused_symbols).issubset(scoped_symbols)
+                ):
+                    continue
+                for symbol in reused_symbols:
+                    evidence = role_evidence.get(symbol)
+                    if not isinstance(evidence, dict) or not (
+                        str(evidence.get('schema_version') or '').strip()
+                        == REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION
+                        and str(
+                            evidence.get('feedback_run_id') or ''
+                        ).strip()
+                        and str(
+                            evidence.get('feedback_received_at') or ''
+                        ).strip()
                     ):
                         continue
-                    failed_keys.update(
-                        (str(symbol or '').strip().upper(), role)
-                        for symbol in raw_symbols
-                        if str(symbol or '').strip()
-                    )
-            if row.get('status') == 'failed' or int(
-                row.get('failed_count') or 0
-            ) > len(failed_keys):
-                return all_scope_keys
-            return failed_keys & all_scope_keys
+                    reused_evidence_by_key[(symbol, role)] = dict(evidence)
+            return reused_evidence_by_key
 
         for row in rows:
             run_id = str(row['run_id'] or '').strip()
             payload = row['request_payload']
-            parent_by_child_run_id[run_id] = str(
+            child_parent_run_id = str(
                 payload.get('parent_run_id') or ''
             ).strip() or None
-            child_parent_run_id = parent_by_child_run_id[run_id]
+            row_mode_matches = bool(
+                row['point_in_time_recovery_matches']
+            )
+            lineage_mode_matches = bool(
+                row_mode_matches
+                and (
+                    child_parent_run_id is None
+                    or mode_matches_by_run_id.get(child_parent_run_id)
+                    is True
+                )
+            )
+            if lineage_mode_matches:
+                parent_by_child_run_id[run_id] = child_parent_run_id
             scopes = scopes_for_payload(payload)
             status = str(row['status'] or '').strip().lower()
             if child_parent_run_id:
@@ -3357,21 +3981,32 @@ class AgentFeedbackRetryService:
                             symbol in normalized_symbols
                             and child_key not in latest_child_by_parent_key
                         ):
+                            # Keep an incompatible newest child as a barrier;
+                            # dropping it would revive an older matching child.
                             latest_child_by_parent_key[child_key] = (
                                 run_id,
-                                'failed'
-                                if status
-                                in {
-                                    'completed',
-                                    'completed_with_failures',
-                                    'partial',
-                                    'failed',
-                                }
-                                and (symbol, role) in failed_scope_keys
-                                else status,
+                                (
+                                    _POINT_IN_TIME_MODE_MISMATCH_CHILD_STATUS
+                                    if not lineage_mode_matches
+                                    else (
+                                        'failed'
+                                        if status
+                                        in {
+                                            'completed',
+                                            'completed_with_failures',
+                                            'partial',
+                                            'failed',
+                                        }
+                                        and (symbol, role)
+                                        in failed_scope_keys
+                                        else status
+                                    )
+                                ),
                             )
 
             if run_id == current_parent_run_id:
+                continue
+            if not row_mode_matches:
                 continue
             row_started_at = row['started_at']
             if row_started_at.tzinfo is None or row_started_at.utcoffset() is None:
@@ -3396,10 +4031,30 @@ class AgentFeedbackRetryService:
                 row=row,
                 scopes=scopes,
             )
+            reused_parent_evidence_by_key = reused_evidence_by_key_for_run(
+                row=row,
+                scopes=scopes,
+            )
+            for (symbol, role), evidence in (
+                reused_parent_evidence_by_key.items()
+            ):
+                reuse_attestation_by_parent_key[
+                    (run_id, symbol, role)
+                ] = evidence
             lease_loss_parent_reusable = lease_loss_parent_is_reusable(row)
             for role, scoped_symbols in scopes.items():
                 for symbol in scoped_symbols:
                     key = (symbol, role)
+                    if (
+                        key in reused_parent_evidence_by_key
+                        and (run_id, symbol, role)
+                        not in latest_child_by_parent_key
+                        and required_prior_parent_run_id is None
+                    ):
+                        # A reuse-only parent did not create new authority for
+                        # this scope. Keep walking to the original parent/child
+                        # whose durable feedback receipt it attested.
+                        continue
                     if symbol in normalized_symbols and key not in latest_parent_by_key:
                         latest_parent_by_key[key] = (
                             run_id,
@@ -3416,6 +4071,7 @@ class AgentFeedbackRetryService:
             latest_parent_by_key,
             parent_by_child_run_id,
             latest_child_by_parent_key,
+            reuse_attestation_by_parent_key,
         )
 
     def _filter_decider_retry_ready_symbols(
@@ -3540,6 +4196,7 @@ class AgentFeedbackRetryService:
         knowledge_cutoff_at: datetime | str | None = None,
         fs_div: str | None = None,
         reuse_static_inputs: FeedbackReuseStaticInputs | None = None,
+        point_in_time_recovery: bool = False,
     ) -> RoleSequenceSnapshot:
         normalized_roles = tuple(roles)
         normalized_symbols = tuple(eligible_symbols)
@@ -3647,11 +4304,16 @@ class AgentFeedbackRetryService:
             tuple[str, str, str],
             tuple[str, str],
         ] = {}
+        reuse_attestation_by_parent_key: dict[
+            tuple[str, str, str],
+            dict[str, Any],
+        ] = {}
         if parent_run_id and normalized_parent_started_at is not None:
             (
                 latest_prior_parent_by_key,
                 parent_by_child_run_id,
                 latest_child_by_parent_key,
+                reuse_attestation_by_parent_key,
             ) = self._load_reuse_lineage_context(
                 market_date=market_date,
                 roles=normalized_roles,
@@ -3659,6 +4321,7 @@ class AgentFeedbackRetryService:
                 current_parent_run_id=parent_run_id,
                 current_parent_started_at=normalized_parent_started_at,
                 required_prior_parent_run_id=reuse_parent_run_id,
+                point_in_time_recovery=point_in_time_recovery,
             )
 
         def decision_is_reusable(symbol: str, role: str) -> bool:
@@ -3719,24 +4382,75 @@ class AgentFeedbackRetryService:
             if received_at > normalized_parent_started_at:
                 return False
 
-            prior_parent = latest_prior_parent_by_key.get((symbol, role))
-            if prior_parent is None:
-                return not failure_shadowed_by_latest_lineage
-            prior_parent_run_id, prior_parent_status = prior_parent
             feedback_run_id = str(
                 (reuse_evidence or {}).get('feedback_run_id') or ''
             ).strip()
+            if feedback_run_id not in parent_by_child_run_id:
+                # Reuse authority must come from a run in the requested
+                # point-in-time mode. Legacy rows without the flag are normal
+                # mode only; malformed or opposite-mode rows are rejected.
+                return False
+            prior_parent = latest_prior_parent_by_key.get((symbol, role))
+            if prior_parent is None:
+                if reuse_parent_run_id is not None:
+                    return False
+                return not failure_shadowed_by_latest_lineage
+            prior_parent_run_id, prior_parent_status = prior_parent
             prior_child = latest_child_by_parent_key.get(
                 (prior_parent_run_id, symbol, role)
             )
             if reuse_parent_run_id is not None:
-                return (
+                direct_child_matches = (
                     prior_parent_run_id == reuse_parent_run_id
                     and parent_by_child_run_id.get(feedback_run_id)
                     == reuse_parent_run_id
                     and prior_child is not None
                     and prior_child[0] == feedback_run_id
                     and prior_child[1]
+                    in {
+                        'completed',
+                        'completed_with_failures',
+                        'partial',
+                    }
+                )
+                if direct_child_matches:
+                    return True
+                if prior_child is not None:
+                    # Once the exact reuse parent dispatched this scope, its
+                    # latest child is authoritative. A stale reuse attestation
+                    # must never shadow a pending, failed, or newer child.
+                    return False
+                attested_evidence = reuse_attestation_by_parent_key.get(
+                    (reuse_parent_run_id, symbol, role)
+                )
+                if not isinstance(attested_evidence, dict) or any(
+                    attested_evidence.get(field)
+                    != (reuse_evidence or {}).get(field)
+                    for field in (
+                        'schema_version',
+                        'feedback_id',
+                        'feedback_run_id',
+                        'feedback_received_at',
+                        'decision_snapshot_id',
+                        'decision_snapshot_fingerprint',
+                        'decision_snapshot_observed_at',
+                    )
+                ):
+                    return False
+                source_parent_run_id = parent_by_child_run_id.get(
+                    feedback_run_id
+                )
+                source_child = (
+                    latest_child_by_parent_key.get(
+                        (source_parent_run_id, symbol, role)
+                    )
+                    if source_parent_run_id is not None
+                    else None
+                )
+                return (
+                    source_child is not None
+                    and source_child[0] == feedback_run_id
+                    and source_child[1]
                     in {
                         'completed',
                         'completed_with_failures',
@@ -3928,8 +4642,21 @@ class AgentFeedbackRetryService:
     ) -> RetryCyclePlan | None:
         boundary_pending_roles = snapshot.boundary_pending_roles()
         if boundary_pending_roles:
-            cycle_number = previous_cycle_number or 1
-            if enforce_max_cycles and cycle_number > max_cycles:
+            cycle_number = max(
+                previous_cycle_number or 1,
+                previous_completed_cycles + 1,
+            )
+            summarizer_first_pass_incomplete = all(
+                role in SUMMARIZER_AGENT_NAMES
+                for role in boundary_pending_roles
+            )
+            # Retry budgets must not truncate unattempted summarizer fanout.
+            # A no-progress guard in the execution loop still bounds stalls.
+            if (
+                enforce_max_cycles
+                and cycle_number > max_cycles
+                and not summarizer_first_pass_incomplete
+            ):
                 return None
             current_role = boundary_pending_roles[0]
             current_index = snapshot.roles.index(current_role)
@@ -4551,6 +5278,9 @@ class AgentFeedbackRetryService:
         bypass_prerequisite_gate: bool = False,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
+        point_in_time_recovery = bool(
+            getattr(config, 'point_in_time_recovery', False)
+        )
         resolved_idempotency_key = str(
             getattr(config, 'idempotency_key', None) or ''
         ).strip() or None
@@ -4665,27 +5395,43 @@ class AgentFeedbackRetryService:
         should_bypass_prerequisite_gate = bool(
             force or bypass_prerequisite_gate
         )
-        prerequisites = (
-            agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
-                market_date=config.market_date,
-                fs_div=resolved_fs_div,
-            )
+        eligible_symbols = self._load_eligible_symbols(
+            market_date=config.market_date,
+            requested_symbols=requested_symbols,
         )
+        if requested_symbols is not None and not eligible_symbols:
+            prerequisites = {
+                'status': 'blocked',
+                'ready': False,
+                'blocked_stage_ids': ['market_risk_filter'],
+                'waiting_stage_ids': [],
+                'missing_prerequisites': [
+                    {
+                        'stage': 'market_risk_filter',
+                        'gate_status': 'blocked',
+                        'reason': 'requested_scope_has_no_eligible_symbols',
+                    }
+                ],
+            }
+        else:
+            prerequisites = (
+                agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                    market_date=config.market_date,
+                    fs_div=resolved_fs_div,
+                    symbols=eligible_symbols,
+                )
+            )
         if not should_bypass_prerequisite_gate and not prerequisites['ready']:
             return self._run_retry_cycles_admitted(
                 config=config,
                 force=force,
                 bypass_prerequisite_gate=bypass_prerequisite_gate,
                 prerequisites=prerequisites,
+                preloaded_eligible_symbols=eligible_symbols,
                 weekly_policy_session_guard=(
                     weekly_policy_session_guard
                 ),
             )
-
-        eligible_symbols = self._load_eligible_symbols(
-            market_date=config.market_date,
-            requested_symbols=requested_symbols,
-        )
         if effective_knowledge_cutoff_at is None:
             (
                 effective_knowledge_cutoff_at,
@@ -4733,6 +5479,10 @@ class AgentFeedbackRetryService:
                 == _normalize_admission_knowledge_cutoff(
                     effective_knowledge_cutoff_at
                 )
+                and _request_payload_matches_point_in_time_recovery(
+                    prior_request,
+                    point_in_time_recovery,
+                )
             )
 
         def idempotent_replay_response(
@@ -4756,6 +5506,7 @@ class AgentFeedbackRetryService:
                 'force_recompute': bool(
                     force or getattr(config, 'force_recompute', False)
                 ),
+                'point_in_time_recovery': point_in_time_recovery,
                 'feedback_scope_mode': feedback_scope_mode,
                 'scope_authority': dict(
                     normalized_scope_authority or {}
@@ -4786,6 +5537,7 @@ class AgentFeedbackRetryService:
                     idempotent_run,
                     idempotency_key=resolved_idempotency_key,
                     role_symbol_scopes=resolved_role_symbol_scopes or {},
+                    point_in_time_recovery=point_in_time_recovery,
                 ):
                     return idempotent_replay_response(idempotent_run)
 
@@ -4829,6 +5581,9 @@ class AgentFeedbackRetryService:
             ) or not _previous_run_matches_scope_authority(
                 previous_run,
                 normalized_scope_authority,
+            ) or not _previous_run_matches_point_in_time_recovery(
+                previous_run,
+                point_in_time_recovery,
             ) or (
                 bool(reuse_parent_run_id)
                 and not _previous_run_matches_retry_contract(
@@ -4841,6 +5596,7 @@ class AgentFeedbackRetryService:
                         getattr(config, 'outer_batch_size', 20) or 20
                     ),
                     idempotency_key=resolved_idempotency_key,
+                    point_in_time_recovery=point_in_time_recovery,
                 )
             ):
                 previous_run = None
@@ -4891,6 +5647,7 @@ class AgentFeedbackRetryService:
             role_symbol_scopes=resolved_role_symbol_scopes,
             fs_div=resolved_fs_div,
             scope_authority=normalized_scope_authority,
+            point_in_time_recovery=point_in_time_recovery,
         )
         if not admission['acquired']:
             active_run = admission.get('conflict_run')
@@ -4901,6 +5658,7 @@ class AgentFeedbackRetryService:
                     active_run,
                     idempotency_key=resolved_idempotency_key or '',
                     role_symbol_scopes=resolved_role_symbol_scopes or {},
+                    point_in_time_recovery=point_in_time_recovery,
                 ):
                     return idempotent_replay_response(active_run)
             active_run_id = (
@@ -5089,6 +5847,9 @@ class AgentFeedbackRetryService:
             progress_callback = None
         feedback_scope_mode = normalize_feedback_scope_mode(getattr(config, 'feedback_scope_mode', None))
         effective_force_recompute = bool(force or getattr(config, 'force_recompute', False))
+        point_in_time_recovery = bool(
+            getattr(config, 'point_in_time_recovery', False)
+        )
         should_bypass_prerequisite_gate = bool(force or bypass_prerequisite_gate)
         raw_requested_symbols = getattr(config, 'symbols', None)
         requested_symbols = (
@@ -5101,12 +5862,37 @@ class AgentFeedbackRetryService:
             roles=roles,
             requested_symbols=requested_symbols,
         )
-        prerequisites = prerequisites or (
-            agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+        eligible_symbols = (
+            list(preloaded_eligible_symbols)
+            if preloaded_eligible_symbols is not None
+            else self._load_eligible_symbols(
                 market_date=config.market_date,
-                fs_div=resolved_fs_div,
+                requested_symbols=requested_symbols,
             )
         )
+        if prerequisites is None:
+            if requested_symbols is not None and not eligible_symbols:
+                prerequisites = {
+                    'status': 'blocked',
+                    'ready': False,
+                    'blocked_stage_ids': ['market_risk_filter'],
+                    'waiting_stage_ids': [],
+                    'missing_prerequisites': [
+                        {
+                            'stage': 'market_risk_filter',
+                            'gate_status': 'blocked',
+                            'reason': 'requested_scope_has_no_eligible_symbols',
+                        }
+                    ],
+                }
+            else:
+                prerequisites = (
+                    agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+                        market_date=config.market_date,
+                        fs_div=resolved_fs_div,
+                        symbols=eligible_symbols,
+                    )
+                )
         if not should_bypass_prerequisite_gate and not prerequisites['ready']:
             progress = self._get_retry_progress(
                 market_date=config.market_date,
@@ -5128,8 +5914,12 @@ class AgentFeedbackRetryService:
                 'feedback_scope_mode': feedback_scope_mode,
                 'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
                 'role_symbol_scopes': resolved_role_symbol_scopes,
-                'eligible_symbols': None,
-                'skipped_symbols': [],
+                'eligible_symbols': eligible_symbols,
+                'skipped_symbols': [
+                    symbol
+                    for symbol in (requested_symbols or ())
+                    if symbol not in set(eligible_symbols)
+                ],
                 'run_id': None,
                 'status': prerequisites['status'],
                 'gated': True,
@@ -5139,14 +5929,6 @@ class AgentFeedbackRetryService:
                 'prerequisites': prerequisites,
                 'progress': progress,
             }
-        eligible_symbols = (
-            list(preloaded_eligible_symbols)
-            if preloaded_eligible_symbols is not None
-            else self._load_eligible_symbols(
-                market_date=config.market_date,
-                requested_symbols=requested_symbols,
-            )
-        )
         eligibility_records = load_agent_feedback_eligibility_records(
             market_date=config.market_date,
             requested_symbols=requested_symbols,
@@ -5455,6 +6237,7 @@ class AgentFeedbackRetryService:
             knowledge_cutoff_at=knowledge_cutoff_at,
             fs_div=resolved_fs_div,
             reuse_static_inputs=reuse_static_inputs,
+            point_in_time_recovery=point_in_time_recovery,
         )
         next_plan = self._resolve_cycle_plan(
             snapshot=initial_snapshot,
@@ -5502,6 +6285,7 @@ class AgentFeedbackRetryService:
             'parallel_subtasks': max(1, int(settings.openclaw_agent_parallel_subtasks)),
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,
+            'point_in_time_recovery': point_in_time_recovery,
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             **(
                 {'scope_authority': dict(normalized_scope_authority)}
@@ -5622,6 +6406,12 @@ class AgentFeedbackRetryService:
         try:
             while active_plan is not None:
                 cycle_roles: list[dict[str, Any]] = []
+                cycle_snapshot_before = (
+                    initial_snapshot if not cycles else snapshot_after_cycle
+                )
+                cycle_start_terminal_items = self._collect_terminal_items(
+                    cycle_snapshot_before
+                )
                 cycle_state_before = runtime_feedback_state_store.get_run(
                     config.market_date,
                     run_id=request_run_id,
@@ -5634,7 +6424,7 @@ class AgentFeedbackRetryService:
                 )
                 cycle_start_pending = len(
                     self._collect_retry_pending_symbols(
-                        initial_snapshot if not cycles else snapshot_after_cycle,
+                        cycle_snapshot_before,
                         retry_attempted_symbols_by_role=retry_attempted_before,
                     )
                 )
@@ -5684,6 +6474,7 @@ class AgentFeedbackRetryService:
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
                         reuse_static_inputs=reuse_static_inputs,
+                        point_in_time_recovery=point_in_time_recovery,
                     )
                     completed_roles_before = tuple(
                         list(active_plan.completed_roles) + list(active_plan.plan_roles[:index])
@@ -5776,6 +6567,9 @@ class AgentFeedbackRetryService:
                                     # blocked again inside every child batch.
                                     force=should_bypass_prerequisite_gate,
                                     force_recompute=effective_force_recompute,
+                                    point_in_time_recovery=(
+                                        point_in_time_recovery
+                                    ),
                                     auto_scope=requested_symbols is None,
                                     role_symbol_scopes={role: dispatch_chunk},
                                     funnel_diagnostics={
@@ -5842,6 +6636,9 @@ class AgentFeedbackRetryService:
                                     knowledge_cutoff_at=knowledge_cutoff_at,
                                     fs_div=resolved_fs_div,
                                     reuse_static_inputs=reuse_static_inputs,
+                                    point_in_time_recovery=(
+                                        point_in_time_recovery
+                                    ),
                                 )
                                 self._sync_runtime_state(
                                     market_date=config.market_date,
@@ -5939,6 +6736,7 @@ class AgentFeedbackRetryService:
                         knowledge_cutoff_at=knowledge_cutoff_at,
                         fs_div=resolved_fs_div,
                         reuse_static_inputs=reuse_static_inputs,
+                        point_in_time_recovery=point_in_time_recovery,
                     )
                     role_state_after = snapshot_after_role.role_states[role]
                     role_boundary_complete = len(role_state_after.boundary_pending_symbols) == 0
@@ -6018,6 +6816,7 @@ class AgentFeedbackRetryService:
                     knowledge_cutoff_at=knowledge_cutoff_at,
                     fs_div=resolved_fs_div,
                     reuse_static_inputs=reuse_static_inputs,
+                    point_in_time_recovery=point_in_time_recovery,
                 )
                 cycle_state = runtime_feedback_state_store.get_run(
                     config.market_date,
@@ -6033,8 +6832,14 @@ class AgentFeedbackRetryService:
                     snapshot_after_cycle,
                     retry_attempted_symbols_by_role=retry_attempted_after,
                 )
+                boundary_progress_stalled = (
+                    active_plan.mode == 'boundary_resume'
+                    and bool(snapshot_after_cycle.boundary_pending_roles())
+                    and self._collect_terminal_items(snapshot_after_cycle)
+                    <= cycle_start_terminal_items
+                )
                 cycle_status = 'blocked' if blocked else ('completed' if not retry_pending_symbols else 'partial')
-                if not blocked:
+                if not blocked and not boundary_progress_stalled:
                     completed_cycles = active_plan.cycle_number
                 cycles.append(
                     {
@@ -6046,9 +6851,10 @@ class AgentFeedbackRetryService:
                         'completed_roles': list(cycle_state.completed_roles if cycle_state is not None else active_plan.completed_roles),
                         'remaining_roles': list(cycle_state.remaining_roles if cycle_state is not None else active_plan.remaining_roles),
                         'role_batches': cycle_roles,
+                        'boundary_progress_stalled': boundary_progress_stalled,
                     }
                 )
-                if blocked or not retry_pending_symbols:
+                if blocked or not retry_pending_symbols or boundary_progress_stalled:
                     initial_snapshot = snapshot_after_cycle
                     break
 
@@ -6076,6 +6882,7 @@ class AgentFeedbackRetryService:
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
                 reuse_static_inputs=reuse_static_inputs,
+                point_in_time_recovery=point_in_time_recovery,
             )
             final_state_before_finish = runtime_feedback_state_store.get_run(
                 config.market_date,
@@ -6174,6 +6981,7 @@ class AgentFeedbackRetryService:
                 knowledge_cutoff_at=knowledge_cutoff_at,
                 fs_div=resolved_fs_div,
                 reuse_static_inputs=reuse_static_inputs,
+                point_in_time_recovery=point_in_time_recovery,
             ),
             retry_attempted_symbols_by_role=(
                 final_state.retry_attempted_symbols_by_role
@@ -6184,6 +6992,7 @@ class AgentFeedbackRetryService:
 
         return {
             'market_date': config.market_date.isoformat(),
+            'knowledge_cutoff_at': knowledge_cutoff_at,
             'policy_context_as_of_date': (
                 resolved_policy_context_as_of_date.isoformat()
             ),
@@ -6193,6 +7002,7 @@ class AgentFeedbackRetryService:
             'outer_batch_size': config.outer_batch_size,
             'reuse_existing': config.reuse_existing,
             'force_recompute': effective_force_recompute,
+            'point_in_time_recovery': point_in_time_recovery,
             'feedback_scope_mode': feedback_scope_mode,
             'scope_authority': (
                 dict(normalized_scope_authority)

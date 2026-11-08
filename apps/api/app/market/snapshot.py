@@ -53,6 +53,8 @@ KRW_UNIT = 'krw'
 KIS_TR_PBMN_TO_KRW_MULTIPLIER = 1_000_000
 LEGACY_INVESTOR_FLOW_UNITS = frozenset({KIS_TRADING_VALUE_UNIT, 'kis_net_value_raw'})
 KIS_INDEX_OBSERVATION_SOURCE = 'kis_index_intraday_bar'
+KIS_INVESTOR_FLOW_SOURCE = 'kis_investor_time_by_market'
+KIS_INVESTOR_FLOW_OBSERVATION_SOURCE = 'current_session_index_anchor'
 KIS_BREADTH_VERIFICATION_BASIS = (
     'kis_directional_buckets_with_same_date_completed_master_upper_bound'
 )
@@ -401,6 +403,7 @@ class MarketSnapshotService:
                 ):
                     return self._decorate_cached_payload(cache_record)
                 include_optional_legs = force or optional_legs_due
+                include_investor_flow = force or force_index or optional_legs_due
                 attempted_at = self._now()
                 claim_refresh_bucket = getattr(
                     self.cache_store,
@@ -438,6 +441,7 @@ class MarketSnapshotService:
                         cache_record=cache_record,
                         trigger=trigger,
                         include_optional_legs=include_optional_legs,
+                        include_investor_flow=include_investor_flow,
                         attempted_at=attempted_at,
                     ),
                     name='market-snapshot-refresh',
@@ -451,6 +455,7 @@ class MarketSnapshotService:
         cache_record: MarketSnapshotCacheRecord | None,
         trigger: str,
         include_optional_legs: bool,
+        include_investor_flow: bool,
         attempted_at: datetime,
     ) -> dict[str, Any] | None:
         cached_payload = cache_record.payload if cache_record is not None else None
@@ -481,6 +486,7 @@ class MarketSnapshotService:
                 cache_record=cache_record,
                 refreshed_at=attempted_at,
                 include_optional_legs=include_optional_legs,
+                include_investor_flow=include_investor_flow,
             )
         except Exception as exc:
             stale_payload = self._build_stale_payload_from_cache(
@@ -527,7 +533,10 @@ class MarketSnapshotService:
         cache_record: MarketSnapshotCacheRecord | None,
         refreshed_at: datetime,
         include_optional_legs: bool,
+        include_investor_flow: bool | None = None,
     ) -> dict[str, Any]:
+        if include_investor_flow is None:
+            include_investor_flow = include_optional_legs
         kis_api_client = self._effective_kis_client()
 
         # Prime the shared token cache once before fanning out multiple KIS reads.
@@ -546,6 +555,7 @@ class MarketSnapshotService:
                     kis_api_client,
                     target,
                     include_optional_legs=include_optional_legs,
+                    include_investor_flow=include_investor_flow,
                     cached_market_row=(
                         cached_markets.get(target.key)
                         if isinstance(cached_markets.get(target.key), Mapping)
@@ -793,7 +803,10 @@ class MarketSnapshotService:
         *,
         include_optional_legs: bool,
         cached_market_row: Mapping[str, Any] | None,
+        include_investor_flow: bool | None = None,
     ) -> dict[str, Any]:
+        if include_investor_flow is None:
+            include_investor_flow = include_optional_legs
         index_payload_before = await kis_api_client.fetch_market_index_price(
             index_code=target.index_code
         )
@@ -864,31 +877,112 @@ class MarketSnapshotService:
                 'KIS index observation is not a fresh current regular-session observation'
             )
         flow_error: str | None = None
-        if include_optional_legs:
+        flow_collected_at: datetime | None = None
+        flow_provider_observed_at: datetime | None = None
+        flow_observation_age_seconds: float | None = None
+        flow_current_session = False
+        use_cached_flow_values = False
+        rejected_flow_candidate: dict[str, Any] | None = None
+        cached_flow_leg = (
+            cached_market_row.get('flow_leg')
+            if isinstance(cached_market_row, Mapping)
+            and isinstance(cached_market_row.get('flow_leg'), Mapping)
+            else {}
+        )
+        if include_investor_flow:
             try:
                 flow_payload = await kis_api_client.fetch_investor_time_by_market(
                     market_code=target.investor_market_code,
                     sector_code=target.investor_sector_code,
                 )
+                flow_collected_at = self._now()
                 flow_output: Mapping[str, Any] = self._extract_flow_output(flow_payload)
-                flow_status = 'ready'
+                flow_provider_observed_at = provider_observed_at
+                flow_observation_age_seconds = (
+                    (flow_collected_at - flow_provider_observed_at).total_seconds()
+                    if flow_provider_observed_at is not None
+                    else None
+                )
+                flow_current_session = bool(
+                    flow_provider_observed_at is not None
+                    and flow_provider_observed_at.astimezone(SEOUL_TZ).date()
+                    == flow_collected_at.astimezone(SEOUL_TZ).date()
+                    and time(9, 0)
+                    <= flow_provider_observed_at.astimezone(SEOUL_TZ).time().replace(tzinfo=None)
+                    <= time(15, 30)
+                    and observation_payload_match is True
+                )
+                flow_live_fresh = bool(
+                    flow_current_session
+                    and flow_observation_age_seconds is not None
+                    and 0 <= flow_observation_age_seconds
+                    <= settings.market_snapshot_open_drive_max_age_seconds
+                )
+                flow_status = 'ready' if flow_live_fresh else 'unverified'
+                if not flow_live_fresh:
+                    flow_error = (
+                        'KIS investor-flow response lacks a fresh current-session provider anchor'
+                    )
             except Exception as exc:
                 logger.warning('Market snapshot investor-flow leg failed for %s: %s', target.label, exc)
                 flow_output = {}
                 flow_error = str(exc)
                 flow_status = 'unavailable'
+            cached_flow_status = str(
+                cached_flow_leg.get('status') or ''
+            ).strip().lower()
+            cached_flow_business_date = str(
+                cached_flow_leg.get('provider_business_date') or ''
+            ).strip()
+            candidate_business_date = (
+                provider_observed_at.date().isoformat()
+                if provider_observed_at is not None
+                else ''
+            )
+            cached_flow_is_trusted_same_date = bool(
+                flow_status != 'ready'
+                and cached_flow_status in {'ready', 'cached'}
+                and cached_flow_leg.get('current_session') is True
+                and cached_flow_business_date
+                and cached_flow_business_date == candidate_business_date
+                and '09:00:00'
+                <= str(cached_flow_leg.get('provider_session_time') or '')
+                <= '15:30:00'
+            )
+            if cached_flow_is_trusted_same_date:
+                rejected_flow_candidate = {
+                    'status': flow_status,
+                    'collected_at': (
+                        flow_collected_at.isoformat()
+                        if flow_collected_at is not None
+                        else None
+                    ),
+                    'provider_observed_at': (
+                        flow_provider_observed_at.isoformat()
+                        if flow_provider_observed_at is not None
+                        else None
+                    ),
+                    'observation_age_seconds': flow_observation_age_seconds,
+                    'current_session': flow_current_session,
+                    'error': flow_error,
+                }
+                use_cached_flow_values = True
+                flow_output = {}
+                flow_status = 'cached'
+                flow_error = (
+                    str(cached_flow_leg.get('error'))
+                    if cached_flow_leg.get('error') not in (None, '')
+                    else None
+                )
         else:
             flow_output = {}
-            cached_flow_leg = (
-                cached_market_row.get('flow_leg')
-                if isinstance(cached_market_row, Mapping)
-                and isinstance(cached_market_row.get('flow_leg'), Mapping)
-                else {}
-            )
+            use_cached_flow_values = True
             cached_flow_status = str(cached_flow_leg.get('status') or '').strip().lower()
             flow_status = (
                 'cached'
                 if cached_flow_status in {'ready', 'cached'}
+                else 'unverified'
+                if cached_flow_status == 'unverified'
                 else 'unavailable'
             )
             flow_error = (
@@ -896,6 +990,50 @@ class MarketSnapshotService:
                 if cached_flow_leg.get('error') not in (None, '')
                 else None
             )
+
+        if use_cached_flow_values:
+            flow_leg = dict(cached_flow_leg)
+            flow_leg.update(
+                {
+                    'status': flow_status,
+                    'source': KIS_INVESTOR_FLOW_SOURCE,
+                    'observation_source': KIS_INVESTOR_FLOW_OBSERVATION_SOURCE,
+                    'max_age_seconds': settings.market_snapshot_open_drive_max_age_seconds,
+                    'error': flow_error,
+                }
+            )
+            if rejected_flow_candidate is not None:
+                flow_leg['rejected_refresh_candidate'] = rejected_flow_candidate
+        else:
+            flow_leg = {
+                'status': flow_status,
+                'source': KIS_INVESTOR_FLOW_SOURCE,
+                'observation_source': KIS_INVESTOR_FLOW_OBSERVATION_SOURCE,
+                'collected_at': (
+                    flow_collected_at.isoformat()
+                    if flow_collected_at is not None
+                    else None
+                ),
+                'provider_observed_at': (
+                    flow_provider_observed_at.isoformat()
+                    if flow_provider_observed_at is not None
+                    else None
+                ),
+                'provider_business_date': (
+                    flow_provider_observed_at.date().isoformat()
+                    if flow_provider_observed_at is not None
+                    else None
+                ),
+                'provider_session_time': (
+                    flow_provider_observed_at.strftime('%H:%M:%S')
+                    if flow_provider_observed_at is not None
+                    else None
+                ),
+                'observation_age_seconds': flow_observation_age_seconds,
+                'current_session': flow_current_session,
+                'max_age_seconds': settings.market_snapshot_open_drive_max_age_seconds,
+                'error': flow_error,
+            }
 
         upper_limit_count = _parse_int(index_output.get('uplm_issu_cnt'), field_name='uplm_issu_cnt')
         advancers = _parse_int(index_output.get('ascn_issu_cnt'), field_name='ascn_issu_cnt')
@@ -956,14 +1094,10 @@ class MarketSnapshotService:
                 'observation_payload_match': observation_payload_match,
                 'error': provider_observation_error,
             },
-            'flow_leg': {
-                'status': flow_status,
-                'source': 'kis_investor_time_by_market',
-                'error': flow_error,
-            },
+            'flow_leg': flow_leg,
             'foreign_net_quantity': (
                 _parse_int(flow_output.get('frgn_ntby_qty'), field_name='frgn_ntby_qty')
-                if include_optional_legs
+                if include_investor_flow and not use_cached_flow_values
                 else (cached_market_row or {}).get('foreign_net_quantity')
             ),
             'foreign_net_value': (
@@ -971,12 +1105,12 @@ class MarketSnapshotService:
                     flow_output.get('frgn_ntby_tr_pbmn'),
                     field_name='frgn_ntby_tr_pbmn',
                 )
-                if include_optional_legs
+                if include_investor_flow and not use_cached_flow_values
                 else (cached_market_row or {}).get('foreign_net_value')
             ),
             'institution_net_quantity': (
                 _parse_int(flow_output.get('orgn_ntby_qty'), field_name='orgn_ntby_qty')
-                if include_optional_legs
+                if include_investor_flow and not use_cached_flow_values
                 else (cached_market_row or {}).get('institution_net_quantity')
             ),
             'institution_net_value': (
@@ -984,7 +1118,7 @@ class MarketSnapshotService:
                     flow_output.get('orgn_ntby_tr_pbmn'),
                     field_name='orgn_ntby_tr_pbmn',
                 )
-                if include_optional_legs
+                if include_investor_flow and not use_cached_flow_values
                 else (cached_market_row or {}).get('institution_net_value')
             ),
             'investor_flow_value_unit': KRW_UNIT,
@@ -1347,11 +1481,13 @@ class MarketSnapshotService:
             if flow_statuses and all(status == 'ready' for status in flow_statuses)
             else 'cached'
             if flow_statuses and all(status == 'cached' for status in flow_statuses)
+            else 'unverified'
+            if flow_statuses and all(status == 'unverified' for status in flow_statuses)
             else 'unavailable'
             if flow_statuses and all(status == 'unavailable' for status in flow_statuses)
             else 'partial'
         )
-        if flow_leg_status not in {'ready', 'cached'}:
+        if flow_leg_status != 'ready':
             missing_fields.append('markets.investor_flow')
         if usd_krw_snapshot.get('rate') is None:
             missing_fields.append('usd_krw.rate')

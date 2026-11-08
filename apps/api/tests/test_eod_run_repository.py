@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import unittest
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -18,16 +20,28 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+    nonblocking_partial_progression_digest,
+)
 from app.repositories.eod_run_repository import (
+    _automatic_terminal_continuation_resume_stage,
     _load_pipeline_recovery_candidates,
+    _resolved_terminal_continuation_suffix,
     AutoEODRecoveryTarget,
     advisory_eod_collection_lock,
     advisory_eod_collection_locks,
     complete_eod_collection_run,
     count_eod_run_persisted_symbols,
     create_eod_collection_run,
+    daily_price_bar_writer_admission,
+    daily_price_bar_writer_admission_lock,
     daily_price_bar_has_current_eod_run_provenance,
     eod_collection_advisory_lock_keys,
+    eod_collection_advisory_lock_is_held,
     list_eod_collection_runs,
     load_latest_eod_collection_run,
     load_latest_pykrx_enrichment_repair_checkpoint,
@@ -356,6 +370,49 @@ class DailyPriceBarRunProvenanceTests(unittest.TestCase):
 
 
 class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
+    def test_terminal_continuation_suffix_accepts_current_and_legacy_only(
+        self,
+    ) -> None:
+        current = (
+            'agent_feedback_summaries',
+            'signal_decider',
+            'next_open_execution_plan',
+        )
+        legacy = (*current, 'signal_decider_evaluations')
+
+        self.assertEqual(
+            _resolved_terminal_continuation_suffix(current),
+            current,
+        )
+        self.assertEqual(
+            _resolved_terminal_continuation_suffix(legacy),
+            legacy,
+        )
+        self.assertEqual(
+            _resolved_terminal_continuation_suffix(
+                ('price_collection', *current)
+            ),
+            current,
+        )
+        self.assertIsNone(
+            _resolved_terminal_continuation_suffix(
+                (*current, 'external_news_collect')
+            )
+        )
+        self.assertEqual(
+            _automatic_terminal_continuation_resume_stage(
+                legacy,
+                satisfied_prefix_count=2,
+            ),
+            'next_open_execution_plan',
+        )
+        self.assertIsNone(
+            _automatic_terminal_continuation_resume_stage(
+                legacy,
+                satisfied_prefix_count=3,
+            )
+        )
+
     def setUp(self) -> None:
         self.sqlite_engine = create_engine('sqlite+pysqlite:///:memory:')
         EODCollectionRun.__table__.create(self.sqlite_engine)
@@ -371,6 +428,293 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
     def _session_scope(self):
         with self.session_factory.begin() as session:
             yield session
+
+    def _persist_nonblocking_partial_recovery_lineage(
+        self,
+        *,
+        market_date: date,
+        include_pipeline_marker: bool,
+        reconcile_eod: bool,
+        followup_attempts: int = 1,
+    ) -> dict[str, int]:
+        from tests.test_eod_run_stage_support import EODRunStageSupportTests
+
+        recovery = deepcopy(
+            EODRunStageSupportTests._nonblocking_partial_recovery_result()
+        )
+        completed_at = datetime.fromisoformat(
+            recovery['pipeline_run']['completed_at']
+        )
+
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=market_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=2,
+                symbols_succeeded=2,
+                symbols_failed=0,
+                started_at=completed_at - timedelta(minutes=10),
+                completed_at=completed_at - timedelta(minutes=8),
+                run_metadata={'mode': 'daily_auto'},
+            )
+            session.add(eod_run)
+            session.flush()
+
+            session.add_all(
+                [
+                    DailyPipelineRun(
+                        market_date=market_date,
+                        trigger='auto_eod_followup_resume',
+                        status='failed',
+                        current_stage='signal_decider',
+                        started_at=completed_at
+                        - timedelta(minutes=10 - attempt),
+                        completed_at=completed_at
+                        - timedelta(minutes=9 - attempt),
+                        run_metadata={
+                            'reused_eod_collection_run_id': eod_run.id,
+                        },
+                    )
+                    for attempt in range(followup_attempts - 1)
+                ]
+            )
+
+            pipeline_metadata = deepcopy(
+                recovery['pipeline_run']['run_metadata']
+            )
+            pipeline_run = DailyPipelineRun(
+                market_date=market_date,
+                trigger='auto_eod_followup_resume',
+                status='partial',
+                current_stage=recovery['pipeline_run']['current_stage'],
+                started_at=completed_at - timedelta(minutes=4),
+                completed_at=completed_at,
+                run_metadata={},
+            )
+            session.add(pipeline_run)
+            session.flush()
+
+            marker = pipeline_metadata['nonblocking_partial_progression']
+            pipeline_metadata['reused_eod_collection_run_id'] = int(
+                eod_run.id
+            )
+            marker['market_date'] = market_date.isoformat()
+            marker['pipeline_run_id'] = int(pipeline_run.id)
+            marker['reused_eod_collection_run_id'] = int(eod_run.id)
+            marker['proof_digest'] = (
+                nonblocking_partial_progression_digest(marker)
+            )
+            if not include_pipeline_marker:
+                pipeline_metadata.pop(
+                    'nonblocking_partial_progression',
+                    None,
+                )
+            pipeline_run.run_metadata = pipeline_metadata
+            if reconcile_eod:
+                eod_run.run_metadata = {
+                    **eod_run.run_metadata,
+                    'nonblocking_partial_progression': deepcopy(marker),
+                    'nonblocking_feedback_retry_debt': deepcopy(
+                        marker['retry_debt']
+                    ),
+                }
+
+            for stage_id, stage in recovery['stages'].items():
+                is_signal_stage = stage_id == 'signal_decider'
+                counts = marker['decider'] if is_signal_stage else None
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=pipeline_run.id,
+                        market_date=market_date,
+                        stage_id=stage_id,
+                        status=stage['status'],
+                        processed=(counts or {}).get('total_items', 1),
+                        total=(counts or {}).get('total_items', 1),
+                        succeeded=(counts or {}).get('completed_items', 1),
+                        failed=(counts or {}).get('failed_items', 0),
+                        remaining=0,
+                        started_at=completed_at - timedelta(minutes=1),
+                        completed_at=completed_at,
+                        source_run_ids=(
+                            {
+                                'signal_decider_run_id': 'decider-run',
+                                'source_summary_run_id': 'summary-run',
+                            }
+                            if is_signal_stage
+                            else {
+                                'parent_signal_decider_run_id': (
+                                    'decider-run'
+                                ),
+                                'source_summary_run_id': 'summary-run',
+                            }
+                            if stage_id in {
+                                'next_open_execution_plan',
+                                'signal_decider_evaluations',
+                            }
+                            else {}
+                        ),
+                        details=(
+                            {
+                                'result_summary': deepcopy(
+                                    stage['result']
+                                ),
+                                'completion_scope_proof': deepcopy(
+                                    stage['details'][
+                                        'completion_scope_proof'
+                                    ]
+                                ),
+                            }
+                            if is_signal_stage
+                            else {
+                                'nonblocking_scope_proof': deepcopy(
+                                    marker['downstream'][
+                                        'plan_scope_proof'
+                                        if stage_id
+                                        == 'next_open_execution_plan'
+                                        else 'evaluation_scope_proof'
+                                    ]
+                                ),
+                                'completion_scope_proof': deepcopy(
+                                    stage['details'][
+                                        'completion_scope_proof'
+                                    ]
+                                ),
+                            }
+                            if stage_id in {
+                                'next_open_execution_plan',
+                                'signal_decider_evaluations',
+                            }
+                            else {}
+                        ),
+                    )
+                )
+
+            return {
+                'eod_run_id': int(eod_run.id),
+                'pipeline_run_id': int(pipeline_run.id),
+            }
+
+    def _load_recovery_target_for_date(
+        self,
+        market_date: date,
+    ) -> AutoEODRecoveryTarget | None:
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            return load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=market_date,
+                on_or_before=market_date,
+            )
+
+    def test_bare_nonblocking_partial_remains_recovery_eligible(self) -> None:
+        market_date = date(2026, 10, 19)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=False,
+            reconcile_eod=False,
+        )
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_reconciled_nonblocking_partial_is_not_recovery_eligible(
+        self,
+    ) -> None:
+        market_date = date(2026, 10, 20)
+        self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=True,
+        )
+
+        self.assertIsNone(self._load_recovery_target_for_date(market_date))
+
+    def test_valid_nonblocking_partial_without_eod_copy_surfaces_past_cap(
+        self,
+    ) -> None:
+        market_date = date(2026, 4, 14)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=False,
+            followup_attempts=5,
+        )
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, lineage['eod_run_id'])
+            eod_run.run_metadata = {
+                **eod_run.run_metadata,
+                'followup_recovery_required': True,
+            }
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_tampered_nonblocking_partial_marker_remains_recovery_eligible(
+        self,
+    ) -> None:
+        market_date = date(2026, 10, 21)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=True,
+        )
+        with self.session_factory.begin() as session:
+            pipeline_run = session.get(
+                DailyPipelineRun,
+                lineage['pipeline_run_id'],
+            )
+            metadata = deepcopy(pipeline_run.run_metadata)
+            metadata['nonblocking_partial_progression']['summary'][
+                'completed_symbols'
+            ] = ['005930']
+            pipeline_run.run_metadata = metadata
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_tampered_eod_nonblocking_copy_remains_recovery_eligible(
+        self,
+    ) -> None:
+        market_date = date(2026, 10, 22)
+        lineage = self._persist_nonblocking_partial_recovery_lineage(
+            market_date=market_date,
+            include_pipeline_marker=True,
+            reconcile_eod=True,
+        )
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, lineage['eod_run_id'])
+            metadata = deepcopy(eod_run.run_metadata)
+            metadata['nonblocking_feedback_retry_debt'][
+                'summary_failed_symbols_by_role'
+            ]['technical-summarizer'] = []
+            eod_run.run_metadata = metadata
+
+        self.assertEqual(
+            self._load_recovery_target_for_date(market_date),
+            AutoEODRecoveryTarget(
+                trade_date=market_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
 
     def test_repair_marker_projection_preserves_raw_json_types(self) -> None:
         session = MagicMock()
@@ -1816,7 +2160,6 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
             'agent_feedback_summaries',
             'signal_decider',
             'next_open_execution_plan',
-            'signal_decider_evaluations',
         ]
         with self.session_factory.begin() as session:
             eod_run = EODCollectionRun(
@@ -2241,7 +2584,6 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                     'agent_feedback_summaries': 'completed',
                     'signal_decider': 'pending',
                     'next_open_execution_plan': 'pending',
-                    'signal_decider_evaluations': 'pending',
                 },
             }
             decider_stage = session.execute(
@@ -2760,6 +3102,560 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
                 )
             )
         self.assertIsNone(missing_child_target)
+
+    def _persist_same_day_open_false_skip_lineage(
+        self,
+        *,
+        source_date: date,
+        target_date: date,
+        followup_attempts: int,
+        latest_status: str = 'partial',
+        include_marker: bool = False,
+        canonical_proof: bool = True,
+        marker_delay_seconds_after_false_skip: int = 1,
+        marker_overrides: dict | None = None,
+    ) -> dict[str, int]:
+        started_at = datetime.combine(
+            target_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ) + timedelta(hours=1)
+        stage_ids = AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+        with self.session_factory.begin() as session:
+            eod_run = EODCollectionRun(
+                market='KRX',
+                trade_date=source_date,
+                source='pykrx',
+                trigger='auto_close_scheduler',
+                status='completed',
+                symbols_total=2,
+                symbols_succeeded=2,
+                symbols_failed=0,
+                started_at=started_at,
+                run_metadata={
+                    'mode': 'daily_auto',
+                    'markets': ['KOSPI', 'KOSDAQ'],
+                    'downstream_retry_symbols': [],
+                },
+            )
+            session.add(eod_run)
+            session.flush()
+            eod_run_id = int(eod_run.id)
+            prior_runs = [
+                DailyPipelineRun(
+                    market_date=source_date,
+                    trigger='auto_eod_followup_resume',
+                    status='failed',
+                    current_stage='signal_decider',
+                    started_at=started_at + timedelta(minutes=index),
+                    completed_at=started_at + timedelta(minutes=index),
+                    run_metadata={
+                        'reused_eod_collection_run_id': eod_run.id,
+                    },
+                )
+                for index in range(4)
+            ]
+            session.add_all(prior_runs)
+            session.flush()
+            proof_pipeline_run = prior_runs[-1]
+            proof_pipeline_run_id = int(proof_pipeline_run.id)
+            if canonical_proof:
+                proof_pipeline_run.status = 'blocked'
+                proof_pipeline_run.current_stage = stage_ids[-1]
+                proof_pipeline_run.completed_at = started_at + timedelta(
+                    minutes=4
+                )
+                proof_pipeline_run.run_metadata = {
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'reused_eod_collection_run_id': eod_run.id,
+                    'resolved_stages': list(stage_ids),
+                    'resume_from_stage': stage_ids[0],
+                    'point_in_time_recovery': True,
+                    'force': False,
+                    'reuse_existing_feedback': True,
+                    'allow_expired_analysis_replay': False,
+                    'same_day_intraday_watch_continuation_admitted': True,
+                    'fs_div': 'CFS',
+                    'feedback_knowledge_cutoff': {
+                        'ready': True,
+                        'reason': 'latest_completed_summary_cutoff',
+                        'knowledge_cutoff_at': (
+                            started_at + timedelta(minutes=3)
+                        ).isoformat(),
+                        'source_run_id': 'feedback-cycle-summary',
+                        'feedback_scope_mode': 'decider_scope_fast_path',
+                        'requested_symbols': ['005930'],
+                    },
+                }
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=proof_pipeline_run.id,
+                        market_date=source_date,
+                        stage_id='signal_decider',
+                        status='partial',
+                        processed=160,
+                        total=160,
+                        succeeded=147,
+                        failed=13,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=3),
+                        completed_at=started_at + timedelta(minutes=4),
+                        source_run_ids={
+                            'agent_feedback_run_id': 'decider-cycle-prior'
+                        },
+                        details={
+                            'result_summary': {
+                                'run_id': 'decider-cycle-prior',
+                                'prerequisites': {'ready': True},
+                                'progress': {
+                                    'summary': {
+                                        'run_status': 'partial',
+                                        'failed_items': 13,
+                                        'completed_cycles': 0,
+                                        'cycle_number': 1,
+                                        'failure_groups': {
+                                            'openclaw_transport_error': {
+                                                'count': 13,
+                                                'retryable_count': 13,
+                                            }
+                                        },
+                                        'role_progress': {
+                                            'short-term-decider': {
+                                                'retry_pending_symbols': 13,
+                                                'in_progress_symbols': 0,
+                                                'pending_symbols': 0,
+                                            },
+                                            'signal-decider': {
+                                                'retry_pending_symbols': 0,
+                                                'in_progress_symbols': 0,
+                                                'pending_symbols': 0,
+                                            },
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    )
+                )
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=proof_pipeline_run.id,
+                        market_date=source_date,
+                        stage_id='next_open_execution_plan',
+                        status='blocked',
+                        processed=0,
+                        total=0,
+                        succeeded=0,
+                        failed=0,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=4),
+                        completed_at=started_at + timedelta(minutes=4),
+                        source_run_ids={},
+                        details={
+                            'result_summary': {
+                                'reason': 'signal_decider_stage_incomplete'
+                            }
+                        },
+                    )
+                )
+            false_skip = DailyPipelineRun(
+                market_date=source_date,
+                trigger='auto_eod_followup_resume',
+                status='skipped',
+                current_stage=stage_ids[-1],
+                started_at=started_at + timedelta(minutes=5),
+                completed_at=started_at + timedelta(minutes=6),
+                run_metadata={
+                    'entrypoint': 'daily_pipeline_stage_service.run',
+                    'reused_eod_collection_run_id': eod_run.id,
+                    'resolved_stages': list(stage_ids),
+                    'resume_from_stage': 'signal_decider',
+                    'point_in_time_recovery': True,
+                    'force': False,
+                    'reuse_existing_feedback': True,
+                    'allow_expired_analysis_replay': False,
+                    'same_day_intraday_watch_continuation_admitted': False,
+                },
+            )
+            session.add(false_skip)
+            session.flush()
+            for stage_id in stage_ids:
+                session.add(
+                    DailyPipelineStageRun(
+                        pipeline_run_id=false_skip.id,
+                        market_date=source_date,
+                        stage_id=stage_id,
+                        status='skipped',
+                        processed=0,
+                        total=0,
+                        succeeded=0,
+                        failed=0,
+                        remaining=0,
+                        started_at=started_at + timedelta(minutes=5),
+                        completed_at=started_at + timedelta(minutes=6),
+                        source_run_ids={},
+                        details={
+                            'result_summary': {
+                                'triggered': False,
+                                'status': 'skipped',
+                                'reason': 'next_open_window_expired',
+                                'market_date': source_date.isoformat(),
+                                'target_trade_date': target_date.isoformat(),
+                                'current_market_date': target_date.isoformat(),
+                                'market_state': 'OPEN',
+                                'stage': stage_id,
+                            }
+                        },
+                    )
+                )
+
+            latest_recovery = false_skip
+            for attempt_index in range(5, followup_attempts):
+                is_latest = attempt_index == followup_attempts - 1
+                latest_recovery = DailyPipelineRun(
+                    market_date=source_date,
+                    trigger='auto_eod_followup_resume',
+                    status=latest_status if is_latest else 'failed',
+                    current_stage='signal_decider',
+                    started_at=started_at
+                    + timedelta(minutes=attempt_index + 2),
+                    completed_at=started_at
+                    + timedelta(minutes=attempt_index + 3),
+                    run_metadata={
+                        'entrypoint': 'daily_pipeline_stage_service.run',
+                        'resolved_stages': list(stage_ids),
+                        'resume_from_stage': stage_ids[0],
+                        'reused_eod_collection_run_id': eod_run.id,
+                        'point_in_time_recovery': True,
+                        'force': False,
+                        'reuse_existing_feedback': True,
+                        'allow_expired_analysis_replay': False,
+                    },
+                )
+                session.add(latest_recovery)
+            session.flush()
+
+            if include_marker:
+                marker = {
+                    'version': SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+                    'status': 'pending',
+                    'source_false_skip_run_id': int(false_skip.id),
+                    'proof_pipeline_run_id': proof_pipeline_run_id,
+                    'target_trade_date': target_date.isoformat(),
+                    'attempt_limit': (
+                        SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                    ),
+                    'started_at': (
+                        started_at
+                        + timedelta(
+                            minutes=6,
+                            seconds=marker_delay_seconds_after_false_skip,
+                        )
+                    ).isoformat(),
+                }
+                marker.update(marker_overrides or {})
+                eod_run.run_metadata = {
+                    **eod_run.run_metadata,
+                    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY: marker,
+                }
+
+            return {
+                'eod_run_id': eod_run_id,
+                'false_skip_run_id': int(false_skip.id),
+                'proof_pipeline_run_id': proof_pipeline_run_id,
+                'latest_recovery_run_id': int(latest_recovery.id),
+            }
+
+    def test_same_day_open_false_skip_rearms_cleared_exact_pitr_debt(
+        self,
+    ) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=5,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_markerless_post_cap_partial_does_not_extend_recovery(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_valid_rearm_marker_surfaces_post_cap_partial_or_interrupted(
+        self,
+    ) -> None:
+        for day_offset, latest_status in enumerate(
+            ('partial', 'interrupted'),
+            start=20,
+        ):
+            with self.subTest(latest_status=latest_status):
+                source_date = date(2026, 10, day_offset)
+                target_date = source_date + timedelta(days=1)
+                lineage = self._persist_same_day_open_false_skip_lineage(
+                    source_date=source_date,
+                    target_date=target_date,
+                    followup_attempts=6,
+                    latest_status=latest_status,
+                    include_marker=True,
+                )
+
+                with patch(
+                    'app.repositories.eod_run_repository.session_scope',
+                    self._session_scope,
+                ):
+                    target = load_oldest_outstanding_auto_eod_recovery_target(
+                        on_or_after=source_date,
+                        on_or_before=target_date,
+                    )
+
+                self.assertEqual(
+                    target,
+                    AutoEODRecoveryTarget(
+                        trade_date=source_date.isoformat(),
+                        eod_run_id=lineage['eod_run_id'],
+                    ),
+                )
+
+    def test_valid_rearm_marker_surfaces_eighth_attempt_once_more(self) -> None:
+        source_date = date(2026, 10, 24)
+        target_date = date(2026, 10, 25)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=8,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_terminally_expired_rearm_does_not_resurface_next_day(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+        with self.session_factory.begin() as session:
+            eod_run = session.get(EODCollectionRun, lineage['eod_run_id'])
+            metadata = dict(eod_run.run_metadata)
+            metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY] = {
+                **metadata[SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY],
+                'status': 'blocked',
+                'blocked_reason': 'next_open_window_expired',
+                'blocked_at': '2026-10-28T06:30:00+00:00',
+            }
+            metadata['followup_recovery_required'] = False
+            eod_run.run_metadata = metadata
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date + timedelta(days=1),
+            )
+
+        self.assertIsNone(target)
+
+    def test_stale_pending_rearm_surfaces_once_for_terminal_block(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date + timedelta(days=1),
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_stale_pending_rearm_surfaces_after_pre_run_crash(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        lineage = self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=5,
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date + timedelta(days=1),
+            )
+
+        self.assertEqual(
+            target,
+            AutoEODRecoveryTarget(
+                trade_date=source_date.isoformat(),
+                eod_run_id=lineage['eod_run_id'],
+            ),
+        )
+
+    def test_invalid_rearm_marker_does_not_extend_recovery(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+            include_marker=True,
+            marker_overrides={'attempt_limit': 9},
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_rearm_marker_rejects_generic_failed_proof_run(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+            include_marker=True,
+            canonical_proof=False,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_rearm_marker_must_precede_first_post_skip_attempt(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=6,
+            latest_status='partial',
+            include_marker=True,
+            marker_delay_seconds_after_false_skip=61,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
+
+    def test_rearm_marker_cannot_extend_past_eighth_attempt(self) -> None:
+        source_date = date(2026, 10, 27)
+        target_date = date(2026, 10, 28)
+        self._persist_same_day_open_false_skip_lineage(
+            source_date=source_date,
+            target_date=target_date,
+            followup_attempts=9,
+            latest_status='interrupted',
+            include_marker=True,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            target = load_oldest_outstanding_auto_eod_recovery_target(
+                on_or_after=source_date,
+                on_or_before=target_date,
+            )
+
+        self.assertIsNone(target)
 
     def test_exhausted_terminal_satisfied_followup_remains_eligible_for_convergence(
         self,
@@ -3424,6 +4320,170 @@ class OldestOutstandingAutoEODRecoveryDateTests(unittest.TestCase):
 
 class AdvisoryEODCollectionLockTests(unittest.TestCase):
     @patch('app.repositories.eod_run_repository.engine')
+    def test_same_context_lock_is_reentrant_and_resets_ownership(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        self.assertFalse(
+            eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            )
+        )
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-09-23',
+            source='daily_price_bars',
+        ) as acquired:
+            self.assertTrue(acquired)
+            self.assertTrue(
+                eod_collection_advisory_lock_is_held(
+                    market='KRX',
+                    trade_date='2026-09-23',
+                    source='daily_price_bars',
+                )
+            )
+            with advisory_eod_collection_lock(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            ) as nested_acquired:
+                self.assertTrue(nested_acquired)
+
+        self.assertFalse(
+            eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            )
+        )
+        engine.connect.assert_called_once_with()
+        self.assertEqual(connection.execute.call_count, 4)
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_sync_writer_admission_holds_fence_for_complete_call(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+        observed_ownership: list[bool] = []
+
+        @daily_price_bar_writer_admission
+        def writer(*, market_date: date) -> str:
+            observed_ownership.append(
+                eod_collection_advisory_lock_is_held(
+                    market='KRX',
+                    trade_date=market_date,
+                    source='daily_price_bars',
+                )
+            )
+            return market_date.isoformat()
+
+        self.assertEqual(
+            writer(market_date=date(2026, 9, 23)),
+            '2026-09-23',
+        )
+        self.assertEqual(observed_ownership, [True])
+        self.assertFalse(
+            eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date='2026-09-23',
+                source='daily_price_bars',
+            )
+        )
+        engine.connect.assert_called_once_with()
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_async_writer_admission_is_reentrant_under_outer_fence(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        @daily_price_bar_writer_admission
+        async def writer(*, market_date: date) -> bool:
+            return eod_collection_advisory_lock_is_held(
+                market='KRX',
+                trade_date=market_date,
+                source='daily_price_bars',
+            )
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-09-23',
+            source='daily_price_bars',
+        ) as acquired:
+            self.assertTrue(acquired)
+            self.assertTrue(
+                asyncio.run(writer(market_date=date(2026, 9, 23)))
+            )
+
+        engine.connect.assert_called_once_with()
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_writer_admission_fails_closed_when_date_fence_is_busy(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = False
+
+        @daily_price_bar_writer_admission
+        def writer(*, market_date: date) -> None:
+            self.fail('contended writer must not run')
+
+        with self.assertRaisesRegex(RuntimeError, 'already held'):
+            writer(market_date=date(2026, 9, 23))
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_writer_admission_context_is_reentrant_under_outer_fence(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = True
+
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2026-09-23',
+            source='daily_price_bars',
+        ) as acquired:
+            self.assertTrue(acquired)
+            with daily_price_bar_writer_admission_lock(
+                market_date=date(2026, 9, 23),
+            ):
+                self.assertTrue(
+                    eod_collection_advisory_lock_is_held(
+                        market='KRX',
+                        trade_date='2026-09-23',
+                        source='daily_price_bars',
+                    )
+                )
+
+        engine.connect.assert_called_once_with()
+
+    @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_sorts_deduplicates_and_unlocks_in_reverse(
         self,
         engine,
@@ -3451,27 +4511,31 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
             isolation_level='AUTOCOMMIT'
         )
         calls = connection.execute.call_args_list
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 8)
         self.assertEqual(
-            [call.args[1] for call in calls[:3]],
+            [call.args[1] for call in calls[:4]],
             [
+                {'source_key': 10_003, 'trade_key': 0},
                 {'source_key': 10_003, 'trade_key': 20_260_921},
                 {'source_key': 10_003, 'trade_key': 20_260_922},
                 {'source_key': 10_003, 'trade_key': 20_260_923},
             ],
         )
         self.assertEqual(
-            [call.args[1] for call in calls[3:]],
+            [call.args[1] for call in calls[4:]],
             [
                 {'source_key': 10_003, 'trade_key': 20_260_923},
                 {'source_key': 10_003, 'trade_key': 20_260_922},
                 {'source_key': 10_003, 'trade_key': 20_260_921},
+                {'source_key': 10_003, 'trade_key': 0},
             ],
         )
-        for call in calls[:3]:
+        self.assertIn('pg_try_advisory_lock_shared', str(calls[0].args[0]))
+        for call in calls[1:4]:
             self.assertIn('pg_try_advisory_lock', str(call.args[0]))
-        for call in calls[3:]:
+        for call in calls[4:7]:
             self.assertIn('pg_advisory_unlock', str(call.args[0]))
+        self.assertIn('pg_advisory_unlock_shared', str(calls[7].args[0]))
 
     @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_reports_blocked_date_and_releases_prefix(
@@ -3488,7 +4552,9 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         blocked_lock.scalar.return_value = False
         connection.execute.side_effect = [
             first_lock,
+            first_lock,
             blocked_lock,
+            MagicMock(),
             MagicMock(),
         ]
 
@@ -3500,10 +4566,10 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
             self.assertEqual(lock_result, (False, '2026-09-22'))
 
         calls = connection.execute.call_args_list
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 5)
         self.assertEqual(
             [call.args[1]['trade_key'] for call in calls],
-            [20_260_921, 20_260_922, 20_260_921],
+            [0, 20_260_921, 20_260_922, 20_260_921, 0],
         )
         self.assertIn('pg_advisory_unlock', str(calls[-1].args[0]))
 
@@ -3520,7 +4586,9 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         first_lock.scalar.return_value = True
         connection.execute.side_effect = [
             first_lock,
+            first_lock,
             RuntimeError('database connection interrupted'),
+            MagicMock(),
             MagicMock(),
         ]
 
@@ -3533,14 +4601,44 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
                 self.fail('failed acquisition must not enter its context')
 
         calls = connection.execute.call_args_list
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 5)
         self.assertIn('pg_try_advisory_lock', str(calls[0].args[0]))
-        self.assertIn('pg_try_advisory_lock', str(calls[1].args[0]))
-        self.assertIn('pg_advisory_unlock', str(calls[2].args[0]))
+        self.assertIn('pg_try_advisory_lock', str(calls[2].args[0]))
+        self.assertIn('pg_advisory_unlock', str(calls[3].args[0]))
         self.assertEqual(
-            calls[2].args[1],
+            calls[3].args[1],
             {'source_key': 10_003, 'trade_key': 20_260_921},
         )
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_multi_date_unlock_failure_invalidates_pooled_session(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        first_lock = MagicMock()
+        first_lock.scalar.return_value = True
+        second_lock = MagicMock()
+        second_lock.scalar.return_value = True
+        connection.execute.side_effect = [
+            first_lock,
+            first_lock,
+            second_lock,
+            RuntimeError('unlock statement interrupted'),
+        ]
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2026-09-21', '2026-09-22'),
+            source='daily_price_bars',
+        ) as lock_result:
+            self.assertEqual(lock_result, (True, None))
+
+        connection.invalidate.assert_called_once_with()
+        self.assertEqual(connection.execute.call_count, 4)
 
     @patch('app.repositories.eod_run_repository.engine')
     def test_multi_date_lock_rejects_empty_date_set_without_connecting(
@@ -3556,6 +4654,62 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
                 self.fail('empty lock set must not enter its context')
 
         engine.connect.assert_not_called()
+
+    @patch('app.repositories.eod_run_repository.engine')
+    def test_exclusive_admission_reports_global_contention_before_date_locks(
+        self,
+        engine,
+    ) -> None:
+        raw_connection = MagicMock()
+        connection = MagicMock()
+        engine.connect.return_value.__enter__.return_value = raw_connection
+        raw_connection.execution_options.return_value = connection
+        connection.execute.return_value.scalar.return_value = False
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2099-12-30',),
+            source='daily_price_bars',
+            exclusive_admission=True,
+        ) as lock_result:
+            self.assertEqual(lock_result, (False, 'all_dates'))
+
+        self.assertEqual(connection.execute.call_count, 1)
+        call = connection.execute.call_args
+        self.assertEqual(
+            call.args[1],
+            {'source_key': 10_003, 'trade_key': 0},
+        )
+        self.assertIn('pg_try_advisory_lock(', str(call.args[0]))
+
+    def test_no_bar_cross_date_writer_blocks_exclusive_repair_admission(self):
+        with advisory_eod_collection_lock(
+            market='KRX',
+            trade_date='2099-12-29',
+            source='daily_price_bars',
+        ) as writer_acquired:
+            self.assertTrue(writer_acquired)
+            with advisory_eod_collection_locks(
+                market='KRX',
+                trade_dates=('2099-12-30',),
+                source='daily_price_bars',
+                exclusive_admission=True,
+            ) as repair_result:
+                self.assertEqual(repair_result, (False, 'all_dates'))
+
+        with advisory_eod_collection_locks(
+            market='KRX',
+            trade_dates=('2099-12-30',),
+            source='daily_price_bars',
+            exclusive_admission=True,
+        ) as repair_result:
+            self.assertEqual(repair_result, (True, None))
+            with advisory_eod_collection_lock(
+                market='KRX',
+                trade_date='2099-12-31',
+                source='daily_price_bars',
+            ) as writer_acquired:
+                self.assertFalse(writer_acquired)
 
     def test_daily_price_bar_lock_uses_shared_writer_key(self) -> None:
         self.assertEqual(
@@ -3666,7 +4820,77 @@ class AdvisoryEODCollectionLockTests(unittest.TestCase):
         ) as acquired:
             self.assertTrue(acquired)
 
+        connection.invalidate.assert_called_once_with()
         engine.connect.return_value.__exit__.assert_called_once_with(None, None, None)
+
+    def test_unlock_failure_discards_real_pooled_session(self) -> None:
+        probe_engine = create_engine(
+            engine.url,
+            pool_size=2,
+            max_overflow=0,
+            future=True,
+        )
+        source_key, trade_key = eod_collection_advisory_lock_keys(
+            market='KRX',
+            trade_date='2099-12-29',
+            source='daily_price_bars',
+        )
+        parameters = {'source_key': source_key, 'trade_key': trade_key}
+
+        def fail_unlock_before_execution(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if 'pg_advisory_unlock' in statement:
+                raise RuntimeError('synthetic unlock failure')
+
+        event.listen(
+            probe_engine,
+            'before_cursor_execute',
+            fail_unlock_before_execution,
+        )
+        try:
+            # Keep a separate backend checked out so it can verify that the
+            # owner's PostgreSQL session was actually closed, not merely
+            # returned to the pool with its session-level lock intact.
+            with probe_engine.connect() as contender:
+                with patch(
+                    'app.repositories.eod_run_repository.engine',
+                    probe_engine,
+                ):
+                    with advisory_eod_collection_lock(
+                        market='KRX',
+                        trade_date='2099-12-29',
+                        source='daily_price_bars',
+                    ) as acquired:
+                        self.assertTrue(acquired)
+
+                transaction = contender.begin()
+                try:
+                    contender_acquired = bool(
+                        contender.execute(
+                            text(
+                                'SELECT pg_try_advisory_xact_lock('
+                                ':source_key, :trade_key)'
+                            ),
+                            parameters,
+                        ).scalar()
+                    )
+                finally:
+                    transaction.rollback()
+
+            self.assertTrue(contender_acquired)
+        finally:
+            event.remove(
+                probe_engine,
+                'before_cursor_execute',
+                fail_unlock_before_execution,
+            )
+            probe_engine.dispose()
 
 
 class CompleteEODCollectionRunUnitTests(unittest.TestCase):

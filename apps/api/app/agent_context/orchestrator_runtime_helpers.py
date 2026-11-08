@@ -435,10 +435,12 @@ def dispatch_for_symbols_via_subagents(
     fs_div: str | None,
     disclosures_limit: int,
     per_role_parallelism: int,
+    force: bool,
     signal_decider_agent_name: str,
     normalize_requested_symbols: Callable[[Sequence[str]], list[str]],
     split_requested_symbols_by_agent_feedback_eligibility: Callable[..., tuple[list[str], list[str]]],
     agent_context_read_service,
+    agent_feedback_prerequisite_service,
     normalize_agent_response: Callable[..., dict[str, Any]],
     build_response_storage_payload: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
@@ -479,6 +481,48 @@ def dispatch_for_symbols_via_subagents(
             },
             'items': [],
             'failures': [],
+        }
+    prerequisites = (
+        None
+        if force
+        else agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+            fs_div=fs_div,
+            symbols=dispatch_symbols,
+        )
+    )
+    if prerequisites is not None and not prerequisites['ready']:
+        return {
+            'request': {
+                'market_date': normalized_market_date.isoformat(),
+                'symbols': list(dispatch_symbols),
+                'requested_symbols': requested_symbols,
+                'request_run_id': None,
+                'roles': [spec.role for spec in specs],
+                'fs_div': fs_div,
+                'disclosures_limit': disclosures_limit,
+                'per_role_parallelism': max(
+                    1,
+                    int(per_role_parallelism),
+                ),
+                'scope': AGENT_FEEDBACK_SCOPE_REQUESTED,
+                'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                'eligibility_filters': list(
+                    AGENT_FEEDBACK_ELIGIBILITY_FILTERS
+                ),
+                'skipped_symbols': skipped_symbols,
+                'mode': 'slot_parent_subagent_fanout',
+            },
+            'summary': {
+                'status': prerequisites['status'],
+                'completed': 0,
+                'failed': 0,
+                'skipped': len(skipped_symbols),
+                'gated': True,
+            },
+            'items': [],
+            'failures': [],
+            'prerequisites': prerequisites,
         }
     symbol_context = agent_context_read_service.get_symbol_day_context(
         market_date=normalized_market_date,

@@ -4019,6 +4019,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_account_targets = f'Main={self.account_reference}@1500000'
         self.client = FakeExecClient()
         self.service = SignalDeciderExecIntegrationService(client=self.client)
+        self.passive_wait_loader_patcher = patch.object(
+            self.service,
+            '_load_passive_signal_wait_observations',
+            return_value=[],
+        )
+        self.passive_wait_loader_patcher.start()
+        self.addCleanup(self.passive_wait_loader_patcher.stop)
         self.utcnow_patcher = patch(
             'app.orders.exec_integration._utcnow',
             return_value=datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc),
@@ -5097,6 +5104,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         *,
         exec_status: str = 'watch_monitoring_active',
         response_item_status: str | None = None,
+        additional_intent_statuses: dict[str, str] | None = None,
         core_execution_status: str = 'planned',
         blocking_reason_code: str = 'manual_recovery_gate_block',
     ) -> tuple[dict, dict, int]:
@@ -5167,24 +5175,57 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'ready': True,
             'monitoring': {'alive': True},
         }
+        response_items = [
+            {
+                'core_item_key': short_entry_item['core_item_key'],
+                'execution_plan_id': short_entry_link['exec_plan_id'],
+                'execution_plan_item_id': short_entry_link[
+                    'exec_plan_item_id'
+                ],
+                'symbol': self.symbol,
+                'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
+                'status': response_item_status or exec_status,
+                'monitoring_status': exec_status,
+            }
+        ]
+        for intent, status in (additional_intent_statuses or {}).items():
+            source_item = next(
+                item
+                for item in short_post_call['items']
+                if item.get('intent') == intent
+            )
+            with session_scope() as session:
+                persisted_short_row = session.get(
+                    SignalDeciderExecutionPlanItem,
+                    short_plan_item_id,
+                )
+                intent_link = next(
+                    link
+                    for link in persisted_short_row.submission_payload[
+                        'exec_dispatch'
+                    ]['item_links']
+                    if link['intent'] == intent
+                )
+            response_items.append(
+                {
+                    'core_item_key': source_item['core_item_key'],
+                    'execution_plan_id': intent_link['exec_plan_id'],
+                    'execution_plan_item_id': intent_link[
+                        'exec_plan_item_id'
+                    ],
+                    'symbol': self.symbol,
+                    'intent': intent,
+                    'status': status,
+                    'monitoring_status': status,
+                }
+            )
+
         self.client.plan_response = {
             'items': [
                 {
                     'external_plan_id': short_plan_id,
                     'status': 'accepted',
-                    'items': [
-                        {
-                            'core_item_key': short_entry_item['core_item_key'],
-                            'execution_plan_id': short_entry_link['exec_plan_id'],
-                            'execution_plan_item_id': short_entry_link[
-                                'exec_plan_item_id'
-                            ],
-                            'symbol': self.symbol,
-                            'intent': EXEC_INTENT_INTRADAY_WATCH_BUY,
-                            'status': response_item_status or exec_status,
-                            'monitoring_status': exec_status,
-                        }
-                    ],
+                    'items': response_items,
                 }
             ]
         }
@@ -5307,11 +5348,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items_by_agent['signal-decider']['eligibility_status'], 'blocked')
         self.assertEqual(items_by_agent['short-term-decider']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
 
-    async def test_short_term_entry_quality_blocks_scalp_when_signal_decider_waits(self) -> None:
+    async def test_short_term_entry_quality_has_no_signal_lane_dependency(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
             tactical_action='scalp_buy_candidate',
             request_payload={
                 'symbol_day_context': {
+                    'pre_decider_enrichment_context': (
+                        self._closed_market_pre_decider_context()
+                    ),
                     'technical_snapshot': {
                         'trend_state': 'uptrend',
                         'breakout_20d': True,
@@ -5339,18 +5383,41 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={
-                    'action': 'wait',
-                    'decision_snapshot_id': self.snapshot_id,
-                    'policy_version': self.policy_version,
-                },
                 tactical_action='scalp_buy_candidate',
             )
+            validation, _traceability = (
+                signal_decider_next_open_execution_service._build_validation_payload(
+                    snapshot=snapshot,
+                    target=NextOpenAccountTarget(
+                        label='Main',
+                        account_reference=self.account_reference,
+                        budget_krw=Decimal('1500000'),
+                    ),
+                    policy_context=None,
+                    price_cache={},
+                )
+            )
 
-        blocking_codes = {entry['code'] for entry in blocks}
-        self.assertIn('signal_decider_wait_blocks_scalp_buy', blocking_codes)
-        self.assertEqual(warnings, [])
-        self.assertEqual(feature_snapshot['signal_decider_crosscheck']['action'], 'wait')
+        self.assertEqual(blocks, [])
+        serialized_quality = json.dumps(
+            {
+                'warnings': warnings,
+                'feature_snapshot': feature_snapshot,
+            },
+            sort_keys=True,
+        )
+        serialized_validation = json.dumps(validation, sort_keys=True)
+        for serialized in (serialized_quality, serialized_validation):
+            self.assertNotIn('signal_decider_crosscheck', serialized)
+            self.assertNotIn('cross_lane', serialized)
+            self.assertNotIn('alignment_gate', serialized)
+        self.assertEqual(validation['blocking_reasons'], [])
+        self.assertNotIn('requested_quantity', validation['pricing'])
+        self.assertNotIn('final_quantity', validation['pricing'])
+        self.assertEqual(
+            validation['handoff']['approval_state'],
+            'pending_exec_agent',
+        )
 
     async def test_short_term_entry_quality_warns_low_buy_quality_score(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot(
@@ -5389,7 +5456,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5407,7 +5473,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5450,7 +5515,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5489,7 +5553,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5532,7 +5595,6 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             snapshot = session.get(SignalDeciderDecisionSnapshot, short_snapshot_id)
             blocks, warnings, feature_snapshot = _short_term_entry_quality_blocks(
                 snapshot=snapshot,
-                signal_decider_crosscheck={'action': 'buy'},
                 tactical_action='watch_for_trigger',
             )
 
@@ -5637,7 +5699,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry_item['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', entry_item['quantity_policy'])
         self.assertEqual(Decimal(str(entry_item['quantity_policy']['budget_krw'])), Decimal('1500000'))
-        self.assertIsNone(entry_item['quantity_policy']['estimated_notional_krw'])
+        self.assertEqual(
+            entry_item['quantity_policy']['estimated_notional_krw'],
+            '250000.00',
+        )
         self.assertEqual(entry_item['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(
             entry_item['risk_context']['max_holding_close_policy'],
@@ -8823,30 +8888,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'projection_digest',
             json.dumps(entry['risk_context']['flow_short_sector_context']),
         )
-        self.assertEqual(
-            entry['risk_context']['signal_decider_alignment'],
-            'wait_conflict_block',
+        forbidden_alignment_keys = {
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_signal_decider_decision_snapshot_id',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+        }
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(entry['risk_context']))
+        self.assertNotIn(
+            'signal_decider_alignment',
+            json.dumps(handoff, sort_keys=True),
         )
-        self.assertEqual(
-            entry['risk_context']['alignment_gate_action'],
-            'report_only_block_candidate',
-        )
-        self.assertEqual(
-            entry['risk_context']['alignment_gate_reason'],
-            'signal_decider_wait_conflict',
-        )
-        self.assertEqual(
-            entry['risk_context'][
-                'alignment_signal_decider_decision_snapshot_id'
-            ],
-            991,
-        )
-        self.assertEqual(
-            entry['risk_context']['final_enforcement_decision'],
-            'allowed_report_only',
-        )
-        self.assertEqual(entry['risk_context']['requested_quantity'], '29')
-        self.assertEqual(entry['risk_context']['final_quantity'], '29')
         self.assertEqual(
             entry['risk_context']['data_quality_warnings'],
             ['Intraday order-book evidence requires a live recheck.'],
@@ -9123,6 +9179,258 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('role', handoff['decider_output']['response_payload'])
         self.assertNotIn('agent_name', handoff['decider_output']['response_payload'])
         self.assertEqual(handoff['decider_output']['response_payload']['next_day_open_action'], 'buy')
+
+    def _configure_signal_trigger_plan_contract(self) -> None:
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            snapshot.entry_price_basis = 'trigger_limit'
+            snapshot.target_price = 54_000
+            snapshot.stop_loss_price = 47_000
+            snapshot.response_payload = {
+                **(snapshot.response_payload or {}),
+                'next_day_open_action': 'buy',
+                'preferred_action': 'buy',
+                'trigger_price': 50_500,
+                'chase_limit_price': 51_500,
+                'target_price': 54_000,
+                'stop_loss_price': 47_000,
+                'trigger_conditions': ['50,500원 회복을 확인합니다.'],
+            }
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            row.planned_order_type = 'limit'
+            row.eligibility_status = 'monitor_candidate'
+            row.execution_status = 'awaiting_trigger'
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'handoff_intent': 'intraday_watch_buy',
+                'handoff_active': True,
+                'exec_monitoring_active': True,
+                'entry_execution_mode': 'pending_trigger_limit',
+                'trigger_price': 50_500,
+                'chase_limit_price': 51_500,
+                'target_price': 54_000,
+                'stop_loss_price': 47_000,
+            }
+
+    async def test_fresh_signal_trigger_plan_uses_persisted_rounded_snapshot_prices(
+        self,
+    ) -> None:
+        with session_scope() as session:
+            snapshot = session.get(
+                SignalDeciderDecisionSnapshot,
+                self.snapshot_id,
+            )
+            snapshot.entry_price_basis = 'trigger_limit'
+            snapshot.target_price = 54_001
+            snapshot.stop_loss_price = 49_800
+            snapshot.request_payload = {
+                'signal_decider_policy': (
+                    self._signal_decider_policy_request_fixture()
+                ),
+                'symbol_day_context': {
+                    'company': {'market': 'KOSPI'},
+                    'pre_decider_enrichment_context': (
+                        self._closed_market_pre_decider_context()
+                    ),
+                },
+            }
+            snapshot.response_payload = {
+                **(snapshot.response_payload or {}),
+                'next_day_open_action': 'buy',
+                'preferred_action': 'buy',
+                'trigger_price': 50_500,
+                'chase_limit_price': 51_500,
+                'target_price': 54_000.75,
+                'stop_loss_price': 49_799.75,
+                'trigger_conditions': ['50,500원 회복을 확인합니다.'],
+            }
+
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[
+                    {'trade_date': '2026-04-29', 'close_price': 50_000}
+                ],
+            ),
+            patch(
+                'app.orders.next_open_execution.signal_decider_loop_service.get_policy_prompt_context',
+                return_value={'status': 'active'},
+            ),
+        ):
+            result = await self.service.dispatch_next_open_plan(
+                target_trade_date=self.target_trade_date,
+                refresh_plan=True,
+                dry_run=True,
+                force=True,
+                trigger='persisted_rounded_signal_trigger_prices',
+            )
+
+        self.assertEqual(result['summary']['failed_group_count'], 0)
+        self.assertEqual(result['summary']['preview_group_count'], 1, result)
+        payload = result['dispatch']['preview_plans'][0]['payload']
+        entry_item = next(
+            item
+            for item in payload['items']
+            if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
+        )
+        self.assertEqual(entry_item['risk_context']['target_price'], '54001')
+        self.assertEqual(entry_item['risk_context']['stop_loss_price'], '49800')
+
+    async def test_dispatch_signal_trigger_buy_preserves_watch_prices_and_chase_cap(self) -> None:
+        self._configure_signal_trigger_plan_contract()
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        entry_item = self.client.post_calls[0]['items'][0]
+        self.assertEqual(entry_item['decision_agent_name'], 'signal-decider')
+        self.assertEqual(entry_item['intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
+        self.assertEqual(entry_item['trigger_price'], 50_500)
+        self.assertEqual(entry_item['limit_price'], 51_500)
+        self.assertEqual(
+            entry_item['risk_context']['entry_execution_mode'],
+            'pending_trigger_limit',
+        )
+        self.assertTrue(entry_item['risk_context']['monitoring_candidate'])
+        self.assertEqual(
+            entry_item['risk_context']['original_watch_trigger_price'],
+            50_500,
+        )
+        self.assertEqual(
+            entry_item['risk_context']['original_watch_chase_limit_price'],
+            51_500,
+        )
+
+    def test_signal_trigger_handoff_rejects_stale_planned_row_contract(self) -> None:
+        self._configure_signal_trigger_plan_contract()
+
+        def replace_trace_value(row, field, value) -> None:
+            traceability = copy.deepcopy(row.traceability_payload or {})
+            traceability[field] = value
+            row.traceability_payload = traceability
+
+        tamper_cases = (
+            (
+                'planned_order_type',
+                lambda row: setattr(row, 'planned_order_type', 'market'),
+            ),
+            (
+                'eligibility_status',
+                lambda row: setattr(row, 'eligibility_status', 'eligible'),
+            ),
+            (
+                'handoff_intent',
+                lambda row: replace_trace_value(
+                    row,
+                    'handoff_intent',
+                    'next_open_buy',
+                ),
+            ),
+            (
+                'handoff_active',
+                lambda row: replace_trace_value(
+                    row,
+                    'handoff_active',
+                    False,
+                ),
+            ),
+            (
+                'entry_execution_mode',
+                lambda row: replace_trace_value(
+                    row,
+                    'entry_execution_mode',
+                    'next_open_market',
+                ),
+            ),
+            (
+                'trigger_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'trigger_price',
+                    50_600,
+                ),
+            ),
+            (
+                'chase_limit_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'chase_limit_price',
+                    51_600,
+                ),
+            ),
+            (
+                'target_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'target_price',
+                    54_100,
+                ),
+            ),
+            (
+                'stop_loss_price',
+                lambda row: replace_trace_value(
+                    row,
+                    'stop_loss_price',
+                    49_100,
+                ),
+            ),
+        )
+
+        for field, tamper in tamper_cases:
+            with self.subTest(field=field):
+                rows = self.service._load_next_open_rows(
+                    target_trade_date=self.target_trade_date,
+                    account_reference=self.account_reference,
+                )
+                snapshots = self.service._load_snapshots(rows)
+                tamper(rows[0])
+                with self.assertRaisesRegex(
+                    SignalDeciderExecPayloadContractError,
+                    f'signal_trigger_plan_contract_mismatch:{field}',
+                ):
+                    self.service._build_exec_plan_payload(
+                        rows=rows,
+                        snapshots=snapshots,
+                        trigger='tampered_signal_trigger_contract',
+                    )
+
+    async def test_signal_trigger_contract_drift_never_posts_or_falls_back(self) -> None:
+        self._configure_signal_trigger_plan_contract()
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            row.planned_order_type = 'market'
+
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='tampered_signal_trigger_contract',
+        )
+
+        self.assertEqual(self.client.post_calls, [])
+        self.assertEqual(result['summary']['failed_group_count'], 1)
+        group = result['dispatch']['groups'][0]
+        self.assertEqual(group['dispatch_status'], 'contract_error')
+        self.assertEqual(group['translated_item_count'], 0)
+        self.assertIn(
+            'signal_trigger_plan_contract_mismatch:planned_order_type',
+            group['error']['message'],
+        )
 
     async def test_dispatch_next_open_plan_uses_next_open_dry_run_default(self) -> None:
         settings.signal_decider_next_open_enabled = False
@@ -10758,11 +11066,22 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             signal_row.validation_payload = {
                 **(signal_row.validation_payload or {}),
                 'pre_decider_enrichment_context': self._closed_market_pre_decider_context(),
+                'legacy_cross_lane_audit': {
+                    'signal_decider_alignment': 'short_term_reject_conflict',
+                    'alignment_gate_action': 'block',
+                    'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 31,
+                    'final_quantity': 0,
+                },
                 'warnings': [
                     {
                         'code': 'transaction_cost_evidence_pending_live_delegated_to_exec_watch',
                         'message': 'Exec must confirm live cost before any buy.',
-                    }
+                    },
+                    {
+                        'code': 'signal_decider_reject_cross_lane_observation',
+                        'message': 'Legacy opposite-lane observation.',
+                    },
                 ],
                 'performance_gate': {
                     'expected_return_economics': {
@@ -10774,6 +11093,24 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     }
                 },
             }
+            signal_traceability = dict(signal_row.traceability_payload or {})
+            signal_decision_traceability = dict(
+                signal_traceability.get('decision_traceability') or {}
+            )
+            signal_decision_traceability['legacy_cross_lane_audit'] = {
+                'alignment_gate': {
+                    **alignment_gate,
+                    'signal_decider_alignment': 'short_term_reject_conflict',
+                },
+                'final_enforcement_decision': 'blocked',
+                'requested_quantity': 31,
+                'final_quantity': 0,
+                'signal_decider_crosscheck': {'action': 'reject'},
+            }
+            signal_traceability['decision_traceability'] = (
+                signal_decision_traceability
+            )
+            signal_row.traceability_payload = signal_traceability
             row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
             row.validation_payload = {
                 **(row.validation_payload or {}),
@@ -10786,10 +11123,19 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'code': 'short_term_reward_risk_ratio_block_delegated_to_exec_watch',
                         'message': 'Exec must confirm reward/risk at trigger time.',
                     },
+                    {
+                        'code': 'signal_decider_wait_cross_lane_observation',
+                        'message': 'Legacy opposite-lane observation.',
+                    },
+                    {
+                        'code': 'signal_decider_wait_conflict_gate_report_only',
+                        'message': 'Legacy opposite-lane gate audit.',
+                    },
                 ],
                 'short_term_entry_quality': {
                     'raw_trading_value_krw': 2_500_000_000,
                     'reward_risk_ratio': '1.50',
+                    'signal_decider_crosscheck': {'action': 'wait'},
                 },
                 'alignment_gate': alignment_gate,
                 'signal_decider_alignment': 'wait_conflict_block',
@@ -10840,6 +11186,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(short_payload['metadata']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_payload['strategy_run_id'], f'short-term-decider:2026-04-30:{self.account_reference.replace(":", "_").replace("-", "_")}')
+        forbidden_alignment_keys = {
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_signal_decider_decision_snapshot_id',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+            'signal_decider_crosscheck',
+        }
         signal_entry = signal_payload['items'][0]
         self.assertEqual(signal_entry['quantity_policy']['type'], 'exec_agent_sized')
         self.assertNotIn('quantity', signal_entry['quantity_policy'])
@@ -10848,6 +11205,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
         self.assertEqual(signal_entry['risk_context']['max_holding_close_policy']['enabled'], False)
         self.assertIsNone(signal_entry['risk_context']['max_holding_close_policy']['max_holding_trading_sessions'])
+        signal_risk_json = json.dumps(signal_entry['risk_context'], sort_keys=True)
+        for forbidden_key in forbidden_alignment_keys:
+            self.assertNotIn(f'"{forbidden_key}"', signal_risk_json)
+        self.assertNotIn(
+            'signal_decider_reject_cross_lane_observation',
+            signal_risk_json,
+        )
         self.assertEqual(
             signal_entry['risk_context']['delegated_gate_codes'],
             ['transaction_cost_evidence_pending_live_delegated_to_exec_watch'],
@@ -10887,12 +11251,18 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['decision_agent_name'], 'short-term-decider')
         self.assertEqual(short_entry['risk_context']['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(short_entry['risk_context']['generic_action'], 'monitor_candidate')
-        self.assertEqual(short_entry['risk_context']['signal_decider_alignment'], 'wait_conflict_block')
-        self.assertEqual(short_entry['risk_context']['alignment_gate_action'], 'report_only_block_candidate')
-        self.assertEqual(short_entry['risk_context']['final_enforcement_decision'], 'allowed_report_only')
-        self.assertEqual(short_entry['risk_context']['requested_quantity'], '29')
-        self.assertEqual(short_entry['risk_context']['final_quantity'], '29')
-        self.assertEqual(short_entry['risk_context']['alignment_signal_decider_decision_snapshot_id'], 991)
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(short_entry['risk_context']))
+        short_risk_json = json.dumps(short_entry['risk_context'], sort_keys=True)
+        for forbidden_key in forbidden_alignment_keys:
+            self.assertNotIn(f'"{forbidden_key}"', short_risk_json)
+        self.assertNotIn(
+            'signal_decider_wait_cross_lane_observation',
+            short_risk_json,
+        )
+        self.assertNotIn(
+            'signal_decider_wait_conflict_gate_report_only',
+            short_risk_json,
+        )
         self.assertEqual(short_entry['risk_context']['entry_execution_mode'], 'pending_trigger_limit')
         self.assertTrue(short_entry['risk_context']['monitoring_candidate'])
         self.assertEqual(short_entry['risk_context']['monitoring_intent'], EXEC_INTENT_INTRADAY_WATCH_BUY)
@@ -10909,13 +11279,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(short_entry['risk_context']['conviction_score_10'], 6.5)
         self.assertEqual(short_entry['risk_context']['decision_run_id'], 'short-run-1')
         self.assertEqual(short_entry['quantity_policy']['type'], 'exec_agent_sized')
-        self.assertEqual(short_entry['quantity_policy']['final_enforcement_decision'], 'allowed_report_only')
-        self.assertEqual(short_entry['quantity_policy']['requested_quantity'], '29')
-        self.assertEqual(short_entry['quantity_policy']['final_quantity'], '29')
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(short_entry['quantity_policy']))
         self.assertEqual(Decimal(str(short_entry['quantity_policy']['budget_krw'])), Decimal('1500000'))
         self.assertEqual(short_entry['quantity_policy']['allocation_mode'], 'specified')
         self.assertEqual(short_entry['quantity_policy']['account_reference'], self.account_reference)
         self.assertEqual(short_entry['quantity_policy']['account_label'], 'Main')
+        self.assertEqual(
+            Decimal(
+                short_entry['quantity_policy']['estimated_notional_krw']
+            ),
+            Decimal('1493500'),
+        )
         self.assertEqual(short_entry['risk_context']['classification'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(short_entry['risk_context']['market_regime_context']['schema_version'], 'market_regime_context_v1')
         self.assertEqual(short_entry['risk_context']['market_regime_context']['recommended_exec_action'], 'downsize')
@@ -10947,15 +11321,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff['source_market_date'], '2026-04-29')
         self.assertEqual(handoff['traceability']['decision_snapshot_id'], short_snapshot_id)
         self.assertEqual(handoff['traceability']['handoff_intent'], 'intraday_watch_buy')
-        self.assertEqual(handoff['traceability']['signal_decider_alignment'], 'wait_conflict_block')
-        self.assertEqual(handoff['traceability']['alignment_gate_action'], 'report_only_block_candidate')
-        self.assertEqual(handoff['traceability']['final_enforcement_decision'], 'allowed_report_only')
-        self.assertEqual(handoff['traceability']['requested_quantity'], 29)
-        self.assertEqual(handoff['traceability']['final_quantity'], 29)
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(handoff['traceability']))
         self.assertEqual(handoff['decider_output']['generic_action'], 'monitor_candidate')
         self.assertEqual(handoff['decider_output']['handoff_intent'], 'intraday_watch_buy')
-        self.assertEqual(handoff['decider_output']['signal_decider_alignment'], 'wait_conflict_block')
-        self.assertEqual(handoff['decider_output']['final_enforcement_decision'], 'allowed_report_only')
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(handoff['decider_output']))
         self.assertEqual(handoff['traceability']['core_plan_item_id'], short_entry['risk_context']['core_plan_item_id'])
         self.assertEqual(handoff['decider_input_context']['request_payload'], decider_request_payload)
         self.assertEqual(handoff['decider_input_context']['input_feature_snapshot_payload'], decider_input_features)
@@ -11048,7 +11417,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal_item['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
         self.assertEqual(result['summary']['delegated_for_exec_agent_sizing_count'], 2)
 
-    async def test_dispatch_next_open_plan_binds_core_downsize_quantity(self) -> None:
+    async def test_dispatch_next_open_plan_ignores_stale_core_downsize_quantity(self) -> None:
         short_snapshot_id = self._seed_short_term_snapshot()
         short_plan_item_id = self._seed_short_term_plan_item(snapshot_id=short_snapshot_id)
         alignment_gate = {
@@ -11096,14 +11465,269 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         entry = next(item for item in short_payload['items'] if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY)
         self.assertEqual(entry['quantity_policy']['type'], 'exec_agent_sized')
-        self.assertEqual(entry['quantity_policy']['max_quantity'], '2')
+        self.assertNotIn('max_quantity', entry['quantity_policy'])
         self.assertNotIn('quantity', entry['quantity_policy'])
-        self.assertEqual(entry['quantity_policy']['enforcement_source'], 'core_wait_conflict_alignment_gate')
-        self.assertEqual(entry['quantity_policy']['requested_quantity'], '29')
-        self.assertEqual(entry['quantity_policy']['final_quantity'], '2')
-        self.assertEqual(entry['risk_context']['final_enforcement_decision'], 'downsized')
-        self.assertEqual(entry['risk_context']['requested_quantity'], '29')
-        self.assertEqual(entry['risk_context']['final_quantity'], '2')
+        forbidden_alignment_keys = {
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_signal_decider_decision_snapshot_id',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+            'enforcement_source',
+        }
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(entry['quantity_policy']))
+        self.assertTrue(forbidden_alignment_keys.isdisjoint(entry['risk_context']))
+        self.assertNotIn(
+            'signal_decider_alignment',
+            json.dumps(
+                entry['risk_context']['decider_handoff_context'],
+                sort_keys=True,
+            ),
+        )
+        with session_scope() as session:
+            persisted = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertEqual(
+                persisted.validation_payload['alignment_gate'][
+                    'enforcement_decision'
+                ],
+                'downsized',
+            )
+
+    async def test_dispatch_next_open_plan_recovers_stale_alignment_only_hard_blocks_per_lane(self) -> None:
+        short_snapshot_id = self._seed_short_term_snapshot()
+        short_plan_item_id = self._seed_short_term_plan_item(
+            snapshot_id=short_snapshot_id,
+        )
+        alignment_gate = {
+            'schema_version': 'signal_decider_alignment_gate_v1',
+            'enforcement_mode': 'hard_block',
+            'signal_decider_alignment': 'wait_conflict_block',
+            'alignment_gate_action': 'block',
+            'alignment_gate_reason': 'Legacy opposite-lane WAIT veto.',
+            'signal_decider_decision_snapshot_id': 991,
+            'enforcement_decision': 'blocked',
+            'requested_quantity': 29,
+            'final_quantity': 0,
+        }
+        with session_scope() as session:
+            signal_row = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            signal_row.eligibility_status = 'blocked'
+            signal_row.planned_quantity = Decimal('20')
+            signal_row.estimated_notional_krw = Decimal('1000000')
+            signal_row.validation_payload = {
+                **(signal_row.validation_payload or {}),
+                'blocking_reasons': [
+                    {
+                        'code': 'signal_decider_reject_cross_lane_observation',
+                        'message': 'Legacy opposite-lane REJECT veto.',
+                    }
+                ],
+                'legacy_alignment_enforcement': {
+                    'signal_decider_alignment': 'short_term_reject_conflict',
+                    'alignment_gate_action': 'block',
+                    'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 5,
+                    'final_quantity': 0,
+                },
+                'pricing': {
+                    'planned_quantity': 20,
+                    'estimated_notional_krw': '1000000',
+                    'requested_quantity': 5,
+                    'final_quantity': 0,
+                },
+            }
+            signal_row.traceability_payload = {
+                **(signal_row.traceability_payload or {}),
+                'decision_traceability': {
+                    **(
+                        (signal_row.traceability_payload or {}).get(
+                            'decision_traceability'
+                        )
+                        or {}
+                    ),
+                    'legacy_alignment_enforcement': {
+                        'signal_decider_alignment': 'short_term_reject_conflict',
+                        'alignment_gate_action': 'block',
+                        'final_enforcement_decision': 'blocked',
+                        'requested_quantity': 5,
+                        'final_quantity': 0,
+                    },
+                },
+            }
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            row.eligibility_status = 'blocked'
+            row.planned_quantity = Decimal('29')
+            row.estimated_notional_krw = Decimal('1493500')
+            row.validation_payload = {
+                **(row.validation_payload or {}),
+                'blocking_reasons': [
+                    {
+                        'code': 'signal_decider_wait_conflict_gate',
+                        'message': 'Legacy opposite-lane WAIT veto.',
+                    }
+                ],
+                'legacy_alignment_enforcement': {
+                    'alignment_gate': alignment_gate,
+                    'final_enforcement_decision': 'blocked',
+                    'requested_quantity': 29,
+                    'final_quantity': 0,
+                },
+                'pricing': {
+                    'planned_quantity': 29,
+                    'estimated_notional_krw': '1493500',
+                    'requested_quantity': 29,
+                    'final_quantity': 0,
+                },
+            }
+            row.traceability_payload = {
+                **(row.traceability_payload or {}),
+                'decision_traceability': {
+                    **(
+                        (row.traceability_payload or {}).get(
+                            'decision_traceability'
+                        )
+                        or {}
+                    ),
+                    'legacy_alignment_enforcement': {
+                        'alignment_gate': alignment_gate,
+                        'final_enforcement_decision': 'blocked',
+                        'requested_quantity': 29,
+                        'final_quantity': 0,
+                    },
+                },
+            }
+
+        await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date,
+            refresh_plan=False,
+            dry_run=False,
+            force=True,
+            trigger='test',
+        )
+
+        by_agent = {
+            payload['metadata']['decision_agent_name']: payload
+            for payload in self.client.post_calls
+        }
+        self.assertEqual(
+            set(by_agent),
+            {'signal-decider', 'short-term-decider'},
+        )
+        signal_entry = next(
+            item
+            for item in by_agent['signal-decider']['items']
+            if item['intent'] == EXEC_INTENT_NEXT_OPEN_BUY
+        )
+        self.assertEqual(
+            signal_entry['quantity_policy']['type'],
+            'exec_agent_sized',
+        )
+        self.assertNotIn('quantity', signal_entry['quantity_policy'])
+        self.assertNotIn('max_quantity', signal_entry['quantity_policy'])
+        self.assertEqual(
+            Decimal(str(signal_entry['quantity_policy']['estimated_notional_krw'])),
+            Decimal('1000000'),
+        )
+        signal_risk_json = json.dumps(
+            signal_entry['risk_context'],
+            sort_keys=True,
+        )
+        for forbidden_text in (
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'final_enforcement_decision',
+            'signal_decider_reject_cross_lane_observation',
+            '"planned_quantity": 0',
+            '"estimated_notional_krw": "0"',
+        ):
+            self.assertNotIn(forbidden_text, signal_risk_json)
+        short_entry = next(
+            item
+            for item in by_agent['short-term-decider']['items']
+            if item['intent'] == EXEC_INTENT_INTRADAY_WATCH_BUY
+        )
+        self.assertEqual(
+            short_entry['quantity_policy']['type'],
+            'exec_agent_sized',
+        )
+        self.assertNotIn('quantity', short_entry['quantity_policy'])
+        self.assertNotIn('max_quantity', short_entry['quantity_policy'])
+        self.assertEqual(
+            Decimal(str(short_entry['quantity_policy']['estimated_notional_krw'])),
+            Decimal('1493500'),
+        )
+        short_risk_json = json.dumps(
+            short_entry['risk_context'],
+            sort_keys=True,
+        )
+        for forbidden_text in (
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'signal_decider_wait_conflict_gate',
+            '"planned_quantity": 0',
+            '"estimated_notional_krw": "0"',
+        ):
+            self.assertNotIn(forbidden_text, short_risk_json)
+        outbound_json = json.dumps(by_agent, sort_keys=True)
+        for forbidden_key in (
+            'signal_decider_alignment',
+            'alignment_gate_action',
+            'alignment_gate_reason',
+            'alignment_gate',
+            'final_enforcement_decision',
+            'requested_quantity',
+            'final_quantity',
+            'signal_decider_crosscheck',
+        ):
+            self.assertNotIn(f'"{forbidden_key}"', outbound_json)
+        with session_scope() as session:
+            persisted = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertEqual(persisted.eligibility_status, 'blocked')
+            self.assertEqual(persisted.planned_quantity, Decimal('29'))
+            self.assertEqual(
+                persisted.estimated_notional_krw,
+                Decimal('1493500'),
+            )
+            self.assertEqual(
+                persisted.validation_payload['legacy_alignment_enforcement'][
+                    'alignment_gate'
+                ]['enforcement_decision'],
+                'blocked',
+            )
+            persisted_signal = session.get(
+                SignalDeciderExecutionPlanItem,
+                self.plan_item_id,
+            )
+            self.assertEqual(
+                persisted_signal.eligibility_status,
+                'blocked',
+            )
+            self.assertEqual(
+                persisted_signal.planned_quantity,
+                Decimal('20'),
+            )
+            self.assertEqual(
+                persisted_signal.estimated_notional_krw,
+                Decimal('1000000'),
+            )
 
     async def test_readback_promotes_blocked_planned_short_term_watch_to_delegated(self) -> None:
         overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
@@ -11155,6 +11779,88 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             audit = row.submission_payload['exec_dispatch']['core_state_sync']
             self.assertEqual(audit['core_state_before']['execution_status'], 'submit_failed')
             self.assertEqual(audit['core_state_after']['execution_status'], EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING)
+
+    async def test_readback_keeps_watch_sizing_pending_unapproved_and_inactive(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_sizing_pending',
+        )
+
+        self.assertFalse(short_item['exec_monitoring_active'])
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'blocked')
+        self.assertEqual(short_item['execution_status'], 'planned')
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 0)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+            self.assertNotIn(
+                'core_state_sync',
+                row.submission_payload['exec_dispatch'],
+            )
+
+    async def test_readback_keeps_dispatch_accepted_entry_unapproved_and_inactive(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='accepted',
+        )
+
+        self.assertFalse(short_item['exec_monitoring_active'])
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'blocked')
+        self.assertEqual(short_item['execution_status'], 'planned')
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 0)
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, short_plan_item_id)
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+            self.assertNotIn(
+                'core_state_sync',
+                row.submission_payload['exec_dispatch'],
+            )
+
+    async def test_readback_does_not_promote_pending_entry_from_active_exit_intent(self) -> None:
+        overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
+            exec_status='watch_sizing_pending',
+            additional_intent_statuses={
+                EXEC_INTENT_TARGET_SELL: 'target_sell_monitoring',
+            },
+        )
+
+        self.assertEqual(short_item['remote_state']['derived_status'], 'working')
+        self.assertFalse(short_item['exec_monitoring_active'])
+        self.assertFalse(short_item['exec_agent_approved'])
+        self.assertEqual(short_item['approval_state'], 'blocked')
+        self.assertEqual(short_item['execution_status'], 'planned')
+        self.assertEqual(overview['summary']['core_exec_state_divergence_count'], 0)
+
+        board = await self.service.get_runtime_daily_board(
+            market_date=self.target_trade_date,
+            refresh=False,
+            trigger='test',
+        )
+        board_item = next(
+            item
+            for item in board['items']
+            if item['plan_item_id'] == short_plan_item_id
+        )
+        self.assertEqual(board_item['status'], 'scheduled')
+        self.assertEqual(board_item['monitoring_state'], 'idle')
+        self.assertFalse(board_item['exec_monitoring_active'])
+        self.assertFalse(board_item['exec_agent_approved'])
+
+        with session_scope() as session:
+            row = session.get(
+                SignalDeciderExecutionPlanItem,
+                short_plan_item_id,
+            )
+            self.assertEqual(row.execution_status, 'planned')
+            self.assertFalse(row.traceability_payload['exec_monitoring_active'])
+            self.assertNotIn(
+                'core_state_sync',
+                row.submission_payload['exec_dispatch'],
+            )
 
     async def test_readback_reconciles_recovered_watch_expiry_without_stale_quarantine_reason(self) -> None:
         overview, short_item, short_plan_item_id = await self._readback_stale_short_term_watch(
@@ -11210,11 +11916,12 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(short_board_item['status'], 'scheduled')
-        self.assertEqual(short_board_item['monitoring_state'], 'watching_fill')
-        self.assertTrue(short_board_item['exec_monitoring_active'])
-        self.assertTrue(short_board_item['exec_runtime_showable'])
-        self.assertEqual(short_board_item['exec_runtime_state'], 'exec_approved_watch')
-        self.assertEqual(short_board_item['core_state_divergence_warning']['code'], 'exec_watch_state_divergence')
+        self.assertEqual(short_board_item['monitoring_state'], 'idle')
+        self.assertFalse(short_board_item['exec_monitoring_active'])
+        self.assertFalse(short_board_item['exec_runtime_showable'])
+        self.assertFalse(short_board_item['exec_agent_approved'])
+        self.assertEqual(short_board_item['exec_runtime_state'], 'core_planned_only')
+        self.assertIsNone(short_board_item['core_state_divergence_warning'])
         self.assertEqual(short_board_item['open_quantity'], 0)
         self.assertIsNone(short_board_item['broker_order_id'])
 
@@ -12833,6 +13540,349 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
 
+    def test_passive_signal_wait_observations_use_latest_validated_krx_snapshot(self) -> None:
+        def snapshot(
+            *,
+            snapshot_id: int,
+            symbol: str,
+            action: str = 'wait',
+            agent_name: str = 'signal-decider',
+            market: str = 'KOSPI',
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                id=snapshot_id,
+                market_date=self.market_date,
+                symbol=symbol,
+                agent_name=agent_name,
+                decision_action=action,
+                next_day_open_action=action,
+                feedback_received_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    7,
+                    snapshot_id % 60,
+                    tzinfo=timezone.utc,
+                ),
+                created_at=datetime(
+                    2026,
+                    4,
+                    29,
+                    7,
+                    snapshot_id % 60,
+                    tzinfo=timezone.utc,
+                ),
+                request_payload={
+                    'symbol_day_context': {
+                        'company': {'market': market},
+                    },
+                },
+            )
+
+        generation_state = {
+            'snapshots': [
+                snapshot(snapshot_id=11, symbol='012030'),
+                snapshot(snapshot_id=12, symbol='012030', action='reject'),
+                snapshot(snapshot_id=13, symbol='032080'),
+                snapshot(snapshot_id=14, symbol='USWAIT', market='NASDAQ'),
+                snapshot(
+                    snapshot_id=15,
+                    symbol='070590',
+                    agent_name='short-term-decider',
+                ),
+                snapshot(snapshot_id=16, symbol='089890', action='reject'),
+                snapshot(snapshot_id=17, symbol='089890'),
+            ],
+        }
+
+        with patch.object(
+            signal_decider_next_open_execution_service,
+            '_load_latest_snapshot_generation_state',
+            return_value=generation_state,
+        ) as generation_loader:
+            observations = (
+                SignalDeciderExecIntegrationService
+                ._load_passive_signal_wait_observations(
+                    source_market_date=self.market_date,
+                    target_trade_date=self.target_trade_date,
+                )
+            )
+
+        self.assertEqual(
+            observations,
+            [
+                {
+                    'symbol': '032080',
+                    'decision_snapshot_id': 13,
+                    'decision_agent_name': 'signal-decider',
+                    'source_market_date': self.market_date.isoformat(),
+                    'observed_at': '2026-04-29T07:13:00+00:00',
+                }
+            ],
+        )
+        generation_loader.assert_called_once_with(
+            source_market_date=self.market_date,
+            target_trade_date=self.target_trade_date,
+            allow_post_open_intraday_watch=False,
+        )
+
+    def test_runtime_monitored_symbols_adds_signal_wait_as_observation_only(self) -> None:
+        wait_symbol = '032080'
+        self._seed_symbol(symbol=wait_symbol, name_ko='Passive wait')
+        with session_scope() as session:
+            plan_count_before = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+
+        with patch(
+            'app.orders.exec_integration.kis_realtime_price_service'
+        ) as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {
+                        'status': 'ready',
+                        'mode': 'mock',
+                        'active_monitoring_items': [],
+                        'active_monitoring_facts_complete': True,
+                    },
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                    )
+                ),
+                passive_signal_wait_observations=[
+                    {
+                        'symbol': wait_symbol,
+                        'decision_snapshot_id': 13,
+                        'decision_agent_name': 'signal-decider',
+                        'source_market_date': self.market_date.isoformat(),
+                        'observed_at': '2026-04-29T07:13:00+00:00',
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            [wait_symbol],
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['observation_only_symbols'],
+            [wait_symbol],
+        )
+        self.assertEqual(payload['realtime_subscription']['desired_symbol_count'], 1)
+        self.assertEqual(payload['summary']['items_total'], 1)
+        item = payload['items'][0]
+        self.assertEqual(item['symbol'], wait_symbol)
+        self.assertEqual(item['name'], 'Passive wait')
+        self.assertEqual(item['market'], 'KOSPI')
+        self.assertEqual(item['monitoring_state'], 'idle')
+        self.assertFalse(item['exec_monitoring_active'])
+        self.assertFalse(item['exec_runtime_showable'])
+        self.assertEqual(
+            item['exec_runtime_state'],
+            'signal_wait_observation_requested',
+        )
+        self.assertEqual(
+            item['exec_runtime_exclusion_reason'],
+            'observation_only_no_order_authority',
+        )
+        self.assertEqual(
+            item['exec_runtime_exclusion_reasons'],
+            ['observation_only_no_order_authority'],
+        )
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertIsNone(item['exec_agent_action'])
+        self.assertFalse(item['held_position'])
+        self.assertEqual(
+            item['monitoring_statuses'],
+            ['signal_wait_observation_only'],
+        )
+        self.assertEqual(item['planned_intents'], [])
+        self.assertEqual(item['tactical_actions'], [])
+        self.assertEqual(item['handoff_intents'], [])
+        self.assertIsNone(item['target_price'])
+        self.assertIsNone(item['stop_loss_price'])
+        self.assertIsNone(item['trigger_price'])
+        self.assertIsNone(item['chase_limit_price'])
+        self.assertEqual(item['decision_agent_names'], ['signal-decider'])
+        self.assertEqual(item['account_references'], [])
+        self.assertEqual(item['status_counts'], {})
+        self.assertEqual(self.client.post_calls, [])
+        with session_scope() as session:
+            plan_count_after = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+        self.assertEqual(plan_count_after, plan_count_before)
+
+    def test_live_exec_membership_wins_over_passive_wait_label(self) -> None:
+        wait_symbol = '032080'
+        self._seed_symbol(symbol=wait_symbol, name_ko='Already monitored')
+        with patch(
+            'app.orders.exec_integration.kis_realtime_price_service'
+        ) as price_service:
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = self.service._build_runtime_monitored_symbols_payload(
+                board={
+                    'market_date': self.target_trade_date.isoformat(),
+                    'runtime': {
+                        'status': 'ready',
+                        'mode': 'mock',
+                        'active_monitoring_items': [],
+                        'active_monitoring_facts_complete': True,
+                    },
+                    'items': [],
+                },
+                refresh=False,
+                refresh_state={'requested': False, 'status': 'not_requested'},
+                served_from_cache=False,
+                live_holding_symbols=set(),
+                live_exec_monitoring_membership=(
+                    ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset({wait_symbol}),
+                        membership_complete=True,
+                    )
+                ),
+                passive_signal_wait_observations=[
+                    {
+                        'symbol': wait_symbol,
+                        'decision_snapshot_id': 13,
+                        'decision_agent_name': 'signal-decider',
+                        'source_market_date': self.market_date.isoformat(),
+                        'observed_at': '2026-04-29T07:13:00+00:00',
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            [wait_symbol],
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['observation_only_symbols'],
+            [],
+        )
+        item = payload['items'][0]
+        self.assertTrue(item['exec_monitoring_active'])
+        self.assertTrue(item['exec_runtime_showable'])
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertEqual(item['exec_runtime_state'], 'runtime_membership_only')
+        self.assertEqual(item['planned_intents'], [])
+        self.assertEqual(item['handoff_intents'], [])
+        self.assertIsNone(item['trigger_price'])
+        self.assertIsNone(item['chase_limit_price'])
+
+    async def test_passive_wait_loader_failure_preserves_base_monitored_symbols(self) -> None:
+        held_symbol = '070590'
+        self._seed_symbol(symbol=held_symbol, name_ko='Protected holding')
+        board = {
+            'market_date': self.target_trade_date.isoformat(),
+            'runtime': {
+                'status': 'ready',
+                'mode': 'mock',
+                'active_monitoring_items': [],
+                'active_monitoring_facts_complete': True,
+            },
+            'freshness': None,
+            'items': [],
+        }
+        portfolio_membership = PortfolioHoldingSymbolMembership(
+            symbols=frozenset({held_symbol}),
+            membership_complete=True,
+        )
+
+        with (
+            patch.object(
+                self.service,
+                'get_runtime_daily_board',
+                new=AsyncMock(return_value=board),
+            ),
+            patch.object(
+                self.service,
+                '_load_live_portfolio_holding_membership',
+                new=AsyncMock(return_value=portfolio_membership),
+            ),
+            patch.object(
+                self.service,
+                '_load_live_exec_monitoring_symbols',
+                new=AsyncMock(
+                    return_value=ExecRuntimeMonitoredSymbolMembership(
+                        symbols=frozenset(),
+                        membership_complete=True,
+                    )
+                ),
+            ),
+            patch(
+                'app.orders.exec_integration._async_previous_trading_day',
+                new=AsyncMock(return_value=self.market_date),
+            ),
+            patch.object(
+                self.service,
+                '_load_passive_signal_wait_observations',
+                side_effect=RuntimeError('validation unavailable'),
+            ),
+            patch(
+                'app.orders.exec_integration.kis_realtime_price_service'
+            ) as price_service,
+            self.assertLogs('app.orders.exec_integration', level='WARNING'),
+        ):
+            price_service.price_fields_for_symbol.return_value = {
+                'current_price': None,
+                'price_as_of': None,
+                'price_received_at': None,
+                'price_source': None,
+                'price_status': 'unavailable',
+                'display_price_available': False,
+                'realtime_subscribed': False,
+                'realtime_subscription_reason': 'not_subscribed',
+            }
+            payload = await self.service._build_and_cache_runtime_monitored_symbols(
+                market_date=self.target_trade_date,
+                refresh=False,
+                refresh_state={
+                    'requested': False,
+                    'status': 'not_requested',
+                },
+                trigger='test',
+            )
+
+        self.assertEqual(
+            payload['realtime_subscription']['desired_symbols'],
+            [held_symbol],
+        )
+        self.assertEqual(
+            payload['realtime_subscription']['observation_only_symbols'],
+            [],
+        )
+        self.assertTrue(payload['items'][0]['held_position'])
+        self.assertEqual(payload['items'][0]['planned_intents'], [])
+
     async def test_runtime_monitored_symbols_flags_exec_approved_watch_candidate(self) -> None:
         self.client.agent_sizing_payloads_by_agent['signal-decider'] = {
             'approved': True,
@@ -12903,7 +13953,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['approved_notional'], '250000.0000')
         self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
 
-    async def test_runtime_monitored_symbols_treats_accepted_entry_link_as_exec_approved_watch(self) -> None:
+    async def test_runtime_monitored_symbols_keep_scheduled_entry_links_inactive(self) -> None:
         with patch('app.orders.exec_integration.kis_realtime_price_service') as price_service:
             price_service.price_fields_for_symbol.return_value = {
                 'current_price': 50200,
@@ -12978,15 +14028,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
 
                     item = payload['items'][0]
                     self.assertEqual(item['symbol'], symbol)
-                    self.assertTrue(item['exec_runtime_showable'])
-                    self.assertTrue(item['exec_monitoring_active'])
-                    self.assertTrue(item['exec_agent_approved'])
-                    self.assertEqual(item['exec_agent_action'], 'approve')
-                    self.assertEqual(item['exec_runtime_state'], 'exec_approved_watch')
-                    self.assertIsNone(item['exec_runtime_exclusion_reason'])
+                    self.assertFalse(item['exec_runtime_showable'])
+                    self.assertFalse(item['exec_monitoring_active'])
+                    self.assertFalse(item['exec_agent_approved'])
+                    self.assertIsNone(item['exec_agent_action'])
+                    self.assertEqual(item['exec_runtime_state'], 'core_planned_only')
+                    self.assertEqual(
+                        item['exec_runtime_exclusion_reason'],
+                        'core_planned_not_exec_approved',
+                    )
                     self.assertIn(entry_status, item['monitoring_statuses'])
-                    self.assertIn('watch_monitoring_active', item['monitoring_statuses'])
-                    self.assertNotEqual(item['exec_runtime_state'], 'core_planned_only')
+                    self.assertNotIn('watch_monitoring_active', item['monitoring_statuses'])
 
     async def test_runtime_monitored_symbols_flags_core_only_and_rejected_candidates(self) -> None:
         core_only = self.service._build_runtime_board_item(
@@ -13445,6 +14497,34 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {'005930'},
             ),
+            (
+                'summary_accepts_alphanumeric_krx_symbol',
+                {
+                    'asOf': '2026-04-30T00:00:00+00:00',
+                    'source': 'kis_portfolio_summary_v1',
+                    'accountCoverage': {
+                        'status': 'complete',
+                        'configuredCount': 1,
+                        'returnedCount': 1,
+                    },
+                    'sync': {'status': 'synced'},
+                    'freshness': {
+                        'isStale': False,
+                        'refreshInFlight': False,
+                    },
+                    'accounts': [
+                        {
+                            'id': self.account_reference,
+                            'broker': 'kis',
+                            'holdingsCompleteness': {'status': 'complete'},
+                            'holdings': [
+                                {'symbol': '0010A0', 'quantity': 5}
+                            ],
+                        }
+                    ],
+                },
+                {'0010A0'},
+            ),
         ]
 
         for label, payload, expected in cases:
@@ -13791,9 +14871,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 (frozenset(), True),
             ),
             (
+                'complete_alphanumeric_krx_symbol',
+                _runtime_monitored_membership_payload(['0010A0']),
+                (frozenset({'0010A0'}), True),
+            ),
+            (
                 'complete_rejects_non_domestic_symbols',
                 _runtime_monitored_membership_payload(
                     ['005930', 'AAPL'],
+                ),
+                None,
+            ),
+            (
+                'complete_rejects_letter_in_numeric_prefix',
+                _runtime_monitored_membership_payload(
+                    ['005930', '12A456'],
                 ),
                 None,
             ),
@@ -15696,7 +16788,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('xxxx', board_payload)
         self.assertLess(len(board_payload.encode('utf-8')), 20000)
 
-    async def test_runtime_monitored_symbols_include_target_stop_watch_from_partial_read_model(self) -> None:
+    async def test_runtime_monitored_symbols_keep_unsubmitted_blocked_geometry_idle(self) -> None:
         with session_scope() as session:
             row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
             row.eligibility_status = 'blocked'
@@ -15726,11 +16818,13 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(monitored['summary']['items_total'], 1)
-        self.assertEqual(monitored['summary']['watching_fill'], 1)
+        self.assertEqual(monitored['summary']['watching_fill'], 0)
+        self.assertEqual(monitored['summary']['idle'], 1)
         self.assertEqual(monitored['freshness']['status'], 'partial')
         self.assertEqual(monitored['freshness']['readback_missing_count'], 1)
         self.assertEqual(monitored['items'][0]['symbol'], self.symbol)
-        self.assertEqual(monitored['items'][0]['monitoring_state'], 'watching_fill')
+        self.assertEqual(monitored['items'][0]['monitoring_state'], 'idle')
+        self.assertFalse(monitored['items'][0]['exec_monitoring_active'])
         self.assertEqual(monitored['items'][0]['planned_intents'], ['stop_sell', 'target_sell'])
         self.assertEqual(self.client.runtime_calls, 0)
         self.assertEqual(self.client.order_calls, [])
@@ -15792,6 +16886,136 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.service.list_signal_decider_exec_overview = original_overview
+
+    async def test_dashboard_background_refresh_preserves_passive_wait_observation_cache(self) -> None:
+        wait_symbol = '032080'
+        self._seed_symbol(symbol=wait_symbol, name_ko='Passive wait')
+        passive_observation = {
+            'symbol': wait_symbol,
+            'decision_snapshot_id': 13,
+            'decision_agent_name': 'signal-decider',
+            'source_market_date': self.market_date.isoformat(),
+            'observed_at': '2026-04-29T07:13:00+00:00',
+        }
+        original_overview = self.service.list_signal_decider_exec_overview
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def delayed_background_overview(**kwargs):
+            if kwargs.get('refresh'):
+                refresh_started.set()
+                await release_refresh.wait()
+            return await original_overview(**kwargs)
+
+        self.service.list_signal_decider_exec_overview = delayed_background_overview
+        with session_scope() as session:
+            plan_count_before = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+        try:
+            with (
+                patch.object(
+                    self.service,
+                    '_load_passive_signal_wait_observations',
+                    return_value=[passive_observation],
+                ),
+                patch.object(
+                    self.service,
+                    '_load_live_portfolio_holding_membership',
+                    new=AsyncMock(
+                        return_value=PortfolioHoldingSymbolMembership(
+                            symbols=frozenset(),
+                            membership_complete=True,
+                        )
+                    ),
+                ),
+                patch.object(
+                    self.service,
+                    '_load_live_exec_monitoring_symbols',
+                    new=AsyncMock(
+                        return_value=ExecRuntimeMonitoredSymbolMembership(
+                            symbols=frozenset(),
+                            membership_complete=True,
+                        )
+                    ),
+                ),
+                patch(
+                    'app.orders.exec_integration.kis_realtime_price_service'
+                ) as price_service,
+            ):
+                price_service.price_fields_for_symbol.return_value = {
+                    'current_price': None,
+                    'price_as_of': None,
+                    'price_received_at': None,
+                    'price_source': None,
+                    'price_status': 'unavailable',
+                    'display_price_available': False,
+                    'realtime_subscribed': False,
+                    'realtime_subscription_reason': 'not_subscribed',
+                }
+                initial = await self.service.list_runtime_monitored_symbols(
+                    market_date=self.target_trade_date,
+                    refresh=True,
+                    trigger='test',
+                )
+                self.assertIn(
+                    wait_symbol,
+                    initial['realtime_subscription'][
+                        'observation_only_symbols'
+                    ],
+                )
+                await asyncio.wait_for(refresh_started.wait(), timeout=1.0)
+                release_refresh.set()
+                tasks = list(self.service._dashboard_refresh_tasks.values())
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+                cached = await self.service.list_runtime_monitored_symbols(
+                    market_date=self.target_trade_date,
+                    refresh=False,
+                    trigger='test',
+                )
+        finally:
+            release_refresh.set()
+            tasks = list(self.service._dashboard_refresh_tasks.values())
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.service.list_signal_decider_exec_overview = original_overview
+
+        self.assertIn(
+            wait_symbol,
+            cached['realtime_subscription']['desired_symbols'],
+        )
+        self.assertIn(
+            wait_symbol,
+            cached['realtime_subscription']['observation_only_symbols'],
+        )
+        item = next(
+            item for item in cached['items'] if item['symbol'] == wait_symbol
+        )
+        self.assertEqual(
+            item['monitoring_statuses'],
+            ['signal_wait_observation_only'],
+        )
+        self.assertEqual(item['planned_intents'], [])
+        self.assertEqual(item['tactical_actions'], [])
+        self.assertEqual(item['handoff_intents'], [])
+        self.assertIsNone(item['approved_quantity'])
+        self.assertIsNone(item['approved_notional'])
+        self.assertIsNone(item['trigger_price'])
+        self.assertIsNone(item['chase_limit_price'])
+        self.assertIsNone(item['target_price'])
+        self.assertIsNone(item['stop_loss_price'])
+        self.assertEqual(item['account_references'], [])
+        self.assertFalse(item['exec_agent_approved'])
+        self.assertIsNone(item['exec_agent_action'])
+        self.assertEqual(item['status_counts'], {})
+        self.assertEqual(self.client.post_calls, [])
+        with session_scope() as session:
+            plan_count_after = len(
+                session.execute(select(SignalDeciderExecutionPlanItem)).scalars().all()
+            )
+        self.assertEqual(plan_count_after, plan_count_before)
 
     async def test_dashboard_background_refresh_stores_monitored_cache_with_live_holding_filter(self) -> None:
         key = self.service._dashboard_refresh_key(

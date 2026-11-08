@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import or_, select, text
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.agent_context.lease_loss_evidence import (
     terminal_feedback_completed_run_evidence_error,
@@ -23,9 +25,12 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
+    daily_pipeline_warning_metadata,
+    normalize_daily_pipeline_stage_status,
     terminal_continuation_expired_decision_skip_evidence_is_valid,
     terminal_continuation_feedback_lease_loss_run_id,
     terminal_continuation_lease_loss_resume_lineage_is_valid,
@@ -33,14 +38,24 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_resume_is_unconsumed,
 )
 from app.eod.summary_cutoff_contract import (
-    LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    CUTOFF_REPAIR_STAGE_IDS,
     completed_summary_scope_matches_parent,
     is_resumable_summary_cutoff_contract_repair,
     normalize_symbol_codes,
+    resolved_cutoff_repair_stage_ids,
     summary_cutoff_proof_from_stage,
+)
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    is_canonical_same_day_signal_rearm_proof,
+    is_recoverable_same_day_intraday_watch_expiration,
+    pending_same_day_intraday_watch_rearm_marker,
 )
 from app.repositories.eod_run_repository import (
     daily_price_bar_has_current_eod_run_provenance,
+    eod_collection_admission_advisory_lock_keys,
     eod_collection_advisory_lock_keys,
 )
 
@@ -83,6 +98,15 @@ TERMINAL_DAILY_PIPELINE_STATUSES = {
 }
 SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS = 5 * 60 * 1000
 TERMINAL_CONTINUATION_EXPECTED_LINEAGE_RUN_COUNT = 6
+TERMINAL_CONTINUATION_STAGE_ORDER = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+)
+LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER = (
+    *TERMINAL_CONTINUATION_STAGE_ORDER,
+    'signal_decider_evaluations',
+)
 
 
 def _utcnow() -> datetime:
@@ -133,6 +157,132 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _resolved_terminal_continuation_stage_order(
+    resolved_stages: object,
+) -> tuple[str, ...] | None:
+    """Resolve the current suffix while retaining persisted legacy claims."""
+
+    if not isinstance(resolved_stages, (list, tuple)):
+        return None
+    normalized = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stages
+    )
+    if not normalized or any(not stage_id for stage_id in normalized):
+        return None
+    for stage_order in (
+        LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER,
+        TERMINAL_CONTINUATION_STAGE_ORDER,
+    ):
+        if normalized[-len(stage_order) :] == stage_order:
+            return stage_order
+    return None
+
+
+def _project_terminal_continuation_metadata_to_current_contract(
+    metadata: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str], bool] | None:
+    """Retire the legacy evaluation tail without erasing its audit evidence.
+
+    Version-1 continuation rows can still carry the former four-stage suffix.
+    Once that row is claimed, only the decision/plan suffix is executable.  The
+    immutable ``terminal_continuation_evidence`` keeps the original evaluation
+    row readable; active run metadata must not advertise it as retry debt.
+    """
+
+    raw_resolved_stages = metadata.get('resolved_stages')
+    persisted_suffix = _resolved_terminal_continuation_stage_order(
+        raw_resolved_stages
+    )
+    if persisted_suffix is None or not isinstance(
+        raw_resolved_stages,
+        (list, tuple),
+    ):
+        return None
+    resolved_stages = [
+        str(stage_id or '').strip() for stage_id in raw_resolved_stages
+    ]
+    if (
+        any(not stage_id for stage_id in resolved_stages)
+        or len(resolved_stages) != len(set(resolved_stages))
+    ):
+        return None
+
+    legacy_projection = (
+        persisted_suffix == LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
+    )
+    active_resolved_stages = (
+        resolved_stages[:-1] if legacy_projection else resolved_stages
+    )
+    projected_metadata = dict(metadata)
+    projected_metadata['resolved_stages'] = list(active_resolved_stages)
+
+    raw_requested_stages = projected_metadata.get('requested_stages')
+    if isinstance(raw_requested_stages, (list, tuple)):
+        requested_stages = [
+            str(stage_id or '').strip() for stage_id in raw_requested_stages
+        ]
+        if legacy_projection and requested_stages[-1:] == [
+            'signal_decider_evaluations'
+        ]:
+            requested_stages = requested_stages[:-1]
+        projected_metadata['requested_stages'] = requested_stages
+
+    raw_stage_statuses = projected_metadata.get('stage_statuses')
+    if isinstance(raw_stage_statuses, Mapping):
+        active_stage_statuses = dict(raw_stage_statuses)
+        if legacy_projection:
+            active_stage_statuses.pop('signal_decider_evaluations', None)
+        projected_metadata['stage_statuses'] = active_stage_statuses
+
+    return (
+        projected_metadata,
+        active_resolved_stages,
+        legacy_projection,
+    )
+
+
+def _intraday_summary_cutoff_proof(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Normalize the immutable cutoff carried by an admitted PITR suffix."""
+
+    raw_cutoff = metadata.get('feedback_knowledge_cutoff')
+    if not isinstance(raw_cutoff, Mapping):
+        return None
+    cutoff_at = _parse_utc_datetime(raw_cutoff.get('knowledge_cutoff_at'))
+    source_run_id = str(raw_cutoff.get('source_run_id') or '').strip()
+    scope_mode = str(raw_cutoff.get('feedback_scope_mode') or '').strip()
+    fs_div = str(metadata.get('fs_div') or '').strip().upper()
+    raw_symbols = raw_cutoff.get('requested_symbols')
+    symbols = (
+        normalize_symbol_codes(raw_symbols)
+        if isinstance(raw_symbols, list)
+        else []
+    )
+    if not (
+        raw_cutoff.get('ready') is True
+        and cutoff_at is not None
+        and source_run_id
+        and scope_mode
+        in {
+            FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+            FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        }
+        and fs_div in {'CFS', 'OFS'}
+        and symbols
+        and symbols == raw_symbols
+    ):
+        return None
+    return {
+        'source_run_id': source_run_id,
+        'feedback_scope_mode': scope_mode,
+        'requested_symbols': None,
+        'expected_completed_symbols': symbols,
+        'knowledge_cutoff_at': cutoff_at.isoformat(),
+        'fs_div': fs_div,
+    }
 
 
 def _terminal_continuation_execution_context_error(
@@ -232,7 +382,7 @@ def _summary_cutoff_contract_repair_execution_context_error(
     ):
         return 'reused_eod_collection_run_id'
     if str(metadata.get('resume_from_stage') or '').strip() != (
-        LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+        CUTOFF_REPAIR_STAGE_IDS[0]
     ):
         return 'resume_from_stage'
 
@@ -325,13 +475,23 @@ def _build_counts(
     failed: Any = None,
     remaining: Any = None,
 ) -> dict[str, int]:
-    total_value = _as_int(total)
-    succeeded_value = _as_int(succeeded)
-    failed_value = _as_int(failed)
-    processed_value = _as_int(processed, succeeded_value + failed_value)
-    if processed is None:
-        processed_value = succeeded_value + failed_value
-    remaining_value = _as_int(remaining, max(total_value - processed_value, 0) if total_value else 0)
+    total_value = max(_as_int(total), 0)
+    succeeded_value = max(_as_int(succeeded), 0)
+    failed_value = max(_as_int(failed), 0)
+    processed_value = max(
+        _as_int(processed, succeeded_value + failed_value),
+        succeeded_value + failed_value,
+        0,
+    )
+    total_value = max(total_value, processed_value)
+    maximum_remaining = max(total_value - processed_value, 0)
+    remaining_value = min(
+        max(
+            _as_int(remaining, maximum_remaining),
+            0,
+        ),
+        maximum_remaining,
+    )
     return {
         'processed': processed_value,
         'total': total_value,
@@ -343,10 +503,19 @@ def _build_counts(
 
 def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
     stage_id = str(getattr(stage_row, 'stage_id', '') or '').strip()
-    return {
+    raw_status = str(
+        getattr(stage_row, 'status', '') or ''
+    ).strip().lower()
+    details = (
+        dict(getattr(stage_row, 'details', {}))
+        if isinstance(getattr(stage_row, 'details', {}), Mapping)
+        else {}
+    )
+    outcome = {
         'stage': stage_id,
         'stage_id': stage_id,
-        'status': str(getattr(stage_row, 'status', '') or '').strip().lower(),
+        'market_date': _iso(getattr(stage_row, 'market_date', None)),
+        'status': raw_status,
         'processed': _as_int(getattr(stage_row, 'processed', 0)),
         'total': _as_int(getattr(stage_row, 'total', 0)),
         'succeeded': _as_int(getattr(stage_row, 'succeeded', 0)),
@@ -354,12 +523,22 @@ def _stage_row_outcome(stage_row: object) -> dict[str, Any]:
         'remaining': _as_int(getattr(stage_row, 'remaining', 0)),
         'completed_at': getattr(stage_row, 'completed_at', None),
         'error_message': getattr(stage_row, 'error_message', None),
-        'details': (
-            getattr(stage_row, 'details', {})
-            if isinstance(getattr(stage_row, 'details', {}), Mapping)
-            else {}
-        ),
+        'details': details,
     }
+    normalized_status = normalize_daily_pipeline_stage_status(
+        stage_id=stage_id,
+        status=raw_status,
+        outcome=outcome,
+    )
+    if normalized_status != raw_status:
+        outcome['status'] = normalized_status
+        outcome['source_status'] = raw_status
+        details.setdefault('status_canonicalized_from', raw_status)
+        details.setdefault(
+            'status_canonicalization_reason',
+            'terminal_optional_context_unavailable',
+        )
+    return outcome
 
 
 def _build_stage_duration_details(
@@ -376,6 +555,60 @@ def _build_stage_duration_details(
         'slow_stage': elapsed_ms >= SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS,
         'slow_stage_threshold_ms': SLOW_DAILY_PIPELINE_STAGE_THRESHOLD_MS,
     }
+
+
+def _publish_live_run(method):
+    """Mirror a run row into the DB-free live progress feed after commit."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        daily_pipeline_live_progress.publish_run(result)
+        return result
+
+    return wrapper
+
+
+def _publish_live_stage(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        daily_pipeline_live_progress.publish_stage(result)
+        return result
+
+    return wrapper
+
+
+def _publish_live_heartbeat(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        daily_pipeline_live_progress.publish_heartbeat(
+            pipeline_run_id=kwargs.get('pipeline_run_id'),
+            stage_id=str(kwargs.get('stage_id') or ''),
+            alive=bool(result),
+        )
+        return result
+
+    return wrapper
+
+
+def _publish_live_interruptions(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        if isinstance(result, Mapping):
+            for run_id in result.get('run_ids') or []:
+                daily_pipeline_live_progress.publish_run(
+                    {
+                        'id': run_id,
+                        'status': 'interrupted',
+                        'error_message': kwargs.get('reason'),
+                    }
+                )
+        return result
+
+    return wrapper
 
 
 class DailyPipelineRunStateService:
@@ -425,6 +658,57 @@ class DailyPipelineRunStateService:
             'details': row.details or {},
         }
 
+    @staticmethod
+    def _interrupt_running_child_stages(
+        *,
+        parent_row: DailyPipelineRun,
+        stage_rows: Sequence[DailyPipelineStageRun],
+        now: datetime,
+        preserve_updated_at: bool,
+    ) -> int:
+        repaired_count = 0
+        parent_terminal_at = parent_row.completed_at or now
+        reason = (
+            parent_row.error_message
+            or 'Interrupted running stage because its parent pipeline run is terminal.'
+        )
+        for stage_row in stage_rows:
+            if stage_row.status not in ACTIVE_DAILY_PIPELINE_STATUSES:
+                continue
+            historical_updated_at = stage_row.updated_at
+            details = dict(stage_row.details or {})
+            details['terminal_parent_reconciliation'] = {
+                'schema_version': 'terminal_parent_running_stage_reconciliation_v1',
+                'reason': 'parent_terminal_while_stage_running',
+                'parent_run_id': int(parent_row.id),
+                'parent_status': str(parent_row.status),
+                'previous_stage_status': str(stage_row.status),
+                'parent_terminal_at': _iso(parent_terminal_at),
+                'reconciled_at': now.isoformat(),
+                'historical_updated_at_preserved': bool(
+                    preserve_updated_at
+                ),
+            }
+            stage_row.status = 'interrupted'
+            stage_row.remaining = max(
+                _as_int(stage_row.total) - _as_int(stage_row.processed),
+                0,
+            )
+            stage_row.current_step = 'parent_terminal_reconciled'
+            stage_row.current_activity = reason
+            stage_row.error_message = reason
+            stage_row.completed_at = stage_row.completed_at or parent_terminal_at
+            stage_row.details = details
+            if preserve_updated_at:
+                stage_row.updated_at = historical_updated_at
+                if hasattr(stage_row, '_sa_instance_state'):
+                    flag_modified(stage_row, 'updated_at')
+            else:
+                stage_row.updated_at = now
+            repaired_count += 1
+        return repaired_count
+
+    @_publish_live_run
     def start_run(
         self,
         *,
@@ -437,6 +721,15 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
+        admission_keys = eod_collection_admission_advisory_lock_keys(
+            market='KRX',
+            source='daily_price_bars',
+        )
+        if admission_keys is None:
+            raise RuntimeError(
+                'daily price-bar admission lock is unavailable'
+            )
+        admission_source_key, admission_trade_key = admission_keys
         metadata = {
             'requested_stages': list(requested_stages),
             'resolved_stages': list(resolved_stages),
@@ -446,8 +739,17 @@ class DailyPipelineRunStateService:
             # Serialize admission for every entry point. HTTP clients can time
             # out while the worker thread continues, so limiting this guard to
             # monitor-triggered runs still permits duplicate manual/API runs.
+            # The global shared fence is acquired first so a broad missing-bar
+            # repair can exclude creation of a future/no-bar active run while
+            # it holds the exclusive form of the same fence.
             session.execute(
-                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                text(
+                    'WITH admission AS MATERIALIZED ('
+                    'SELECT pg_advisory_xact_lock_shared('
+                    f'{admission_source_key}, {admission_trade_key})'
+                    ') SELECT pg_advisory_xact_lock('
+                    ':source_key, :trade_key) FROM admission'
+                ),
                 {
                     'source_key': 20_001,
                     'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
@@ -680,6 +982,7 @@ class DailyPipelineRunStateService:
             mark_started=True,
         )
 
+    @_publish_live_stage
     def update_stage(
         self,
         *,
@@ -705,7 +1008,31 @@ class DailyPipelineRunStateService:
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
-        normalized_status = str(status or 'running')
+        raw_status = str(status or 'running').strip().lower()
+        normalized_details = dict(details or {})
+        normalized_status = normalize_daily_pipeline_stage_status(
+            stage_id=stage_id,
+            status=raw_status,
+            outcome={
+                'stage': stage_id,
+                'status': raw_status,
+                'processed': processed,
+                'total': total,
+                'succeeded': succeeded,
+                'failed': failed,
+                'remaining': remaining,
+                'details': normalized_details,
+            },
+        )
+        if normalized_status != raw_status:
+            normalized_details.setdefault(
+                'status_canonicalized_from',
+                raw_status,
+            )
+            normalized_details.setdefault(
+                'status_canonicalization_reason',
+                'terminal_optional_context_unavailable',
+            )
         terminal = normalized_status in TERMINAL_DAILY_PIPELINE_STATUSES
         with session_scope(
             statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
@@ -747,6 +1074,44 @@ class DailyPipelineRunStateService:
                 failed=row.failed if failed is None else failed,
                 remaining=resolved_remaining,
             )
+            if normalized_status == 'completed':
+                counts['processed'] = counts['total']
+                counts['remaining'] = 0
+
+            if (
+                terminal
+                and normalized_details.get('terminal_count_authority')
+                == 'result'
+            ):
+                previous_counts = {
+                    'processed': max(_as_int(row.processed), 0),
+                    'total': max(_as_int(row.total), 0),
+                    'succeeded': max(_as_int(row.succeeded), 0),
+                    'failed': max(_as_int(row.failed), 0),
+                    'remaining': max(_as_int(row.remaining), 0),
+                }
+                count_fields = (
+                    'processed',
+                    'total',
+                    'succeeded',
+                    'failed',
+                    'remaining',
+                )
+                mismatch_fields = [
+                    field
+                    for field in count_fields
+                    if previous_counts[field] != counts[field]
+                ]
+                if mismatch_fields:
+                    normalized_details['terminal_count_reconciliation'] = {
+                        'schema_version': (
+                            'daily_pipeline_terminal_count_reconciliation_v1'
+                        ),
+                        'authority': 'result',
+                        'mismatch_fields': mismatch_fields,
+                        'previous': previous_counts,
+                        'result': dict(counts),
+                    }
 
             row.status = normalized_status
             row.processed = counts['processed']
@@ -762,8 +1127,8 @@ class DailyPipelineRunStateService:
             if source_run_ids is not None:
                 row.source_run_ids = dict(source_run_ids)
             row.completed_at = completed_at or (now if terminal else None)
-            if details is not None:
-                row.details = dict(details)
+            if details is not None or normalized_status != raw_status:
+                row.details = normalized_details
             if terminal:
                 merged_details = dict(row.details or {})
                 merged_details.update(
@@ -781,6 +1146,7 @@ class DailyPipelineRunStateService:
             session.flush()
             return self._serialize_stage(row)
 
+    @_publish_live_heartbeat
     def heartbeat_stage(
         self,
         *,
@@ -867,6 +1233,7 @@ class DailyPipelineRunStateService:
             recompute_remaining=True,
         )
 
+    @_publish_live_run
     def finish_run(
         self,
         *,
@@ -897,8 +1264,19 @@ class DailyPipelineRunStateService:
                                 == int(pipeline_run_id)
                             )
                             .order_by(DailyPipelineStageRun.id.asc())
+                            .with_for_update()
                         ).scalars()
                     )
+                    repaired_count = 0
+                    if requested_status in TERMINAL_DAILY_PIPELINE_STATUSES:
+                        repaired_count = self._interrupt_running_child_stages(
+                            parent_row=row,
+                            stage_rows=stage_rows,
+                            now=now,
+                            preserve_updated_at=True,
+                        )
+                    if repaired_count:
+                        session.flush()
                     return self._serialize_run(row, stage_rows)
                 raise ValueError(
                     f'daily pipeline run is not active: {pipeline_run_id} ({row.status})'
@@ -916,10 +1294,259 @@ class DailyPipelineRunStateService:
                     select(DailyPipelineStageRun)
                     .where(DailyPipelineStageRun.pipeline_run_id == int(pipeline_run_id))
                     .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
                 ).scalars()
             )
+            if requested_status in TERMINAL_DAILY_PIPELINE_STATUSES:
+                self._interrupt_running_child_stages(
+                    parent_row=row,
+                    stage_rows=stage_rows,
+                    now=now,
+                    preserve_updated_at=False,
+                )
             session.flush()
             return self._serialize_run(row, stage_rows)
+
+    def reconcile_terminal_parent_running_stages(
+        self,
+        *,
+        expected_orphans: Mapping[int, tuple[str, str]],
+        expected_orphan_count: int,
+        apply: bool = False,
+        preserve_historical_updated_at: bool = True,
+    ) -> dict[str, Any]:
+        """Repair one reviewed terminal-parent/running-child incident set.
+
+        The global orphan set must match the supplied manifest exactly. This
+        keeps the internal operation fail-closed if production state changes
+        between review and execution.
+        """
+
+        normalized_expected = {
+            int(parent_id): (
+                str(parent_status).strip().lower(),
+                str(stage_id).strip(),
+            )
+            for parent_id, (parent_status, stage_id) in expected_orphans.items()
+        }
+        normalized_expected_count = int(expected_orphan_count)
+        if not normalized_expected:
+            raise ValueError('expected terminal-child repair manifest is empty')
+        if normalized_expected_count != len(normalized_expected):
+            raise ValueError(
+                'expected orphan count must equal the exact parent manifest size'
+            )
+        if any(
+            parent_status not in TERMINAL_DAILY_PIPELINE_STATUSES
+            or not stage_id
+            for parent_status, stage_id in normalized_expected.values()
+        ):
+            raise ValueError('expected terminal-child repair manifest is invalid')
+
+        now = _utcnow()
+        expected_parent_ids = tuple(sorted(normalized_expected))
+
+        def _orphan_statement():
+            return (
+                select(DailyPipelineRun, DailyPipelineStageRun)
+                .join(
+                    DailyPipelineStageRun,
+                    DailyPipelineStageRun.pipeline_run_id
+                    == DailyPipelineRun.id,
+                )
+                .where(
+                    DailyPipelineRun.status.in_(
+                        TERMINAL_DAILY_PIPELINE_STATUSES
+                    ),
+                    DailyPipelineStageRun.status.in_(
+                        ACTIVE_DAILY_PIPELINE_STATUSES
+                    ),
+                )
+                .order_by(
+                    DailyPipelineRun.id.asc(),
+                    DailyPipelineStageRun.id.asc(),
+                )
+                .with_for_update()
+            )
+
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS,
+            lock_timeout_ms=DAILY_PIPELINE_HEARTBEAT_LOCK_TIMEOUT_MS,
+            isolated_connection=True,
+        ) as session:
+            parent_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(DailyPipelineRun.id.in_(expected_parent_ids))
+                    .order_by(DailyPipelineRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            orphan_rows = list(session.execute(_orphan_statement()).all())
+            scoped_stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id.in_(
+                            expected_parent_ids
+                        )
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+
+            actual_parent_ids = sorted(int(row.id) for row in parent_rows)
+            actual_manifest = sorted(
+                (
+                    int(parent_row.id),
+                    str(parent_row.status),
+                    str(stage_row.stage_id),
+                )
+                for parent_row, stage_row in orphan_rows
+            )
+            expected_manifest = sorted(
+                (
+                    parent_id,
+                    parent_status,
+                    stage_id,
+                )
+                for parent_id, (parent_status, stage_id) in normalized_expected.items()
+            )
+            parent_statuses_match = all(
+                normalized_expected.get(int(row.id), ('', ''))[0]
+                == str(row.status)
+                for row in parent_rows
+            )
+            parent_completed_at_present = all(
+                row.completed_at is not None for row in parent_rows
+            )
+            invariants = {
+                'parent_ids_match': actual_parent_ids
+                == list(expected_parent_ids),
+                'parent_statuses_match': parent_statuses_match,
+                'parent_completed_at_present': parent_completed_at_present,
+                'orphan_count_matches': len(orphan_rows)
+                == normalized_expected_count,
+                'orphan_manifest_matches': actual_manifest
+                == expected_manifest,
+            }
+
+            audited_stage_rows: list[
+                tuple[DailyPipelineStageRun, Mapping[str, Any]]
+            ] = []
+            for stage_row in scoped_stage_rows:
+                audit = (
+                    (stage_row.details or {}).get(
+                        'terminal_parent_reconciliation'
+                    )
+                    or {}
+                )
+                if (
+                    stage_row.status == 'interrupted'
+                    and isinstance(audit, Mapping)
+                    and str(audit.get('schema_version') or '')
+                    == 'terminal_parent_running_stage_reconciliation_v1'
+                ):
+                    audited_stage_rows.append((stage_row, audit))
+            audited_manifest = sorted(
+                (
+                    int(stage_row.pipeline_run_id),
+                    str(audit.get('parent_status') or ''),
+                    str(stage_row.stage_id),
+                )
+                for stage_row, audit in audited_stage_rows
+            )
+            already_applied_invariants = {
+                'parent_ids_match': invariants['parent_ids_match'],
+                'parent_statuses_match': invariants[
+                    'parent_statuses_match'
+                ],
+                'parent_completed_at_present': invariants[
+                    'parent_completed_at_present'
+                ],
+                'no_pending_orphans': not orphan_rows,
+                'repair_marker_count_matches': len(audited_stage_rows)
+                == normalized_expected_count,
+                'repair_marker_manifest_matches': audited_manifest
+                == expected_manifest,
+            }
+            if all(already_applied_invariants.values()):
+                return {
+                    'status': 'already_applied',
+                    'dry_run': not apply,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': 0,
+                    'invariants': already_applied_invariants,
+                    'repaired_stage_run_ids': sorted(
+                        int(stage_row.id)
+                        for stage_row, _audit in audited_stage_rows
+                    ),
+                }
+
+            if not all(invariants.values()):
+                return {
+                    'status': 'blocked',
+                    'reason': 'terminal_child_repair_manifest_mismatch',
+                    'dry_run': not apply,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'actual_parent_ids': actual_parent_ids,
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': len(orphan_rows),
+                    'expected_manifest': expected_manifest,
+                    'actual_manifest': actual_manifest,
+                    'invariants': invariants,
+                    'repaired_stage_run_ids': [],
+                }
+
+            if not apply:
+                return {
+                    'status': 'ready',
+                    'dry_run': True,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': len(orphan_rows),
+                    'expected_manifest': expected_manifest,
+                    'actual_manifest': actual_manifest,
+                    'invariants': invariants,
+                    'repaired_stage_run_ids': [],
+                }
+
+            repaired_stage_run_ids: list[int] = []
+            for parent_row, stage_row in orphan_rows:
+                repaired_stage_run_ids.append(int(stage_row.id))
+                self._interrupt_running_child_stages(
+                    parent_row=parent_row,
+                    stage_rows=[stage_row],
+                    now=now,
+                    preserve_updated_at=preserve_historical_updated_at,
+                )
+            session.flush()
+            remaining_orphans = list(
+                session.execute(_orphan_statement()).all()
+            )
+            if remaining_orphans:
+                session.rollback()
+                return {
+                    'status': 'blocked',
+                    'reason': 'terminal_child_repair_postcondition_failed',
+                    'dry_run': False,
+                    'expected_parent_ids': list(expected_parent_ids),
+                    'expected_orphan_count': normalized_expected_count,
+                    'actual_orphan_count': len(remaining_orphans),
+                    'invariants': invariants,
+                    'repaired_stage_run_ids': [],
+                }
+            return {
+                'status': 'completed',
+                'dry_run': False,
+                'expected_parent_ids': list(expected_parent_ids),
+                'expected_orphan_count': normalized_expected_count,
+                'actual_orphan_count': 0,
+                'invariants': invariants,
+                'repaired_stage_run_ids': sorted(repaired_stage_run_ids),
+            }
 
     def get_latest_run(
         self,
@@ -1048,6 +1675,65 @@ class DailyPipelineRunStateService:
                 select(DailyPipelineRun.id).where(*filters)
             ).scalars()
             return sum(1 for _ in run_ids)
+
+    def list_prior_followup_runs_for_lineage(
+        self,
+        *,
+        market_date: str | date,
+        reused_eod_collection_run_id: int,
+        before_pipeline_run_id: int,
+        limit: int = 8,
+        order_by_id_desc: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Load a bounded prior recovery chain for one exact EOD lineage."""
+
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_eod_run_id = int(reused_eod_collection_run_id)
+        normalized_before_run_id = int(before_pipeline_run_id)
+        if normalized_eod_run_id <= 0 or normalized_before_run_id <= 0:
+            raise ValueError('lineage and pipeline run ids must be positive')
+
+        with session_scope() as session:
+            ordering = (
+                (DailyPipelineRun.id.desc(),)
+                if order_by_id_desc
+                else (
+                    DailyPipelineRun.started_at.desc(),
+                    DailyPipelineRun.id.desc(),
+                )
+            )
+            rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.trigger
+                        == 'auto_eod_followup_resume',
+                        DailyPipelineRun.id < normalized_before_run_id,
+                        DailyPipelineRun.run_metadata[
+                            'reused_eod_collection_run_id'
+                        ].as_integer()
+                        == normalized_eod_run_id,
+                    )
+                    .order_by(*ordering)
+                    .limit(max(1, min(int(limit), 8)))
+                ).scalars()
+            )
+            serialized: list[dict[str, Any]] = []
+            for row in rows:
+                stage_rows = list(
+                    session.execute(
+                        select(DailyPipelineStageRun)
+                        .where(
+                            DailyPipelineStageRun.pipeline_run_id
+                            == row.id
+                        )
+                        .order_by(DailyPipelineStageRun.id.asc())
+                    ).scalars()
+                )
+                serialized.append(self._serialize_run(row, stage_rows))
+            return serialized
 
     def claim_summary_cutoff_contract_repair_resume(
         self,
@@ -1265,6 +1951,16 @@ class DailyPipelineRunStateService:
                     'cutoff_contract_repair_progress_invalid',
                     status=status,
                 )
+            persisted_repair_stage_ids = (
+                resolved_cutoff_repair_stage_ids(
+                    metadata.get('resolved_stages')
+                )
+            )
+            if persisted_repair_stage_ids is None:
+                return reject(
+                    'cutoff_contract_repair_stage_contract_invalid',
+                    status=status,
+                )
 
             repair_proof = dict(
                 metadata['summary_cutoff_contract_repair_proof']
@@ -1355,9 +2051,11 @@ class DailyPipelineRunStateService:
                     'summary_cutoff_contract_repair_resumed_from_status': (
                         status
                     ),
+                    'requested_stages': list(CUTOFF_REPAIR_STAGE_IDS),
+                    'resolved_stages': list(CUTOFF_REPAIR_STAGE_IDS),
                     'stage_statuses': {
                         stage_id: 'pending'
-                        for stage_id in LEGACY_CUTOFF_REPAIR_STAGE_IDS
+                        for stage_id in CUTOFF_REPAIR_STAGE_IDS
                     },
                     'resumable': True,
                 }
@@ -1383,7 +2081,7 @@ class DailyPipelineRunStateService:
                 stage_row.updated_at = now
 
             run_row.status = 'running'
-            run_row.current_stage = LEGACY_CUTOFF_REPAIR_STAGE_IDS[0]
+            run_row.current_stage = CUTOFF_REPAIR_STAGE_IDS[0]
             run_row.completed_at = None
             run_row.error_message = None
             run_row.updated_at = now
@@ -1400,6 +2098,495 @@ class DailyPipelineRunStateService:
                     stage_rows,
                 ),
                 'knowledge_cutoff_resolution': compact_cutoff_resolution,
+            }
+
+    def claim_same_day_intraday_watch_rearm_resume(
+        self,
+        *,
+        pipeline_run_id: int,
+        market_date: str | date,
+        reused_eod_collection_run_id: int,
+        target_trade_date: str | date,
+        expected_summary_cutoff_proof: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Reclaim only the unfinished tail after a durable signal decision.
+
+        The EOD marker authorizes no new decision pass.  This claim therefore
+        preserves the completed signal row and resets only the first unfinished
+        execution-plan stage plus its untouched tail in the same pipeline run.
+        """
+
+        normalized_pipeline_run_id = int(pipeline_run_id)
+        normalized_eod_run_id = int(reused_eod_collection_run_id)
+        normalized_market_date = _normalize_market_date(market_date)
+        normalized_target_trade_date = _normalize_market_date(
+            target_trade_date
+        )
+
+        def reject(rejection_reason: str, **extra: Any) -> dict[str, Any]:
+            return {
+                'claimed': False,
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'reason': rejection_reason,
+                **extra,
+            }
+
+        if min(normalized_pipeline_run_id, normalized_eod_run_id) <= 0:
+            return reject('invalid_rearm_resume_identity')
+        if not isinstance(expected_summary_cutoff_proof, Mapping):
+            return reject('summary_cutoff_proof_unavailable')
+        expected_proof = dict(expected_summary_cutoff_proof)
+        now = _utcnow()
+
+        with session_scope(
+            statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
+        ) as session:
+            session.execute(
+                text('SELECT pg_advisory_xact_lock(:source_key, :trade_key)'),
+                {
+                    'source_key': 20_001,
+                    'trade_key': int(
+                        normalized_market_date.strftime('%Y%m%d')
+                    ),
+                },
+            )
+            run_row = session.execute(
+                select(DailyPipelineRun)
+                .where(DailyPipelineRun.id == normalized_pipeline_run_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if run_row is None:
+                return reject('pipeline_run_not_found')
+
+            metadata = (
+                dict(run_row.run_metadata)
+                if isinstance(run_row.run_metadata, Mapping)
+                else {}
+            )
+            interruption_reason = str(
+                metadata.get('interrupted_reason') or ''
+            ).strip()
+            if not (
+                run_row.market_date == normalized_market_date
+                and str(run_row.trigger or '').strip()
+                == 'auto_eod_followup_resume'
+                and str(run_row.status or '').strip().lower()
+                == 'interrupted'
+                and tuple(metadata.get('resolved_stages') or ())
+                == AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+                and str(metadata.get('resume_from_stage') or '').strip()
+                == AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[0]
+                and str(metadata.get('entrypoint') or '').strip()
+                == 'daily_pipeline_stage_service.run'
+                and _as_int(metadata.get('reused_eod_collection_run_id'))
+                == normalized_eod_run_id
+                and metadata.get('point_in_time_recovery') is True
+                and metadata.get('force') is False
+                and metadata.get('reuse_existing_feedback') is True
+                and metadata.get('allow_expired_analysis_replay') is False
+                and metadata.get(
+                    'same_day_intraday_watch_continuation_admitted'
+                ) is True
+                and metadata.get('resumable') is True
+                and isinstance(metadata.get('markets'), list)
+                and bool(metadata.get('markets'))
+                and all(
+                    isinstance(market, str) and market.strip()
+                    for market in metadata['markets']
+                )
+                and str(metadata.get('fs_div') or '').strip().upper()
+                in {'CFS', 'OFS'}
+                and interruption_reason
+                and _parse_utc_datetime(metadata.get('interrupted_at'))
+                is not None
+                and str(run_row.error_message or '').strip()
+                == interruption_reason
+            ):
+                return reject('rearm_resume_parent_contract_mismatch')
+
+            current_proof = _intraday_summary_cutoff_proof(metadata)
+            if current_proof is None or current_proof != expected_proof:
+                return reject('summary_cutoff_proof_mismatch')
+
+            eod_run = session.get(EODCollectionRun, normalized_eod_run_id)
+            if eod_run is not None:
+                session.refresh(eod_run, with_for_update=True)
+            if not (
+                eod_run is not None
+                and str(eod_run.market or '').strip().upper() == 'KRX'
+                and str(eod_run.source or '').strip().lower() == 'pykrx'
+                and eod_run.trade_date == normalized_market_date
+            ):
+                return reject('eod_lineage_context_mismatch')
+            eod_metadata = (
+                eod_run.run_metadata
+                if isinstance(eod_run.run_metadata, Mapping)
+                else {}
+            )
+            marker = pending_same_day_intraday_watch_rearm_marker(
+                eod_metadata.get(SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY),
+                target_trade_date=normalized_target_trade_date,
+            )
+            if marker is None:
+                return reject('same_day_rearm_marker_invalid')
+
+            lineage_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.trigger
+                        == 'auto_eod_followup_resume',
+                        DailyPipelineRun.run_metadata[
+                            'reused_eod_collection_run_id'
+                        ].as_integer()
+                        == normalized_eod_run_id,
+                    )
+                    .order_by(
+                        DailyPipelineRun.started_at.asc(),
+                        DailyPipelineRun.id.asc(),
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            lineage_by_id = {int(row.id): row for row in lineage_rows}
+            source_run = lineage_by_id.get(
+                int(marker['source_false_skip_run_id'])
+            )
+            proof_run = lineage_by_id.get(int(marker['proof_pipeline_run_id']))
+            ordered_ids = [int(row.id) for row in lineage_rows]
+            if not (
+                source_run is not None
+                and proof_run is not None
+                and ordered_ids
+                and ordered_ids[-1] == normalized_pipeline_run_id
+                and len(ordered_ids)
+                <= SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+                and int(proof_run.id) < int(source_run.id)
+                < normalized_pipeline_run_id
+            ):
+                return reject(
+                    'same_day_rearm_lineage_mismatch',
+                    observed_pipeline_run_ids=ordered_ids,
+                )
+            marker_started_at = _parse_utc_datetime(marker.get('started_at'))
+            source_completed_at = _as_utc_datetime(source_run.completed_at)
+            current_started_at = _as_utc_datetime(run_row.started_at)
+            proof_started_at = getattr(proof_run, 'started_at', None)
+            source_started_at = getattr(source_run, 'started_at', None)
+            if not (
+                isinstance(proof_started_at, datetime)
+                and proof_started_at.tzinfo is not None
+                and proof_started_at.utcoffset() is not None
+                and isinstance(source_started_at, datetime)
+                and source_started_at.tzinfo is not None
+                and source_started_at.utcoffset() is not None
+                and proof_started_at.astimezone(timezone.utc)
+                <= source_started_at.astimezone(timezone.utc)
+            ):
+                return reject('same_day_rearm_proof_chronology_mismatch')
+            if not (
+                marker_started_at is not None
+                and source_completed_at is not None
+                and current_started_at is not None
+                and source_completed_at <= marker_started_at
+                <= current_started_at
+            ):
+                return reject('same_day_rearm_marker_timeline_mismatch')
+            proof_metadata = (
+                proof_run.run_metadata
+                if isinstance(proof_run.run_metadata, Mapping)
+                else {}
+            )
+            if _intraday_summary_cutoff_proof(proof_metadata) != expected_proof:
+                return reject('proof_pipeline_cutoff_mismatch')
+
+            marker_evidence_stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id.in_(
+                            [int(source_run.id), int(proof_run.id)]
+                        ),
+                        DailyPipelineStageRun.market_date
+                        == normalized_market_date,
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            marker_stages_by_run: dict[int, dict[str, dict[str, Any]]] = {}
+            for stage_row in marker_evidence_stage_rows:
+                stage_outcome = _stage_row_outcome(stage_row)
+                stage_outcome['source_run_ids'] = (
+                    dict(stage_row.source_run_ids)
+                    if isinstance(stage_row.source_run_ids, Mapping)
+                    else {}
+                )
+                marker_stages_by_run.setdefault(
+                    int(stage_row.pipeline_run_id),
+                    {},
+                )[str(stage_row.stage_id or '').strip()] = stage_outcome
+
+            def marker_pipeline_evidence(
+                row: DailyPipelineRun,
+            ) -> dict[str, Any]:
+                return {
+                    'id': int(row.id),
+                    'market_date': row.market_date,
+                    'trigger': row.trigger,
+                    'status': row.status,
+                    'current_stage': row.current_stage,
+                    'completed_at': row.completed_at,
+                    'error_message': row.error_message,
+                    'run_metadata': row.run_metadata,
+                    'stages': marker_stages_by_run.get(int(row.id), {}),
+                }
+
+            if not is_recoverable_same_day_intraday_watch_expiration(
+                marker_pipeline_evidence(source_run),
+                current_market_date=normalized_target_trade_date,
+            ):
+                return reject('source_false_skip_evidence_invalid')
+            if not is_canonical_same_day_signal_rearm_proof(
+                marker_pipeline_evidence(proof_run),
+                expected_eod_collection_run_id=normalized_eod_run_id,
+            ):
+                return reject('proof_pipeline_evidence_invalid')
+
+            active_rows = list(
+                session.execute(
+                    select(DailyPipelineRun)
+                    .where(
+                        DailyPipelineRun.market_date
+                        == normalized_market_date,
+                        DailyPipelineRun.status.in_(
+                            ACTIVE_DAILY_PIPELINE_STATUSES
+                        ),
+                        DailyPipelineRun.id != normalized_pipeline_run_id,
+                    )
+                    .with_for_update()
+                ).scalars()
+            )
+            if active_rows:
+                return reject(
+                    'overlapping_run_already_active',
+                    active_pipeline_run_ids=[
+                        int(active_row.id) for active_row in active_rows
+                    ],
+                )
+
+            stage_rows = list(
+                session.execute(
+                    select(DailyPipelineStageRun)
+                    .where(
+                        DailyPipelineStageRun.pipeline_run_id
+                        == normalized_pipeline_run_id
+                    )
+                    .order_by(DailyPipelineStageRun.id.asc())
+                    .with_for_update()
+                ).scalars()
+            )
+            stage_rows_by_id = {
+                str(stage_row.stage_id or '').strip(): stage_row
+                for stage_row in stage_rows
+            }
+            if not (
+                stage_rows_by_id
+                and set(stage_rows_by_id).issubset(
+                    set(AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER)
+                )
+                and len(stage_rows_by_id) == len(stage_rows)
+                and 'signal_decider' in stage_rows_by_id
+            ):
+                return reject('resolved_stage_rows_mismatch')
+
+            def satisfied(stage_row: DailyPipelineStageRun) -> bool:
+                return bool(
+                    daily_pipeline_outcome_is_satisfied(
+                        _stage_row_outcome(stage_row)
+                    )
+                    and stage_row.completed_at is not None
+                    and not str(stage_row.error_message or '').strip()
+                )
+
+            signal_row = stage_rows_by_id['signal_decider']
+            signal_sources = (
+                signal_row.source_run_ids
+                if isinstance(signal_row.source_run_ids, Mapping)
+                else {}
+            )
+            if not (
+                satisfied(signal_row)
+                and str(
+                    signal_sources.get('agent_feedback_run_id')
+                    or signal_sources.get('run_id')
+                    or ''
+                ).strip()
+            ):
+                return reject('completed_signal_evidence_invalid')
+
+            satisfied_prefix: list[str] = []
+            for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER:
+                stage_row = stage_rows_by_id.get(stage_id)
+                if stage_row is None or not satisfied(stage_row):
+                    break
+                satisfied_prefix.append(stage_id)
+            if len(satisfied_prefix) == len(
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+            ):
+                return reject('same_day_rearm_suffix_already_satisfied')
+            first_unfinished_index = len(satisfied_prefix)
+            if first_unfinished_index == 0:
+                return reject('completed_signal_evidence_invalid')
+            first_unfinished_stage = (
+                AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[
+                    first_unfinished_index
+                ]
+            )
+
+            def untouched_pending(stage_row: DailyPipelineStageRun) -> bool:
+                return bool(
+                    str(stage_row.status or '').strip().lower() == 'pending'
+                    and all(
+                        _as_int(getattr(stage_row, field, 0)) == 0
+                        for field in (
+                            'processed',
+                            'total',
+                            'succeeded',
+                            'failed',
+                            'remaining',
+                        )
+                    )
+                    and stage_row.completed_at is None
+                    and not str(stage_row.error_message or '').strip()
+                    and isinstance(stage_row.source_run_ids, Mapping)
+                    and not stage_row.source_run_ids
+                )
+
+            first_row = stage_rows_by_id.get(first_unfinished_stage)
+            first_status = (
+                str(first_row.status or '').strip().lower()
+                if first_row is not None
+                else 'absent'
+            )
+            current_stage = str(run_row.current_stage or '').strip()
+            if first_status == 'absent':
+                first_is_valid = current_stage in {
+                    first_unfinished_stage,
+                    satisfied_prefix[-1],
+                }
+            elif first_status == 'pending':
+                first_is_valid = bool(
+                    untouched_pending(first_row)
+                    and current_stage
+                    in {first_unfinished_stage, satisfied_prefix[-1]}
+                )
+            elif first_status == 'interrupted':
+                details = (
+                    first_row.details
+                    if isinstance(first_row.details, Mapping)
+                    else {}
+                )
+                first_is_valid = bool(
+                    current_stage == first_unfinished_stage
+                    and str(first_row.current_step or '').strip()
+                    == 'core_restart_interrupted'
+                    and first_row.completed_at is not None
+                    and str(first_row.error_message or '').strip()
+                    == interruption_reason
+                    and details.get('resumable') is True
+                    and str(details.get('interrupted_reason') or '').strip()
+                    == interruption_reason
+                )
+            else:
+                first_is_valid = False
+            untouched_tail = all(
+                stage_id not in stage_rows_by_id
+                or untouched_pending(stage_rows_by_id[stage_id])
+                for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[
+                    first_unfinished_index + 1 :
+                ]
+            )
+            if not first_is_valid or not untouched_tail:
+                return reject(
+                    'same_day_rearm_stage_progress_invalid',
+                    first_unfinished_stage=first_unfinished_stage,
+                    first_unfinished_status=first_status,
+                )
+
+            persisted_stage_outcomes = {
+                stage_id: self._serialize_stage(stage_rows_by_id[stage_id])
+                for stage_id in satisfied_prefix
+            }
+            stage_statuses = {
+                stage_id: str(stage_rows_by_id[stage_id].status or '')
+                .strip()
+                .lower()
+                for stage_id in satisfied_prefix
+            }
+            for stage_id in AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER[
+                first_unfinished_index:
+            ]:
+                stage_row = stage_rows_by_id.get(stage_id)
+                stage_statuses[stage_id] = 'pending'
+                if stage_row is None:
+                    continue
+                stage_row.status = 'pending'
+                stage_row.processed = 0
+                stage_row.total = 0
+                stage_row.succeeded = 0
+                stage_row.failed = 0
+                stage_row.remaining = 0
+                stage_row.current_step = (
+                    'same_day_intraday_watch_rearm_pending'
+                )
+                stage_row.current_activity = (
+                    f'Pending same-day recovery from {first_unfinished_stage}'
+                )
+                stage_row.current_symbol = None
+                stage_row.current_period = None
+                stage_row.started_at = now
+                stage_row.updated_at = now
+                stage_row.completed_at = None
+                stage_row.error_message = None
+                stage_row.source_run_ids = {}
+                stage_row.details = {}
+
+            metadata.update(
+                {
+                    'same_day_intraday_watch_rearm_resume_count': (
+                        _as_int(
+                            metadata.get(
+                                'same_day_intraday_watch_rearm_resume_count'
+                            )
+                        )
+                        + 1
+                    ),
+                    'same_day_intraday_watch_rearm_resumed_at': now.isoformat(),
+                    'same_day_intraday_watch_rearm_resume_from_stage': (
+                        first_unfinished_stage
+                    ),
+                    'stage_statuses': stage_statuses,
+                    'resumable': True,
+                }
+            )
+            run_row.status = 'running'
+            run_row.current_stage = first_unfinished_stage
+            run_row.completed_at = None
+            run_row.error_message = None
+            run_row.updated_at = now
+            run_row.run_metadata = metadata
+            session.flush()
+            return {
+                'claimed': True,
+                'reason': 'same_day_intraday_watch_rearm_resumed',
+                'pipeline_run_id': normalized_pipeline_run_id,
+                'resume_from_stage': first_unfinished_stage,
+                'pipeline_run': self._serialize_run(run_row, stage_rows),
+                'persisted_stage_outcomes': persisted_stage_outcomes,
+                'summary_cutoff_proof': current_proof,
             }
 
     def claim_terminal_continuation(
@@ -1444,12 +2631,6 @@ class DailyPipelineRunStateService:
         if normalized_reason != 'summary_knowledge_cutoff_repair':
             return reject('unsupported_terminal_continuation_reason')
 
-        continuation_suffix = (
-            'agent_feedback_summaries',
-            'signal_decider',
-            'next_open_execution_plan',
-            'signal_decider_evaluations',
-        )
         now = _utcnow()
         with session_scope(
             statement_timeout_ms=DAILY_PIPELINE_STATE_WRITE_TIMEOUT_MS
@@ -1489,6 +2670,16 @@ class DailyPipelineRunStateService:
                 if isinstance(run_row.run_metadata, Mapping)
                 else {}
             )
+            continuation_suffix = (
+                _resolved_terminal_continuation_stage_order(
+                    metadata.get('resolved_stages')
+                )
+            )
+            if continuation_suffix is None:
+                return reject(
+                    'terminal_continuation_suffix_mismatch',
+                    status=current_status,
+                )
             if (
                 current_status in {'running', 'interrupted', 'failed'}
                 and _as_int(metadata.get('terminal_continuation_count')) == 1
@@ -1514,7 +2705,7 @@ class DailyPipelineRunStateService:
                 )
             if (
                 str(run_row.current_stage or '').strip()
-                != 'signal_decider_evaluations'
+                != continuation_suffix[-1]
             ):
                 return reject(
                     'terminal_stage_mismatch',
@@ -1939,38 +3130,43 @@ class DailyPipelineRunStateService:
                     status=current_status,
                 )
 
-            evaluation_stage = stage_rows_by_id[
-                'signal_decider_evaluations'
-            ]
-            evaluation_details = (
-                evaluation_stage.details
-                if isinstance(evaluation_stage.details, Mapping)
-                else {}
-            )
-            evaluation_result = (
-                evaluation_details.get('result_summary')
-                if isinstance(
-                    evaluation_details.get('result_summary'), Mapping
-                )
-                else {}
-            )
-            if not (
-                str(evaluation_stage.status or '').strip().lower()
-                == 'blocked'
-                and str(evaluation_result.get('status') or '')
-                .strip()
-                .lower()
-                == 'blocked'
-                and evaluation_result.get('triggered') is False
-                and str(evaluation_result.get('reason') or '').strip()
-                == 'declared_dependencies_incomplete'
-                and evaluation_result.get('incomplete_dependencies')
-                == ['signal_decider']
+            if (
+                continuation_suffix
+                == LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
             ):
-                return reject(
-                    'evaluation_block_reason_mismatch',
-                    status=current_status,
+                evaluation_stage = stage_rows_by_id[
+                    'signal_decider_evaluations'
+                ]
+                evaluation_details = (
+                    evaluation_stage.details
+                    if isinstance(evaluation_stage.details, Mapping)
+                    else {}
                 )
+                evaluation_result = (
+                    evaluation_details.get('result_summary')
+                    if isinstance(
+                        evaluation_details.get('result_summary'), Mapping
+                    )
+                    else {}
+                )
+                if not (
+                    str(evaluation_stage.status or '').strip().lower()
+                    == 'blocked'
+                    and str(evaluation_result.get('status') or '')
+                    .strip()
+                    .lower()
+                    == 'blocked'
+                    and evaluation_result.get('triggered') is False
+                    and str(evaluation_result.get('reason') or '')
+                    .strip()
+                    == 'declared_dependencies_incomplete'
+                    and evaluation_result.get('incomplete_dependencies')
+                    == ['signal_decider']
+                ):
+                    return reject(
+                        'evaluation_block_reason_mismatch',
+                        status=current_status,
+                    )
 
             summary_source_run_id = next(iter(summary_source_ids))
             cutoff_resolution = (
@@ -2077,6 +3273,10 @@ class DailyPipelineRunStateService:
                             'completed_at': _iso(run_row.completed_at),
                             'error_message': run_row.error_message,
                             'resume_from_stage': prior_resume_from_stage,
+                            'requested_stages': list(
+                                metadata.get('requested_stages') or []
+                            ),
+                            'resolved_stages': list(resolved_stages),
                             'stage_statuses': dict(
                                 prior_stage_statuses
                             ),
@@ -2087,13 +3287,29 @@ class DailyPipelineRunStateService:
                     },
                 }
             )
-            resumed_stage_statuses = dict(prior_stage_statuses)
+            active_projection = (
+                _project_terminal_continuation_metadata_to_current_contract(
+                    metadata
+                )
+            )
+            if active_projection is None:
+                return reject(
+                    'terminal_continuation_suffix_mismatch',
+                    status=current_status,
+                )
+            metadata, active_resolved_stages, _ = active_projection
+            resumed_stage_statuses = dict(
+                metadata.get('stage_statuses') or {}
+            )
             resumed_stage_statuses.update(
-                {stage_id: 'pending' for stage_id in continuation_suffix}
+                {
+                    stage_id: 'pending'
+                    for stage_id in TERMINAL_CONTINUATION_STAGE_ORDER
+                }
             )
             metadata['stage_statuses'] = resumed_stage_statuses
 
-            for stage_id in continuation_suffix:
+            for stage_id in TERMINAL_CONTINUATION_STAGE_ORDER:
                 stage_row = stage_rows_by_id[stage_id]
                 stage_row.status = 'pending'
                 stage_row.processed = 0
@@ -2125,7 +3341,10 @@ class DailyPipelineRunStateService:
 
             pipeline_run = self._serialize_run(
                 run_row,
-                [stage_rows_by_id[stage_id] for stage_id in resolved_stages],
+                [
+                    stage_rows_by_id[stage_id]
+                    for stage_id in active_resolved_stages
+                ],
             )
             return {
                 'claimed': True,
@@ -2351,11 +3570,32 @@ class DailyPipelineRunStateService:
             str(stage_row.stage_id or '').strip(): stage_row
             for stage_row in stage_rows
         }
+        archived_suffix_evidence = continuation_evidence.get(
+            'suffix_stages'
+        )
+        archived_legacy_continuation = bool(
+            isinstance(archived_suffix_evidence, Mapping)
+            and set(archived_suffix_evidence)
+            == set(LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER)
+        )
+        allowed_stage_row_ids = set(resolved_stages)
+        if archived_legacy_continuation:
+            allowed_stage_row_ids.add('signal_decider_evaluations')
         if (
             len(stage_rows_by_id) != len(stage_rows)
-            or set(stage_rows_by_id) != set(resolved_stages)
+            or set(stage_rows_by_id) != allowed_stage_row_ids
         ):
             return reject('resolved_stage_rows_mismatch')
+
+        active_projection = (
+            _project_terminal_continuation_metadata_to_current_contract(
+                metadata
+            )
+        )
+        if active_projection is None:
+            return reject('terminal_continuation_suffix_mismatch')
+        _, active_resolved_stages, _ = active_projection
+        active_continuation_suffix = TERMINAL_CONTINUATION_STAGE_ORDER
 
         stage_statuses = metadata.get('stage_statuses')
         if not isinstance(stage_statuses, Mapping):
@@ -2396,7 +3636,7 @@ class DailyPipelineRunStateService:
             return reject('stage_status_evidence_mismatch')
 
         satisfied_prefix: list[str] = []
-        for stage_id in continuation_suffix:
+        for stage_id in active_continuation_suffix:
             stage_row = stage_rows_by_id[stage_id]
             if not (
                 daily_pipeline_outcome_is_satisfied(
@@ -2408,11 +3648,11 @@ class DailyPipelineRunStateService:
                 break
             satisfied_prefix.append(stage_id)
 
-        if len(satisfied_prefix) == len(continuation_suffix):
+        if len(satisfied_prefix) == len(active_continuation_suffix):
             return reject('terminal_continuation_suffix_already_satisfied')
 
         first_unfinished_index = len(satisfied_prefix)
-        first_unfinished_stage = continuation_suffix[
+        first_unfinished_stage = active_continuation_suffix[
             first_unfinished_index
         ]
         first_unfinished_row = stage_rows_by_id[first_unfinished_stage]
@@ -2462,7 +3702,7 @@ class DailyPipelineRunStateService:
 
         metadata_prefix_size = 0
         metadata_pending_seen = False
-        for stage_id in continuation_suffix:
+        for stage_id in active_continuation_suffix:
             persisted_status = str(
                 stage_statuses.get(stage_id) or ''
             ).strip().lower()
@@ -2552,7 +3792,7 @@ class DailyPipelineRunStateService:
 
         untouched_tail = all(
             untouched_claim_stage(stage_rows_by_id[stage_id])
-            for stage_id in continuation_suffix[
+            for stage_id in active_continuation_suffix[
                 first_unfinished_index + 1 :
             ]
         )
@@ -2588,14 +3828,24 @@ class DailyPipelineRunStateService:
         parent_evidence = continuation_evidence.get('parent')
         suffix_evidence = continuation_evidence.get('suffix_stages')
         summary_proof = continuation_evidence.get('summary_proof')
+        legacy_continuation = bool(
+            continuation_suffix
+            == LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
+            or archived_legacy_continuation
+        )
+        archived_continuation_suffix = (
+            LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER
+            if legacy_continuation
+            else TERMINAL_CONTINUATION_STAGE_ORDER
+        )
         if not (
             isinstance(parent_evidence, Mapping)
             and str(parent_evidence.get('status') or '').strip().lower()
             == 'blocked'
             and str(parent_evidence.get('current_stage') or '').strip()
-            == 'signal_decider_evaluations'
+            == archived_continuation_suffix[-1]
             and isinstance(suffix_evidence, Mapping)
-            and set(suffix_evidence) == set(continuation_suffix)
+            and set(suffix_evidence) == set(archived_continuation_suffix)
             and isinstance(summary_proof, Mapping)
             and summary_proof.get('ready') is True
         ):
@@ -2604,9 +3854,11 @@ class DailyPipelineRunStateService:
         archived_summary = suffix_evidence['agent_feedback_summaries']
         archived_decider = suffix_evidence['signal_decider']
         archived_plan = suffix_evidence['next_open_execution_plan']
-        archived_evaluations = suffix_evidence[
-            'signal_decider_evaluations'
-        ]
+        archived_evaluations = (
+            suffix_evidence.get('signal_decider_evaluations')
+            if legacy_continuation
+            else None
+        )
         archived_summary_sources = (
             archived_summary.get('source_run_ids')
             if isinstance(archived_summary, Mapping)
@@ -2751,22 +4003,32 @@ class DailyPipelineRunStateService:
                 archived_plan_result.get('upstream_status') or ''
             ).strip().lower()
             == 'failed'
-            and isinstance(archived_evaluations, Mapping)
-            and str(archived_evaluations.get('status') or '')
-            .strip()
-            .lower()
-            == 'blocked'
-            and str(archived_evaluation_result.get('status') or '')
-            .strip()
-            .lower()
-            == 'blocked'
-            and archived_evaluation_result.get('triggered') is False
-            and str(
-                archived_evaluation_result.get('reason') or ''
-            ).strip()
-            == 'declared_dependencies_incomplete'
-            and archived_evaluation_result.get('incomplete_dependencies')
-            == ['signal_decider']
+            and (
+                not legacy_continuation
+                or (
+                    isinstance(archived_evaluations, Mapping)
+                    and str(archived_evaluations.get('status') or '')
+                    .strip()
+                    .lower()
+                    == 'blocked'
+                    and str(
+                        archived_evaluation_result.get('status') or ''
+                    )
+                    .strip()
+                    .lower()
+                    == 'blocked'
+                    and archived_evaluation_result.get('triggered')
+                    is False
+                    and str(
+                        archived_evaluation_result.get('reason') or ''
+                    ).strip()
+                    == 'declared_dependencies_incomplete'
+                    and archived_evaluation_result.get(
+                        'incomplete_dependencies'
+                    )
+                    == ['signal_decider']
+                )
+            )
         ):
             return reject('terminal_continuation_archived_suffix_invalid')
 
@@ -3174,7 +4436,17 @@ class DailyPipelineRunStateService:
             stage_id: _stage_row_outcome(stage_rows_by_id[stage_id])
             for stage_id in satisfied_prefix
         }
-        resumed_stage_statuses = dict(stage_statuses)
+        active_projection = (
+            _project_terminal_continuation_metadata_to_current_contract(
+                metadata
+            )
+        )
+        if active_projection is None:
+            return reject('terminal_continuation_suffix_mismatch')
+        metadata, active_resolved_stages, _ = active_projection
+        resumed_stage_statuses = dict(
+            metadata.get('stage_statuses') or {}
+        )
         resumed_stage_statuses.update(
             {
                 stage_id: str(
@@ -3186,7 +4458,7 @@ class DailyPipelineRunStateService:
         resumed_stage_statuses.update(
             {
                 stage_id: 'pending'
-                for stage_id in continuation_suffix[
+                for stage_id in active_continuation_suffix[
                     first_unfinished_index:
                 ]
             }
@@ -3211,7 +4483,9 @@ class DailyPipelineRunStateService:
             metadata[
                 'terminal_continuation_feedback_lease_loss_run_id'
             ] = failed_lease_child_run_id
-        for stage_id in continuation_suffix[first_unfinished_index:]:
+        for stage_id in active_continuation_suffix[
+            first_unfinished_index:
+        ]:
             stage_row = stage_rows_by_id[stage_id]
             stage_row.status = 'pending'
             stage_row.processed = 0
@@ -3243,7 +4517,10 @@ class DailyPipelineRunStateService:
 
         pipeline_run = self._serialize_run(
             run_row,
-            [stage_rows_by_id[stage_id] for stage_id in resolved_stages],
+            [
+                stage_rows_by_id[stage_id]
+                for stage_id in active_resolved_stages
+            ],
         )
         return {
             'claimed': True,
@@ -3333,6 +4610,22 @@ class DailyPipelineRunStateService:
                     for stage_id in raw_resolved_stages
                 )
             )
+            continuation_marker_valid = (
+                terminal_continuation_marker_is_valid(metadata)
+            )
+            legacy_evaluation_retired = False
+            if continuation_marker_valid:
+                active_projection = (
+                    _project_terminal_continuation_metadata_to_current_contract(
+                        metadata
+                    )
+                )
+                if active_projection is not None:
+                    (
+                        metadata,
+                        resolved_stages,
+                        legacy_evaluation_retired,
+                    ) = active_projection
 
             stage_rows = list(
                 session.execute(
@@ -3369,7 +4662,7 @@ class DailyPipelineRunStateService:
             }
             outcome_is_satisfied = (
                 daily_pipeline_prefix_outcome_is_satisfied
-                if terminal_continuation_marker_is_valid(metadata)
+                if continuation_marker_valid
                 else daily_pipeline_outcome_is_satisfied
             )
             incomplete_stages = {
@@ -3388,20 +4681,43 @@ class DailyPipelineRunStateService:
                     'incomplete_stages': incomplete_stages,
                 }
 
+            warning_metadata = daily_pipeline_warning_metadata(
+                persisted_stage_outcomes,
+            )
+            warning_stage_ids = set(warning_metadata['warning_stage_ids'])
+            parent_statuses = {
+                stage_id: status
+                for stage_id, status in stage_statuses.items()
+                if stage_id not in warning_stage_ids
+            }
             if any(
                 status == 'partial'
-                for status in stage_statuses.values()
+                for status in parent_statuses.values()
             ):
                 terminal_status = 'partial'
-            elif all(
+            elif parent_statuses and all(
                 status == 'skipped'
-                for status in stage_statuses.values()
+                for status in parent_statuses.values()
             ):
                 terminal_status = 'skipped'
             else:
                 terminal_status = 'completed'
             if sealing_satisfied_terminal:
-                if terminal_status != current_status:
+                optional_warning_upgrade = bool(
+                    current_status == 'partial'
+                    and terminal_status == 'completed'
+                    and warning_stage_ids
+                )
+                retired_evaluation_upgrade = bool(
+                    legacy_evaluation_retired
+                    and current_status == 'partial'
+                    and terminal_status == 'completed'
+                )
+                if (
+                    terminal_status != current_status
+                    and not optional_warning_upgrade
+                    and not retired_evaluation_upgrade
+                ):
                     return {
                         'updated': False,
                         'pipeline_run_id': normalized_pipeline_run_id,
@@ -3431,14 +4747,20 @@ class DailyPipelineRunStateService:
                             now.isoformat()
                         ),
                         'stage_statuses': merged_stage_statuses,
+                        **warning_metadata,
                     }
                 )
+                if optional_warning_upgrade or retired_evaluation_upgrade:
+                    run_row.status = terminal_status
+                    run_row.error_message = None
+                if legacy_evaluation_retired:
+                    run_row.current_stage = resolved_stages[-1]
                 run_row.updated_at = now
                 run_row.run_metadata = metadata
                 return {
                     'updated': True,
                     'pipeline_run_id': normalized_pipeline_run_id,
-                    'status': current_status,
+                    'status': terminal_status,
                     'resolved_stages': resolved_stages,
                     'stage_statuses': stage_statuses,
                 }
@@ -3449,9 +4771,12 @@ class DailyPipelineRunStateService:
                     'converged_at': now.isoformat(),
                     'converged_from_status': current_status,
                     'stage_statuses': stage_statuses,
+                    **warning_metadata,
                 }
             )
             run_row.status = terminal_status
+            if legacy_evaluation_retired:
+                run_row.current_stage = resolved_stages[-1]
             run_row.error_message = None
             run_row.completed_at = now
             run_row.updated_at = now
@@ -3501,6 +4826,25 @@ class DailyPipelineRunStateService:
                     'daily pipeline and EOD collection contexts do not match'
                 )
 
+            eod_metadata = dict(
+                eod_run.run_metadata
+                if isinstance(
+                    getattr(eod_run, 'run_metadata', None),
+                    dict,
+                )
+                else {}
+            )
+            reverse_pipeline_run_id = _as_int(
+                eod_metadata.get('daily_pipeline_run_id')
+            )
+            if reverse_pipeline_run_id not in {0, int(pipeline_run_id)}:
+                raise ValueError(
+                    'EOD collection run is linked to a different daily '
+                    'pipeline run'
+                )
+            eod_metadata['daily_pipeline_run_id'] = int(pipeline_run_id)
+            eod_run.run_metadata = eod_metadata
+
             metadata = dict(run_row.run_metadata or {})
             metadata['eod_collection_run_id'] = int(eod_run_id)
             run_row.run_metadata = metadata
@@ -3510,6 +4854,7 @@ class DailyPipelineRunStateService:
             'eod_run_id': int(eod_run_id),
         }
 
+    @_publish_live_interruptions
     def mark_active_runs_interrupted(
         self,
         *,
@@ -3556,13 +4901,43 @@ class DailyPipelineRunStateService:
                     > 0
                     for stage_row in stage_rows
                 )
+                entrypoint = str(
+                    run_metadata.get('entrypoint') or ''
+                ).strip()
+                resolved_stage_ids = {
+                    str(stage_id).strip()
+                    for stage_id in (
+                        run_metadata.get('resolved_stages') or []
+                    )
+                    if str(stage_id).strip()
+                }
                 is_auto_pykrx_parent = bool(
                     run_metadata.get('mode') == 'daily_auto'
-                    or run_metadata.get('entrypoint')
+                    or entrypoint
                     == 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
                     or run_row.trigger == 'auto_eod_followup_resume'
                 )
-                if has_eod_reference or is_auto_pykrx_parent:
+                is_internal_pykrx_parent = bool(
+                    entrypoint == 'daily_pipeline_stage_service.run'
+                    and 'price_collection' in resolved_stage_ids
+                )
+                is_pykrx_parent = bool(
+                    is_auto_pykrx_parent or is_internal_pykrx_parent
+                )
+                if has_eod_reference or is_pykrx_parent:
+                    admission_keys = (
+                        eod_collection_admission_advisory_lock_keys(
+                            market='KRX',
+                            source='daily_price_bars',
+                        )
+                    )
+                    if admission_keys is None:
+                        raise RuntimeError(
+                            'daily price-bar admission lock is unavailable'
+                        )
+                    admission_source_key, admission_trade_key = (
+                        admission_keys
+                    )
                     source_key, trade_key = eod_collection_advisory_lock_keys(
                         market='KRX',
                         trade_date=expected_market_date,
@@ -3571,8 +4946,12 @@ class DailyPipelineRunStateService:
                     lock_acquired = bool(
                         session.execute(
                             text(
-                                'SELECT pg_try_advisory_xact_lock('
-                                ':source_key, :trade_key)'
+                                'SELECT CASE WHEN '
+                                'pg_try_advisory_xact_lock_shared('
+                                f'{admission_source_key}, '
+                                f'{admission_trade_key}) '
+                                'THEN pg_try_advisory_xact_lock('
+                                ':source_key, :trade_key) ELSE FALSE END'
                             ),
                             {
                                 'source_key': source_key,
@@ -3622,9 +5001,11 @@ class DailyPipelineRunStateService:
                     ):
                         linked_eod_runs.append(eod_run)
 
-                # Older runs may have crashed after creating the provider row
-                # but before their first stage checkpoint persisted its ID.
-                if not linked_eod_ids and is_auto_pykrx_parent:
+                # A process can stop after the provider row is committed but
+                # before the parent-side link commits. Recover that narrow
+                # window only through the exact reverse metadata authority;
+                # same-date/trigger proximity is never ownership evidence.
+                if not linked_eod_ids and is_pykrx_parent:
                     fallback_eod_runs = list(
                         session.execute(
                             select(EODCollectionRun)
@@ -3649,25 +5030,6 @@ class DailyPipelineRunStateService:
                             .limit(2)
                         ).scalars()
                     )
-                    if not fallback_eod_runs:
-                        fallback_eod_runs = list(
-                            session.execute(
-                                select(EODCollectionRun)
-                                .where(
-                                    EODCollectionRun.market == 'KRX',
-                                    EODCollectionRun.source == 'pykrx',
-                                    EODCollectionRun.trade_date
-                                    == expected_market_date,
-                                    EODCollectionRun.trigger == run_row.trigger,
-                                    EODCollectionRun.status == 'running',
-                                )
-                                .order_by(
-                                    EODCollectionRun.started_at.desc(),
-                                    EODCollectionRun.id.desc(),
-                                )
-                                .limit(2)
-                            ).scalars()
-                    )
                     if len(fallback_eod_runs) > 1:
                         ambiguous_eod_link_run_ids.append(int(run_row.id))
                         linked_eod_runs = []
@@ -3688,13 +5050,6 @@ class DailyPipelineRunStateService:
                     ambiguous_eod_link_run_ids.append(int(run_row.id))
                     linked_eod_runs = []
 
-                resolved_stage_ids = {
-                    str(stage_id).strip()
-                    for stage_id in (
-                        (run_row.run_metadata or {}).get('resolved_stages') or []
-                    )
-                    if str(stage_id).strip()
-                }
                 if not resolved_stage_ids:
                     resolved_stage_ids = {
                         str(stage_row.stage_id).strip()

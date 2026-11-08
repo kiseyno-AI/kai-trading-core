@@ -126,9 +126,10 @@ def _bar(
 
 class SymbolHistoryRepairInputTests(unittest.TestCase):
     def test_requires_explicit_valid_bounded_symbols(self):
-        with self.assertRaisesRegex(ValueError, '6-digit'):
+        self.assertEqual(_normalize_symbols(['0010a0']), ('0010A0',))
+        with self.assertRaisesRegex(ValueError, 'canonical KRX'):
             _normalize_symbols(['5930'])
-        with self.assertRaisesRegex(ValueError, '6-digit'):
+        with self.assertRaisesRegex(ValueError, 'canonical KRX'):
             _normalize_symbols(['00A930'])
         with self.assertRaisesRegex(ValueError, 'duplicates'):
             _normalize_symbols(['005930', '005930'])
@@ -272,7 +273,7 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
             ),
         )
         result = service.repair_range(
-            symbols=['005930'],
+            symbols=['00104K'],
             start_date=first_date,
             end_date=second_date,
         )
@@ -281,7 +282,7 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
         self.assertFalse(result['applied'])
         self.assertEqual(
             range_calls,
-            [('20260922', '20260923', '005930')],
+            [('20260922', '20260923', '00104K')],
         )
         self.assertEqual(
             market_calls,
@@ -293,9 +294,9 @@ class SymbolHistoryRepairServiceTests(unittest.TestCase):
             ],
         )
         bars = database_calls[0]['bars']
-        self.assertEqual([bar.turnover for bar in bars], [910_000, 920_000])
-        self.assertEqual(result['provider_skipped_code_count'], 2)
-        self.assertEqual(result['symbol_markets'], {'005930': 'KOSPI'})
+        self.assertEqual([bar.turnover for bar in bars], [77, 77])
+        self.assertEqual(result['provider_skipped_code_count'], 0)
+        self.assertEqual(result['symbol_markets'], {'00104K': 'KOSPI'})
 
     def test_symbol_range_loader_retries_error_and_empty_before_success(self):
         trade_date = date(2026, 9, 23)

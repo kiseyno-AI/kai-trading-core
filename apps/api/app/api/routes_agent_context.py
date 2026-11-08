@@ -8,7 +8,7 @@ from typing import Any
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,6 +19,7 @@ from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
     resolve_agent_feedback_scope,
+    split_requested_symbols_by_agent_feedback_eligibility,
 )
 from app.agent_context.feedback_service import agent_context_feedback_service
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
@@ -361,12 +362,14 @@ def _inspect_feedback_prerequisites(
     market_date: date,
     fs_div: str | None = None,
     force: bool = False,
+    symbols: list[str] | None = None,
 ) -> dict[str, Any] | None:
     if force:
         return None
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
         fs_div=fs_div,
+        symbols=symbols,
     )
     return None if prerequisites['ready'] else prerequisites
 
@@ -887,14 +890,21 @@ async def dispatch_symbol_agent_feedback(
 
         requested_roles = list(payload.roles or EXPECTED_ROLES)
         requested_symbols = list(dict.fromkeys(payload.symbols))
+        dispatch_symbols, skipped_symbols = (
+            split_requested_symbols_by_agent_feedback_eligibility(
+                market_date=payload.market_date,
+                requested_symbols=requested_symbols,
+            )
+        )
         prerequisites = _inspect_feedback_prerequisites(
             market_date=payload.market_date,
             fs_div=payload.fs_div,
             force=payload.force,
+            symbols=dispatch_symbols,
         )
         request_payload = {
             'market_date': payload.market_date.isoformat(),
-            'symbols': requested_symbols,
+            'symbols': dispatch_symbols,
             'requested_symbols': requested_symbols,
             'request_run_id': None,
             'roles': requested_roles,
@@ -913,6 +923,7 @@ async def dispatch_symbol_agent_feedback(
             'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+            'skipped_symbols': skipped_symbols,
             'wait_for_completion': False,
         }
         if prerequisites is not None:
@@ -1209,28 +1220,37 @@ async def list_agent_feedback_session_cleanup(
 @router.post('/feedback/dispatch/subagent-experiment')
 async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExperimentRequest, background_tasks: BackgroundTasks) -> dict:
     try:
-        prerequisites = _inspect_feedback_prerequisites(
-            market_date=payload.market_date,
-            fs_div=payload.fs_div,
-            force=payload.force,
-        )
-        if prerequisites is not None:
-            return _build_feedback_gate_response(
-                request_payload={
-                    'market_date': payload.market_date.isoformat(),
-                    'symbols': payload.symbols,
-                    'requested_symbols': payload.symbols,
-                    'request_run_id': None,
-                    'roles': payload.roles or EXPECTED_ROLES,
-                    'fs_div': payload.fs_div,
-                    'disclosures_limit': payload.disclosures_limit,
-                    'per_role_parallelism': payload.per_role_parallelism,
-                    'mode': 'subagent_experiment',
-                    'wait_for_completion': payload.wait_for_completion,
-                },
-                prerequisites=prerequisites,
-            )
         if not payload.wait_for_completion:
+            requested_symbols = list(dict.fromkeys(payload.symbols))
+            dispatch_symbols, skipped_symbols = (
+                split_requested_symbols_by_agent_feedback_eligibility(
+                    market_date=payload.market_date,
+                    requested_symbols=requested_symbols,
+                )
+            )
+            prerequisites = _inspect_feedback_prerequisites(
+                market_date=payload.market_date,
+                fs_div=payload.fs_div,
+                force=payload.force,
+                symbols=dispatch_symbols,
+            )
+            if prerequisites is not None:
+                return _build_feedback_gate_response(
+                    request_payload={
+                        'market_date': payload.market_date.isoformat(),
+                        'symbols': dispatch_symbols,
+                        'requested_symbols': requested_symbols,
+                        'request_run_id': None,
+                        'roles': payload.roles or EXPECTED_ROLES,
+                        'fs_div': payload.fs_div,
+                        'disclosures_limit': payload.disclosures_limit,
+                        'per_role_parallelism': payload.per_role_parallelism,
+                        'skipped_symbols': skipped_symbols,
+                        'mode': 'subagent_experiment',
+                        'wait_for_completion': False,
+                    },
+                    prerequisites=prerequisites,
+                )
             request_run_id = f'subagent-symbol-run-{payload.market_date.isoformat()}-api-{payload.per_role_parallelism}x{len(payload.symbols)}'
 
             def _run_background_subagent_dispatch() -> None:
@@ -1242,6 +1262,7 @@ async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExp
                         fs_div=payload.fs_div,
                         disclosures_limit=payload.disclosures_limit,
                         per_role_parallelism=payload.per_role_parallelism,
+                        force=payload.force,
                     )
                     logger.info(
                         'Subagent experiment background dispatch finished',
@@ -1291,6 +1312,7 @@ async def dispatch_symbol_agent_feedback_via_subagents(payload: AgentSubagentExp
             fs_div=payload.fs_div,
             disclosures_limit=payload.disclosures_limit,
             per_role_parallelism=payload.per_role_parallelism,
+            force=payload.force,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1619,6 +1641,7 @@ async def compute_decider_post_decision_evaluations(payload: DeciderEvaluationCo
         prerequisites = _inspect_feedback_prerequisites(
             market_date=payload.market_date_to,
             force=payload.force_recompute,
+            symbols=payload.symbols,
         )
         if prerequisites is not None:
             request_payload = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()
@@ -1911,6 +1934,7 @@ async def compute_signal_decider_evaluations(payload: SignalDeciderEvaluationCom
         prerequisites = _inspect_feedback_prerequisites(
             market_date=payload.market_date_to,
             force=payload.force_recompute,
+            symbols=payload.symbols,
         )
         if prerequisites is not None:
             request_payload = payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()
@@ -2147,14 +2171,36 @@ class CoreControlRequest(BaseModel):
 
     action: str = Field(default='kill', pattern=r'^(kill|restart)$')
     signal_name: str = Field(default='SIGKILL', pattern=r'^SIG(?:TERM|KILL)$')
-    port: int = Field(default=8000, ge=1, le=65535)
+    # Optional for backward compatibility. The endpoint may only ever act on the
+    # port this API instance is serving; any other value is rejected so the
+    # control route cannot be used to signal unrelated local services (for
+    # example the Exec runtime).
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+
+def _own_server_port(request: Request) -> int:
+    server = request.scope.get('server')
+    if isinstance(server, (tuple, list)) and len(server) >= 2 and server[1]:
+        return int(server[1])
+    return int(os.environ.get('PORT', '8000'))
 
 
 @router.post('/internal/core/control')
-async def control_core_api(payload: CoreControlRequest) -> dict:
+async def control_core_api(payload: CoreControlRequest, request: Request) -> dict:
+    own_port = _own_server_port(request)
+    if payload.port is not None and payload.port != own_port:
+        raise HTTPException(
+            status_code=422,
+            detail=f'port must match the port this API is serving ({own_port})',
+        )
+    payload = payload.model_copy(update={'port': own_port})
     try:
-        result = subprocess.run(
-            ['lsof', '-ti', f':{payload.port}'],
+        # Only the listening process owns the port. A plain ``lsof -i :PORT``
+        # also matches client connections, which would signal unrelated
+        # processes (such as a web server holding a keep-alive connection).
+        result = await run_in_threadpool(
+            subprocess.run,
+            ['lsof', '-nP', '-ti', f'TCP:{payload.port}', '-sTCP:LISTEN'],
             check=False,
             capture_output=True,
             text=True,
@@ -2174,8 +2220,20 @@ async def control_core_api(payload: CoreControlRequest) -> dict:
         if payload.action == 'restart':
             plist = Path(__file__).resolve().parents[2] / 'com.kiseyno.kai-trading-core-api.plist'
             uid = str(os.getuid())
-            subprocess.run(['launchctl', 'bootout', f'gui/{uid}', str(plist)], check=False, capture_output=True, text=True)
-            restarted = subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(plist)], check=True, capture_output=True, text=True)
+            await run_in_threadpool(
+                subprocess.run,
+                ['launchctl', 'bootout', f'gui/{uid}', str(plist)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            restarted = await run_in_threadpool(
+                subprocess.run,
+                ['launchctl', 'bootstrap', f'gui/{uid}', str(plist)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             logger.warning('core api control endpoint invoked', extra={'action': payload.action, 'port': payload.port, 'signal': payload.signal_name, 'killed_pids': target_pids, 'self_targeted': self_targeted})
             return {
                 'status': 'restarted',

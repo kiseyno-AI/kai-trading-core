@@ -6,9 +6,10 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app.core.settings import settings
+from app.market.clock import async_get_market_state
 from app.orders.account_inquiry_service import (
     TradingAccountInquiryError,
     TradingAccountInquiryValidationError,
@@ -142,6 +143,7 @@ class PortfolioSummaryService:
         order_service: Any | None = None,
         portfolio_account_references: str | None = None,
         cache_ttl_seconds: int | None = None,
+        market_state_loader: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self.account_inquiry_service = account_inquiry_service or trading_account_inquiry_service
         self.order_service = order_service or trading_order_service
@@ -152,6 +154,7 @@ class PortfolioSummaryService:
             else cache_ttl_seconds
         )
         self.cache_ttl_seconds = max(int(configured_ttl), 0)
+        self.market_state_loader = market_state_loader or async_get_market_state
         self._cache: PortfolioSummaryCacheRecord | None = None
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task | None = None
@@ -175,6 +178,29 @@ class PortfolioSummaryService:
         if cache_record is None:
             return await self.refresh_portfolio_summary_if_due(trigger=trigger, force=True)
         if self._refresh_is_due(cache_record):
+            try:
+                market_state = await self.market_state_loader()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'Portfolio summary market-state check failed; serving cached data: %s',
+                    exc,
+                )
+                return self._decorate_cached_payload(
+                    cache_record,
+                    served_from_cache=True,
+                    stale_reason_override='market_state_unavailable_cache',
+                    market_state='UNKNOWN',
+                )
+            normalized_market_state = str(
+                getattr(market_state, 'state', '') or ''
+            ).strip().upper()
+            if normalized_market_state in {'WEEKEND', 'HOLIDAY'}:
+                return self._decorate_cached_payload(
+                    cache_record,
+                    served_from_cache=True,
+                    stale_reason_override='market_closed_cache',
+                    market_state=normalized_market_state,
+                )
             self._ensure_background_refresh(trigger=f'{trigger}:stale_cache')
         return self._decorate_cached_payload(cache_record, served_from_cache=True)
 
@@ -188,6 +214,12 @@ class PortfolioSummaryService:
             cache_record = self._cache
             if cache_record is not None and not force and not self._refresh_is_due(cache_record):
                 return self._decorate_cached_payload(cache_record, served_from_cache=True)
+            if self._runtime_status().ready:
+                guarded_payload = await self._guard_refresh_by_market_state(
+                    cache_record=cache_record,
+                )
+                if guarded_payload is not None:
+                    return guarded_payload
             self._active_refresh_count += 1
             try:
                 outcome = await self._refresh_portfolio_summary(
@@ -205,6 +237,78 @@ class PortfolioSummaryService:
             if outcome.uncached_payload is None:
                 raise RuntimeError('Portfolio summary refresh completed without a result.')
             return self._decorate_uncached_payload(outcome.uncached_payload)
+
+    async def _guard_refresh_by_market_state(
+        self,
+        *,
+        cache_record: PortfolioSummaryCacheRecord | None,
+    ) -> dict[str, Any] | None:
+        attempted_at = _utc_now()
+        try:
+            market_state = await self.market_state_loader()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'Portfolio summary market-state check failed; refresh deferred: %s',
+                exc,
+            )
+            if cache_record is not None:
+                return self._decorate_cached_payload(
+                    cache_record,
+                    served_from_cache=True,
+                    stale_reason_override='market_state_unavailable_cache',
+                    market_state='UNKNOWN',
+                )
+            message = (
+                'Portfolio summary refresh was deferred because market state '
+                'is unavailable.'
+            )
+            freshness = self._build_uncached_freshness_payload(
+                attempted_at=attempted_at,
+                last_refresh_status='error',
+                last_refresh_error=message,
+            )
+            freshness['marketState'] = 'UNKNOWN'
+            return self._decorate_uncached_payload(
+                self._build_unavailable_summary(
+                    as_of=attempted_at.isoformat(),
+                    status='unavailable',
+                    source='portfolio_summary_market_state',
+                    message=message,
+                    freshness=freshness,
+                )
+            )
+
+        normalized_market_state = str(
+            getattr(market_state, 'state', '') or ''
+        ).strip().upper()
+        if normalized_market_state not in {'WEEKEND', 'HOLIDAY'}:
+            return None
+        if cache_record is not None:
+            return self._decorate_cached_payload(
+                cache_record,
+                served_from_cache=True,
+                stale_reason_override='market_closed_cache',
+                market_state=normalized_market_state,
+            )
+
+        message = (
+            'Portfolio summary refresh is deferred while the market is closed.'
+        )
+        freshness = self._build_uncached_freshness_payload(
+            attempted_at=attempted_at,
+            last_refresh_status='degraded',
+            last_refresh_error=None,
+        )
+        freshness['marketState'] = normalized_market_state
+        return self._decorate_uncached_payload(
+            self._build_unavailable_summary(
+                as_of=attempted_at.isoformat(),
+                status='unavailable',
+                source='portfolio_summary_market_state',
+                message=message,
+                freshness=freshness,
+            )
+        )
 
     def _ensure_background_refresh(self, *, trigger: str) -> None:
         if self._refresh_task is not None and not self._refresh_task.done():
@@ -742,9 +846,17 @@ class PortfolioSummaryService:
         cache_record: PortfolioSummaryCacheRecord,
         *,
         served_from_cache: bool,
+        stale_reason_override: str | None = None,
+        market_state: str | None = None,
     ) -> dict[str, Any]:
         payload = copy.deepcopy(cache_record.payload)
         freshness = self._build_freshness_payload(cache_record, served_from_cache=served_from_cache)
+        if stale_reason_override is not None:
+            freshness['isStale'] = True
+            freshness['staleReason'] = stale_reason_override
+            freshness['refreshInFlight'] = False
+        if market_state is not None:
+            freshness['marketState'] = market_state
         payload['freshness'] = freshness
 
         sync = payload.get('sync') if isinstance(payload.get('sync'), dict) else {}
@@ -754,6 +866,10 @@ class PortfolioSummaryService:
             stale_notice = 'Portfolio summary is serving cached data while a refresh runs in background.'
         elif freshness['staleReason'] == 'refresh_failed':
             stale_notice = 'Portfolio summary is serving cached data because the last refresh failed.'
+        elif freshness['staleReason'] == 'market_closed_cache':
+            stale_notice = 'Portfolio summary is serving the last cached data while the market is closed.'
+        elif freshness['staleReason'] == 'market_state_unavailable_cache':
+            stale_notice = 'Portfolio summary is serving cached data because market state is unavailable.'
 
         if stale_notice is not None:
             if sync.get('status') == 'synced':

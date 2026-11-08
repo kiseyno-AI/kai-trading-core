@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 from app.brokers.kis.provider import kis_client
 from app.market_data_store import load_current_quote, load_daily_bars_for_symbol, persist_quote_snapshot
-from app.market.clock import async_get_market_state
+from app.market.clock import KST, async_get_market_state
 from app.quotes.cache import quote_cache
 from app.quotes.names import SymbolNameService
 from app.scanner.state import scanner_state
@@ -60,7 +60,9 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
 def _market_calendar_date(server_time: str) -> date:
     parsed = _parse_iso_datetime(server_time)
     if parsed is None:
-        return datetime.utcnow().date()
+        # The KRX calendar date is a Korea-time date. A UTC date is one day
+        # behind between 00:00 and 09:00 KST.
+        return datetime.now(KST).date()
     return parsed.date()
 
 

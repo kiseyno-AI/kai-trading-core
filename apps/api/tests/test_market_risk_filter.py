@@ -8,12 +8,14 @@ from app.db import engine, session_scope
 from app.db_models import (
     DailyMarketRiskFilterResult,
     DailyMarketRiskSnapshot,
+    DailyPriceBar,
     EODCollectionRun,
     Symbol,
 )
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
     load_daily_market_risk_snapshots,
+    persist_daily_price_bar,
 )
 from app.repositories.eod_run_repository import create_eod_collection_run
 from app.signals.market_risk_evaluators import (
@@ -186,7 +188,7 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
 
         def upsert_side_effect(item: dict) -> None:
             if item['symbol'] == '000660':
-                raise RuntimeError('write failed')
+                raise ValueError('malformed persisted row')
 
         with (
             patch.object(
@@ -196,7 +198,7 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
             ) as collect_snapshots,
             patch(
                 'app.signals.market_risk_filter.upsert_daily_market_risk_filter_results',
-                side_effect=RuntimeError('bulk write failed'),
+                side_effect=ValueError('batch contains malformed row'),
             ) as bulk_upsert,
             patch(
                 'app.signals.market_risk_filter.upsert_daily_market_risk_filter_result',
@@ -219,7 +221,24 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['summary']['matched_symbol_count'], 3)
         self.assertEqual(result['summary']['evaluated_count'], 2)
         self.assertEqual(result['summary']['watchlist_count'], 1)
+        self.assertEqual(
+            result['summary']['screening_rejected_count'],
+            0,
+        )
+        self.assertNotIn('failed_count', result['summary'])
         self.assertEqual(result['failed_symbols'], ['051910', '000660'])
+        self.assertEqual(
+            result['scope_outcome_manifest_version'],
+            'market_risk_filter_scope_outcomes_v1',
+        )
+        self.assertEqual(
+            result['successful_stock_codes'],
+            ['005930'],
+        )
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['000660', '051910'],
+        )
         bulk_upsert.assert_called_once()
         self.assertEqual(upsert.call_count, 2)
         self.assertEqual([item['symbol'] for item in result['items']], ['005930'])
@@ -227,6 +246,126 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
             result['items'][0]['filter_payload']['watchlist_reasons'],
             ['market_warning_01', 'investment_caution'],
         )
+
+    async def test_exact_scope_preserves_causally_skipped_symbols_as_retry_debt(
+        self,
+    ) -> None:
+        snapshot_service = DailyMarketRiskSnapshotService()
+        service = DailyMarketRiskFilterService(
+            snapshot_service=snapshot_service
+        )
+        exact_symbols = ['000001', '000002', '000003']
+        admitted_symbols = exact_symbols[1:]
+        snapshot_items = [
+            build_market_risk_snapshot(
+                symbol=symbol,
+                market_date='2026-04-14',
+                quote_response={'output': {}},
+            )
+            for symbol in admitted_symbols
+        ]
+        snapshot_collection = {
+            'market_date': '2026-04-14',
+            'source': 'kis_quote2_snapshot_v1',
+            'feature_version': 'kis_quote2_snapshot_v1',
+            'requested_symbols': admitted_symbols,
+            'matched_symbols': admitted_symbols,
+            'missing_symbols': [],
+            'snapshots_persisted': 2,
+            'snapshots_failed': 0,
+            'failed_symbols': [],
+            'failed_symbol_errors': [],
+            'items': snapshot_items,
+            'scope_finalization': {'ready': True},
+        }
+
+        with (
+            patch.object(
+                snapshot_service,
+                'collect_for_market_date',
+                new=AsyncMock(return_value=snapshot_collection),
+            ),
+            patch(
+                'app.signals.market_risk_filter.'
+                'replace_daily_market_risk_filter_results_exact_scope',
+                return_value={
+                    'successful_symbols': admitted_symbols,
+                    'failed_symbols': exact_symbols[:1],
+                    'failed_symbol_errors': [{
+                        'symbol': exact_symbols[0],
+                        'error': 'result_not_persisted',
+                    }],
+                    'scope_finalization': {'ready': True},
+                },
+            ),
+        ):
+            result = await service.rebuild_for_market_date(
+                market_date='2026-04-14',
+                symbols=admitted_symbols,
+                exact_scope_symbols=exact_symbols,
+            )
+
+        self.assertEqual(result['selected_stock_codes'], exact_symbols)
+        self.assertEqual(
+            result['successful_stock_codes'],
+            admitted_symbols,
+        )
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            exact_symbols[:1],
+        )
+        self.assertEqual(result['results_persisted'], 2)
+        self.assertEqual(result['results_failed'], 1)
+
+    async def test_rebuild_propagates_checkpoint_failure_before_persistence(
+        self,
+    ) -> None:
+        snapshot_service = DailyMarketRiskSnapshotService()
+        service = DailyMarketRiskFilterService(
+            snapshot_service=snapshot_service
+        )
+        snapshot_collection = {
+            'market_date': '2026-04-14',
+            'source': 'kis_quote2_snapshot_v1',
+            'feature_version': 'kis_quote2_snapshot_v1',
+            'requested_symbols': ['005930'],
+            'matched_symbols': ['005930'],
+            'missing_symbols': [],
+            'failed_symbols': [],
+            'failed_symbol_errors': [],
+            'items': [
+                build_market_risk_snapshot(
+                    symbol='005930',
+                    market_date='2026-04-14',
+                    quote_response={'output': {}},
+                )
+            ],
+        }
+
+        def _failing_checkpoint_callback(**_payload) -> None:
+            raise RuntimeError('checkpoint store unavailable')
+
+        with (
+            patch.object(
+                snapshot_service,
+                'collect_for_market_date',
+                new=AsyncMock(return_value=snapshot_collection),
+            ),
+            patch(
+                'app.signals.market_risk_filter.'
+                'upsert_daily_market_risk_filter_results'
+            ) as persist_results,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'checkpoint store unavailable',
+            ):
+                await service.rebuild_for_market_date(
+                    market_date='2026-04-14',
+                    progress_callback=_failing_checkpoint_callback,
+                )
+
+        persist_results.assert_not_called()
 
     def test_inspect_resolves_latest_on_or_before_requested_market_date(self) -> None:
         service = DailyMarketRiskFilterService()
@@ -316,6 +455,22 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
             symbols_total=2,
             run_metadata={'mode': 'daily_auto'},
         )
+        for symbol in self.symbols:
+            persist_daily_price_bar(
+                {
+                    'symbol': symbol,
+                    'market': 'KRX',
+                    'business_date': self.market_date.isoformat(),
+                    'open_price': 100,
+                    'high_price': 110,
+                    'low_price': 90,
+                    'close_price': 105,
+                    'volume': 1_000,
+                    'turnover': 105_000,
+                    'source': 'test',
+                },
+                run_id=self.run_id,
+            )
 
     def tearDown(self) -> None:
         with session_scope() as session:
@@ -323,6 +478,7 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
             if symbol_ids:
                 session.execute(delete(DailyMarketRiskFilterResult).where(DailyMarketRiskFilterResult.symbol_id.in_(symbol_ids)))
                 session.execute(delete(DailyMarketRiskSnapshot).where(DailyMarketRiskSnapshot.symbol_id.in_(symbol_ids)))
+                session.execute(delete(DailyPriceBar).where(DailyPriceBar.symbol_id.in_(symbol_ids)))
             session.execute(delete(Symbol).where(Symbol.symbol.in_(self.symbols)))
             session.execute(delete(EODCollectionRun).where(EODCollectionRun.id == self.run_id))
 
@@ -352,10 +508,28 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
         self.assertEqual(result['snapshot_collection']['snapshots_persisted'], 2)
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['summary']['watchlist_count'], 1)
-        self.assertEqual(result['summary']['failed_count'], 1)
+        self.assertEqual(
+            result['summary']['screening_rejected_count'],
+            1,
+        )
+        self.assertNotIn('failed_count', result['summary'])
+        self.assertEqual(
+            result['selected_stock_codes'],
+            self.symbols,
+        )
+        self.assertEqual(
+            result['successful_stock_codes'],
+            self.symbols,
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], [])
         self.assertEqual(snapshot_inspection['item']['market_warning_code'], '01')
         self.assertEqual(filter_inspection['item']['risk_state'], 'watchlist')
         self.assertTrue(filter_inspection['item']['watchlist_flagged'])
+        self.assertEqual(
+            filter_inspection['summary']['screening_rejected_count'],
+            0,
+        )
+        self.assertNotIn('failed_count', filter_inspection['summary'])
         self.assertTrue(stored_snapshots)
         self.assertTrue(stored_filters)
         self.assertEqual(stored_snapshots[0]['eod_run_id'], self.run_id)
@@ -365,6 +539,77 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
             ['market_warning_01', 'investment_caution'],
         )
         self.assertNotIn('market_warning_code', stored_filters[0])
+
+    async def test_targeted_exact_retry_preserves_unaffected_filter_rows(
+        self,
+    ) -> None:
+        inputs = [
+            MarketRiskSymbolInput(
+                symbol='196001',
+                name_ko='테스트주의',
+                market='KOSPI',
+            ),
+            MarketRiskSymbolInput(
+                symbol='196002',
+                name_ko='테스트관리',
+                market='KOSDAQ',
+            ),
+        ]
+        retry_symbol = '196002'
+
+        with patch.object(
+            self.snapshot_service,
+            '_load_symbol_rows',
+            return_value=(inputs, self.symbols, []),
+        ):
+            initial = await self.filter_service.rebuild_for_market_date(
+                market_date=self.market_date.isoformat(),
+                run_id=self.run_id,
+            )
+
+        before_retry = load_daily_market_risk_filter_results(
+            market_date=self.market_date,
+            symbols=self.symbols,
+        )
+        unaffected_before = next(
+            item for item in before_retry if item['symbol'] == '196001'
+        )
+
+        with patch.object(
+            self.snapshot_service,
+            '_load_symbol_rows',
+            return_value=(inputs[1:], [retry_symbol], []),
+        ):
+            recovered = await self.filter_service.rebuild_for_market_date(
+                market_date=self.market_date.isoformat(),
+                symbols=[retry_symbol],
+                exact_scope_symbols=[retry_symbol],
+                run_id=self.run_id,
+            )
+
+        after_retry = load_daily_market_risk_filter_results(
+            market_date=self.market_date,
+            symbols=self.symbols,
+        )
+        unaffected_after = next(
+            item for item in after_retry if item['symbol'] == '196001'
+        )
+
+        self.assertEqual(initial['results_persisted'], 2)
+        self.assertEqual(
+            recovered['selected_stock_codes'],
+            [retry_symbol],
+        )
+        self.assertEqual(
+            recovered['successful_stock_codes'],
+            [retry_symbol],
+        )
+        self.assertEqual(recovered['retry_debt_stock_codes'], [])
+        self.assertEqual(
+            {item['symbol'] for item in after_retry},
+            set(self.symbols),
+        )
+        self.assertEqual(unaffected_after, unaffected_before)
 
 
 if __name__ == '__main__':

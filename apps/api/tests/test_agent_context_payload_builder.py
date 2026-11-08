@@ -4,6 +4,9 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sqlalchemy.dialects import postgresql
+
+import app.agent_context.payload_builder as payload_builder_module
 from app.agent_context.payload_builder import (
     AgentPayloadBuilder,
     PayloadWindows,
@@ -30,6 +33,43 @@ class SequentialFakeSession:
 
 
 class AgentPayloadBuilderTests(unittest.TestCase):
+    def test_market_signal_query_uses_same_day_price_bar_authority(self):
+        query = payload_builder_module._build_market_signal_rows_query(
+            market_date=date(2026, 10, 30)
+        )
+
+        sql = str(query.compile(dialect=postgresql.dialect())).lower()
+        self.assertIn('join daily_price_bars', sql)
+        self.assertIn(
+            'daily_price_bars.trade_date = daily_signal_features.market_date',
+            sql,
+        )
+        self.assertIn('order by case when', sql)
+        self.assertNotIn(
+            'order by daily_signal_features.signal_count desc',
+            sql,
+        )
+
+    def test_market_signal_serialization_removes_stale_placeholders(self):
+        row = payload_builder_module._serialize_market_signal_feature(
+            SimpleNamespace(
+                signal_count=3,
+                volume_power_rank=1,
+                volume_power=999.99,
+                overtime_volume_rank=2,
+                overtime_volume=0,
+                overtime_fluctuation_rank=3,
+                overtime_fluctuation_rate=1.5,
+                feature_payload={'sources': {}},
+            ),
+            SimpleNamespace(symbol='005930', name_ko='삼성전자', market='KOSPI'),
+        )
+
+        self.assertEqual(row['signal_count'], 1)
+        self.assertIsNone(row['volume_power_rank'])
+        self.assertIsNone(row['overtime_volume_rank'])
+        self.assertEqual(row['overtime_fluctuation_rank'], 3)
+
     def test_build_signal_participation_context_uses_full_row_source_counts_and_sorted_leaders(self):
         rows = [
             {

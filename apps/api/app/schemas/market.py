@@ -1,5 +1,5 @@
-from datetime import datetime
-from typing import Literal
+from datetime import date, datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -59,6 +59,10 @@ class MarketSnapshotMarket(BaseModel):
         default='krw',
         description='Unit for `foreign_net_value` and `institution_net_value`.',
     )
+    flow_leg: dict | None = Field(
+        default=None,
+        description='Investor-flow freshness and current-session provenance.',
+    )
 
 
 class MarketSnapshotFX(BaseModel):
@@ -91,3 +95,21 @@ class MarketSnapshotResponse(BaseModel):
     markets: dict[str, MarketSnapshotMarket]
     usd_krw: MarketSnapshotFX
     freshness: MarketSnapshotFreshness
+
+
+class LiveSectorProjectionResponse(BaseModel):
+    schema_version: Literal['live_sector_projection_v1']
+    status: Literal['ready', 'pending_current_session', 'unavailable']
+    reason: str | None = None
+    symbol: str
+    market: str | None = None
+    market_date: date | None = None
+    source_market_date: date
+    observed_at: datetime | None = None
+    source: str
+    sector_identity: dict[str, Any] | None = None
+    cohort: dict[str, Any]
+    benchmark: dict[str, Any] | None = None
+    projection: dict[str, Any]
+    missing_fields: list[str] = Field(default_factory=list)
+    served_from_cache: bool = False

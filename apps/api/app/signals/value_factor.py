@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
     load_daily_pykrx_enrichment_rows,
@@ -10,9 +10,23 @@ from app.market_data_store import (
     load_daily_value_factor_results,
     load_recent_price_bars_by_symbol,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_value_factor_result,
     upsert_daily_value_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
+    attach_symbol_payloads,
+    build_symbol_results,
+    build_factor_coverage_contract,
+    factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 VALUE_FACTOR_VERSION = 'value_factor_v1'
 VALUE_FACTOR_SOURCE = VALUE_FACTOR_VERSION
@@ -47,21 +61,6 @@ def _normalize_market_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
 
 
 def _percentile_from_rank(rank: int, total: int) -> float:
@@ -108,6 +107,7 @@ class ValueFactorInput:
 
 
 class DailyValueFactorService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -115,6 +115,8 @@ class DailyValueFactorService:
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = VALUE_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -132,36 +134,58 @@ class DailyValueFactorService:
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
-            return {
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
+            result = {
+                'status': 'completed',
+                'reason': 'explicit_empty_scope_noop',
+                'quality_status': summary['quality_status'],
+                'quality_warning': summary['quality_warning'],
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'remaining_retryable_events': 0,
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
                 'failed_symbol_errors': [],
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='value_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
         inputs, matched_symbols, missing_symbols = self._load_inputs(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
         ranking_inputs = inputs
+        ranking_missing_symbols: list[str] = []
         if (
             normalized_symbols is not None
             and normalized_symbols != normalized_ranking_symbols
         ):
-            ranking_inputs, _, _ = self._load_inputs(
+            ranking_inputs, _, ranking_missing_symbols = self._load_inputs(
                 market_date=normalized_market_date,
                 symbols=(
                     normalized_ranking_symbols
@@ -170,14 +194,21 @@ class DailyValueFactorService:
                 ),
             )
 
-        ranking_items = [
-            self._build_symbol_result(
-                input_row=item,
-                market_date=normalized_market_date,
-                source=source,
-            )
-            for item in ranking_inputs
-        ]
+        (
+            ranking_items,
+            ranking_failed_symbols,
+            ranking_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_inputs,
+            symbol_of=lambda item: item.symbol,
+            build=lambda item: run_symbol_computation(
+                lambda: self._build_symbol_result(
+                    input_row=item,
+                    market_date=normalized_market_date,
+                    source=source,
+                )
+            ),
+        )
         universe_counts = self._assign_metric_rankings(ranking_items)
         self._assign_scores_and_rankings(ranking_items)
 
@@ -185,24 +216,82 @@ class DailyValueFactorService:
             items = _sort_items(ranking_items)
         else:
             ranked_items_by_symbol = {item['symbol']: item for item in ranking_items}
+            ranking_failed_symbol_set = set(ranking_failed_symbols)
             items = []
             for input_row in inputs:
+                if input_row.symbol in ranking_failed_symbol_set:
+                    continue
                 item = ranked_items_by_symbol.get(input_row.symbol)
                 if item is None:
-                    item = self._build_symbol_result(
-                        input_row=input_row,
-                        market_date=normalized_market_date,
-                        source=source,
+                    fallback_items, fallback_failed, fallback_errors = (
+                        build_symbol_results(
+                            [input_row],
+                            symbol_of=lambda value: value.symbol,
+                            build=lambda value: run_symbol_computation(
+                                lambda: self._build_symbol_result(
+                                    input_row=value,
+                                    market_date=normalized_market_date,
+                                    source=source,
+                                )
+                            ),
+                        )
                     )
+                    ranking_failed_symbols.extend(fallback_failed)
+                    ranking_failed_symbol_errors.extend(fallback_errors)
+                    if not fallback_items:
+                        continue
+                    item = fallback_items[0]
                     self._assign_scores_and_rankings([item])
                 items.append(item)
 
-        for item in items:
-            item['factor_payload'] = self._build_factor_payload(
-                item=item,
-                source=source,
-                universe_counts=universe_counts,
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=ranking_failed_symbols,
+            failed_symbol_errors=ranking_failed_symbol_errors,
+            target_symbols=[input_row.symbol for input_row in inputs],
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
+        )
+
+        items, payload_failed_symbols, payload_failed_errors = (
+            attach_symbol_payloads(
+                items,
+                payload_builder=lambda item: self._build_factor_payload(
+                    item=item,
+                    source=source,
+                    universe_counts=universe_counts,
+                ),
             )
+        )
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (payload_failed_symbols, payload_failed_errors),
+            )
+        )
         summary = self._build_summary(
             items,
             requested_symbols=requested_symbols,
@@ -214,19 +303,41 @@ class DailyValueFactorService:
             self._strip_internal_fields(item)
 
         persisted_count = 0
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            upsert_daily_value_factor_results(items)
-            persisted_count = len(items)
-        except Exception:
-            for item in items:
-                try:
-                    upsert_daily_value_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='value_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (
+                    publication['failed_symbols'],
+                    publication['failed_symbol_errors'],
+                ),
+            )
+            scope_finalization = publication['scope_finalization']
+        else:
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=upsert_daily_value_factor_results,
+                item_write=upsert_daily_value_factor_result,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -239,8 +350,23 @@ class DailyValueFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+                failed_symbol_errors=failed_symbol_errors,
+            )
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
+        )
 
-        return {
+        result = {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -254,6 +380,9 @@ class DailyValueFactorService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': _sort_items(items),
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,
@@ -593,7 +722,7 @@ class DailyValueFactorService:
         ready_count = sum(
             1 for item in items if item.get('value_status') == VALUE_STATUS_SCORED
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -608,6 +737,52 @@ class DailyValueFactorService:
             'unready_count': len(missing_symbols) + len(items) - ready_count,
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        def metric_status(item: dict[str, Any], metric: str) -> str | None:
+            if metric == 'per' and item.get('per_status') is not None:
+                return str(item['per_status'])
+            payload = item.get('factor_payload')
+            statuses = payload.get('metric_statuses') if isinstance(payload, dict) else None
+            value = statuses.get(metric) if isinstance(statuses, dict) else None
+            return str(value) if value is not None else None
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
+            is_ready=lambda item: item.get('value_score') is not None,
+            is_complete=lambda item: item.get('value_status') == VALUE_STATUS_SCORED,
+            unusable_reason=lambda item: item.get('value_status'),
+            input_families={
+                metric: (
+                    lambda item, metric=metric: metric_status(item, metric)
+                    == METRIC_STATUS_AVAILABLE,
+                    lambda item, metric=metric: metric_status(item, metric),
+                )
+                for metric in ('per', 'pbr', 'dividend_yield')
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

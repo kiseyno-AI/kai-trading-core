@@ -142,6 +142,7 @@ class SignalDeciderEvaluationMaintenanceService:
         normalized_primary_horizons = _normalize_primary_horizons(primary_horizons)
         prerequisites = self.prerequisite_service.inspect_feedback_prerequisites(
             market_date=normalized_market_date.isoformat(),
+            symbols=normalized_symbols or None,
         )
         request_payload = {
             'as_of_market_date': normalized_market_date.isoformat(),

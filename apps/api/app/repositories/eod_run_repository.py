@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from functools import wraps
+import inspect
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import and_, func, or_, select, text
@@ -19,6 +22,7 @@ from app.db_models import (
     DailyPipelineRun,
     DailyPipelineStageRun,
     DailyPriceBar,
+    DailyPriceContext,
     DailyTechnicalSnapshot,
     DailyTrendingRank,
     EODCollectionRun,
@@ -33,6 +37,16 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_marker_is_valid,
     terminal_continuation_resume_is_unconsumed,
 )
+from app.eod.run_stage_support import (
+    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER,
+    SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
+    SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
+    is_canonical_same_day_signal_rearm_proof,
+    is_exact_auto_pitr_intraday_watch_recovery_request,
+    is_recoverable_same_day_intraday_watch_expiration,
+    pending_same_day_intraday_watch_rearm_marker,
+    validated_nonblocking_partial_progression_marker,
+)
 from app.eod.summary_cutoff_contract import (
     is_resumable_summary_cutoff_contract_repair,
     is_summary_cutoff_contract_repair_candidate,
@@ -44,6 +58,48 @@ logger = logging.getLogger(__name__)
 
 
 KIS_FINAL_BAR_REPAIR_SOURCE = 'kis_final_bar_repair'
+
+_CURRENT_TERMINAL_CONTINUATION_SUFFIX = (
+    'agent_feedback_summaries',
+    'signal_decider',
+    'next_open_execution_plan',
+)
+_LEGACY_TERMINAL_CONTINUATION_SUFFIX = (
+    *_CURRENT_TERMINAL_CONTINUATION_SUFFIX,
+    'signal_decider_evaluations',
+)
+
+
+def _resolved_terminal_continuation_suffix(
+    resolved_stages: Sequence[str],
+) -> tuple[str, ...] | None:
+    normalized = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stages
+    )
+    if not normalized or any(not stage_id for stage_id in normalized):
+        return None
+    for suffix in (
+        _LEGACY_TERMINAL_CONTINUATION_SUFFIX,
+        _CURRENT_TERMINAL_CONTINUATION_SUFFIX,
+    ):
+        if normalized[-len(suffix) :] == suffix:
+            return suffix
+    return None
+
+
+def _automatic_terminal_continuation_resume_stage(
+    continuation_suffix: Sequence[str],
+    *,
+    satisfied_prefix_count: int,
+) -> str | None:
+    if not 0 <= satisfied_prefix_count < len(continuation_suffix):
+        return None
+    stage_id = str(
+        continuation_suffix[satisfied_prefix_count] or ''
+    ).strip()
+    if stage_id == 'signal_decider_evaluations':
+        return None
+    return stage_id or None
 
 
 def daily_price_bar_has_current_eod_run_provenance(
@@ -73,7 +129,16 @@ _EOD_COLLECTION_LOCK_SOURCE_KEYS = {
     ('KRX', 'pykrx'): 10_001,
     ('KRX', 'kis'): 10_002,
     ('KRX', 'daily_price_bars'): 10_003,
+    ('KRX', 'dart_share_issuance'): 10_004,
 }
+_DAILY_PRICE_BAR_LOCK_IDENTITY = ('KRX', 'daily_price_bars')
+_GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY = 0
+_HELD_EOD_COLLECTION_LOCKS: ContextVar[
+    frozenset[tuple[str, str, str]]
+] = ContextVar(
+    'held_eod_collection_locks',
+    default=frozenset(),
+)
 _AUTO_DAILY_PIPELINE_ENTRYPOINT = (
     'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
 )
@@ -170,29 +235,188 @@ def eod_collection_advisory_lock_keys(
     return source_key, int(normalized_trade_date.strftime('%Y%m%d'))
 
 
+def eod_collection_admission_advisory_lock_keys(
+    *,
+    market: str,
+    source: str,
+) -> tuple[int, int] | None:
+    """Return the global admission key shared by all price-bar writers."""
+
+    if (market, source) != _DAILY_PRICE_BAR_LOCK_IDENTITY:
+        return None
+    return (
+        _EOD_COLLECTION_LOCK_SOURCE_KEYS[_DAILY_PRICE_BAR_LOCK_IDENTITY],
+        _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY,
+    )
+
+
+def _eod_collection_lock_identity(
+    *,
+    market: str,
+    trade_date: str | date,
+    source: str,
+) -> tuple[str, str, str]:
+    return (
+        str(market).strip().upper(),
+        str(source).strip(),
+        _normalize_trade_date(trade_date).isoformat(),
+    )
+
+
+def eod_collection_advisory_lock_is_held(
+    *,
+    market: str,
+    trade_date: str | date,
+    source: str,
+) -> bool:
+    """Return whether this execution context already owns the date fence.
+
+    The database lock is session-scoped, while pipeline stages use separate
+    SQLAlchemy sessions for their atomic publications.  Tracking ownership in
+    a context variable makes those nested calls re-entrant without weakening
+    admission for concurrent API/CLI writers in other threads or tasks.
+    """
+
+    return _eod_collection_lock_identity(
+        market=market,
+        trade_date=trade_date,
+        source=source,
+    ) in _HELD_EOD_COLLECTION_LOCKS.get()
+
+
+@contextmanager
+def daily_price_bar_writer_admission_lock(
+    *,
+    market_date: str | date,
+):
+    """Hold the date fence for one complete price-dependent write."""
+
+    normalized = _normalize_trade_date(market_date).isoformat()
+    with advisory_eod_collection_lock(
+        market='KRX',
+        trade_date=normalized,
+        source='daily_price_bars',
+    ) as acquired:
+        if not acquired:
+            raise RuntimeError(
+                'daily price-dependent writer lock is already held for '
+                f'{normalized}'
+            )
+        yield
+
+
+def daily_price_bar_writer_admission(func):
+    """Serialize a complete same-date derived-data computation and publish.
+
+    Mutating services decorated with this helper join the same date-scoped
+    fence as the official pipeline and exact repair tools.  Existing owners
+    are re-entrant through :func:`eod_collection_advisory_lock_is_held`.
+    """
+
+    async def _async_call(*args: Any, **kwargs: Any):
+        market_date = kwargs.get('market_date')
+        if market_date is None:
+            raise ValueError('market_date is required for writer admission')
+        with daily_price_bar_writer_admission_lock(
+            market_date=market_date,
+        ):
+            return await func(*args, **kwargs)
+
+    def _sync_call(*args: Any, **kwargs: Any):
+        market_date = kwargs.get('market_date')
+        if market_date is None:
+            raise ValueError('market_date is required for writer admission')
+        with daily_price_bar_writer_admission_lock(
+            market_date=market_date,
+        ):
+            return func(*args, **kwargs)
+
+    wrapper = _async_call if inspect.iscoroutinefunction(func) else _sync_call
+    return wraps(func)(wrapper)
+
+
+def _invalidate_advisory_lock_connection(connection: Any) -> None:
+    """Discard a pooled session whose advisory-lock cleanup failed."""
+
+    try:
+        connection.invalidate()
+    except Exception:
+        logger.warning(
+            'Failed to invalidate the EOD advisory-lock connection after '
+            'unlock cleanup failed.',
+            exc_info=True,
+        )
+
+
 @contextmanager
 def advisory_eod_collection_locks(
     *,
     market: str,
     trade_dates: Sequence[str | date],
     source: str,
+    exclusive_admission: bool = False,
 ):
-    """Hold a sorted set of EOD date locks on one dedicated connection."""
+    """Hold admission plus a sorted set of EOD date locks.
+
+    Daily-price writers take a shared global admission lock before their
+    exact-date locks. Broad repairs can request the exclusive form to close
+    the race with a writer for a date that has no persisted price row yet.
+    """
 
     normalized_dates = tuple(
         sorted({_normalize_trade_date(item) for item in trade_dates})
     )
     if not normalized_dates:
         raise ValueError('at least one EOD advisory-lock date is required')
+    lock_identities = frozenset(
+        _eod_collection_lock_identity(
+            market=market,
+            trade_date=item,
+            source=source,
+        )
+        for item in normalized_dates
+    )
+    held_identities = _HELD_EOD_COLLECTION_LOCKS.get()
+    if lock_identities.issubset(held_identities):
+        yield True, None
+        return
     source_key = _EOD_COLLECTION_LOCK_SOURCE_KEYS.get(
         (market, source),
         19_999,
     )
+    uses_global_admission = (market, source) == _DAILY_PRICE_BAR_LOCK_IDENTITY
+    admission_acquired = False
+    admission_shared = uses_global_admission and not exclusive_admission
     acquired_trade_keys: list[int] = []
     blocked_date: date | None = None
+    cleanup_failed = False
+    ownership_token = None
     with engine.connect() as raw_connection:
         connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
         try:
+            if uses_global_admission:
+                admission_function = (
+                    'pg_try_advisory_lock_shared'
+                    if admission_shared
+                    else 'pg_try_advisory_lock'
+                )
+                admission_acquired = bool(
+                    connection.execute(
+                        text(
+                            f'SELECT {admission_function}('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    ).scalar()
+                )
+                if not admission_acquired:
+                    yield False, 'all_dates'
+                    return
             for trade_date in normalized_dates:
                 trade_key = int(trade_date.strftime('%Y%m%d'))
                 acquired = bool(
@@ -211,11 +435,17 @@ def advisory_eod_collection_locks(
                     blocked_date = trade_date
                     break
                 acquired_trade_keys.append(trade_key)
+            if blocked_date is None:
+                ownership_token = _HELD_EOD_COLLECTION_LOCKS.set(
+                    held_identities.union(lock_identities)
+                )
             yield (
                 blocked_date is None,
                 blocked_date.isoformat() if blocked_date is not None else None,
             )
         finally:
+            if ownership_token is not None:
+                _HELD_EOD_COLLECTION_LOCKS.reset(ownership_token)
             for trade_key in reversed(acquired_trade_keys):
                 try:
                     connection.execute(
@@ -229,8 +459,44 @@ def advisory_eod_collection_locks(
                         },
                     )
                 except Exception:
-                    # Closing the dedicated connection releases every held lock.
-                    pass
+                    # SQLAlchemy close normally returns this session to the
+                    # pool, where session-level locks would remain held.
+                    # Invalidating it closes the PostgreSQL session and
+                    # releases this lock plus any remaining locks in the set.
+                    _invalidate_advisory_lock_connection(connection)
+                    cleanup_failed = True
+                    logger.warning(
+                        'Failed to explicitly release EOD advisory locks; '
+                        'discarded the dedicated connection.',
+                        exc_info=True,
+                    )
+                    break
+            if admission_acquired and not cleanup_failed:
+                admission_unlock_function = (
+                    'pg_advisory_unlock_shared'
+                    if admission_shared
+                    else 'pg_advisory_unlock'
+                )
+                try:
+                    connection.execute(
+                        text(
+                            f'SELECT {admission_unlock_function}('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    )
+                except Exception:
+                    _invalidate_advisory_lock_connection(connection)
+                    logger.warning(
+                        'Failed to explicitly release the EOD admission '
+                        'lock; discarded the dedicated connection.',
+                        exc_info=True,
+                    )
 
 
 def _serialize_eod_collection_run(row: EODCollectionRun) -> dict[str, Any]:
@@ -681,6 +947,15 @@ def _load_eod_recovery_metadata(
             metadata['stage_progress']['agent_feedback_summaries'].label(
                 'feedback_summary_stage'
             ),
+            metadata['same_day_intraday_watch_rearm'].label(
+                'same_day_intraday_watch_rearm'
+            ),
+            metadata['nonblocking_partial_progression'].label(
+                'nonblocking_partial_progression'
+            ),
+            metadata['nonblocking_feedback_retry_debt'].label(
+                'nonblocking_feedback_retry_debt'
+            ),
         ).where(EODCollectionRun.id.in_(tuple(candidate_by_id)))
     )
     for row in rows:
@@ -701,6 +976,15 @@ def _load_eod_recovery_metadata(
                 'markets': row.markets,
                 'requested_symbols': row.requested_symbols,
                 'feedback_summary_stage': row.feedback_summary_stage,
+                'same_day_intraday_watch_rearm': (
+                    row.same_day_intraday_watch_rearm
+                ),
+                'nonblocking_partial_progression': (
+                    row.nonblocking_partial_progression
+                ),
+                'nonblocking_feedback_retry_debt': (
+                    row.nonblocking_feedback_retry_debt
+                ),
             }
         )
 
@@ -841,6 +1125,15 @@ def _load_pipeline_recovery_candidates(
             .as_boolean()
             .label('reuse_existing_feedback'),
             metadata['force'].as_boolean().label('force'),
+            metadata['point_in_time_recovery']
+            .as_boolean()
+            .label('point_in_time_recovery'),
+            metadata['allow_expired_analysis_replay']
+            .as_boolean()
+            .label('allow_expired_analysis_replay'),
+            metadata['same_day_intraday_watch_continuation_admitted']
+            .as_boolean()
+            .label('same_day_intraday_watch_continuation_admitted'),
             metadata['terminal_continuation_feedback_lease_loss_run_id']
             .as_string()
             .label('terminal_continuation_feedback_lease_loss_run_id'),
@@ -860,6 +1153,9 @@ def _load_pipeline_recovery_candidates(
             ),
             metadata['summary_cutoff_contract_repair_resume_count']
             .label('summary_cutoff_contract_repair_resume_count'),
+            metadata['nonblocking_partial_progression'].label(
+                'nonblocking_partial_progression'
+            ),
         )
         .where(DailyPipelineRun.market_date.in_(tuple(market_dates)))
         .order_by(
@@ -921,6 +1217,13 @@ def _load_pipeline_recovery_candidates(
                 'fs_div': row.fs_div,
                 'reuse_existing_feedback': row.reuse_existing_feedback,
                 'force': row.force,
+                'point_in_time_recovery': row.point_in_time_recovery,
+                'allow_expired_analysis_replay': (
+                    row.allow_expired_analysis_replay
+                ),
+                'same_day_intraday_watch_continuation_admitted': (
+                    row.same_day_intraday_watch_continuation_admitted
+                ),
                 'terminal_continuation_feedback_lease_loss_run_id': (
                     row.terminal_continuation_feedback_lease_loss_run_id
                 ),
@@ -939,6 +1242,9 @@ def _load_pipeline_recovery_candidates(
                 ),
                 'summary_cutoff_contract_repair_resume_count': (
                     row.summary_cutoff_contract_repair_resume_count
+                ),
+                'nonblocking_partial_progression': (
+                    row.nonblocking_partial_progression
                 ),
             },
         )
@@ -1031,6 +1337,374 @@ def _pipeline_stage_outcome(stage_row: DailyPipelineStageRun) -> dict[str, Any]:
             stage_row.details if isinstance(stage_row.details, dict) else {}
         ),
     }
+
+
+def _validated_nonblocking_partial_recovery(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    eod_run: _EODRecoveryCandidate,
+    require_eod_reconciled: bool,
+) -> dict[str, Any] | None:
+    """Rebuild and validate a partial-success recovery from durable rows."""
+
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return None
+    resolved_stages = [
+        str(stage_id or '').strip() for stage_id in raw_resolved_stages
+    ]
+    if not (
+        resolved_stages
+        and all(resolved_stages)
+        and len(resolved_stages) == len(set(resolved_stages))
+    ):
+        return None
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(resolved_stages),
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+    }
+    if set(stages) != set(resolved_stages):
+        return None
+    recovery_result = {
+        'status': pipeline_run.status,
+        'pipeline_run_id': int(pipeline_run.id),
+        'pipeline_run': {
+            'id': int(pipeline_run.id),
+            'market_date': pipeline_run.market_date.isoformat(),
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'completed_at': pipeline_run.completed_at,
+            'error_message': pipeline_run.error_message,
+            'run_metadata': metadata,
+        },
+        'market_date': pipeline_run.market_date.isoformat(),
+        'resolved_stages': resolved_stages,
+        'stages': stages,
+    }
+    marker = validated_nonblocking_partial_progression_marker(
+        recovery_result,
+        expected_eod_collection_run_id=int(eod_run.id),
+    )
+    if marker is None:
+        return None
+    if not require_eod_reconciled:
+        return marker
+
+    eod_metadata = (
+        eod_run.run_metadata
+        if isinstance(eod_run.run_metadata, dict)
+        else {}
+    )
+    if not (
+        eod_metadata.get('nonblocking_partial_progression') == marker
+        and eod_metadata.get('nonblocking_feedback_retry_debt')
+        == marker.get('retry_debt')
+        and not _eod_has_followup_recovery_scope(eod_run)
+        and not _eod_has_price_recovery_scope(eod_run)
+    ):
+        return None
+    return marker
+
+
+def _followup_recovery_is_recoverable_same_day_expiration(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    current_market_date: date,
+) -> bool:
+    """Keep one exact OPEN PITR false-skip from consuming recovery debt."""
+
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, dict)
+        else {}
+    )
+    raw_resolved_stages = metadata.get('resolved_stages')
+    if not isinstance(raw_resolved_stages, list):
+        return False
+    resolved_stages = tuple(
+        str(stage_id or '').strip()
+        for stage_id in raw_resolved_stages
+        if str(stage_id or '').strip()
+    )
+    if len(resolved_stages) != len(raw_resolved_stages):
+        return False
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(resolved_stages),
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+    }
+    if set(stages) != set(resolved_stages):
+        return False
+    return is_recoverable_same_day_intraday_watch_expiration(
+        {
+            'id': pipeline_run.id,
+            'market_date': pipeline_run.market_date,
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'started_at': pipeline_run.started_at,
+            'updated_at': pipeline_run.activity_at,
+            'completed_at': pipeline_run.completed_at,
+            'error_message': pipeline_run.error_message,
+            'run_metadata': metadata,
+            'stages': stages,
+        },
+        current_market_date=current_market_date,
+    )
+
+
+def _followup_candidate_is_exact_intraday_watch_recovery(
+    pipeline_run: _PipelineRecoveryCandidate,
+    *,
+    eod_run_id: int,
+) -> bool:
+    metadata = (
+        pipeline_run.run_metadata
+        if isinstance(pipeline_run.run_metadata, Mapping)
+        else {}
+    )
+    resolved_stages = metadata.get('resolved_stages')
+    return bool(
+        metadata.get('entrypoint') == 'daily_pipeline_stage_service.run'
+        and metadata.get('allow_expired_analysis_replay') is False
+        and isinstance(resolved_stages, (list, tuple))
+        and is_exact_auto_pitr_intraday_watch_recovery_request(
+            trigger=pipeline_run.trigger,
+            point_in_time_recovery=metadata.get('point_in_time_recovery'),
+            reused_eod_collection_run_id=metadata.get(
+                'reused_eod_collection_run_id'
+            ),
+            force=metadata.get('force'),
+            reuse_existing_feedback=metadata.get('reuse_existing_feedback'),
+            resume_from_stage=metadata.get('resume_from_stage'),
+            resolved_stages=resolved_stages,
+        )
+        and metadata.get('reused_eod_collection_run_id') == eod_run_id
+    )
+
+
+def _followup_recovery_is_canonical_signal_rearm_proof(
+    session: Any,
+    *,
+    pipeline_run: _PipelineRecoveryCandidate,
+    eod_run_id: int,
+) -> bool:
+    """Verify the immutable signal retry evidence named by a rearm marker."""
+
+    stage_rows = list(
+        session.execute(
+            select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id
+                == int(pipeline_run.id),
+                DailyPipelineStageRun.market_date
+                == pipeline_run.market_date,
+                DailyPipelineStageRun.stage_id.in_(
+                    AUTO_PITR_INTRADAY_WATCH_RECOVERY_STAGE_ORDER
+                ),
+            )
+        ).scalars()
+    )
+    stages = {
+        str(stage_row.stage_id or '').strip(): _pipeline_stage_outcome(
+            stage_row
+        )
+        for stage_row in stage_rows
+    }
+    return is_canonical_same_day_signal_rearm_proof(
+        {
+            'id': int(pipeline_run.id),
+            'market_date': pipeline_run.market_date,
+            'trigger': pipeline_run.trigger,
+            'status': pipeline_run.status,
+            'current_stage': pipeline_run.current_stage,
+            'run_metadata': pipeline_run.run_metadata,
+            'stages': stages,
+        },
+        expected_eod_collection_run_id=eod_run_id,
+    )
+
+
+def _followup_recovery_has_valid_same_day_rearm_marker(
+    session: Any,
+    *,
+    eod_run: _EODRecoveryCandidate,
+    pipeline_candidates: Sequence[_PipelineRecoveryCandidate],
+    latest_recovery: _PipelineRecoveryCandidate | None,
+    current_market_date: date,
+    followup_attempts: int,
+    allow_stale_target_for_terminal_block: bool = False,
+) -> bool:
+    """Validate the narrow marker that extends one false-skip lineage.
+
+    This is deliberately separate from the generic follow-up retry budget. The
+    marker can surface only the exact same-day OPEN false-skip it names, and it
+    cannot authorize work after its bounded eighth recovery observation.
+    """
+
+    within_rearm_attempt_budget = bool(
+        _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD < followup_attempts
+        <= SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT
+    )
+    stale_pre_run_crash = bool(
+        allow_stale_target_for_terminal_block
+        and followup_attempts == _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+    )
+    if not (
+        (within_rearm_attempt_budget or stale_pre_run_crash)
+        and latest_recovery is not None
+        and str(latest_recovery.status or '').strip().lower()
+        in (
+            _RECOVERABLE_DAILY_PIPELINE_STATUSES
+            | _CONVERGENCE_ELIGIBLE_RECOVERY_STATUSES
+        )
+        and _followup_candidate_is_exact_intraday_watch_recovery(
+            latest_recovery,
+            eod_run_id=eod_run.id,
+        )
+    ):
+        return False
+
+    marker = pending_same_day_intraday_watch_rearm_marker(
+        eod_run.run_metadata.get(
+            SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY
+        ),
+        target_trade_date=(
+            None
+            if allow_stale_target_for_terminal_block
+            else current_market_date
+        ),
+    )
+    if marker is None:
+        return False
+    marker_target_trade_date = date.fromisoformat(
+        str(marker['target_trade_date'])
+    )
+    if allow_stale_target_for_terminal_block and not (
+        marker_target_trade_date < current_market_date
+    ):
+        return False
+    marker_started_at = _normalized_datetime(marker.get('started_at'))
+    if marker_started_at is None:
+        return False
+    source_false_skip_run_id = marker.get('source_false_skip_run_id')
+    proof_pipeline_run_id = marker.get('proof_pipeline_run_id')
+
+    candidates_by_id = {
+        candidate.id: candidate for candidate in pipeline_candidates
+    }
+    source_false_skip = candidates_by_id.get(source_false_skip_run_id)
+    proof_pipeline_run = candidates_by_id.get(proof_pipeline_run_id)
+    if source_false_skip is None or proof_pipeline_run is None:
+        return False
+
+    def _reuses_exact_eod(candidate: _PipelineRecoveryCandidate) -> bool:
+        metadata = (
+            candidate.run_metadata
+            if isinstance(candidate.run_metadata, Mapping)
+            else {}
+        )
+        try:
+            return int(metadata.get('reused_eod_collection_run_id')) == int(
+                eod_run.id
+            )
+        except (TypeError, ValueError):
+            return False
+
+    if not (
+        source_false_skip.market_date == eod_run.trade_date
+        and proof_pipeline_run.market_date == eod_run.trade_date
+        and source_false_skip.trigger == _AUTO_DAILY_RECOVERY_TRIGGER
+        and proof_pipeline_run.trigger == _AUTO_DAILY_RECOVERY_TRIGGER
+        and _reuses_exact_eod(source_false_skip)
+        and _reuses_exact_eod(proof_pipeline_run)
+        and proof_pipeline_run.started_at <= source_false_skip.started_at
+        and (
+            latest_recovery.id > source_false_skip.id
+            or (
+                stale_pre_run_crash
+                and latest_recovery.id == source_false_skip.id
+            )
+        )
+        and _reuses_exact_eod(latest_recovery)
+    ):
+        return False
+
+    source_completed_at = _normalized_datetime(source_false_skip.completed_at)
+    if source_completed_at is None or marker_started_at < source_completed_at:
+        return False
+    post_source_attempts = sorted(
+        (
+            candidate
+            for candidate in pipeline_candidates
+            if candidate.id > source_false_skip.id
+            and candidate.market_date == eod_run.trade_date
+            and candidate.trigger == _AUTO_DAILY_RECOVERY_TRIGGER
+            and _reuses_exact_eod(candidate)
+        ),
+        key=lambda candidate: (
+            _normalized_datetime(candidate.started_at)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            candidate.id,
+        ),
+    )
+    earliest_attempt_at = (
+        _normalized_datetime(post_source_attempts[0].started_at)
+        if post_source_attempts
+        else None
+    )
+    marker_precedes_recovery_attempt = bool(
+        (
+            earliest_attempt_at is not None
+            and marker_started_at <= earliest_attempt_at
+        )
+        or (stale_pre_run_crash and not post_source_attempts)
+    )
+    return bool(
+        marker_precedes_recovery_attempt
+        and _followup_recovery_is_recoverable_same_day_expiration(
+            session,
+            pipeline_run=source_false_skip,
+            current_market_date=marker_target_trade_date,
+        )
+        and _followup_recovery_is_canonical_signal_rearm_proof(
+            session,
+            pipeline_run=proof_pipeline_run,
+            eod_run_id=eod_run.id,
+        )
+    )
 
 
 def _terminal_continuation_lease_loss_child_is_valid(
@@ -1218,17 +1892,13 @@ def _followup_recovery_is_reclaimable_feedback_lease_loss(
         for stage_id in raw_resolved_stages
         if str(stage_id or '').strip()
     ]
-    continuation_suffix = (
-        'agent_feedback_summaries',
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
+    continuation_suffix = _resolved_terminal_continuation_suffix(
+        resolved_stages
     )
     if (
         len(resolved_stages) != len(raw_resolved_stages)
         or len(resolved_stages) != len(set(resolved_stages))
-        or tuple(resolved_stages[-len(continuation_suffix) :])
-        != continuation_suffix
+        or continuation_suffix is None
     ):
         return False
 
@@ -1312,8 +1982,8 @@ def _followup_recovery_is_reclaimable_feedback_lease_loss(
         and not (stage.source_run_ids or {})
         and not (stage.details or {})
         for stage in (
-            stage_rows_by_id['next_open_execution_plan'],
-            stage_rows_by_id['signal_decider_evaluations'],
+            stage_rows_by_id[stage_id]
+            for stage_id in continuation_suffix[2:]
         )
     )
 
@@ -1401,17 +2071,13 @@ def _followup_recovery_is_resumable_terminal_continuation(
         for stage_id in raw_resolved_stages
         if str(stage_id or '').strip()
     ]
-    continuation_suffix = (
-        'agent_feedback_summaries',
-        'signal_decider',
-        'next_open_execution_plan',
-        'signal_decider_evaluations',
+    continuation_suffix = _resolved_terminal_continuation_suffix(
+        resolved_stages
     )
     if (
         len(resolved_stages) != len(raw_resolved_stages)
         or len(resolved_stages) != len(set(resolved_stages))
-        or tuple(resolved_stages[-len(continuation_suffix) :])
-        != continuation_suffix
+        or continuation_suffix is None
     ):
         return False
 
@@ -1452,6 +2118,17 @@ def _followup_recovery_is_resumable_terminal_continuation(
             break
         satisfied_prefix.append(stage_id)
     if len(satisfied_prefix) == len(continuation_suffix):
+        return False
+
+    first_unfinished_index = len(satisfied_prefix)
+    first_unfinished_stage = _automatic_terminal_continuation_resume_stage(
+        continuation_suffix,
+        satisfied_prefix_count=first_unfinished_index,
+    )
+    if first_unfinished_stage is None:
+        # Historical evaluation-only debt is maintenance work, not an
+        # execution-readiness continuation.  Preserve the persisted row for
+        # audit without scheduling or resuming it automatically.
         return False
 
     recorded_prefix = metadata.get('terminal_continuation_completed_prefix')
@@ -1522,8 +2199,6 @@ def _followup_recovery_is_resumable_terminal_continuation(
             and not (stage.details or {})
         )
 
-    first_unfinished_index = len(satisfied_prefix)
-    first_unfinished_stage = continuation_suffix[first_unfinished_index]
     first_unfinished = stage_rows_by_id[first_unfinished_stage]
     first_status = str(first_unfinished.status or '').strip().lower()
     current_stage = str(pipeline_run.current_stage or '').strip()
@@ -2063,24 +2738,81 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                     trade_date=eod_row.trade_date.isoformat(),
                     eod_run_id=eod_row.id,
                 )
-            if _eod_has_followup_recovery_scope(eod_row):
-                followup_attempts = _count_auto_followup_recovery_attempts(
+            pipeline_candidates = _load_pipeline_recovery_candidates(
+                session,
+                market_dates=[eod_row.trade_date],
+            )
+            latest_recovery = _latest_exact_followup_recovery(
+                candidates=pipeline_candidates,
+                eod_run=eod_row,
+            )
+            followup_attempts = _count_auto_followup_recovery_attempts(
+                session,
+                eod_run=eod_row,
+            )
+            if (
+                latest_recovery is not None
+                and followup_attempts
+                <= _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD
+                and _followup_recovery_is_recoverable_same_day_expiration(
                     session,
-                    eod_run=eod_row,
+                    pipeline_run=latest_recovery,
+                    current_market_date=cutoff,
                 )
+            ):
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
+            if _followup_recovery_has_valid_same_day_rearm_marker(
+                session,
+                eod_run=eod_row,
+                pipeline_candidates=pipeline_candidates,
+                latest_recovery=latest_recovery,
+                current_market_date=cutoff,
+                followup_attempts=followup_attempts,
+            ):
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
+            if _followup_recovery_has_valid_same_day_rearm_marker(
+                session,
+                eod_run=eod_row,
+                pipeline_candidates=pipeline_candidates,
+                latest_recovery=latest_recovery,
+                current_market_date=cutoff,
+                followup_attempts=followup_attempts,
+                allow_stale_target_for_terminal_block=True,
+            ):
+                return AutoEODRecoveryTarget(
+                    trade_date=eod_row.trade_date.isoformat(),
+                    eod_run_id=eod_row.id,
+                )
+            if _eod_has_followup_recovery_scope(eod_row):
+                if (
+                    latest_recovery is not None
+                    and _validated_nonblocking_partial_recovery(
+                        session,
+                        pipeline_run=latest_recovery,
+                        eod_run=eod_row,
+                        require_eod_reconciled=False,
+                    )
+                    is not None
+                ):
+                    # The suffix finished, but Core may have restarted before
+                    # copying the proof to its EOD ancestor. Surface exactly
+                    # one lineage for idempotent reconciliation regardless of
+                    # the ordinary retry-attempt cap.
+                    return AutoEODRecoveryTarget(
+                        trade_date=eod_row.trade_date.isoformat(),
+                        eod_run_id=eod_row.id,
+                    )
                 if followup_attempts < _MAX_AUTO_FOLLOWUP_RECOVERY_RUNS_PER_EOD:
                     return AutoEODRecoveryTarget(
                         trade_date=eod_row.trade_date.isoformat(),
                         eod_run_id=eod_row.id,
                     )
-                pipeline_candidates = _load_pipeline_recovery_candidates(
-                    session,
-                    market_dates=[eod_row.trade_date],
-                )
-                latest_recovery = _latest_exact_followup_recovery(
-                    candidates=pipeline_candidates,
-                    eod_run=eod_row,
-                )
                 if (
                     latest_recovery is not None
                     and _followup_recovery_is_satisfied_for_convergence(
@@ -2176,13 +2908,45 @@ def load_oldest_outstanding_auto_eod_recovery_target(
                 ),
                 None,
             )
+            pipeline_status = (
+                str(linked_pipeline.status or '').strip().lower()
+                if linked_pipeline is not None
+                else ''
+            )
+            partial_pipeline_reconciled = bool(
+                linked_pipeline is not None
+                and pipeline_status == 'partial'
+                and isinstance(linked_pipeline.run_metadata, dict)
+                and linked_pipeline.run_metadata.get('resumable') is False
+                and _validated_nonblocking_partial_recovery(
+                    session,
+                    pipeline_run=linked_pipeline,
+                    eod_run=eod_row,
+                    require_eod_reconciled=True,
+                )
+                is not None
+            )
             pipeline_is_incomplete = bool(
                 linked_pipeline is not None
-                and str(linked_pipeline.status or '').strip().lower()
-                in _RECOVERABLE_DAILY_PIPELINE_STATUSES
+                and pipeline_status in _RECOVERABLE_DAILY_PIPELINE_STATUSES
                 and (
-                    not isinstance(linked_pipeline.run_metadata, dict)
-                    or linked_pipeline.run_metadata.get('resumable') is not False
+                    (
+                        pipeline_status == 'partial'
+                        and not partial_pipeline_reconciled
+                    )
+                    or (
+                        pipeline_status != 'partial'
+                        and (
+                            not isinstance(
+                                linked_pipeline.run_metadata,
+                                dict,
+                            )
+                            or linked_pipeline.run_metadata.get(
+                                'resumable'
+                            )
+                            is not False
+                        )
+                    )
                 )
             )
             if pipeline_is_incomplete and eod_has_price_recovery_scope:
@@ -2447,6 +3211,15 @@ def load_eod_run_stage_counts(run_id: int) -> dict[str, dict]:
 
 @contextmanager
 def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
+    identity = _eod_collection_lock_identity(
+        market=market,
+        trade_date=trade_date,
+        source=source,
+    )
+    held_identities = _HELD_EOD_COLLECTION_LOCKS.get()
+    if identity in held_identities:
+        yield True
+        return
     source_key, trade_key = eod_collection_advisory_lock_keys(
         market=market,
         trade_date=trade_date,
@@ -2460,18 +3233,53 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
     # it via idle_in_transaction_session_timeout before the unlock statement.
     with engine.connect() as raw_connection:
         connection = raw_connection.execution_options(isolation_level='AUTOCOMMIT')
-        acquired = bool(
-            connection.execute(
-                text('SELECT pg_try_advisory_lock(:source_key, :trade_key)'),
-                {
-                    'source_key': source_key,
-                    'trade_key': trade_key,
-                },
-            ).scalar()
-        )
+        uses_global_admission = (
+            market,
+            source,
+        ) == _DAILY_PRICE_BAR_LOCK_IDENTITY
+        admission_acquired = False
+        acquired = False
+        cleanup_failed = False
+        ownership_token = None
         try:
+            if uses_global_admission:
+                admission_acquired = bool(
+                    connection.execute(
+                        text(
+                            'SELECT pg_try_advisory_lock_shared('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    ).scalar()
+                )
+                if not admission_acquired:
+                    yield False
+                    return
+            acquired = bool(
+                connection.execute(
+                    text(
+                        'SELECT pg_try_advisory_lock('
+                        ':source_key, :trade_key)'
+                    ),
+                    {
+                        'source_key': source_key,
+                        'trade_key': trade_key,
+                    },
+                ).scalar()
+            )
+            if acquired:
+                ownership_token = _HELD_EOD_COLLECTION_LOCKS.set(
+                    held_identities.union({identity})
+                )
             yield acquired
         finally:
+            if ownership_token is not None:
+                _HELD_EOD_COLLECTION_LOCKS.reset(ownership_token)
             if acquired:
                 try:
                     connection.execute(
@@ -2482,12 +3290,36 @@ def advisory_eod_collection_lock(*, market: str, trade_date: str, source: str):
                         },
                     )
                 except Exception:
-                    # Closing the dedicated PostgreSQL session releases any
-                    # remaining session-level advisory lock. Do not replace a
-                    # pipeline result/error with a cleanup-only failure.
+                    # Connection.close() normally returns the PostgreSQL
+                    # session to SQLAlchemy's pool, so it does not release a
+                    # session-level lock after a failed unlock. Invalidate the
+                    # connection without replacing a pipeline result/error.
+                    _invalidate_advisory_lock_connection(connection)
+                    cleanup_failed = True
                     logger.warning(
                         'Failed to explicitly release EOD advisory lock; '
-                        'closing the dedicated connection will release it.',
+                        'discarded the dedicated connection.',
+                        exc_info=True,
+                    )
+            if admission_acquired and not cleanup_failed:
+                try:
+                    connection.execute(
+                        text(
+                            'SELECT pg_advisory_unlock_shared('
+                            ':source_key, :trade_key)'
+                        ),
+                        {
+                            'source_key': source_key,
+                            'trade_key': (
+                                _GLOBAL_EOD_COLLECTION_ADMISSION_TRADE_KEY
+                            ),
+                        },
+                    )
+                except Exception:
+                    _invalidate_advisory_lock_connection(connection)
+                    logger.warning(
+                        'Failed to explicitly release the EOD admission '
+                        'lock; discarded the dedicated connection.',
                         exc_info=True,
                     )
 
@@ -2561,6 +3393,19 @@ def count_daily_price_bars_for_live_symbols(trade_date: str | date) -> int:
                 .select_from(DailyPriceBar)
                 .join(Symbol, Symbol.id == DailyPriceBar.symbol_id)
                 .where(DailyPriceBar.trade_date == _normalize_trade_date(trade_date))
+                .where(Symbol.is_active.is_(True))
+            ).scalar_one()
+        )
+
+
+def count_daily_price_contexts_for_live_symbols(market_date: str | date) -> int:
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(func.distinct(DailyPriceContext.symbol_id)))
+                .select_from(DailyPriceContext)
+                .join(Symbol, Symbol.id == DailyPriceContext.symbol_id)
+                .where(DailyPriceContext.market_date == _normalize_trade_date(market_date))
                 .where(Symbol.is_active.is_(True))
             ).scalar_one()
         )

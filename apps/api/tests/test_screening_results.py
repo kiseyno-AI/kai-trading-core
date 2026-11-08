@@ -36,6 +36,13 @@ class ScreeningResultReadServiceIntegrationTests(unittest.TestCase):
         self.symbols = ['236001', '236002', '236003']
         self.composite_dates = [date(2026, 4, 24), date(2026, 4, 25)]
         self.market_risk_dates = [date(2026, 4, 14)]
+        # Latest-mode reads are intentionally global.  Clear prior test rows
+        # so this integration fixture cannot inherit a later date from a
+        # different test module or an interrupted earlier run.
+        with session_scope() as session:
+            session.execute(delete(DailyCompositeFactorResult))
+            session.execute(delete(DailyMarketRiskFilterResult))
+            session.execute(delete(DailyUnifiedValueFactorResult))
         self._seed_rows()
 
     def tearDown(self) -> None:

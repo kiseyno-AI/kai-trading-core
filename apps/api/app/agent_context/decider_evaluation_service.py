@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import math
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, true
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import aliased
 
@@ -21,6 +20,7 @@ from app.db_models import (
 )
 from app.market.session import next_krx_trading_date
 from app.market_data_store import load_daily_bars_for_symbol_range
+from app.core.numbers import finite_float as _to_float
 
 DEFAULT_DECIDER_EVALUATION_WINDOW_DAYS = 5
 DECIDER_EVALUATION_ENGINE_VERSION = 'decider_post_decision_eval_v3'
@@ -41,6 +41,7 @@ SHADOW_AVOID_CHASE_SCHEMA_VERSION = 'short_term_avoid_chase_shadow_v1'
 EVALUATION_COST_ASSUMPTIONS_SCHEMA_VERSION = (
     'decider_evaluation_cost_assumptions_v1'
 )
+DECIDER_EVALUATION_UPSERT_BATCH_SIZE = 500
 
 
 def _normalize_market_date(value: str | date) -> date:
@@ -169,29 +170,6 @@ def _to_int(value: Any) -> int | None:
             return None
         try:
             return int(float(normalized))
-        except ValueError:
-            return None
-    return None
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, int):
-        resolved = float(value)
-        return resolved if math.isfinite(resolved) else None
-    if isinstance(value, Decimal):
-        resolved = float(value)
-        return resolved if math.isfinite(resolved) else None
-    if isinstance(value, str):
-        normalized = value.strip()
-        if not normalized:
-            return None
-        try:
-            resolved = float(normalized)
-            return resolved if math.isfinite(resolved) else None
         except ValueError:
             return None
     return None
@@ -424,45 +402,27 @@ class DeciderPostDecisionEvaluationRepository:
         agent_names: Sequence[str],
         symbols: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        snapshot_id_subquery = (
-            select(SignalDeciderDecisionSnapshot.id)
+        latest_snapshot = (
+            select(
+                SignalDeciderDecisionSnapshot.id.label(
+                    'decision_snapshot_id'
+                ),
+                SignalDeciderDecisionSnapshot.feedback_received_at.label(
+                    'feedback_received_at'
+                ),
+                SignalDeciderDecisionSnapshot.created_at.label('created_at'),
+                SignalDeciderDecisionSnapshot.request_payload.label(
+                    'decision_request_payload'
+                ),
+            )
             .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
             .order_by(
                 SignalDeciderDecisionSnapshot.created_at.desc(),
                 SignalDeciderDecisionSnapshot.id.desc(),
             )
             .limit(1)
-            .scalar_subquery()
-        )
-        snapshot_feedback_received_at_subquery = (
-            select(SignalDeciderDecisionSnapshot.feedback_received_at)
-            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
-            .order_by(
-                SignalDeciderDecisionSnapshot.created_at.desc(),
-                SignalDeciderDecisionSnapshot.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
-        )
-        snapshot_created_at_subquery = (
-            select(SignalDeciderDecisionSnapshot.created_at)
-            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
-            .order_by(
-                SignalDeciderDecisionSnapshot.created_at.desc(),
-                SignalDeciderDecisionSnapshot.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
-        )
-        snapshot_request_payload_subquery = (
-            select(SignalDeciderDecisionSnapshot.request_payload)
-            .where(SignalDeciderDecisionSnapshot.feedback_id == AgentContextFeedback.id)
-            .order_by(
-                SignalDeciderDecisionSnapshot.created_at.desc(),
-                SignalDeciderDecisionSnapshot.id.desc(),
-            )
-            .limit(1)
-            .scalar_subquery()
+            .correlate(AgentContextFeedback)
+            .lateral('latest_decision_snapshot')
         )
         with session_scope() as session:
             stmt = (
@@ -476,11 +436,12 @@ class DeciderPostDecisionEvaluationRepository:
                     AgentContextFeedback.received_at.label('received_at'),
                     AgentContextFeedback.normalized_feedback_payload.label('normalized_feedback_payload'),
                     AgentContextFeedback.feedback_payload.label('feedback_payload'),
-                    snapshot_id_subquery.label('decision_snapshot_id'),
-                    snapshot_feedback_received_at_subquery.label('feedback_received_at'),
-                    snapshot_created_at_subquery.label('created_at'),
-                    snapshot_request_payload_subquery.label('decision_request_payload'),
+                    latest_snapshot.c.decision_snapshot_id,
+                    latest_snapshot.c.feedback_received_at,
+                    latest_snapshot.c.created_at,
+                    latest_snapshot.c.decision_request_payload,
                 )
+                .outerjoin(latest_snapshot, true())
                 .where(
                     AgentContextFeedback.market_date >= market_date_from,
                     AgentContextFeedback.market_date <= market_date_to,
@@ -502,33 +463,55 @@ class DeciderPostDecisionEvaluationRepository:
             return []
 
         with session_scope() as session:
-            stmt = insert(DeciderPostDecisionEvaluation).values(list(items))
-            excluded = stmt.excluded
-            stmt = stmt.on_conflict_do_update(
-                constraint='uq_decider_post_decision_evaluations_feedback_window',
-                set_={
-                    'decision_snapshot_id': excluded.decision_snapshot_id,
-                    'agent_name': excluded.agent_name,
-                    'market_date': excluded.market_date,
-                    'symbol': excluded.symbol,
-                    'decision_action': excluded.decision_action,
-                    'entry_trade_date': excluded.entry_trade_date,
-                    'entry_price': excluded.entry_price,
-                    'target_price': excluded.target_price,
-                    'stop_loss_price': excluded.stop_loss_price,
-                    'first_target_hit_trade_date': excluded.first_target_hit_trade_date,
-                    'first_stop_hit_trade_date': excluded.first_stop_hit_trade_date,
-                    'mfe_pct': excluded.mfe_pct,
-                    'mae_pct': excluded.mae_pct,
-                    'outcome_label': excluded.outcome_label,
-                    'outcome_reason': excluded.outcome_reason,
-                    'data_quality_warnings_payload': excluded.data_quality_warnings_payload,
-                    'metadata_payload': excluded.metadata_payload,
-                    'computed_at': excluded.computed_at,
-                    'updated_at': excluded.updated_at,
-                },
-            ).returning(DeciderPostDecisionEvaluation.id)
-            record_ids = list(session.execute(stmt).scalars().all())
+            record_ids: list[int] = []
+            for offset in range(
+                0,
+                len(items),
+                DECIDER_EVALUATION_UPSERT_BATCH_SIZE,
+            ):
+                batch = list(
+                    items[
+                        offset : offset
+                        + DECIDER_EVALUATION_UPSERT_BATCH_SIZE
+                    ]
+                )
+                stmt = insert(DeciderPostDecisionEvaluation).values(batch)
+                excluded = stmt.excluded
+                stmt = stmt.on_conflict_do_update(
+                    constraint=(
+                        'uq_decider_post_decision_evaluations_feedback_window'
+                    ),
+                    set_={
+                        'decision_snapshot_id': excluded.decision_snapshot_id,
+                        'agent_name': excluded.agent_name,
+                        'market_date': excluded.market_date,
+                        'symbol': excluded.symbol,
+                        'decision_action': excluded.decision_action,
+                        'entry_trade_date': excluded.entry_trade_date,
+                        'entry_price': excluded.entry_price,
+                        'target_price': excluded.target_price,
+                        'stop_loss_price': excluded.stop_loss_price,
+                        'first_target_hit_trade_date': (
+                            excluded.first_target_hit_trade_date
+                        ),
+                        'first_stop_hit_trade_date': (
+                            excluded.first_stop_hit_trade_date
+                        ),
+                        'mfe_pct': excluded.mfe_pct,
+                        'mae_pct': excluded.mae_pct,
+                        'outcome_label': excluded.outcome_label,
+                        'outcome_reason': excluded.outcome_reason,
+                        'data_quality_warnings_payload': (
+                            excluded.data_quality_warnings_payload
+                        ),
+                        'metadata_payload': excluded.metadata_payload,
+                        'computed_at': excluded.computed_at,
+                        'updated_at': excluded.updated_at,
+                    },
+                ).returning(DeciderPostDecisionEvaluation.id)
+                record_ids.extend(
+                    session.execute(stmt).scalars().all()
+                )
             if not record_ids:
                 return []
             rows = session.execute(

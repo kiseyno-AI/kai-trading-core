@@ -2,16 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_beta_factor_results,
     load_recent_price_bars_by_symbol,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_beta_factor_result,
     upsert_daily_beta_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
+    attach_symbol_payloads,
+    build_factor_coverage_contract,
+    build_symbol_results,
+    factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 BETA_FACTOR_VERSION = 'beta_v1'
 BETA_FACTOR_SOURCE = BETA_FACTOR_VERSION
@@ -50,21 +64,6 @@ def _normalize_market_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
 
 
 def _percentile_from_rank(rank: int, total: int) -> float:
@@ -152,6 +151,7 @@ class BenchmarkContext:
 
 
 class DailyBetaFactorService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -159,6 +159,8 @@ class DailyBetaFactorService:
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = BETA_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -176,37 +178,59 @@ class DailyBetaFactorService:
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
-            return {
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
+            result = {
+                'status': 'completed',
+                'reason': 'explicit_empty_scope_noop',
+                'quality_status': summary['quality_status'],
+                'quality_warning': summary['quality_warning'],
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'remaining_retryable_events': 0,
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
                 'failed_symbol_errors': [],
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='beta_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         inputs, matched_symbols, missing_symbols = self._load_inputs(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
         ranking_inputs = inputs
+        ranking_missing_symbols: list[str] = []
         if (
             normalized_symbols is not None
             and normalized_symbols != normalized_ranking_symbols
         ):
-            ranking_inputs, _, _ = self._load_inputs(
+            ranking_inputs, _, ranking_missing_symbols = self._load_inputs(
                 market_date=normalized_market_date,
                 symbols=(
                     normalized_ranking_symbols
@@ -215,16 +239,56 @@ class DailyBetaFactorService:
                 ),
             )
 
-        benchmark_context = self._build_benchmark_context(ranking_inputs)
-        ranking_items = [
-            self._build_symbol_result(
-                input_row=item,
-                market_date=normalized_market_date,
-                source=source,
-                benchmark_context=benchmark_context,
-            )
-            for item in ranking_inputs
+        (
+            validated_return_inputs,
+            return_series_failed_symbols,
+            return_series_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_inputs,
+            symbol_of=lambda item: item.symbol,
+            build=lambda item: run_symbol_computation(
+                lambda: {
+                    'input': item,
+                    'returns': build_simple_return_series_from_bars(item.bars),
+                }
+            ),
+        )
+        ranking_inputs = [
+            entry['input'] for entry in validated_return_inputs
         ]
+        return_series_by_symbol = {
+            entry['input'].symbol: entry['returns']
+            for entry in validated_return_inputs
+        }
+        benchmark_context = self._build_benchmark_context(
+            ranking_inputs,
+            return_series_by_symbol=return_series_by_symbol,
+        )
+        (
+            ranking_items,
+            ranking_failed_symbols,
+            ranking_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_inputs,
+            symbol_of=lambda item: item.symbol,
+            build=lambda item: run_symbol_computation(
+                lambda: self._build_symbol_result(
+                    input_row=item,
+                    market_date=normalized_market_date,
+                    source=source,
+                    benchmark_context=benchmark_context,
+                )
+            ),
+        )
+        ranking_failed_symbols, ranking_failed_symbol_errors = (
+            merge_symbol_failures(
+                (
+                    return_series_failed_symbols,
+                    return_series_failed_symbol_errors,
+                ),
+                (ranking_failed_symbols, ranking_failed_symbol_errors),
+            )
+        )
         universe_counts = self._assign_rankings(ranking_items)
         self._assign_scores_and_classifications(ranking_items)
         universe_counts['low_beta_score'] = sum(1 for item in ranking_items if item.get('low_beta_score') is not None)
@@ -233,25 +297,83 @@ class DailyBetaFactorService:
             items = _sort_items(ranking_items)
         else:
             ranked_items_by_symbol = {item['symbol']: item for item in ranking_items}
+            ranking_failed_symbol_set = set(ranking_failed_symbols)
             items = []
             for input_row in inputs:
+                if input_row.symbol in ranking_failed_symbol_set:
+                    continue
                 item = ranked_items_by_symbol.get(input_row.symbol)
                 if item is None:
-                    item = self._build_symbol_result(
-                        input_row=input_row,
-                        market_date=normalized_market_date,
-                        source=source,
-                        benchmark_context=benchmark_context,
+                    fallback_items, fallback_failed, fallback_errors = (
+                        build_symbol_results(
+                            [input_row],
+                            symbol_of=lambda value: value.symbol,
+                            build=lambda value: run_symbol_computation(
+                                lambda: self._build_symbol_result(
+                                    input_row=value,
+                                    market_date=normalized_market_date,
+                                    source=source,
+                                    benchmark_context=benchmark_context,
+                                )
+                            ),
+                        )
                     )
+                    ranking_failed_symbols.extend(fallback_failed)
+                    ranking_failed_symbol_errors.extend(fallback_errors)
+                    if not fallback_items:
+                        continue
+                    item = fallback_items[0]
                     self._assign_scores_and_classifications([item])
                 items.append(item)
 
-        for item in items:
-            item['factor_payload'] = self._build_factor_payload(
-                item=item,
-                source=source,
-                universe_counts=universe_counts,
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=ranking_failed_symbols,
+            failed_symbol_errors=ranking_failed_symbol_errors,
+            target_symbols=[input_row.symbol for input_row in inputs],
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
+        )
+
+        items, payload_failed_symbols, payload_failed_errors = (
+            attach_symbol_payloads(
+                items,
+                payload_builder=lambda item: self._build_factor_payload(
+                    item=item,
+                    source=source,
+                    universe_counts=universe_counts,
+                ),
             )
+        )
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (payload_failed_symbols, payload_failed_errors),
+            )
+        )
         summary = self._build_summary(
             items,
             requested_symbols=requested_symbols,
@@ -263,19 +385,38 @@ class DailyBetaFactorService:
             self._strip_internal_fields(item)
 
         persisted_count = 0
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            upsert_daily_beta_factor_results(items)
-            persisted_count = len(items)
-        except Exception:
-            for item in items:
-                try:
-                    upsert_daily_beta_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='beta_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (publication['failed_symbols'], publication['failed_symbol_errors']),
+            )
+            scope_finalization = publication['scope_finalization']
+        else:
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=upsert_daily_beta_factor_results,
+                item_write=upsert_daily_beta_factor_result,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -288,8 +429,23 @@ class DailyBetaFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+                failed_symbol_errors=failed_symbol_errors,
+            )
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
+        )
 
-        return {
+        result = {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -303,6 +459,9 @@ class DailyBetaFactorService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': _sort_items(items),
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,
@@ -396,7 +555,12 @@ class DailyBetaFactorService:
         ]
         return inputs, matched_symbols, missing_symbols
 
-    def _build_benchmark_context(self, inputs: Sequence[BetaFactorInput]) -> BenchmarkContext:
+    def _build_benchmark_context(
+        self,
+        inputs: Sequence[BetaFactorInput],
+        *,
+        return_series_by_symbol: Mapping[str, dict[str, float]] | None = None,
+    ) -> BenchmarkContext:
         return_lists_by_market: dict[str, dict[str, list[float]]] = {
             BENCHMARK_MARKET_KOSPI: {},
             BENCHMARK_MARKET_KOSDAQ: {},
@@ -404,7 +568,11 @@ class DailyBetaFactorService:
         }
 
         for input_row in inputs:
-            symbol_returns = build_simple_return_series_from_bars(input_row.bars)
+            symbol_returns = (
+                return_series_by_symbol.get(input_row.symbol, {})
+                if return_series_by_symbol is not None
+                else build_simple_return_series_from_bars(input_row.bars)
+            )
             contribution_markets = [BENCHMARK_MARKET_KRX]
             market_bucket = resolve_beta_benchmark_market(input_row.market)
             if market_bucket in {BENCHMARK_MARKET_KOSPI, BENCHMARK_MARKET_KOSDAQ}:
@@ -674,7 +842,7 @@ class DailyBetaFactorService:
             for item in items
             if item['low_beta_classification'] in {'eligible', 'watchlist', 'ineligible'}
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -691,6 +859,56 @@ class DailyBetaFactorService:
             'unready_count': len(missing_symbols) + len(items) - ready_count,
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        def metric_available(item: dict[str, Any], metric: str) -> bool:
+            payload = item.get('factor_payload')
+            availability = payload.get('availability') if isinstance(payload, dict) else None
+            metrics = availability.get('metrics') if isinstance(availability, dict) else None
+            return bool(metrics.get(metric)) if isinstance(metrics, dict) else False
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
+            is_ready=lambda item: item.get('low_beta_score') is not None,
+            is_complete=lambda item: all(
+                metric_available(item, metric)
+                for metric in ('beta_60d', 'beta_120d')
+            ),
+            unusable_reason=lambda item: item.get('low_beta_classification'),
+            input_families={
+                metric: (
+                    lambda item, metric=metric: metric_available(item, metric),
+                    lambda item, metric=metric: (
+                        None
+                        if metric_available(item, metric)
+                        else f'missing_{metric}'
+                    ),
+                )
+                for metric in ('beta_60d', 'beta_120d')
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

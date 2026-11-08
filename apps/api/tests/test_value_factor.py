@@ -320,25 +320,20 @@ class DailyValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['results_persisted'], 0)
         self.assertEqual(result['results_failed'], 0)
         self.assertEqual(result['items'], [])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['reason'], 'explicit_empty_scope_noop')
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['summary']['requested_symbol_count'], 0)
+        self.assertEqual(result['summary']['ready_count'], 0)
+        self.assertEqual(result['summary']['persisted_count'], 0)
+        self.assertEqual(result['summary']['coverage_status'], 'partial')
         self.assertEqual(
-            result['summary'],
+            result['summary']['ranking_universe_counts'],
             {
-                'requested_symbol_count': 0,
-                'matched_symbol_count': 0,
-                'missing_symbol_count': 0,
-                'symbols_with_market_date_bar': 0,
-                'missing_market_date_bar_count': 0,
-                'invalid_per_count': 0,
-                'missing_metric_count': 0,
-                'scored_count': 0,
-                'ready_count': 0,
-                'unready_count': 0,
-                'ranking_universe_counts': {
-                    'per': 0,
-                    'pbr': 0,
-                    'dividend_yield': 0,
-                    'composite_score': 0,
-                },
+                'per': 0,
+                'pbr': 0,
+                'dividend_yield': 0,
+                'composite_score': 0,
             },
         )
 
@@ -364,3 +359,33 @@ class DailyValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['feature_version'], VALUE_FACTOR_VERSION)
         self.assertEqual(result['summary']['requested_symbol'], '005930')
         self.assertEqual(result['item'], stored_items[0])
+
+    def test_evaluate_symbol_returns_inspection_payload(self) -> None:
+        service = DailyValueFactorService()
+        inspection = {
+            'market_date': '2026-04-24',
+            'feature_version': VALUE_FACTOR_VERSION,
+            'summary': {'entries': 1},
+            'item': {'symbol': '005930'},
+        }
+
+        with patch.object(service, 'inspect', return_value=inspection) as inspect:
+            result = service.evaluate_symbol(
+                market_date='2026-04-24',
+                symbol='5930',
+            )
+
+        inspect.assert_called_once_with(
+            market_date='2026-04-24',
+            symbol='5930',
+        )
+        self.assertEqual(
+            result,
+            {
+                'market_date': '2026-04-24',
+                'feature_version': VALUE_FACTOR_VERSION,
+                'symbol': '005930',
+                'summary': {'entries': 1},
+                'item': {'symbol': '005930'},
+            },
+        )

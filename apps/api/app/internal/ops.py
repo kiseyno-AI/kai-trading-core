@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -25,14 +26,46 @@ from app.agent_context.signal_decider_calendar_review_service import signal_deci
 from app.agent_context.decider_replay_service import decider_replay_service
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
     signal_decider_loop_service,
 )
 from app.core.settings import settings
-from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
-from app.dart.signals_service import dart_signals_service
+from app.dart.fundamentals_capture_service import (
+    dart_fundamentals_capture_service,
+)
+from app.dart.fundamentals_store import CAPTURE_STATUS_MAPPING_FAILED
+from app.dart.share_issuance_audit import (
+    DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER,
+    DART_SHARE_ISSUANCE_AUDIT_SCOPE_EXPLICIT_SUBSET,
+    DART_SHARE_ISSUANCE_AUDIT_SCOPE_GLOBAL_ACTIVATION,
+    DART_SHARE_ISSUANCE_AUDIT_TRIGGER,
+    DART_SHARE_ISSUANCE_BACKFILL_TRIGGER,
+    DART_SHARE_ISSUANCE_CURSOR_VERSION,
+    DART_SHARE_ISSUANCE_MANIFEST_SOURCE_ACTIVE_UNIVERSE,
+    DART_SHARE_ISSUANCE_MANIFEST_SOURCE_EXPLICIT,
+    DART_SHARE_ISSUANCE_MANIFEST_VERSION,
+    DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
+    DART_SHARE_ISSUANCE_OUTCOME_MANIFEST_VERSION,
+)
+from app.dart.signals_service import (
+    MAX_AUDIT_BACKFILL_CONCURRENCY,
+    SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION,
+    SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS,
+    SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA,
+    SHARE_ISSUANCE_RULE_VERSION,
+    dart_signals_service,
+)
+from app.dart.stale_sync_run_reconciliation import (
+    stale_dart_sync_run_reconciliation,
+)
+from app.dart.sync_service import (
+    MAX_DART_DISCLOSURE_SYNC_CONCURRENCY,
+    dart_disclosure_sync_service,
+)
 from app.db import init_database
 from app.eod.action_summaries import daily_action_summary_service
 from app.eod.auto_pykrx import auto_pykrx_eod_scheduler
+from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 from app.eod.daily_pipeline_tracking import (
     build_prior_date_current_only_stage_skip,
@@ -42,12 +75,20 @@ from app.eod.master import refresh_master_if_due
 from app.eod.master_state import master_refresh_state
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
+from app.eod.price_bar_repair_state import (
+    record_pending_trending_rebuild,
+    resolve_pending_frozen_price_dependent_membership,
+)
+from app.eod.stale_collection_run_repair import (
+    stale_eod_collection_run_repair,
+)
 from app.eod.state import job_state
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.external_news.service import external_news_service
 from app.internal.deploy_hygiene import collect_schema_drift_preflight
 from app.market.clock import get_market_state
 from app.market.kis_intraday_snapshots import KIS_INTRADAY_SNAPSHOT_SOURCE, kis_intraday_snapshot_service
+from app.market.symbol_codes import normalize_krx_short_code
 from app.market_data_store import (
     compute_and_persist_daily_trending_ranks,
     load_tracked_symbols,
@@ -85,6 +126,17 @@ from app.signals.unified_value_factor import (
 from app.signals.value_factor import VALUE_FACTOR_SOURCE, daily_value_factor_service
 from app.scanner.state import scanner_state
 from app.signals.daily_signal_features import daily_signal_feature_service
+
+
+DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY = 4
+DART_SHARE_ISSUANCE_BACKFILL_OPS_DEFAULT_CONCURRENCY = 4
+TERMINAL_CHILD_REPAIR_EXPECTED_ORPHANS = {
+    151: ('failed', 'price_collection'),
+    217: ('failed', 'signal_decider'),
+    231: ('interrupted', 'signal_decider'),
+    447: ('blocked', 'agent_feedback_summaries'),
+}
+TERMINAL_CHILD_REPAIR_EXPECTED_COUNT = 4
 
 
 def bootstrap_runtime() -> None:
@@ -217,6 +269,7 @@ def inspect_pykrx_enrichment(
 def run_dart_fundamentals_daily_if_due(
     *,
     market_date: str | None = None,
+    symbols: str | None = None,
     symbol_limit: int | None = None,
     symbol_offset: int = 0,
     capture_limit: int = 500,
@@ -224,10 +277,28 @@ def run_dart_fundamentals_daily_if_due(
     force: bool = False,
     fs_div: str | None = None,
 ) -> dict[str, Any]:
+    parsed_symbols: list[str] | None = None
+    if symbols is not None:
+        if symbol_limit is not None or symbol_offset != 0:
+            raise ValueError(
+                '--symbols cannot be combined with a non-default '
+                '--symbol-limit or --symbol-offset'
+            )
+        parsed_symbols = []
+        for value in symbols.split(','):
+            normalized_stock_code = normalize_krx_short_code(value)
+            if normalized_stock_code is None:
+                raise ValueError(
+                    '--symbols must contain comma-separated canonical KRX short codes'
+                )
+            if normalized_stock_code not in parsed_symbols:
+                parsed_symbols.append(normalized_stock_code)
+
     bootstrap_runtime()
     return asyncio.run(
         dart_fundamentals_capture_service.run_daily_incremental_refresh(
             market_date=market_date,
+            symbols=parsed_symbols,
             symbol_limit=symbol_limit,
             symbol_offset=symbol_offset,
             capture_limit=capture_limit,
@@ -249,6 +320,7 @@ def backfill_dart_audit_signals(
     market_date: str,
     limit: int = 25,
     after_event_id: int = 0,
+    concurrency: int = DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY,
     dry_run: bool = True,
 ) -> dict[str, Any]:
     bootstrap_runtime()
@@ -257,6 +329,1067 @@ def backfill_dart_audit_signals(
             market_date=date.fromisoformat(market_date),
             limit=limit,
             after_event_id=after_event_id,
+            concurrency=concurrency,
+            dry_run=dry_run,
+        )
+    )
+
+
+def _normalize_dart_share_issuance_stock_codes(
+    values: Iterable[Any],
+) -> list[str]:
+    normalized: set[str] = set()
+    for value in values:
+        stock_code = normalize_krx_short_code(value)
+        if stock_code is None:
+            raise ValueError(
+                'DART share-issuance stock codes must be canonical KRX short codes'
+            )
+        normalized.add(stock_code)
+    return sorted(normalized)
+
+
+def _build_dart_share_issuance_manifest(
+    *,
+    market_date: date,
+    requested_stock_codes: list[str],
+    manifest_source: str,
+    audit_scope: str,
+) -> dict[str, Any]:
+    window_start = market_date - timedelta(
+        days=SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS
+    )
+    manifest = {
+        'manifest_version': DART_SHARE_ISSUANCE_MANIFEST_VERSION,
+        'policy_version': DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
+        'market_date': market_date.isoformat(),
+        'window_start': window_start.isoformat(),
+        'window_end': market_date.isoformat(),
+        'requested_stock_codes': requested_stock_codes,
+        'manifest_source': manifest_source,
+        'audit_scope': audit_scope,
+    }
+    manifest_hash = _canonical_json_sha256(manifest)
+    return {
+        **manifest,
+        'hash_algorithm': 'sha256',
+        'manifest_hash': manifest_hash,
+    }
+
+
+def _canonical_json_sha256(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        ).encode('utf-8')
+    ).hexdigest()
+
+
+def _normalize_evidence_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value or ''))
+    except ValueError:
+        return None
+
+
+async def _build_dart_share_issuance_aggregate_audit(
+    *,
+    manifest: dict[str, Any],
+    requested_stock_codes: list[str],
+) -> dict[str, Any]:
+    window_start = date.fromisoformat(manifest['window_start'])
+    window_end = date.fromisoformat(manifest['window_end'])
+    requested_set = set(requested_stock_codes)
+    mapping_lookup_error: str | None = None
+    try:
+        mapping_result = (
+            await dart_fundamentals_capture_service.client.lookup_corp_codes_for_stocks(
+                stock_codes=requested_stock_codes,
+            )
+        )
+    except Exception as exc:
+        mapping_lookup_error = str(exc)
+        mapping_result = {
+            'resolved': [],
+            'unsupported_stock_codes': [],
+            'conflicting_mappings': [
+                {
+                    'stock_code': stock_code,
+                    'reason': 'corp_mapping_lookup_failed',
+                }
+                for stock_code in requested_stock_codes
+            ],
+            'mapping_authority': {
+                'source': 'lookup_failed',
+                'authoritative': False,
+            },
+        }
+
+    raw_mapping_authority = mapping_result.get('mapping_authority')
+    mapping_authority = (
+        dict(raw_mapping_authority)
+        if isinstance(raw_mapping_authority, dict)
+        else {'authoritative': False, 'source': 'missing_mapping_authority'}
+    )
+    mapping_is_authoritative = (
+        mapping_authority.get('authoritative') is True
+    )
+    resolved_by_stock: dict[str, dict[str, str]] = {}
+    mapping_contract_debt: dict[str, set[str]] = {
+        stock_code: set() for stock_code in requested_stock_codes
+    }
+    resolved_claim_counts: dict[str, int] = {
+        stock_code: 0 for stock_code in requested_stock_codes
+    }
+    unexpected_mapping_stock_codes: set[str] = set()
+    for item in mapping_result.get('resolved') or []:
+        if not isinstance(item, dict):
+            continue
+        stock_code = str(item.get('stock_code') or '').strip().zfill(6)
+        corp_code = str(item.get('corp_code') or '').strip()
+        if stock_code not in requested_set:
+            if stock_code:
+                unexpected_mapping_stock_codes.add(stock_code)
+            continue
+        resolved_claim_counts[stock_code] += 1
+        if not corp_code:
+            mapping_contract_debt[stock_code].add('missing_corp_code')
+            continue
+        existing = resolved_by_stock.get(stock_code)
+        if existing is not None and existing['corp_code'] != corp_code:
+            mapping_contract_debt[stock_code].add('conflicting_corp_codes')
+            continue
+        resolved_by_stock[stock_code] = {
+            'stock_code': stock_code,
+            'corp_code': corp_code,
+            'corp_name': str(item.get('corp_name') or '').strip(),
+        }
+
+    for stock_code, claim_count in resolved_claim_counts.items():
+        if claim_count > 1:
+            mapping_contract_debt[stock_code].add(
+                'duplicate_resolved_stock_mapping'
+            )
+    stock_codes_by_corp: dict[str, list[str]] = {}
+    for stock_code, resolved in resolved_by_stock.items():
+        stock_codes_by_corp.setdefault(resolved['corp_code'], []).append(
+            stock_code
+        )
+    for stock_codes_for_corp in stock_codes_by_corp.values():
+        if len(stock_codes_for_corp) <= 1:
+            continue
+        for stock_code in stock_codes_for_corp:
+            mapping_contract_debt[stock_code].add(
+                'duplicate_corp_code_mapping_across_stock_codes'
+            )
+
+    unsupported_stock_codes = {
+        str(stock_code or '').strip().zfill(6)
+        for stock_code in mapping_result.get('unsupported_stock_codes') or []
+        if str(stock_code or '').strip()
+    }
+    unexpected_mapping_stock_codes.update(
+        unsupported_stock_codes - requested_set
+    )
+    unsupported_stock_codes &= requested_set
+    for item in mapping_result.get('conflicting_mappings') or []:
+        if not isinstance(item, dict):
+            continue
+        stock_code = str(item.get('stock_code') or '').strip().zfill(6)
+        if stock_code not in requested_set:
+            if stock_code:
+                unexpected_mapping_stock_codes.add(stock_code)
+            continue
+        reason = str(
+            item.get('reason')
+            or item.get('error')
+            or 'mapping_conflict'
+        )
+        mapping_contract_debt[stock_code].add(reason)
+
+    if not mapping_is_authoritative:
+        for stock_code in requested_stock_codes:
+            mapping_contract_debt[stock_code].add(
+                'mapping_authority_not_authoritative'
+            )
+    for stock_code in requested_stock_codes:
+        if stock_code in unsupported_stock_codes and stock_code in resolved_by_stock:
+            mapping_contract_debt[stock_code].add(
+                'mapping_both_resolved_and_unsupported'
+            )
+        if (
+            stock_code not in unsupported_stock_codes
+            and stock_code not in resolved_by_stock
+            and not mapping_contract_debt[stock_code]
+        ):
+            mapping_contract_debt[stock_code].add('mapping_result_missing')
+
+    eligible_mappings = {
+        stock_code: resolved
+        for stock_code, resolved in resolved_by_stock.items()
+        if not mapping_contract_debt[stock_code]
+        and stock_code not in unsupported_stock_codes
+        and mapping_is_authoritative
+    }
+    evidence_read_error: str | None = None
+    coverage_rows: list[dict[str, Any]] = []
+    positive_dates: dict[str, date] = {}
+    if eligible_mappings:
+        corp_codes = sorted(
+            {item['corp_code'] for item in eligible_mappings.values()}
+        )
+        try:
+            coverage_rows = (
+                dart_signals_service.repository.list_current_share_issuance_coverage(
+                    corp_codes=corp_codes,
+                    on_or_before=window_end,
+                )
+            )
+            positive_dates = (
+                dart_signals_service.repository.list_latest_share_issuance_positive_event_dates(
+                    corp_codes=corp_codes,
+                    on_or_before=window_end,
+                )
+            )
+        except Exception as exc:
+            evidence_read_error = str(exc)
+            for stock_code in eligible_mappings:
+                mapping_contract_debt[stock_code].add(
+                    'persisted_evidence_read_failed'
+                )
+
+    complete_coverage_by_corp: dict[str, dict[str, Any]] = {}
+    eligible_corp_codes = {
+        item['corp_code'] for item in eligible_mappings.values()
+    }
+    for row in coverage_rows:
+        if not isinstance(row, dict):
+            continue
+        corp_code = str(row.get('corp_code') or '').strip()
+        if corp_code not in eligible_corp_codes:
+            continue
+        coverage = dart_signals_service._validated_share_issuance_coverage(
+            row,
+            corp_code=corp_code,
+        )
+        if coverage is None or coverage.get('status') != 'complete':
+            continue
+        coverage_start = _normalize_evidence_date(coverage.get('window_start'))
+        coverage_end = _normalize_evidence_date(coverage.get('window_end'))
+        if (
+            coverage_start is None
+            or coverage_end is None
+            or coverage_start > window_start
+            or coverage_end != window_end
+        ):
+            continue
+        existing = complete_coverage_by_corp.get(corp_code)
+        if existing is None:
+            complete_coverage_by_corp[corp_code] = coverage
+            continue
+        existing_start = _normalize_evidence_date(existing.get('window_start'))
+        existing_end = _normalize_evidence_date(existing.get('window_end'))
+        if (
+            existing_start is None
+            or existing_end is None
+            or coverage_start < existing_start
+            or coverage_end > existing_end
+        ):
+            complete_coverage_by_corp[corp_code] = coverage
+
+    outcomes: list[dict[str, Any]] = []
+    classification_stock_codes: dict[str, list[str]] = {
+        'completed_positive': [],
+        'completed_negative': [],
+        'terminal_not_applicable': [],
+        'retry_debt': [],
+    }
+    for stock_code in requested_stock_codes:
+        resolved = eligible_mappings.get(stock_code)
+        debt_reasons = sorted(mapping_contract_debt[stock_code])
+        if debt_reasons:
+            classification = 'retry_debt'
+            outcome = {
+                'stock_code': stock_code,
+                'classification': classification,
+                'reasons': debt_reasons,
+            }
+        elif stock_code in unsupported_stock_codes:
+            classification = 'terminal_not_applicable'
+            outcome = {
+                'stock_code': stock_code,
+                'classification': classification,
+                'reason': 'authoritative_unsupported_mapping',
+            }
+        elif resolved is None:
+            classification = 'retry_debt'
+            outcome = {
+                'stock_code': stock_code,
+                'classification': classification,
+                'reasons': ['mapping_result_missing'],
+            }
+        else:
+            corp_code = resolved['corp_code']
+            positive_date = _normalize_evidence_date(
+                positive_dates.get(corp_code)
+            )
+            coverage = complete_coverage_by_corp.get(corp_code)
+            if (
+                positive_date is not None
+                and window_start <= positive_date <= window_end
+            ):
+                classification = 'completed_positive'
+                outcome = {
+                    'stock_code': stock_code,
+                    'corp_code': corp_code,
+                    'classification': classification,
+                    'positive_event_date': positive_date.isoformat(),
+                }
+            elif coverage is not None:
+                classification = 'completed_negative'
+                outcome = {
+                    'stock_code': stock_code,
+                    'corp_code': corp_code,
+                    'classification': classification,
+                    'coverage_window_start': coverage['window_start'],
+                    'coverage_window_end': coverage['window_end'],
+                }
+            else:
+                classification = 'retry_debt'
+                outcome = {
+                    'stock_code': stock_code,
+                    'corp_code': corp_code,
+                    'classification': classification,
+                    'reasons': ['missing_complete_window_evidence'],
+                }
+        outcomes.append(outcome)
+        classification_stock_codes[classification].append(stock_code)
+
+    classified_codes = [item['stock_code'] for item in outcomes]
+    classification_complete = (
+        len(classified_codes) == len(requested_stock_codes)
+        and classified_codes == requested_stock_codes
+        and len(set(classified_codes)) == len(classified_codes)
+    )
+    mapping_contract_exact = (
+        mapping_is_authoritative and not unexpected_mapping_stock_codes
+    )
+    outcome_manifest = {
+        'outcome_manifest_version': (
+            DART_SHARE_ISSUANCE_OUTCOME_MANIFEST_VERSION
+        ),
+        'policy_version': DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
+        'source_manifest_version': manifest['manifest_version'],
+        'source_manifest_hash': manifest['manifest_hash'],
+        'market_date': manifest['market_date'],
+        'window_start': manifest['window_start'],
+        'window_end': manifest['window_end'],
+        'requested_stock_codes': requested_stock_codes,
+        'manifest_source': manifest['manifest_source'],
+        'audit_scope': manifest['audit_scope'],
+        'outcomes': outcomes,
+    }
+    outcome_manifest_sha256 = _canonical_json_sha256(outcome_manifest)
+    aggregate_evidence_ready = (
+        classification_complete
+        and mapping_contract_exact
+        and not classification_stock_codes['retry_debt']
+    )
+    return {
+        'audit_version': 'dart_share_issuance_aggregate_audit_v1',
+        'policy_version': DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
+        'evidence_policy': {
+            'authority_policy_version': (
+                SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+            ),
+            'coverage_schema_version': (
+                SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA
+            ),
+            'rule_version': SHARE_ISSUANCE_RULE_VERSION,
+        },
+        'manifest_version': manifest['manifest_version'],
+        'manifest_hash': manifest['manifest_hash'],
+        'manifest_source': manifest['manifest_source'],
+        'audit_scope': manifest['audit_scope'],
+        'market_date': manifest['market_date'],
+        'window_start': manifest['window_start'],
+        'window_end': manifest['window_end'],
+        'requested_count': len(requested_stock_codes),
+        'requested_stock_codes': requested_stock_codes,
+        'mapping_authority': mapping_authority,
+        'mapping_lookup_error': mapping_lookup_error,
+        'evidence_read_error': evidence_read_error,
+        'unexpected_mapping_stock_codes': sorted(
+            unexpected_mapping_stock_codes
+        ),
+        'classification_stock_codes': classification_stock_codes,
+        'classification_counts': {
+            key: len(value)
+            for key, value in classification_stock_codes.items()
+        },
+        'outcome_manifest': outcome_manifest,
+        'outcome_manifest_hash_algorithm': 'sha256',
+        'outcome_manifest_sha256': outcome_manifest_sha256,
+        'aggregate_manifest_classification_complete': (
+            classification_complete
+        ),
+        'aggregate_mapping_contract_exact': mapping_contract_exact,
+        'aggregate_evidence_ready': aggregate_evidence_ready,
+        'aggregate_evidence_complete': False,
+        'durable_audit_complete': False,
+        'persistence_status': 'pending',
+        'audit_run_id': None,
+    }
+
+
+def _persist_dart_share_issuance_aggregate_audit(
+    aggregate_audit: dict[str, Any],
+) -> dict[str, Any]:
+    repository = dart_disclosure_sync_service.repository
+    pending_audit = {
+        **aggregate_audit,
+        'aggregate_evidence_complete': False,
+        'durable_audit_complete': False,
+        'persistence_status': 'pending_completion',
+    }
+    run_metadata = {
+        'audit_type': 'dart_share_issuance_aggregate',
+        'aggregate_audit': pending_audit,
+    }
+    run_id: int | None = None
+    try:
+        audit_trigger = (
+            DART_SHARE_ISSUANCE_ACTIVATION_AUDIT_TRIGGER
+            if aggregate_audit.get('audit_scope')
+            == DART_SHARE_ISSUANCE_AUDIT_SCOPE_GLOBAL_ACTIVATION
+            else DART_SHARE_ISSUANCE_AUDIT_TRIGGER
+        )
+        run_id = repository.create_sync_run(
+            window_start=aggregate_audit['window_start'],
+            window_end=aggregate_audit['window_end'],
+            trigger=audit_trigger,
+            page_size=max(aggregate_audit['requested_count'], 1),
+            run_metadata=run_metadata,
+        )
+        completed_audit = {
+            **aggregate_audit,
+            'aggregate_evidence_complete': (
+                aggregate_audit['aggregate_evidence_ready']
+            ),
+            'durable_audit_complete': True,
+            'persistence_status': 'completed',
+            'audit_run_id': run_id,
+        }
+        repository.complete_sync_run(
+            run_id,
+            status='completed',
+            pages_fetched=0,
+            events_seen=0,
+            events_inserted=0,
+            events_updated=0,
+            financial_report_events=0,
+            run_metadata={
+                'audit_type': 'dart_share_issuance_aggregate',
+                'aggregate_audit': completed_audit,
+            },
+        )
+        return completed_audit
+    except Exception as exc:
+        return {
+            **aggregate_audit,
+            'aggregate_evidence_complete': False,
+            'durable_audit_complete': False,
+            'persistence_status': 'failed',
+            'persistence_error': str(exc),
+            'audit_run_id': run_id,
+        }
+
+
+def _empty_dart_share_issuance_operator_buckets() -> dict[str, Any]:
+    return {
+        'completed': {'count': 0, 'stock_codes': []},
+        'terminal_not_applicable': {
+            'count': 0,
+            'stock_codes': [],
+            'items': [],
+        },
+        'retryable_unmapped': {
+            'count': 0,
+            'stock_codes': [],
+            'items': [],
+        },
+        'retryable_sync': {'count': 0, 'stock_codes': []},
+    }
+
+
+def _build_dart_share_issuance_noop_result(
+    base_result: dict[str, Any],
+    *,
+    status: str,
+    dry_run: bool,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    result = {
+        **base_result,
+        'status': status,
+        'dry_run': dry_run,
+        'resolved_corporation_count': 0,
+        'lookup_error_count': 0,
+        'lookup_errors': [],
+        'terminal_not_applicable_stock_codes': [],
+        'retryable_unmapped_stock_codes': [],
+        'retry_debt_stock_codes': [],
+        'operator_buckets': _empty_dart_share_issuance_operator_buckets(),
+        'sync': None,
+    }
+    if reason is not None:
+        result['reason'] = reason
+    return result
+
+
+async def _backfill_dart_share_issuance_evidence_async(
+    *,
+    market_date: date,
+    limit: int,
+    stock_codes: str | None,
+    after_stock_code: str | None,
+    expected_manifest_hash: str | None,
+    concurrency: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if not 1 <= concurrency <= MAX_DART_DISCLOSURE_SYNC_CONCURRENCY:
+        raise ValueError(
+            'concurrency must be between 1 and '
+            f'{MAX_DART_DISCLOSURE_SYNC_CONCURRENCY}'
+        )
+    if stock_codes is None:
+        active_symbols = (
+            dart_fundamentals_capture_service.active_symbol_loader()
+        )
+        requested_stock_codes = _normalize_dart_share_issuance_stock_codes(
+            row.get('symbol') for row in active_symbols
+        )
+        manifest_source = (
+            DART_SHARE_ISSUANCE_MANIFEST_SOURCE_ACTIVE_UNIVERSE
+        )
+        audit_scope = DART_SHARE_ISSUANCE_AUDIT_SCOPE_GLOBAL_ACTIVATION
+        requested_input_count = len(active_symbols)
+    else:
+        raw_stock_codes = stock_codes.split(',')
+        requested_stock_codes = _normalize_dart_share_issuance_stock_codes(
+            raw_stock_codes
+        )
+        manifest_source = DART_SHARE_ISSUANCE_MANIFEST_SOURCE_EXPLICIT
+        audit_scope = DART_SHARE_ISSUANCE_AUDIT_SCOPE_EXPLICIT_SUBSET
+        requested_input_count = len(raw_stock_codes)
+
+    manifest = _build_dart_share_issuance_manifest(
+        market_date=market_date,
+        requested_stock_codes=requested_stock_codes,
+        manifest_source=manifest_source,
+        audit_scope=audit_scope,
+    )
+    normalized_after_stock_code = None
+    if after_stock_code is not None:
+        normalized_after_stock_code = (
+            _normalize_dart_share_issuance_stock_codes([after_stock_code])[0]
+        )
+        if normalized_after_stock_code not in requested_stock_codes:
+            raise ValueError(
+                'after_stock_code must be present in the exact requested '
+                'stock-code manifest'
+            )
+    start_index = (
+        requested_stock_codes.index(normalized_after_stock_code) + 1
+        if normalized_after_stock_code is not None
+        else 0
+    )
+    selected_stock_codes = requested_stock_codes[
+        start_index : start_index + limit
+    ]
+    next_index = start_index + len(selected_stock_codes)
+    has_more = next_index < len(requested_stock_codes)
+    next_after_stock_code = (
+        selected_stock_codes[-1] if selected_stock_codes else None
+    )
+    expected_hash = str(expected_manifest_hash or '').strip().lower() or None
+    manifest_hash_matches_expected = (
+        None
+        if expected_hash is None
+        else expected_hash == manifest['manifest_hash']
+    )
+    base_invariants = {
+        'manifest_contains_exact_requested_stock_codes': (
+            manifest['requested_stock_codes'] == requested_stock_codes
+        ),
+        'manifest_stock_codes_sorted_unique': (
+            requested_stock_codes == sorted(set(requested_stock_codes))
+        ),
+        'manifest_hash_matches_expected': manifest_hash_matches_expected,
+        'selection_is_exact_manifest_slice': (
+            selected_stock_codes
+            == requested_stock_codes[start_index:next_index]
+        ),
+        'cursor_is_exclusive_and_monotonic': (
+            normalized_after_stock_code is None
+            or all(
+                stock_code > normalized_after_stock_code
+                for stock_code in selected_stock_codes
+            )
+        ),
+        'selected_stock_codes_partition_complete': None,
+        'classification_buckets_disjoint': None,
+        'terminal_not_applicable_excluded_from_retry_debt': None,
+        'retry_debt_is_exact_retryable_union': None,
+        'sync_stock_codes_within_resolved_scope': None,
+    }
+    base_result = {
+        'policy_version': DART_SHARE_ISSUANCE_OPS_POLICY_VERSION,
+        'evidence_policy': {
+            'authority_policy_version': (
+                SHARE_ISSUANCE_AUTHORITY_POLICY_VERSION
+            ),
+            'coverage_schema_version': (
+                SHARE_ISSUANCE_NEGATIVE_COVERAGE_SCHEMA
+            ),
+            'rule_version': SHARE_ISSUANCE_RULE_VERSION,
+        },
+        'market_date': market_date.isoformat(),
+        'window_start': manifest['window_start'],
+        'window_end': manifest['window_end'],
+        'coverage_days': SHARE_ISSUANCE_NEGATIVE_COVERAGE_DAYS,
+        'manifest_source': manifest_source,
+        'audit_scope': audit_scope,
+        'manifest_version': manifest['manifest_version'],
+        'manifest_hash': manifest['manifest_hash'],
+        'manifest': manifest,
+        'expected_manifest_hash': expected_hash,
+        'requested_input_count': requested_input_count,
+        'requested_count': len(requested_stock_codes),
+        'requested_stock_codes': requested_stock_codes,
+        'cursor_version': DART_SHARE_ISSUANCE_CURSOR_VERSION,
+        'after_stock_code': normalized_after_stock_code,
+        'limit': limit,
+        'concurrency': concurrency,
+        'selected_count': len(selected_stock_codes),
+        'selected_stock_codes': selected_stock_codes,
+        'next_after_stock_code': next_after_stock_code,
+        'has_more': has_more,
+        'full_manifest_selected': (
+            start_index == 0
+            and len(selected_stock_codes) == len(requested_stock_codes)
+        ),
+        'full_manifest_audit': None,
+        'invariants': base_invariants,
+    }
+    if not requested_stock_codes:
+        return _build_dart_share_issuance_noop_result(
+            base_result,
+            status='blocked',
+            dry_run=dry_run,
+            reason='empty_requested_stock_code_manifest',
+        )
+    if not dry_run and expected_hash is None:
+        return _build_dart_share_issuance_noop_result(
+            base_result,
+            status='blocked',
+            dry_run=False,
+            reason='expected_manifest_hash_required',
+        )
+    if not dry_run and not manifest_hash_matches_expected:
+        return _build_dart_share_issuance_noop_result(
+            base_result,
+            status='blocked',
+            dry_run=False,
+            reason='expected_manifest_hash_mismatch',
+        )
+    if dry_run:
+        return _build_dart_share_issuance_noop_result(
+            base_result,
+            status='dry_run',
+            dry_run=True,
+        )
+
+    try:
+        mapping_result = (
+            await dart_fundamentals_capture_service.client.lookup_corp_codes_for_stocks(
+                stock_codes=requested_stock_codes,
+            )
+        )
+    except Exception as exc:
+        mapping_result = {
+            'resolved': [],
+            'unsupported_stock_codes': [],
+            'conflicting_mappings': [
+                {
+                    'stock_code': stock_code,
+                    'corp_codes': [],
+                    'reason': 'corp_mapping_lookup_failed',
+                    'error': str(exc),
+                }
+                for stock_code in requested_stock_codes
+            ],
+        }
+
+    if not isinstance(mapping_result, dict):
+        mapping_result = {}
+
+    def normalize_mapping_stock_code(value: Any) -> str:
+        return normalize_krx_short_code(value) or ''
+
+    requested_stock_code_set = set(requested_stock_codes)
+    resolved_by_stock: dict[str, list[dict[str, Any]]] = {}
+    for item in mapping_result.get('resolved') or []:
+        if not isinstance(item, dict):
+            continue
+        stock_code = normalize_mapping_stock_code(item.get('stock_code'))
+        if stock_code in requested_stock_code_set:
+            resolved_by_stock.setdefault(stock_code, []).append(item)
+    unsupported_stock_codes: set[str] = set()
+    for item in mapping_result.get('unsupported_stock_codes') or []:
+        stock_code = normalize_mapping_stock_code(item)
+        if stock_code in requested_stock_code_set:
+            unsupported_stock_codes.add(stock_code)
+    conflicts_by_stock: dict[str, list[dict[str, Any]]] = {}
+    for item in mapping_result.get('conflicting_mappings') or []:
+        if not isinstance(item, dict):
+            continue
+        stock_code = normalize_mapping_stock_code(item.get('stock_code'))
+        if stock_code in requested_stock_code_set:
+            conflicts_by_stock.setdefault(stock_code, []).append(item)
+    mapping_authority = mapping_result.get('mapping_authority')
+    mapping_is_authoritative = bool(
+        isinstance(mapping_authority, dict)
+        and mapping_authority.get('authoritative') is True
+    )
+    stock_codes_by_corp: dict[str, set[str]] = {}
+    for stock_code, candidates in resolved_by_stock.items():
+        for candidate in candidates:
+            corp_code = str(candidate.get('corp_code') or '').strip()
+            if corp_code:
+                stock_codes_by_corp.setdefault(corp_code, set()).add(
+                    stock_code
+                )
+    for stock_code, conflict_items in conflicts_by_stock.items():
+        for conflict_item in conflict_items:
+            for value in conflict_item.get('corp_codes') or []:
+                corp_code = str(value or '').strip()
+                if corp_code:
+                    stock_codes_by_corp.setdefault(corp_code, set()).add(
+                        stock_code
+                    )
+    duplicate_corp_codes = {
+        corp_code
+        for corp_code, stock_codes_for_corp in stock_codes_by_corp.items()
+        if len(stock_codes_for_corp) > 1
+    }
+
+    corporations: list[dict[str, Any]] = []
+    terminal_not_applicable: list[dict[str, Any]] = []
+    retryable_unmapped: list[dict[str, Any]] = []
+    for stock_code in selected_stock_codes:
+        candidates = resolved_by_stock.get(stock_code, [])
+        conflict_items = conflicts_by_stock.get(stock_code, [])
+        corp_codes = sorted(
+            {
+                str(item.get('corp_code') or '').strip()
+                for item in candidates
+                if str(item.get('corp_code') or '').strip()
+            }
+        )
+        has_unsupported_claim = stock_code in unsupported_stock_codes
+        if (
+            mapping_is_authoritative
+            and len(candidates) == 1
+            and len(corp_codes) == 1
+            and corp_codes[0] not in duplicate_corp_codes
+            and not has_unsupported_claim
+            and not conflict_items
+        ):
+            candidate = candidates[0]
+            corporations.append(
+                {
+                    **candidate,
+                    'stock_code': stock_code,
+                    'corp_code': corp_codes[0],
+                    'corp_name': (
+                        str(candidate.get('corp_name') or '').strip()
+                        or corp_codes[0]
+                    ),
+                }
+            )
+            continue
+        if (
+            mapping_is_authoritative
+            and not candidates
+            and has_unsupported_claim
+            and not conflict_items
+        ):
+            terminal_not_applicable.append(
+                {
+                    'stock_code': stock_code,
+                    'error_type': 'DartLookupError',
+                    'error': (
+                        'DART corporation mapping is authoritatively '
+                        'unsupported'
+                    ),
+                    'terminal': True,
+                    'status': CAPTURE_STATUS_MAPPING_FAILED,
+                }
+            )
+            continue
+
+        if conflict_items:
+            reason = str(
+                conflict_items[0].get('reason')
+                or conflict_items[0].get('error')
+                or 'conflicting_stock_mapping'
+            )
+        elif len(candidates) > 1:
+            reason = 'duplicate_resolved_stock_mapping'
+        elif candidates and has_unsupported_claim:
+            reason = 'conflicting_resolved_and_unsupported_mapping'
+        elif not mapping_is_authoritative:
+            reason = 'corp_mapping_authority_not_authoritative'
+        elif corp_codes and corp_codes[0] in duplicate_corp_codes:
+            reason = 'duplicate_corp_code_mapping_across_stock_codes'
+        elif candidates:
+            reason = 'resolved_stock_mapping_missing_corp_code'
+        else:
+            reason = 'stock_mapping_missing_from_authoritative_response'
+        retryable_unmapped.append(
+            {
+                'stock_code': stock_code,
+                'corp_codes': corp_codes,
+                'reason': reason,
+                'error_type': 'DartMappingContractError',
+                'error': reason,
+            }
+        )
+
+    sync_result: dict[str, Any] | None = None
+    if corporations:
+        sync_result = (
+            await dart_disclosure_sync_service.sync_disclosures_for_corporations(
+                corporations=corporations,
+                start_date=date.fromisoformat(manifest['window_start']),
+                end_date=market_date,
+                trigger=DART_SHARE_ISSUANCE_BACKFILL_TRIGGER,
+                concurrency=concurrency,
+            )
+        )
+
+    resolved_stock_codes = {
+        str(corporation['stock_code']) for corporation in corporations
+    }
+    sync_status = str((sync_result or {}).get('status') or 'completed')
+    reported_sync_incomplete_stock_codes = {
+        str(stock_code or '').strip()
+        for key in (
+            'failed_stock_codes',
+            'unattempted_stock_codes',
+            'incomplete_stock_codes',
+        )
+        for stock_code in (sync_result or {}).get(key) or []
+        if str(stock_code or '').strip()
+    }
+    unexpected_sync_stock_codes = sorted(
+        reported_sync_incomplete_stock_codes - resolved_stock_codes
+    )
+    retryable_sync_stock_codes = (
+        reported_sync_incomplete_stock_codes & resolved_stock_codes
+    )
+    if corporations and sync_status != 'completed' and not retryable_sync_stock_codes:
+        retryable_sync_stock_codes = set(resolved_stock_codes)
+    completed_stock_codes = sorted(
+        resolved_stock_codes - retryable_sync_stock_codes
+    )
+    terminal_not_applicable_stock_codes = sorted(
+        {
+            str(item.get('stock_code') or '').strip()
+            for item in terminal_not_applicable
+            if str(item.get('stock_code') or '').strip()
+        }
+    )
+    retryable_unmapped_stock_codes = sorted(
+        {
+            str(item.get('stock_code') or '').strip()
+            for item in retryable_unmapped
+            if str(item.get('stock_code') or '').strip()
+        }
+    )
+    retryable_sync_stock_codes = set(retryable_sync_stock_codes)
+    retry_debt_stock_codes = sorted(
+        set(retryable_unmapped_stock_codes) | retryable_sync_stock_codes
+    )
+    classification_sets = [
+        set(completed_stock_codes),
+        set(terminal_not_applicable_stock_codes),
+        set(retryable_unmapped_stock_codes),
+        retryable_sync_stock_codes,
+    ]
+    classified_stock_codes = set().union(*classification_sets)
+    classification_buckets_disjoint = sum(
+        len(bucket) for bucket in classification_sets
+    ) == len(classified_stock_codes)
+    selected_partition_complete = (
+        classified_stock_codes == set(selected_stock_codes)
+    )
+    terminal_excluded_from_retry_debt = not (
+        set(terminal_not_applicable_stock_codes)
+        & set(retry_debt_stock_codes)
+    )
+    retry_debt_is_exact_retryable_union = set(retry_debt_stock_codes) == (
+        set(retryable_unmapped_stock_codes) | retryable_sync_stock_codes
+    )
+    invariants = {
+        **base_invariants,
+        'selected_stock_codes_partition_complete': (
+            selected_partition_complete
+        ),
+        'classification_buckets_disjoint': (
+            classification_buckets_disjoint
+        ),
+        'terminal_not_applicable_excluded_from_retry_debt': (
+            terminal_excluded_from_retry_debt
+        ),
+        'retry_debt_is_exact_retryable_union': (
+            retry_debt_is_exact_retryable_union
+        ),
+        'sync_stock_codes_within_resolved_scope': (
+            not unexpected_sync_stock_codes
+        ),
+    }
+    invariant_failure = not all(
+        value
+        for value in invariants.values()
+        if value is not None
+    )
+    if invariant_failure or unexpected_sync_stock_codes:
+        status = 'failed'
+    elif retry_debt_stock_codes:
+        status = (
+            'failed'
+            if len(retry_debt_stock_codes) == len(selected_stock_codes)
+            else 'partial'
+        )
+    else:
+        status = 'completed'
+    operator_buckets = {
+        'completed': {
+            'count': len(completed_stock_codes),
+            'stock_codes': completed_stock_codes,
+        },
+        'terminal_not_applicable': {
+            'count': len(terminal_not_applicable_stock_codes),
+            'stock_codes': terminal_not_applicable_stock_codes,
+            'items': terminal_not_applicable,
+        },
+        'retryable_unmapped': {
+            'count': len(retryable_unmapped_stock_codes),
+            'stock_codes': retryable_unmapped_stock_codes,
+            'items': retryable_unmapped,
+        },
+        'retryable_sync': {
+            'count': len(retryable_sync_stock_codes),
+            'stock_codes': sorted(retryable_sync_stock_codes),
+        },
+    }
+    result = {
+        **base_result,
+        'status': status,
+        'dry_run': False,
+        'resolved_corporation_count': len(corporations),
+        'lookup_error_count': len(retryable_unmapped),
+        'lookup_errors': retryable_unmapped,
+        'terminal_not_applicable_stock_codes': (
+            terminal_not_applicable_stock_codes
+        ),
+        'retryable_unmapped_stock_codes': (
+            retryable_unmapped_stock_codes
+        ),
+        'retry_debt_stock_codes': retry_debt_stock_codes,
+        'unexpected_sync_stock_codes': unexpected_sync_stock_codes,
+        'operator_buckets': operator_buckets,
+        'invariants': invariants,
+        'full_manifest_audit': None,
+        'aggregate_audit': None,
+        'sync': sync_result,
+    }
+    if has_more:
+        return result
+
+    aggregate_audit = await _build_dart_share_issuance_aggregate_audit(
+        manifest=manifest,
+        requested_stock_codes=requested_stock_codes,
+    )
+    aggregate_audit = _persist_dart_share_issuance_aggregate_audit(
+        aggregate_audit
+    )
+    durable_audit_complete = (
+        aggregate_audit['durable_audit_complete'] is True
+        and aggregate_audit[
+            'aggregate_manifest_classification_complete'
+        ]
+        is True
+        and aggregate_audit['aggregate_mapping_contract_exact'] is True
+    )
+    aggregate_retry_debt = aggregate_audit[
+        'classification_stock_codes'
+    ]['retry_debt']
+    if not durable_audit_complete:
+        result['status'] = 'failed'
+    elif aggregate_retry_debt:
+        classified_non_debt_count = (
+            aggregate_audit['requested_count'] - len(aggregate_retry_debt)
+        )
+        result['status'] = (
+            'partial' if classified_non_debt_count else 'failed'
+        )
+    else:
+        result['status'] = 'completed'
+    result['aggregate_audit'] = aggregate_audit
+    result['durable_full_manifest_audit_complete'] = durable_audit_complete
+    result['full_manifest_audit'] = (
+        durable_audit_complete
+        and aggregate_audit['aggregate_evidence_complete'] is True
+        and not aggregate_retry_debt
+    )
+    return result
+
+
+def backfill_dart_share_issuance_evidence(
+    *,
+    market_date: str,
+    limit: int = 25,
+    stock_codes: str | None = None,
+    after_stock_code: str | None = None,
+    expected_manifest_hash: str | None = None,
+    concurrency: int = DART_SHARE_ISSUANCE_BACKFILL_OPS_DEFAULT_CONCURRENCY,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    if not 1 <= limit <= 100:
+        raise ValueError('limit must be between 1 and 100')
+    if not 1 <= concurrency <= MAX_DART_DISCLOSURE_SYNC_CONCURRENCY:
+        raise ValueError(
+            'concurrency must be between 1 and '
+            f'{MAX_DART_DISCLOSURE_SYNC_CONCURRENCY}'
+        )
+    resolved_market_date = date.fromisoformat(market_date)
+    bootstrap_runtime()
+    return asyncio.run(
+        _backfill_dart_share_issuance_evidence_async(
+            market_date=resolved_market_date,
+            limit=limit,
+            stock_codes=stock_codes,
+            after_stock_code=after_stock_code,
+            expected_manifest_hash=expected_manifest_hash,
+            concurrency=concurrency,
             dry_run=dry_run,
         )
     )
@@ -339,6 +1472,50 @@ def list_daily_pipeline_stages() -> dict[str, Any]:
     return daily_pipeline_stage_service.describe()
 
 
+def repair_terminal_daily_pipeline_children(
+    *,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    # Deliberately bypass bootstrap_runtime(): this one-time repair must not
+    # run migrations or hydrate unrelated runtime state.
+    return (
+        daily_pipeline_run_state_service
+        .reconcile_terminal_parent_running_stages(
+            expected_orphans=dict(TERMINAL_CHILD_REPAIR_EXPECTED_ORPHANS),
+            expected_orphan_count=TERMINAL_CHILD_REPAIR_EXPECTED_COUNT,
+            apply=not dry_run,
+            preserve_historical_updated_at=True,
+        )
+    )
+
+
+def repair_stale_eod_collection_runs(
+    *,
+    dry_run: bool = True,
+    expected_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    # Deliberately bypass bootstrap_runtime(): this reviewed persistence-only
+    # repair must not run migrations, hydrate runtime state, or call providers.
+    return stale_eod_collection_run_repair.repair(
+        apply=not dry_run,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+
+
+def reconcile_stale_dart_sync_runs(
+    *,
+    dry_run: bool = True,
+    expected_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    # Deliberately bypass bootstrap_runtime(): this reviewed persistence-only
+    # reconciliation must not run migrations, hydrate runtime state, call
+    # providers, or replay disclosure collection.
+    return stale_dart_sync_run_reconciliation.reconcile(
+        apply=not dry_run,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
+
+
 def run_daily_pipeline_stages(
     *,
     market_date: str | None = None,
@@ -395,6 +1572,8 @@ def compute_signal_decider_evaluations(
     parsed_horizons = [int(item.strip()) for item in horizons.split(',') if item.strip()] if horizons else None
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
+        symbols=parsed_symbols,
+        required_stage_ids=SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
     )
     if not force_recompute and not prerequisites['ready']:
         return {
@@ -720,14 +1899,63 @@ def compute_action_summaries(*, market_date: str, symbols: str | None = None) ->
     )
 
 
-def compute_trending_ranks(*, market_date: str, periods: str | None = None) -> dict[str, Any]:
+def compute_trending_ranks(
+    *,
+    market_date: str,
+    periods: str | None = None,
+    symbols: str | None = None,
+) -> dict[str, Any]:
     bootstrap_runtime()
+    repair_started_at = datetime.now(timezone.utc)
     parsed_periods = [item.strip().lower() for item in periods.split(',') if item.strip()] if periods else None
-    return compute_and_persist_daily_trending_ranks(
+    parsed_symbols = (
+        [item.strip().upper() for item in symbols.split(',') if item.strip()]
+        if symbols
+        else None
+    )
+    frozen_symbols = resolve_pending_frozen_price_dependent_membership(
+        market_date=market_date
+    )
+    authoritative_scope = False
+    if frozen_symbols is not None:
+        if (
+            parsed_symbols is not None
+            and tuple(sorted(parsed_symbols)) != frozen_symbols
+        ):
+            raise ValueError(
+                'explicit trending scope does not match the pending frozen '
+                'price-dependent membership'
+            )
+        parsed_symbols = list(frozen_symbols)
+        authoritative_scope = True
+    else:
+        raise ValueError(
+            'trending rank replacement requires pending frozen '
+            'price-dependent membership; an unproven global or explicit '
+            'scope is destructive and is refused'
+        )
+    result = compute_and_persist_daily_trending_ranks(
         market_date=market_date,
         periods=parsed_periods,
         source='internal_ops_cli',
+        symbols=parsed_symbols,
+        authoritative_scope=authoritative_scope,
     )
+    completed_periods = tuple(
+        str(item.get('period') or '').strip().lower()
+        for item in result.get('periods') or []
+        if item.get('status') == 'completed'
+        and str(item.get('period') or '').strip()
+    )
+    if completed_periods:
+        record_pending_trending_rebuild(
+            market_date=market_date,
+            periods=completed_periods,
+            repair_started_at=repair_started_at,
+            rebuild_completed_at=datetime.now(timezone.utc),
+            exact_symbols=parsed_symbols,
+        )
+    return result
 
 
 def run_agent_feedback_retry_cycles(
@@ -943,6 +2171,95 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('scanner-tracked-symbols', help='Return /scanner/tracked-symbols directly from services')
     subparsers.add_parser('eod-status', help='Return /eod/status directly from services')
     subparsers.add_parser('eod-pipeline-stages', help='List the canonical daily pipeline stage catalog')
+    pipeline_terminal_child_repair_parser = subparsers.add_parser(
+        'eod-pipeline-terminal-child-repair',
+        help=(
+            'Repair the reviewed terminal-parent/running-child incident set; '
+            'defaults to a read-only exact-scope check'
+        ),
+    )
+    pipeline_terminal_child_repair_mode = (
+        pipeline_terminal_child_repair_parser.add_mutually_exclusive_group()
+    )
+    pipeline_terminal_child_repair_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help='Apply the fixed-scope repair after all invariants match.',
+    )
+    pipeline_terminal_child_repair_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Verify the exact incident scope without writing (default).',
+    )
+    pipeline_terminal_child_repair_parser.set_defaults(dry_run=True)
+    stale_collection_run_repair_parser = subparsers.add_parser(
+        'eod-stale-collection-run-repair',
+        help=(
+            'Repair reviewed stale EOD collection runs; defaults to a '
+            'read-only exact-scope check'
+        ),
+    )
+    stale_collection_run_repair_mode = (
+        stale_collection_run_repair_parser.add_mutually_exclusive_group()
+    )
+    stale_collection_run_repair_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help=(
+            'Apply only after all frozen invariants and the reviewed manifest '
+            'hash match.'
+        ),
+    )
+    stale_collection_run_repair_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Verify the exact incident scope without writing (default).',
+    )
+    stale_collection_run_repair_parser.add_argument(
+        '--expected-manifest-sha256',
+        help=(
+            'Required with --apply; copy manifest_sha256 from a successful '
+            'dry-run.'
+        ),
+    )
+    stale_collection_run_repair_parser.set_defaults(dry_run=True)
+    stale_dart_sync_reconciliation_parser = subparsers.add_parser(
+        'dart-stale-sync-run-reconcile',
+        help=(
+            'Reconcile six reviewed historical DART sync runs; defaults to '
+            'a read-only exact-scope check'
+        ),
+    )
+    stale_dart_sync_reconciliation_mode = (
+        stale_dart_sync_reconciliation_parser.add_mutually_exclusive_group()
+    )
+    stale_dart_sync_reconciliation_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help=(
+            'Apply only after the exact row, cutoff, event-reference, and '
+            'reviewed manifest-hash invariants match.'
+        ),
+    )
+    stale_dart_sync_reconciliation_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Verify the exact reviewed scope without writing (default).',
+    )
+    stale_dart_sync_reconciliation_parser.add_argument(
+        '--expected-manifest-sha256',
+        help=(
+            'Required with --apply; copy manifest_sha256 from a successful '
+            'dry-run.'
+        ),
+    )
+    stale_dart_sync_reconciliation_parser.set_defaults(dry_run=True)
     subparsers.add_parser(
         'schema-drift-preflight',
         help='Verify runtime-critical tables and constraints before write-heavy workflows are treated as healthy',
@@ -1011,6 +2328,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Run DART fundamentals daily incremental refresh directly',
     )
     dart_daily_parser.add_argument('--market-date')
+    dart_daily_parser.add_argument(
+        '--symbols',
+        help='Optional comma-separated exact stock-code scope',
+    )
     dart_daily_parser.add_argument('--symbol-limit', type=int)
     dart_daily_parser.add_argument('--symbol-offset', type=int, default=0)
     dart_daily_parser.add_argument('--capture-limit', type=int, default=500)
@@ -1031,6 +2352,13 @@ def _build_parser() -> argparse.ArgumentParser:
     dart_audit_backfill_parser.add_argument('--market-date', required=True)
     dart_audit_backfill_parser.add_argument('--limit', type=int, default=25)
     dart_audit_backfill_parser.add_argument('--after-event-id', type=int, default=0)
+    dart_audit_backfill_parser.add_argument(
+        '--concurrency',
+        type=int,
+        choices=range(1, MAX_AUDIT_BACKFILL_CONCURRENCY + 1),
+        default=DART_AUDIT_BACKFILL_OPS_DEFAULT_CONCURRENCY,
+        help='Maximum concurrent DART document captures per wave (default: 4).',
+    )
     dart_audit_backfill_mode = dart_audit_backfill_parser.add_mutually_exclusive_group()
     dart_audit_backfill_mode.add_argument(
         '--apply',
@@ -1045,6 +2373,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Inspect the bounded candidate page without writing (default).',
     )
     dart_audit_backfill_parser.set_defaults(dry_run=True)
+
+    dart_dilution_backfill_parser = subparsers.add_parser(
+        'dart-share-issuance-evidence-backfill',
+        help=(
+            'Build exact 365-day DART share-issuance evidence for a bounded '
+            'active-universe page'
+        ),
+    )
+    dart_dilution_backfill_parser.add_argument('--market-date', required=True)
+    dart_dilution_backfill_parser.add_argument('--limit', type=int, default=25)
+    dart_dilution_backfill_parser.add_argument(
+        '--concurrency',
+        type=int,
+        choices=range(1, MAX_DART_DISCLOSURE_SYNC_CONCURRENCY + 1),
+        default=DART_SHARE_ISSUANCE_BACKFILL_OPS_DEFAULT_CONCURRENCY,
+        help='Maximum concurrent DART corporation fetches per wave (default: 4).',
+    )
+    dart_dilution_backfill_parser.add_argument(
+        '--stock-codes',
+        help=(
+            'Optional comma-separated exact stock-code manifest. When omitted, '
+            'the current active universe is canonicalized into the manifest.'
+        ),
+    )
+    dart_dilution_backfill_parser.add_argument(
+        '--after-stock-code',
+        help=(
+            'Exclusive stable continuation cursor copied from '
+            'next_after_stock_code.'
+        ),
+    )
+    dart_dilution_backfill_parser.add_argument(
+        '--expected-manifest-hash',
+        help=(
+            'Required with --apply; copy manifest_hash from a reviewed dry '
+            'run over the same exact requested stock codes.'
+        ),
+    )
+    dart_dilution_backfill_mode = (
+        dart_dilution_backfill_parser.add_mutually_exclusive_group()
+    )
+    dart_dilution_backfill_mode.add_argument(
+        '--apply',
+        action='store_false',
+        dest='dry_run',
+        help='Fetch the exact disclosure window and persist evidence.',
+    )
+    dart_dilution_backfill_mode.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='Inspect the bounded symbol page without provider calls or writes (default).',
+    )
+    dart_dilution_backfill_parser.set_defaults(dry_run=True)
 
     signal_features_parser = subparsers.add_parser(
         'kis-daily-signal-features-collect',
@@ -1169,6 +2551,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     trending_parser.add_argument('--market-date', required=True)
     trending_parser.add_argument('--periods')
+    trending_parser.add_argument('--symbols')
 
     feedback_retry_parser = subparsers.add_parser(
         'agent-feedback-retry-cycles',
@@ -1467,6 +2850,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         payload = get_eod_status()
     elif args.command == 'eod-pipeline-stages':
         payload = list_daily_pipeline_stages()
+    elif args.command == 'eod-pipeline-terminal-child-repair':
+        payload = repair_terminal_daily_pipeline_children(
+            dry_run=args.dry_run,
+        )
+    elif args.command == 'eod-stale-collection-run-repair':
+        payload = repair_stale_eod_collection_runs(
+            dry_run=args.dry_run,
+            expected_manifest_sha256=args.expected_manifest_sha256,
+        )
+    elif args.command == 'dart-stale-sync-run-reconcile':
+        payload = reconcile_stale_dart_sync_runs(
+            dry_run=args.dry_run,
+            expected_manifest_sha256=args.expected_manifest_sha256,
+        )
     elif args.command == 'schema-drift-preflight':
         payload, exit_code = collect_schema_drift_preflight()
         print(json.dumps(payload, ensure_ascii=False))
@@ -1524,6 +2921,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == 'dart-fundamentals-daily-run-if-due':
         payload = run_dart_fundamentals_daily_if_due(
             market_date=args.market_date,
+            symbols=args.symbols,
             symbol_limit=args.symbol_limit,
             symbol_offset=args.symbol_offset,
             capture_limit=args.capture_limit,
@@ -1538,6 +2936,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             market_date=args.market_date,
             limit=args.limit,
             after_event_id=args.after_event_id,
+            concurrency=args.concurrency,
+            dry_run=args.dry_run,
+        )
+    elif args.command == 'dart-share-issuance-evidence-backfill':
+        payload = backfill_dart_share_issuance_evidence(
+            market_date=args.market_date,
+            limit=args.limit,
+            stock_codes=args.stock_codes,
+            after_stock_code=args.after_stock_code,
+            expected_manifest_hash=args.expected_manifest_hash,
+            concurrency=args.concurrency,
             dry_run=args.dry_run,
         )
     elif args.command == 'kis-daily-signal-features-collect':
@@ -1598,7 +3007,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     elif args.command == 'eod-composite-factors-compute':
         payload = compute_composite_factors(market_date=args.market_date, symbols=args.symbols)
     elif args.command == 'eod-trending-ranks-compute':
-        payload = compute_trending_ranks(market_date=args.market_date, periods=args.periods)
+        payload = compute_trending_ranks(
+            market_date=args.market_date,
+            periods=args.periods,
+            symbols=args.symbols,
+        )
     elif args.command == 'agent-feedback-retry-cycles':
         payload = run_agent_feedback_retry_cycles(
             market_date=args.market_date,
@@ -1747,6 +3160,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     if (
         args.command == 'dart-audit-signals-backfill'
         and payload.get('status') in {'partial', 'completed_with_gaps', 'failed'}
+    ) or (
+        args.command == 'dart-share-issuance-evidence-backfill'
+        and payload.get('status')
+        in {'blocked', 'partial', 'completed_with_gaps', 'failed'}
+    ) or (
+        args.command == 'eod-pipeline-terminal-child-repair'
+        and payload.get('status') in {'blocked', 'failed'}
+    ) or (
+        args.command == 'eod-stale-collection-run-repair'
+        and payload.get('status') in {'blocked', 'failed'}
+    ) or (
+        args.command == 'dart-stale-sync-run-reconcile'
+        and payload.get('status') in {'blocked', 'failed'}
     ):
         return 2
     return 0

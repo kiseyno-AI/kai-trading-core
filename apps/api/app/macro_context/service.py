@@ -8,7 +8,9 @@ from typing import Any, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.audit_logging import exception_message
 from app.core.settings import settings
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.integrations.fred.client import FREDAPIError, FREDClient, FREDConfigurationError
 from app.integrations.world_bank.client import WorldBankAPIError, WorldBankClient
 from app.macro_context.store import MacroContextObservationRecord, MacroContextObservationStore, macro_context_observation_store
@@ -38,6 +40,9 @@ class MacroSeriesConfig:
     unit: str | None = None
     frequency: str | None = None
     regime_key: str | None = None
+    # 'yoy_percent': store the change against the observation 12 periods
+    # earlier (monthly index levels such as CPI) instead of the raw level.
+    transform: str | None = None
 
 
 DEFAULT_WORLD_BANK_SERIES: dict[str, MacroSeriesConfig] = {
@@ -70,16 +75,36 @@ DEFAULT_WORLD_BANK_SERIES: dict[str, MacroSeriesConfig] = {
     ),
 }
 
-DEFAULT_FRED_SERIES: dict[str, MacroSeriesConfig] = {
-    'DEXKOUS': MacroSeriesConfig(
+
+
+def _fred(series_id: str, name: str, unit: str, frequency: str, regime_key: str, transform: str | None = None) -> MacroSeriesConfig:
+    return MacroSeriesConfig(
         source=FRED_SOURCE,
-        series_id='DEXKOUS',
-        series_name='USD/KRW exchange rate from FRED',
-        country_code=None,
-        unit='KRW per USD',
-        frequency='daily',
-        regime_key='fx',
-    ),
+        series_id=series_id,
+        series_name=name,
+        unit=unit,
+        frequency=frequency,
+        regime_key=regime_key,
+        transform=transform,
+    )
+
+
+# US/global drivers of Korean equities: rates, curve, risk appetite, credit,
+# oil, US inflation/labor, and the won.
+DEFAULT_FRED_SERIES: dict[str, MacroSeriesConfig] = {
+    config.series_id: config
+    for config in (
+        _fred('DEXKOUS', 'USD/KRW exchange rate from FRED', 'KRW per USD', 'daily', 'fx'),
+        _fred('DFF', 'US effective federal funds rate', 'percent', 'daily', 'us_policy_rate'),
+        _fred('DGS10', 'US 10-year Treasury yield', 'percent', 'daily', 'us_10y'),
+        _fred('DGS2', 'US 2-year Treasury yield', 'percent', 'daily', 'us_2y'),
+        _fred('T10Y2Y', 'US 10y minus 2y Treasury spread', 'percentage points', 'daily', 'us_curve'),
+        _fred('VIXCLS', 'CBOE VIX volatility index', 'index', 'daily', 'risk'),
+        _fred('BAMLH0A0HYM2', 'US high-yield option-adjusted spread', 'percent', 'daily', 'credit'),
+        _fred('DCOILWTICO', 'WTI crude oil spot price', 'USD per barrel', 'daily', 'oil'),
+        _fred('CPIAUCSL', 'US CPI inflation (year over year)', 'percent YoY', 'monthly', 'us_inflation', 'yoy_percent'),
+        _fred('UNRATE', 'US unemployment rate', 'percent', 'monthly', 'us_labor'),
+    )
 }
 
 
@@ -281,6 +306,53 @@ def _label_fx(value: float | None) -> str:
     return 'usdkrw_normal'
 
 
+def _band(value: float | None, unknown: str, bands: Sequence[tuple[float, str]], otherwise: str) -> str:
+    """First label whose lower bound the value reaches; bands are high to low."""
+
+    if value is None:
+        return unknown
+    for floor, label in bands:
+        if value >= floor:
+            return label
+    return otherwise
+
+
+def _global_labels(series_by_key: dict[str, dict[str, Any]]) -> dict[str, str]:
+    def value(key: str) -> float | None:
+        # Daily market drivers go stale fast: a stale or missing series is
+        # unknown, never a calm reading carried forward.
+        item = series_by_key.get(key) or {}
+        if item.get('status') != 'available':
+            return None
+        return _to_float(item.get('latest_value'))
+
+    risk = _band(value('risk'), 'risk_unknown', ((30.0, 'risk_stress'), (20.0, 'risk_elevated'), (15.0, 'risk_normal')), 'risk_calm')
+    credit = _band(value('credit'), 'credit_unknown', ((6.0, 'credit_stress'), (4.5, 'credit_widening'), (3.5, 'credit_normal')), 'credit_tight')
+    curve_value = value('us_curve')
+    curve = _band(curve_value, 'curve_unknown', ((1.5, 'curve_steep'), (0.5, 'curve_normal'), (0.0, 'curve_flat')), 'curve_inverted')
+    if 'stress' in risk or 'stress' in credit:
+        global_risk = 'global_risk_off'
+    elif risk == 'risk_elevated' or credit == 'credit_widening':
+        global_risk = 'global_risk_caution'
+    elif risk == 'risk_calm' and credit == 'credit_tight':
+        global_risk = 'global_risk_on'
+    elif 'unknown' in risk and 'unknown' in credit:
+        global_risk = 'global_risk_unknown'
+    else:
+        global_risk = 'global_risk_neutral'
+    return {
+        'us_policy_label': _band(value('us_policy_rate'), 'us_policy_unknown', ((4.0, 'us_policy_restrictive'), (2.0, 'us_policy_neutral')), 'us_policy_accommodative'),
+        'us_10y_label': _band(value('us_10y'), 'us_10y_unknown', ((4.5, 'us_10y_high'), (3.0, 'us_10y_normal')), 'us_10y_low'),
+        'us_curve_label': curve,
+        'risk_label': risk,
+        'credit_label': credit,
+        'oil_label': _band(value('oil'), 'oil_unknown', ((90.0, 'oil_high'), (60.0, 'oil_normal')), 'oil_low'),
+        'us_inflation_label': _band(value('us_inflation'), 'us_inflation_unknown', ((3.5, 'us_inflation_hot'), (2.5, 'us_inflation_above_target'), (1.5, 'us_inflation_on_target')), 'us_inflation_soft'),
+        'us_labor_label': _band(value('us_labor'), 'us_labor_unknown', ((5.0, 'us_labor_weak'), (4.0, 'us_labor_balanced')), 'us_labor_tight'),
+        'global_risk_label': global_risk,
+    }
+
+
 def _composite_label(*, growth_label: str, inflation_label: str, labor_label: str) -> str:
     if growth_label == 'growth_slowdown' and inflation_label == 'inflation_pressure':
         return 'macro_stagflation_watch'
@@ -310,6 +382,7 @@ def _build_regime_summary(series_by_key: dict[str, dict[str, Any]], *, context_s
         'inflation_label': inflation_label,
         'labor_label': labor_label,
         'fx_label': _label_fx(fx),
+        **_global_labels(series_by_key),
         'composite_label': _composite_label(
             growth_label=growth_label,
             inflation_label=inflation_label,
@@ -445,19 +518,11 @@ class MacroContextService:
         knowledge_cutoff_at = _historical_knowledge_cutoff_at(resolved_as_of, now=resolved_now)
         stale_after_hours = max(1, int(settings.macro_context_stale_after_hours or 72))
         configs = self._context_series()
-        try:
-            latest = self.store.load_latest_by_series(
-                series_keys=[(config.source, config.series_id) for config in configs],
-                as_of_date=resolved_as_of,
-                fetched_at_before=knowledge_cutoff_at,
-            )
-        except SQLAlchemyError as exc:
-            return self._unavailable_context(
-                as_of_date=resolved_as_of,
-                reason='macro_context_storage_unavailable',
-                detail=str(exc),
-                now=resolved_now,
-            )
+        latest = self.store.load_latest_by_series(
+            series_keys=[(config.source, config.series_id) for config in configs],
+            as_of_date=resolved_as_of,
+            fetched_at_before=knowledge_cutoff_at,
+        )
 
         series_items: list[dict[str, Any]] = []
         series_by_regime_key: dict[str, dict[str, Any]] = {}
@@ -542,11 +607,15 @@ class MacroContextService:
                 for config in world_bank_configs
                 if (config.source, config.series_id) in only_series_keys
             ]
-            fred_configs = [
-                config
-                for config in fred_configs
-                if (config.source, config.series_id) in only_series_keys
-            ]
+            if not (
+                settings.macro_context_fred_enabled
+                and not settings.fred_api_key.strip()
+            ):
+                fred_configs = [
+                    config
+                    for config in fred_configs
+                    if (config.source, config.series_id) in only_series_keys
+                ]
 
         world_bank_result = await self._refresh_world_bank(now=now, configs=world_bank_configs)
         source_statuses[WORLD_BANK_SOURCE] = world_bank_result['source_status']
@@ -590,7 +659,15 @@ class MacroContextService:
         series_statuses: list[dict[str, Any]] = []
         observations_upserted = 0
         observations_failed = 0
-        for config in configs:
+        for index, config in enumerate(configs):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': index,
+                    'total': len(configs),
+                    'current_symbol': config.series_id,
+                    'current_step': f'fetch_{config.source}_series',
+                }
+            )
             try:
                 payload = await self.world_bank_client.fetch_indicator(
                     country=config.country_code or settings.macro_context_world_bank_country,
@@ -606,13 +683,19 @@ class MacroContextService:
                 period = str(row.get('date') or '').strip()
                 if not period:
                     raise WorldBankAPIError('World Bank returned an empty observation period')
+                try:
+                    observation_date = _observation_date_from_period(period)
+                except ValueError as exc:
+                    raise WorldBankAPIError(
+                        'World Bank returned an invalid observation period'
+                    ) from exc
                 record = self.store.upsert_observation(
                     source=WORLD_BANK_SOURCE,
                     series_id=config.series_id,
                     series_name=config.series_name,
                     country_code=config.country_code or settings.macro_context_world_bank_country,
                     observation_period=period,
-                    observation_date=_observation_date_from_period(period),
+                    observation_date=observation_date,
                     value=value,
                     unit=config.unit,
                     frequency=config.frequency,
@@ -636,23 +719,26 @@ class MacroContextService:
                         'fetched_at': record.fetched_at.isoformat(),
                     }
                 )
-            except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
+            except SQLAlchemyError:
+                raise
+            except WorldBankAPIError as exc:
                 observations_failed += 1
-                try:
-                    self.store.mark_refresh_failure(
-                        source=WORLD_BANK_SOURCE,
-                        series_id=config.series_id,
-                        failed_at=now,
-                        reason=str(exc),
-                    )
-                except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
-                    pass
+                reason = exception_message(exc)
+                self.store.mark_refresh_failure(
+                    source=WORLD_BANK_SOURCE,
+                    series_id=config.series_id,
+                    failed_at=now,
+                    reason=reason,
+                )
                 series_statuses.append(
                     {
                         'source': WORLD_BANK_SOURCE,
                         'series_id': config.series_id,
                         'status': 'failed',
-                        'reason': str(exc),
+                        'reason': reason,
+                        'error_type': type(exc).__name__,
+                        'retryable': True,
+                        'action_required': 'automatic_retry_pending',
                     }
                 )
 
@@ -684,32 +770,49 @@ class MacroContextService:
         if not settings.macro_context_fred_enabled:
             return self._fred_disabled_result(status='disabled', reason='MACRO_CONTEXT_FRED_ENABLED=false')
         if not settings.fred_api_key.strip():
-            return self._fred_disabled_result(status='disabled_missing_api_key', reason='FRED_API_KEY is not configured')
+            return self._fred_disabled_result(
+                status='blocked_missing_credential',
+                reason='FRED_API_KEY is not configured',
+                configs=configs,
+                configuration_blocked=True,
+            )
         if not configs:
             return self._fred_disabled_result(status='disabled_no_series', reason='MACRO_CONTEXT_FRED_SERIES is empty')
 
         series_statuses: list[dict[str, Any]] = []
         observations_upserted = 0
         observations_failed = 0
-        for config in configs:
+        for index, config in enumerate(configs):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': index,
+                    'total': len(configs),
+                    'current_symbol': config.series_id,
+                    'current_step': f'fetch_{config.source}_series',
+                }
+            )
             try:
-                payload = await self.fred_client.fetch_latest_observations(series_id=config.series_id, limit=5)
-                row = self._select_first_numeric_fred_row(payload.get('observations') or [])
-                if row is None:
-                    raise FREDAPIError('FRED returned no numeric observations')
-                value = _to_float(row.get('value'))
-                if value is None:
-                    raise FREDAPIError('FRED returned an empty latest value')
+                payload = await self.fred_client.fetch_latest_observations(
+                    series_id=config.series_id,
+                    limit=15 if config.transform == 'yoy_percent' else 5,
+                )
+                row, value = self._fred_latest_value(config, payload.get('observations') or [])
                 period = str(row.get('date') or '').strip()
                 if not period:
                     raise FREDAPIError('FRED returned an empty observation date')
+                try:
+                    observation_date = _observation_date_from_period(period)
+                except ValueError as exc:
+                    raise FREDAPIError(
+                        'FRED returned an invalid observation date'
+                    ) from exc
                 record = self.store.upsert_observation(
                     source=FRED_SOURCE,
                     series_id=config.series_id,
                     series_name=config.series_name,
                     country_code=config.country_code,
                     observation_period=period,
-                    observation_date=_observation_date_from_period(period),
+                    observation_date=observation_date,
                     value=value,
                     unit=config.unit,
                     frequency=config.frequency,
@@ -729,24 +832,32 @@ class MacroContextService:
                     }
                 )
             except FREDConfigurationError as exc:
-                return self._fred_disabled_result(status='disabled_missing_api_key', reason=str(exc))
-            except Exception as exc:  # noqa: BLE001 - source failures must not abort the refresh.
+                return self._fred_disabled_result(
+                    status='blocked_missing_credential',
+                    reason=exception_message(exc),
+                    configs=configs,
+                    configuration_blocked=True,
+                )
+            except SQLAlchemyError:
+                raise
+            except FREDAPIError as exc:
                 observations_failed += 1
-                try:
-                    self.store.mark_refresh_failure(
-                        source=FRED_SOURCE,
-                        series_id=config.series_id,
-                        failed_at=now,
-                        reason=str(exc),
-                    )
-                except Exception:  # noqa: BLE001 - retain the provider failure as the primary result.
-                    pass
+                reason = exception_message(exc)
+                self.store.mark_refresh_failure(
+                    source=FRED_SOURCE,
+                    series_id=config.series_id,
+                    failed_at=now,
+                    reason=reason,
+                )
                 series_statuses.append(
                     {
                         'source': FRED_SOURCE,
                         'series_id': config.series_id,
                         'status': 'failed',
-                        'reason': str(exc),
+                        'reason': reason,
+                        'error_type': type(exc).__name__,
+                        'retryable': True,
+                        'action_required': 'automatic_retry_pending',
                     }
                 )
 
@@ -764,25 +875,62 @@ class MacroContextService:
         }
 
     @staticmethod
-    def _fred_disabled_result(*, status: str, reason: str) -> dict[str, Any]:
-        return {
-            'source_status': {
+    def _fred_disabled_result(
+        *,
+        status: str,
+        reason: str,
+        configs: Sequence[MacroSeriesConfig] | None = None,
+        configuration_blocked: bool = False,
+    ) -> dict[str, Any]:
+        configured_series = list(configs or [])
+        observations_failed = (
+            len(configured_series) if configuration_blocked else 0
+        )
+        series_statuses = [
+            {
+                'source': FRED_SOURCE,
+                'series_id': config.series_id,
                 'status': status,
                 'reason': reason,
-                'series_count': 0,
-                'observations_upserted': 0,
-                'observations_failed': 0,
-            },
-            'series_statuses': [
+                **(
+                    {
+                        'retryable': False,
+                        'action_required': 'configure_fred_api_key',
+                    }
+                    if configuration_blocked
+                    else {}
+                ),
+            }
+            for config in configured_series
+        ]
+        if not series_statuses:
+            series_statuses = [
                 {
                     'source': FRED_SOURCE,
                     'series_id': None,
                     'status': status,
                     'reason': reason,
                 }
-            ],
+            ]
+        return {
+            'source_status': {
+                'status': status,
+                'reason': reason,
+                'series_count': len(configured_series),
+                'observations_upserted': 0,
+                'observations_failed': observations_failed,
+                **(
+                    {
+                        'retryable': False,
+                        'action_required': 'configure_fred_api_key',
+                    }
+                    if configuration_blocked
+                    else {}
+                ),
+            },
+            'series_statuses': series_statuses,
             'observations_upserted': 0,
-            'observations_failed': 0,
+            'observations_failed': observations_failed,
         }
 
     @staticmethod
@@ -791,6 +939,37 @@ class MacroContextService:
             if isinstance(row, dict) and _to_float(row.get('value')) is not None:
                 return row
         return None
+
+    @classmethod
+    def _fred_latest_value(
+        cls,
+        config: MacroSeriesConfig,
+        rows: Sequence[dict[str, Any]],
+    ) -> tuple[dict[str, Any], float]:
+        row = cls._select_first_numeric_fred_row(rows)
+        if row is None:
+            raise FREDAPIError('FRED returned no numeric observations')
+        value = _to_float(row.get('value'))
+        if value is None:
+            raise FREDAPIError('FRED returned an empty latest value')
+        if config.transform != 'yoy_percent':
+            return row, value
+        try:
+            latest = date.fromisoformat(str(row.get('date') or '')[:10])
+        except ValueError as exc:
+            raise FREDAPIError('FRED returned an invalid observation date') from exc
+        base_date = latest.replace(year=latest.year - 1).isoformat()
+        base = next(
+            (
+                _to_float(item.get('value'))
+                for item in rows
+                if isinstance(item, dict) and str(item.get('date') or '')[:10] == base_date
+            ),
+            None,
+        )
+        if not base:
+            raise FREDAPIError(f'FRED returned no base observation for {base_date} to compute YoY')
+        return {**row, 'level': row.get('value'), 'base_date': base_date, 'base_level': base}, round((value / base - 1.0) * 100.0, 3)
 
     @staticmethod
     def _select_first_numeric_fred_row(rows: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
@@ -809,7 +988,7 @@ class MacroContextService:
             fred_status = 'disabled'
             reason = 'MACRO_CONTEXT_FRED_ENABLED=false'
         elif not settings.fred_api_key.strip():
-            fred_status = 'disabled_missing_api_key'
+            fred_status = 'blocked_missing_credential'
             reason = 'FRED_API_KEY is not configured'
         else:
             fred_status = 'configured'
@@ -817,6 +996,14 @@ class MacroContextService:
         statuses[FRED_SOURCE] = {
             'status': fred_status,
             'reason': reason,
+            **(
+                {
+                    'retryable': False,
+                    'action_required': 'configure_fred_api_key',
+                }
+                if fred_status == 'blocked_missing_credential'
+                else {}
+            ),
         }
         return statuses
 
@@ -847,51 +1034,5 @@ class MacroContextService:
         if isinstance(value, str) and value.strip():
             return date.fromisoformat(value.strip()[:10])
         return now.date()
-
-    @staticmethod
-    def _unavailable_context(
-        *,
-        as_of_date: date,
-        reason: str,
-        detail: str | None,
-        now: datetime,
-    ) -> dict[str, Any]:
-        return {
-            'schema_version': MACRO_CONTEXT_SCHEMA_VERSION,
-            'status': 'unavailable',
-            'as_of_date': as_of_date.isoformat(),
-            'generated_at': now.isoformat(),
-            'latest_fetched_at': None,
-            'freshness': {
-                'stale_after_hours': settings.macro_context_stale_after_hours,
-                'status': 'unavailable',
-                'reason': reason,
-                'detail': detail,
-            },
-            'source_statuses': {
-                'macro_context': {
-                    'status': 'unavailable',
-                    'reason': reason,
-                }
-            },
-            'series': [],
-            'macro_regime_summary': {
-                'schema_version': 'macro_regime_summary_v1',
-                'method': 'deterministic_threshold_labels',
-                'growth_label': 'growth_unknown',
-                'inflation_label': 'inflation_unknown',
-                'labor_label': 'labor_unknown',
-                'fx_label': 'fx_unknown',
-                'composite_label': 'macro_unknown',
-                'freshness_label': 'macro_context_unavailable',
-                'llm_generated': False,
-            },
-            'usage_policy': {
-                'contextual_input_only': True,
-                'direct_buy_sell_signal': False,
-                'llm_generated': False,
-            },
-        }
-
 
 macro_context_service = MacroContextService()

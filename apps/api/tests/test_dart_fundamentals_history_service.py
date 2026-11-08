@@ -220,6 +220,23 @@ class DartFundamentalsHistoryServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['matched_symbol_count'], 0)
         self.assertEqual(result['summary']['missing_symbols'], ['005930', '000660'])
 
+    def test_history_service_normalizes_alpha_codes_and_rejects_malformed_codes(self):
+        repository = FakeHistoryRepository([])
+        service = DartFundamentalsHistoryService(repository=repository)
+
+        result = service.get_historical_fundamentals(
+            symbols=['00088k'],
+            exact_date=date(2024, 12, 31),
+        )
+
+        self.assertEqual(repository.last_args['stock_codes'], ['00088K'])
+        self.assertEqual(result['summary']['missing_symbols'], ['00088K'])
+        with self.assertRaisesRegex(ValueError, 'invalid stock code'):
+            service.get_historical_fundamentals(
+                symbols=['ABC123'],
+                exact_date=date(2024, 12, 31),
+            )
+
     def test_history_service_rejects_missing_date_window(self):
         service = DartFundamentalsHistoryService(repository=FakeHistoryRepository([]))
 

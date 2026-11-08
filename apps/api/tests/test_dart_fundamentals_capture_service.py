@@ -1,15 +1,34 @@
 import unittest
 import asyncio
 from datetime import date
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.dart.fundamentals_capture_service import (
-    DartFundamentalsCaptureService,
+    DartFundamentalsProgressCallbackError,
+    DartFundamentalsCaptureService as _DartFundamentalsCaptureService,
     _bounded_missing_probe_codes,
+    _exact_reusable_fundamentals_scope_outcome,
+    _load_active_symbols,
+    _load_share_issuance_activation_audit,
+    _normalize_active_universe_stock_codes,
+    _normalize_exact_stock_code_manifest,
     build_row_payloads,
     infer_fundamentals_request,
+    legacy_cfs_recovery_candidate_manifest_sha256,
+    resolve_supported_dart_corp_record,
 )
+from app.dart.fundamentals_store import (
+    LegacyCfsRecoveryCandidateDriftError,
+)
+from app.dart.signals_service import build_authoritative_absence_audit_signal
+
+
+def DartFundamentalsCaptureService(**kwargs):
+    kwargs.setdefault('global_share_issuance_enabled', False)
+    return _DartFundamentalsCaptureService(**kwargs)
 
 
 def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
@@ -39,6 +58,56 @@ def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[st
     }
 
 
+def _exact_fundamentals_scope_outcome(
+    selected_stock_codes: list[str],
+    *,
+    retry_debt_stock_codes: list[str] | None = None,
+) -> dict:
+    retry_debt = set(retry_debt_stock_codes or [])
+    successful = [
+        stock_code
+        for stock_code in selected_stock_codes
+        if stock_code not in retry_debt
+    ]
+    return {
+        'scope_outcome_manifest_version': (
+            'dart_fundamentals_scope_outcomes_v1'
+        ),
+        'selected_stock_codes': list(selected_stock_codes),
+        'successful_stock_codes': successful,
+        'retry_debt_stock_codes': sorted(retry_debt),
+        'scope_outcome_manifest': [
+            {
+                'stock_code': stock_code,
+                'outcome': (
+                    'retry_debt'
+                    if stock_code in retry_debt
+                    else 'success'
+                ),
+            }
+            for stock_code in selected_stock_codes
+        ],
+    }
+
+
+def _complete_negative_audit_diagnostics() -> dict:
+    return {
+        'version': 'dart_audit_archive_diagnostics_v1',
+        'archive_sha256': 'a' * 64,
+        'archive_size_bytes': 321,
+        'member_count': 1,
+        'members': [],
+        'decoded_member_count': 1,
+        'aud_opn_table_count': 1,
+        'audit_report_label_row_count': 1,
+        'known_opinion_token_row_count': 1,
+        'positive_authority_evidence_count': 0,
+        'negative_authority_evidence_count': 1,
+        'ambiguous_authority_evidence_count': 0,
+        'truncated': False,
+    }
+
+
 def test_bounded_missing_probe_rotates_by_batch_without_daily_starvation() -> None:
     candidates = [f'{index:06d}' for index in range(300)]
 
@@ -61,6 +130,60 @@ def test_bounded_missing_probe_rotates_by_batch_without_daily_starvation() -> No
     assert first == same_day
     assert len(first) == 100
     assert set(first).isdisjoint(next_day)
+
+
+def test_fundamentals_stock_code_manifests_support_canonical_alpha_codes() -> None:
+    assert _normalize_exact_stock_code_manifest(
+        ['00088k', '5930', '00088K']
+    ) == ['00088K', '005930']
+    assert _normalize_active_universe_stock_codes(
+        [{'symbol': '00088K'}, {'symbol': '5930'}]
+    ) == ['00088K', '005930']
+
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        'invalid stock code',
+    ):
+        _normalize_exact_stock_code_manifest(['ABC123'])
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError,
+        'invalid stock code',
+    ):
+        _normalize_active_universe_stock_codes([{'symbol': 'ABC123'}])
+
+
+def test_active_symbol_loader_keeps_only_canonical_krx_scope() -> None:
+    rows = [
+        {'symbol': '005930', 'market': 'KOSPI'},
+        {'symbol': '0010A0', 'market': 'KOSDAQ'},
+        {'symbol': 'AAPL', 'market': 'NASDAQ'},
+        {'symbol': 'TQF2601', 'market': 'KOSPI'},
+    ]
+
+    with patch(
+        'app.dart.fundamentals_capture_service.load_symbols',
+        return_value=rows,
+    ) as loader:
+        assert _load_active_symbols() == rows[:2]
+
+    loader.assert_called_once_with(
+        is_active=True,
+        markets=['KOSPI', 'KOSDAQ', 'KONEX', 'KRX'],
+    )
+
+
+def test_reusable_fundamentals_scope_accepts_alpha_and_rejects_malformed_codes() -> None:
+    scope = _exact_fundamentals_scope_outcome(['00088K'])
+    assert _exact_reusable_fundamentals_scope_outcome(
+        {'fundamentals_scope_outcome': scope},
+        selected_stock_codes=['00088K'],
+    ) == scope
+
+    malformed = _exact_fundamentals_scope_outcome(['ABC123'])
+    assert _exact_reusable_fundamentals_scope_outcome(
+        {'fundamentals_scope_outcome': malformed},
+        selected_stock_codes=['ABC123'],
+    ) is None
 
 
 class FakeCaptureClient:
@@ -136,6 +259,7 @@ class FakeCaptureRepository:
         self.terminals = []
         self.snapshots = []
         self.candidate_call_kwargs = []
+        self.legacy_recovery_call_kwargs = []
 
     def create_capture_run(self, **kwargs):
         self.created_runs.append(kwargs)
@@ -350,18 +474,132 @@ class FakeCaptureRepository:
             events = [event for event in events if event['id'] in event_ids]
         return events[:limit] if limit is not None else events
 
+    def list_legacy_cfs_no_data_recovery_candidates(
+        self,
+        *,
+        stock_codes,
+        receipt_date_from,
+        receipt_date_to,
+        event_ids=None,
+    ):
+        self.legacy_recovery_call_kwargs.append(
+            {
+                'stock_codes': stock_codes,
+                'receipt_date_from': receipt_date_from,
+                'receipt_date_to': receipt_date_to,
+                'event_ids': event_ids,
+            }
+        )
+        candidates = [
+            {
+                'id': 8,
+                'rcept_no': '20260413000001',
+                'corp_code': 'no-data',
+                'corp_name': 'No Data Corp',
+                'stock_code': '333333',
+                'report_nm': '사업보고서 (2025.12)',
+                'filing_category': 'annual_report',
+                'fundamentals_capture_status': 'captured',
+                'receipt_date': '2026-04-13',
+                'legacy_snapshot_id': 108,
+                'legacy_source_status': '013',
+                'legacy_snapshot_rcept_no': '20260413000001',
+                'legacy_snapshot_corp_code': 'no-data',
+                'legacy_snapshot_stock_code': '333333',
+                'legacy_snapshot_filing_category': 'annual_report',
+                'legacy_business_year': 2025,
+                'legacy_report_code': '11011',
+                'legacy_fs_div': 'CFS',
+                'legacy_statement_type': 'consolidated',
+                'legacy_period_type': 'annual',
+                'legacy_period_end_month': 12,
+                'legacy_fallback_from_status': None,
+                'legacy_captured_at': '2026-04-13T01:02:03+00:00',
+            }
+        ]
+        if event_ids is not None:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate['id'] in event_ids
+            ]
+        return candidates
+
     def replace_snapshot_dataset(self, **kwargs):
         self.snapshots.append(kwargs)
         return 101
 
+    def replace_snapshot_dataset_and_mark_event_success(
+        self,
+        *,
+        expected_recovery_candidate=None,
+        **kwargs,
+    ):
+        if expected_recovery_candidate is not None:
+            self.validate_legacy_cfs_no_data_recovery_candidate(
+                expected_recovery_candidate
+            )
+        snapshot_id = self.replace_snapshot_dataset(**kwargs)
+        self.mark_event_capture_success(kwargs['event_id'])
+        return snapshot_id
+
+    def validate_legacy_cfs_no_data_recovery_candidate(self, expected_candidate):
+        current = self.list_legacy_cfs_no_data_recovery_candidates(
+            stock_codes=[expected_candidate['stock_code']],
+            receipt_date_from=date.fromisoformat(
+                expected_candidate['receipt_date']
+            ),
+            receipt_date_to=date.fromisoformat(
+                expected_candidate['receipt_date']
+            ),
+            event_ids=[expected_candidate['id']],
+        )
+        if (
+            legacy_cfs_recovery_candidate_manifest_sha256(current)
+            != legacy_cfs_recovery_candidate_manifest_sha256(
+                [expected_candidate]
+            )
+        ):
+            raise LegacyCfsRecoveryCandidateDriftError(
+                'legacy CFS recovery candidate changed after review'
+            )
+
     def mark_event_capture_success(self, event_id):
         self.successes.append(event_id)
 
-    def mark_event_capture_failed(self, event_id, *, error_message):
+    def mark_event_capture_failed(
+        self,
+        event_id,
+        *,
+        error_message,
+        expected_event=None,
+        expected_recovery_candidate=None,
+    ):
+        if expected_recovery_candidate is not None:
+            self.validate_legacy_cfs_no_data_recovery_candidate(
+                expected_recovery_candidate
+            )
         self.failures.append((event_id, error_message))
+        return True
 
-    def mark_event_capture_terminal(self, event_id, *, capture_status, error_message):
+    def mark_event_capture_terminal(
+        self,
+        event_id,
+        *,
+        capture_status,
+        error_message,
+        expected_event=None,
+        expected_recovery_candidate=None,
+    ):
+        if expected_recovery_candidate is not None:
+            self.validate_legacy_cfs_no_data_recovery_candidate(
+                expected_recovery_candidate
+            )
         self.terminals.append((event_id, capture_status, error_message))
+        return True
+
+    def find_committed_snapshot_publication(self, **kwargs):
+        return None
 
     def get_latest_capture_run(self):
         return {'id': 88, 'status': 'completed'}
@@ -393,6 +631,13 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                     'opinion_code': 'unqualified',
                     'opinion_label': '적정',
                     'has_audit_issue': False,
+                    'source_section': '감사보고서 > 감사의견',
+                    'evidence_text': '감사의견 | 적정',
+                    'payload': {
+                        'parser': 'semantic_audit_table_v1',
+                        'opinion_cell': '적정',
+                        'row_cells': ['당기', '적정'],
+                    },
                 },
                 'dilution_signal': None,
             },
@@ -415,6 +660,173 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.mock_piotroski_filter = self.piotroski_filter_patcher.start()
         self.addCleanup(self.piotroski_filter_patcher.stop)
 
+    async def test_non_authoritative_corp_cache_cannot_terminalize_absence(self):
+        class NonAuthoritativeClient:
+            async def has_supported_stock_code(self, _stock_code):
+                return False
+
+            def corp_code_mapping_authority(self):
+                return {
+                    'source': 'persistent_fallback',
+                    'authoritative': False,
+                    'cache_age_seconds': 999999,
+                }
+
+        corp, error = await resolve_supported_dart_corp_record(
+            NonAuthoritativeClient(),
+            stock_code='005930',
+        )
+
+        self.assertIsNone(corp)
+        self.assertEqual(
+            error['error_type'],
+            'DartMappingAuthorityUnavailable',
+        )
+        self.assertFalse(error['terminal'])
+        self.assertEqual(
+            error['mapping_authority']['source'],
+            'persistent_fallback',
+        )
+
+    async def test_corp_mapping_canonicalizes_alpha_stock_code(self):
+        calls = []
+
+        class AlphaClient:
+            async def has_supported_stock_code(self, stock_code):
+                calls.append(('supported', stock_code))
+                return True
+
+            async def lookup_corp_code(self, *, stock_code):
+                calls.append(('lookup', stock_code))
+                return {
+                    'corp_code': '00126380',
+                    'corp_name': 'Alpha Corp',
+                }
+
+        corp, error = await resolve_supported_dart_corp_record(
+            AlphaClient(),
+            stock_code='00088k',
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corp['stock_code'], '00088K')
+        self.assertEqual(
+            calls,
+            [('supported', '00088K'), ('lookup', '00088K')],
+        )
+
+    async def test_global_activation_failure_stops_before_current_universe_work(self):
+        activation_loader = Mock(
+            return_value={
+                'enabled': False,
+                'reasons': ['audit_manifest_hash_mismatch'],
+            }
+        )
+        service = _DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=Mock(
+                side_effect=AssertionError('must not load active universe')
+            ),
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=activation_loader,
+        )
+        service._run_daily_incremental_refresh = AsyncMock()
+
+        result = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 10, 30),
+        )
+
+        activation_loader.assert_called_once_with()
+        service._run_daily_incremental_refresh.assert_not_awaited()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(
+            result['reason'],
+            'global_share_issuance_activation_audit_required',
+        )
+
+    async def test_global_activation_loader_error_fails_closed(self):
+        activation_loader = Mock(
+            side_effect=RuntimeError('audit store unavailable')
+        )
+        service = _DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=Mock(
+                side_effect=AssertionError('must not load active universe')
+            ),
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=activation_loader,
+        )
+        service._run_daily_incremental_refresh = AsyncMock()
+
+        result = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 10, 30),
+        )
+
+        activation_loader.assert_called_once_with()
+        service._run_daily_incremental_refresh.assert_not_awaited()
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn(
+            'activation_audit_read_failed',
+            result['activation_audit']['reasons'],
+        )
+
+    def test_activation_loader_uses_dedicated_full_universe_trigger(self):
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.repository.get_latest_sync_run',
+            return_value=None,
+        ) as get_latest_sync_run:
+            result = _load_share_issuance_activation_audit()
+
+        get_latest_sync_run.assert_called_once_with(
+            trigger='ops_dart_issuance_activation',
+            include_internal_audits=True,
+        )
+        self.assertFalse(result['enabled'])
+
+    def _build_global_followup_service(
+        self,
+        stock_codes: list[str] | None = None,
+    ):
+        stock_codes = list(stock_codes or ['005930'])
+
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        repository = FakeCaptureRepository()
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': stock_code} for stock_code in stock_codes
+            ],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda **_kwargs: {
+                'enabled': True,
+            },
+        )
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 188,
+                'status': 'completed',
+                **_exact_fundamentals_scope_outcome(stock_codes),
+            }
+        )
+        return service, repository
+
     async def test_capture_annual_fundamentals_captures_audit_signal_before_marking_success(self):
         repository = FakeCaptureRepository()
         service = DartFundamentalsCaptureService(
@@ -435,10 +847,184 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repository.successes, [1])
         self.assertEqual(result['results'][0]['audit_signal_status'], 'captured')
 
+    async def test_capture_annual_fundamentals_accepts_durable_authoritative_absence(self):
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': 1,
+                'rcept_no': '20260407000003',
+                'receipt_date': '2026-04-07',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        self.mock_capture_dart_signals.return_value = {
+            'rcept_no': '20260407000003',
+            'audit_signal': {
+                'opinion_code': sentinel.opinion_code,
+                'opinion_label': sentinel.opinion_label,
+                'has_audit_issue': sentinel.has_audit_issue,
+                'source_section': sentinel.source_section,
+                'evidence_text': sentinel.evidence_text,
+                'payload': sentinel.payload,
+            },
+            'audit_signal_evaluated': True,
+            'dilution_signal': None,
+        }
+        repository = FakeCaptureRepository()
+        list_candidates = repository.list_capture_candidates
+        repository.list_capture_candidates = lambda **kwargs: [
+            {**event, 'receipt_date': '2026-04-07'}
+            for event in list_candidates(**kwargs)
+        ]
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(repository.successes, [1])
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(
+            result['results'][0]['audit_signal_status'],
+            'authoritative_absence',
+        )
+
+    async def test_capture_annual_fundamentals_retries_malformed_authoritative_absence(self):
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': 1,
+                'rcept_no': '20260407000003',
+                'receipt_date': '2026-04-07',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        sentinel.payload['receipt_date'] = '2026-04-08'
+        self.mock_capture_dart_signals.return_value = {
+            'rcept_no': '20260407000003',
+            'audit_signal': {
+                'opinion_code': sentinel.opinion_code,
+                'opinion_label': sentinel.opinion_label,
+                'has_audit_issue': sentinel.has_audit_issue,
+                'source_section': sentinel.source_section,
+                'evidence_text': sentinel.evidence_text,
+                'payload': sentinel.payload,
+            },
+            'audit_signal_evaluated': True,
+            'dilution_signal': None,
+        }
+        repository = FakeCaptureRepository()
+        list_candidates = repository.list_capture_candidates
+        repository.list_capture_candidates = lambda **kwargs: [
+            {**event, 'receipt_date': '2026-04-07'}
+            for event in list_candidates(**kwargs)
+        ]
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_captured'], 0)
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(repository.successes, [])
+        self.assertEqual(repository.snapshots, [])
+        self.assertIn('malformed audit evidence', repository.failures[0][1])
+
+    async def test_capture_annual_fundamentals_retries_downgrade_and_opinion_drift(self):
+        sentinel = build_authoritative_absence_audit_signal(
+            {
+                'id': 1,
+                'rcept_no': '20260407000003',
+                'receipt_date': '2026-04-07',
+            },
+            _complete_negative_audit_diagnostics(),
+        )
+        corrupted_payload = dict(sentinel.payload)
+        corrupted_payload['schema_version'] = 'tampered'
+        corrupted_payload['evidence_semantics'] = 'tampered'
+        cases = {
+            'corrupted_sentinel_downgrade': {
+                'opinion_code': 'unqualified',
+                'has_audit_issue': False,
+                'payload': corrupted_payload,
+            },
+            'qualified_marked_clean': {
+                'opinion_code': 'qualified',
+                'has_audit_issue': False,
+                'payload': {'parser': 'semantic_audit_table_v1'},
+            },
+        }
+
+        for label, audit_signal in cases.items():
+            with self.subTest(label=label):
+                self.mock_capture_dart_signals.return_value = {
+                    'rcept_no': '20260407000003',
+                    'audit_signal': audit_signal,
+                    'audit_signal_evaluated': True,
+                    'dilution_signal': None,
+                }
+                repository = FakeCaptureRepository()
+                list_candidates = repository.list_capture_candidates
+                repository.list_capture_candidates = lambda **kwargs: [
+                    {**event, 'receipt_date': '2026-04-07'}
+                    for event in list_candidates(**kwargs)
+                ]
+                service = DartFundamentalsCaptureService(
+                    client=FakeCaptureClient(),
+                    repository=repository,
+                )
+
+                result = await service.capture_recent_fundamentals(
+                    limit=1,
+                    force=False,
+                    trigger='test',
+                    fs_div='CFS',
+                )
+
+                self.assertEqual(result['events_captured'], 0)
+                self.assertEqual(result['events_failed'], 1)
+                self.assertEqual(repository.successes, [])
+                self.assertIn(
+                    'malformed audit evidence',
+                    repository.failures[0][1],
+                )
+
     async def test_capture_annual_fundamentals_keeps_event_retryable_when_audit_evidence_is_missing(self):
+        audit_diagnostics = {
+            'version': 'dart_audit_archive_diagnostics_v1',
+            'archive_sha256': 'a' * 64,
+            'archive_size_bytes': 321,
+            'member_count': 2,
+            'members': [
+                {
+                    'name': '20260407000003.xml',
+                    'name_truncated': False,
+                    'size_bytes': 123,
+                    'declared_encoding': 'utf-8',
+                    'decode_success': True,
+                }
+            ],
+            'decoded_member_count': 1,
+            'aud_opn_table_count': 0,
+            'audit_report_label_row_count': 0,
+            'known_opinion_token_row_count': 0,
+            'truncated': True,
+        }
         self.mock_capture_dart_signals.return_value = {
             'rcept_no': '20260407000003',
             'audit_signal': None,
+            'audit_diagnostics': audit_diagnostics,
             'dilution_signal': None,
         }
         repository = FakeCaptureRepository()
@@ -461,6 +1047,18 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('audit evidence', repository.failures[0][1])
         self.assertEqual(repository.snapshots, [])
         self.assertEqual(result['results'][0]['status'], 'failed')
+        self.assertEqual(
+            result['results'][0]['audit_diagnostics'],
+            audit_diagnostics,
+        )
+        completed_run_metadata = repository.completed_runs[-1][1]['run_metadata']
+        persisted_failure = completed_run_metadata['operator_buckets'][
+            'retryable_capture_failures'
+        ]['items_sample'][0]
+        self.assertEqual(
+            persisted_failure['audit_diagnostics'],
+            audit_diagnostics,
+        )
 
     async def test_capture_recent_fundamentals_persists_snapshots_and_marks_event_status(self):
         client = FakeCaptureClient()
@@ -494,6 +1092,185 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 and call.kwargs.get('event_id') == 2
                 for call in log_fetch_event.call_args_list
             )
+        )
+
+    async def test_post_commit_progress_failure_does_not_create_retry_debt(self):
+        class TelemetryFailRepository(FakeCaptureRepository):
+            def __init__(self):
+                super().__init__()
+                self.progress_attempts = 0
+
+            def update_capture_run_progress(self, run_id, **kwargs):
+                self.progress_attempts += 1
+                if self.progress_attempts == 3:
+                    raise RuntimeError('telemetry store unavailable')
+                return super().update_capture_run_progress(run_id, **kwargs)
+
+        repository = TelemetryFailRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(result['events_failed'], 0)
+        self.assertEqual(result['telemetry_warning_count'], 1)
+        self.assertEqual(result['results'][0]['status'], 'captured')
+        self.assertIn('telemetry_warning', result['results'][0])
+        self.assertEqual(repository.successes, [1])
+        self.assertEqual(repository.failures, [])
+
+    async def test_unknown_snapshot_commit_outcome_reconciles_durable_success(
+        self,
+    ):
+        class CommitAckLossRepository(FakeCaptureRepository):
+            def replace_snapshot_dataset_and_mark_event_success(
+                self,
+                **kwargs,
+            ):
+                super().replace_snapshot_dataset_and_mark_event_success(
+                    **kwargs
+                )
+                raise RuntimeError('connection lost after commit')
+
+            def find_committed_snapshot_publication(self, **kwargs):
+                if (
+                    self.successes == [kwargs['event_id']]
+                    and self.snapshots
+                    and self.snapshots[-1]['capture_run_id']
+                    == kwargs['capture_run_id']
+                ):
+                    return 101
+                return None
+
+        repository = CommitAckLossRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(result['events_failed'], 0)
+        self.assertEqual(repository.failures, [])
+        self.assertEqual(
+            result['results'][0]['publication_reconciliation'],
+            {
+                'status': 'committed_after_unknown_outcome',
+                'snapshot_id': 101,
+            },
+        )
+
+    async def test_pre_event_telemetry_failures_do_not_stop_capture_batch(self):
+        class TelemetryFailRepository(FakeCaptureRepository):
+            def __init__(self):
+                super().__init__()
+                self.progress_attempts = 0
+
+            def update_capture_run_progress(self, run_id, **kwargs):
+                self.progress_attempts += 1
+                if self.progress_attempts in {1, 2}:
+                    raise RuntimeError('telemetry store unavailable')
+                return super().update_capture_run_progress(run_id, **kwargs)
+
+        repository = TelemetryFailRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=3,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_seen'], 3)
+        self.assertEqual(result['events_captured'], 2)
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(repository.successes, [1, 3])
+        self.assertEqual(repository.failures[0][0], 2)
+        self.assertEqual(result['telemetry_warning_count'], 2)
+        self.assertEqual(
+            [warning['phase'] for warning in result['telemetry_warnings']],
+            ['initial_progress', 'event_started'],
+        )
+
+    async def test_failure_telemetry_error_does_not_stop_sibling_event(self):
+        class FailureTelemetryRepository(FakeCaptureRepository):
+            def __init__(self):
+                super().__init__()
+                self.progress_attempts = 0
+
+            def update_capture_run_progress(self, run_id, **kwargs):
+                self.progress_attempts += 1
+                if self.progress_attempts == 5:
+                    raise RuntimeError('failure telemetry unavailable')
+                return super().update_capture_run_progress(run_id, **kwargs)
+
+        repository = FailureTelemetryRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=3,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['events_seen'], 3)
+        self.assertEqual(repository.successes, [1, 3])
+        self.assertEqual(repository.failures[0][0], 2)
+        failed_result = next(
+            item for item in result['results'] if item['event_id'] == 2
+        )
+        self.assertEqual(
+            failed_result['telemetry_warning']['phase'],
+            'event_failed',
+        )
+
+    async def test_run_completion_telemetry_error_preserves_durable_results(self):
+        class CompletionTelemetryRepository(FakeCaptureRepository):
+            def complete_capture_run(self, run_id, **kwargs):
+                raise RuntimeError('run telemetry unavailable')
+
+        repository = CompletionTelemetryRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            force=False,
+            trigger='test',
+            fs_div='CFS',
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(repository.successes, [1])
+        self.assertEqual(result['telemetry_warning_count'], 1)
+        self.assertEqual(
+            result['telemetry_warnings'][0]['phase'],
+            'run_completed',
         )
 
     async def test_capture_recent_fundamentals_filters_to_requested_stock_codes(self):
@@ -591,6 +1368,250 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(repository.successes, [8])
         self.assertEqual(repository.terminals, [])
+
+    async def test_legacy_cfs_recovery_uses_only_hash_bound_exact_candidates(self):
+        class StandaloneOnlyClient(FakeCaptureClient):
+            async def fetch_financial_statements(self, **kwargs):
+                if kwargs['corp_code'] == 'no-data' and kwargs['fs_div'] == 'CFS':
+                    self.calls.append(kwargs)
+                    return {
+                        'status': '013',
+                        'message': 'No consolidated statements',
+                        'list': [],
+                    }
+                if kwargs['corp_code'] == 'no-data' and kwargs['fs_div'] == 'OFS':
+                    original_corp_code = kwargs['corp_code']
+                    kwargs = {**kwargs, 'corp_code': 'standalone-data'}
+                    payload = await super().fetch_financial_statements(**kwargs)
+                    self.calls[-1] = {
+                        **self.calls[-1],
+                        'corp_code': original_corp_code,
+                    }
+                    return payload
+                return await super().fetch_financial_statements(**kwargs)
+
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=StandaloneOnlyClient(),
+            repository=repository,
+        )
+        candidates = repository.list_legacy_cfs_no_data_recovery_candidates(
+            stock_codes=['333333'],
+            receipt_date_from=date(2026, 1, 1),
+            receipt_date_to=date(2026, 10, 30),
+            event_ids=[8],
+        )
+        repository.legacy_recovery_call_kwargs.clear()
+
+        result = await service.capture_recent_fundamentals(
+            limit=None,
+            force=False,
+            trigger='legacy_cfs_013_repair',
+            fs_div='CFS',
+            stock_codes=['333333'],
+            receipt_date_from=date(2026, 1, 1),
+            receipt_date_to=date(2026, 10, 30),
+            event_ids=[8],
+            exact_stock_code_manifest=['333333'],
+            legacy_cfs_no_data_recovery=True,
+            expected_recovery_candidate_manifest_sha256=(
+                legacy_cfs_recovery_candidate_manifest_sha256(candidates)
+            ),
+        )
+
+        self.assertEqual(result['events_captured'], 1)
+        self.assertEqual(result['results'][0]['fs_div'], 'OFS')
+        self.assertEqual(repository.candidate_call_kwargs, [])
+        self.assertEqual(
+            repository.legacy_recovery_call_kwargs[0],
+            {
+                'stock_codes': ['333333'],
+                'receipt_date_from': date(2026, 1, 1),
+                'receipt_date_to': date(2026, 10, 30),
+                'event_ids': [8],
+            },
+        )
+        self.assertEqual(
+            repository.legacy_recovery_call_kwargs[1:],
+            [
+                {
+                    'stock_codes': ['333333'],
+                    'receipt_date_from': date(2026, 4, 13),
+                    'receipt_date_to': date(2026, 4, 13),
+                    'event_ids': [8],
+                },
+                {
+                    'stock_codes': ['333333'],
+                    'receipt_date_from': date(2026, 4, 13),
+                    'receipt_date_to': date(2026, 4, 13),
+                    'event_ids': [8],
+                },
+            ],
+        )
+        created_metadata = repository.created_runs[0]['run_metadata']
+        self.assertEqual(
+            created_metadata['recovery_mode'],
+            'legacy_cfs_013_to_ofs_v1',
+        )
+
+    def test_legacy_recovery_manifest_fingerprints_provider_and_ranking_coordinates(self):
+        repository = FakeCaptureRepository()
+        candidate = repository.list_legacy_cfs_no_data_recovery_candidates(
+            stock_codes=['333333'],
+            receipt_date_from=date(2026, 1, 1),
+            receipt_date_to=date(2026, 10, 30),
+            event_ids=[8],
+        )[0]
+        baseline_hash = legacy_cfs_recovery_candidate_manifest_sha256(
+            [candidate]
+        )
+        mutations = {
+            'rcept_no': '20260413009999',
+            'corp_code': 'changed-corp',
+            'corp_name': 'Changed Corp',
+            'stock_code': '999999',
+            'report_nm': '사업보고서 (2024.12)',
+            'filing_category': 'semiannual_report',
+            'receipt_date': '2026-04-14',
+            'legacy_snapshot_id': 109,
+            'legacy_snapshot_rcept_no': '20260413009999',
+            'legacy_snapshot_corp_code': 'changed-corp',
+            'legacy_snapshot_stock_code': '999999',
+            'legacy_snapshot_filing_category': 'semiannual_report',
+            'legacy_business_year': 2024,
+            'legacy_report_code': '11012',
+            'legacy_fs_div': 'OFS',
+            'legacy_statement_type': 'separate',
+            'legacy_period_type': 'semiannual',
+            'legacy_period_end_month': 6,
+            'legacy_source_status': '000',
+            'legacy_fallback_from_status': '013',
+            'legacy_captured_at': '2026-04-14T01:02:03+00:00',
+        }
+        rejected_scope_mutations = {
+            'stock_code',
+            'legacy_snapshot_stock_code',
+            'legacy_fs_div',
+            'legacy_period_type',
+            'legacy_source_status',
+            'legacy_fallback_from_status',
+        }
+
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                mutated = {**candidate, field: value}
+                if field in rejected_scope_mutations:
+                    with self.assertRaises(ValueError):
+                        legacy_cfs_recovery_candidate_manifest_sha256(
+                            [mutated]
+                        )
+                else:
+                    self.assertNotEqual(
+                        legacy_cfs_recovery_candidate_manifest_sha256(
+                            [mutated]
+                        ),
+                        baseline_hash,
+                    )
+
+    async def test_legacy_recovery_revalidates_each_candidate_before_provider_calls(self):
+        original_repository = FakeCaptureRepository()
+        candidate = (
+            original_repository
+            .list_legacy_cfs_no_data_recovery_candidates(
+                stock_codes=['333333'],
+                receipt_date_from=date(2026, 1, 1),
+                receipt_date_to=date(2026, 10, 30),
+                event_ids=[8],
+            )[0]
+        )
+
+        class DriftingRecoveryRepository(FakeCaptureRepository):
+            def __init__(self):
+                super().__init__()
+                self.recovery_queries = 0
+
+            def list_legacy_cfs_no_data_recovery_candidates(self, **kwargs):
+                self.recovery_queries += 1
+                if self.recovery_queries == 1:
+                    return [dict(candidate)]
+                return [{**candidate, 'corp_code': 'changed-after-review'}]
+
+        class RecordingClient(FakeCaptureClient):
+            def __init__(self):
+                super().__init__()
+                self.company_overview_calls = []
+
+            async def fetch_company_overview(self, corp_code):
+                self.company_overview_calls.append(corp_code)
+                return await super().fetch_company_overview(corp_code)
+
+        repository = DriftingRecoveryRepository()
+        client = RecordingClient()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=None,
+            force=False,
+            trigger='legacy_cfs_013_repair',
+            fs_div='CFS',
+            stock_codes=['333333'],
+            receipt_date_from=date(2026, 1, 1),
+            receipt_date_to=date(2026, 10, 30),
+            event_ids=[8],
+            exact_stock_code_manifest=['333333'],
+            legacy_cfs_no_data_recovery=True,
+            expected_recovery_candidate_manifest_sha256=(
+                legacy_cfs_recovery_candidate_manifest_sha256([candidate])
+            ),
+        )
+
+        self.assertEqual(result['events_captured'], 0)
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(client.company_overview_calls, [])
+        self.assertEqual(repository.snapshots, [])
+        self.assertEqual(repository.successes, [])
+        self.assertEqual(repository.failures, [])
+        self.assertIn('candidate changed', result['results'][0]['error'])
+
+    async def test_legacy_cfs_recovery_rejects_broad_or_unbound_scope(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        invalid_cases = [
+            {'force': True},
+            {'limit': 20},
+            {'fs_div': 'OFS'},
+            {'event_ids': None},
+            {'expected_recovery_candidate_manifest_sha256': None},
+        ]
+        base = {
+            'limit': None,
+            'force': False,
+            'fs_div': 'CFS',
+            'stock_codes': ['333333'],
+            'receipt_date_from': date(2026, 1, 1),
+            'receipt_date_to': date(2026, 10, 30),
+            'event_ids': [8],
+            'exact_stock_code_manifest': ['333333'],
+            'legacy_cfs_no_data_recovery': True,
+            'expected_recovery_candidate_manifest_sha256': 'a' * 64,
+        }
+        for override in invalid_cases:
+            with self.subTest(override=override):
+                with self.assertRaises(ValueError):
+                    await service.capture_recent_fundamentals(
+                        **{**base, **override}
+                    )
+
+        self.assertEqual(repository.created_runs, [])
+        self.assertEqual(repository.candidate_call_kwargs, [])
+        self.assertEqual(repository.legacy_recovery_call_kwargs, [])
 
     async def test_capture_recent_fundamentals_keeps_failed_ofs_fallback_retryable(self):
         class FailingStandaloneFallbackClient(FakeCaptureClient):
@@ -870,6 +1891,248 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_selected'], 2)
         self.assertEqual(result['symbols_resolved'], 2)
         self.assertEqual(result['sync']['run_id'], 77)
+
+    async def test_backfill_current_universe_accepts_exact_active_stock_code_manifest(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+                {'symbol': '035420'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 88,
+                'status': 'completed',
+                'financial_report_events': 2,
+            },
+        ) as sync_disclosures:
+            result = await service.backfill_current_universe_fundamentals(
+                stock_codes=['035420', '000660', '035420'],
+                capture_limit=10,
+                fs_div='CFS',
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 10, 30),
+            )
+
+        self.assertEqual(result['scope'], 'targeted_active_universe')
+        self.assertEqual(result['requested_stock_codes'], ['035420', '000660'])
+        self.assertEqual(
+            result['requested_stock_code_manifest_sha256'],
+            'e1295df1fe3193c96103e255688328d197c5429ce655daf90010c01e1a0365ad',
+        )
+        self.assertEqual(result['symbol_offset'], 0)
+        self.assertEqual(result['symbol_limit'], 2)
+        self.assertEqual(result['symbols_selected'], 2)
+        self.assertEqual(result['capture']['scope'], 'targeted_active_universe')
+        self.assertEqual(
+            result['capture']['stock_code_manifest'],
+            ['035420', '000660'],
+        )
+        self.assertEqual(repository.stale_run_failures, [])
+        self.assertEqual(
+            repository.created_runs[-1]['trigger'],
+            'targeted_active_backfill',
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata']['scope'],
+            'targeted_active_universe',
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'root_stock_code_manifest'
+            ],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'stock_code_manifest'
+            ],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            repository.created_runs[-1]['run_metadata'][
+                'stale_run_reconciliation'
+            ],
+            'skipped_exact_scope',
+        )
+        self.assertEqual(
+            [
+                item['stock_code']
+                for item in sync_disclosures.call_args.kwargs['corporations']
+            ],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            sync_disclosures.call_args.kwargs['scope'],
+            'targeted_active_universe',
+        )
+        self.assertEqual(
+            sync_disclosures.call_args.kwargs['trigger'],
+            'targeted_active_backfill',
+        )
+        self.assertEqual(
+            sync_disclosures.call_args.kwargs['root_stock_code_manifest'],
+            ['035420', '000660'],
+        )
+
+    async def test_targeted_backfill_persists_root_manifest_when_sync_reduces_capture_scope(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '035420'},
+                {'symbol': '000660'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={
+                'run_id': 89,
+                'status': 'partial',
+                'financial_report_events': 1,
+                'failed_stock_codes': ['000660'],
+                'unattempted_stock_codes': [],
+            },
+        ):
+            result = await service.backfill_current_universe_fundamentals(
+                stock_codes=['035420', '000660'],
+                capture_limit=10,
+                fs_div='CFS',
+                start_date=date(2025, 1, 1),
+                end_date=date(2026, 10, 30),
+            )
+
+        run_metadata = repository.created_runs[-1]['run_metadata']
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(
+            run_metadata['root_stock_code_manifest'],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            run_metadata['stock_code_manifest'],
+            ['035420'],
+        )
+        self.assertNotEqual(
+            run_metadata['root_stock_code_manifest_sha256'],
+            run_metadata['stock_code_manifest_sha256'],
+        )
+        self.assertEqual(
+            result['capture']['root_stock_code_manifest'],
+            ['035420', '000660'],
+        )
+        self.assertEqual(
+            result['capture']['stock_code_manifest'],
+            ['035420'],
+        )
+
+    async def test_backfill_current_universe_rejects_blank_exact_manifest_token(self):
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+        ) as sync_disclosures:
+            with self.assertRaisesRegex(
+                ValueError,
+                'contains an invalid stock code',
+            ):
+                await service.backfill_current_universe_fundamentals(
+                    stock_codes=['005930', '', '000660'],
+                )
+
+        sync_disclosures.assert_not_called()
+
+    async def test_capture_rejects_root_manifest_without_exact_scope_before_stale_reconciliation(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'requires an exact capture manifest',
+        ):
+            await service.capture_recent_fundamentals(
+                stock_codes=['005930'],
+                root_stock_code_manifest=['005930'],
+            )
+
+        self.assertEqual(repository.stale_run_failures, [])
+        self.assertEqual(repository.created_runs, [])
+
+    async def test_capture_rejects_non_ascii_exact_stock_code_before_db_work(self):
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            'contains an invalid stock code',
+        ):
+            await service.capture_recent_fundamentals(
+                stock_codes=['１２３４５６'],
+                exact_stock_code_manifest=['１２３４５６'],
+            )
+
+        self.assertEqual(repository.stale_run_failures, [])
+        self.assertEqual(repository.created_runs, [])
+
+    async def test_backfill_current_universe_rejects_inactive_target_before_provider_calls(self):
+        client = FakeCaptureClient()
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=client,
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            daily_price_bar_bounds_loader=lambda: (
+                date(2026, 1, 2),
+                date(2026, 10, 30),
+            ),
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+        ) as sync_disclosures:
+            with self.assertRaisesRegex(
+                ValueError,
+                'requires active stock codes: 000660',
+            ):
+                await service.backfill_current_universe_fundamentals(
+                    stock_codes=['005930', '000660'],
+                    capture_limit=10,
+                )
+
+        sync_disclosures.assert_not_called()
 
     async def test_backfill_current_universe_marks_capture_limit_debt_partial_until_scope_is_drained(self):
         class DrainingCaptureRepository(FakeCaptureRepository):
@@ -1269,7 +2532,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result['piotroski_filter_error'])
         self.assertEqual(repository.successes, [4, 5])
         self.assertEqual([call['start_date'] for call in sync_calls], [date(2015, 1, 1), date(2026, 4, 2)])
-        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [4, 5])
+        self.assertIn(
+            [4, 5],
+            [
+                call['event_ids']
+                for call in repository.candidate_call_kwargs
+                if call['event_ids'] is not None
+            ],
+        )
         self.assertEqual(repository.completed_refresh_runs[-1][1]['status'], 'completed')
         self.assertEqual(
             repository.completed_refresh_runs[-1][1]['run_metadata']['updated_entries'],
@@ -1290,7 +2560,10 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         )
-        self.mock_piotroski_filter.assert_called_once_with(market_date=date(2026, 4, 14))
+        self.mock_piotroski_filter.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['000660', '005930', '123456'],
+        )
 
     async def test_daily_incremental_refresh_boundedly_probes_missing_symbols_in_recent_window(self):
         client = FakeCaptureClient()
@@ -1348,7 +2621,96 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             if item['state'] == 'missing_recent_probe_deferred'
         ]
         self.assertEqual(len(deferred), 2)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['successful_stock_codes'], ['222222'])
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['111111', '333333'],
+        )
+        self.assertIn('scope_retry_debt', result['partial_reasons'])
+        self.mock_piotroski_filter.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['222222'],
+        )
+
+    async def test_daily_incremental_refresh_admits_persisted_stale_symbols_without_provider_refresh(self):
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            stock_code: {
+                'stock_code': stock_code,
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2025-01-01',
+                'latest_resolved_fundamentals_receipt_date': '2025-01-01',
+                'latest_snapshot': {'id': index},
+                'latest_terminal_fundamentals_event': None,
+            }
+            for index, stock_code in enumerate(
+                ('005930', '000660'),
+                start=1,
+            )
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+        )
+
+        with patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            45,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                capture_limit=10,
+                fs_div='CFS',
+                trigger='test_daily',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
         self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['symbols_failed'], 0)
+        self.assertIsNone(result['failure_reason'])
+        self.assertEqual(result['successful_stock_codes'], ['000660', '005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertEqual(result['retry_debt_count'], 0)
+        self.assertEqual(result['symbols_fresh'], 0)
+        self.assertEqual(
+            result['maintenance_deferred_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(result['maintenance_deferred_count'], 2)
+        self.assertNotIn('scope_retry_debt', result['partial_reasons'])
+        self.assertEqual(
+            result['state_histogram'],
+            {'stale_incremental_backfill_deferred': 2},
+        )
+        completed_run = repository.completed_refresh_runs[-1][1]
+        self.assertEqual(completed_run['status'], 'completed')
+        self.assertEqual(completed_run['symbols_failed'], 0)
+        self.assertIsNone(completed_run['error_message'])
+        self.assertIsNone(completed_run['run_metadata']['failure_reason'])
+        self.assertEqual(
+            completed_run['run_metadata']['retry_debt_count'],
+            0,
+        )
+        self.assertEqual(
+            completed_run['run_metadata']['successful_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(
+            completed_run['run_metadata'][
+                'maintenance_deferred_stock_codes'
+            ],
+            ['000660', '005930'],
+        )
+        self.assertEqual(
+            completed_run['run_metadata']['state_histogram'],
+            {'stale_incremental_backfill_deferred': 2},
+        )
 
     async def test_daily_incremental_refresh_retries_failed_event_when_baseline_is_missing(self):
         client = FakeCaptureClient()
@@ -1393,7 +2755,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_missing'], 1)
         self.assertEqual(result['events_detected'], 1)
         self.assertEqual(result['events_captured'], 1)
-        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [7])
+        self.assertIn(
+            [7],
+            [
+                call['event_ids']
+                for call in repository.candidate_call_kwargs
+                if call['event_ids'] is not None
+            ],
+        )
         self.assertEqual(repository.successes, [7])
 
     async def test_daily_incremental_refresh_propagates_company_sync_failures_as_retryable_partial(self):
@@ -1806,7 +3175,14 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['triggered'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['events_detected'], 2)
-        self.assertEqual(repository.candidate_call_kwargs[-1]['event_ids'], [5, 11])
+        self.assertIn(
+            [5, 11],
+            [
+                call['event_ids']
+                for call in repository.candidate_call_kwargs
+                if call['event_ids'] is not None
+            ],
+        )
         self.assertEqual(repository.successes, [5, 11])
         self.assertNotIn(10, repository.successes)
 
@@ -2075,6 +3451,11 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             'market_date': '2026-04-14',
             'status': 'completed',
             'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_scope_outcome': (
+                    _exact_fundamentals_scope_outcome(['005930'])
+                ),
+            },
         }
         service = DartFundamentalsCaptureService(
             client=FakeCaptureClient(),
@@ -2087,6 +3468,906 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['triggered'])
         self.assertEqual(result['reason'], 'already_completed')
         self.assertEqual(repository.created_refresh_runs, [])
+
+    async def test_daily_incremental_refresh_reuses_its_own_persisted_exact_scope_on_second_call(self):
+        class PersistingRefreshRepository(FakeCaptureRepository):
+            def complete_refresh_run(self, run_id, **kwargs):
+                super().complete_refresh_run(run_id, **kwargs)
+                self.latest_refresh_run = {
+                    'id': run_id,
+                    'market_date': '2026-04-14',
+                    'status': kwargs['status'],
+                    'fs_div': 'CFS',
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != 'status'
+                    },
+                }
+
+        repository = PersistingRefreshRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-14',
+                'latest_resolved_fundamentals_receipt_date': '2026-04-14',
+                'latest_snapshot': {'id': 1},
+                'latest_terminal_fundamentals_event': None,
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        first = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            run_piotroski_followup=False,
+            run_feedback_followup=False,
+        )
+        second = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            run_piotroski_followup=False,
+            run_feedback_followup=False,
+        )
+
+        self.assertEqual(first['status'], 'completed')
+        self.assertFalse(second['triggered'])
+        self.assertEqual(second['reason'], 'already_completed')
+        self.assertEqual(len(repository.created_refresh_runs), 1)
+
+    async def test_daily_incremental_refresh_does_not_reuse_legacy_completed_run_without_exact_scope(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {'fundamentals_core_status': 'completed'},
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('new exact scope run reached')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'new exact scope run reached'):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_daily_incremental_refresh_does_not_reuse_completed_scope_with_retry_debt(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_core_status': 'completed',
+                'fundamentals_scope_outcome': (
+                    _exact_fundamentals_scope_outcome(
+                        ['005930'],
+                        retry_debt_stock_codes=['005930'],
+                    )
+                ),
+            },
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('retry debt must be reprocessed')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            'retry debt must be reprocessed',
+        ):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_daily_incremental_refresh_does_not_reuse_completed_run_for_disjoint_scope(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_core_status': 'completed',
+                'fundamentals_scope_outcome': (
+                    _exact_fundamentals_scope_outcome(['005930'])
+                ),
+            },
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('new exact scope run reached')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'new exact scope run reached'):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                symbols=['000660'],
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_daily_incremental_refresh_does_not_reuse_non_exhaustive_scope_manifest(self):
+        incomplete_outcome = _exact_fundamentals_scope_outcome(
+            ['005930', '000660']
+        )
+        incomplete_outcome['scope_outcome_manifest'] = [
+            incomplete_outcome['scope_outcome_manifest'][0]
+        ]
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 188,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'fs_div': 'CFS',
+            'run_metadata': {
+                'fundamentals_core_status': 'completed',
+                'fundamentals_scope_outcome': incomplete_outcome,
+            },
+        }
+        repository.create_refresh_run = Mock(
+            side_effect=RuntimeError('new exact scope run reached')
+        )
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'},
+                {'symbol': '000660'},
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'new exact scope run reached'):
+            await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+
+        repository.create_refresh_run.assert_called_once()
+
+    async def test_compound_refresh_preserves_core_failure_evidence(self):
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        repository = FakeCaptureRepository()
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {
+                'enabled': True,
+            },
+        )
+        failure_reason = (
+            'all_selected_symbols_stale_incremental_backfill_deferred'
+        )
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 188,
+                'status': 'failed',
+                'failure_reason': failure_reason,
+                'retry_debt_count': 1,
+                'state_histogram': {
+                    'stale_incremental_backfill_deferred': 1,
+                },
+                **_exact_fundamentals_scope_outcome(
+                    ['005930'],
+                    retry_debt_stock_codes=['005930'],
+                ),
+            }
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'failed',
+                'scan_status': 'failed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_count'], 1)
+        self.assertGreaterEqual(len(repository.completed_refresh_runs), 3)
+        self.assertTrue(
+            all(
+                completion['error_message'] == failure_reason
+                for _, completion in repository.completed_refresh_runs
+            )
+        )
+        self.assertTrue(
+            all(
+                completion['run_metadata']['fundamentals_failure_reason']
+                == failure_reason
+                for _, completion in repository.completed_refresh_runs
+            )
+        )
+
+    async def _compound_partial_reasons(self, *, fundamentals_retry_debt, issuance_ready):
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {'stock_code': stock_code, 'corp_code': f'corp-{stock_code}'}
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [{'symbol': '005930'}, {'symbol': '000660'}],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {'enabled': True},
+        )
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 190,
+                'status': 'partial' if fundamentals_retry_debt else 'completed',
+                'partial_reasons': ['scope_retry_debt'] if fundamentals_retry_debt else [],
+                'retry_debt_count': len(fundamentals_retry_debt),
+                **_exact_fundamentals_scope_outcome(
+                    ['000660', '005930'],
+                    retry_debt_stock_codes=fundamentals_retry_debt,
+                ),
+            }
+        )
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 902,
+                'status': 'completed',
+                'scan_status': 'completed',
+                'coverage_ready_stock_codes': issuance_ready,
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': [],
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 11, 6),
+                fs_div='CFS',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+        return result
+
+    async def test_fundamentals_only_retry_debt_is_not_labelled_share_issuance(self):
+        result = await self._compound_partial_reasons(
+            fundamentals_retry_debt=['000660'],
+            issuance_ready=['000660', '005930'],
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertIn('scope_retry_debt', result['partial_reasons'])
+        self.assertNotIn('share_issuance_scope_incomplete', result['partial_reasons'])
+
+    async def test_missing_issuance_evidence_is_labelled_share_issuance(self):
+        result = await self._compound_partial_reasons(
+            fundamentals_retry_debt=[],
+            issuance_ready=['005930'],
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertIn('share_issuance_scope_incomplete', result['partial_reasons'])
+
+    async def test_compound_refresh_propagates_core_database_failure(self):
+        service, _repository = self._build_global_followup_service()
+        service._run_daily_incremental_refresh.side_effect = SQLAlchemyError(
+            'fundamentals database unavailable'
+        )
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'failed',
+                'scan_status': 'failed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            },
+        ) as issuance:
+            with self.assertRaisesRegex(
+                SQLAlchemyError,
+                'fundamentals database unavailable',
+            ):
+                await service.run_daily_incremental_refresh(
+                    market_date=date(2026, 4, 14),
+                    fs_div='CFS',
+                )
+
+        issuance.assert_not_awaited()
+
+    async def test_compound_refresh_propagates_progress_callback_failure(self):
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [{'symbol': '005930'}],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {
+                'enabled': True,
+            },
+        )
+
+        def fail_progress(**_payload):
+            raise RuntimeError('pipeline tracking write failed')
+
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 901,
+                'status': 'failed',
+                'scan_status': 'failed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            },
+        ) as issuance:
+            with self.assertRaisesRegex(
+                DartFundamentalsProgressCallbackError,
+                'pipeline tracking write failed',
+            ):
+                await service.run_daily_incremental_refresh(
+                    market_date=date(2026, 4, 14),
+                    fs_div='CFS',
+                    progress_callback=fail_progress,
+                )
+
+        issuance.assert_not_awaited()
+
+    async def test_compound_refresh_persists_and_advances_baseline_repair_cursor(self):
+        stock_codes = ['000001', '000002', '000003']
+
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {
+                            'stock_code': stock_code,
+                            'corp_code': f'corp-{stock_code}',
+                        }
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        class CursorRepository(FakeCaptureRepository):
+            def complete_refresh_run(self, run_id, **kwargs):
+                super().complete_refresh_run(run_id, **kwargs)
+                self.latest_refresh_run = {
+                    'id': run_id,
+                    'market_date': '2026-04-14',
+                    'status': kwargs['status'],
+                    'fs_div': 'CFS',
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key != 'status'
+                    },
+                }
+
+        repository = CursorRepository()
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': stock_code} for stock_code in stock_codes
+            ],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda **_kwargs: {
+                'enabled': True,
+            },
+        )
+        core_outcome = _exact_fundamentals_scope_outcome(stock_codes)
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 188,
+                'status': 'completed',
+                **core_outcome,
+            }
+        )
+
+        async def repair(**kwargs):
+            requested = [
+                item['stock_code'] for item in kwargs['corporations']
+            ]
+            return {
+                'triggered': True,
+                'status': 'completed',
+                'successful_stock_codes': requested,
+                'incomplete_stock_codes': [],
+            }
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'partial',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': [],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': stock_codes,
+                },
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                side_effect=repair,
+            ) as repair_mock,
+            patch(
+                'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_missing_symbol_probe_limit',
+                1,
+            ),
+        ):
+            first = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+            )
+            second = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 15),
+                fs_div='CFS',
+            )
+
+        requested_batches = [
+            [
+                item['stock_code']
+                for item in call.kwargs['corporations']
+            ]
+            for call in repair_mock.await_args_list
+        ]
+        self.assertEqual(requested_batches, [['000001'], ['000002']])
+        self.assertEqual(
+            first['share_issuance_baseline_repair'][
+                'cursor_after_stock_code'
+            ],
+            '000001',
+        )
+        self.assertEqual(
+            second['share_issuance_baseline_repair'][
+                'previous_cursor_after_stock_code'
+            ],
+            '000001',
+        )
+        self.assertEqual(
+            repository.latest_refresh_run['run_metadata'][
+                'share_issuance_baseline_repair_cursor_after_stock_code'
+            ],
+            '000002',
+        )
+
+    async def test_compound_refresh_orders_issuance_before_piotroski_and_feedback(self):
+        service, repository = self._build_global_followup_service()
+        call_order = []
+        core_result = dict(
+            service._run_daily_incremental_refresh.return_value
+        )
+
+        async def run_core(**kwargs):
+            call_order.append('fundamentals')
+            self.assertFalse(kwargs['run_piotroski_followup'])
+            self.assertFalse(kwargs['run_feedback_followup'])
+            return core_result
+
+        async def run_global_scan(**_kwargs):
+            call_order.append('global_scan')
+            return {
+                'run_id': 901,
+                'status': 'partial',
+                'scan_status': 'completed',
+                'coverage_ready_stock_codes': [],
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': ['005930'],
+            }
+
+        async def run_baseline_repair(**_kwargs):
+            call_order.append('baseline_repair')
+            return {
+                'triggered': True,
+                'status': 'completed',
+                'successful_stock_codes': ['005930'],
+                'incomplete_stock_codes': [],
+            }
+
+        piotroski_result = {
+            'market_date': '2026-04-14',
+            'results_persisted': 1,
+            'results_failed': 0,
+        }
+
+        def run_piotroski(**_kwargs):
+            call_order.append('piotroski')
+            return piotroski_result
+
+        def inspect_prerequisites(**kwargs):
+            call_order.append('feedback_prerequisites')
+            self.assertEqual(kwargs['symbols'], ['005930'])
+            persisted_scope = repository.completed_refresh_runs[-1][1][
+                'run_metadata'
+            ]
+            self.assertEqual(
+                persisted_scope['successful_stock_codes'],
+                ['005930'],
+            )
+            self.assertEqual(
+                persisted_scope['retry_debt_stock_codes'],
+                [],
+            )
+            return _feedback_prerequisites()
+
+        feedback_result = {'completed': True, 'final_pending': 0}
+
+        def run_feedback(**kwargs):
+            call_order.append('feedback')
+            self.assertEqual(kwargs['config'].symbols, ('005930',))
+            return feedback_result
+
+        service._run_daily_incremental_refresh.side_effect = run_core
+        self.mock_piotroski_filter.side_effect = run_piotroski
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                side_effect=run_global_scan,
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                side_effect=run_baseline_repair,
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=inspect_prerequisites,
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                side_effect=run_feedback,
+            ),
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        self.assertEqual(
+            call_order,
+            [
+                'fundamentals',
+                'global_scan',
+                'baseline_repair',
+                'piotroski',
+                'feedback_prerequisites',
+                'feedback',
+            ],
+        )
+        self.mock_piotroski_filter.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            symbols=['005930'],
+        )
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['piotroski_filter'], piotroski_result)
+        self.assertEqual(result['feedback_followup'], feedback_result)
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['piotroski_filter_followup'], piotroski_result)
+        self.assertEqual(metadata['feedback_followup'], feedback_result)
+        self.assertEqual(metadata['compound_status'], 'completed')
+
+    async def test_compound_refresh_runs_followups_only_for_ready_subset(self):
+        service, repository = self._build_global_followup_service(
+            ['000660', '005930']
+        )
+
+        def run_piotroski(**kwargs):
+            self.assertEqual(kwargs['symbols'], ['000660'])
+            pre_followup = repository.completed_refresh_runs[-1][1]
+            self.assertEqual(pre_followup['status'], 'partial')
+            self.assertEqual(
+                pre_followup['run_metadata']['successful_stock_codes'],
+                ['000660'],
+            )
+            self.assertEqual(
+                pre_followup['run_metadata']['retry_debt_stock_codes'],
+                ['005930'],
+            )
+            self.assertEqual(
+                pre_followup['run_metadata'][
+                    'piotroski_filter_followup_state'
+                ],
+                'pending',
+            )
+            return {'results_persisted': 1, 'results_failed': 0}
+
+        self.mock_piotroski_filter.side_effect = run_piotroski
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'partial',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': ['000660'],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': ['005930'],
+                },
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                return_value={
+                    'triggered': True,
+                    'status': 'partial',
+                    'successful_stock_codes': [],
+                    'incomplete_stock_codes': ['005930'],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ) as prerequisites,
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+                return_value={'completed': True},
+            ) as feedback,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['successful_stock_codes'], ['000660'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+        prerequisites.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            fs_div='CFS',
+            symbols=['000660'],
+        )
+        self.assertEqual(feedback.call_args.kwargs['config'].symbols, ('000660',))
+
+    async def test_compound_refresh_skips_followups_when_all_symbols_are_debt(self):
+        service, repository = self._build_global_followup_service(
+            ['000660', '005930']
+        )
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'partial',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': [],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': ['000660', '005930'],
+                },
+            ),
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+                new_callable=AsyncMock,
+                return_value={
+                    'triggered': True,
+                    'status': 'partial',
+                    'successful_stock_codes': [],
+                    'incomplete_stock_codes': ['000660', '005930'],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            ) as prerequisites,
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        self.mock_piotroski_filter.assert_not_called()
+        prerequisites.assert_not_called()
+        feedback.assert_not_called()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['successful_stock_codes'], [])
+        self.assertEqual(
+            result['retry_debt_stock_codes'],
+            ['000660', '005930'],
+        )
+        self.assertEqual(
+            result['piotroski_filter']['reason'],
+            'no_compound_ready_symbols',
+        )
+        self.assertEqual(
+            result['feedback_followup']['reason'],
+            'piotroski_filter_followup_incomplete',
+        )
+        self.assertEqual(
+            repository.completed_refresh_runs[-1][1]['status'],
+            'failed',
+        )
+
+    async def test_compound_refresh_is_partial_when_piotroski_persistence_is_incomplete(self):
+        service, repository = self._build_global_followup_service()
+        self.mock_piotroski_filter.return_value = {
+            'market_date': '2026-04-14',
+            'results_persisted': 0,
+            'results_failed': 1,
+            'failed_symbols': ['005930'],
+        }
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'completed',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': ['005930'],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': [],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback_followup,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        feedback_followup.assert_not_called()
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn(
+            'piotroski_filter_persistence_incomplete',
+            result['partial_reasons'],
+        )
+        self.assertEqual(
+            result['feedback_followup']['reason'],
+            'piotroski_filter_followup_incomplete',
+        )
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['compound_status'], 'partial')
+        self.assertIn(
+            'piotroski_filter_persistence_incomplete',
+            metadata['partial_reasons'],
+        )
+        self.assertEqual(
+            metadata['piotroski_filter_followup']['failed_symbols'],
+            ['005930'],
+        )
+
+    async def test_compound_refresh_is_partial_when_piotroski_raises(self):
+        service, repository = self._build_global_followup_service()
+        self.mock_piotroski_filter.side_effect = RuntimeError(
+            'piotroski persistence unavailable'
+        )
+
+        with (
+            patch(
+                'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+                new_callable=AsyncMock,
+                return_value={
+                    'run_id': 901,
+                    'status': 'completed',
+                    'scan_status': 'completed',
+                    'coverage_ready_stock_codes': ['005930'],
+                    'decision_ready_positive_stock_codes': [],
+                    'retry_debt_stock_codes': [],
+                },
+            ),
+            patch(
+                'app.dart.fundamentals_capture_service.agent_feedback_retry_service.run_retry_cycles',
+            ) as feedback_followup,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                fs_div='CFS',
+                run_feedback_followup=True,
+            )
+
+        feedback_followup.assert_not_called()
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn(
+            'piotroski_filter_followup_failed',
+            result['partial_reasons'],
+        )
+        self.assertIsNone(result['piotroski_filter'])
+        self.assertEqual(
+            result['piotroski_filter_error'],
+            'piotroski persistence unavailable',
+        )
+        metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
+        self.assertEqual(metadata['compound_status'], 'partial')
+        self.assertEqual(
+            metadata['piotroski_filter_followup_error'],
+            'piotroski persistence unavailable',
+        )
+        self.assertEqual(
+            metadata['feedback_followup']['reason'],
+            'piotroski_filter_followup_incomplete',
+        )
 
 
 class InferFundamentalsRequestTests(unittest.TestCase):

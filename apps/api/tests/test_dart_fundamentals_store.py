@@ -7,8 +7,11 @@ from uuid import uuid4
 from app.agent_context.reuse_service import AgentContextReuseService
 from app.dart.fundamentals_store import (
     DartFundamentalsRepository,
+    FundamentalsCaptureCandidateDriftError,
+    LegacyCfsRecoveryCandidateDriftError,
     eligible_fundamentals_fs_divs,
     is_usable_fundamentals_source_status,
+    legacy_cfs_recovery_candidate_identity,
 )
 from app.db import session_scope
 from app.db_models import (
@@ -23,6 +26,33 @@ from sqlalchemy import delete, select
 
 
 class FundamentalsSourceStatusTests(unittest.TestCase):
+    @staticmethod
+    def _legacy_recovery_candidate(stock_code: str) -> dict:
+        return {
+            'event_id': 1,
+            'legacy_snapshot_id': 2,
+            'legacy_business_year': 2025,
+            'stock_code': stock_code,
+            'rcept_no': '20260301000000',
+            'corp_code': '00126380',
+            'corp_name': '테스트',
+            'report_nm': '사업보고서',
+            'filing_category': 'annual_report',
+            'receipt_date': '2026-03-01',
+            'legacy_snapshot_rcept_no': '20260301000000',
+            'legacy_snapshot_corp_code': '00126380',
+            'legacy_snapshot_stock_code': stock_code,
+            'legacy_snapshot_filing_category': 'annual_report',
+            'legacy_report_code': '11011',
+            'legacy_fs_div': 'CFS',
+            'legacy_statement_type': 'consolidated',
+            'legacy_period_type': 'annual',
+            'legacy_period_end_month': 12,
+            'legacy_source_status': '013',
+            'legacy_fallback_from_status': None,
+            'legacy_captured_at': '2026-03-01T12:00:00+00:00',
+        }
+
     def test_only_success_status_is_eligible_for_factor_inputs(self):
         self.assertTrue(is_usable_fundamentals_source_status('000'))
         self.assertFalse(is_usable_fundamentals_source_status('013'))
@@ -72,6 +102,17 @@ class FundamentalsSourceStatusTests(unittest.TestCase):
             order_by_sql.index('rcept_no DESC'),
             order_by_sql.index('CASE WHEN'),
         )
+
+    def test_legacy_recovery_identity_accepts_alpha_and_rejects_malformed(self):
+        identity = legacy_cfs_recovery_candidate_identity(
+            self._legacy_recovery_candidate('00088K')
+        )
+
+        self.assertEqual(identity['stock_code'], '00088K')
+        with self.assertRaisesRegex(ValueError, 'stock identity is malformed'):
+            legacy_cfs_recovery_candidate_identity(
+                self._legacy_recovery_candidate('ABC123')
+            )
 
 
 class DartFundamentalsRepositoryTests(unittest.TestCase):
@@ -145,6 +186,7 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         report_code: str = '11011',
         fs_div: str = 'CFS',
         source_status: str | None = '000',
+        request_payload: dict | None = None,
         rcept_no: str | None = None,
         disclosure_event_id: int | None = None,
     ) -> tuple[int, int]:
@@ -193,7 +235,7 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
                 currency='KRW',
                 source_status=source_status,
                 source_message='OK',
-                request_payload={},
+                request_payload=request_payload or {},
                 response_payload={},
             )
             session.add(snapshot)
@@ -204,6 +246,365 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
 
         self.created_snapshot_ids.append(snapshot_id)
         return event_id, snapshot_id
+
+    def test_legacy_cfs_no_data_recovery_candidates_are_latest_exact_and_unproven(self):
+        recoverable = f'T{uuid4().hex[:10]}'.upper()
+        newer_success = f'T{uuid4().hex[:10]}'.upper()
+        already_fallback = f'T{uuid4().hex[:10]}'.upper()
+        terminal_proof = f'T{uuid4().hex[:10]}'.upper()
+
+        recoverable_event_id, recoverable_snapshot_id = (
+            self._create_event_snapshot(
+                stock_code=recoverable,
+                receipt_date=date(2026, 3, 18),
+                capture_status='captured',
+                business_year=2025,
+                source_status='013',
+            )
+        )
+        self._create_event_snapshot(
+            stock_code=newer_success,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2024,
+            source_status='013',
+        )
+        self._create_event_snapshot(
+            stock_code=newer_success,
+            receipt_date=date(2026, 3, 19),
+            capture_status='captured',
+            business_year=2025,
+            source_status='000',
+        )
+        self._create_event_snapshot(
+            stock_code=already_fallback,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2025,
+            source_status='013',
+            request_payload={
+                'requested_fs_div': 'CFS',
+                'fallback_from_status': '013',
+            },
+        )
+        terminal_event_id, _ = self._create_event_snapshot(
+            stock_code=terminal_proof,
+            receipt_date=date(2026, 3, 18),
+            capture_status='no_data',
+            business_year=2025,
+            source_status='013',
+        )
+        with session_scope() as session:
+            terminal_event = session.get(
+                DartDisclosureEvent,
+                terminal_event_id,
+            )
+            terminal_event.fundamentals_last_error = (
+                'CFS [013] no consolidated statements; '
+                'OFS [013]: no standalone statements'
+            )
+
+        candidates = (
+            self.repository.list_legacy_cfs_no_data_recovery_candidates(
+                stock_codes=[
+                    recoverable,
+                    newer_success,
+                    already_fallback,
+                    terminal_proof,
+                ],
+                receipt_date_from=date(2026, 1, 1),
+                receipt_date_to=date(2026, 10, 30),
+            )
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]['id'], recoverable_event_id)
+        self.assertEqual(candidates[0]['stock_code'], recoverable)
+        self.assertEqual(
+            candidates[0]['legacy_snapshot_id'],
+            recoverable_snapshot_id,
+        )
+        self.assertEqual(candidates[0]['legacy_source_status'], '013')
+
+    def test_legacy_recovery_excludes_event_snapshot_stock_code_drift(self):
+        original_stock_code = f'T{uuid4().hex[:10]}'.upper()
+        event_id, _ = self._create_event_snapshot(
+            stock_code=original_stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2025,
+            source_status='013',
+        )
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            event.stock_code = f'T{uuid4().hex[:10]}'.upper()
+
+        candidates = (
+            self.repository.list_legacy_cfs_no_data_recovery_candidates(
+                stock_codes=[original_stock_code],
+                receipt_date_from=date(2026, 1, 1),
+                receipt_date_to=date(2026, 10, 30),
+            )
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_legacy_recovery_newer_snapshot_outside_window_tombstones_old_013(self):
+        stock_code = f'T{uuid4().hex[:10]}'.upper()
+        self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 10, 30),
+            capture_status='captured',
+            business_year=2025,
+            source_status='013',
+        )
+        self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 10, 31),
+            capture_status='captured',
+            business_year=2025,
+            source_status='000',
+        )
+
+        candidates = (
+            self.repository.list_legacy_cfs_no_data_recovery_candidates(
+                stock_codes=[stock_code],
+                receipt_date_from=date(2026, 1, 1),
+                receipt_date_to=date(2026, 10, 30),
+            )
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_atomic_snapshot_publication_rolls_back_when_event_success_write_fails(self):
+        stock_code = f'T{uuid4().hex[:10]}'.upper()
+        event_id, _ = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='failed',
+            business_year=2025,
+            source_status='013',
+        )
+        run_id = self._create_run(trigger='atomic_publication_test')
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            event_identity = {
+                'rcept_no': event.rcept_no,
+                'corp_code': event.corp_code,
+                'corp_name': event.corp_name,
+                'stock_code': event.stock_code,
+                'filing_category': event.filing_category,
+            }
+
+        with patch.object(
+            self.repository,
+            '_mark_event_capture_success_in_session',
+            side_effect=RuntimeError('simulated event status failure'),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'simulated event status failure',
+            ):
+                self.repository.replace_snapshot_dataset_and_mark_event_success(
+                    event_id=event_id,
+                    capture_run_id=run_id,
+                    snapshot_payload={
+                        **event_identity,
+                        'business_year': 2025,
+                        'report_code': '11011',
+                        'fs_div': 'OFS',
+                        'statement_type': 'separate',
+                        'period_type': 'annual',
+                        'period_end_month': 12,
+                        'currency': 'KRW',
+                        'source_status': '000',
+                        'source_message': 'OK',
+                        'request_payload': {
+                            'requested_fs_div': 'CFS',
+                            'fallback_from_status': '013',
+                        },
+                        'response_payload': {'status': '000', 'list': []},
+                    },
+                    row_payloads=[],
+                    highlight_payloads=[],
+                )
+
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            ofs_snapshot = session.execute(
+                select(DartFundamentalsSnapshot).where(
+                    DartFundamentalsSnapshot.disclosure_event_id == event_id,
+                    DartFundamentalsSnapshot.fs_div == 'OFS',
+                )
+            ).scalar_one_or_none()
+            self.assertEqual(event.fundamentals_capture_status, 'failed')
+            self.assertIsNone(ofs_snapshot)
+
+    def test_force_refresh_failure_preserves_existing_usable_capture(self):
+        stock_code = f'T{uuid4().hex[:10]}'.upper()
+        event_id, snapshot_id = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2025,
+            source_status='000',
+        )
+        expected_event = {
+            'id': event_id,
+            'fundamentals_capture_status': 'captured',
+            'fundamentals_capture_attempts': 0,
+        }
+
+        published = self.repository.mark_event_capture_failed(
+            event_id,
+            error_message='provider temporarily unavailable',
+            expected_event=expected_event,
+        )
+        terminal_published = self.repository.mark_event_capture_terminal(
+            event_id,
+            capture_status='no_data',
+            error_message='provider returned no data',
+            expected_event=expected_event,
+        )
+
+        self.assertFalse(published)
+        self.assertFalse(terminal_published)
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            snapshot = session.get(DartFundamentalsSnapshot, snapshot_id)
+            self.assertEqual(event.fundamentals_capture_status, 'captured')
+            self.assertEqual(event.fundamentals_capture_attempts, 0)
+            self.assertIsNone(event.fundamentals_last_error)
+            self.assertEqual(snapshot.source_status, '000')
+
+    def test_unknown_commit_readback_requires_exact_publication_identity(self):
+        stock_code = f'T{uuid4().hex[:10]}'.upper()
+        event_id, _ = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='failed',
+            business_year=2025,
+            source_status='013',
+        )
+        run_id = self._create_run(trigger='unknown_commit_readback_test')
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            event_identity = {
+                'rcept_no': event.rcept_no,
+                'corp_code': event.corp_code,
+                'corp_name': event.corp_name,
+                'stock_code': event.stock_code,
+                'filing_category': event.filing_category,
+            }
+
+        snapshot_id = (
+            self.repository.replace_snapshot_dataset_and_mark_event_success(
+                event_id=event_id,
+                capture_run_id=run_id,
+                snapshot_payload={
+                    **event_identity,
+                    'business_year': 2025,
+                    'report_code': '11011',
+                    'fs_div': 'CFS',
+                    'statement_type': 'consolidated',
+                    'period_type': 'annual',
+                    'period_end_month': 12,
+                    'currency': 'KRW',
+                    'source_status': '000',
+                    'source_message': 'OK',
+                    'request_payload': {},
+                    'response_payload': {'status': '000'},
+                },
+                row_payloads=[],
+                highlight_payloads=[],
+            )
+        )
+
+        self.assertEqual(
+            self.repository.find_committed_snapshot_publication(
+                event_id=event_id,
+                capture_run_id=run_id,
+                rcept_no=event_identity['rcept_no'],
+                business_year=2025,
+                report_code='11011',
+                fs_div='CFS',
+            ),
+            snapshot_id,
+        )
+        self.assertIsNone(
+            self.repository.find_committed_snapshot_publication(
+                event_id=event_id,
+                capture_run_id=run_id + 1,
+                rcept_no=event_identity['rcept_no'],
+                business_year=2025,
+                report_code='11011',
+                fs_div='CFS',
+            )
+        )
+
+    def test_stale_failure_cannot_overwrite_concurrent_capture_success(self):
+        stock_code = f'T{uuid4().hex[:10]}'.upper()
+        event_id, _ = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='pending',
+            business_year=2025,
+            source_status='000',
+        )
+        stale_candidate = {
+            'id': event_id,
+            'fundamentals_capture_status': 'pending',
+            'fundamentals_capture_attempts': 0,
+        }
+        self.repository.mark_event_capture_success(event_id)
+
+        with self.assertRaises(FundamentalsCaptureCandidateDriftError):
+            self.repository.mark_event_capture_failed(
+                event_id,
+                error_message='late provider failure',
+                expected_event=stale_candidate,
+            )
+
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            self.assertEqual(event.fundamentals_capture_status, 'captured')
+            self.assertEqual(event.fundamentals_capture_attempts, 1)
+            self.assertIsNone(event.fundamentals_last_error)
+
+    def test_conditional_failure_write_rejects_candidate_coordinate_drift(self):
+        stock_code = f'{int(uuid4().hex[:8], 16) % 1_000_000:06d}'
+        event_id, _ = self._create_event_snapshot(
+            stock_code=stock_code,
+            receipt_date=date(2026, 3, 18),
+            capture_status='captured',
+            business_year=2025,
+            source_status='013',
+        )
+        candidates = (
+            self.repository.list_legacy_cfs_no_data_recovery_candidates(
+                stock_codes=[stock_code],
+                receipt_date_from=date(2026, 1, 1),
+                receipt_date_to=date(2026, 10, 30),
+                event_ids=[event_id],
+            )
+        )
+        self.assertEqual(len(candidates), 1)
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            event.corp_code = f'C{uuid4().hex[:8]}'
+
+        with self.assertRaises(LegacyCfsRecoveryCandidateDriftError):
+            self.repository.mark_event_capture_failed(
+                event_id,
+                error_message='provider temporarily unavailable',
+                expected_recovery_candidate=candidates[0],
+            )
+
+        with session_scope() as session:
+            event = session.get(DartDisclosureEvent, event_id)
+            self.assertEqual(event.fundamentals_capture_status, 'captured')
+            self.assertEqual(event.fundamentals_capture_attempts, 0)
+            self.assertIsNone(event.fundamentals_last_error)
 
     def _create_financial_event(
         self,

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent_context import orchestrator as orchestrator_module
+from app.agent_context import orchestrator_helpers as orchestrator_helpers_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator, OpenClawAgentClient
 from app.agent_context.orchestrator_helpers import (
     build_decider_input_generation,
@@ -47,6 +48,140 @@ def _attach_response_correlation(result: dict, *, expected_symbols: list[str]) -
     result['decoded'] = decoded
     result['response_correlation'] = response_correlation
     return result
+
+
+class CanonicalDeciderPriceGuardTests(unittest.TestCase):
+    def test_rejects_missing_stale_and_nonpositive_canonical_price(self):
+        validate = getattr(
+            orchestrator_helpers_module,
+            'canonical_decider_price_issue',
+            None,
+        )
+        self.assertTrue(callable(validate))
+
+        cases = (
+            ({'symbol': '005930'}, 'canonical_price_context_missing'),
+            (
+                {
+                    'symbol': '005930',
+                    'price_context': {
+                        'trade_date': '2026-04-13',
+                        'close_price': 71000,
+                    },
+                },
+                'canonical_price_context_date_mismatch',
+            ),
+            (
+                {
+                    'symbol': '005930',
+                    'price_context': {
+                        'trade_date': '2026-04-14',
+                        'close_price': None,
+                    },
+                },
+                'canonical_price_context_close_invalid',
+            ),
+        )
+        for item, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                issue = validate(
+                    item=item,
+                    market_date=date(2026, 4, 14),
+                )
+                self.assertEqual(issue['code'], expected_code)
+
+        self.assertIsNone(
+            validate(
+                item={
+                    'symbol': '005930',
+                    'price_context': {
+                        'trade_date': '2026-04-14',
+                        'close_price': 71000,
+                    },
+                },
+                market_date=date(2026, 4, 14),
+            )
+        )
+
+    def test_decider_dispatch_excludes_only_symbol_with_stale_price(self):
+        service = AgentFeedbackOrchestrator()
+        all_failures: list[dict] = []
+        buffered_failures: list[tuple[tuple, dict]] = []
+
+        def buffer_failure(*args, **kwargs):
+            buffered_failures.append((args, kwargs))
+
+        symbol_context_items = [
+            {
+                'symbol': '005930',
+                'price_context': {
+                    'trade_date': '2026-04-13',
+                    'close_price': 71000,
+                },
+            },
+            {
+                'symbol': '000660',
+                'price_context': {
+                    'trade_date': '2026-04-14',
+                    'close_price': 185000,
+                },
+            },
+        ]
+
+        with (
+            patch.object(
+                service,
+                '_build_decider_policy_context',
+                return_value={},
+            ),
+            patch.object(
+                service,
+                '_build_upstream_feedback_bundle',
+                return_value=({}, {}, []),
+            ),
+            patch.object(
+                service,
+                '_build_signal_decider_payload',
+                side_effect=lambda **kwargs: {
+                    'symbol': kwargs['item']['symbol'],
+                },
+            ),
+            patch.object(
+                orchestrator_module.signal_decider_market_context_builder,
+                'build',
+                return_value={},
+            ),
+        ):
+            dispatch_items = service._prepare_role_dispatch_items(
+                role='signal-decider',
+                market_date=date(2026, 4, 14),
+                policy_context_as_of_date=date(2026, 4, 14),
+                request_run_id='canonical-price-guard-test',
+                symbol_context_items=symbol_context_items,
+                source_context_scope_symbols=['005930', '000660'],
+                eligibility_scope_symbols=['005930', '000660'],
+                fs_div='CFS',
+                disclosures_limit=10,
+                source_knowledge_cutoff_at='2026-04-14T06:30:00+00:00',
+                upstream_summary_run_id=None,
+                reuse_decisions={},
+                previous_decision_context_decisions={},
+                upstream_reuse_decisions={},
+                all_failures=all_failures,
+                buffer_failure=buffer_failure,
+            )
+
+        self.assertEqual(
+            [item['symbol'] for item in dispatch_items],
+            ['000660'],
+        )
+        self.assertEqual(len(all_failures), 1)
+        self.assertEqual(all_failures[0]['symbol'], '005930')
+        self.assertEqual(
+            all_failures[0]['error'],
+            'canonical_price_context_date_mismatch',
+        )
+        self.assertEqual(len(buffered_failures), 1)
 
 
 def _batch_result(symbol: str) -> dict:
@@ -1733,6 +1868,88 @@ class ResponseIntegrityGuardTests(unittest.TestCase):
         )
         self.assertEqual(failures[0]['diagnostics']['session_cleanup']['status'], 'deleted')
 
+    def test_incomplete_wait_geometry_is_retryable_and_never_persisted(self):
+        payload = _complete_actionable_signal_feedback()
+        payload.update(
+            {
+                'preferred_action': 'wait',
+                'next_day_open_action': 'wait',
+                'wait_reason': {
+                    'code': 'unsuitable_execution_timing',
+                    'summary': '구체적인 진입 트리거를 산출할 근거가 부족합니다.',
+                },
+                'entry_price_basis': 'next_open',
+                'trigger_price': None,
+                'chase_limit_price': None,
+                'expected_return_pct': None,
+                'trigger_conditions': [],
+            }
+        )
+        normalized = orchestrator_module.normalize_agent_response(
+            role='signal-decider',
+            output_text=json.dumps(payload, ensure_ascii=False),
+            raw_response=payload,
+            market_date='2026-04-23',
+            symbol='005930',
+            agent_name='signal-decider',
+        )
+        self.assertFalse(normalized['response_contract_valid'])
+
+        store_calls: list[dict] = []
+
+        class Client:
+            @staticmethod
+            def dispatch(**kwargs):
+                return {
+                    'normalized_feedback': normalized,
+                    'session_ref': {
+                        'session_key': kwargs['payload']['session_key']
+                    },
+                }
+
+        class Orchestrator:
+            @staticmethod
+            def _get_client():
+                return Client()
+
+            @staticmethod
+            def _store_feedback(**kwargs):
+                store_calls.append(kwargs)
+                raise AssertionError(
+                    'invalid WAIT feedback must not reach persistence or snapshots'
+                )
+
+            @staticmethod
+            def _cleanup_session_key(**kwargs):
+                return {
+                    'status': 'deleted',
+                    'session_key': kwargs['session_key'],
+                }
+
+        items, failures = dispatch_and_store(
+            Orchestrator(),
+            market_date=date(2026, 4, 23),
+            request_run_id='incomplete-wait-geometry',
+            specs=[
+                SimpleNamespace(
+                    role='signal-decider',
+                    agent_name='signal-decider',
+                )
+            ],
+            payloads={'signal-decider': {'trade_date': '2026-04-23'}},
+            symbol='005930',
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(store_calls, [])
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0]['retryable'])
+        self.assertTrue(
+            failures[0]['failure_kind'].startswith(
+                'response_contract_invalid:action_requirement_invalid:'
+            )
+        )
+
     def test_single_dispatch_cleanup_failure_does_not_mask_contract_failure(self):
         class Client:
             @staticmethod
@@ -2797,6 +3014,109 @@ class RepairJsonTailTests(unittest.TestCase):
             'signal_envelope_v1',
         )
 
+    def test_compressed_actual_signal_decider_payload_keeps_signal_and_market_contexts(self):
+        market_context = {
+            'market': 'KOSPI',
+            'market_state': 'closed',
+            'breadth': {'advancers': 510, 'decliners': 380},
+        }
+        payload = build_signal_decider_payload(
+            item={
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'price_context': {'close_price': 71000, 'volume': 120000},
+                'scores': {
+                    'momentum': {
+                        'status': 'available',
+                        'score': 0.91,
+                    }
+                },
+                'factor_summary': {
+                    'requested_market_date': '2026-04-14',
+                    'factor_scores': {
+                        'momentum': {
+                            'status': 'available',
+                            'score': 0.91,
+                            'components_used': 3,
+                            'components_possible': 3,
+                        }
+                    },
+                },
+                'liquidity_context': {'turnover': {'trading_value_krw': 8520000000}},
+                'decider_data_quality_context': {'status': 'available'},
+                'decision_input_quality_context': {
+                    'final_judgment': {'hard_blocks': []},
+                },
+                'pre_decider_enrichment_context': {'status': 'available'},
+                'market_regime_context': {'posture': 'normal'},
+                'macro_context': {
+                    'status': 'available',
+                    'macro_regime_summary': {'growth_label': 'growth_stable'},
+                },
+                'signal_envelopes': [
+                    {
+                        'schema_version': 'signal_envelope_v1',
+                        'source_name': 'price:daily',
+                        'source_type': 'market_data',
+                        'symbol': '005930',
+                        'market_date': '2026-04-14',
+                        'summary': '정규장 종가와 거래량이 확정됐습니다.',
+                    }
+                ],
+            },
+            market_date=date(2026, 4, 14),
+            request_run_id='request-run-compression-regression',
+            market_context=market_context,
+            upstream_summaries={
+                'technical-summarizer': {
+                    'summary': '추세와 거래량이 양호합니다.',
+                }
+            },
+            upstream_traceability={
+                'technical-summarizer': {'run_id': 'technical-run-1'},
+            },
+            signal_decider_agent_name='signal-decider',
+            signal_decider_policy={},
+        )
+        payload['source_revalidation_request'] = {
+            'schema_version': 'decider_source_revalidation_request_v1',
+        }
+        payload['decision_input_generation_fence'] = {
+            'schema_version': 'decision_input_generation_fence_v1',
+            'enforcement': 'required',
+        }
+
+        compressed = compressed_batch_item_for_prompt(payload)
+
+        self.assertIsInstance(compressed['signal_envelopes'], list)
+        self.assertEqual(
+            compressed['signal_envelopes'][0]['source_name'],
+            'price:daily',
+        )
+        self.assertEqual(compressed['market_context'], market_context)
+        self.assertEqual(
+            compressed['symbol_day_context']['price_context']['close_price'],
+            71000,
+        )
+        self.assertEqual(
+            compressed['liquidity_context']['turnover']['trading_value_krw'],
+            8520000000,
+        )
+        self.assertEqual(compressed['macro_context']['status'], 'available')
+        self.assertEqual(compressed['scores']['momentum']['score'], 0.91)
+        self.assertEqual(
+            compressed['factor_summary']['factor_scores']['momentum']['score'],
+            0.91,
+        )
+        self.assertEqual(
+            compressed['core_post_response_revalidation']['status'],
+            'enforced_by_core_after_model_response',
+        )
+        self.assertEqual(
+            compressed['narrative_execution_authority']['status'],
+            'noncanonical_narratives_are_not_current_execution_evidence',
+        )
+
     def test_build_signal_decider_payload_preserves_degraded_macro_context_statuses(self):
         for status in ('partial', 'unavailable', 'stale'):
             with self.subTest(status=status):
@@ -3157,6 +3477,715 @@ class RepairJsonTailTests(unittest.TestCase):
         self.assertTrue(context['screening_decision']['selected'])
         self.assertEqual(context['context_provenance']['screening_rank'], 1)
 
+    def test_trim_batch_item_for_prompt_resolves_auxiliary_market_activity_against_daily_price_context(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'symbol_day_context': {
+                    'symbol': '005930',
+                    'market': 'KOSPI',
+                    'market_date': '2026-04-14',
+                    'price_context': {
+                        'trade_date': '2026-04-14',
+                        'close_price': 71000,
+                        'volume': 120000,
+                        'turnover': 8520000000,
+                    },
+                    'technical_snapshot': {
+                        'market_date': '2026-04-14',
+                        'close': 71000,
+                        'rsi_14': 58.2,
+                    },
+                    'valuation_context': {
+                        'status': 'available',
+                        'valuation_snapshot': {
+                            'close_price': 70500,
+                            'volume': 140000,
+                            'trading_value': 9870000000,
+                            'market_cap': 420000000000000,
+                            'per': 12.5,
+                            'pbr': 1.2,
+                        },
+                    },
+                    'sector_peer_context': {
+                        'status': 'available',
+                        'sector_name': 'Semiconductors',
+                        'close_price': 70500,
+                        'change_pct': 9.5,
+                        'self': {
+                            'symbol': '005930',
+                            'market_cap': 420000000000000,
+                            'change_pct': 9.5,
+                        },
+                        'peers': [
+                            {
+                                'symbol': '000660',
+                                'market_cap': 300000000000000,
+                                'change_pct': 2.1,
+                            }
+                        ],
+                    },
+                },
+                'market_regime_context': {
+                    'schema_version': 'market_regime_context_v1',
+                    'status': 'available',
+                    'market_date': '2026-04-14',
+                    'sector_context': {
+                        'status': 'available',
+                        'sector_name': 'Semiconductors',
+                        'self_change_pct': 9.5,
+                        'peer_avg_change_pct': 2.1,
+                    },
+                },
+            }
+        )
+
+        context = trimmed['symbol_day_context']
+        self.assertEqual(
+            list(context)[:5],
+            ['symbol', 'market', 'market_date', 'price_context', 'technical_snapshot'],
+        )
+        valuation = context['valuation_context']
+        self.assertEqual(valuation['valuation_snapshot']['per'], 12.5)
+        self.assertEqual(valuation['valuation_snapshot']['market_cap'], 420000000000000)
+        self.assertNotIn('close_price', valuation['valuation_snapshot'])
+        self.assertNotIn('volume', valuation['valuation_snapshot'])
+        self.assertNotIn('trading_value', valuation['valuation_snapshot'])
+        self.assertEqual(
+            valuation['market_activity_reference']['authority'],
+            'symbol_day_context.price_context',
+        )
+        sector = context['sector_peer_context']
+        self.assertNotIn('close_price', sector)
+        self.assertNotIn('change_pct', sector)
+        self.assertNotIn('change_pct', sector['self'])
+        self.assertEqual(sector['peers'][0]['change_pct'], 2.1)
+        self.assertEqual(
+            sector['market_activity_reference']['authority'],
+            'symbol_day_context.price_context',
+        )
+        regime_sector = trimmed['market_regime_context']['sector_context']
+        self.assertNotIn('self_change_pct', regime_sector)
+        self.assertEqual(regime_sector['peer_avg_change_pct'], 2.1)
+        self.assertEqual(
+            regime_sector['market_activity_reference']['authority'],
+            'symbol_day_context.price_context',
+        )
+
+    def test_trim_batch_item_for_prompt_replaces_post_response_revalidation_controls_with_notice(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'source_revalidation_request': {
+                    'schema_version': 'decider_source_revalidation_request_v1',
+                    'source_context_scope_symbols': ['005930'],
+                },
+                'decision_input_generation_fence': {
+                    'schema_version': 'decision_input_generation_fence_v1',
+                    'enforcement': 'required',
+                    'durable_revalidation_required': True,
+                },
+            }
+        )
+
+        self.assertNotIn('source_revalidation_request', trimmed)
+        self.assertNotIn('decision_input_generation_fence', trimmed)
+        self.assertEqual(
+            trimmed['core_post_response_revalidation']['status'],
+            'enforced_by_core_after_model_response',
+        )
+        self.assertEqual(
+            trimmed['core_post_response_revalidation']['decision_effect'],
+            'not_a_pre_decision_evidence_gap',
+        )
+
+    def test_trim_batch_item_for_prompt_preserves_unrelated_structured_risk_reason(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'signal_envelopes': [
+                    {
+                        'structured_conflict': {
+                            'source_a': 'price_context',
+                            'source_b': 'liquidity_context',
+                            'finding': '종가가 다릅니다',
+                            'decision': '가격 원천 충돌 해소 전 대기',
+                            'reason': '시장 위험회피 국면',
+                            'blocker': '거래대금 원천 불일치로 실행 근거 부족',
+                        }
+                    }
+                ],
+            }
+        )
+
+        conflict = trimmed['signal_envelopes'][0]['structured_conflict']
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            conflict['finding'],
+        )
+        self.assertIn('stale_price_conflict_claim', conflict['decision'])
+        self.assertIn('stale_price_conflict_claim', conflict['blocker'])
+        self.assertEqual(conflict['reason'], '시장 위험회피 국면')
+
+    def test_trim_batch_item_for_prompt_preserves_independent_structured_decision_and_blocker(self):
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'signal_envelopes': [
+                    {
+                        'structured_conflict': {
+                            'source_a': 'price_context',
+                            'source_b': 'liquidity_context',
+                            'finding': '종가가 다릅니다',
+                            'decision': '거래정지로 매수 불가',
+                            'blocker': '시장 위험회피로 신규 매수 제한',
+                        }
+                    }
+                ],
+            }
+        )
+
+        conflict = trimmed['signal_envelopes'][0]['structured_conflict']
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            conflict['finding'],
+        )
+        self.assertEqual(conflict['decision'], '거래정지로 매수 불가')
+        self.assertEqual(conflict['blocker'], '시장 위험회피로 신규 매수 제한')
+
+    def test_trim_batch_item_for_prompt_qualifies_core_revalidation_controls(self):
+        technical_corpus = [
+            '기술적 지지선 재검증 완료 후 반등이 확인됐습니다.',
+            '저항 돌파 재검증 통과로 추세가 강화됐습니다.',
+            '기술적 지지 재검증 결과 상승 추세가 유지됩니다.',
+        ]
+        trimmed = trim_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'upstream_summaries': {
+                    'technical-summarizer': {
+                        'technical_corpus': technical_corpus,
+                        'core_control': 'Core 재검증 완료 결과가 없어 대기합니다.',
+                        'source_control': '원천 재검증 통과 결과가 제공되지 않았습니다.',
+                        'fence_control': '입력 생성 펜스 재검증 결과를 확인해야 합니다.',
+                    }
+                },
+            }
+        )
+
+        summary = trimmed['upstream_summaries']['technical-summarizer']
+        self.assertEqual(summary['technical_corpus'], technical_corpus)
+        for key in ('core_control', 'source_control', 'fence_control'):
+            self.assertIn('core_post_response_revalidation_claim', summary[key])
+
+    def test_trim_batch_item_for_prompt_withholds_stale_narrative_execution_blockers(self):
+        source_item = {
+            'symbol': '005930',
+            'market_date': '2026-04-14',
+            'symbol_day_context': {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'price_context': {
+                    'close_price': 71000,
+                    'volume': 120000,
+                },
+                'technical_snapshot': {'close': 71000},
+            },
+            'liquidity_context': {
+                'turnover': {
+                    'close_price': 71000,
+                    'volume': 120000,
+                    'trading_value_krw': 8520000000,
+                }
+            },
+            'decision_input_quality_context': {
+                'final_judgment': {'hard_blocks': []},
+                'execution_feasibility': {'blocking_reasons': []},
+            },
+            'upstream_summaries': {
+                'technical-analyst': {
+                    'summary': (
+                        'price_context의 close_price 71,000과 liquidity_context의 '
+                        'close_price 70,500이 불일치합니다.'
+                    ),
+                    'thesis_summary': '추세는 유지되고 있습니다.',
+                    'technical_risk': '가격과 모멘텀 판정이 불일치합니다.',
+                    'close_trend_risk': '종가와 추세 신호가 불일치합니다.',
+                    'resistance_context': '저항값보다 현재 종가가 높습니다.',
+                    'resistance_mismatch_context': (
+                        '저항값이 현재 종가보다 낮아 가격 컨텍스트와 '
+                        '불일치 가능성이 있어 재검증이 필요합니다.'
+                    ),
+                    'candle_context': '고가-종가 거리 2.1%입니다.',
+                    'short_context': '공매도 총거래량 집계범위 차이입니다.',
+                    'benign_source_difference': (
+                        '가격 컨텍스트와 유동성 컨텍스트의 산출 기준 '
+                        '차이를 설명합니다.'
+                    ),
+                    'benign_calculation_difference': (
+                        '가격 데이터 필드 차이는 계산 목적에 따른 것입니다.'
+                    ),
+                    'volume_risk': (
+                        '시장 Regime과 개별 종목의 단기 가격·거래량 흐름 '
+                        '신호가 충돌합니다.'
+                    ),
+                    'supporting_evidence': [
+                        '기술적 지지선 재검증이 필요합니다.'
+                    ],
+                    'details': {
+                        'anomalies': [
+                            '가격 컨텍스트 종가와 유동성 컨텍스트 종가가 상충합니다.',
+                            (
+                                'price_context와 liquidity_context 종가를 '
+                                '단일 원천으로 정합화해야 합니다.'
+                            ),
+                            '종가 불일치로 원천 데이터 재검증이 필요합니다.',
+                            '종가 충돌 해소 전에는 부분 준비만 가능합니다.',
+                            '기준가격 충돌이 있어 대기 유지합니다.',
+                            '가격 원천 충돌로 실행 근거가 부족합니다.',
+                            '가격 정합성 문제 해소 전 대기합니다.',
+                            '가격 필드 불일치입니다.',
+                            (
+                                '종가 데이터가 일부 컨텍스트에서 71,000과 '
+                                '70,500으로 불일치합니다.'
+                            ),
+                            '종가·거래대금 기준값을 단일 원천으로 정합화해야 합니다.',
+                            '동일 거래일 종가 71,000/70,500의 원천 정합성이 필요합니다.',
+                            '종가가 자료원별로 달라 대기합니다.',
+                            '종가를 단일 기준값으로 정규화해야 합니다.',
+                            '가격 기준과 병합 반영 여부를 정합화해야 합니다.',
+                            '일관된 단일 종가가 필요합니다.',
+                            '종가 값 불일치가 있어 부분 준비만 가능합니다.',
+                            (
+                                '가격·유동성 입력 간 종가 차이로 정확한 '
+                                '실행 기준은 제한됩니다.'
+                            ),
+                            (
+                                '정상 시장 국면과 상승 추세는 유지되지만 개별 '
+                                '가격 충돌을 해소하지 못했습니다.'
+                            ),
+                            '종가 기준을 정합화하고 눌림 지지를 재검토해야 합니다.',
+                            '정합화된 가격에서 눌림 후 지지 회복을 확인해야 합니다.',
+                            (
+                                '일봉 거래대금 21,991,907,400원과 원시 유동성 '
+                                '거래대금 22,020,672,700원에 차이가 있습니다.'
+                            ),
+                        ]
+                    },
+                },
+            },
+            'signal_envelopes': [
+                {
+                    'schema_version': 'signal_envelope_v1',
+                    'symbol': '005930',
+                    'market_date': '2026-04-14',
+                    'horizon': 'swing',
+                    'source_name': 'technical-analyst',
+                    'source_type': 'agent_feedback',
+                    'thesis_summary': '수급과 추세는 양호합니다.',
+                    'summary': (
+                        '가격 컨텍스트 종가 71,000원과 유동성 컨텍스트 '
+                        '종가 70,500원이 서로 다릅니다.'
+                    ),
+                    'alternate_summary': (
+                        'price_context.close_price=71000과 '
+                        'liquidity_context.turnover.close_price=70500이 상이함'
+                    ),
+                    'normal_freshness_summary': (
+                        '가격·기술 데이터는 정상이고 '
+                        '유동성 컨텍스트도 신선합니다.'
+                    ),
+                    'closed_session_summary': (
+                        '시장 정상 국면이며 일봉 데이터와 거래대금은 '
+                        '당일 기준 신선합니다. 장 마감 상태라 실시간 '
+                        '호가·스프레드는 적용 대상이 아니며, 해당 가격은 '
+                        '최신 완료 일봉 기준입니다.'
+                    ),
+                    'confirmed_consistency_summary': (
+                        '가격 컨텍스트와 유동성 컨텍스트의 종가는 '
+                        '정합하며 실행 기준이 일치합니다.'
+                    ),
+                    'financial_consistency_summary': (
+                        '재무제표 계정 정합성 검증 추가가 필요하며 '
+                        '입력 피처 정규화가 필요합니다.'
+                    ),
+                    'risk_flags': [
+                        (
+                            'price_context close 71000 differs from '
+                            'liquidity_context close 70500.'
+                        ),
+                        (
+                            'price_context close 71000 does not match '
+                            'liquidity_context close 70500.'
+                        ),
+                        '가격 데이터의 종가 값이 서로 일치하지 않아 대기합니다.',
+                        '가격과 모멘텀 판정이 불일치합니다.',
+                        (
+                            '거래대금도 803,125,152원과 804,467,457원으로 '
+                            '불일치합니다.'
+                        ),
+                        '거래대금과 회전율 수치에 소폭 불일치가 있습니다.',
+                    ],
+                    'structured_conflict': {
+                        'source_a': 'price_context',
+                        'source_b': 'liquidity_context',
+                        'finding': '종가가 서로 다릅니다.',
+                        'decision': '해소 전 대기합니다.',
+                        'recommendation': 'wait',
+                        'recommendation_class': 'wait',
+                        'risk_reward_assessment': (
+                            '현재 종가에서 저항까지의 여력은 작고 '
+                            '지지선 이탈 위험은 큭니다.'
+                        ),
+                    },
+                    'sources_conflict': {
+                        'sources': ['price_context', 'liquidity_context'],
+                        'finding': '종가가 서로 다릅니다.',
+                        'decision': '해소 전 대기합니다.',
+                        'thesis_summary': '수급과 추세는 양호합니다.',
+                    },
+                    'nested_sources_conflict': {
+                        'source_comparison': {
+                            'primary': 'price_context',
+                            'secondary': 'liquidity_context',
+                        },
+                        'finding': '종가가 서로 다릅니다.',
+                        'decision': '해소 전 대기합니다.',
+                        'owner': 'risk-team',
+                    },
+                    'benign_sources': {
+                        'sources': ['price_context', 'liquidity_context'],
+                        'finding': '산출 목적이 달라 두 소스를 함께 사용합니다.',
+                        'decision': '두 소스를 함께 사용합니다.',
+                    },
+                    'nested_ancestor_conflict': {
+                        'reason': '시장 위험회피 국면으로 대기합니다.',
+                        'warning': '변동성이 큽니다.',
+                        'child': {
+                            'sources': ['price_context', 'liquidity_context'],
+                            'finding': '종가가 서로 다릅니다.',
+                            'decision': '해소 전 대기합니다.',
+                        },
+                    },
+                }
+            ],
+            'previous_decision_context': {
+                'available': True,
+                'market_date': '2026-04-13',
+                'wait_reason': (
+                    '필수 원천 재검증 완료 결과가 제공되지 않아 통과를 '
+                    '확인할 수 없습니다.'
+                ),
+                'thesis_summary': '전일 지지선은 유지됐습니다.',
+                'data_quality_warnings': [
+                    '요구된 재검증의 현재 통과 결과가 없습니다.',
+                    '시장·업종 상대강도와 가격 자료 정합성을 확인해야 합니다.',
+                    '거래대금도 저장 경로별 차이가 있어 단일 권위값 확인이 필요합니다.',
+                ],
+                'upgrade_trigger': {
+                    'summary': '가격·거래대금 기준 충돌 해소 후 재평가합니다.',
+                },
+                'summary': (
+                    '추세는 양호하지만 종가도 충돌하므로 '
+                    '신규 단기 매수 후보에서 제외합니다.'
+                ),
+                'decision_risks': [
+                    (
+                        '종가뿐 아니라 거래대금과 공매도 집계의 '
+                        '범위에도 차이가 있어 세부 가격 판단의 '
+                        '신뢰도가 제한됩니다.'
+                    ),
+                    '공매도 총거래량 집계범위 차이입니다.',
+                ],
+                'invalidation_conditions': [
+                    '원천 충돌이 지속되면 관찰 후보 또는 '
+                    '매수 후보로 상향하지 않습니다.'
+                ],
+                'trigger_conditions': [
+                    (
+                        '가격·기술 원천의 26,550원과 유동성·평가·업종 '
+                        '원천의 26,250원 차이를 해소해야 합니다.'
+                    ),
+                    (
+                        '당일 종가·거래량의 원천 차이를 설명하고 동일 기준의 '
+                        '확정 자료를 제공해야 합니다.'
+                    ),
+                    (
+                        '동일 거래일 기술·유동성·가치평가 자료의 종가와 '
+                        '거래대금 차이를 설명하고 일관된 기준을 확인해야 합니다.'
+                    ),
+                ],
+            },
+        }
+        source_before = json.dumps(source_item, ensure_ascii=False, sort_keys=True)
+
+        trimmed = trim_batch_item_for_prompt(source_item)
+
+        upstream = trimmed['upstream_summaries']['technical-analyst']
+        previous = trimmed['previous_decision_context']
+        self.assertIn(
+            'noncanonical_market_activity_conflict',
+            upstream['summary'],
+        )
+        self.assertEqual(upstream['thesis_summary'], '추세는 유지되고 있습니다.')
+        self.assertEqual(
+            upstream['technical_risk'],
+            '가격과 모멘텀 판정이 불일치합니다.',
+        )
+        self.assertEqual(
+            upstream['close_trend_risk'],
+            '종가와 추세 신호가 불일치합니다.',
+        )
+        self.assertEqual(
+            upstream['resistance_context'],
+            '저항값보다 현재 종가가 높습니다.',
+        )
+        self.assertIn(
+            '저항값이 현재 종가보다 낮아 가격 컨텍스트와 불일치',
+            upstream['resistance_mismatch_context'],
+        )
+        self.assertEqual(upstream['candle_context'], '고가-종가 거리 2.1%입니다.')
+        self.assertEqual(
+            upstream['short_context'],
+            '공매도 총거래량 집계범위 차이입니다.',
+        )
+        self.assertIn('산출 기준 차이', upstream['benign_source_difference'])
+        self.assertIn('계산 목적', upstream['benign_calculation_difference'])
+        self.assertIn('신호가 충돌', upstream['volume_risk'])
+        self.assertEqual(
+            upstream['supporting_evidence'],
+            ['기술적 지지선 재검증이 필요합니다.'],
+        )
+        self.assertIn(
+            'noncanonical_market_activity_conflict',
+            upstream['details']['anomalies'][0],
+        )
+        self.assertIn(
+            'stale_price_conflict_claim',
+            upstream['details']['anomalies'][1],
+        )
+        self.assertIn(
+            'core_post_response_revalidation_claim',
+            upstream['details']['anomalies'][2],
+        )
+        for stale_claim in upstream['details']['anomalies'][3:]:
+            self.assertIn('stale_price_conflict_claim', stale_claim)
+        self.assertIn(
+            'core_post_response_revalidation_claim',
+            previous['wait_reason'],
+        )
+        self.assertEqual(previous['market_date'], '2026-04-13')
+        self.assertEqual(previous['thesis_summary'], '전일 지지선은 유지됐습니다.')
+        self.assertIn(
+            'core_post_response_revalidation_claim',
+            previous['data_quality_warnings'][0],
+        )
+        self.assertIn(
+            'previous_noncanonical_execution_claim',
+            previous['data_quality_warnings'][1],
+        )
+        self.assertIn(
+            'stale_price_conflict_claim',
+            previous['data_quality_warnings'][2],
+        )
+        self.assertIn(
+            'stale_price_conflict_claim',
+            previous['upgrade_trigger']['summary'],
+        )
+        self.assertIn('stale_price_conflict_claim', previous['summary'])
+        self.assertIn(
+            'stale_price_conflict_claim',
+            previous['decision_risks'][0],
+        )
+        self.assertEqual(
+            previous['decision_risks'][1],
+            '공매도 총거래량 집계범위 차이입니다.',
+        )
+        self.assertIn(
+            'previous_noncanonical_execution_claim',
+            previous['invalidation_conditions'][0],
+        )
+        signal_envelope = trimmed['signal_envelopes'][0]
+        self.assertIn('noncanonical_market_activity_conflict', signal_envelope['summary'])
+        self.assertIn(
+            'noncanonical_market_activity_conflict',
+            signal_envelope['alternate_summary'],
+        )
+        self.assertEqual(
+            signal_envelope['normal_freshness_summary'],
+            '가격·기술 데이터는 정상이고 '
+            '유동성 컨텍스트도 신선합니다.',
+        )
+        self.assertIn(
+            '적용 대상이 아니며',
+            signal_envelope['closed_session_summary'],
+        )
+        self.assertIn(
+            '정합하며 실행 기준이 일치',
+            signal_envelope['confirmed_consistency_summary'],
+        )
+        self.assertIn(
+            '재무제표 계정 정합성',
+            signal_envelope['financial_consistency_summary'],
+        )
+        for risk_flag in signal_envelope['risk_flags'][:2]:
+            self.assertIn('noncanonical_market_activity_conflict', risk_flag)
+        self.assertIn(
+            'stale_price_conflict_claim',
+            signal_envelope['risk_flags'][2],
+        )
+        self.assertEqual(
+            signal_envelope['risk_flags'][3],
+            '가격과 모멘텀 판정이 불일치합니다.',
+        )
+        for risk_flag in signal_envelope['risk_flags'][4:]:
+            self.assertIn('stale_price_conflict_claim', risk_flag)
+        self.assertEqual(signal_envelope['schema_version'], 'signal_envelope_v1')
+        self.assertEqual(signal_envelope['symbol'], '005930')
+        self.assertEqual(signal_envelope['market_date'], '2026-04-14')
+        self.assertEqual(signal_envelope['horizon'], 'swing')
+        self.assertEqual(signal_envelope['source_name'], 'technical-analyst')
+        self.assertEqual(signal_envelope['source_type'], 'agent_feedback')
+        self.assertEqual(
+            signal_envelope['thesis_summary'],
+            '수급과 추세는 양호합니다.',
+        )
+        structured_conflict = signal_envelope['structured_conflict']
+        self.assertEqual(structured_conflict['source_a'], 'price_context')
+        self.assertEqual(structured_conflict['source_b'], 'liquidity_context')
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            structured_conflict['finding'],
+        )
+        self.assertIn(
+            '해소 전 대기',
+            structured_conflict['decision'],
+        )
+        self.assertEqual(structured_conflict['recommendation'], 'wait')
+        self.assertEqual(structured_conflict['recommendation_class'], 'wait')
+        self.assertIn(
+            '저항까지의 여력',
+            structured_conflict['risk_reward_assessment'],
+        )
+        for key in ('sources_conflict', 'nested_sources_conflict'):
+            structured_variant = signal_envelope[key]
+            self.assertIn(
+                'structured_noncanonical_market_activity_conflict',
+                structured_variant['finding'],
+            )
+            self.assertEqual(structured_variant['decision'], '해소 전 대기합니다.')
+        self.assertEqual(
+            signal_envelope['sources_conflict']['thesis_summary'],
+            '수급과 추세는 양호합니다.',
+        )
+        self.assertEqual(
+            signal_envelope['nested_sources_conflict']['owner'],
+            'risk-team',
+        )
+        self.assertEqual(
+            signal_envelope['benign_sources']['finding'],
+            '산출 목적이 달라 두 소스를 함께 사용합니다.',
+        )
+        ancestor = signal_envelope['nested_ancestor_conflict']
+        self.assertEqual(
+            ancestor['reason'],
+            '시장 위험회피 국면으로 대기합니다.',
+        )
+        self.assertEqual(ancestor['warning'], '변동성이 큽니다.')
+        self.assertIn(
+            'structured_noncanonical_market_activity_conflict',
+            ancestor['child']['finding'],
+        )
+        self.assertIn(
+            '해소 전 대기',
+            ancestor['child']['decision'],
+        )
+        for trigger_condition in previous['trigger_conditions']:
+            self.assertIn('stale_price_conflict_claim', trigger_condition)
+        authority = trimmed['narrative_execution_authority']
+        self.assertEqual(authority['sanitized_claim_count'], 44)
+        self.assertEqual(
+            authority['sanitized_sections'],
+            [
+                'upstream_summaries',
+                'previous_decision_context',
+                'signal_envelopes',
+            ],
+        )
+        self.assertEqual(
+            authority['current_authority_paths'][0],
+            'symbol_day_context.price_context',
+        )
+        self.assertEqual(
+            trimmed['decision_input_quality_context']['final_judgment']['hard_blocks'],
+            [],
+        )
+        self.assertIn(
+            'decision_input_quality_context.final_judgment.hard_blocks',
+            authority['current_authority_paths'],
+        )
+        self.assertEqual(
+            json.dumps(source_item, ensure_ascii=False, sort_keys=True),
+            source_before,
+        )
+        compressed = compressed_batch_item_for_prompt(source_item)
+        compressed_text = json.dumps(compressed, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn('close_price 70,500이 불일치', compressed_text)
+        self.assertNotIn('재검증 완료 결과가 제공되지 않아', compressed_text)
+        self.assertEqual(
+            compressed['narrative_execution_authority']['status'],
+            'noncanonical_narratives_are_not_current_execution_evidence',
+        )
+
+    def test_compressed_batch_item_for_prompt_keeps_canonical_execution_fields(self):
+        compressed = compressed_batch_item_for_prompt(
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'symbol_day_context': {
+                    'symbol': '005930',
+                    'market': 'KOSPI',
+                    'market_date': '2026-04-14',
+                    'company': {'name': 'Samsung Electronics'},
+                    'market_session': {'current_market_state': 'closed'},
+                    'market_data_phase_contract': {'phase': 'post_close'},
+                    'decider_data_quality_context': {'status': 'available'},
+                    'decision_input_quality_context': {
+                        'final_judgment': {'hard_blocks': []},
+                    },
+                    'quote_context': {'status': 'not_applicable'},
+                    'price_context': {'close_price': 71000, 'volume': 120000},
+                    'liquidity_context': {'status': 'available'},
+                    'technical_snapshot': {'close': 71000, 'rsi_14': 58.2},
+                    'intraday_execution_context': {'status': 'not_applicable'},
+                    'intraday_wait_recheck_context': {'status': 'not_applicable'},
+                    'valuation_context': {
+                        'valuation_snapshot': {'per': 12.5, 'pbr': 1.2},
+                    },
+                    'action_summary': {'action': 'watch'},
+                    'investor_flow_context': {'status': 'available'},
+                    'short_selling_context': {'status': 'available'},
+                    'sector_peer_context': {'status': 'available'},
+                    'market_relative_context': {'status': 'available'},
+                    'market_breadth_context': {'status': 'available'},
+                    'macro_context': {'status': 'available'},
+                },
+            }
+        )
+
+        context = compressed['symbol_day_context']
+        self.assertIn('price_context', context)
+        self.assertIn('technical_snapshot', context)
+        self.assertIn('liquidity_context', context)
+        self.assertIn('intraday_execution_context', context)
+        self.assertIn('valuation_context', context)
+        self.assertNotIn('intraday_wait_recheck_context', context)
+
 
 class FakeFuture:
     def __init__(self, *, result, cancel_result):
@@ -3362,7 +4391,10 @@ class DeciderReadyAgentContextReadService:
                 {
                     'symbol': symbol,
                     'market_date': kwargs['market_date'].isoformat(),
-                    'price_context': {'close_price': 85700},
+                    'price_context': {
+                        'trade_date': kwargs['market_date'].isoformat(),
+                        'close_price': 85700,
+                    },
                     'liquidity_context': {
                         'status': 'available',
                         'turnover': {
@@ -3554,6 +4586,72 @@ class MutatingDeciderInputReadService:
             item['technical_snapshot'] = {
                 **(item.get('technical_snapshot') or {}),
                 'source_generation': generation,
+            }
+        return payload
+
+
+class SessionMutatingDeciderInputReadService:
+    def __init__(self):
+        self.calls = 0
+        self.delegate = DeciderReadyAgentContextReadService()
+
+    def get_symbol_day_context(self, **kwargs):
+        self.calls += 1
+        payload = self.delegate.get_symbol_day_context(**kwargs)
+        market_open = self.calls > 1
+        for item in payload['items']:
+            item.update(
+                {
+                    'market_session': {
+                        'current_market_session': (
+                            'open' if market_open else 'closed'
+                        ),
+                    },
+                    'market_data_phase_contract': {
+                        'current_market_state': (
+                            'OPEN' if market_open else 'PREOPEN'
+                        ),
+                    },
+                    'quote_context': {
+                        'price': 90100 if market_open else 85700,
+                    },
+                    'intraday_execution_context': {
+                        'quote': {
+                            'price': 90100 if market_open else 85700
+                        },
+                    },
+                    'pre_decider_enrichment_context': {
+                        'quote_orderbook_snapshot': {
+                            'current_price': (
+                                90100 if market_open else 85700
+                            ),
+                        },
+                    },
+                    'market_regime_context': {
+                        'open_drive': {
+                            'index_change_percent': (
+                                -1.3 if market_open else None
+                            ),
+                        },
+                    },
+                }
+            )
+            item['liquidity_context']['intraday'] = {
+                'status': 'available',
+                'quote_balance_rank': 1 if market_open else 5,
+            }
+        return payload
+
+
+class NonDurableDeciderInputReadService(
+    DeciderReadyAgentContextReadService
+):
+    def get_symbol_day_context(self, **kwargs):
+        payload = super().get_symbol_day_context(**kwargs)
+        for item in payload['items']:
+            item['market_breadth_context'] = {
+                'status': 'available',
+                'source': 'kis_market_snapshot_v1',
             }
         return payload
 
@@ -3885,6 +4983,8 @@ class SignalDeciderBatchClient:
                     'next_day_open_action': 'buy',
                     'wait_reason': None,
                     'entry_price_basis': 'next_open',
+                    'trigger_price': None,
+                    'chase_limit_price': None,
                     'target_price': 91200,
                     'expected_return_pct': 6.4,
                     'stop_loss_price': 82900,
@@ -3892,6 +4992,7 @@ class SignalDeciderBatchClient:
                     'confidence_score_10': 7,
                     'conviction_score_10': 6,
                     'thesis_summary': 'Specialists align on a tactical next-day long setup.',
+                    'trigger_conditions': [],
                     'supporting_evidence': ['Breadth improved.', 'Support held above 80000.'],
                     'decision_risks': ['Leadership remains narrow.'],
                     'invalidation_conditions': ['Gap below 82900 at the next open.'],
@@ -4332,6 +5433,13 @@ def _patch_feedback_eligibility(*symbols: str):
 
 class AgentFeedbackOrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.dispatch_coordinator_patcher = patch.object(
+            orchestrator_module,
+            '_OPENCLAW_DISPATCH_COORDINATOR',
+            orchestrator_module._OpenClawDispatchCoordinator(),
+        )
+        self.dispatch_coordinator_patcher.start()
+        self.addCleanup(self.dispatch_coordinator_patcher.stop)
         self.prerequisite_patcher = patch(
             'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
             side_effect=lambda **_: _feedback_prerequisites(),
@@ -4821,6 +5929,74 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('manual_review_only', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
         self.assertNotIn('tighten or relax the actual action threshold', message)
+        example_text = message.split('JSON example:\n', 1)[1].split(
+            '\n\nMarket date:',
+            1,
+        )[0]
+        example_feedback = json.loads(example_text)['items'][0]['feedback']
+        self.assertEqual(example_feedback['entry_price_basis'], 'trigger_limit')
+        self.assertGreater(example_feedback['trigger_price'], 0)
+        self.assertGreaterEqual(
+            example_feedback['chase_limit_price'],
+            example_feedback['trigger_price'],
+        )
+        self.assertGreater(
+            example_feedback['target_price'],
+            example_feedback['chase_limit_price'],
+        )
+        self.assertLess(
+            example_feedback['stop_loss_price'],
+            example_feedback['trigger_price'],
+        )
+        self.assertTrue(example_feedback['trigger_conditions'])
+        self.assertNotIn(
+            'intraday_wait_recheck_context is supplied',
+            message,
+        )
+
+    def test_technical_summarizer_batch_message_has_one_unambiguous_envelope_contract(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+        )
+        technical_spec = next(
+            spec
+            for spec in orchestrator_module.DISPATCH_SPECS
+            if spec.role == 'technical-summarizer'
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            message = client._build_batch_message(
+                spec=technical_spec,
+                market_date=orchestrator_module.date.fromisoformat('2026-10-28'),
+                batch_items=[{'symbol': '028050', 'market_date': '2026-10-28'}],
+                request_marker='batch-request::technical-contract-test',
+            )
+            single_message = client._build_message(
+                spec=technical_spec,
+                payload={'symbol': '028050', 'market_date': '2026-10-28'},
+            )
+
+        self.assertIn(
+            'exactly one top-level object in this batch envelope: '
+            '{"items": [{"symbol": "...", "feedback": {...}}]}',
+            message,
+        )
+        self.assertIn(
+            'For every technical-summarizer feedback object, required keys are:',
+            message,
+        )
+        self.assertNotIn('Required top-level keys:', message)
+        self.assertIn(
+            'For every technical-summarizer feedback object, required keys are:',
+            single_message,
+        )
+        self.assertNotIn('Required top-level keys:', single_message)
 
     def test_short_term_and_fundamental_prompts_use_canonical_horizon_and_market_specific_sources(self):
         fake_settings = SimpleNamespace(
@@ -4865,6 +6041,10 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('"expected_holding_period": "1-3 trading days"', short_term_message)
         self.assertIn('"preferred_action": "watch_for_trigger"', short_term_message)
         self.assertNotIn('1-2 trading day', short_term_message)
+        self.assertNotIn(
+            'intraday_wait_recheck_context is supplied',
+            short_term_message,
+        )
         self.assertIn('DART', fundamental_message)
         self.assertIn('SEC', fundamental_message)
         self.assertIn('market and source metadata', fundamental_message)
@@ -4944,6 +6124,79 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertGreaterEqual(message.count('compressed_payload'), 2)
         self.assertIn('usage_policy.model_guidance_eligible=true', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
+
+    def test_retired_wait_recheck_context_is_not_prompt_input(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=60000,
+        )
+        wait_recheck_context = {
+            'schema_version': 'intraday_wait_recheck_context_v3',
+            'context_sha256': 'sha256:exact-wait-context',
+            'event': {
+                'event_id': 321,
+                'generation': 2,
+                'rearmed_from_event_id': 123,
+            },
+            'observation': {
+                'ask_price': 3995,
+                'observed_at': '2026-10-27T00:29:41+00:00',
+                'evidence': {
+                    'sample_count': 4,
+                    'support_ratio': 1.0,
+                    'span_seconds': 6,
+                },
+            },
+            'direct_order_authority': False,
+        }
+        ordinary_item = {
+            'symbol': '011690',
+            'market_date': '2026-10-27',
+            'symbol_day_context': {
+                'market': 'KRX',
+                'price_context': {'close': 3985},
+            },
+        }
+        wait_item = deepcopy(ordinary_item)
+        wait_item['symbol_day_context']['intraday_wait_recheck_context'] = (
+            deepcopy(wait_recheck_context)
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            ordinary_message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-10-27'),
+                batch_items=[ordinary_item],
+                request_marker='batch-request::ordinary-under-cap',
+            )
+            wait_message = client._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-10-27'),
+                batch_items=[wait_item],
+                request_marker='batch-request::wait-recheck-under-cap',
+            )
+
+        self.assertLess(len(ordinary_message), fake_settings.openclaw_agent_max_prompt_chars)
+        self.assertLess(len(wait_message), fake_settings.openclaw_agent_max_prompt_chars)
+        self.assertIn(
+            'Analyze each assigned symbol directly using only the supplied payload.',
+            ordinary_message,
+        )
+        self.assertIn(
+            'Analyze each assigned symbol directly using only the supplied payload.',
+            wait_message,
+        )
+        encoded_payload = wait_message.split('Assigned batch payload:\n', 1)[1]
+        prompt_items = json.loads(encoded_payload)
+        self.assertNotIn(
+            'intraday_wait_recheck_context',
+            prompt_items[0]['symbol_day_context'],
+        )
 
     def test_compressed_batch_prompt_builds_and_includes_contract_suffix_once(self):
         fake_settings = SimpleNamespace(
@@ -5388,12 +6641,18 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
     def test_dispatch_for_symbols_returns_blocked_gate_when_prerequisites_are_not_ready(self):
         service = AgentFeedbackOrchestrator()
 
-        with patch(
-            'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
-            side_effect=lambda **_: _feedback_prerequisites(
-                status='blocked',
-                missing_stage_ids=['quality_factors', 'composite_factors'],
-            ),
+        with (
+            patch(
+                'app.agent_context.orchestrator.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=lambda **_: _feedback_prerequisites(
+                    status='blocked',
+                    missing_stage_ids=[
+                        'quality_factors',
+                        'composite_factors',
+                    ],
+                ),
+            ) as inspect_prerequisites,
+            _patch_feedback_eligibility('005930'),
         ):
             result = service.dispatch_for_symbols(
                 market_date='2026-04-14',
@@ -5409,6 +6668,14 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             result['request']['parent_run_id'],
             'feedback-parent-prerequisite-gate',
+        )
+        self.assertEqual(
+            inspect_prerequisites.call_args.kwargs['symbols'],
+            ['005930'],
+        )
+        self.assertIn(
+            'signal_features',
+            inspect_prerequisites.call_args.kwargs['required_stage_ids'],
         )
 
     def test_buffered_symbol_dispatch_cleans_each_batch_session_once(self):
@@ -7012,6 +8279,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertTrue(decider_payload['output_contract']['batch_envelope_required'])
         self.assertTrue(decider_payload['output_contract']['symbol_identity']['exact_match_required'])
         self.assertIn('wait_reason', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('trigger_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('chase_limit_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('target_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('stop_loss_price', decider_payload['output_contract']['required_feedback_fields'])
+        self.assertIn('trigger_conditions', decider_payload['output_contract']['required_feedback_fields'])
         self.assertIn('decision_delta', decider_payload['output_contract']['required_feedback_fields'])
         self.assertIn(
             'item_symbol_feedback_symbol_and_traceability_symbol_match_assigned_symbol',
@@ -7622,6 +8894,156 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 for call in changed_lookup_calls
             )
         )
+
+    def test_point_in_time_dispatch_accepts_session_change_only_with_durable_source(
+        self,
+    ):
+        cases = (
+            (
+                'preopen_to_open',
+                SessionMutatingDeciderInputReadService(),
+                'completed',
+            ),
+            (
+                'non_durable_live_breadth',
+                NonDurableDeciderInputReadService(),
+                'partial',
+            ),
+            (
+                'material_eod_change',
+                MutatingDeciderInputReadService(),
+                'partial',
+            ),
+        )
+
+        for case_name, read_service, expected_status in cases:
+            with self.subTest(case=case_name):
+                service = AgentFeedbackOrchestrator()
+                service.client = SignalDeciderBatchClient()
+                feedback_service = FakeFeedbackService()
+                failure_service = RecordingFailureService()
+                cleanup_service = FakeSessionCleanupService()
+                revalidation_calls = []
+                original_revalidate = (
+                    service._revalidate_decider_dispatch_inputs
+                )
+
+                def recording_revalidate(**kwargs):
+                    revalidation_calls.append(kwargs)
+                    return original_revalidate(**kwargs)
+
+                service._revalidate_decider_dispatch_inputs = (
+                    recording_revalidate
+                )
+                fake_settings = SimpleNamespace(
+                    openclaw_agent_symbol_chunk_size=1,
+                    openclaw_agent_parallel_subtasks=1,
+                )
+                market_context_builder = FakeMarketContextBuilder(
+                    {
+                        'status': 'ready',
+                        'market_date': '2026-04-14',
+                        'summary': {'market_bias': 'risk_on'},
+                        'flows': {},
+                        'missing_fields': [],
+                    }
+                )
+
+                with patch.object(
+                    orchestrator_module,
+                    'settings',
+                    fake_settings,
+                ):
+                    with patch.object(
+                        orchestrator_module,
+                        'agent_context_read_service',
+                        read_service,
+                    ):
+                        with patch.object(
+                            orchestrator_module,
+                            'agent_context_reuse_service',
+                            SimpleNamespace(
+                                build_latest_decisions=lambda **kwargs: {}
+                            ),
+                        ):
+                            with patch.object(
+                                orchestrator_module,
+                                'agent_context_feedback_service',
+                                feedback_service,
+                            ):
+                                with patch.object(
+                                    orchestrator_module,
+                                    'agent_context_feedback_failure_service',
+                                    failure_service,
+                                ):
+                                    with patch.object(
+                                        orchestrator_module,
+                                        'agent_feedback_session_cleanup_service',
+                                        cleanup_service,
+                                    ):
+                                        with patch.object(
+                                            orchestrator_module,
+                                            'signal_decider_market_context_builder',
+                                            market_context_builder,
+                                        ):
+                                            with patch.object(
+                                                service,
+                                                '_load_post_decision_material_context_failures',
+                                                return_value={},
+                                            ):
+                                                with _patch_feedback_eligibility(
+                                                    '005930'
+                                                ):
+                                                    result = (
+                                                        service.dispatch_for_symbols(
+                                                            market_date=(
+                                                                '2026-04-14'
+                                                            ),
+                                                            symbols=['005930'],
+                                                            reuse_existing=False,
+                                                            point_in_time_recovery=True,
+                                                        )
+                                                    )
+
+                self.assertEqual(
+                    result['summary']['status'],
+                    expected_status,
+                )
+                self.assertTrue(revalidation_calls)
+                self.assertTrue(
+                    all(
+                        call['durable_source_generation'] is True
+                        and call['revalidate_market_context'] is False
+                        for call in revalidation_calls
+                    )
+                )
+                if case_name == 'preopen_to_open':
+                    self.assertTrue(
+                        any(
+                            call.get(
+                                'revalidate_post_decision_material_context'
+                            )
+                            for call in revalidation_calls
+                        )
+                    )
+                    self.assertEqual(result['summary']['completed'], 5)
+                    self.assertEqual(failure_service.recorded, [])
+                else:
+                    revalidation_codes = {
+                        reason['code']
+                        for failure in failure_service.recorded
+                        for reason in failure['context'][
+                            'input_generation_revalidation'
+                        ]['reasons']
+                    }
+                    self.assertIn(
+                        (
+                            'durable_source_generation_ineligible'
+                            if case_name == 'non_durable_live_breadth'
+                            else 'source_context_changed'
+                        ),
+                        revalidation_codes,
+                    )
 
     def test_decider_response_is_rejected_when_source_context_changes_during_dispatch(self):
         service = AgentFeedbackOrchestrator()
@@ -8602,6 +10024,110 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['response_correlation']['attribution_status'], 'matched')
         self.assertIsNone(result['response_correlation']['failure_class'])
 
+    def _dispatch_plain_text_batch(self, *, spec, symbol, output_text):
+        response_payload = {
+            'id': f'resp-plain-text-{spec.role}',
+            'status': 'completed',
+            'model': f'openclaw/{spec.agent_name}',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [{'type': 'output_text', 'text': output_text}],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent-openclaw-state',
+            openclaw_signal_decider_expected_model='openai/gpt-6.1-sol',
+            openclaw_short_term_decider_expected_model='openai/gpt-6.1-sol',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=[],
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event') as log_event:
+                    result = OpenClawAgentClient().dispatch_batch(
+                        spec=spec,
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=[
+                            {
+                                'symbol': symbol,
+                                'request_run_id': f'symbol-run-2026-04-14-plain-{spec.role}',
+                                'session_slot': 1,
+                                'session_key': f'agent:{spec.agent_name}:feedback/{spec.agent_name}/plain-01',
+                            }
+                        ],
+                    )
+        return result, log_event
+
+    def test_summarizer_plain_text_batch_with_a_dropped_closer_is_repaired(self):
+        feedback = {
+            'role': 'eod-summarizer',
+            'summary': 'Constructive close.',
+            'confidence': 0.6,
+            'risk_flags': [],
+            'details': {'trend': 'up'},
+            'improvement_notes': [],
+        }
+        valid = json.dumps({'items': [{'symbol': '005930', 'feedback': feedback}]})
+        self.assertTrue(valid.endswith('}}]}'))
+        broken = valid[:-4] + '}]}'
+
+        result, log_event = self._dispatch_plain_text_batch(
+            spec=orchestrator_module.DISPATCH_SPECS[0],
+            symbol='005930',
+            output_text=broken,
+        )
+
+        self.assertEqual(result['decoded'], json.loads(valid))
+        self.assertEqual(result['response_correlation']['decoded_source'], 'output_text')
+        self.assertIsNone(result['response_correlation']['failure_class'])
+        self.assertEqual(
+            result['request_provenance']['json_structure_repair'],
+            {'applied': True, 'inserted_closers': 1, 'removed_trailing_commas': 0},
+        )
+        stages = [call.args[0] for call in log_event.call_args_list]
+        self.assertIn('dispatch_batch_json_structure_repaired', stages)
+
+    def test_decider_roles_never_get_json_structure_repair(self):
+        self.assertTrue(
+            set(orchestrator_module.JSON_STRUCTURE_REPAIR_ROLES).isdisjoint(
+                orchestrator_module.DECISION_SUPPORT_AGENT_NAMES
+            )
+        )
+        self.assertEqual(
+            set(orchestrator_module.JSON_STRUCTURE_REPAIR_ROLES),
+            set(orchestrator_module.SUMMARIZER_AGENT_NAMES),
+        )
+        decider_spec = orchestrator_module.DISPATCH_SPECS[-1]
+        self.assertIn(decider_spec.role, orchestrator_module.DECISION_SUPPORT_AGENT_NAMES)
+        valid = json.dumps(
+            {'items': [{'symbol': '005930', 'feedback': _complete_actionable_signal_feedback()}]}
+        )
+        self.assertTrue(valid.endswith('}}]}'))
+
+        result, _ = self._dispatch_plain_text_batch(
+            spec=decider_spec,
+            symbol='005930',
+            output_text=valid[:-4] + '}]}',
+        )
+
+        self.assertNotIn('json_structure_repair', result['request_provenance'])
+        self.assertEqual(result['response_correlation']['decoded_source'], 'core_structured_fallback')
+        self.assertTrue(result['decoded']['items'][0]['feedback']['details']['fallback_generated_by_core'])
+
     def test_openclaw_batch_dispatch_does_not_fall_back_to_text_after_wrong_function_call(self):
         valid_text = json.dumps(
             {
@@ -9220,6 +10746,673 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(len(http_calls), 1)
 
+    def test_openclaw_completion_coordinator_serializes_same_gateway_only(self):
+        coordinator = orchestrator_module._OpenClawDispatchCoordinator()
+        same_gateway_attempted = threading.Event()
+        same_gateway_entered = threading.Event()
+        other_gateway_entered = threading.Event()
+        admissions = []
+
+        def admit(*, key, entered, attempted=None):
+            if attempted is not None:
+                attempted.set()
+            with coordinator.admit(key=key) as admission:
+                admissions.append(admission)
+                entered.set()
+
+        with coordinator.admit(key='https://openclaw.example'):
+            same_gateway_thread = threading.Thread(
+                target=admit,
+                kwargs={
+                    'key': 'https://openclaw.example',
+                    'entered': same_gateway_entered,
+                    'attempted': same_gateway_attempted,
+                },
+            )
+            other_gateway_thread = threading.Thread(
+                target=admit,
+                kwargs={
+                    'key': 'https://another-openclaw.example',
+                    'entered': other_gateway_entered,
+                },
+            )
+            same_gateway_thread.start()
+            other_gateway_thread.start()
+
+            self.assertTrue(same_gateway_attempted.wait(timeout=1.0))
+            self.assertTrue(other_gateway_entered.wait(timeout=1.0))
+            self.assertFalse(same_gateway_entered.wait(timeout=0.05))
+
+        self.assertTrue(same_gateway_entered.wait(timeout=1.0))
+        same_gateway_thread.join(timeout=1.0)
+        other_gateway_thread.join(timeout=1.0)
+
+        self.assertFalse(same_gateway_thread.is_alive())
+        self.assertFalse(other_gateway_thread.is_alive())
+        self.assertEqual(
+            {admission['coordination_mode'] for admission in admissions},
+            {'completion_single_flight'},
+        )
+
+    def test_openclaw_completion_coordinator_releases_without_fixed_delay(self):
+        coordinator = orchestrator_module._OpenClawDispatchCoordinator(
+            clock=lambda: 100.0
+        )
+        waiter_attempted = threading.Event()
+        waiter_entered = threading.Event()
+
+        def wait_for_admission():
+            waiter_attempted.set()
+            with coordinator.admit(key='https://openclaw.example') as admission:
+                self.assertEqual(admission['wait_seconds'], 0)
+                waiter_entered.set()
+
+        with self.assertRaisesRegex(RuntimeError, 'dispatch failed'):
+            with coordinator.admit(key='https://openclaw.example') as first:
+                self.assertEqual(first['wait_seconds'], 0)
+                waiter = threading.Thread(target=wait_for_admission)
+                waiter.start()
+                self.assertTrue(waiter_attempted.wait(timeout=1.0))
+                self.assertFalse(waiter_entered.wait(timeout=0.05))
+                raise RuntimeError('dispatch failed')
+
+        self.assertTrue(waiter_entered.wait(timeout=1.0))
+        waiter.join(timeout=1.0)
+        self.assertFalse(waiter.is_alive())
+
+    def test_successful_reprobe_clears_circuit_before_postprocessing(self):
+        http_calls = []
+        first_response_classified = threading.Event()
+        release_first_postprocessing = threading.Event()
+        errors = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, {'status': 'completed'}),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        def post_once(client, *, request_run_id):
+            reprobe = client._raise_if_circuit_broken(
+                request_run_id=request_run_id,
+            )
+            return client._post_model_request(
+                role='eod-summarizer',
+                operation='batch',
+                url='https://openclaw.example/v1/responses',
+                body={'model': 'openclaw/eod-summarizer', 'input': 'test'},
+                headers=client._headers(),
+                timeout_seconds=30,
+                request_run_id=request_run_id,
+                capacity_reprobe=reprobe,
+                retry_contract_anchor=None,
+                retry_contract_change_message='retry contract changed',
+                failed_contract_change_message='failed contract changed',
+                started_event='dispatch_batch_request',
+                started_log_fields={},
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ), patch.object(
+            orchestrator_module,
+            'build_runtime_contract_provenance',
+            return_value={'generation': 'stable'},
+        ), patch.object(
+            orchestrator_module,
+            'build_dispatch_runtime_contract_provenance',
+            return_value={'verified': True},
+        ), patch.object(
+            orchestrator_module,
+            'log_agent_feedback_event',
+        ):
+            client = OpenClawAgentClient()
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchRetryableError(
+                    'OpenClaw gateway unavailable',
+                    details={
+                        'failure_kind': 'openclaw_transport_error',
+                        'failure_status': 'transport/error',
+                        'failure_category': 'transport',
+                        'retryable': True,
+                        'shared_transport_outage': True,
+                        'shared_dispatch_outage': True,
+                    },
+                ),
+                request_run_id='failed-run',
+            )
+
+            def first_reprobe():
+                try:
+                    post_once(client, request_run_id='reprobe-run')
+                    first_response_classified.set()
+                    release_first_postprocessing.wait(timeout=2.0)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    first_response_classified.set()
+
+            first_thread = threading.Thread(target=first_reprobe)
+            first_thread.start()
+            self.assertTrue(first_response_classified.wait(timeout=1.0))
+
+            try:
+                post_once(client, request_run_id='next-run')
+            finally:
+                release_first_postprocessing.set()
+                first_thread.join(timeout=1.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(http_calls), 2)
+
+    def test_queued_client_observes_shared_429_before_second_post(self):
+        first_post_started = threading.Event()
+        second_post_started = threading.Event()
+        release_first_post = threading.Event()
+        post_lock = threading.Lock()
+        http_calls = []
+        errors = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        class BlockingRateLimitClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json):
+                with post_lock:
+                    call_number = len(http_calls) + 1
+                    http_calls.append(
+                        {'url': url, 'json': json, 'kwargs': self.kwargs}
+                    )
+                if call_number == 1:
+                    first_post_started.set()
+                    if not release_first_post.wait(timeout=2.0):
+                        raise TimeoutError('test did not release first OpenClaw request')
+                else:
+                    second_post_started.set()
+                return FakeHTTPResponse(
+                    429,
+                    {'error': 'rate_limit'},
+                    headers={'Retry-After': '120'},
+                )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'symbol-run-2026-04-14-shared-429',
+                'dispatch_id': 'shared-429-dispatch',
+                'session_slot': 1,
+                'session_key': 'feedback/eod-summarizer/shared-429',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        def dispatch(client):
+            try:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=BlockingRateLimitClient,
+        ):
+            first_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            second_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            first_thread.start()
+            self.assertTrue(first_post_started.wait(timeout=1.0))
+            second_thread.start()
+            self.assertFalse(second_post_started.wait(timeout=0.1))
+            release_first_post.set()
+            first_thread.join(timeout=2.0)
+            second_thread.join(timeout=2.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(http_calls), 1)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(
+            any(
+                isinstance(error, orchestrator_module.AgentDispatchRetryableError)
+                for error in errors
+            )
+        )
+        blocked_errors = [
+            error
+            for error in errors
+            if isinstance(error, orchestrator_module.AgentDispatchTerminalError)
+        ]
+        self.assertEqual(len(blocked_errors), 1)
+        self.assertTrue(blocked_errors[0].details['retryable'])
+        self.assertEqual(
+            blocked_errors[0].details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+
+    def test_queued_client_observes_wrapped_shared_transport_before_second_post(self):
+        first_post_started = threading.Event()
+        second_post_started = threading.Event()
+        release_first_post = threading.Event()
+        post_lock = threading.Lock()
+        http_calls = []
+        errors = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        class BlockingTransportClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json):
+                with post_lock:
+                    call_number = len(http_calls) + 1
+                    http_calls.append(
+                        {'url': url, 'json': json, 'kwargs': self.kwargs}
+                    )
+                if call_number == 1:
+                    first_post_started.set()
+                    if not release_first_post.wait(timeout=2.0):
+                        raise TimeoutError('test did not release first request')
+                    return FakeHTTPResponse(
+                        502,
+                        {'error': 'connection refused'},
+                    )
+                second_post_started.set()
+                return FakeHTTPResponse(
+                    502,
+                    {'error': 'unexpected second request'},
+                )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'symbol-run-2026-04-14-shared-transport',
+                'dispatch_id': 'shared-transport-dispatch',
+                'session_slot': 1,
+                'session_key': 'feedback/eod-summarizer/shared-transport',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        def dispatch(client):
+            try:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=BlockingTransportClient,
+        ):
+            first_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            second_thread = threading.Thread(
+                target=dispatch,
+                args=(OpenClawAgentClient(),),
+            )
+            first_thread.start()
+            self.assertTrue(first_post_started.wait(timeout=1.0))
+            second_thread.start()
+            self.assertFalse(second_post_started.wait(timeout=0.1))
+            release_first_post.set()
+            first_thread.join(timeout=2.0)
+            second_thread.join(timeout=2.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(len(http_calls), 1)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(
+            sorted(error.details['failure_kind'] for error in errors),
+            ['openclaw_transport_error', 'openclaw_transport_error'],
+        )
+        self.assertEqual(
+            sum(
+                isinstance(error, orchestrator_module.AgentDispatchTerminalError)
+                for error in errors
+            ),
+            1,
+        )
+
+    def test_rate_limit_circuit_is_not_weakened_by_capacity_trip(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_rate_limit_fallback_cooldown_seconds=900,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            rate_limit_error = client._provider_rate_limit_error(
+                FakeHTTPResponse(
+                    429,
+                    {'error': 'rate_limit'},
+                    headers={'Retry-After': '120'},
+                ),
+                operation='batch',
+            )
+            client._trip_circuit_breaker(
+                rate_limit_error,
+                request_run_id='run-a',
+            )
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchTerminalError(
+                    'local capacity unavailable',
+                    details={
+                        'failure_kind': 'openclaw_storage_admission_blocked',
+                        'failure_status': 'capacity/storage-admission-blocked',
+                        'failure_category': 'capacity',
+                        'retryable': True,
+                        'shared_dispatch_outage': True,
+                    },
+                ),
+                request_run_id='run-b',
+            )
+
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchTerminalError
+            ) as blocked:
+                client._raise_if_circuit_broken(request_run_id='run-c')
+
+        self.assertEqual(
+            blocked.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertGreater(blocked.exception.details['retry_after_seconds'], 0)
+
+    def test_http_429_trips_circuit_before_runtime_contract_drift_error(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(
+                    429,
+                    {'error': 'rate_limit'},
+                    headers={'Retry-After': '120'},
+                ),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ), patch.object(
+            orchestrator_module,
+            'build_runtime_contract_provenance',
+            side_effect=[{'generation': 'before'}, {'generation': 'after'}],
+        ), patch.object(
+            orchestrator_module,
+            'build_dispatch_runtime_contract_provenance',
+            return_value={'verified': False},
+        ):
+            client = OpenClawAgentClient()
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchRetryableError
+            ) as raised:
+                client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=[
+                        {
+                            'symbol': '005930',
+                            'market_date': '2026-04-14',
+                            'request_run_id': 'runtime-drift-429-run',
+                            'dispatch_id': 'runtime-drift-429-dispatch',
+                            'session_slot': 1,
+                            'session_key': 'feedback/eod-summarizer/drift-429',
+                            'session_reuse_mode': 'fresh_per_batch',
+                        }
+                    ],
+                )
+
+        self.assertEqual(
+            raised.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertEqual(len(http_calls), 1)
+
+    def test_wrapped_provider_429_opens_circuit_before_next_post(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_agent_rate_limit_fallback_cooldown_seconds=900,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(
+                    502,
+                    {
+                        'error': (
+                            'exceeded retry limit, last status: '
+                            '429 Too Many Requests'
+                        )
+                    },
+                ),
+                calls=http_calls,
+                **kwargs,
+            )
+
+        batch_items = [
+            {
+                'symbol': '005930',
+                'market_date': '2026-04-14',
+                'request_run_id': 'wrapped-provider-429-run',
+                'dispatch_id': 'wrapped-provider-429-dispatch',
+                'session_slot': 1,
+                'session_key': 'feedback/eod-summarizer/wrapped-429',
+                'session_reuse_mode': 'fresh_per_batch',
+            }
+        ]
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=fake_client_factory,
+        ):
+            first_client = OpenClawAgentClient()
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchRetryableError
+            ) as raised:
+                first_client.dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+            with self.assertRaises(
+                orchestrator_module.AgentDispatchTerminalError
+            ) as blocked:
+                OpenClawAgentClient().dispatch_batch(
+                    spec=orchestrator_module.DISPATCH_SPECS[0],
+                    market_date=orchestrator_module.date.fromisoformat(
+                        '2026-04-14'
+                    ),
+                    batch_items=batch_items,
+                )
+
+        self.assertEqual(len(http_calls), 1)
+        self.assertEqual(
+            raised.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertEqual(
+            blocked.exception.details['failure_kind'],
+            'openclaw_provider_rate_limited',
+        )
+        self.assertEqual(
+            raised.exception.details['response_status_code'],
+            502,
+        )
+
+    def test_connection_refused_http_error_is_not_provider_rate_limit(self):
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_agent_rate_limit_fallback_cooldown_seconds=900,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            client = OpenClawAgentClient()
+            error = client._provider_rate_limit_error(
+                FakeHTTPResponse(502, {'error': 'connection refused'}),
+                operation='batch dispatch',
+            )
+
+        self.assertIsNone(error)
+
+    def test_inner_reprobe_reservation_is_released_when_post_raises(self):
+        http_calls = []
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_min_dispatch_interval_seconds=0,
+            openclaw_state_dir='/tmp/openclaw-test-state',
+        )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings), patch(
+            'app.agent_context.orchestrator.httpx.Client',
+            side_effect=lambda **kwargs: RaisingHTTPClient(
+                exc=httpx.ReadTimeout('provider read timed out'),
+                calls=http_calls,
+                **kwargs,
+            ),
+        ), patch.object(
+            orchestrator_module,
+            'build_runtime_contract_provenance',
+            return_value={'verified': True},
+        ):
+            client = OpenClawAgentClient()
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchTerminalError(
+                    'shared capacity unavailable',
+                    details={
+                        'failure_kind': (
+                            'openclaw_plugin_state_capacity_exhausted'
+                        ),
+                        'failure_status': 'capacity/exhausted',
+                        'failure_category': 'capacity',
+                        'retryable': False,
+                        'shared_dispatch_outage': True,
+                    },
+                ),
+                request_run_id='run-a',
+            )
+            with self.assertRaises(httpx.ReadTimeout):
+                client._post_model_request(
+                    role='eod-summarizer',
+                    operation='batch',
+                    url='https://openclaw.example/v1/responses',
+                    body={'model': 'openclaw/eod-summarizer', 'input': 'x'},
+                    headers={},
+                    timeout_seconds=30,
+                    request_run_id='run-b',
+                    capacity_reprobe=False,
+                    retry_contract_anchor=None,
+                    retry_contract_change_message='retry contract changed',
+                    failed_contract_change_message='runtime contract changed',
+                    started_event='test_dispatch_started',
+                    started_log_fields={},
+                )
+
+            self.assertTrue(
+                client._raise_if_circuit_broken(request_run_id='run-c')
+            )
+
     def test_openclaw_dispatch_pacer_spaces_model_starts_without_real_sleep(self):
         monotonic_now = [100.0]
         sleep_calls = []
@@ -9351,12 +11544,20 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 client._raise_if_circuit_broken(request_run_id='run-b')
 
             self.assertGreater(blocked.exception.details['retry_after_seconds'], 0)
-            with client._circuit_breaker_lock:
-                message, details = client._circuit_breaker_error
-                details['retry_not_before'] = (
-                    datetime.now(timezone.utc) - timedelta(seconds=1)
-                ).isoformat()
-                client._circuit_breaker_error = (message, details)
+            expired_details = dict(rate_limit_error.details)
+            expired_details['retry_not_before'] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            client._dispatch_coordinator = (
+                orchestrator_module._OpenClawDispatchCoordinator()
+            )
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchRetryableError(
+                    str(rate_limit_error),
+                    details=expired_details,
+                ),
+                request_run_id='run-a',
+            )
 
             self.assertTrue(
                 client._raise_if_circuit_broken(request_run_id='run-b')
@@ -9381,12 +11582,22 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     allow_reserved_reprobe=True,
                 )
 
-            with client._circuit_breaker_lock:
-                message, details = client._circuit_breaker_error
-                details['retry_not_before'] = (
-                    datetime.now(timezone.utc) - timedelta(seconds=1)
-                ).isoformat()
-                client._circuit_breaker_error = (message, details)
+            expired_replacement_details = dict(
+                replacement_rate_limit.details
+            )
+            expired_replacement_details['retry_not_before'] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            client._dispatch_coordinator = (
+                orchestrator_module._OpenClawDispatchCoordinator()
+            )
+            client._trip_circuit_breaker(
+                orchestrator_module.AgentDispatchRetryableError(
+                    str(replacement_rate_limit),
+                    details=expired_replacement_details,
+                ),
+                request_run_id='run-z',
+            )
             self.assertTrue(
                 client._raise_if_circuit_broken(request_run_id='run-b')
             )

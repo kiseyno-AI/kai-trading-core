@@ -21,6 +21,7 @@ from app.db_models import DailyPriceBar, DailyPykrxEnrichmentRow, Symbol
 from app.eod.finality import validate_finalized_krx_write_date
 from app.eod.market_membership import validate_market_membership_snapshot
 from app.eod.pykrx_import import import_pykrx_stock, pykrx_request_context
+from app.market.session import previous_krx_trading_date
 from app.market_data_store import (
     load_daily_market_relative_contexts,
     load_daily_pykrx_enrichment_rows,
@@ -28,6 +29,8 @@ from app.market_data_store import (
     upsert_daily_pykrx_enrichment_rows,
 )
 from app.repositories.eod_run_repository import list_eod_collection_runs
+from app.eod.live_progress import daily_pipeline_live_progress
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol, split_symbol_list as _normalize_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +129,23 @@ SHORT_BALANCE_METRIC_KEYS = (
     'market_cap',
     'short_balance_ratio_pct',
 )
+SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS = 2
+SHORT_BALANCE_AVAILABILITY_CONTRACT = 'krx_t_plus_2'
+SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING = 'not_applicable_new_listing'
 VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS = ('per', 'pbr', 'dividend_yield')
+VALUATION_AVAILABILITY_AVAILABLE = 'available'
+VALUATION_AVAILABILITY_PROVIDER_REPORTED_UNAVAILABLE = (
+    'provider_reported_unavailable'
+)
+VALUATION_AVAILABILITY_PROVIDER_SCOPE_ABSENT = 'provider_scope_absent'
+VALUATION_AVAILABILITY_PROVIDER_ERROR = 'provider_error'
+VALUATION_TERMINAL_UNAVAILABLE_STATUSES = frozenset(
+    {
+        VALUATION_AVAILABILITY_PROVIDER_REPORTED_UNAVAILABLE,
+        VALUATION_AVAILABILITY_PROVIDER_SCOPE_ABSENT,
+    }
+)
+VALUATION_MIN_HEALTHY_FUNDAMENTAL_SCOPE_RATIO = 0.95
 MAX_SQL_SYMBOL_FILTER_SIZE = 500
 PYKRX_ENRICHMENT_READ_TIMEOUT_MS = 30_000
 PYKRX_COVERAGE_RUN_CANDIDATE_LIMIT = 50
@@ -186,11 +205,136 @@ def is_decision_usable_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
             dict(payload.get('short_volume') or {}),
             SHORT_VOLUME_METRIC_KEYS,
         )
+    if category == 'valuation_snapshot':
+        has_valuation_metric = any(
+            (metric_value := _to_float(payload.get(key))) is not None
+            and metric_value > 0
+            for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
+        )
+        if has_valuation_metric:
+            return True
+        market_cap = _to_float(payload.get('market_cap'))
+        return (
+            source == 'pykrx'
+            and market_cap is not None
+            and market_cap > 0
+            and payload.get('valuation_availability_status')
+            in VALUATION_TERMINAL_UNAVAILABLE_STATUSES
+        )
     return True
 
 
 def _metric_group_complete(payload: dict[str, Any], keys: Sequence[str]) -> bool:
     return all(_to_float(payload.get(key)) is not None for key in keys)
+
+
+def _short_balance_component_satisfied(payload: dict[str, Any]) -> bool:
+    return _metric_group_complete(payload, SHORT_BALANCE_METRIC_KEYS) or (
+        payload.get('availability_status')
+        == SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING
+    )
+
+
+def _preserve_existing_short_selling_components(
+    *,
+    rows: Sequence[dict[str, Any]],
+    existing_rows: Sequence[dict[str, Any]],
+    component_retry_debt: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """Merge only provider-failed components from same-date durable rows.
+
+    A short-volume success must not erase a value/balance component that was
+    already collected successfully for the same market date. Components are
+    copied only when their full metric group (and balance as-of date) matches
+    the current debt contract; unresolved symbols remain exact retry debt.
+    """
+
+    existing_by_scope = {
+        (
+            str(item.get('market') or '').strip().upper(),
+            str(item.get('scope_type') or '').strip().lower(),
+            str(item.get('scope_key') or '').strip(),
+        ): item
+        for item in existing_rows
+        if item.get('scope_key')
+    }
+    component_specs = {
+        'short_value': ('short_volume', SHORT_VALUE_METRIC_KEYS),
+        'short_balance': ('short_balance', SHORT_BALANCE_METRIC_KEYS),
+    }
+    expected_as_of_by_component = {
+        str(item.get('component') or ''): item.get('expected_as_of_date')
+        for item in component_retry_debt
+        if isinstance(item, Mapping)
+    }
+    preserved_counts = {component: 0 for component in component_specs}
+    merged_rows: list[dict[str, Any]] = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        payload = dict(row.get('payload') or {})
+        missing_fields = list(payload.get('missing_fields') or [])
+        existing = existing_by_scope.get(
+            (
+                str(row.get('market') or '').strip().upper(),
+                str(row.get('scope_type') or '').strip().lower(),
+                str(row.get('scope_key') or '').strip(),
+            )
+        )
+        existing_payload = dict((existing or {}).get('payload') or {})
+        preserved_components: list[str] = []
+        for component, (payload_group, metric_keys) in component_specs.items():
+            if component not in missing_fields:
+                continue
+            existing_group = dict(existing_payload.get(payload_group) or {})
+            if not _metric_group_complete(existing_group, metric_keys):
+                continue
+            if component == 'short_balance':
+                expected_as_of = expected_as_of_by_component.get(component)
+                if (
+                    expected_as_of
+                    and existing_group.get('as_of_date') != expected_as_of
+                ):
+                    continue
+                payload[payload_group] = existing_group
+            else:
+                current_group = dict(payload.get(payload_group) or {})
+                current_group.update(
+                    {key: existing_group[key] for key in metric_keys}
+                )
+                payload[payload_group] = current_group
+            missing_fields.remove(component)
+            preserved_components.append(component)
+            preserved_counts[component] += 1
+        payload['missing_fields'] = missing_fields
+        if preserved_components:
+            payload['preserved_components_from_existing'] = sorted(
+                preserved_components
+            )
+        row['payload'] = payload
+        merged_rows.append(row)
+
+    unresolved_debt: list[dict[str, Any]] = []
+    for raw_debt in component_retry_debt:
+        debt = dict(raw_debt)
+        component = str(debt.get('component') or '')
+        affected_symbols = sorted(
+            {
+                str(row.get('symbol') or row.get('scope_key') or '').strip()
+                for row in merged_rows
+                if component
+                in list((row.get('payload') or {}).get('missing_fields') or [])
+                and str(
+                    row.get('symbol') or row.get('scope_key') or ''
+                ).strip()
+            }
+        )
+        if not affected_symbols:
+            continue
+        debt['affected_symbol_count'] = len(affected_symbols)
+        debt['affected_symbols'] = affected_symbols
+        debt['affected_symbols_preview'] = affected_symbols[:50]
+        unresolved_debt.append(debt)
+    return merged_rows, unresolved_debt, preserved_counts
 
 
 def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
@@ -211,18 +355,28 @@ def is_complete_pykrx_enrichment_row(row: dict[str, Any]) -> bool:
         return (
             _metric_group_complete(short_volume, SHORT_VOLUME_METRIC_KEYS)
             and _metric_group_complete(short_volume, SHORT_VALUE_METRIC_KEYS)
-            and _metric_group_complete(
-                dict(payload.get('short_balance') or {}),
-                SHORT_BALANCE_METRIC_KEYS,
+            and _short_balance_component_satisfied(
+                dict(payload.get('short_balance') or {})
             )
         )
     if category == 'valuation_snapshot':
+        # A successful same-day provider response can authoritatively report
+        # that valuation multiples do not apply to a symbol (for example,
+        # SPACs, preferred shares, REITs, or foreign listings).  That is a
+        # terminal acquisition outcome, not retry debt.  Provider failures
+        # never receive a terminal status and remain fail-closed above.
         market_cap = _to_float(payload.get('market_cap'))
+        if row.get('source') != 'pykrx' or market_cap is None or market_cap <= 0:
+            return False
         has_valuation_metric = any(
-            _to_float(payload.get(key)) is not None
+            (metric_value := _to_float(payload.get(key))) is not None
+            and metric_value > 0
             for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
         )
-        return row.get('source') == 'pykrx' and market_cap is not None and market_cap > 0 and has_valuation_metric
+        return has_valuation_metric or (
+            payload.get('valuation_availability_status')
+            in VALUATION_TERMINAL_UNAVAILABLE_STATUSES
+        )
     return True
 
 
@@ -244,23 +398,24 @@ def _normalize_yyyymmdd(value: str | date) -> str:
     return _normalize_iso_date(value).replace('-', '')
 
 
+def _resolve_short_balance_as_of_date(market_date: str | date) -> date:
+    resolved_date = date.fromisoformat(_normalize_iso_date(market_date))
+    for _ in range(SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS):
+        previous_date = previous_krx_trading_date(
+            resolved_date,
+            allow_fallback=True,
+        )
+        if previous_date is None:
+            raise RuntimeError(
+                'Could not resolve KRX T+2 short balance availability date '
+                f'before {resolved_date.isoformat()}'
+            )
+        resolved_date = previous_date
+    return resolved_date
+
+
 def _current_krx_calendar_date() -> date:
     return datetime.now(ZoneInfo('Asia/Seoul')).date()
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols or []:
-        text = str(raw_symbol or '').strip().upper()
-        if not text:
-            continue
-        symbol = text.zfill(6) if text.isdigit() else text
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        normalized.append(symbol)
-    return normalized
 
 
 def _normalize_markets(markets: Sequence[str] | None) -> list[str]:
@@ -479,11 +634,6 @@ def _has_valuation_snapshot_payload(rows: Sequence[dict[str, Any]]) -> bool:
     return False
 
 
-def _normalize_symbol(value: Any) -> str:
-    text = str(value or '').strip().upper()
-    return text.zfill(6) if text.isdigit() else text
-
-
 def _symbol_membership_sha256(symbols: Sequence[str] | set[str]) -> str:
     normalized = sorted({_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)})
     return hashlib.sha256('\n'.join(normalized).encode('utf-8')).hexdigest()
@@ -639,11 +789,19 @@ class PykrxEnrichmentService:
         cache: dict[tuple[Any, ...], pd.DataFrame] = {}
         category_results: dict[str, dict[str, Any]] = {}
         categories_with_errors: list[str] = []
+        component_retry_debt: list[dict[str, Any]] = []
         required_collection_symbol_filter = (
             None if use_full_market_coverage else symbol_filter
         )
 
-        for category in resolved_categories:
+        for category_index, category in enumerate(resolved_categories):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': category_index,
+                    'total': len(resolved_categories),
+                    'current_step': f'collect_{category}',
+                }
+            )
             category_rows: list[dict[str, Any]]
             if category == 'sector_classification':
                 category_rows, details = self._collect_sector_classification_rows(
@@ -728,6 +886,49 @@ class PykrxEnrichmentService:
                     category_rows.extend(kis_rows)
                     details['kis_candidate_fallback'] = kis_details
 
+            if (
+                use_full_market_coverage
+                and category == 'short_selling'
+                and details.get('component_retry_debt')
+            ):
+                try:
+                    existing_short_rows = load_daily_pykrx_enrichment_rows(
+                        market_date=market_date_iso,
+                        categories=['short_selling'],
+                        markets=normalized_markets,
+                        source='pykrx',
+                        limit=None,
+                    )
+                    (
+                        category_rows,
+                        unresolved_component_debt,
+                        preserved_component_counts,
+                    ) = _preserve_existing_short_selling_components(
+                        rows=category_rows,
+                        existing_rows=existing_short_rows,
+                        component_retry_debt=(
+                            details.get('component_retry_debt') or []
+                        ),
+                    )
+                    details['component_retry_debt'] = (
+                        unresolved_component_debt
+                    )
+                    details['preserved_existing_component_counts'] = {
+                        component: count
+                        for component, count in preserved_component_counts.items()
+                        if count > 0
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    details['persistence_blocked'] = True
+                    details.setdefault('errors', []).append(
+                        {
+                            'operation': (
+                                'short_selling_existing_component_reconciliation'
+                            ),
+                            'error': str(exc),
+                        }
+                    )
+
             category_rows = _prepare_rows_for_persistence(
                 category_rows,
                 point_in_time_recovery=point_in_time_recovery,
@@ -758,17 +959,54 @@ class PykrxEnrichmentService:
                     if supported_replace_markets is None
                     or market in supported_replace_markets
                 ]
-                persisted_count = persist_enrichment_rows(
-                    rows=provider_rows,
-                    replace_scopes=[
-                        {
-                            'market_date': market_date_iso,
-                            'market': market,
-                            'category': category,
-                            'source': 'pykrx',
-                        }
+                failed_replace_markets = {
+                    str(item.get('market') or '').strip().upper()
+                    for item in details.get('errors') or []
+                    if str(item.get('market') or '').strip()
+                }
+                has_unscoped_errors = any(
+                    not str(item.get('market') or '').strip()
+                    for item in details.get('errors') or []
+                )
+                if has_unscoped_errors:
+                    replace_markets = []
+                else:
+                    replace_markets = [
+                        market
                         for market in replace_markets
-                    ],
+                        if market not in failed_replace_markets
+                    ]
+
+                # A failed provider market is never authoritative enough to
+                # overwrite its existing full-market snapshot. Short-selling
+                # is the sole exception: its independent value/balance
+                # components are reconciled above against same-date durable
+                # rows before any upsert. All other categories discard rows
+                # from failed markets and preserve the prior snapshot intact.
+                if details.get('persistence_blocked') or has_unscoped_errors:
+                    provider_rows = []
+                elif category != 'short_selling' and failed_replace_markets:
+                    provider_rows = [
+                        row
+                        for row in provider_rows
+                        if str(row.get('market') or '').strip().upper()
+                        not in failed_replace_markets
+                    ]
+                persisted_count = (
+                    0
+                    if details.get('persistence_blocked')
+                    else persist_enrichment_rows(
+                        rows=provider_rows,
+                        replace_scopes=[
+                            {
+                                'market_date': market_date_iso,
+                                'market': market,
+                                'category': category,
+                                'source': 'pykrx',
+                            }
+                            for market in replace_markets
+                        ],
+                    )
                 )
                 if non_provider_rows:
                     persisted_count += persist_enrichment_rows(
@@ -809,11 +1047,27 @@ class PykrxEnrichmentService:
                         'rows_persisted': persisted_count,
                     }
             details['rows_persisted'] = persisted_count
+            category_component_retry_debt = [
+                dict(item)
+                for item in details.get('component_retry_debt') or []
+                if isinstance(item, dict)
+            ]
+            component_retry_debt.extend(
+                {
+                    'category': category,
+                    **item,
+                }
+                for item in category_component_retry_debt
+            )
             details['status'] = (
                 'recovered'
                 if persisted_count > 0 and fallback_result is not None
                 else 'completed'
-                if persisted_count > 0 and not details.get('errors')
+                if (
+                    persisted_count > 0
+                    and not details.get('errors')
+                    and not category_component_retry_debt
+                )
                 else 'partial'
             )
             if details.get('errors') and persisted_count <= 0:
@@ -879,7 +1133,20 @@ class PykrxEnrichmentService:
             for category, details in category_results.items()
             if details.get('fallback') and int(details.get('rows_persisted') or 0) > 0
         ]
-        status = 'partial' if categories_with_errors else ('recovered' if recovered_categories else 'completed')
+        retry_debt_categories = sorted(
+            {
+                str(item.get('category'))
+                for item in component_retry_debt
+                if item.get('category')
+            }
+        )
+        status = (
+            'partial'
+            if categories_with_errors or component_retry_debt
+            else 'recovered'
+            if recovered_categories
+            else 'completed'
+        )
         _log_pykrx_enrichment_fetch(
             'collect_for_market_date',
             status,
@@ -893,6 +1160,7 @@ class PykrxEnrichmentService:
             },
             failed_categories=categories_with_errors,
             recovered_categories=recovered_categories,
+            retry_debt_categories=retry_debt_categories,
             requested_symbol_count=coverage.get('requested_symbol_count'),
             requested_market_count=coverage.get('requested_market_count'),
         )
@@ -914,6 +1182,8 @@ class PykrxEnrichmentService:
             'status': status,
             'categories': category_results,
             'coverage': coverage,
+            'component_retry_debt': component_retry_debt,
+            'retry_debt_categories': retry_debt_categories,
         }
 
     def _collect_kis_candidate_fallback_rows(
@@ -1957,7 +2227,65 @@ class PykrxEnrichmentService:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        balance_as_of_date: date | None = None
+        balance_date_error: Exception | None = None
+        not_applicable_new_listing_symbols: set[str] = set()
+        historical_membership_resolved = False
+        historical_membership_symbols: set[str] | None = None
+        try:
+            balance_as_of_date = _resolve_short_balance_as_of_date(
+                market_date_iso
+            )
+        except Exception as exc:  # pragma: no cover - defensive calendar guard
+            balance_date_error = exc
         allowed_symbols = self._active_symbol_filter(symbol_filter=symbol_filter, symbol_meta=symbol_meta)
+
+        def load_historical_membership_symbols() -> set[str] | None:
+            nonlocal historical_membership_resolved
+            nonlocal historical_membership_symbols
+            if historical_membership_resolved:
+                return historical_membership_symbols
+            historical_membership_resolved = True
+            if balance_as_of_date is None:
+                return None
+
+            balance_date = _normalize_yyyymmdd(balance_as_of_date)
+            complete_membership: set[str] = set()
+            for historical_market in sorted(SHORTING_SUPPORTED_MARKETS):
+                try:
+                    membership_frame = self._fetch_frame(
+                        cache=cache,
+                        cache_key=(
+                            'stock_universe_membership',
+                            balance_date,
+                            historical_market,
+                        ),
+                        operation='short_selling_balance_membership',
+                        func=_market_ticker_membership_frame,
+                        require_non_empty=True,
+                        date=balance_date,
+                        market=historical_market,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        {
+                            'market': historical_market,
+                            'operation': (
+                                'short_selling_balance_membership'
+                            ),
+                            'error': str(exc),
+                        }
+                    )
+                    historical_membership_symbols = None
+                    return None
+                complete_membership.update(
+                    _normalize_symbol(ticker)
+                    for ticker in membership_frame.index.tolist()
+                    if _normalize_symbol(ticker)
+                )
+            historical_membership_symbols = complete_membership
+            return historical_membership_symbols
+
         for market in markets:
             if market not in SHORTING_SUPPORTED_MARKETS:
                 continue
@@ -2027,13 +2355,21 @@ class PykrxEnrichmentService:
                 value_frame = pd.DataFrame()
 
             try:
+                if balance_as_of_date is None:
+                    raise RuntimeError(
+                        'short_selling_balance availability date resolution failed: '
+                        f'{balance_date_error}'
+                    )
+                balance_as_of_date_yyyymmdd = _normalize_yyyymmdd(
+                    balance_as_of_date
+                )
                 balance_frame = self._fetch_frame(
                     cache=cache,
-                    cache_key=('short_selling_balance', market_date_yyyymmdd, market),
+                    cache_key=('short_selling_balance', balance_as_of_date_yyyymmdd, market),
                     operation='short_selling_balance',
                     func=stock.get_shorting_balance_by_ticker,
                     require_non_empty=True,
-                    date=market_date_yyyymmdd,
+                    date=balance_as_of_date_yyyymmdd,
                     market=market,
                 )
             except Exception as exc:
@@ -2044,6 +2380,47 @@ class PykrxEnrichmentService:
                 str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()
                 for item in volume_frame.index.tolist()
             }
+            eligible_symbols = {
+                symbol
+                for symbol in symbols_for_market
+                if not allowed_symbols or symbol in allowed_symbols
+            }
+            incomplete_balance_symbols = {
+                symbol
+                for symbol in eligible_symbols
+                if not _metric_group_complete(
+                    {
+                        'short_balance_qty': _to_int(
+                            _frame_value(balance_frame, symbol, '공매도잔고')
+                        ),
+                        'listed_shares': _to_int(
+                            _frame_value(balance_frame, symbol, '상장주식수')
+                        ),
+                        'short_balance_amount': _to_int(
+                            _frame_value(balance_frame, symbol, '공매도금액')
+                        ),
+                        'market_cap': _to_int(
+                            _frame_value(balance_frame, symbol, '시가총액')
+                        ),
+                        'short_balance_ratio_pct': _to_float(
+                            _frame_value(balance_frame, symbol, '비중')
+                        ),
+                    },
+                    SHORT_BALANCE_METRIC_KEYS,
+                )
+            }
+            market_not_applicable_new_listings: set[str] = set()
+            if balance_as_of_date is not None and incomplete_balance_symbols:
+                balance_membership_symbols = (
+                    load_historical_membership_symbols()
+                )
+                if balance_membership_symbols is not None:
+                    market_not_applicable_new_listings = (
+                        incomplete_balance_symbols - balance_membership_symbols
+                    )
+                    not_applicable_new_listing_symbols.update(
+                        market_not_applicable_new_listings
+                    )
             reference_count = len(reference_symbols) if reference_symbols else None
             reference_sha256 = (
                 _symbol_membership_sha256(reference_symbols)
@@ -2093,6 +2470,13 @@ class PykrxEnrichmentService:
                         ),
                     },
                     'short_balance': {
+                        'as_of_date': (
+                            balance_as_of_date.isoformat()
+                            if balance_as_of_date is not None
+                            else None
+                        ),
+                        'availability_lag_trading_days': SHORT_BALANCE_AVAILABILITY_LAG_TRADING_DAYS,
+                        'availability_contract': SHORT_BALANCE_AVAILABILITY_CONTRACT,
                         'short_balance_qty': _to_int(_frame_value(balance_frame, symbol, '공매도잔고')),
                         'listed_shares': _to_int(_frame_value(balance_frame, symbol, '상장주식수')),
                         'short_balance_amount': _to_int(_frame_value(balance_frame, symbol, '공매도금액')),
@@ -2105,7 +2489,13 @@ class PykrxEnrichmentService:
                     missing_fields.append('short_volume')
                 if not _metric_group_complete(payload['short_volume'], SHORT_VALUE_METRIC_KEYS):
                     missing_fields.append('short_value')
-                if not _metric_group_complete(payload['short_balance'], SHORT_BALANCE_METRIC_KEYS):
+                if symbol in market_not_applicable_new_listings:
+                    payload['short_balance']['availability_status'] = (
+                        SHORT_BALANCE_NOT_APPLICABLE_NEW_LISTING
+                    )
+                elif not _metric_group_complete(
+                    payload['short_balance'], SHORT_BALANCE_METRIC_KEYS
+                ):
                     missing_fields.append('short_balance')
                 payload['missing_fields'] = missing_fields
                 rows.append(
@@ -2123,11 +2513,66 @@ class PykrxEnrichmentService:
                     }
                 )
 
+        component_retry_debt: list[dict[str, Any]] = []
+        component_operations = {
+            'short_value': 'short_selling_value',
+            'short_balance': 'short_selling_balance',
+        }
+        for component, operation in component_operations.items():
+            affected_symbols = sorted(
+                {
+                    str(row.get('symbol') or row.get('scope_key') or '').strip()
+                    for row in rows
+                    if component
+                    in list((row.get('payload') or {}).get('missing_fields') or [])
+                    and str(row.get('symbol') or row.get('scope_key') or '').strip()
+                }
+            )
+            if not affected_symbols:
+                continue
+            operation_errors = [
+                dict(item)
+                for item in errors
+                if item.get('operation') == operation
+            ]
+            component_retry_debt.append(
+                {
+                    'component': component,
+                    'operation': operation,
+                    'status': 'retry_debt',
+                    'retryable': True,
+                    'action_required': 'retry_pykrx_enrichment_for_market_date',
+                    'market_date': market_date_iso,
+                    'expected_as_of_date': (
+                        balance_as_of_date.isoformat()
+                        if component == 'short_balance'
+                        and balance_as_of_date is not None
+                        else market_date_iso
+                    ),
+                    'affected_symbol_count': len(affected_symbols),
+                    'affected_symbols': affected_symbols,
+                    'affected_symbols_preview': affected_symbols[:50],
+                    'provider_errors': operation_errors,
+                    'reason': (
+                        str(operation_errors[0].get('error') or operation)
+                        if operation_errors
+                        else f'{component} is incomplete for persisted rows'
+                    ),
+                }
+            )
+
         return rows, {
             'category': 'short_selling',
             'scope_type': 'symbol',
             'rows_prepared': len(rows),
             'errors': errors,
+            'component_retry_debt': component_retry_debt,
+            'short_balance_not_applicable_new_listing_count': len(
+                not_applicable_new_listing_symbols
+            ),
+            'short_balance_not_applicable_new_listing_symbols': sorted(
+                not_applicable_new_listing_symbols
+            ),
         }
 
     def _collect_valuation_snapshot_rows(
@@ -2166,18 +2611,90 @@ class PykrxEnrichmentService:
                     date=market_date_yyyymmdd,
                     market=market,
                 )
+                fundamental_fetch_failed = False
             except Exception as exc:
                 errors.append({'market': market, 'operation': 'valuation_fundamentals', 'error': str(exc)})
                 fundamental_frame = pd.DataFrame()
+                fundamental_fetch_failed = True
 
-            symbols_for_market = {
-                str(item).strip().upper().zfill(6) if str(item).strip().isdigit() else str(item).strip().upper()
-                for item in set(market_cap_frame.index.tolist()) | set(fundamental_frame.index.tolist())
+            market_cap_symbols = {
+                _normalize_symbol(item)
+                for item in market_cap_frame.index.tolist()
+                if _normalize_symbol(item)
             }
+            fundamental_symbols = {
+                _normalize_symbol(item)
+                for item in fundamental_frame.index.tolist()
+                if _normalize_symbol(item)
+            }
+            if not fundamental_fetch_failed and market_cap_symbols:
+                fundamental_scope_ratio = len(
+                    fundamental_symbols & market_cap_symbols
+                ) / len(market_cap_symbols)
+                if (
+                    fundamental_scope_ratio
+                    < VALUATION_MIN_HEALTHY_FUNDAMENTAL_SCOPE_RATIO
+                ):
+                    errors.append(
+                        {
+                            'market': market,
+                            'operation': 'valuation_fundamentals_scope',
+                            'error': 'fundamental scope below healthy minimum',
+                            'fundamental_scope_ratio': round(
+                                fundamental_scope_ratio,
+                                6,
+                            ),
+                            'minimum_scope_ratio': (
+                                VALUATION_MIN_HEALTHY_FUNDAMENTAL_SCOPE_RATIO
+                            ),
+                        }
+                    )
+                    fundamental_fetch_failed = True
+            symbols_for_market = market_cap_symbols | fundamental_symbols
             for symbol in sorted(symbols_for_market):
                 if allowed_symbols and symbol not in allowed_symbols:
                     continue
                 symbol_info = symbol_meta.get(symbol) or {}
+                valuation_metrics = {
+                    'bps': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'BPS')
+                    ),
+                    'per': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'PER')
+                    ),
+                    'pbr': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'PBR')
+                    ),
+                    'eps': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'EPS')
+                    ),
+                    'dividend_yield': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'DIV')
+                    ),
+                    'dps': _to_float(
+                        _frame_value(fundamental_frame, symbol, 'DPS')
+                    ),
+                }
+                has_valuation_metric = any(
+                    (valuation_metrics.get(key) or 0) > 0
+                    for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS
+                )
+                if has_valuation_metric:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_AVAILABLE
+                    )
+                elif fundamental_fetch_failed:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_PROVIDER_ERROR
+                    )
+                elif symbol in fundamental_symbols:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_PROVIDER_REPORTED_UNAVAILABLE
+                    )
+                else:
+                    valuation_availability_status = (
+                        VALUATION_AVAILABILITY_PROVIDER_SCOPE_ABSENT
+                    )
                 rows.append(
                     {
                         'market_date': market_date_iso,
@@ -2196,12 +2713,10 @@ class PykrxEnrichmentService:
                             'volume': _to_int(_frame_value(market_cap_frame, symbol, '거래량')),
                             'trading_value': _to_int(_frame_value(market_cap_frame, symbol, '거래대금')),
                             'listed_shares': _to_int(_frame_value(market_cap_frame, symbol, '상장주식수')),
-                            'bps': _to_float(_frame_value(fundamental_frame, symbol, 'BPS')),
-                            'per': _to_float(_frame_value(fundamental_frame, symbol, 'PER')),
-                            'pbr': _to_float(_frame_value(fundamental_frame, symbol, 'PBR')),
-                            'eps': _to_float(_frame_value(fundamental_frame, symbol, 'EPS')),
-                            'dividend_yield': _to_float(_frame_value(fundamental_frame, symbol, 'DIV')),
-                            'dps': _to_float(_frame_value(fundamental_frame, symbol, 'DPS')),
+                            **valuation_metrics,
+                            'valuation_availability_status': (
+                                valuation_availability_status
+                            ),
                         },
                     }
                 )
@@ -2298,8 +2813,6 @@ class PykrxEnrichmentService:
         market_categories = [category for category in categories if CATEGORY_SCOPE_TYPE[category] == 'market']
         time_sensitive_categories = set(symbol_categories) & TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES
         fresh_stock_universe_categories = set(time_sensitive_categories)
-        if 'valuation_snapshot' in symbol_categories:
-            fresh_stock_universe_categories.add('valuation_snapshot')
         coverage_symbol_categories = list(symbol_categories)
         if (
             fresh_stock_universe_categories
@@ -2515,12 +3028,16 @@ class PykrxEnrichmentService:
         category_summaries: dict[str, dict[str, Any]] = {}
         for category in categories:
             supported_markets = CATEGORY_SUPPORTED_MARKETS.get(category)
-            decision_usable_rows = [
+            raw_category_rows = [
                 item
                 for item in rows
                 if item['category'] == category
                 and (supported_markets is None or _row_market(item) in supported_markets)
-                and is_decision_usable_pykrx_enrichment_row(item)
+            ]
+            decision_usable_rows = [
+                item
+                for item in raw_category_rows
+                if is_decision_usable_pykrx_enrichment_row(item)
             ]
             complete_rows = [
                 item
@@ -2616,17 +3133,25 @@ class PykrxEnrichmentService:
                             else 'fresh_pykrx_sector_classification'
                         )
                 elif category == 'valuation_snapshot':
-                    if not fresh_stock_universe_available:
+                    expected_scope_keys = {
+                        str(item.get('symbol') or '').strip().upper()
+                        for item in active_symbol_rows
+                        if str(item.get('symbol') or '').strip()
+                        and (
+                            supported_markets is None
+                            or _row_market(item) in supported_markets
+                        )
+                    }
+                    if not expected_scope_keys:
                         expected_rows = None
                         expectation_status = 'unavailable'
                         expected_universe_source = (
-                            'fresh_pykrx_stock_universe_unavailable'
+                            'validated_eod_run_market_membership_unavailable'
                         )
                     else:
-                        expected_scope_keys = fresh_stock_symbols
                         expected_rows = len(expected_scope_keys)
                         expected_universe_source = (
-                            'fresh_pykrx_sector_classification'
+                            'validated_eod_run_market_membership'
                         )
                 elif category in TIME_SENSITIVE_NO_CARRY_FORWARD_CATEGORIES:
                     if not fresh_stock_universe_available:
@@ -2663,12 +3188,21 @@ class PykrxEnrichmentService:
                 if expected_scope_keys is None
                 else complete_scope_keys & expected_scope_keys
             )
+            # ``category_rows`` is the exact set admitted to required-stage
+            # decisions.  It intentionally differs from full component
+            # completeness for short selling: same-day short-volume evidence
+            # is decision-usable even when the optional T+2 balance component
+            # is unavailable.  Valuation keeps its stricter observed-row
+            # contract because ``category_rows`` is built from complete rows.
             eligible_decision_usable_scope_keys = (
-                decision_usable_scope_keys
+                present_scope_keys
                 if expected_scope_keys is None
-                else decision_usable_scope_keys & expected_scope_keys
+                else present_scope_keys & expected_scope_keys
             )
             present_rows = len(eligible_present_scope_keys)
+            decision_usable_present_rows = len(
+                eligible_decision_usable_scope_keys
+            )
             complete_present_rows = len(eligible_complete_scope_keys)
             latest_captured_at = None
             latest_parsed = None
@@ -2677,13 +3211,27 @@ class PykrxEnrichmentService:
                 if parsed is not None and (latest_parsed is None or parsed > latest_parsed):
                     latest_parsed = parsed
                     latest_captured_at = item.get('captured_at')
-            category_summaries[category] = {
+            category_summary = {
                 'scope_type': CATEGORY_SCOPE_TYPE[category],
+                'expected_scope_keys': (
+                    sorted(expected_scope_keys)
+                    if expected_scope_keys is not None
+                    else None
+                ),
+                'decision_usable_scope_keys': sorted(
+                    eligible_decision_usable_scope_keys
+                ),
+                'complete_scope_keys': sorted(
+                    eligible_complete_scope_keys
+                ),
                 'present_rows': present_rows,
                 'raw_present_rows': len(decision_usable_scope_keys),
+                'decision_usable_present_rows': (
+                    decision_usable_present_rows
+                ),
                 'complete_present_rows': complete_present_rows,
                 'missing_component_rows': max(
-                    len(eligible_decision_usable_scope_keys) - complete_present_rows,
+                    len(decision_usable_scope_keys) - complete_present_rows,
                     0,
                 ),
                 'expected_rows': expected_rows,
@@ -2699,6 +3247,21 @@ class PykrxEnrichmentService:
                     if expectation_status == 'not_applicable'
                     else _coverage_status(
                         present_rows=present_rows,
+                        expected_rows=expected_rows,
+                    )
+                ),
+                'decision_usable_ratio': (
+                    round(decision_usable_present_rows / expected_rows, 6)
+                    if expected_rows is not None and expected_rows > 0
+                    else None
+                ),
+                'decision_usable_status': (
+                    'unavailable'
+                    if expectation_status == 'unavailable'
+                    else 'not_applicable'
+                    if expectation_status == 'not_applicable'
+                    else _coverage_status(
+                        present_rows=decision_usable_present_rows,
                         expected_rows=expected_rows,
                     )
                 ),
@@ -2723,6 +3286,72 @@ class PykrxEnrichmentService:
                 'markets': sorted({item['market'] for item in category_rows if item.get('market')}),
                 'latest_captured_at': latest_captured_at,
             }
+            if category == 'short_selling':
+                short_component_specs = {
+                    'short_volume': ('short_volume', SHORT_VOLUME_METRIC_KEYS),
+                    'short_value': ('short_volume', SHORT_VALUE_METRIC_KEYS),
+                    'short_balance': ('short_balance', SHORT_BALANCE_METRIC_KEYS),
+                }
+                component_coverage: dict[str, dict[str, Any]] = {}
+                for component, (payload_group, metric_keys) in short_component_specs.items():
+                    component_scope_keys = {
+                        item.get('symbol') or item['scope_key']
+                        for item in raw_category_rows
+                        if (item.get('symbol') or item.get('scope_key'))
+                        and item.get('source') != 'pykrx_carry_forward'
+                        and (
+                            _short_balance_component_satisfied(
+                                dict(
+                                    (item.get('payload') or {}).get(
+                                        payload_group
+                                    )
+                                    or {}
+                                )
+                            )
+                            if component == 'short_balance'
+                            else _metric_group_complete(
+                                dict(
+                                    (item.get('payload') or {}).get(
+                                        payload_group
+                                    )
+                                    or {}
+                                ),
+                                metric_keys,
+                            )
+                        )
+                    }
+                    eligible_component_scope_keys = (
+                        component_scope_keys
+                        if expected_scope_keys is None
+                        else component_scope_keys & expected_scope_keys
+                    )
+                    component_present_rows = len(eligible_component_scope_keys)
+                    component_status = (
+                        'unavailable'
+                        if expectation_status == 'unavailable' or expected_rows is None
+                        else 'not_applicable'
+                        if expectation_status == 'not_applicable'
+                        else _coverage_status(
+                            present_rows=component_present_rows,
+                            expected_rows=expected_rows,
+                        )
+                    )
+                    component_coverage[component] = {
+                        'present_rows': component_present_rows,
+                        'missing_rows': (
+                            max(expected_rows - component_present_rows, 0)
+                            if expected_rows is not None
+                            else None
+                        ),
+                        'coverage_ratio': (
+                            round(component_present_rows / expected_rows, 6)
+                            if expected_rows is not None and expected_rows > 0
+                            else None
+                        ),
+                        'coverage_status': component_status,
+                    }
+                category_summary['component_coverage'] = component_coverage
+            category_summaries[category] = category_summary
 
         return {
             'market_date': market_date,

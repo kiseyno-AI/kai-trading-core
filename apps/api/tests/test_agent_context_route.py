@@ -1275,6 +1275,25 @@ class AgentContextRouteTests(unittest.TestCase):
         )
         self.prerequisite_patcher.start()
         self.addCleanup(self.prerequisite_patcher.stop)
+        def eligibility_side_effect(**kwargs):
+            return (
+                list(dict.fromkeys(kwargs['requested_symbols'])),
+                [],
+            )
+        self.route_eligibility_patcher = patch(
+            'app.api.routes_agent_context.'
+            'split_requested_symbols_by_agent_feedback_eligibility',
+            side_effect=eligibility_side_effect,
+        )
+        self.orchestrator_eligibility_patcher = patch(
+            'app.agent_context.orchestrator.'
+            '_split_requested_symbols_by_agent_feedback_eligibility',
+            side_effect=eligibility_side_effect,
+        )
+        self.route_eligibility_patcher.start()
+        self.orchestrator_eligibility_patcher.start()
+        self.addCleanup(self.route_eligibility_patcher.stop)
+        self.addCleanup(self.orchestrator_eligibility_patcher.stop)
 
     def test_symbol_day_context_route_calls_service(self):
         fake_service = FakeAgentContextReadService()
@@ -1465,22 +1484,33 @@ class AgentContextRouteTests(unittest.TestCase):
             threadpool_functions.append(function)
             return function(*args, **kwargs)
 
-        with patch(
-            'app.api.routes_agent_context.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
-            side_effect=lambda **_: _feedback_prerequisites(
-                status='waiting',
-                missing_stage_ids=['fundamentals_daily_refresh', 'quality_factors'],
+        with (
+            patch(
+                'app.api.routes_agent_context.'
+                'split_requested_symbols_by_agent_feedback_eligibility',
+                return_value=(['005930'], ['000660']),
             ),
-        ), patch(
-            'app.api.routes_agent_context.run_in_threadpool',
-            side_effect=fake_run_in_threadpool,
+            patch(
+                'app.api.routes_agent_context.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                side_effect=lambda **_: _feedback_prerequisites(
+                    status='waiting',
+                    missing_stage_ids=[
+                        'fundamentals_daily_refresh',
+                        'quality_factors',
+                    ],
+                ),
+            ) as inspect_prerequisites,
+            patch(
+                'app.api.routes_agent_context.run_in_threadpool',
+                side_effect=fake_run_in_threadpool,
+            ),
         ):
             client = TestClient(self.app)
             response = client.post(
                 '/agent-context/feedback/dispatch/symbols',
                 json={
                     'market_date': '2026-04-14',
-                    'symbols': ['005930'],
+                    'symbols': ['005930', '000660'],
                     'roles': ['technical-summarizer'],
                     'knowledge_cutoff_at': '2026-04-14T06:30:00+00:00',
                     'wait_for_completion': False,
@@ -1496,6 +1526,78 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertTrue(payload['summary']['gated'])
         self.assertEqual(payload['summary']['status'], 'waiting')
         self.assertEqual(payload['items'], [])
+        self.assertEqual(payload['request']['symbols'], ['005930'])
+        self.assertEqual(
+            payload['request']['requested_symbols'],
+            ['005930', '000660'],
+        )
+        self.assertEqual(
+            payload['request']['skipped_symbols'],
+            ['000660'],
+        )
+        inspect_prerequisites.assert_called_once_with(
+            market_date=date(2026, 4, 14),
+            fs_div=None,
+            symbols=['005930'],
+        )
+
+    def test_subagent_dispatch_prerequisite_checks_receive_exact_eligible_symbols(self):
+        for wait_for_completion in (False, True):
+            eligibility_target = (
+                'app.agent_context.orchestrator.'
+                '_split_requested_symbols_by_agent_feedback_eligibility'
+                if wait_for_completion
+                else 'app.api.routes_agent_context.'
+                'split_requested_symbols_by_agent_feedback_eligibility'
+            )
+            with (
+                self.subTest(
+                    wait_for_completion=wait_for_completion
+                ),
+                patch(
+                    eligibility_target,
+                    return_value=(['005930'], ['000660']),
+                ),
+                patch(
+                    'app.api.routes_agent_context.'
+                    'agent_feedback_prerequisite_service.'
+                    'inspect_feedback_prerequisites',
+                    return_value=_feedback_prerequisites(
+                        status='waiting',
+                        missing_stage_ids=[
+                            'fundamentals_daily_refresh'
+                        ],
+                    ),
+                ) as inspect_prerequisites,
+            ):
+                response = TestClient(self.app).post(
+                    '/agent-context/feedback/dispatch/subagent-experiment',
+                    json={
+                        'market_date': '2026-04-14',
+                        'symbols': ['005930', '000660'],
+                        'roles': ['technical-summarizer'],
+                        'fs_div': 'OFS',
+                        'wait_for_completion': wait_for_completion,
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload['summary']['gated'])
+            self.assertEqual(payload['request']['symbols'], ['005930'])
+            self.assertEqual(
+                payload['request']['requested_symbols'],
+                ['005930', '000660'],
+            )
+            self.assertEqual(
+                payload['request']['skipped_symbols'],
+                ['000660'],
+            )
+            inspect_prerequisites.assert_called_once_with(
+                market_date=date(2026, 4, 14),
+                fs_div='OFS',
+                symbols=['005930'],
+            )
 
     def test_symbol_dispatch_background_route_starts_durable_queued_run_and_reuses_same_run_id(self):
         fake_orchestrator = FakeBackgroundDispatchOrchestrator()

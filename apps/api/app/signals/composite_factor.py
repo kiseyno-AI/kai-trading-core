@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.market_data_store import (
+    list_symbols_with_daily_bar_on_date,
     load_daily_advanced_value_factor_results,
     load_daily_beta_factor_results,
     load_daily_composite_factor_results,
@@ -12,10 +13,23 @@ from app.market_data_store import (
     load_daily_momentum_factor_results,
     load_daily_value_factor_results,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_composite_factor_result,
     upsert_daily_composite_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
 from app.signals.momentum_factor import enrich_momentum_audit_fields
+from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
+    build_factor_coverage_contract,
+    build_symbol_results,
+    factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 COMPOSITE_FACTOR_VERSION = 'composite_v1'
 COMPOSITE_FACTOR_SOURCE = COMPOSITE_FACTOR_VERSION
@@ -117,21 +131,6 @@ def _normalize_market_date(value: str | date) -> date:
     return date.fromisoformat(value)
 
 
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
-
-
 def _percentile_from_rank(rank: int, total: int) -> float:
     if total <= 1:
         return 1.0
@@ -151,6 +150,7 @@ def _sort_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class DailyCompositeFactorService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -158,6 +158,8 @@ class DailyCompositeFactorService:
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = COMPOSITE_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -174,85 +176,226 @@ class DailyCompositeFactorService:
                     + ','.join(outside_ranking_scope[:20])
                 )
         requested_symbols = list(normalized_symbols or [])
+        full_scope_replacement = symbols is None and ranking_symbols is None
         if normalized_symbols == []:
-            return self._empty_rebuild_result(
+            result = self._empty_rebuild_result(
                 market_date=normalized_market_date,
                 source=source,
                 requested_symbols=requested_symbols,
                 matched_symbols=[],
                 missing_symbols=[],
+                explicit_empty_scope=True,
             )
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='composite_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
+        authoritative_universe = list_symbols_with_daily_bar_on_date(
+            normalized_market_date.isoformat()
+        )
+        authoritative_symbol_set = set(authoritative_universe)
+        authoritative_ranking_symbols = (
+            [
+                symbol
+                for symbol in (normalized_ranking_symbols or [])
+                if symbol in authoritative_symbol_set
+            ]
+            if ranking_symbols is not None
+            else list(authoritative_universe)
+        )
+        ranking_scope_missing_symbols = (
+            [
+                symbol
+                for symbol in (normalized_ranking_symbols or [])
+                if symbol not in authoritative_symbol_set
+            ]
+            if ranking_symbols is not None
+            else []
+        )
         ranking_rows_by_family = self._load_factor_rows(
             market_date=normalized_market_date,
-            symbols=(
-                normalized_ranking_symbols
-                if ranking_symbols is not None
-                else None
-            ),
+            symbols=authoritative_ranking_symbols,
         )
-        ranking_symbols = self._collect_symbol_universe(ranking_rows_by_family)
+        missing_factor_families = [
+            family
+            for family in FACTOR_DEFINITION_BY_FAMILY
+            if family not in ranking_rows_by_family
+        ]
+        if missing_factor_families:
+            raise KeyError(
+                'missing shared composite factor families: '
+                + ','.join(missing_factor_families)
+            )
+        ranking_symbols = authoritative_ranking_symbols
 
         if normalized_symbols is None:
             matched_symbols = ranking_symbols
             missing_symbols: list[str] = []
             target_symbols = ranking_symbols
         else:
-            symbol_rows = load_symbols(symbols=normalized_symbols)
-            matched_symbols = [item['symbol'] for item in symbol_rows]
+            matched_symbols = [
+                symbol
+                for symbol in normalized_symbols
+                if symbol in authoritative_symbol_set
+            ]
             matched_symbol_set = set(matched_symbols)
             missing_symbols = [symbol for symbol in normalized_symbols if symbol not in matched_symbol_set]
             target_symbols = matched_symbols
             if not matched_symbols:
-                return self._empty_rebuild_result(
+                result = self._empty_rebuild_result(
                     market_date=normalized_market_date,
                     source=source,
                     requested_symbols=requested_symbols,
                     matched_symbols=[],
                     missing_symbols=missing_symbols,
                 )
+                if exact_scope_symbols is not None:
+                    result['scope_finalization'] = (
+                        replace_daily_derived_results_exact_scope(
+                            market_date=normalized_market_date,
+                            stage_id='composite_factors',
+                            results=[],
+                            exact_symbols=exact_scope_symbols,
+                            authoritative_market_scope=(
+                                authoritative_market_scope
+                            ),
+                        )['scope_finalization']
+                    )
+                return result
 
         metadata_map = self._load_symbol_metadata(
             symbols=sorted(set(ranking_symbols).union(target_symbols)),
             factor_rows_by_family=ranking_rows_by_family,
         )
 
-        items_by_symbol: dict[str, dict[str, Any]] = {}
-        for symbol in ranking_symbols:
-            item = self._build_symbol_result(
-                symbol=symbol,
-                market_date=normalized_market_date,
-                source=source,
-                metadata=metadata_map.get(symbol),
-                factor_rows_by_family=ranking_rows_by_family,
+        ranking_items, computation_failed_symbols, computation_failed_symbol_errors = (
+            build_symbol_results(
+                ranking_symbols,
+                symbol_of=lambda symbol: symbol,
+                build=lambda symbol: run_symbol_computation(
+                    lambda: self._build_symbol_result(
+                        symbol=symbol,
+                        market_date=normalized_market_date,
+                        source=source,
+                        metadata=metadata_map.get(symbol),
+                        factor_rows_by_family=ranking_rows_by_family,
+                    )
+                ),
             )
-            items_by_symbol[symbol] = item
+        )
+        items_by_symbol = {item['symbol']: item for item in ranking_items}
 
         extra_symbols = [symbol for symbol in target_symbols if symbol not in items_by_symbol]
-        for symbol in extra_symbols:
-            item = self._build_symbol_result(
-                symbol=symbol,
-                market_date=normalized_market_date,
-                source=source,
-                metadata=metadata_map.get(symbol),
-                factor_rows_by_family=ranking_rows_by_family,
+        retry_extra_symbols = [
+            symbol for symbol in extra_symbols
+            if symbol not in set(computation_failed_symbols)
+        ]
+        extra_items, extra_failed_symbols, extra_failed_symbol_errors = (
+            build_symbol_results(
+                retry_extra_symbols,
+                symbol_of=lambda symbol: symbol,
+                build=lambda symbol: run_symbol_computation(
+                    lambda: self._build_symbol_result(
+                        symbol=symbol,
+                        market_date=normalized_market_date,
+                        source=source,
+                        metadata=metadata_map.get(symbol),
+                        factor_rows_by_family=ranking_rows_by_family,
+                    )
+                ),
             )
-            items_by_symbol[symbol] = item
-
+        )
+        items_by_symbol.update({item['symbol']: item for item in extra_items})
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (extra_failed_symbols, extra_failed_symbol_errors),
+            )
+        )
         all_items = list(items_by_symbol.values())
         input_universe_counts = self._assign_scores_and_rankings(all_items)
-        for item in all_items:
+
+        def finalize_composite_item(item: dict[str, Any]) -> dict[str, Any]:
             self._attach_output_blocks(item)
             item['factor_payload'] = self._build_factor_payload(
                 item=item,
                 source=source,
                 input_universe_counts=input_universe_counts,
             )
+            return item
+
+        (
+            all_items,
+            payload_failed_symbols,
+            payload_failed_symbol_errors,
+        ) = build_symbol_results(
+            all_items,
+            symbol_of=lambda item: str(item.get('symbol') or ''),
+            build=lambda item: run_symbol_computation(
+                lambda: finalize_composite_item(item)
+            ),
+        )
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (payload_failed_symbols, payload_failed_symbol_errors),
+            )
+        )
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=computation_failed_symbols,
+            failed_symbol_errors=computation_failed_symbol_errors,
+            target_symbols=target_symbols,
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_scope_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
+        )
+        items_by_symbol = {item['symbol']: item for item in all_items}
 
         if normalized_symbols is None:
-            items = _sort_items([items_by_symbol[symbol] for symbol in ranking_symbols])
+            items = _sort_items([
+                items_by_symbol[symbol]
+                for symbol in ranking_symbols
+                if symbol in items_by_symbol
+            ])
         else:
-            items = _sort_items([items_by_symbol[symbol] for symbol in target_symbols])
+            items = _sort_items([
+                items_by_symbol[symbol]
+                for symbol in target_symbols
+                if symbol in items_by_symbol
+            ])
 
         summary = self._build_summary(
             items,
@@ -266,23 +409,65 @@ class DailyCompositeFactorService:
             self._strip_internal_fields(item)
 
         persisted_count = 0
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            persisted_count = upsert_daily_composite_factor_results(items)
-            if persisted_count != len(items):
-                raise RuntimeError(
-                    f'composite batch upsert persisted {persisted_count} of {len(items)} results'
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='composite_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (publication['failed_symbols'], publication['failed_symbol_errors']),
+            )
+            scope_finalization = publication['scope_finalization']
+        else:
+            def write_composite_batch(
+                batch: Sequence[dict[str, Any]],
+            ) -> None:
+                written_count = (
+                    upsert_daily_composite_factor_results(
+                        batch,
+                        replace_market_date=normalized_market_date,
+                    )
+                    if full_scope_replacement
+                    else upsert_daily_composite_factor_results(batch)
                 )
-        except Exception:
-            persisted_count = 0
-            for item in items:
-                try:
-                    upsert_daily_composite_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+                if written_count != len(batch):
+                    raise RuntimeError(
+                        'composite batch upsert persisted '
+                        f'{written_count} of {len(batch)} results'
+                    )
+
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=write_composite_batch,
+                item_write=(
+                    None
+                    if full_scope_replacement
+                    else upsert_daily_composite_factor_result
+                ),
+                failure_prefix=(
+                    'atomic_full_scope_replace_failed'
+                    if full_scope_replacement
+                    else 'persistence_failed'
+                ),
+                write_empty_batch=full_scope_replacement,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -295,8 +480,25 @@ class DailyCompositeFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+                failed_symbol_errors=failed_symbol_errors,
+            )
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
+        )
+        summary['common_complete_cohort_count'] = summary['complete_count']
+        summary['renormalized_partial_cohort_count'] = summary['partial_count']
 
-        return {
+        result = {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -310,6 +512,9 @@ class DailyCompositeFactorService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': items,
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,
@@ -380,6 +585,8 @@ class DailyCompositeFactorService:
         market_date: date,
         symbols: list[str] | None,
     ) -> dict[str, dict[str, dict[str, Any]]]:
+        if symbols == []:
+            return {family: {} for family in FACTOR_DEFINITION_BY_FAMILY}
         return {
             'momentum': {
                 item['symbol']: item
@@ -886,7 +1093,7 @@ class DailyCompositeFactorService:
         input_universe_counts: dict[str, int],
     ) -> dict[str, Any]:
         ready_count = sum(1 for item in items if item.get('composite_score') is not None)
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -927,6 +1134,53 @@ class DailyCompositeFactorService:
             },
             'input_universe_counts': input_universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+        )
+        summary['common_complete_cohort_count'] = summary['complete_count']
+        summary['renormalized_partial_cohort_count'] = summary['partial_count']
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        def snapshot(item: dict[str, Any], family: str) -> dict[str, Any]:
+            payload = item.get('factor_payload')
+            inputs = payload.get('inputs') if isinstance(payload, dict) else None
+            family_payload = inputs.get(family) if isinstance(inputs, dict) else None
+            return family_payload if isinstance(family_payload, dict) else {}
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
+            is_ready=lambda item: item.get('composite_score') is not None,
+            is_complete=lambda item: int(item.get('valid_factor_count') or 0)
+            == len(FACTOR_DEFINITIONS),
+            unusable_reason=lambda item: item.get('composite_classification'),
+            input_families={
+                family: (
+                    lambda item, family=family: snapshot(item, family).get('available')
+                    is True,
+                    lambda item, family=family: snapshot(item, family).get('status'),
+                )
+                for family in FACTOR_DEFINITION_BY_FAMILY
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:
@@ -943,21 +1197,37 @@ class DailyCompositeFactorService:
         requested_symbols: list[str],
         matched_symbols: list[str],
         missing_symbols: list[str],
+        explicit_empty_scope: bool = False,
     ) -> dict[str, Any]:
+        summary = self._build_summary(
+            [],
+            requested_symbols=requested_symbols,
+            matched_symbols=matched_symbols,
+            missing_symbols=missing_symbols,
+            input_universe_counts=dict(EMPTY_INPUT_UNIVERSE_COUNTS),
+        )
+        stage_contract = (
+            {
+                'status': 'completed',
+                'reason': 'explicit_empty_scope_noop',
+                'quality_status': summary['quality_status'],
+                'quality_warning': summary['quality_warning'],
+                'gate_status': 'ready',
+                'blocking_status': 'non_blocking',
+                'remaining_retryable_events': 0,
+            }
+            if explicit_empty_scope
+            else factor_stage_result_contract(summary)
+        )
         return {
+            **stage_contract,
             'market_date': market_date.isoformat(),
             'source': source,
             'feature_version': source,
             'requested_symbols': requested_symbols,
             'matched_symbols': matched_symbols,
             'missing_symbols': missing_symbols,
-            'summary': self._build_summary(
-                [],
-                requested_symbols=requested_symbols,
-                matched_symbols=matched_symbols,
-                missing_symbols=missing_symbols,
-                input_universe_counts=dict(EMPTY_INPUT_UNIVERSE_COUNTS),
-            ),
+            'summary': summary,
             'results_persisted': 0,
             'results_failed': 0,
             'failed_symbols': [],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
@@ -26,7 +27,10 @@ from sqlalchemy import select
 
 from app.agent_context.decision_delta import build_previous_decision_context
 from app.agent_context.feedback_service import agent_context_feedback_service
-from app.agent_context.prerequisite_service import agent_feedback_prerequisite_service
+from app.agent_context.prerequisite_service import (
+    FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER,
+    agent_feedback_prerequisite_service,
+)
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -46,6 +50,7 @@ from app.agent_context.orchestrator_helpers import (
     build_decider_source_context_generation as _build_decider_source_context_generation,
     durable_decider_source_context_fingerprint_matches as _durable_decider_source_context_fingerprint_matches,
     build_signal_decider_payload as _build_signal_decider_payload_helper,
+    canonical_decider_price_issue as _canonical_decider_price_issue,
     build_upstream_feedback_bundle as _build_upstream_feedback_bundle_helper,
     coerce_decoded_batch_response as _coerce_decoded_batch_response,
     correlate_decoded_batch_response as _correlate_decoded_batch_response,
@@ -113,6 +118,7 @@ from app.agent_context.run_state_service import agent_context_feedback_run_state
 from app.agent_context.response_contract import (
     build_agent_contract_provenance,
     build_contract_prompt_suffix,
+    decode_agent_json_object_with_structure_repair,
     decode_strict_agent_json_object,
     normalize_agent_response,
 )
@@ -152,6 +158,200 @@ PERSISTED_SNAPSHOT_JSON_MAX_BYTES = 1024 * 1024
 POST_DECISION_NEWS_SCAN_LIMIT = 50
 _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
 _MAX_OPENCLAW_RATE_LIMIT_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+
+
+def _openclaw_rate_limit_retry_not_before(
+    details: Mapping[str, Any],
+) -> datetime | None:
+    raw_value = str(details.get('retry_not_before') or '').strip()
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass
+class _OpenClawGatewayCircuitState:
+    error: tuple[str, dict[str, Any]] | None = None
+    run_id: str | None = None
+    reprobe_run_id: str | None = None
+
+
+class _OpenClawDispatchCoordinator:
+    """Coordinate model dispatches and shared outage state per gateway."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._clock = clock
+        self._condition = threading.Condition()
+        self._active_keys: set[str] = set()
+        self._circuit_states: dict[str, _OpenClawGatewayCircuitState] = {}
+
+    @staticmethod
+    def _normalized_key(key: str) -> str:
+        return str(key or 'openclaw').strip() or 'openclaw'
+
+    @contextmanager
+    def admit(self, *, key: str):
+        normalized_key = self._normalized_key(key)
+        wait_started_at = self._clock()
+        with self._condition:
+            while normalized_key in self._active_keys:
+                self._condition.wait()
+            self._active_keys.add(normalized_key)
+        admission = {
+            'coordination_mode': 'completion_single_flight',
+            'wait_seconds': max(0.0, self._clock() - wait_started_at),
+            'max_in_flight': 1,
+        }
+        try:
+            yield admission
+        finally:
+            with self._condition:
+                self._active_keys.discard(normalized_key)
+                self._condition.notify_all()
+
+    def check_circuit(
+        self,
+        *,
+        key: str,
+        request_run_id: str | None,
+        allow_reserved_reprobe: bool,
+    ) -> bool:
+        normalized_key = self._normalized_key(key)
+        normalized_run_id = str(request_run_id or '').strip() or None
+        blocked_error: tuple[str, dict[str, Any]] | None = None
+        with self._condition:
+            state = self._circuit_states.get(normalized_key)
+            stored = state.error if state is not None else None
+            if stored is None:
+                return False
+            message, stored_details = stored
+            if (
+                allow_reserved_reprobe
+                and normalized_run_id is not None
+                and state is not None
+                and state.reprobe_run_id == normalized_run_id
+            ):
+                return True
+            failure_kind = str(
+                stored_details.get('failure_kind') or ''
+            ).strip()
+            retry_not_before = (
+                _openclaw_rate_limit_retry_not_before(stored_details)
+                if failure_kind
+                == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                else None
+            )
+            now = datetime.now(timezone.utc)
+            rate_limit_cooldown_active = bool(
+                retry_not_before is not None and now < retry_not_before
+            )
+            if rate_limit_cooldown_active:
+                blocked_details = dict(stored_details)
+                blocked_details['retry_after_seconds'] = max(
+                    1,
+                    math.ceil((retry_not_before - now).total_seconds()),
+                )
+                blocked_error = (message, blocked_details)
+            else:
+                rate_limit_cooldown_expired = bool(
+                    failure_kind
+                    == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                    and retry_not_before is not None
+                )
+                independent_run = bool(
+                    normalized_run_id is not None
+                    and state is not None
+                    and normalized_run_id != state.run_id
+                )
+                if (
+                    (rate_limit_cooldown_expired or independent_run)
+                    and normalized_run_id is not None
+                    and state is not None
+                    and state.reprobe_run_id is None
+                ):
+                    state.reprobe_run_id = normalized_run_id
+                    return True
+                blocked_error = (message, dict(stored_details))
+        if blocked_error is not None:
+            message, details = blocked_error
+            raise AgentDispatchTerminalError(message, details=details)
+        return False
+
+    def trip_circuit(
+        self,
+        *,
+        key: str,
+        error: AgentDispatchError,
+        request_run_id: str | None,
+    ) -> None:
+        normalized_key = self._normalized_key(key)
+        with self._condition:
+            existing_state = self._circuit_states.get(normalized_key)
+            existing_details = (
+                existing_state.error[1]
+                if existing_state is not None
+                and existing_state.error is not None
+                else None
+            )
+            existing_rate_limit_deadline = (
+                _openclaw_rate_limit_retry_not_before(existing_details)
+                if isinstance(existing_details, dict)
+                and existing_details.get('failure_kind')
+                == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                else None
+            )
+            incoming_rate_limit_deadline = (
+                _openclaw_rate_limit_retry_not_before(error.details)
+                if error.details.get('failure_kind')
+                == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
+                else None
+            )
+            now = datetime.now(timezone.utc)
+            if (
+                existing_rate_limit_deadline is not None
+                and existing_rate_limit_deadline > now
+                and (
+                    incoming_rate_limit_deadline is None
+                    or incoming_rate_limit_deadline
+                    <= existing_rate_limit_deadline
+                )
+            ):
+                return
+            self._circuit_states[normalized_key] = (
+                _OpenClawGatewayCircuitState(
+                    error=(str(error), dict(error.details)),
+                    run_id=str(request_run_id or '').strip() or None,
+                )
+            )
+
+    def finish_reprobe(
+        self,
+        *,
+        key: str,
+        request_run_id: str | None,
+        recovered: bool,
+    ) -> None:
+        normalized_key = self._normalized_key(key)
+        normalized_run_id = str(request_run_id or '').strip() or None
+        with self._condition:
+            state = self._circuit_states.get(normalized_key)
+            if state is None or state.reprobe_run_id != normalized_run_id:
+                return
+            if recovered:
+                self._circuit_states.pop(normalized_key, None)
+                return
+            state.run_id = normalized_run_id
+            state.reprobe_run_id = None
 
 
 class _OpenClawDispatchPacer:
@@ -197,6 +397,7 @@ class _OpenClawDispatchPacer:
             'minimum_interval_seconds': interval,
         }
 
+_OPENCLAW_DISPATCH_COORDINATOR = _OpenClawDispatchCoordinator()
 _OPENCLAW_DISPATCH_PACER = _OpenClawDispatchPacer()
 
 
@@ -291,6 +492,10 @@ class AgentDispatchSpec:
 
 UPSTREAM_SUMMARY_ROLES: tuple[str, ...] = SUMMARIZER_AGENT_NAMES
 OPENCLAW_BATCH_RESPONSE_TOOL_NAME = 'submit_agent_feedback_batch'
+# Summarizer batches may be served by a runtime that returns the envelope as
+# plain text (e.g. the Claude Code CLI fallback). Only these roles get the
+# narrow structure repair; decider output stays strictly fail-closed.
+JSON_STRUCTURE_REPAIR_ROLES: frozenset[str] = frozenset(SUMMARIZER_AGENT_NAMES)
 
 
 DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
@@ -326,7 +531,6 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
             'If previous_decision_context is supplied, summarize the delta instead of repeating the earlier wait explanation: state what changed, what stayed the same, whether the setup is persistent or improving or worsening, and the concrete trigger that upgrades the setup. '
             'Account for market_regime_context when choosing scalp_buy_candidate, watch_for_trigger, wait, or reject: defensive/risk_off defaults to wait/reject unless the candidate shows exceptional market/sector leadership; caution/normal require setup confirmation; aggressive_open and trend_day can support faster or continuation-oriented entries only inside the supplied bounded window and without sizing or safety-gate claims. '
             'Treat missing news/disclosure detail and missing detailed quarterly/cash-flow detail as auxiliary by default, not standalone blockers, unless the setup explicitly depends on them. '
-            'When intraday_wait_recheck_context is supplied, treat its immutable fresh best-ask observation only as a request to reassess the prior WAIT; the touch is not buy authority, does not override any blocker, and may be promoted only to watch_for_trigger after a fresh conservative review. '
             'Write all operator-facing feedback in Korean while staying JSON-only, and avoid execution logic, leverage, sizing, or fake precision.'
         ),
     ),
@@ -334,7 +538,8 @@ DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
         role=SIGNAL_DECIDER_AGENT_NAME,
         agent_name=SIGNAL_DECIDER_AGENT_NAME,
         instruction=(
-            'Synthesize the three specialist summaries into conservative next-trading-day decision support only, '
+            'Operate as an independent swing, position, and long-horizon lane rather than a duplicate of or subordinate filter for the short-term lane, which normally holds 2-3 trading days, may exit earlier on invalidation, stop, or target, and never exceeds 3 trading sessions. '
+            'Synthesize the three specialist summaries into conservative decision support using this lane\'s own entry, target, stop, invalidation, and holding-horizon evidence, '
             'choosing buy, wait, or reject while surfacing evidence, disagreement, invalidation, data-quality warnings, '
             'and explicit realistic target and stop-loss levels for every symbol. '
             'Every wait decision must name one primary wait_reason taxonomy blocker plus a concise actionable explanation. '
@@ -505,21 +710,11 @@ def _is_shared_openclaw_transport_outage(
     )
 
 
-def _is_shared_openclaw_dispatch_outage(
+def _has_openclaw_provider_rate_limit_marker(
     *,
-    exc: BaseException | None = None,
     error: str | None = None,
-    response_status_code: int | None = None,
 ) -> bool:
-    if _is_shared_openclaw_transport_outage(exc=exc, error=error):
-        return True
-    if response_status_code == 429:
-        return True
-    normalized = ' '.join(
-        part.strip().lower()
-        for part in (str(exc or ''), str(error or ''))
-        if part and part.strip()
-    )
+    normalized = str(error or '').strip().lower()
     return any(
         marker in normalized
         for marker in (
@@ -530,7 +725,27 @@ def _is_shared_openclaw_dispatch_outage(
             'too many requests',
             'http 429',
             'error 429',
+            'status: 429',
         )
+    )
+
+
+def _is_shared_openclaw_dispatch_outage(
+    *,
+    exc: BaseException | None = None,
+    error: str | None = None,
+    response_status_code: int | None = None,
+) -> bool:
+    if _is_shared_openclaw_transport_outage(exc=exc, error=error):
+        return True
+    if response_status_code == 429:
+        return True
+    return _has_openclaw_provider_rate_limit_marker(
+        error=' '.join(
+            part.strip()
+            for part in (str(exc or ''), str(error or ''))
+            if part and part.strip()
+        ),
     )
 
 
@@ -576,11 +791,8 @@ class OpenClawAgentClient:
                 ),
             ),
         )
+        self._dispatch_coordinator = _OPENCLAW_DISPATCH_COORDINATOR
         self._dispatch_pacer = _OPENCLAW_DISPATCH_PACER
-        self._circuit_breaker_lock = threading.Lock()
-        self._circuit_breaker_error: tuple[str, dict[str, Any]] | None = None
-        self._circuit_breaker_run_id: str | None = None
-        self._circuit_breaker_reprobe_run_id: str | None = None
 
     @staticmethod
     def _plugin_state_capacity_error(
@@ -614,7 +826,13 @@ class OpenClawAgentClient:
         *,
         operation: str,
     ) -> AgentDispatchRetryableError | None:
-        if response.status_code != 429:
+        wrapped_provider_rate_limit = bool(
+            response.status_code >= 400
+            and _has_openclaw_provider_rate_limit_marker(
+                error=response.text[:1000],
+            )
+        )
+        if response.status_code != 429 and not wrapped_provider_rate_limit:
             return None
         now = datetime.now(timezone.utc)
         retry_after_seconds = self.rate_limit_fallback_cooldown_seconds
@@ -658,7 +876,8 @@ class OpenClawAgentClient:
         )
         retry_not_before = now + timedelta(seconds=retry_after_seconds)
         return AgentDispatchRetryableError(
-            f'OpenClaw {operation} retryable error 429: {response.text[:300]}',
+            f'OpenClaw {operation} provider rate limit '
+            f'({response.status_code}): {response.text[:300]}',
             details={
                 'failure_kind': (
                     FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
@@ -680,22 +899,35 @@ class OpenClawAgentClient:
     def _rate_limit_retry_not_before(
         details: Mapping[str, Any],
     ) -> datetime | None:
-        raw_value = str(details.get('retry_not_before') or '').strip()
-        if not raw_value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+        return _openclaw_rate_limit_retry_not_before(details)
 
     def _wait_for_dispatch_slot(self) -> dict[str, Any]:
         return self._dispatch_pacer.wait(
             key=self.base_url,
             minimum_interval_seconds=self.minimum_dispatch_interval_seconds,
         )
+
+    @contextmanager
+    def _admit_model_dispatch(self):
+        with self._dispatch_coordinator.admit(
+            key=self.base_url
+        ) as completion_admission:
+            pacing_admission = self._wait_for_dispatch_slot()
+            completion_wait_seconds = float(
+                completion_admission.get('wait_seconds') or 0.0
+            )
+            pacing_wait_seconds = float(
+                pacing_admission.get('wait_seconds') or 0.0
+            )
+            yield {
+                **pacing_admission,
+                **completion_admission,
+                'wait_seconds': (
+                    completion_wait_seconds + pacing_wait_seconds
+                ),
+                'completion_wait_seconds': completion_wait_seconds,
+                'fixed_pacing_wait_seconds': pacing_wait_seconds,
+            }
 
     def _raise_if_circuit_broken(
         self,
@@ -730,60 +962,11 @@ class OpenClawAgentClient:
             )
             raise error
 
-        blocked_error: tuple[str, dict[str, Any]] | None = None
-        with self._circuit_breaker_lock:
-            stored = self._circuit_breaker_error
-            if stored is not None:
-                message, stored_details = stored
-                if (
-                    allow_reserved_reprobe
-                    and normalized_run_id is not None
-                    and self._circuit_breaker_reprobe_run_id
-                    == normalized_run_id
-                ):
-                    return True
-                failure_kind = str(
-                    stored_details.get('failure_kind') or ''
-                ).strip()
-                retry_not_before = (
-                    self._rate_limit_retry_not_before(stored_details)
-                    if failure_kind
-                    == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
-                    else None
-                )
-                now = datetime.now(timezone.utc)
-                rate_limit_cooldown_active = bool(
-                    retry_not_before is not None and now < retry_not_before
-                )
-                if rate_limit_cooldown_active:
-                    blocked_details = dict(stored_details)
-                    blocked_details['retry_after_seconds'] = max(
-                        1,
-                        math.ceil((retry_not_before - now).total_seconds()),
-                    )
-                    blocked_error = (message, blocked_details)
-                else:
-                    rate_limit_cooldown_expired = bool(
-                        failure_kind
-                        == FeedbackFailureKind.OPENCLAW_PROVIDER_RATE_LIMITED.value
-                        and retry_not_before is not None
-                    )
-                    independent_run = bool(
-                        normalized_run_id is not None
-                        and normalized_run_id != self._circuit_breaker_run_id
-                    )
-                    if (
-                        (rate_limit_cooldown_expired or independent_run)
-                        and normalized_run_id is not None
-                        and self._circuit_breaker_reprobe_run_id is None
-                    ):
-                        self._circuit_breaker_reprobe_run_id = normalized_run_id
-                        return True
-                    blocked_error = (message, dict(stored_details))
-        if blocked_error is not None:
-            message, details = blocked_error
-            raise AgentDispatchTerminalError(message, details=details)
-        return False
+        return self._dispatch_coordinator.check_circuit(
+            key=self.base_url,
+            request_run_id=normalized_run_id,
+            allow_reserved_reprobe=allow_reserved_reprobe,
+        )
 
     def _trip_circuit_breaker(
         self,
@@ -791,10 +974,11 @@ class OpenClawAgentClient:
         *,
         request_run_id: str | None,
     ) -> None:
-        with self._circuit_breaker_lock:
-            self._circuit_breaker_error = (str(error), dict(error.details))
-            self._circuit_breaker_run_id = str(request_run_id or '').strip() or None
-            self._circuit_breaker_reprobe_run_id = None
+        self._dispatch_coordinator.trip_circuit(
+            key=self.base_url,
+            error=error,
+            request_run_id=request_run_id,
+        )
 
     def _finish_circuit_breaker_reprobe(
         self,
@@ -802,16 +986,251 @@ class OpenClawAgentClient:
         request_run_id: str | None,
         recovered: bool,
     ) -> None:
-        normalized_run_id = str(request_run_id or '').strip() or None
-        with self._circuit_breaker_lock:
-            if self._circuit_breaker_reprobe_run_id != normalized_run_id:
-                return
-            if recovered:
-                self._circuit_breaker_error = None
-                self._circuit_breaker_run_id = None
-            else:
-                self._circuit_breaker_run_id = normalized_run_id
-            self._circuit_breaker_reprobe_run_id = None
+        self._dispatch_coordinator.finish_reprobe(
+            key=self.base_url,
+            request_run_id=request_run_id,
+            recovered=recovered,
+        )
+
+    def _shared_transport_circuit_error(
+        self,
+        *,
+        exc: Exception,
+        operation: str,
+    ) -> AgentDispatchRetryableError | None:
+        if not _is_shared_openclaw_transport_outage(exc=exc):
+            return None
+        classification = classify_feedback_failure(
+            failure_kind=None,
+            summary={
+                'origin': f'openclaw_{operation}',
+                'exception_type': type(exc).__name__,
+                'error': str(exc),
+            },
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+        return AgentDispatchRetryableError(
+            f'OpenClaw {operation} shared transport outage: {exc}',
+            details={
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'failure_classification': classification.as_payload(),
+                'failure_mode': classification.failure_kind,
+                'retryable': True,
+                'shared_transport_outage': True,
+                'shared_dispatch_outage': True,
+                'exception_type': type(exc).__name__,
+                'error_message': str(exc),
+            },
+        )
+
+    @staticmethod
+    def _shared_transport_response_circuit_error(
+        response: httpx.Response,
+        *,
+        operation: str,
+    ) -> AgentDispatchRetryableError | None:
+        response_text = response.text[:1000]
+        if (
+            response.status_code < 500
+            or not _is_shared_openclaw_transport_outage(error=response_text)
+        ):
+            return None
+        error_message = (
+            f'OpenClaw {operation} HTTP {response.status_code}: '
+            f'{response_text[:300]}'
+        )
+        classification = classify_feedback_failure(
+            failure_kind=None,
+            summary={
+                'origin': f'openclaw_{operation}',
+                'response_status_code': response.status_code,
+                'error': error_message,
+            },
+            context={'response_status_code': response.status_code},
+            error=error_message,
+            exception_type='HTTPStatusError',
+        )
+        return AgentDispatchRetryableError(
+            f'OpenClaw {operation} shared transport outage: '
+            f'{response_text[:300]}',
+            details={
+                'failure_kind': classification.failure_kind,
+                'failure_status': classification.failure_status,
+                'failure_category': classification.failure_category,
+                'failure_classification': classification.as_payload(),
+                'failure_mode': classification.failure_kind,
+                'retryable': True,
+                'shared_transport_outage': True,
+                'shared_dispatch_outage': True,
+                'exception_type': 'HTTPStatusError',
+                'response_status_code': response.status_code,
+                'response_text_excerpt': response_text[:300],
+                'error_message': error_message,
+            },
+        )
+
+    def _post_model_request(
+        self,
+        *,
+        role: str,
+        operation: str,
+        url: str,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout_seconds: float,
+        request_run_id: str | None,
+        capacity_reprobe: bool,
+        retry_contract_anchor: dict[str, Any] | None,
+        retry_contract_change_message: str,
+        failed_contract_change_message: str,
+        started_event: str,
+        started_log_fields: dict[str, Any],
+    ) -> tuple[
+        httpx.Response,
+        dict[str, Any] | None,
+        dict[str, Any],
+        dict[str, Any],
+        bool,
+    ]:
+        with self._admit_model_dispatch() as dispatch_admission:
+            try:
+                log_agent_feedback_event(
+                    started_event,
+                    status='started',
+                    dispatch_rate_admission=dispatch_admission,
+                    http_target={'url': url, 'headers': headers},
+                    request_snapshot=build_request_snapshot(body),
+                    **started_log_fields,
+                )
+                pre_runtime_contract = build_runtime_contract_provenance(
+                    role,
+                    openclaw_state_dir=getattr(
+                        settings,
+                        'openclaw_state_dir',
+                        '~/.openclaw',
+                    ),
+                )
+                if retry_contract_anchor is None:
+                    retry_contract_anchor = pre_runtime_contract
+                else:
+                    retry_contract_proof = (
+                        build_dispatch_runtime_contract_provenance(
+                            pre_dispatch=retry_contract_anchor,
+                            post_dispatch=pre_runtime_contract,
+                        )
+                    )
+                    if (
+                        retry_contract_proof is not None
+                        and retry_contract_proof.get('verified') is not True
+                    ):
+                        raise AgentDispatchTerminalError(
+                            retry_contract_change_message,
+                            details={
+                                'runtime_contract': retry_contract_proof
+                            },
+                        )
+                capacity_reprobe = self._raise_if_circuit_broken(
+                    request_run_id=request_run_id,
+                    allow_reserved_reprobe=capacity_reprobe,
+                )
+                try:
+                    with httpx.Client(
+                        timeout=timeout_seconds,
+                        headers=headers,
+                    ) as client:
+                        response = client.post(url, json=body)
+                except Exception as exc:
+                    transport_error = self._shared_transport_circuit_error(
+                        exc=exc,
+                        operation=operation,
+                    )
+                    if transport_error is not None:
+                        self._trip_circuit_breaker(
+                            transport_error,
+                            request_run_id=request_run_id,
+                        )
+                    raise
+
+                capacity_error = self._plugin_state_capacity_error(response)
+                if capacity_error is not None:
+                    self._trip_circuit_breaker(
+                        capacity_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise capacity_error
+                rate_limit_error = self._provider_rate_limit_error(
+                    response,
+                    operation=operation,
+                )
+                if rate_limit_error is not None:
+                    self._trip_circuit_breaker(
+                        rate_limit_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise rate_limit_error
+                transport_response_error = (
+                    self._shared_transport_response_circuit_error(
+                        response,
+                        operation=operation,
+                    )
+                )
+                if transport_response_error is not None:
+                    self._trip_circuit_breaker(
+                        transport_response_error,
+                        request_run_id=request_run_id,
+                    )
+                    raise transport_response_error
+
+                post_runtime_contract = build_runtime_contract_provenance(
+                    role,
+                    openclaw_state_dir=getattr(
+                        settings,
+                        'openclaw_state_dir',
+                        '~/.openclaw',
+                    ),
+                )
+                runtime_contract = (
+                    build_dispatch_runtime_contract_provenance(
+                        pre_dispatch=pre_runtime_contract,
+                        post_dispatch=post_runtime_contract,
+                    )
+                )
+                if (
+                    response.status_code >= 400
+                    and runtime_contract is not None
+                    and runtime_contract.get('verified') is not True
+                ):
+                    raise AgentDispatchTerminalError(
+                        failed_contract_change_message,
+                        details={
+                            'runtime_contract': runtime_contract,
+                            'response_status_code': response.status_code,
+                            'response_text_excerpt': response.text[:300],
+                        },
+                    )
+                if capacity_reprobe and response.status_code < 400:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=True,
+                    )
+                    capacity_reprobe = False
+                return (
+                    response,
+                    runtime_contract,
+                    dispatch_admission,
+                    retry_contract_anchor,
+                    capacity_reprobe,
+                )
+            except Exception:
+                if capacity_reprobe:
+                    self._finish_circuit_breaker_reprobe(
+                        request_run_id=request_run_id,
+                        recovered=False,
+                    )
+                raise
 
     def _tool_invoke_url(self) -> str:
         parsed = urlparse(self.base_url)
@@ -1884,7 +2303,11 @@ class OpenClawAgentClient:
             if is_us_batch
             else (10300, 10500, 10900, 9900)
         )
-        signal_example_levels = (105.0, 98.0) if is_us_batch else (10500, 9800)
+        signal_example_levels = (
+            (103.0, 105.0, 109.0, 99.0)
+            if is_us_batch
+            else (10300, 10500, 10900, 9900)
+        )
         signal_wait_reason = (
             {
                 'code': 'insufficient_risk_reward',
@@ -1910,7 +2333,8 @@ class OpenClawAgentClient:
                 "- Every feedback.symbol and feedback.traceability.symbol is mandatory and must exactly match its item.symbol.\n"
                 "- One-symbol requests still require the same batch envelope with exactly one item; never collapse the response to a single feedback object.\n"
                 "- All operator-facing natural-language fields must be written in Korean, while the overall output remains raw JSON only.\n"
-                "- Every signal-decider item must include explicit target_price and stop_loss_price values; do not leave them unspecified unless the payload makes a justified level impossible, and in that rare case explain the limitation in data_quality_warnings.\n"
+                "- Every WAIT from either decider lane must include complete positive trigger_price, chase_limit_price, target_price, and stop_loss_price, satisfying stop_loss_price < trigger_price <= chase_limit_price < target_price. trigger_conditions are optional audit prose and never execution authority.\n"
+                "- Every signal-decider WAIT must also use entry_price_basis=trigger_limit. If complete coherent WAIT geometry cannot be supported, return REJECT instead of inventing levels; REJECT may keep unsupported levels null.\n"
                 "- Every wait-like conservative action must include a wait_reason object that names the primary normalized blocker instead of vague missing-information text.\n"
                 "- If previous_decision_context is present for a symbol, every decision-support item must include decision_delta with prior-vs-current metadata, summarize changes instead of repeating the old wait explanation, and name the concrete upgrade trigger.\n"
                 "- If context is weak, missing, conflicting, or truncated, emit a complete conservative wait or reject item instead of prose, placeholders, omissions, or malformed JSON.\n"
@@ -1976,14 +2400,17 @@ class OpenClawAgentClient:
                 'preferred_action': 'wait',
                 'next_day_open_action': 'wait',
                 'wait_reason': signal_wait_reason,
-                'entry_price_basis': 'next_open',
-                'target_price': signal_example_levels[0],
+                'entry_price_basis': 'trigger_limit',
+                'trigger_price': signal_example_levels[0],
+                'chase_limit_price': signal_example_levels[1],
+                'target_price': signal_example_levels[2],
                 'expected_return_pct': None,
-                'stop_loss_price': signal_example_levels[1],
+                'stop_loss_price': signal_example_levels[3],
                 'suggested_holding_period': '3-10 trading days',
                 'confidence_score_10': 6,
                 'conviction_score_10': 5,
                 'thesis_summary': 'brief conservative decision-support thesis',
+                'trigger_conditions': ['example trigger condition'],
                 'supporting_evidence': ['example evidence'],
                 'decision_risks': ['example decision risk'],
                 'decision_delta': {
@@ -2048,7 +2475,7 @@ class OpenClawAgentClient:
             "Prefer derived judgments over restating inputs; if a field is already in the payload, reference its implication instead of copying it.\n"
             "If some inputs are weak or missing, still return conservative structured feedback for that symbol instead of prose or placeholders.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for each symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For WAIT outputs in either decider lane, provide complete coherent trigger_price, chase_limit_price, target_price, and stop_loss_price; signal-decider WAIT must use entry_price_basis=trigger_limit. trigger_conditions are optional audit prose and never a second execution gate. If that complete WAIT price contract is not supportable, return REJECT instead of inventing levels.\n"
             "If previous_decision_context is present, use it to populate decision_delta, avoid copy-pasting the prior wait narrative, and explain both the stable blockers and the concrete upgrade trigger.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
@@ -2084,7 +2511,7 @@ class OpenClawAgentClient:
             f"{signal_decider_batch_rules}"
             "No tool_code, no print(json.dumps(...)), no markdown fences, no intent tags, no prose, no request restatement, raw JSON object only.\n"
             "All operator-facing natural-language fields inside the JSON must be written in Korean.\n"
-            "For decision-support outputs, provide explicit target_price and stop_loss_price levels for every assigned symbol whenever possible; short-term-decider must also provide trigger_price and chase_limit_price. If a level is genuinely not supportable, keep the key and explain the limitation in data_quality_warnings.\n"
+            "For WAIT outputs in either decider lane, provide complete coherent trigger_price, chase_limit_price, target_price, and stop_loss_price; signal-decider WAIT must use entry_price_basis=trigger_limit. trigger_conditions are optional audit prose and never a second execution gate. If that complete WAIT price contract is not supportable, return REJECT instead of inventing levels.\n"
             "Interpret decider_data_quality_context.decision_priority literally: core_execution gaps can justify conservative wait/reject, while auxiliary_context gaps are confidence reducers only by default.\n"
             "Interpret decision_input_quality_context.final_judgment and execution_feasibility as the source-attributed buy-quality guardrail; hard_blocks should prevent buy/watch upgrades unless directly contradicted by fresher supplied evidence.\n"
             "Interpret signal_decider_policy.performance_criteria as auditable replay context only when usage_policy.model_guidance_eligible=true. It may support conservative review or tighter buy thresholds; when manual_review_only=true it must never relax wait/reject into buy or authorize a buy. Deterministic execution may consume it only when usage_policy.deterministic_gate_eligible=true, and that eligibility never activates rule candidates or grants buy authority.\n"
@@ -2096,7 +2523,7 @@ class OpenClawAgentClient:
             f"Market date: {market_date.isoformat()}\n"
             f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False)}"
         )
-        if len(compact_message) <= max_chars:
+        if max_chars <= 0 or len(compact_message) <= max_chars:
             return compact_message
         raise AgentDispatchTerminalError(
             'OpenClaw prompt budget is too small to encode the requested batch without dropping assigned symbols',
@@ -2145,81 +2572,57 @@ class OpenClawAgentClient:
                     capacity_reprobe = self._raise_if_circuit_broken(
                         request_run_id=request_run_id,
                     )
-                dispatch_rate_admission = self._wait_for_dispatch_slot()
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
                     'x-openclaw-agent-id': spec.agent_name,
                 }
                 if expected_model is not None:
                     headers['x-openclaw-model'] = expected_model
-                log_agent_feedback_event(
-                    'dispatch_single_http_target',
-                    status='started',
-                    agent_name=spec.agent_name,
-                    role=spec.role,
-                    session_key=request_session_key,
-                    dispatch_rate_admission=dispatch_rate_admission,
-                    http_target={'url': url, 'headers': headers},
-                    request_snapshot=build_request_snapshot(body),
-                )
-                pre_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                if retry_contract_anchor is None:
-                    retry_contract_anchor = pre_runtime_contract
-                else:
-                    retry_contract_proof = build_dispatch_runtime_contract_provenance(
-                        pre_dispatch=retry_contract_anchor,
-                        post_dispatch=pre_runtime_contract,
-                    )
-                    if retry_contract_proof is not None and retry_contract_proof.get('verified') is not True:
-                        raise AgentDispatchTerminalError(
-                            'OpenClaw runtime contract changed between retry attempts',
-                            details={'runtime_contract': retry_contract_proof},
-                        )
-                capacity_reprobe = self._raise_if_circuit_broken(
-                    request_run_id=request_run_id,
-                    allow_reserved_reprobe=capacity_reprobe,
-                )
-                with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
-                    response = client.post(url, json=body)
-                post_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                runtime_contract = build_dispatch_runtime_contract_provenance(
-                    pre_dispatch=pre_runtime_contract,
-                    post_dispatch=post_runtime_contract,
-                )
-                if response.status_code >= 400 and runtime_contract is not None and runtime_contract.get('verified') is not True:
-                    raise AgentDispatchTerminalError(
-                        'OpenClaw runtime contract changed during failed dispatch attempt',
-                        details={'runtime_contract': runtime_contract},
-                    )
-                capacity_error = self._plugin_state_capacity_error(response)
-                if capacity_error is not None:
-                    self._trip_circuit_breaker(
-                        capacity_error,
-                        request_run_id=request_run_id,
-                    )
-                    raise capacity_error
-                rate_limit_error = self._provider_rate_limit_error(
+                (
                     response,
+                    runtime_contract,
+                    dispatch_rate_admission,
+                    retry_contract_anchor,
+                    capacity_reprobe,
+                ) = self._post_model_request(
+                    role=spec.role,
                     operation='dispatch',
+                    url=url,
+                    body=body,
+                    headers=headers,
+                    timeout_seconds=self.timeout_seconds,
+                    request_run_id=request_run_id,
+                    capacity_reprobe=capacity_reprobe,
+                    retry_contract_anchor=retry_contract_anchor,
+                    retry_contract_change_message=(
+                        'OpenClaw runtime contract changed between retry attempts'
+                    ),
+                    failed_contract_change_message=(
+                        'OpenClaw runtime contract changed during failed '
+                        'dispatch attempt'
+                    ),
+                    started_event='dispatch_single_http_target',
+                    started_log_fields={
+                        'agent_name': spec.agent_name,
+                        'role': spec.role,
+                        'session_key': request_session_key,
+                    },
                 )
-                if rate_limit_error is not None:
-                    self._trip_circuit_breaker(
-                        rate_limit_error,
-                        request_run_id=request_run_id,
-                    )
-                    raise rate_limit_error
                 if response.status_code >= 500:
-                    raise AgentDispatchRetryableError(f'OpenClaw server error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw server error {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 if response.status_code in (408, 409):
-                    raise AgentDispatchRetryableError(f'OpenClaw retryable error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw retryable error {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 if response.status_code >= 400:
-                    raise AgentDispatchTerminalError(f'OpenClaw dispatch failed {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchTerminalError(
+                        f'OpenClaw dispatch failed {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 parsed = response.json()
                 output_text = None
                 for item in parsed.get('output', []):
@@ -2611,10 +3014,6 @@ class OpenClawAgentClient:
                     capacity_reprobe = self._raise_if_circuit_broken(
                         request_run_id=circuit_breaker_run_id,
                     )
-                dispatch_rate_admission = self._wait_for_dispatch_slot()
-                request_provenance[
-                    'dispatch_rate_admission'
-                ] = dispatch_rate_admission
                 request_session_key = fixed_session_key
                 headers = self._headers() | {
                     'x-openclaw-session-key': request_session_key,
@@ -2622,83 +3021,64 @@ class OpenClawAgentClient:
                 }
                 if expected_model is not None:
                     headers['x-openclaw-model'] = expected_model
-                log_agent_feedback_event(
-                    'dispatch_batch_request',
-                    status='started',
-                    request_run_id=request_run_id,
-                    dispatch_id=dispatch_id,
-                    attempt_id=attempt_id,
-                    agent_name=spec.agent_name,
-                    role=spec.role,
-                    market_date=market_date.isoformat(),
-                    session_key=request_session_key,
-                    batch_symbols=batch_symbols,
-                    slot=slot,
-                    session_reuse_mode=session_reuse_mode,
-                    request_marker=request_marker,
-                    dispatch_rate_admission=dispatch_rate_admission,
-                    request_snapshot=build_request_snapshot(body),
-                    http_target={'url': url, 'headers': headers},
-                )
-                pre_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                if retry_contract_anchor is None:
-                    retry_contract_anchor = pre_runtime_contract
-                else:
-                    retry_contract_proof = build_dispatch_runtime_contract_provenance(
-                        pre_dispatch=retry_contract_anchor,
-                        post_dispatch=pre_runtime_contract,
-                    )
-                    if retry_contract_proof is not None and retry_contract_proof.get('verified') is not True:
-                        raise AgentDispatchTerminalError(
-                            'OpenClaw runtime contract changed between batch retry attempts',
-                            details={'runtime_contract': retry_contract_proof},
-                        )
-                capacity_reprobe = self._raise_if_circuit_broken(
-                    request_run_id=circuit_breaker_run_id,
-                    allow_reserved_reprobe=capacity_reprobe,
-                )
-                with httpx.Client(timeout=self.batch_http_timeout_seconds, headers=headers) as client:
-                    response = client.post(url, json=body)
-                post_runtime_contract = build_runtime_contract_provenance(
-                    spec.role,
-                    openclaw_state_dir=getattr(settings, 'openclaw_state_dir', '~/.openclaw'),
-                )
-                runtime_contract = build_dispatch_runtime_contract_provenance(
-                    pre_dispatch=pre_runtime_contract,
-                    post_dispatch=post_runtime_contract,
-                )
-                request_provenance['runtime_contract'] = runtime_contract
-                if response.status_code >= 400 and runtime_contract is not None and runtime_contract.get('verified') is not True:
-                    raise AgentDispatchTerminalError(
-                        'OpenClaw runtime contract changed during failed batch dispatch attempt',
-                        details={'runtime_contract': runtime_contract},
-                    )
-                capacity_error = self._plugin_state_capacity_error(response)
-                if capacity_error is not None:
-                    self._trip_circuit_breaker(
-                        capacity_error,
-                        request_run_id=circuit_breaker_run_id,
-                    )
-                    raise capacity_error
-                rate_limit_error = self._provider_rate_limit_error(
+                (
                     response,
+                    runtime_contract,
+                    dispatch_rate_admission,
+                    retry_contract_anchor,
+                    capacity_reprobe,
+                ) = self._post_model_request(
+                    role=spec.role,
                     operation='batch',
+                    url=url,
+                    body=body,
+                    headers=headers,
+                    timeout_seconds=self.batch_http_timeout_seconds,
+                    request_run_id=circuit_breaker_run_id,
+                    capacity_reprobe=capacity_reprobe,
+                    retry_contract_anchor=retry_contract_anchor,
+                    retry_contract_change_message=(
+                        'OpenClaw runtime contract changed between batch '
+                        'retry attempts'
+                    ),
+                    failed_contract_change_message=(
+                        'OpenClaw runtime contract changed during failed '
+                        'batch dispatch attempt'
+                    ),
+                    started_event='dispatch_batch_request',
+                    started_log_fields={
+                        'request_run_id': request_run_id,
+                        'dispatch_id': dispatch_id,
+                        'attempt_id': attempt_id,
+                        'agent_name': spec.agent_name,
+                        'role': spec.role,
+                        'market_date': market_date.isoformat(),
+                        'session_key': request_session_key,
+                        'batch_symbols': batch_symbols,
+                        'slot': slot,
+                        'session_reuse_mode': session_reuse_mode,
+                        'request_marker': request_marker,
+                    },
                 )
-                if rate_limit_error is not None:
-                    self._trip_circuit_breaker(
-                        rate_limit_error,
-                        request_run_id=circuit_breaker_run_id,
-                    )
-                    raise rate_limit_error
+                request_provenance[
+                    'dispatch_rate_admission'
+                ] = dispatch_rate_admission
+                request_provenance['runtime_contract'] = runtime_contract
                 if response.status_code >= 500:
-                    raise AgentDispatchRetryableError(f'OpenClaw batch server error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw batch server error '
+                        f'{response.status_code}: {response.text[:300]}'
+                    )
                 if response.status_code in (408, 409):
-                    raise AgentDispatchRetryableError(f'OpenClaw batch retryable error {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchRetryableError(
+                        f'OpenClaw batch retryable error '
+                        f'{response.status_code}: {response.text[:300]}'
+                    )
                 if response.status_code >= 400:
-                    raise AgentDispatchTerminalError(f'OpenClaw batch failed {response.status_code}: {response.text[:300]}')
+                    raise AgentDispatchTerminalError(
+                        f'OpenClaw batch failed {response.status_code}: '
+                        f'{response.text[:300]}'
+                    )
                 parsed = response.json()
                 message_output_text = None
                 for item in parsed.get('output', []):
@@ -2744,6 +3124,32 @@ class OpenClawAgentClient:
                         f"OpenClaw batch ended with status={parsed.get('status')}"
                     )
                 decoded, json_failure_class = self._decode_candidate_json(output_text)
+                if (
+                    decoded is None
+                    and json_failure_class == 'json_decode_error'
+                    and spec.role in JSON_STRUCTURE_REPAIR_ROLES
+                ):
+                    (
+                        decoded,
+                        json_failure_class,
+                        json_structure_repair,
+                    ) = decode_agent_json_object_with_structure_repair(output_text)
+                    if json_structure_repair is not None:
+                        request_provenance['json_structure_repair'] = json_structure_repair
+                        log_agent_feedback_event(
+                            'dispatch_batch_json_structure_repaired',
+                            status='repaired',
+                            request_run_id=request_run_id,
+                            dispatch_id=dispatch_id,
+                            attempt_id=attempt_id,
+                            agent_name=spec.agent_name,
+                            role=spec.role,
+                            market_date=market_date.isoformat(),
+                            session_key=request_session_key,
+                            batch_symbols=batch_symbols,
+                            slot=slot,
+                            json_structure_repair=json_structure_repair,
+                        )
                 decoded_source = (
                     'function_call_arguments'
                     if function_call_seen
@@ -3475,6 +3881,20 @@ class AgentFeedbackOrchestrator:
                 if durable_source_generation
                 else 'decision_input_generation'
             )
+            if (
+                durable_source_generation
+                and isinstance(expected_generation, dict)
+                and expected_generation.get('durable_reuse_eligible') is not True
+            ):
+                reasons.append(
+                    {
+                        'code': 'durable_source_generation_ineligible',
+                        'non_durable_reasons': list(
+                            expected_generation.get('non_durable_reasons')
+                            or []
+                        ),
+                    }
+                )
             raw_refreshed_item = refreshed_by_symbol.get(symbol)
             refreshed_item = (
                 dict(raw_refreshed_item)
@@ -3501,48 +3921,6 @@ class AgentFeedbackOrchestrator:
                     )
                 else:
                     refreshed_item.pop('agent_feedback_eligibility', None)
-            expected_wait_recheck_context = (
-                expected_symbol_context.get('intraday_wait_recheck_context')
-                if isinstance(expected_symbol_context, dict)
-                and isinstance(
-                    expected_symbol_context.get(
-                        'intraday_wait_recheck_context'
-                    ),
-                    dict,
-                )
-                else None
-            )
-            if expected_wait_recheck_context is not None:
-                from app.agent_context.wait_recheck_service import (
-                    load_validated_wait_recheck_context,
-                )
-
-                try:
-                    wait_recheck_event_id = int(
-                        expected_wait_recheck_context.get('event_id')
-                    )
-                except (TypeError, ValueError):
-                    wait_recheck_event_id = None
-                validated_wait_recheck_context = (
-                    load_validated_wait_recheck_context(
-                        event_id=wait_recheck_event_id,
-                        symbol=symbol,
-                    )
-                    if wait_recheck_event_id is not None
-                    else None
-                )
-                if (
-                    validated_wait_recheck_context is None
-                    or validated_wait_recheck_context
-                    != expected_wait_recheck_context
-                ):
-                    reasons.append(
-                        {'code': 'intraday_wait_recheck_context_changed'}
-                    )
-                elif isinstance(refreshed_item, dict):
-                    refreshed_item['intraday_wait_recheck_context'] = (
-                        validated_wait_recheck_context
-                    )
             refreshed_policy_context: dict[str, Any] = {}
             try:
                 if decision_role in DECISION_SUPPORT_AGENT_NAMES:
@@ -4708,6 +5086,59 @@ class AgentFeedbackOrchestrator:
                     dependency_policy=dependency_context['dependency_policy'],
                 )
                 continue
+            canonical_price_issue = _canonical_decider_price_issue(
+                item=item,
+                market_date=market_date,
+            )
+            if canonical_price_issue is not None:
+                error = str(canonical_price_issue['code'])
+                failure_kind = (
+                    FeedbackFailureKind.DEPENDENCY_MISSING_UPSTREAM.value
+                )
+                dependency_context = {
+                    'dependency_status': (
+                        'blocked_missing_canonical_same_day_price'
+                    ),
+                    'failure_status': 'dependency/missing-upstream',
+                    'failure_kind': failure_kind,
+                    'dependency_policy': 'record_failure_and_continue',
+                    'canonical_price_issue': canonical_price_issue,
+                }
+                failure = _build_failed_dispatch_item(
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    error=error,
+                    retryable=True,
+                    failure_kind=failure_kind,
+                    context=dependency_context,
+                )
+                all_failures.append(failure)
+                buffer_failure(
+                    role,
+                    symbol,
+                    error,
+                    True,
+                    failure_kind=failure_kind,
+                    context=dependency_context,
+                    agent_name=role,
+                )
+                log_agent_feedback_event(
+                    'decider_canonical_price_rejected',
+                    status='blocked',
+                    market_date=market_date.isoformat(),
+                    request_run_id=request_run_id,
+                    role=role,
+                    agent_name=role,
+                    symbol=symbol,
+                    error_type='CanonicalPriceUnavailable',
+                    error_message=error,
+                    dependency_policy=dependency_context[
+                        'dependency_policy'
+                    ],
+                    canonical_price_issue=canonical_price_issue,
+                )
+                continue
             if market_context is None:
                 market_context = signal_decider_market_context_builder.build(market_date=market_date)
             previous_decision = previous_decision_context_decisions.get(
@@ -4751,16 +5182,6 @@ class AgentFeedbackOrchestrator:
                     policy_context_as_of_date.isoformat()
                 ),
                 'upstream_summary_run_id': upstream_summary_run_id,
-                'intraday_wait_recheck_event_id': (
-                    item.get('intraday_wait_recheck_context', {}).get(
-                        'event_id'
-                    )
-                    if isinstance(
-                        item.get('intraday_wait_recheck_context'),
-                        dict,
-                    )
-                    else None
-                ),
             }
             payload['decision_input_generation_fence'] = {
                 'schema_version': 'decision_input_generation_fence_v1',
@@ -5934,13 +6355,13 @@ class AgentFeedbackOrchestrator:
         parent_run_id: str | None = None,
         force: bool = False,
         force_recompute: bool = False,
+        point_in_time_recovery: bool = False,
         auto_scope: bool = False,
         role_symbol_scopes: dict[str, Sequence[str]] | None = None,
         funnel_diagnostics: dict[str, Any] | None = None,
         upstream_summary_run_id: str | None = None,
         persistence_guard: Callable[..., Any] | None = None,
         expected_weekly_policy_binding: Mapping[str, Any] | None = None,
-        source_context_overlays: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         resolved_policy_context_as_of_date = (
@@ -6003,82 +6424,6 @@ class AgentFeedbackOrchestrator:
         specs = self._select_specs(roles=roles)
         requested_role_names = [spec.role for spec in specs]
         requested_symbols = _normalize_requested_symbols(symbols)
-        normalized_source_context_overlays: dict[str, dict[str, Any]] = {}
-        if source_context_overlays is not None:
-            if requested_role_names != [SHORT_TERM_DECIDER_AGENT_NAME]:
-                raise ValueError(
-                    'source_context_overlays require a short-term-decider-only dispatch'
-                )
-            from app.agent_context.wait_recheck_service import (
-                load_validated_wait_recheck_context,
-            )
-
-            for raw_symbol, raw_context in source_context_overlays.items():
-                symbol = str(raw_symbol or '').strip().upper()
-                if symbol not in set(requested_symbols):
-                    raise ValueError(
-                        'source_context_overlays must match requested symbols'
-                    )
-                if not isinstance(raw_context, Mapping):
-                    raise ValueError('source_context_overlays must contain objects')
-                try:
-                    event_id = int(raw_context.get('event_id'))
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        'source_context_overlays require a durable event_id'
-                    ) from None
-                validated_context = load_validated_wait_recheck_context(
-                    event_id=event_id,
-                    symbol=symbol,
-                )
-                if validated_context is None or validated_context != dict(
-                    raw_context
-                ):
-                    raise ValueError(
-                        'source_context_overlays do not match durable WAIT recheck evidence'
-                    )
-                normalized_source_context_overlays[symbol] = validated_context
-        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
-            market_date=normalized_market_date,
-            fs_div=fs_div,
-        )
-        if not force and not prerequisites['ready']:
-            return {
-                'request': {
-                    'market_date': normalized_market_date.isoformat(),
-                    'symbols': requested_symbols,
-                    'requested_symbols': requested_symbols,
-                    'request_run_id': None,
-                    'parent_run_id': normalized_parent_run_id,
-                    'roles': [spec.role for spec in specs],
-                    'fs_div': fs_div,
-                    'disclosures_limit': disclosures_limit,
-                    'knowledge_cutoff_at': requested_knowledge_cutoff_at,
-                    'policy_context_as_of_date': (
-                        resolved_policy_context_as_of_date.isoformat()
-                    ),
-                    'reuse_existing': reuse_existing,
-                    'force_recompute': force_recompute,
-                    'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
-                    'auto_scope': auto_scope,
-                    'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
-                    'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
-                    'skipped_symbols': [],
-                    'funnel_diagnostics': funnel_diagnostics,
-                    'mode': 'role_sequential_runtime_buffered',
-                },
-                'summary': {
-                    'status': prerequisites['status'],
-                    'completed': 0,
-                    'failed': 0,
-                    'skipped': 0,
-                    'flushed_to_db': 0,
-                    'gated': True,
-                },
-                'items': [],
-                'failures': [],
-                'prerequisites': prerequisites,
-            }
         uses_precomputed_auto_scope = bool(
             auto_scope
             and role_symbol_scopes is not None
@@ -6098,7 +6443,9 @@ class AgentFeedbackOrchestrator:
                 )
             )
             eligibility_scope_symbols_for_revalidation = requested_symbols
-            public_eligibility_diagnostics = _public_eligibility_diagnostics(eligibility_diagnostics)
+            public_eligibility_diagnostics = _public_eligibility_diagnostics(
+                eligibility_diagnostics
+            )
             eligibility_collapse = _requested_scope_eligibility_collapse(
                 requested_symbols=requested_symbols,
                 dispatch_symbols=dispatch_symbols,
@@ -6121,10 +6468,14 @@ class AgentFeedbackOrchestrator:
                         ),
                         'reuse_existing': reuse_existing,
                         'force_recompute': force_recompute,
-                        'scope': resolve_agent_feedback_scope(requested_symbols=requested_symbols),
+                        'scope': resolve_agent_feedback_scope(
+                            requested_symbols=requested_symbols
+                        ),
                         'auto_scope': auto_scope,
                         'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
-                        'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+                        'eligibility_filters': list(
+                            AGENT_FEEDBACK_ELIGIBILITY_FILTERS
+                        ),
                         'skipped_symbols': skipped_symbols,
                         'eligibility_diagnostics': public_eligibility_diagnostics,
                         'funnel_diagnostics': funnel_diagnostics,
@@ -6156,6 +6507,54 @@ class AgentFeedbackOrchestrator:
                         'eligibility_scope_gate': eligibility_collapse,
                     },
                 }
+        prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
+            market_date=normalized_market_date,
+            fs_div=fs_div,
+            symbols=dispatch_symbols,
+            required_stage_ids=(
+                FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
+                if point_in_time_recovery
+                else (*FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER, 'signal_features')
+            ),
+        )
+        if not force and not prerequisites['ready']:
+            return {
+                'request': {
+                    'market_date': normalized_market_date.isoformat(),
+                    'symbols': dispatch_symbols,
+                    'requested_symbols': requested_symbols,
+                    'request_run_id': None,
+                    'parent_run_id': normalized_parent_run_id,
+                    'roles': [spec.role for spec in specs],
+                    'fs_div': fs_div,
+                    'disclosures_limit': disclosures_limit,
+                    'knowledge_cutoff_at': requested_knowledge_cutoff_at,
+                    'policy_context_as_of_date': (
+                        resolved_policy_context_as_of_date.isoformat()
+                    ),
+                    'reuse_existing': reuse_existing,
+                    'force_recompute': force_recompute,
+                    'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
+                    'auto_scope': auto_scope,
+                    'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
+                    'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
+                    'skipped_symbols': skipped_symbols,
+                    'eligibility_diagnostics': public_eligibility_diagnostics,
+                    'funnel_diagnostics': funnel_diagnostics,
+                    'mode': 'role_sequential_runtime_buffered',
+                },
+                'summary': {
+                    'status': prerequisites['status'],
+                    'completed': 0,
+                    'failed': 0,
+                    'skipped': len(skipped_symbols),
+                    'flushed_to_db': 0,
+                    'gated': True,
+                },
+                'items': [],
+                'failures': [],
+                'prerequisites': prerequisites,
+            }
         soft_penalized_symbols = list(public_eligibility_diagnostics.get('soft_penalized_symbols') or [])
         if funnel_diagnostics is None:
             records_by_symbol = eligibility_diagnostics.get('records_by_symbol') if isinstance(eligibility_diagnostics, dict) else {}
@@ -6207,6 +6606,7 @@ class AgentFeedbackOrchestrator:
             'total_parallel_subtasks': role_parallelism,
             'reuse_existing': reuse_existing,
             'force_recompute': force_recompute,
+            'point_in_time_recovery': point_in_time_recovery,
             'scope': resolve_agent_feedback_scope(requested_symbols=None if auto_scope else requested_symbols),
             'auto_scope': auto_scope,
             'eligibility_rule': AGENT_FEEDBACK_ELIGIBILITY_RULE,
@@ -6229,11 +6629,6 @@ class AgentFeedbackOrchestrator:
                 normalized_expected_weekly_policy_binding
             ),
         }
-        if normalized_source_context_overlays:
-            request_payload['source_context_overlay_event_ids'] = {
-                symbol: context['event_id']
-                for symbol, context in normalized_source_context_overlays.items()
-            }
         state = RuntimeFeedbackRunState(
             run_id=request_run_id,
             market_date=normalized_market_date,
@@ -6851,12 +7246,6 @@ class AgentFeedbackOrchestrator:
                             ),
                         )
                     )
-                    for context_item in symbol_context.get('items') or []:
-                        overlay = normalized_source_context_overlays.get(
-                            str(context_item.get('symbol') or '').strip().upper()
-                        )
-                        if overlay is not None:
-                            context_item['intraday_wait_recheck_context'] = overlay
                     context_materialized = True
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
@@ -7043,12 +7432,6 @@ class AgentFeedbackOrchestrator:
                         disclosures_limit=disclosures_limit,
                         knowledge_cutoff_at=requested_knowledge_cutoff_at,
                     )
-                    for context_item in symbol_context.get('items') or []:
-                        overlay = normalized_source_context_overlays.get(
-                            str(context_item.get('symbol') or '').strip().upper()
-                        )
-                        if overlay is not None:
-                            context_item['intraday_wait_recheck_context'] = overlay
                     _attach_agent_feedback_eligibility_context(
                         items=symbol_context.get('items') or [],
                         diagnostics=eligibility_diagnostics,
@@ -7503,6 +7886,12 @@ class AgentFeedbackOrchestrator:
                                                     ),
                                                     authoritative_summary_run_id=(
                                                         normalized_upstream_summary_run_id
+                                                    ),
+                                                    revalidate_market_context=(
+                                                        not point_in_time_recovery
+                                                    ),
+                                                    durable_source_generation=(
+                                                        point_in_time_recovery
                                                     ),
                                                 )
                                             )
@@ -8167,6 +8556,12 @@ class AgentFeedbackOrchestrator:
                                 authoritative_summary_run_id=(
                                     normalized_upstream_summary_run_id
                                 ),
+                                revalidate_market_context=(
+                                    not point_in_time_recovery
+                                ),
+                                durable_source_generation=(
+                                    point_in_time_recovery
+                                ),
                                 revalidate_post_decision_material_context=True,
                                 allow_current_run_feedback=True,
                             )
@@ -8490,6 +8885,7 @@ class AgentFeedbackOrchestrator:
         fs_div: str | None = None,
         disclosures_limit: int = 5,
         per_role_parallelism: int = 5,
+        force: bool = False,
     ) -> dict[str, Any]:
         return _dispatch_for_symbols_via_subagents_helper(
             self,
@@ -8499,10 +8895,14 @@ class AgentFeedbackOrchestrator:
             fs_div=fs_div,
             disclosures_limit=disclosures_limit,
             per_role_parallelism=per_role_parallelism,
+            force=force,
             signal_decider_agent_name=SIGNAL_DECIDER_AGENT_NAME,
             normalize_requested_symbols=_normalize_requested_symbols,
             split_requested_symbols_by_agent_feedback_eligibility=_split_requested_symbols_by_agent_feedback_eligibility,
             agent_context_read_service=agent_context_read_service,
+            agent_feedback_prerequisite_service=(
+                agent_feedback_prerequisite_service
+            ),
             normalize_agent_response=normalize_agent_response,
             build_response_storage_payload=_build_response_storage_payload,
         )

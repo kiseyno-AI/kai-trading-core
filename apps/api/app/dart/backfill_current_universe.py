@@ -27,6 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Run DART fundamentals backfill for the current active universe.')
     parser.add_argument('--symbol-limit', type=lambda value: _parse_int_at_least(value, minimum=1, name='symbol_limit'), default=25)
     parser.add_argument('--symbol-offset', type=lambda value: _parse_int_at_least(value, minimum=0, name='symbol_offset'), default=0)
+    parser.add_argument(
+        '--symbols',
+        default=None,
+        help='Optional comma-separated exact active stock-code manifest.',
+    )
     parser.add_argument('--capture-limit', type=lambda value: _parse_int_at_least(value, minimum=1, name='capture_limit'), default=250)
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--fs-div', default=None)
@@ -36,9 +41,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _run_backfill(args: argparse.Namespace) -> dict:
+    stock_codes = None
+    if args.symbols is not None:
+        # Preserve blank tokens so the exact-manifest validator can reject a
+        # leading, trailing, or doubled comma instead of silently shrinking
+        # reviewed repair scope.
+        stock_codes = str(args.symbols).split(',')
     return await dart_fundamentals_capture_service.backfill_current_universe_fundamentals(
         symbol_limit=args.symbol_limit,
         symbol_offset=args.symbol_offset,
+        stock_codes=stock_codes,
         capture_limit=args.capture_limit,
         force=args.force,
         fs_div=args.fs_div,

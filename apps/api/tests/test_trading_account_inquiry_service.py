@@ -146,6 +146,24 @@ class TradingAccountInquiryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filtered['items'][0]['symbol'], '000660')
         self.assertEqual(filtered['items'][0]['quantity'], 0)
 
+    async def test_get_positions_accepts_alphanumeric_krx_short_code(self) -> None:
+        alphanumeric_row = {
+            **self.client.balance_payload['output1'][0],
+            'pdno': '0010A0',
+            'prdt_name': 'Wise Planet Company',
+        }
+        self.client.balance_payload['output1'] = [alphanumeric_row]
+
+        result = await self.service.get_positions(
+            account_reference=self.account_reference,
+            symbol='0010a0',
+        )
+
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['items'][0]['symbol'], '0010A0')
+        self.assertEqual(result['completeness']['status'], 'complete')
+        self.assertEqual(result['completeness']['malformed_row_count'], 0)
+
     async def test_get_positions_marks_malformed_source_rows_incomplete(self) -> None:
         valid_row = self.client.balance_payload['output1'][0]
         self.client.balance_payload['output1'] = [valid_row]
@@ -198,6 +216,11 @@ class TradingAccountInquiryServiceTests(unittest.IsolatedAsyncioTestCase):
                         'hldg_qty': '1',
                         'evlu_amt': '100',
                     },
+                    {
+                        'pdno': '12A456',
+                        'hldg_qty': '1',
+                        'evlu_amt': '100',
+                    },
                 ]
             }
         ]
@@ -209,10 +232,11 @@ class TradingAccountInquiryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['count'], 1)
         self.assertEqual(result['items'][0]['symbol'], '005930')
         self.assertEqual(result['completeness']['status'], 'incomplete')
-        self.assertEqual(result['completeness']['malformed_row_count'], 2)
+        self.assertEqual(result['completeness']['malformed_row_count'], 3)
         self.assertEqual(
             [issue['code'] for issue in result['completeness']['issues']],
             [
+                'positive_position_symbol_invalid',
                 'positive_position_symbol_invalid',
                 'positive_position_symbol_invalid',
             ],

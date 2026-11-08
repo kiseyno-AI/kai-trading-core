@@ -2,7 +2,7 @@ import json
 import logging
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -131,6 +131,146 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         event = self._read_log_lines('upstream-http.log')[-1]
         self.assertIn('/StatisticSearch/[REDACTED]/json/', event['url'])
 
+    async def test_read_retry_retries_transport_failure_and_audits_each_attempt(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ReadTimeout('', request=request)
+            return httpx.Response(200, json={'ok': True}, request=request)
+
+        transport = httpx.MockTransport(handler)
+        with patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock) as sleep:
+            async with httpx.AsyncClient(transport=transport) as client:
+                response = await audit_logging.request_read_with_retry_and_audit(
+                    client,
+                    'test_service',
+                    'GET',
+                    'https://example.test/resource',
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attempts, 2)
+        sleep.assert_awaited_once_with(0.25)
+        request_events = [
+            event
+            for event in self._read_log_lines('upstream-http.log')
+            if event['event'] == 'upstream_request'
+        ]
+        self.assertEqual(len(request_events), 2)
+        self.assertEqual(request_events[0]['error_type'], 'ReadTimeout')
+        self.assertEqual(request_events[0]['error_message'], 'ReadTimeout')
+        self.assertEqual(request_events[1]['status_code'], 200)
+
+    async def test_read_retry_bounds_retry_after_and_retries_transient_status(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(
+                    429,
+                    headers={'Retry-After': '120'},
+                    request=request,
+                )
+            return httpx.Response(200, json={'ok': True}, request=request)
+
+        transport = httpx.MockTransport(handler)
+        with patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock) as sleep:
+            async with httpx.AsyncClient(transport=transport) as client:
+                response = await audit_logging.request_read_with_retry_and_audit(
+                    client,
+                    'test_service',
+                    'HEAD',
+                    'https://example.test/resource',
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attempts, 2)
+        sleep.assert_awaited_once_with(2.0)
+
+    async def test_read_retry_does_not_retry_other_client_errors(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(401, request=request)
+
+        transport = httpx.MockTransport(handler)
+        with patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock) as sleep:
+            async with httpx.AsyncClient(transport=transport) as client:
+                response = await audit_logging.request_read_with_retry_and_audit(
+                    client,
+                    'test_service',
+                    'GET',
+                    'https://example.test/resource',
+                )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(attempts, 1)
+        sleep.assert_not_awaited()
+
+    async def test_read_retry_rejects_non_idempotent_methods_before_request(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(200, request=request)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with self.assertRaisesRegex(ValueError, 'GET and HEAD'):
+                await audit_logging.request_read_with_retry_and_audit(
+                    client,
+                    'test_service',
+                    'POST',
+                    'https://example.test/resource',
+                )
+
+        self.assertEqual(attempts, 0)
+
+    async def test_read_retry_enforces_hard_attempt_limit(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, request=request)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with self.assertRaisesRegex(ValueError, 'between 1 and 3'):
+                await audit_logging.request_read_with_retry_and_audit(
+                    client,
+                    'test_service',
+                    'GET',
+                    'https://example.test/resource',
+                    max_attempts=4,
+                )
+
+    async def test_read_retry_exhausts_after_three_transport_attempts(self):
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ConnectTimeout('', request=request)
+
+        transport = httpx.MockTransport(handler)
+        with patch('app.core.audit_logging.asyncio.sleep', new_callable=AsyncMock) as sleep:
+            async with httpx.AsyncClient(transport=transport) as client:
+                with self.assertRaises(httpx.ConnectTimeout):
+                    await audit_logging.request_read_with_retry_and_audit(
+                        client,
+                        'test_service',
+                        'GET',
+                        'https://example.test/resource',
+                    )
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.await_count, 2)
+
     async def test_download_logging_records_non_httpx_upstream_calls(self):
         class FakeResponse:
             status = 200
@@ -178,6 +318,36 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event['failed_symbols']), 26)
         self.assertTrue(event['failed_symbols'][-1].startswith('... ('))
         self.assertTrue(event['error_message'].endswith('...'))
+
+    async def test_fetch_operation_logging_bounds_nested_mappings_without_hiding_diagnostics(
+        self,
+    ):
+        nested = {f'field_{index:03d}': index for index in range(60)}
+        nested.update(
+            {
+                'error_message': 'provider response was incomplete',
+                'pipeline_run_id': 596,
+                'symbols_failed': 3,
+            }
+        )
+
+        audit_logging.log_fetch_event(
+            service='pykrx',
+            operation='run_daily_pipeline_if_due',
+            status='failed',
+            result=nested,
+        )
+
+        event = self._read_log_lines('upstream-http.log')[-1]
+        result = event['result']
+        self.assertLessEqual(len(result), 26)
+        self.assertEqual(
+            result['error_message'],
+            'provider response was incomplete',
+        )
+        self.assertEqual(result['pipeline_run_id'], 596)
+        self.assertEqual(result['symbols_failed'], 3)
+        self.assertEqual(result['_omitted_field_count'], 38)
 
 
 if __name__ == '__main__':

@@ -3,18 +3,42 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
+from app.core.audit_logging import exception_message
 from app.core.settings import settings
 from app.external_news.provider import ExternalNewsProvider, NaverNewsSearchProvider
 from app.external_news.store import enrich_recent_external_news_classification, list_external_news_items, persist_external_news_items
 from app.market_data_store import load_symbols
+from app.market.symbol_codes import split_symbol_list as _normalize_symbols
 
 
 logger = logging.getLogger(__name__)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
+EXTERNAL_NEWS_PROVIDER_CIRCUIT_FAILURE_THRESHOLD = 2
+
+
+def _is_expected_provider_failure(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, httpx.HTTPError)):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    if isinstance(exc.__cause__, httpx.HTTPError):
+        return True
+    message = str(exc)
+    return bool(
+        message.startswith('Naver News Search transport error:')
+        or message.startswith('Naver News Search request failed [')
+        or message == 'Naver News Search response JSON decode failed'
+        or message
+        == 'Naver News Search response did not contain an items list'
+        or message == 'naver_search_credentials_missing'
+        or message == 'external_news_provider_disabled'
+    )
 
 
 def _utcnow() -> datetime:
@@ -53,14 +77,47 @@ def _association_window_for_market_date(
     return start, end
 
 
-def _normalize_symbols(symbols: Sequence[str] | str | None) -> list[str]:
-    if symbols is None:
-        return []
-    if isinstance(symbols, str):
-        values = symbols.split(',')
-    else:
-        values = symbols
-    return [str(item).strip() for item in values if str(item).strip()]
+def _news_freshness_cutoff(
+    market_date: date,
+    *,
+    lookback_days: int,
+) -> datetime:
+    return datetime.combine(
+        market_date - timedelta(days=max(int(lookback_days), 0)),
+        time.min,
+        tzinfo=SEOUL_TZ,
+    ).astimezone(timezone.utc)
+
+
+def _news_freshness_published_before(
+    market_date: date,
+    *,
+    captured_at: datetime | None = None,
+) -> datetime:
+    next_midnight = datetime.combine(
+        market_date + timedelta(days=1),
+        time.min,
+        tzinfo=SEOUL_TZ,
+    ).astimezone(timezone.utc)
+    captured = captured_at or _utcnow()
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=timezone.utc)
+    return min(next_midnight, captured.astimezone(timezone.utc))
+
+
+def _is_recent_news_item(
+    item: Any,
+    *,
+    cutoff: datetime,
+    published_before: datetime,
+) -> bool:
+    published_at = getattr(item, 'published_at', None)
+    if not isinstance(published_at, datetime):
+        return False
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    published_at = published_at.astimezone(timezone.utc)
+    return cutoff <= published_at < published_before
 
 
 class ExternalNewsService:
@@ -75,13 +132,60 @@ class ExternalNewsService:
         *,
         symbols: Sequence[str] | str,
         display: int | None = None,
+        freshness_cutoff: datetime | None = None,
+        freshness_published_before: datetime | None = None,
+        freshness_lookback_days: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         requested_symbols = _normalize_symbols(symbols)
         provider_status = self.provider.status()
+        resolved_lookback_days = max(
+            int(
+                freshness_lookback_days
+                if freshness_lookback_days is not None
+                else settings.external_news_context_lookback_days
+            ),
+            0,
+        )
+        resolved_freshness_cutoff = freshness_cutoff or (
+            _utcnow() - timedelta(days=resolved_lookback_days)
+        )
+        if resolved_freshness_cutoff.tzinfo is None:
+            resolved_freshness_cutoff = resolved_freshness_cutoff.replace(
+                tzinfo=timezone.utc
+            )
+        resolved_freshness_cutoff = resolved_freshness_cutoff.astimezone(
+            timezone.utc
+        )
+        resolved_freshness_published_before = (
+            freshness_published_before or _utcnow()
+        )
+        if resolved_freshness_published_before.tzinfo is None:
+            resolved_freshness_published_before = (
+                resolved_freshness_published_before.replace(
+                    tzinfo=timezone.utc
+                )
+            )
+        resolved_freshness_published_before = (
+            resolved_freshness_published_before.astimezone(timezone.utc)
+        )
         summary = {
             'requested_symbol_count': len(requested_symbols),
             'matched_symbol_count': 0,
+            'collected_symbol_count': 0,
+            'failed_symbol_count': 0,
+            'skipped_symbol_count': 0,
+            'provider_circuit_open': False,
             'symbols_with_news': 0,
+            'symbols_with_any_news': 0,
+            'recent_news_symbol_count': 0,
+            'stale_news_symbol_count': 0,
+            'no_result_symbol_count': 0,
+            'freshness_lookback_days': resolved_lookback_days,
+            'freshness_cutoff_at': resolved_freshness_cutoff.isoformat(),
+            'freshness_published_before': (
+                resolved_freshness_published_before.isoformat()
+            ),
             'items_fetched': 0,
             'items_inserted': 0,
             'items_updated': 0,
@@ -103,23 +207,105 @@ class ExternalNewsService:
         items_out: list[dict[str, Any]] = []
         per_symbol_limit = display or settings.external_news_default_display
         throttle_seconds = max(0.0, float(settings.external_news_collect_throttle_seconds or 0.0))
+        consecutive_provider_failures = 0
+        provider_circuit_open = False
         for index, symbol in enumerate(requested_symbols):
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        'processed': index,
+                        'total': len(requested_symbols),
+                        'current_symbol': symbol,
+                        'current_step': 'collect_symbol_news',
+                    }
+                )
             row = symbol_map.get(symbol)
             if row is None:
                 summary['items_skipped'] += 1
+                summary['skipped_symbol_count'] += 1
                 items_out.append({'symbol': symbol, 'status': 'skipped', 'reason': 'symbol_not_found'})
+                continue
+            if provider_circuit_open:
+                summary['items_skipped'] += 1
+                summary['skipped_symbol_count'] += 1
+                items_out.append(
+                    {
+                        'symbol': symbol,
+                        'name_ko': row.get('name_ko'),
+                        'status': 'skipped',
+                        'reason': 'provider_circuit_open',
+                    }
+                )
                 continue
             if index > 0 and throttle_seconds > 0:
                 await asyncio.sleep(throttle_seconds)
             query = f"{row.get('name_ko') or symbol} {symbol}"
-            fetched = await self.provider.search_news(query=query, display=per_symbol_limit)
-            persist_result = persist_external_news_items(symbol=symbol, items=fetched, source=self.provider.provider_name)
+            try:
+                fetched = await self.provider.search_news(
+                    query=query,
+                    display=per_symbol_limit,
+                )
+            except Exception as exc:
+                if not _is_expected_provider_failure(exc):
+                    raise
+                consecutive_provider_failures += 1
+                summary['failed_symbol_count'] += 1
+                provider_circuit_open = (
+                    consecutive_provider_failures
+                    >= EXTERNAL_NEWS_PROVIDER_CIRCUIT_FAILURE_THRESHOLD
+                )
+                summary['provider_circuit_open'] = provider_circuit_open
+                logger.warning(
+                    'External news provider failed for one symbol.',
+                    extra={
+                        'provider': self.provider.provider_name,
+                        'symbol': symbol,
+                        'error_class': type(exc).__name__,
+                        'consecutive_provider_failures': consecutive_provider_failures,
+                        'provider_circuit_open': provider_circuit_open,
+                    },
+                )
+                items_out.append(
+                    {
+                        'symbol': symbol,
+                        'name_ko': row.get('name_ko'),
+                        'status': 'failed',
+                        'reason': 'provider_search_failed',
+                        'query': query,
+                        'error_type': type(exc).__name__,
+                        'error_message': exception_message(exc),
+                    }
+                )
+                continue
+
+            consecutive_provider_failures = 0
+            persist_result = persist_external_news_items(
+                symbol=symbol,
+                items=fetched,
+                source=self.provider.provider_name,
+            )
+
+            summary['collected_symbol_count'] += 1
             summary['items_fetched'] += len(fetched)
             summary['items_inserted'] += int(persist_result.get('inserted', 0))
             summary['items_updated'] += int(persist_result.get('updated', 0))
             summary['items_skipped'] += int(persist_result.get('skipped', 0))
             if fetched:
-                summary['symbols_with_news'] += 1
+                summary['symbols_with_any_news'] += 1
+                if any(
+                    _is_recent_news_item(
+                        item,
+                        cutoff=resolved_freshness_cutoff,
+                        published_before=resolved_freshness_published_before,
+                    )
+                    for item in fetched
+                ):
+                    summary['recent_news_symbol_count'] += 1
+                    summary['symbols_with_news'] += 1
+                else:
+                    summary['stale_news_symbol_count'] += 1
+            else:
+                summary['no_result_symbol_count'] += 1
             items_out.append(
                 {
                     'symbol': symbol,
@@ -130,14 +316,22 @@ class ExternalNewsService:
                     'persisted': persist_result,
                 }
             )
-        return {
-            'status': 'ok',
+        status = (
+            'partial'
+            if summary['failed_symbol_count'] or summary['skipped_symbol_count']
+            else 'ok'
+        )
+        result = {
+            'status': status,
             'provider': provider_status.as_dict(),
             'collected_at': datetime.now(timezone.utc).isoformat(),
             'requested_symbols': requested_symbols,
             'summary': summary,
             'items': items_out,
         }
+        if status == 'partial':
+            result['reason'] = 'external_news_collection_partial'
+        return result
 
     async def collect_for_agent_feedback_candidates(
         self,
@@ -146,9 +340,33 @@ class ExternalNewsService:
         symbols: Sequence[str] | str | None = None,
         display: int | None = None,
         symbol_limit: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(str(market_date)) if not isinstance(market_date, date) else market_date
         requested_symbols = _normalize_symbols(symbols)
+        freshness_lookback_days = max(
+            int(settings.external_news_context_lookback_days),
+            0,
+        )
+        freshness_cutoff = _news_freshness_cutoff(
+            normalized_market_date,
+            lookback_days=freshness_lookback_days,
+        )
+        freshness_published_before = _news_freshness_published_before(
+            normalized_market_date
+        )
+        empty_freshness_summary = {
+            'freshness_lookback_days': freshness_lookback_days,
+            'freshness_cutoff_at': freshness_cutoff.isoformat(),
+            'freshness_published_before': (
+                freshness_published_before.isoformat()
+            ),
+            'recent_news_symbol_count': 0,
+            'stale_news_symbol_count': 0,
+            'no_result_symbol_count': 0,
+            'symbols_with_news': 0,
+            'symbols_with_any_news': 0,
+        }
         provider_status = self.provider.status()
         if not provider_status.enabled:
             return {
@@ -162,6 +380,7 @@ class ExternalNewsService:
                     'requested_symbol_count': len(requested_symbols),
                     'eligible_symbol_count': 0,
                     'collected_symbol_count': 0,
+                    **empty_freshness_summary,
                 },
             }
         eligible_symbols = load_agent_feedback_eligible_symbols(
@@ -182,9 +401,17 @@ class ExternalNewsService:
                     'requested_symbol_count': len(requested_symbols),
                     'eligible_symbol_count': 0,
                     'collected_symbol_count': 0,
+                    **empty_freshness_summary,
                 },
             }
-        result = await self.collect_for_symbols(symbols=eligible_symbols, display=display)
+        result = await self.collect_for_symbols(
+            symbols=eligible_symbols,
+            display=display,
+            freshness_cutoff=freshness_cutoff,
+            freshness_published_before=freshness_published_before,
+            freshness_lookback_days=freshness_lookback_days,
+            progress_callback=progress_callback,
+        )
         result.update(
             {
                 'trigger': 'agent_feedback_candidates',
@@ -193,7 +420,15 @@ class ExternalNewsService:
             }
         )
         result.setdefault('summary', {})['eligible_symbol_count'] = len(eligible_symbols)
-        result['summary']['collected_symbol_count'] = len(eligible_symbols)
+        result['summary'].setdefault(
+            'collected_symbol_count',
+            max(
+                len(eligible_symbols)
+                - int(result['summary'].get('failed_symbol_count') or 0)
+                - int(result['summary'].get('skipped_symbol_count') or 0),
+                0,
+            ),
+        )
         return result
 
     def enrich_recent_classification(
@@ -222,36 +457,13 @@ class ExternalNewsService:
         resolved_lookback_days = (
             lookback_days or settings.external_news_context_lookback_days
         )
-        try:
-            result = enrich_recent_external_news_classification(
-                symbols=normalized_symbols or None,
-                lookback_days=resolved_lookback_days,
-                limit=limit,
-                association_start=association_start,
-                association_end=association_end,
-            )
-        except Exception as exc:
-            logger.error(
-                'External news classification enrichment failed.',
-                extra={
-                    'market_date': (
-                        normalized_market_date.isoformat()
-                        if normalized_market_date is not None
-                        else None
-                    ),
-                    'requested_symbol_count': len(normalized_symbols),
-                    'lookback_days': resolved_lookback_days,
-                    'limit': int(limit),
-                    'error_class': exc.__class__.__name__,
-                },
-            )
-            return {
-                'status': 'unavailable',
-                'reason': 'external_news_storage_unavailable',
-                'error_class': exc.__class__.__name__,
-                'provider': provider_status,
-                'requested_symbols': normalized_symbols,
-            }
+        result = enrich_recent_external_news_classification(
+            symbols=normalized_symbols or None,
+            lookback_days=resolved_lookback_days,
+            limit=limit,
+            association_start=association_start,
+            association_end=association_end,
+        )
         return {
             **result,
             'provider': provider_status,

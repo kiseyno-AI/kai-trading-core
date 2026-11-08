@@ -4,6 +4,14 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
+from app.eod.market_membership import market_membership_sha256
+from app.eod.scope_outcomes import (
+    STAGE_ATOMIC_FINALIZATION_STAGE_IDS,
+    STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS,
+    exact_scope_partition_identity_proof_matches,
+)
+from app.market.symbol_codes import normalize_krx_short_code
+
 
 GENERIC_PARTIAL_PREREQUISITE_MIN_COVERAGE_RATIO = 0.99
 HIGH_COVERAGE_PARTIAL_STAGE_IDS: frozenset[str] = frozenset(
@@ -29,6 +37,7 @@ ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS: frozenset[str] = frozenset(
         'external_news_collect',
         'external_news_enrich',
         'macro_context_refresh',
+        'intraday_snapshots',
     }
 )
 SATISFIED_DEPENDENCY_SKIP_REASONS: frozenset[str] = frozenset(
@@ -69,6 +78,25 @@ def pykrx_enrichment_preflight_is_ready(
         return False
     required_categories = preflight.get('required_categories')
     category_row_counts = preflight.get('category_row_counts')
+    category_decision_usable_row_counts = preflight.get(
+        'category_decision_usable_row_counts'
+    )
+    decision_usable_counts_are_ready = bool(
+        not isinstance(category_decision_usable_row_counts, Mapping)
+        or all(
+            (
+                _optional_int(
+                    category_decision_usable_row_counts.get(category)
+                )
+                or 0
+            )
+            > 0
+            for category in PYKRX_ENRICHMENT_REQUIRED_CATEGORIES
+        )
+    )
+    zero_decision_usable_categories = preflight.get(
+        'zero_decision_usable_categories'
+    )
     return bool(
         preflight.get('allowed') is True
         and str(preflight.get('status') or '').strip().lower() == 'ready'
@@ -84,10 +112,15 @@ def pykrx_enrichment_preflight_is_ready(
             (_optional_int(category_row_counts.get(category)) or 0) > 0
             for category in PYKRX_ENRICHMENT_REQUIRED_CATEGORIES
         )
+        and decision_usable_counts_are_ready
         and preflight.get('failed_categories') == []
         and preflight.get('blocked_categories') == []
         and preflight.get('waiting_categories') == []
         and preflight.get('zero_coverage_categories') == []
+        and (
+            zero_decision_usable_categories is None
+            or zero_decision_usable_categories == []
+        )
     )
 
 
@@ -169,6 +202,18 @@ def daily_pipeline_result_has_no_ready_content(
                 and (persisted_unready_count or 0) >= persisted_count
             ):
                 return True
+    for payload in payloads:
+        decision_ready_count = _optional_int(
+            payload.get('decision_ready_count')
+        )
+        decision_degraded_count = _optional_int(
+            payload.get('decision_degraded_count')
+        )
+        if (
+            decision_ready_count == 0
+            and (decision_degraded_count or 0) > 0
+        ):
+            return True
     expected_count = next(
         (
             value
@@ -520,6 +565,45 @@ def _partial_has_blocking_evidence(
 def _partial_retries_are_terminal(
     payloads: tuple[Mapping[str, Any], ...],
 ) -> bool:
+    retry_pending_flags = (
+        'has_pending_retry',
+        'retry_pending',
+        'retry_required',
+        'retry_scheduled',
+    )
+    retry_pending_counts = (
+        'pending_retry_count',
+        'remaining_retry_count',
+        'retry_pending_count',
+        'retry_symbols_count',
+    )
+    if any(
+        payload.get(key) is True
+        for payload in payloads
+        for key in retry_pending_flags
+    ) or any(
+        (_optional_int(payload.get(key)) or 0) > 0
+        for payload in payloads
+        for key in retry_pending_counts
+    ):
+        return False
+    if any(
+        isinstance(payload.get('retry_symbols'), (list, tuple, set))
+        and bool(payload.get('retry_symbols'))
+        for payload in payloads
+    ):
+        return False
+    for payload in payloads:
+        retry_metadata = payload.get('_retry_metadata')
+        if not isinstance(retry_metadata, Mapping):
+            continue
+        if any(
+            isinstance(retry_metadata.get(key), (list, tuple, set))
+            and bool(retry_metadata.get(key))
+            for key in ('failed_symbols', 'unattempted_symbols')
+        ):
+            return False
+
     remaining_values = [
         parsed
         for payload in payloads
@@ -591,6 +675,97 @@ def _stage_ids(
         for key in ('stage', 'stage_id', 'task')
         if str(payload.get(key) or '').strip()
     }
+
+
+def normalize_daily_pipeline_stage_status(
+    *,
+    stage_id: str | None,
+    status: Any,
+    outcome: Mapping[str, Any] | None = None,
+) -> str:
+    """Canonicalize terminal optional-context unavailability.
+
+    The default daily pipeline treats news and macro context as ordering-only
+    inputs. Once an attempted optional stage has terminally reported that the
+    context is unavailable, keep that degradation visible as ``partial``
+    rather than leaving a non-canonical status that poisons the parent run.
+    Required stages and any active, blocked, or retry-pending shape remain
+    unchanged and therefore fail closed.
+    """
+
+    normalized_status = str(status or '').strip().lower()
+    normalized_stage_id = str(stage_id or '').strip().lower()
+    if (
+        normalized_status != 'unavailable'
+        or normalized_stage_id
+        not in ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS
+    ):
+        return normalized_status
+
+    candidate = dict(outcome or {})
+    candidate['stage'] = normalized_stage_id
+    candidate['status'] = normalized_status
+    payloads = _semantic_result_payloads(candidate)
+    if _partial_has_blocking_evidence(payloads):
+        return normalized_status
+    if not _partial_retries_are_terminal(payloads):
+        return normalized_status
+
+    unresolved_statuses = {
+        'abandoned',
+        'blocked',
+        'in_progress',
+        'interrupted',
+        'pending',
+        'queued',
+        'retry_pending',
+        'retrying',
+        'running',
+        'waiting',
+    }
+    observed_statuses = {
+        str(payload.get(key) or '').strip().lower()
+        for payload in payloads
+        for key in ('status', 'stage_status', 'run_status', 'retry_status')
+        if str(payload.get(key) or '').strip()
+    }
+    if observed_statuses & unresolved_statuses:
+        return normalized_status
+
+    retry_pending_flags = (
+        'has_pending_retry',
+        'retry_pending',
+        'retry_required',
+        'retry_scheduled',
+    )
+    retry_pending_counts = (
+        'pending_retry_count',
+        'remaining_retry_count',
+        'retry_pending_count',
+    )
+    if any(
+        payload.get(key) is True
+        for payload in payloads
+        for key in retry_pending_flags
+    ) or any(
+        (_optional_int(payload.get(key)) or 0) > 0
+        for payload in payloads
+        for key in retry_pending_counts
+    ):
+        return normalized_status
+    if any(
+        payload.get('triggered') is False
+        and payload.get('safe_skip') is not True
+        for payload in payloads
+    ):
+        return normalized_status
+    if any(
+        payload.get('terminal') is False
+        or payload.get('completed') is False
+        for payload in payloads
+    ):
+        return normalized_status
+    return 'partial'
 
 
 def _optional_context_degradation_is_terminal(
@@ -689,6 +864,355 @@ def _partial_has_high_coverage(
     )
 
 
+def _has_exact_scope_outcome_manifest(
+    payloads: tuple[Mapping[str, Any], ...],
+    *,
+    expected_stage_id: str,
+    expected_market_date: str | None,
+) -> bool:
+    """Return whether a payload contains an exhaustive identity partition."""
+
+    expected_manifest_versions = (
+        STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(expected_stage_id)
+    )
+    if expected_manifest_versions is None:
+        return False
+    normalized_market_date = str(expected_market_date or '').strip()
+    if not normalized_market_date:
+        return False
+    finalization_stage_id = STAGE_ATOMIC_FINALIZATION_STAGE_IDS.get(
+        expected_stage_id
+    )
+
+    def matching_atomic_finalization(
+        *,
+        selected_codes: list[str],
+        successful_codes: list[str],
+        compact_proof: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if finalization_stage_id is None:
+            return True
+        successful_hash = market_membership_sha256(successful_codes)
+        for scope_payload in payloads:
+            finalization = scope_payload.get('scope_finalization')
+            if not isinstance(finalization, Mapping):
+                continue
+            exact_count = finalization.get('exact_symbol_count')
+            successful_count = finalization.get(
+                'successful_symbol_count'
+            )
+            deleted_count = finalization.get('deleted_stale_row_count')
+            exact_hash = str(
+                finalization.get('exact_membership_sha256') or ''
+            ).strip().lower()
+            if (
+                finalization.get('ready') is not True
+                or finalization.get('stage') != finalization_stage_id
+                or str(finalization.get('market_date') or '').strip()
+                != normalized_market_date
+                or isinstance(exact_count, bool)
+                or not isinstance(exact_count, int)
+                or exact_count < len(selected_codes)
+                or re.fullmatch(r'[0-9a-f]{64}', exact_hash) is None
+                or isinstance(successful_count, bool)
+                or successful_count != len(successful_codes)
+                or finalization.get(
+                    'successful_membership_sha256'
+                )
+                != successful_hash
+                or isinstance(deleted_count, bool)
+                or not isinstance(deleted_count, int)
+                or deleted_count < 0
+            ):
+                continue
+            if compact_proof is not None and any(
+                compact_proof.get(proof_key)
+                != finalization.get(finalization_key)
+                for proof_key, finalization_key in (
+                    ('finalization_stage_id', 'stage'),
+                    ('finalization_market_date', 'market_date'),
+                    (
+                        'finalization_exact_symbol_count',
+                        'exact_symbol_count',
+                    ),
+                    (
+                        'finalization_exact_membership_sha256',
+                        'exact_membership_sha256',
+                    ),
+                    (
+                        'finalization_successful_symbol_count',
+                        'successful_symbol_count',
+                    ),
+                    (
+                        'finalization_successful_membership_sha256',
+                        'successful_membership_sha256',
+                    ),
+                )
+            ):
+                continue
+            return True
+        return False
+    proof_present = False
+
+    for payload in payloads:
+        proof = payload.get('exact_scope_outcome_proof')
+        if not isinstance(proof, Mapping):
+            continue
+        proof_present = True
+        selected = proof.get('selected_stock_codes')
+        retry_debt = proof.get('retry_debt_stock_codes')
+        terminal = proof.get('terminal_not_applicable_stock_codes')
+        if not all(
+            isinstance(value, list)
+            for value in (selected, retry_debt, terminal)
+        ):
+            continue
+
+        def normalize_proof_codes(
+            values: list[Any],
+        ) -> list[str] | None:
+            normalized = [
+                normalize_krx_short_code(value) for value in values
+            ]
+            if (
+                any(value is None for value in normalized)
+                or len(normalized) != len(set(normalized))
+                or normalized != values
+            ):
+                return None
+            return [str(value) for value in normalized]
+
+        selected_codes = normalize_proof_codes(selected)
+        retry_codes = normalize_proof_codes(retry_debt)
+        terminal_codes = normalize_proof_codes(terminal)
+        if any(
+            value is None
+            for value in (selected_codes, retry_codes, terminal_codes)
+        ):
+            continue
+        selected_codes = selected_codes or []
+        retry_codes = retry_codes or []
+        terminal_codes = terminal_codes or []
+        selected_set = set(selected_codes)
+        retry_set = set(retry_codes)
+        terminal_set = set(terminal_codes)
+        successful_codes = [
+            code
+            for code in selected_codes
+            if code not in retry_set | terminal_set
+        ]
+        if (
+            proof.get('schema_version')
+            != 'exact_scope_outcome_proof_v2'
+            or str(proof.get('stage_id') or '').strip()
+            != expected_stage_id
+            or str(proof.get('market_date') or '').strip()
+            != normalized_market_date
+            or str(proof.get('manifest_version') or '').strip()
+            not in expected_manifest_versions
+            or not selected_codes
+            or selected_codes != sorted(selected_codes)
+            or retry_set & terminal_set
+            or not (retry_set | terminal_set) <= selected_set
+            or not exact_scope_partition_identity_proof_matches(
+                proof=proof,
+                retry_debt_symbols=retry_codes,
+                terminal_not_applicable_symbols=terminal_codes,
+            )
+            or isinstance(proof.get('selected_symbol_count'), bool)
+            or proof.get('selected_symbol_count') != len(selected_codes)
+            or proof.get('selected_symbol_sha256')
+            != market_membership_sha256(selected_codes)
+            or isinstance(proof.get('successful_symbol_count'), bool)
+            or proof.get('successful_symbol_count')
+            != len(successful_codes)
+            or proof.get('successful_symbol_sha256')
+            != market_membership_sha256(successful_codes)
+        ):
+            continue
+        if not matching_atomic_finalization(
+            selected_codes=selected_codes,
+            successful_codes=successful_codes,
+            compact_proof=proof,
+        ):
+            continue
+        return True
+
+    # A persisted compact proof is the stage-bound authority.  Never let an
+    # invalid or swapped proof fall through to the less expressive in-memory
+    # raw manifest carried beside it.
+    if proof_present:
+        return False
+
+    for payload in payloads:
+        version = str(
+            payload.get('scope_outcome_manifest_version') or ''
+        ).strip()
+        if version not in expected_manifest_versions:
+            continue
+        selected = payload.get('selected_stock_codes')
+        successful = payload.get('successful_stock_codes')
+        retry_debt = payload.get('retry_debt_stock_codes')
+        terminal = payload.get('terminal_not_applicable_stock_codes', [])
+        manifest = payload.get('scope_outcome_manifest')
+        if not all(
+            isinstance(value, list)
+            for value in (
+                selected,
+                successful,
+                retry_debt,
+                terminal,
+                manifest,
+            )
+        ):
+            continue
+
+        def normalize(values: list[Any]) -> list[str] | None:
+            normalized = [
+                normalize_krx_short_code(value) for value in values
+            ]
+            if (
+                any(value is None for value in normalized)
+                or len(normalized) != len(set(normalized))
+            ):
+                return None
+            return [str(value) for value in normalized]
+
+        selected_codes = normalize(selected)
+        successful_codes = normalize(successful)
+        retry_codes = normalize(retry_debt)
+        terminal_codes = normalize(terminal)
+        if any(
+            value is None
+            for value in (
+                selected_codes,
+                successful_codes,
+                retry_codes,
+                terminal_codes,
+            )
+        ):
+            continue
+        selected_set = set(selected_codes or [])
+        successful_set = set(successful_codes or [])
+        retry_set = set(retry_codes or [])
+        terminal_set = set(terminal_codes or [])
+        if (
+            not selected_set
+            or successful_set & retry_set
+            or successful_set & terminal_set
+            or retry_set & terminal_set
+            or selected_set
+            != successful_set | retry_set | terminal_set
+        ):
+            continue
+        successful_list = selected_codes or []
+        successful_list = [
+            code
+            for code in successful_list
+            if code in successful_set
+        ]
+        if finalization_stage_id is None:
+            if str(payload.get('market_date') or '').strip() != (
+                normalized_market_date
+            ):
+                continue
+        elif not matching_atomic_finalization(
+            selected_codes=selected_codes or [],
+            successful_codes=successful_list,
+        ):
+            continue
+        authoritative_scope_counts = [
+            parsed
+            for scope_payload in payloads
+            for key in (
+                'selected_symbol_count',
+                'requested_symbol_count',
+                'symbols_selected',
+                'symbols_total',
+                'features_total',
+                'universe_count',
+                'cohort_count',
+            )
+            if (parsed := _optional_int(scope_payload.get(key)))
+            is not None
+            and parsed >= 0
+        ]
+        if not authoritative_scope_counts:
+            for scope_payload in payloads:
+                for succeeded_key, failed_key in (
+                    ('results_persisted', 'results_failed'),
+                    ('features_persisted', 'features_failed'),
+                    ('snapshots_persisted', 'snapshots_failed'),
+                    ('contexts_persisted', 'contexts_failed'),
+                    (
+                        'action_summaries_persisted',
+                        'action_summaries_failed',
+                    ),
+                    ('symbols_succeeded', 'symbols_failed'),
+                    ('succeeded', 'failed'),
+                ):
+                    succeeded_count = _optional_int(
+                        scope_payload.get(succeeded_key)
+                    )
+                    failed_count = _optional_int(
+                        scope_payload.get(failed_key)
+                    )
+                    if (
+                        succeeded_count is not None
+                        and succeeded_count >= 0
+                        and failed_count is not None
+                        and failed_count >= 0
+                    ):
+                        authoritative_scope_counts.append(
+                            succeeded_count + failed_count
+                        )
+        if not authoritative_scope_counts:
+            authoritative_scope_counts = [
+                parsed
+                for scope_payload in payloads
+                if (parsed := _optional_int(scope_payload.get('total')))
+                is not None
+                and parsed >= 0
+            ]
+        if (
+            not authoritative_scope_counts
+            or any(
+                count != len(selected_set)
+                for count in authoritative_scope_counts
+            )
+        ):
+            continue
+        manifest_outcomes: dict[str, str] = {}
+        malformed = False
+        for item in manifest:
+            if not isinstance(item, Mapping):
+                malformed = True
+                break
+            stock_code = normalize_krx_short_code(item.get('stock_code'))
+            outcome = str(item.get('outcome') or '').strip()
+            if (
+                not stock_code
+                or stock_code in manifest_outcomes
+                or outcome
+                not in {
+                    'success',
+                    'retry_debt',
+                    'terminal_not_applicable',
+                }
+            ):
+                malformed = True
+                break
+            manifest_outcomes[stock_code] = outcome
+        expected = {
+            **{code: 'success' for code in successful_set},
+            **{code: 'retry_debt' for code in retry_set},
+            **{code: 'terminal_not_applicable' for code in terminal_set},
+        }
+        if not malformed and manifest_outcomes == expected:
+            return True
+    return False
+
+
 def _partial_is_piotroski_only_fundamentals_gap(
     outcome: Mapping[str, Any],
     payloads: tuple[Mapping[str, Any], ...],
@@ -752,10 +1276,44 @@ def _partial_outcome_is_satisfied(outcome: Mapping[str, Any]) -> bool:
         payloads=payloads,
     ):
         return True
+    high_coverage_stage = bool(
+        _stage_ids(payloads) & HIGH_COVERAGE_PARTIAL_STAGE_IDS
+    )
+    expected_stage_id = str(
+        outcome.get('stage') or outcome.get('stage_id') or ''
+    ).strip()
+    if not expected_stage_id:
+        payload_stage_ids = _stage_ids(payloads)
+        if len(payload_stage_ids) == 1:
+            expected_stage_id = next(iter(payload_stage_ids))
+    result = _mapping(outcome.get('result'))
+    details = _mapping(outcome.get('details'))
+    result_summary = _mapping(details.get('result_summary'))
+    market_date_candidates = {
+        str(value).strip()
+        for value in (
+            outcome.get('market_date'),
+            result.get('market_date'),
+            _mapping(outcome.get('result_summary')).get('market_date'),
+            result_summary.get('market_date'),
+        )
+        if str(value or '').strip()
+    }
+    expected_market_date = (
+        next(iter(market_date_candidates))
+        if len(market_date_candidates) == 1
+        else None
+    )
+    exact_scope_proven = _has_exact_scope_outcome_manifest(
+        payloads,
+        expected_stage_id=expected_stage_id,
+        expected_market_date=expected_market_date,
+    )
     if gate_statuses == {'ready'}:
-        return True
+        return not high_coverage_stage or exact_scope_proven
     return (
-        bool(_stage_ids(payloads) & HIGH_COVERAGE_PARTIAL_STAGE_IDS)
+        high_coverage_stage
+        and exact_scope_proven
         and _partial_has_high_coverage(payloads)
     ) or _partial_is_piotroski_only_fundamentals_gap(outcome, payloads)
 
@@ -774,34 +1332,97 @@ def daily_pipeline_outcome_is_satisfied(
 
     if not isinstance(outcome, Mapping):
         return False
-    status = str(outcome.get('status') or '').strip().lower()
+    normalized_outcome = dict(outcome)
+    status = normalize_daily_pipeline_stage_status(
+        stage_id=str(
+            outcome.get('stage')
+            or outcome.get('stage_id')
+            or outcome.get('task')
+            or ''
+        ),
+        status=outcome.get('status'),
+        outcome=outcome,
+    )
+    normalized_outcome['status'] = status
     if status == 'completed':
-        payloads = _payloads(outcome)
+        payloads = _payloads(normalized_outcome)
         if (
-            daily_pipeline_result_has_no_ready_content(outcome)
+            daily_pipeline_result_has_no_ready_content(normalized_outcome)
             or _partial_has_blocking_evidence(payloads)
             or not _partial_retries_are_terminal(payloads)
             or _has_positive_failure_evidence(payloads)
         ):
             return False
-        nested_stages_satisfied = _nested_stages_are_satisfied(outcome)
+        nested_stages_satisfied = _nested_stages_are_satisfied(
+            normalized_outcome
+        )
         return (
             True
             if nested_stages_satisfied is None
             else nested_stages_satisfied
         )
     if status == 'partial':
-        return _partial_outcome_is_satisfied(outcome)
+        return _partial_outcome_is_satisfied(normalized_outcome)
     if status != 'skipped':
         return False
-    payloads = _payloads(outcome)
+    payloads = _payloads(normalized_outcome)
     if _optional_context_degradation_is_terminal(
         status='skipped',
         payloads=payloads,
     ):
         return True
-    reasons = _skip_reasons(outcome)
+    reasons = _skip_reasons(normalized_outcome)
     return bool(reasons) and reasons <= SATISFIED_DEPENDENCY_SKIP_REASONS
+
+
+def daily_pipeline_nonblocking_warning_stage_ids(
+    stage_outcomes: Mapping[str, Mapping[str, Any] | str],
+) -> tuple[str, ...]:
+    """Return optional terminal partials that must not fail the parent run.
+
+    The stage remains visibly ``partial`` for diagnostics. Only ordering-only
+    context stages with satisfied terminal evidence are downgraded to parent
+    run warnings; active, blocked, failed, or retryable work remains fail
+    closed.
+    """
+
+    warning_stage_ids: list[str] = []
+    for raw_stage_id, raw_outcome in stage_outcomes.items():
+        stage_id = str(raw_stage_id or '').strip().lower()
+        if stage_id not in ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS:
+            continue
+        outcome = (
+            dict(raw_outcome)
+            if isinstance(raw_outcome, Mapping)
+            else {'status': raw_outcome}
+        )
+        outcome['stage'] = stage_id
+        outcome['status'] = normalize_daily_pipeline_stage_status(
+            stage_id=stage_id,
+            status=outcome.get('status'),
+            outcome=outcome,
+        )
+        if (
+            str(outcome.get('status') or '').strip().lower() == 'partial'
+            and daily_pipeline_outcome_is_satisfied(outcome)
+        ):
+            warning_stage_ids.append(stage_id)
+    return tuple(warning_stage_ids)
+
+
+def daily_pipeline_warning_metadata(
+    stage_outcomes: Mapping[str, Mapping[str, Any] | str],
+) -> dict[str, Any]:
+    """Build stable parent/API quality metadata for optional degradation."""
+
+    warning_stage_ids = list(
+        daily_pipeline_nonblocking_warning_stage_ids(stage_outcomes)
+    )
+    return {
+        'quality_status': 'degraded' if warning_stage_ids else 'healthy',
+        'warning_stage_ids': warning_stage_ids,
+        'warning_count': len(warning_stage_ids),
+    }
 
 
 def daily_pipeline_prefix_outcome_is_satisfied(

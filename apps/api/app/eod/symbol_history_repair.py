@@ -30,6 +30,10 @@ from app.eod.pykrx_backfill import (
 )
 from app.eod.finality import validate_finalized_krx_write_date
 from app.market.session import KRX_EXCHANGE_CALENDAR
+from app.market.symbol_codes import (
+    is_canonical_krx_short_code,
+    normalize_krx_short_code,
+)
 from app.market_data_store import advisory_eod_collection_locks
 
 
@@ -148,10 +152,10 @@ def _krx_trading_dates(start_date: date, end_date: date) -> tuple[date, ...]:
 
 
 def _normalize_symbol(value: object) -> str:
-    symbol = str(value or '').strip()
-    if len(symbol) != 6 or not symbol.isdigit():
+    symbol = str(value or '').strip().upper()
+    if not is_canonical_krx_short_code(symbol):
         raise ValueError(
-            f'symbol-history repair requires an explicit 6-digit symbol: '
+            f'symbol-history repair requires an explicit canonical KRX symbol: '
             f'{value!r}'
         )
     return symbol
@@ -171,11 +175,7 @@ def _normalize_symbols(symbols: Sequence[object]) -> tuple[str, ...]:
 
 
 def _normalize_provider_symbol(value: object) -> str | None:
-    raw = str(value or '').strip()
-    normalized = raw.zfill(6)
-    if len(normalized) != 6 or not normalized.isdigit():
-        return None
-    return normalized
+    return normalize_krx_short_code(value)
 
 
 def _provider_code_preview(value: object) -> str:

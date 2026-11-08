@@ -358,3 +358,33 @@ class DailyLowRiskFactorServiceTests(unittest.TestCase):
         )
         self.assertEqual(result['summary']['requested_symbol'], '005930')
         self.assertEqual(result['item'], stored_items[0])
+
+    def test_evaluate_symbol_returns_inspection_payload(self) -> None:
+        service = DailyLowRiskFactorService()
+        inspection = {
+            'market_date': '2026-04-23',
+            'feature_version': LOW_RISK_FEATURE_VERSION,
+            'summary': {'entries': 1},
+            'item': {'symbol': '005930'},
+        }
+
+        with patch.object(service, 'inspect', return_value=inspection) as inspect:
+            result = service.evaluate_symbol(
+                market_date='2026-04-23',
+                symbol='5930',
+            )
+
+        inspect.assert_called_once_with(
+            market_date='2026-04-23',
+            symbol='5930',
+        )
+        self.assertEqual(
+            result,
+            {
+                'market_date': '2026-04-23',
+                'feature_version': LOW_RISK_FEATURE_VERSION,
+                'symbol': '005930',
+                'summary': {'entries': 1},
+                'item': {'symbol': '005930'},
+            },
+        )

@@ -5,15 +5,32 @@ import math
 from dataclasses import dataclass
 from datetime import date
 from statistics import stdev
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_daily_momentum_factor_results,
     load_recent_price_bars_by_symbol,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_momentum_factor_result,
     upsert_daily_momentum_factor_results,
 )
+from app.repositories.eod_run_repository import (
+    daily_price_bar_writer_admission,
+    daily_price_bar_writer_admission_lock,
+)
+from app.signals.factor_coverage import (
+    SYMBOL_LOCAL_COMPUTATION_ERRORS,
+    attach_ranking_dependency_contract,
+    build_factor_coverage_contract,
+    build_symbol_results,
+    factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 MOMENTUM_FACTOR_VERSION = 'price_momentum_v1'
 MOMENTUM_FACTOR_SOURCE = 'daily_price_bars'
@@ -30,30 +47,6 @@ def _normalize_market_date(value: str | date) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return date.fromisoformat(value).isoformat()
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in symbols:
-        normalized_symbol = _normalize_symbol(item)
-        if normalized_symbol in seen:
-            continue
-        seen.add(normalized_symbol)
-        normalized.append(normalized_symbol)
-    return normalized
 
 
 def _round(value: float | None, digits: int = 6) -> float | None:
@@ -708,6 +701,31 @@ class DailyMomentumFactorService:
         universe_symbols: Sequence[str] | None = None,
         persist: bool = False,
     ) -> dict[str, Any]:
+        if persist:
+            with daily_price_bar_writer_admission_lock(
+                market_date=market_date,
+            ):
+                return self._evaluate_symbol(
+                    symbol=symbol,
+                    market_date=market_date,
+                    universe_symbols=universe_symbols,
+                    persist=True,
+                )
+        return self._evaluate_symbol(
+            symbol=symbol,
+            market_date=market_date,
+            universe_symbols=universe_symbols,
+            persist=False,
+        )
+
+    def _evaluate_symbol(
+        self,
+        *,
+        symbol: str,
+        market_date: str | date,
+        universe_symbols: Sequence[str] | None,
+        persist: bool,
+    ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbol = _normalize_symbol(symbol)
         selected_symbols = _normalize_symbols(universe_symbols)
@@ -744,12 +762,15 @@ class DailyMomentumFactorService:
             upsert_daily_momentum_factor_result(row)
         return enrich_momentum_audit_fields(row)
 
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
         market_date: str | date,
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         requested_symbols = _normalize_symbols(symbols)
@@ -765,6 +786,10 @@ class DailyMomentumFactorService:
             if requested_symbols is not None
             else ranking_population
         )
+        explicit_empty_scope = (
+            (symbols is not None and requested_symbols == [])
+            or (ranking_symbols is not None and normalized_ranking_symbols == [])
+        )
         if ranking_symbols is not None:
             outside_ranking_scope = sorted(
                 set(target_symbols).difference(ranking_population)
@@ -775,7 +800,28 @@ class DailyMomentumFactorService:
                     + ','.join(outside_ranking_scope[:20])
                 )
         if not target_symbols:
-            return {
+            summary = self._build_coverage_contract(
+                items=[],
+                persisted_items=[],
+                missing_symbols=[],
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+            stage_contract = (
+                {
+                    'status': 'completed',
+                    'reason': 'explicit_empty_scope_noop',
+                    'quality_status': summary['quality_status'],
+                    'quality_warning': summary['quality_warning'],
+                    'gate_status': 'ready',
+                    'blocking_status': 'non_blocking',
+                    'remaining_retryable_events': 0,
+                }
+                if explicit_empty_scope
+                else factor_stage_result_contract(summary)
+            )
+            result = {
+                **stage_contract,
                 'market_date': normalized_market_date,
                 'source': MOMENTUM_FACTOR_SOURCE,
                 'feature_version': MOMENTUM_FACTOR_VERSION,
@@ -796,26 +842,147 @@ class DailyMomentumFactorService:
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
+                'summary': summary,
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='momentum_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         price_histories = load_recent_price_bars_by_symbol(
             market_date=normalized_market_date,
             symbols=ranking_population,
             history_days=self.history_window,
         )
-        valid_histories = self._extract_valid_histories(
-            market_date=normalized_market_date,
-            target_symbols=ranking_population,
-            price_histories=price_histories,
+        (
+            history_rows,
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_population,
+            symbol_of=lambda symbol: symbol,
+            build=lambda symbol: run_symbol_computation(
+                lambda: {
+                    'symbol': symbol,
+                    'bars': self._validated_history_or_none(
+                        market_date=normalized_market_date,
+                        bars=price_histories.get(symbol) or [],
+                    ),
+                }
+            ),
         )
-        failed_symbols = [symbol for symbol in target_symbols if symbol not in valid_histories]
-
-        ranking_rows = build_daily_momentum_factor_rows(
-            market_date=normalized_market_date,
-            price_histories=valid_histories,
-            overheat_rule=self.overheat_rule,
-            eligibility_rule=self.eligibility_rule,
+        valid_histories = {
+            row['symbol']: row['bars']
+            for row in history_rows
+            if row['bars'] is not None
+        }
+        history_computation_failed_set = set(computation_failed_symbols)
+        ranking_missing_history_symbols = [
+            symbol for symbol in ranking_population
+            if symbol not in valid_histories
+            and symbol not in history_computation_failed_set
+        ]
+        try:
+            ranking_rows = build_daily_momentum_factor_rows(
+                market_date=normalized_market_date,
+                price_histories=valid_histories,
+                overheat_rule=self.overheat_rule,
+                eligibility_rule=self.eligibility_rule,
+            )
+        except SYMBOL_LOCAL_COMPUTATION_ERRORS:
+            _, isolated_failed_symbols, isolated_failed_errors = (
+                build_symbol_results(
+                    list(valid_histories.items()),
+                    symbol_of=lambda item: item[0],
+                    build=lambda item: run_symbol_computation(
+                        lambda: build_daily_momentum_factor_rows(
+                            market_date=normalized_market_date,
+                            price_histories={item[0]: item[1]},
+                            overheat_rule=self.overheat_rule,
+                            eligibility_rule=self.eligibility_rule,
+                        )[0]
+                    ),
+                )
+            )
+            if (
+                not isolated_failed_symbols
+                or len(isolated_failed_symbols) == len(valid_histories)
+            ):
+                raise
+            failed_set = set(isolated_failed_symbols)
+            ranking_rows = build_daily_momentum_factor_rows(
+                market_date=normalized_market_date,
+                price_histories={
+                    symbol: history
+                    for symbol, history in valid_histories.items()
+                    if symbol not in failed_set
+                },
+                overheat_rule=self.overheat_rule,
+                eligibility_rule=self.eligibility_rule,
+            )
+            computation_failed_symbols, computation_failed_symbol_errors = (
+                merge_symbol_failures(
+                    (
+                        computation_failed_symbols,
+                        computation_failed_symbol_errors,
+                    ),
+                    (isolated_failed_symbols, isolated_failed_errors),
+                )
+            )
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=computation_failed_symbols,
+            failed_symbol_errors=computation_failed_symbol_errors,
+            target_symbols=target_symbols,
+        )
+        (
+            missing_history_symbols,
+            _,
+            ranking_dependency_missing_symbols,
+            ranking_dependency_missing_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=ranking_missing_history_symbols,
+            failed_symbol_errors=[
+                {
+                    'symbol': symbol,
+                    'error': 'missing_market_date_bar',
+                }
+                for symbol in ranking_missing_history_symbols
+            ],
+            target_symbols=target_symbols,
+        )
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                ranking_dependency_missing_errors,
+            ),
+        )
+        failed_symbols = list(
+            dict.fromkeys([
+                *missing_history_symbols,
+                *computation_failed_symbols,
+            ])
         )
         if requested_symbols:
             target_symbol_set = set(target_symbols)
@@ -825,22 +992,82 @@ class DailyMomentumFactorService:
 
         persisted_items: list[dict[str, Any]] = []
         write_failed_symbols: list[str] = []
-        try:
-            upsert_daily_momentum_factor_results(rows)
-            persisted_items = list(rows)
-        except Exception:
-            for row in rows:
-                try:
-                    upsert_daily_momentum_factor_result(row)
-                    persisted_items.append(row)
-                except Exception:
-                    write_failed_symbols.append(row['symbol'])
+        write_failed_symbol_errors: list[dict[str, str]] = []
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='momentum_factors',
+                results=rows,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            successful_symbol_set = set(publication['successful_symbols'])
+            persisted_items = [
+                row for row in rows
+                if row['symbol'] in successful_symbol_set
+            ]
+            write_failed_symbols = list(publication['failed_symbols'])
+            write_failed_symbol_errors = list(
+                publication['failed_symbol_errors']
+            )
+            scope_finalization = publication['scope_finalization']
+        else:
+            (
+                persisted_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                rows,
+                bulk_write=upsert_daily_momentum_factor_results,
+                item_write=upsert_daily_momentum_factor_result,
+            )
 
-        combined_failed_symbols = list(dict.fromkeys([*failed_symbols, *write_failed_symbols]))
-        persisted_ready_count = sum(
-            1 for row in persisted_items if row.get('has_sufficient_history')
+        combined_failed_symbols, combined_failed_symbol_errors = (
+            merge_symbol_failures(
+                (
+                    missing_history_symbols,
+                    [
+                        {
+                            'symbol': symbol,
+                            'error': 'missing_market_date_bar',
+                        }
+                        for symbol in missing_history_symbols
+                    ],
+                ),
+                (
+                    computation_failed_symbols,
+                    computation_failed_symbol_errors,
+                ),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
         )
-        return {
+        persisted_ready_count = sum(
+            1 for row in persisted_items if row.get('momentum_percentile') is not None
+        )
+        coverage_failed_symbols = list(
+            dict.fromkeys([
+                *computation_failed_symbols,
+                *write_failed_symbols,
+            ])
+        )
+        summary = self._build_coverage_contract(
+            items=rows,
+            persisted_items=persisted_items,
+            missing_symbols=missing_history_symbols,
+            failed_symbols=coverage_failed_symbols,
+            failed_symbol_errors=[
+                *computation_failed_symbol_errors,
+                *write_failed_symbol_errors,
+            ],
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
+        )
+        result = {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date,
             'source': MOMENTUM_FACTOR_SOURCE,
             'feature_version': MOMENTUM_FACTOR_VERSION,
@@ -849,25 +1076,30 @@ class DailyMomentumFactorService:
             'requested_symbols': len(target_symbols),
             'requested_symbol_count': len(target_symbols),
             'symbols_evaluated': len(rows),
-            'ready_count': sum(1 for row in rows if row.get('has_sufficient_history')),
+            'ready_count': sum(1 for row in rows if row.get('momentum_percentile') is not None),
             'unready_count': (
                 len(failed_symbols)
-                + sum(1 for row in rows if not row.get('has_sufficient_history'))
+                + sum(1 for row in rows if row.get('momentum_percentile') is None)
             ),
             'persisted_ready_count': persisted_ready_count,
             'persisted_unready_count': len(persisted_items) - persisted_ready_count,
             'insufficient_history_count': sum(
                 1 for row in rows if not row.get('has_sufficient_history')
             ),
-            'missing_market_date_bar_count': len(failed_symbols),
+            'missing_market_date_bar_count': len(missing_history_symbols),
             'ranked_symbols': sum(1 for row in rows if row.get('momentum_rank') is not None),
             'top_percentile_symbols': sum(1 for row in rows if row.get('passes_momentum_top_percentile')),
             'eligible_symbols': sum(1 for row in rows if row.get('is_momentum_eligible')),
             'results_persisted': len(persisted_items),
             'results_failed': len(combined_failed_symbols),
             'failed_symbols': combined_failed_symbols[:50],
+            'failed_symbol_errors': combined_failed_symbol_errors[:50],
+            'summary': summary,
             'items': [enrich_momentum_audit_fields(item) for item in persisted_items],
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,
@@ -906,6 +1138,19 @@ class DailyMomentumFactorService:
         }
 
     @staticmethod
+    def _validated_history_or_none(
+        *,
+        market_date: str,
+        bars: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        ordered_bars = _ordered_bars(bars)
+        if not ordered_bars:
+            return None
+        if str(ordered_bars[-1]['trade_date']) != market_date:
+            return None
+        return ordered_bars
+
+    @staticmethod
     def _extract_valid_histories(
         *,
         market_date: str,
@@ -914,13 +1159,85 @@ class DailyMomentumFactorService:
     ) -> dict[str, list[dict[str, Any]]]:
         valid_histories: dict[str, list[dict[str, Any]]] = {}
         for symbol in target_symbols:
-            bars = _ordered_bars(price_histories.get(symbol) or [])
-            if not bars:
-                continue
-            if str(bars[-1]['trade_date']) != market_date:
+            bars = DailyMomentumFactorService._validated_history_or_none(
+                market_date=market_date,
+                bars=price_histories.get(symbol) or [],
+            )
+            if bars is None:
                 continue
             valid_histories[symbol] = bars
         return valid_histories
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        def momentum_available(item: dict[str, Any]) -> bool:
+            return item.get('momentum_12_1') is not None
+
+        def trend_available(item: dict[str, Any]) -> bool:
+            return item.get('ma_60') is not None and item.get('ma_120') is not None
+
+        def overheat_available(item: dict[str, Any]) -> bool:
+            return all(
+                item.get(key) is not None
+                for key in (
+                    'return_5d',
+                    'return_5d_realized_volatility_20d',
+                    'return_5d_vol_adjusted',
+                )
+            )
+
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
+            is_ready=lambda item: item.get('momentum_percentile') is not None,
+            is_complete=lambda item: (
+                momentum_available(item)
+                and trend_available(item)
+                and overheat_available(item)
+            ),
+            unusable_reason=lambda item: item.get('momentum_eligibility_status')
+            or (
+                MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY
+                if not item.get('has_sufficient_history')
+                else 'unusable_momentum_row'
+            ),
+            input_families={
+                'momentum_12_1': (
+                    momentum_available,
+                    lambda item: (
+                        None
+                        if momentum_available(item)
+                        else MOMENTUM_ELIGIBILITY_STATUS_INSUFFICIENT_HISTORY
+                    ),
+                ),
+                'trend_confirmation': (
+                    trend_available,
+                    lambda item: (
+                        None
+                        if trend_available(item)
+                        else 'trend_input_unavailable'
+                    ),
+                ),
+                'overheat_evidence': (
+                    overheat_available,
+                    lambda item: (
+                        None
+                        if overheat_available(item)
+                        else 'overheat_evidence_unavailable'
+                    ),
+                ),
+            },
+        )
 
 
 daily_momentum_factor_service = DailyMomentumFactorService()

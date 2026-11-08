@@ -7,6 +7,7 @@ from typing import Any
 
 from app.core.settings import settings
 from app.integrations.dart.client import DartClient, dart_client
+from app.market.symbol_codes import normalize_krx_short_code
 
 REPORT_CODE_METADATA = {
     '11011': {'period': 'annual', 'label': 'annual_report', 'scope': 'full_year', 'quarter': 4},
@@ -282,6 +283,15 @@ DISCLOSURE_AUDIT_TOKENS = (
 _MATCH_NORMALIZATION_PATTERN = re.compile(r'[\s\-\_\(\)\[\]\{\}/\\,.:;]+')
 
 
+def _normalize_optional_stock_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stock_code = normalize_krx_short_code(value)
+    if stock_code is None:
+        raise ValueError('stock_code must be a valid KRX short code')
+    return stock_code
+
+
 class DartService:
     def __init__(self, client: DartClient | None = None) -> None:
         self.client = client or dart_client
@@ -295,6 +305,7 @@ class DartService:
         filing_days: int = 365,
         filings_limit: int = 10,
     ) -> dict[str, Any]:
+        stock_code = _normalize_optional_stock_code(stock_code)
         corp = await self.client.lookup_corp_code(
             corp_code=corp_code,
             stock_code=stock_code,
@@ -363,6 +374,7 @@ class DartService:
         )
         report_meta = REPORT_CODE_METADATA[resolved_report_code]
 
+        stock_code = _normalize_optional_stock_code(stock_code)
         corp = await self.client.lookup_corp_code(
             corp_code=corp_code,
             stock_code=stock_code,
@@ -557,12 +569,20 @@ class DartService:
 
 def build_fundamentals_dataset(statements: dict[str, Any]) -> dict[str, Any]:
     items = [_normalize_statement_item(item) for item in statements.get('list', [])]
-    highlights = _build_highlights(items)
+    highlights = build_highlights_from_normalized_items(items)
     return {
         'items': items,
         'highlights': highlights,
         'currency': next((item['currency'] for item in items if item.get('currency')), None),
     }
+
+
+def build_highlights_from_normalized_items(
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive the canonical highlight contract from already-normalized DART rows."""
+
+    return _build_highlights(items)
 
 
 def build_fundamental_context_from_highlights(

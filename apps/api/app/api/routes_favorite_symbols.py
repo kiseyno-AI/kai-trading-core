@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from app.market_data_store import load_favorite_symbols, remove_favorite_symbol
 
@@ -15,7 +16,7 @@ def _normalize_symbol_path(symbol: str) -> str:
 @router.get('')
 async def get_favorite_symbols() -> dict:
     try:
-        items = load_favorite_symbols()
+        items = await run_in_threadpool(load_favorite_symbols)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Favorite symbol read failed: {exc}') from exc
     return {
@@ -28,7 +29,7 @@ async def get_favorite_symbols() -> dict:
 async def delete_favorite_symbol(symbol: str) -> dict:
     try:
         normalized_symbol = _normalize_symbol_path(symbol)
-        removed = remove_favorite_symbol(normalized_symbol)
+        removed = await run_in_threadpool(remove_favorite_symbol, normalized_symbol)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

@@ -1,22 +1,29 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 
 from app.brokers.kis.client import KISClientError, KISConfigurationError
 from app.fx.service import KoreaEximRateNotFoundError
 from app.integrations.fx.client import KoreaEximAPIError, KoreaEximConfigurationError
 from app.market_data_store import persist_market_status_snapshot
 from app.market.clock import KST, MarketState, async_get_market_state
-from app.market.session import get_krx_exchange_calendar_day, latest_krx_exchange_calendar_trading_date
+from app.market.live_sector_projection import live_sector_projection_service
+from app.market.session import (
+    get_krx_exchange_calendar_day,
+    latest_krx_exchange_calendar_trading_date,
+)
 from app.market.snapshot import (
     MarketSnapshotConfigurationError,
     MarketSnapshotUnavailableError,
     MarketSnapshotUpstreamError,
     market_snapshot_service,
 )
-from app.schemas.market import MarketSnapshotResponse
+from app.schemas.market import LiveSectorProjectionResponse, MarketSnapshotResponse
+from app.market.business_line_profiles import business_line_summary
+from app.market.symbol_codes import normalize_krx_short_code
 
 router = APIRouter(prefix='/market', tags=['market'])
 logger = logging.getLogger(__name__)
@@ -33,7 +40,7 @@ async def market_status() -> dict:
         return state.__dict__
 
     try:
-        persist_market_status_snapshot(state, source='api')
+        await run_in_threadpool(persist_market_status_snapshot, state, source='api')
     except Exception as exc:
         logger.warning('Market status persistence failed: %s', exc)
     return state.__dict__
@@ -108,3 +115,31 @@ async def market_snapshot() -> dict:
         raise HTTPException(status_code=502, detail=f'Market snapshot upstream failed: {exc}') from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Market snapshot failed: {exc}') from exc
+
+
+@router.get('/live-sector-projection', response_model=LiveSectorProjectionResponse)
+async def live_sector_projection(
+    symbol: str = Query(min_length=1, max_length=32),
+    source_market_date: date = Query(),
+) -> dict:
+    try:
+        return await live_sector_projection_service.get_projection(
+            symbol=symbol,
+            source_market_date=source_market_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception('Live sector projection failed for %s', symbol)
+        raise HTTPException(
+            status_code=503,
+            detail='Live sector projection is temporarily unavailable.',
+        ) from exc
+
+
+@router.get('/business-lines')
+async def get_business_lines(symbols: str | None = None) -> dict:
+    """Business-line taxonomy with member counts; ``symbols`` adds their profiles."""
+
+    requested = [code for code in (normalize_krx_short_code(item) for item in (symbols or '').split(',')) if code] or None
+    return await asyncio.to_thread(business_line_summary, requested)

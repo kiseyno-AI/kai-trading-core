@@ -12,6 +12,7 @@ from app.dart.service import (
     build_fundamental_context_from_highlights,
     classify_disclosure_event,
 )
+from app.market.symbol_codes import normalize_krx_short_code
 
 
 class DartFundamentalsHistoryService:
@@ -131,8 +132,15 @@ def _normalize_symbols(symbols: list[str]) -> list[str]:
     seen: set[str] = set()
     for raw_symbol in symbols:
         for piece in (raw_symbol or '').split(','):
-            symbol = piece.strip()
-            if not symbol or symbol in seen:
+            raw_piece = piece.strip()
+            if not raw_piece:
+                continue
+            symbol = normalize_krx_short_code(raw_piece)
+            if symbol is None:
+                raise ValueError(
+                    'fundamentals history contains an invalid stock code'
+                )
+            if symbol in seen:
                 continue
             seen.add(symbol)
             normalized.append(symbol)

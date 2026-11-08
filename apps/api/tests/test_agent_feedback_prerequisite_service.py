@@ -142,6 +142,33 @@ def test_default_point_in_time_prerequisites_ignore_current_signal_features():
     )
 
 
+def test_prerequisites_include_technical_inputs_and_apply_requested_scope():
+    assert FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER[:2] == (
+        'technical_snapshots',
+        'action_summaries',
+    )
+    pipeline_status = _pipeline_status(
+        pykrx_stage=_pykrx_enrichment_stage(category_overrides={}),
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=pipeline_status,
+    ) as read_status:
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-09-18',
+            fs_div='CFS',
+            symbols=['005930', '000660', '005930'],
+        )
+
+    assert result['ready'] is True
+    assert result['scope_symbols'] == ['005930', '000660']
+    assert result['scope_symbol_count'] == 2
+    assert 'technical_snapshots' in result['ready_stage_ids']
+    assert 'action_summaries' in result['ready_stage_ids']
+    assert read_status.call_args.kwargs['scope_symbols'] == ['005930', '000660']
+
+
 def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     payload = {
         'status': 'partial',
@@ -156,6 +183,90 @@ def test_high_coverage_terminal_partial_prerequisite_is_progressable_ready():
     }
 
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'ready'
+
+
+def test_processed_count_does_not_substitute_for_missing_success_evidence():
+    payload = {
+        'status': 'partial',
+        'total': 100,
+        'processed': 100,
+        'details': {
+            'expected_rows': 100,
+            'remaining_retryable_events': 0,
+        },
+    }
+
+    assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
+
+
+def test_explicit_zero_success_or_persistence_remains_authoritative():
+    cases = (
+        {
+            'status': 'partial',
+            'total': 100,
+            'processed': 100,
+            'succeeded': 0,
+            'details': {
+                'expected_rows': 100,
+                'rows_persisted': 100,
+                'remaining_retryable_events': 0,
+            },
+        },
+        {
+            'status': 'partial',
+            'total': 100,
+            'processed': 100,
+            'succeeded': 100,
+            'details': {
+                'expected_rows': 100,
+                'rows_persisted': 0,
+                'remaining_retryable_events': 0,
+            },
+        },
+    )
+
+    for payload in cases:
+        assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
+
+
+def test_completed_explicit_zero_blocks_but_absent_legacy_counts_remain_ready():
+    cases = (
+        {
+            'status': 'completed',
+            'total': 100,
+            'succeeded': 0,
+            'details': {'expected_rows': 100, 'rows_persisted': 100},
+        },
+        {
+            'status': 'completed',
+            'total': 100,
+            'succeeded': 100,
+            'details': {'expected_rows': 100, 'rows_persisted': 0},
+        },
+    )
+
+    for payload in cases:
+        assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
+
+    assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(
+        {'status': 'completed', 'details': {}}
+    ) == 'ready'
+
+
+def test_partial_coverage_uses_largest_reported_denominator():
+    for total, expected_rows in ((1, 100), (100, 1)):
+        payload = {
+            'status': 'partial',
+            'total': total,
+            'succeeded': 1,
+            'details': {
+                'rows_persisted': 1,
+                'expected_rows': expected_rows,
+                'remaining_retryable_events': 0,
+            },
+        }
+
+        assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
 
 
 def test_high_coverage_partial_is_blocked_when_no_ready_row_persisted():
@@ -180,6 +291,50 @@ def test_high_coverage_partial_is_blocked_when_no_ready_row_persisted():
     }
 
     assert AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload) == 'blocked'
+
+
+def test_explicit_ready_gate_cannot_override_zero_ready_content():
+    payload = {
+        'task': 'momentum_factors',
+        'status': 'completed',
+        'gate_status': 'ready',
+        'total': 1,
+        'succeeded': 1,
+        'details': {
+            'rows_persisted': 1,
+            'expected_rows': 1,
+            'result_summary': {
+                'results_persisted': 1,
+                'persisted_ready_count': 0,
+                'persisted_unready_count': 1,
+            },
+        },
+    }
+
+    assert (
+        AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload)
+        == 'blocked'
+    )
+
+
+def test_factor_decision_counts_cannot_override_zero_ready_content():
+    payload = {
+        'task': 'momentum_factors',
+        'status': 'completed',
+        'gate_status': 'ready',
+        'total': 2,
+        'succeeded': 2,
+        'details': {
+            'rows_persisted': 2,
+            'decision_ready_count': 0,
+            'decision_degraded_count': 2,
+        },
+    }
+
+    assert (
+        AgentFeedbackPrerequisiteService._classify_stage_gate_status(payload)
+        == 'blocked'
+    )
 
 
 def test_konex_only_pykrx_categories_satisfy_feedback_prerequisites():
@@ -493,6 +648,92 @@ def test_inspect_feedback_prerequisites_warns_on_pykrx_provider_unavailable_with
         item['reason']
         for item in warning_categories
     } == {'pykrx_provider_unavailable_optional_enrichment_degraded'}
+
+
+def test_inspect_feedback_prerequisites_blocks_short_shells_without_decision_core():
+    pykrx_stage = _pykrx_enrichment_stage(
+        status='completed',
+        category_overrides={
+            'short_selling': {
+                'present_rows': 2767,
+                'expected_rows': 2767,
+                'coverage_ratio': 1.0,
+                'coverage_status': 'complete',
+                'decision_usable_present_rows': 0,
+                'decision_usable_ratio': 0.0,
+                'decision_usable_status': 'missing',
+                'complete_present_rows': 0,
+                'completeness_ratio': 0.0,
+                'completeness_status': 'missing',
+            },
+        },
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=_pipeline_status(pykrx_stage=pykrx_stage),
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-10-30',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'blocked'
+    assert result['ready'] is False
+    assert result['blocked_stage_ids'] == ['pykrx_enrichment']
+    details = result['stages']['pykrx_enrichment']['details']
+    assert details['decider_category_gate_status'] == 'blocked'
+    assert [
+        item['category']
+        for item in details['decider_blocking_categories']
+    ] == ['short_selling']
+    short_gate = details['decider_blocking_categories'][0]
+    assert short_gate['reason'] == (
+        'missing_required_pykrx_enrichment_decision_evidence'
+    )
+    assert short_gate['decision_usable_rows'] == 0
+    assert short_gate['missing_decision_usable_rows'] == 2767
+    assert short_gate['missing_complete_rows'] == 2767
+
+
+def test_inspect_feedback_prerequisites_warns_but_allows_short_core_without_balance():
+    pykrx_stage = _pykrx_enrichment_stage(
+        status='completed',
+        category_overrides={
+            'short_selling': {
+                'present_rows': 2767,
+                'expected_rows': 2767,
+                'coverage_ratio': 1.0,
+                'coverage_status': 'complete',
+                'decision_usable_present_rows': 2767,
+                'decision_usable_ratio': 1.0,
+                'decision_usable_status': 'complete',
+                'complete_present_rows': 0,
+                'completeness_ratio': 0.0,
+                'completeness_status': 'missing',
+            },
+        },
+    )
+
+    with patch(
+        'app.eod.pipeline_status.eod_pipeline_status_service.read',
+        return_value=_pipeline_status(pykrx_stage=pykrx_stage),
+    ):
+        result = AgentFeedbackPrerequisiteService().inspect_feedback_prerequisites(
+            market_date='2026-10-30',
+            fs_div='CFS',
+        )
+
+    assert result['status'] == 'ready'
+    assert result['ready'] is True
+    assert result['blocked_stage_ids'] == []
+    details = result['stages']['pykrx_enrichment']['details']
+    assert details['decider_category_gate_status'] == 'ready'
+    assert details['decider_blocking_categories'] == []
+    assert [
+        item['category']
+        for item in details['decider_warning_categories']
+    ] == ['short_selling']
 
 
 def test_inspect_feedback_prerequisites_blocks_low_partial_pykrx_enrichment_coverage():

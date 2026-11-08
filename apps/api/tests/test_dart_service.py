@@ -239,13 +239,30 @@ class DartServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.get_company_snapshot(stock_code='5930', filing_days=90, filings_limit=5)
 
-        self.assertEqual(client.lookup_args['stock_code'], '5930')
+        self.assertEqual(client.lookup_args['stock_code'], '005930')
         self.assertEqual(client.company_corp_code, '00126380')
         self.assertEqual(client.filings_args['corp_code'], '00126380')
         self.assertEqual(client.filings_args['page_count'], 5)
         self.assertEqual(result['lookup']['stock_code'], '005930')
         self.assertEqual(result['company']['corp_name'], '삼성전자')
         self.assertEqual(result['recent_filings']['items'][0]['rcept_no'], '20250101000001')
+
+    async def test_company_snapshot_accepts_alpha_krx_short_code(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        await service.get_company_snapshot(stock_code='00088k')
+
+        self.assertEqual(client.lookup_args['stock_code'], '00088K')
+
+    async def test_company_snapshot_rejects_malformed_stock_code(self):
+        client = FakeDartClient()
+        service = DartService(client=client)
+
+        with self.assertRaisesRegex(ValueError, 'valid KRX short code'):
+            await service.get_company_snapshot(stock_code='ABC123')
+
+        self.assertFalse(hasattr(client, 'lookup_args'))
 
     async def test_fundamentals_returns_normalized_financials_and_highlights(self):
         client = FakeDartClient()

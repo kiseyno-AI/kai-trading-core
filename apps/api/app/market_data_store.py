@@ -7,8 +7,22 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import Boolean, Numeric, and_, bindparam, case, cast, delete, func, select, text, true, update
+from sqlalchemy import (
+    Boolean,
+    Numeric,
+    and_,
+    bindparam,
+    case,
+    cast,
+    delete,
+    func,
+    select,
+    text,
+    true,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import aliased
 
 from app.db import engine, session_scope
@@ -50,6 +64,7 @@ from app.eod.market_membership import (
     validate_market_membership_snapshot,
 )
 from app.market.clock import MarketState
+from app.market.symbol_codes import normalize_krx_short_code
 from app.repositories.eod_run_repository import (
     advisory_eod_collection_lock,
     advisory_eod_collection_locks,
@@ -57,11 +72,13 @@ from app.repositories.eod_run_repository import (
     count_daily_action_summaries_for_live_symbols,
     count_daily_price_bars_for_date,
     count_daily_price_bars_for_live_symbols,
+    count_daily_price_contexts_for_live_symbols,
     count_daily_technical_snapshots_for_live_symbols,
     count_eod_collection_runs,
     count_eod_run_persisted_symbols,
     count_live_symbols,
     create_eod_collection_run,
+    daily_price_bar_writer_admission,
     daily_price_bar_has_current_eod_run_provenance,
     load_eod_run_persisted_symbols,
     load_eod_run_stage_counts,
@@ -83,6 +100,20 @@ from app.repositories.symbol_repository import (
     upsert_symbol_universe,
 )
 from app.scanner.state import scanner_state
+from app.signals.signal_feature_readiness import (
+    direct_signal_source_is_decision_usable,
+)
+from app.eod.live_progress import daily_pipeline_live_progress
+
+
+EXACT_SCOPE_ROW_LOCAL_ERRORS = (
+    ArithmeticError,
+    DataError,
+    IntegrityError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 
 def _parse_trade_date(value: str) -> date:
@@ -145,6 +176,148 @@ DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE = 50
 RECENT_PRICE_BARS_SYMBOL_CHUNK_SIZE = 200
 FACTOR_RESULT_UPSERT_CHUNK_SIZE = 400
 
+DAILY_EXACT_SCOPE_RESULT_MODELS = {
+    'price_contexts': DailyPriceContext,
+    'technical_snapshots': DailyTechnicalSnapshot,
+    'action_summaries': DailyActionSummary,
+    'signal_features': DailySignalFeature,
+    'market_risk_snapshots': DailyMarketRiskSnapshot,
+    'market_risk_filter': DailyMarketRiskFilterResult,
+    'piotroski_filter': DailyPiotroskiFilterResult,
+    'momentum_factors': DailyMomentumFactorResult,
+    'value_factors': DailyValueFactorResult,
+    'low_risk_factors': DailyLowRiskFactorResult,
+    'beta_factors': DailyBetaFactorResult,
+    'advanced_value_factors': DailyAdvancedValueFactorResult,
+    'unified_value_factors': DailyUnifiedValueFactorResult,
+    'quality_factors': DailyQualityFactorResult,
+    'composite_factors': DailyCompositeFactorResult,
+}
+
+DAILY_DERIVED_RESULT_CONSTRAINTS = {
+    'market_risk_snapshots': (
+        'uq_daily_market_risk_snapshots_symbol_market_date'
+    ),
+    'market_risk_filter': (
+        'uq_daily_market_risk_filter_results_symbol_market_date'
+    ),
+    'piotroski_filter': (
+        'uq_daily_piotroski_filter_results_symbol_market_date'
+    ),
+    'momentum_factors': (
+        'uq_daily_momentum_factor_results_symbol_market_date'
+    ),
+    'value_factors': 'uq_daily_value_factor_results_symbol_market_date',
+    'low_risk_factors': (
+        'uq_daily_low_risk_factor_results_symbol_market_date'
+    ),
+    'beta_factors': 'uq_daily_beta_factor_results_symbol_market_date',
+    'advanced_value_factors': (
+        'uq_daily_advanced_value_factor_results_symbol_market_date'
+    ),
+    'unified_value_factors': (
+        'uq_daily_unified_value_factor_results_symbol_market_date'
+    ),
+    'quality_factors': (
+        'uq_daily_quality_factor_results_symbol_market_date'
+    ),
+    'composite_factors': (
+        'uq_daily_composite_factor_results_symbol_market_date'
+    ),
+}
+
+DAILY_DERIVED_MARKET_SCOPE_AUTHORITY_SCHEMA_VERSION = (
+    'daily_derived_market_scope_authority_v1'
+)
+DAILY_DERIVED_ALL_MARKET_AUTHORITY = frozenset(
+    {'KOSPI', 'KOSDAQ', 'KONEX'}
+)
+
+
+def build_daily_derived_market_scope_authority(
+    *,
+    market_date: str | date,
+    exact_symbols: Sequence[str],
+    market_membership_snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind a point-in-time snapshot to replacement in proven markets.
+
+    A bare symbol list is intentionally insufficient authority to remove rows
+    outside that list: an exact repair can be a same-market subset.  This
+    proof is only valid when the supplied PyKRX membership snapshot contains
+    the identical symbol set with per-market counts and hashes.  A partial-
+    market proof remains destructive only for those exact members.  Removing
+    rows outside that set additionally requires all-market authority.
+    """
+
+    normalized_symbols = tuple(
+        sorted({_normalize_symbol_code(str(symbol)) for symbol in exact_symbols})
+    )
+    if not normalized_symbols:
+        raise ValueError('market-scope authority requires a non-empty membership')
+    raw_markets = market_membership_snapshot.get('markets')
+    markets = (
+        tuple(sorted(str(market).strip().upper() for market in raw_markets))
+        if isinstance(raw_markets, Mapping)
+        else ()
+    )
+    if not markets:
+        raise ValueError('market-scope authority requires explicit markets')
+    validated = validate_market_membership_snapshot(
+        dict(market_membership_snapshot),
+        requested_symbols=normalized_symbols,
+        markets=markets,
+    )
+    if validated is None:
+        raise ValueError('invalid authoritative market membership snapshot')
+    return {
+        'schema_version': DAILY_DERIVED_MARKET_SCOPE_AUTHORITY_SCHEMA_VERSION,
+        'scope_kind': 'proven_markets',
+        'market_date': _normalize_trade_date(market_date).isoformat(),
+        'symbol_count': len(normalized_symbols),
+        'membership_sha256': market_membership_sha256(normalized_symbols),
+        'market_membership_snapshot': deepcopy(dict(market_membership_snapshot)),
+    }
+
+
+def _validate_daily_derived_market_scope_authority(
+    proof: Mapping[str, Any],
+    *,
+    market_date: date,
+    exact_symbols: Sequence[str],
+) -> dict[str, list[str]]:
+    normalized_symbols = tuple(
+        sorted({_normalize_symbol_code(str(symbol)) for symbol in exact_symbols})
+    )
+    snapshot = proof.get('market_membership_snapshot')
+    raw_markets = snapshot.get('markets') if isinstance(snapshot, Mapping) else None
+    markets = (
+        tuple(sorted(str(market).strip().upper() for market in raw_markets))
+        if isinstance(raw_markets, Mapping)
+        else ()
+    )
+    if (
+        proof.get('schema_version')
+        != DAILY_DERIVED_MARKET_SCOPE_AUTHORITY_SCHEMA_VERSION
+        or proof.get('scope_kind') != 'proven_markets'
+        or proof.get('market_date') != market_date.isoformat()
+        or isinstance(proof.get('symbol_count'), bool)
+        or proof.get('symbol_count') != len(normalized_symbols)
+        or proof.get('membership_sha256')
+        != market_membership_sha256(normalized_symbols)
+        or not isinstance(snapshot, Mapping)
+        or not markets
+    ):
+        raise ValueError('invalid daily derived market-scope authority proof')
+    validated = validate_market_membership_snapshot(
+        dict(snapshot),
+        requested_symbols=normalized_symbols,
+        markets=markets,
+    )
+    if validated is None:
+        raise ValueError('invalid daily derived market-scope membership proof')
+    return validated
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -152,6 +325,183 @@ def _utcnow() -> datetime:
 
 def _get_symbol(session, symbol: str) -> Symbol | None:
     return session.execute(select(Symbol).where(Symbol.symbol == symbol)).scalar_one_or_none()
+
+
+def finalize_daily_derived_stage_exact_scope(
+    *,
+    market_date: str | date,
+    stage_id: str,
+    exact_symbols: Sequence[str],
+    successful_symbols: Sequence[str],
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically remove stale rows after a scoped daily-stage attempt.
+
+    A partial provider or persistence failure must not leave a same-date
+    success row authoritative for the failed member.  By default deletion is
+    restricted to the exact requested symbols.  Removing rows outside that
+    set requires an explicit, date-bound, hashed all-market membership proof.
+    A partial-market or bare same-market subset is never destructive
+    authority outside its exact point-in-time members.
+    """
+
+    with session_scope() as session:
+        return _finalize_daily_derived_stage_exact_scope_in_session(
+            session,
+            market_date=market_date,
+            stage_id=stage_id,
+            exact_symbols=exact_symbols,
+            successful_symbols=successful_symbols,
+            authoritative_market_scope=authoritative_market_scope,
+        )
+
+
+def _finalize_daily_derived_stage_exact_scope_in_session(
+    session,
+    *,
+    market_date: str | date,
+    stage_id: str,
+    exact_symbols: Sequence[str],
+    successful_symbols: Sequence[str],
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+    acquire_table_lock: bool = True,
+) -> dict[str, Any]:
+    """Finalize one exact stage scope inside the caller's transaction."""
+
+    model = DAILY_EXACT_SCOPE_RESULT_MODELS.get(stage_id)
+    if model is None:
+        raise ValueError(f'unsupported exact-scope stage: {stage_id}')
+    normalized_exact = tuple(
+        sorted(
+            {
+                _normalize_symbol_code(str(symbol))
+                for symbol in exact_symbols
+            }
+        )
+    )
+    normalized_successful = tuple(
+        sorted(
+            {
+                _normalize_symbol_code(str(symbol))
+                for symbol in successful_symbols
+            }
+        )
+    )
+    if not normalized_exact:
+        raise ValueError('exact stage scope must not be empty')
+    exact_set = set(normalized_exact)
+    outside_success = sorted(set(normalized_successful) - exact_set)
+    if outside_success:
+        raise ValueError(
+            'successful stage symbols must be contained in exact scope: '
+            + ','.join(outside_success[:20])
+        )
+
+    normalized_date = _normalize_trade_date(market_date)
+    validated_market_scope = (
+        _validate_daily_derived_market_scope_authority(
+            authoritative_market_scope,
+            market_date=normalized_date,
+            exact_symbols=normalized_exact,
+        )
+        if authoritative_market_scope is not None
+        else None
+    )
+    authoritative_markets = tuple(
+        sorted(validated_market_scope)
+        if validated_market_scope is not None
+        else ()
+    )
+    all_market_authority = (
+        set(authoritative_markets) == DAILY_DERIVED_ALL_MARKET_AUTHORITY
+    )
+    if acquire_table_lock:
+        # Serialize finalization with concurrent writers to this result table.
+        session.execute(
+            text(
+                f'LOCK TABLE {model.__tablename__} '
+                'IN SHARE ROW EXCLUSIVE MODE'
+            )
+        )
+    symbol_rows = session.execute(
+        select(Symbol.id, Symbol.symbol, Symbol.market).where(
+            Symbol.symbol.in_(normalized_exact)
+        )
+    ).all()
+    symbol_ids = {
+        str(symbol): int(symbol_id)
+        for symbol_id, symbol, _market in symbol_rows
+    }
+    exact_markets = tuple(
+        sorted({str(market) for _, _, market in symbol_rows})
+    )
+    missing_master_symbols = sorted(exact_set - set(symbol_ids))
+    if missing_master_symbols:
+        raise RuntimeError(
+            'exact stage scope contains symbols missing from master: '
+            + ','.join(missing_master_symbols[:20])
+        )
+    successful_ids = [
+        symbol_ids[symbol]
+        for symbol in normalized_successful
+    ]
+    delete_condition = model.market_date == normalized_date
+    if not all_market_authority:
+        delete_condition = and_(
+            delete_condition,
+            model.symbol_id.in_(list(symbol_ids.values())),
+        )
+    # A partial-market point-in-time snapshot proves only the members inside
+    # ``normalized_exact``.  The current Symbol.market value cannot classify
+    # an outside row historically: a KONEX member may since have transferred
+    # to KOSPI (or vice versa).  Keep the destructive boundary at the proven
+    # exact IDs unless the snapshot covers every supported KRX market.  A
+    # full all-market snapshot proves that every outside row is outside the
+    # authoritative KRX universe for this date, so date-wide cleanup is safe.
+    if successful_ids:
+        delete_condition = and_(
+            delete_condition,
+            model.symbol_id.not_in(successful_ids),
+        )
+    deleted_count = int(
+        session.execute(delete(model).where(delete_condition)).rowcount or 0
+    )
+    remaining_query = (
+        select(Symbol.symbol)
+        .join(model, model.symbol_id == Symbol.id)
+        .where(model.market_date == normalized_date)
+        .order_by(Symbol.symbol.asc())
+    )
+    if not all_market_authority:
+        remaining_query = remaining_query.where(
+            model.symbol_id.in_(list(symbol_ids.values()))
+        )
+    remaining_rows = session.execute(remaining_query).scalars().all()
+    remaining_symbols = tuple(str(symbol) for symbol in remaining_rows)
+    if remaining_symbols != normalized_successful:
+        raise RuntimeError(
+            'exact stage finalization persistence mismatch: '
+            f'stage={stage_id}, expected={len(normalized_successful)}, '
+            f'observed={len(remaining_symbols)}'
+        )
+    return {
+        'stage': stage_id,
+        'market_date': normalized_date.isoformat(),
+        'exact_symbol_count': len(normalized_exact),
+        'exact_markets': list(exact_markets),
+        'authoritative_market_scope': validated_market_scope is not None,
+        'authoritative_markets': list(authoritative_markets),
+        'all_market_authority': all_market_authority,
+        'exact_membership_sha256': market_membership_sha256(
+            normalized_exact
+        ),
+        'successful_symbol_count': len(normalized_successful),
+        'successful_membership_sha256': market_membership_sha256(
+            normalized_successful
+        ),
+        'deleted_stale_row_count': deleted_count,
+        'ready': True,
+    }
 
 
 def _normalize_symbol_code(symbol: str) -> str:
@@ -627,10 +977,8 @@ def persist_daily_price_bars(
 
 
 def _normalize_turnover_repair_symbol(value: object) -> str:
-    symbol = str(value or '').strip().upper()
-    if symbol.isdigit():
-        symbol = symbol.zfill(6)
-    if not symbol or not symbol.isdigit() or len(symbol) != 6:
+    symbol = normalize_krx_short_code(value)
+    if symbol is None:
         raise ValueError(f'invalid KRX turnover-repair symbol: {value!r}')
     return symbol
 
@@ -1910,37 +2258,50 @@ def _build_daily_market_relative_rows_query(
     )
 
 
-def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None:
+def _upsert_daily_price_context_in_session(
+    session,
+    item: dict,
+    *,
+    run_id: int | None = None,
+) -> None:
     refreshed_at = _utcnow()
-    with session_scope() as session:
-        symbol = _get_symbol(session, item['symbol'])
-        if symbol is None:
-            raise ValueError(f"Unknown symbol for daily price context: {item['symbol']}")
+    symbol = _get_symbol(session, item['symbol'])
+    if symbol is None:
+        raise ValueError(f"Unknown symbol for daily price context: {item['symbol']}")
 
-        values = {
-            'symbol_id': symbol.id,
-            'eod_run_id': run_id,
-            'market_date': _normalize_trade_date(item['market_date']),
-            'source': item.get('source', 'pykrx'),
-            'context_payload': item['context_payload'],
-            'captured_at': refreshed_at,
-            'updated_at': refreshed_at,
-        }
-        statement = pg_insert(DailyPriceContext).values(values)
-        session.execute(
-            statement.on_conflict_do_update(
-                constraint='uq_daily_price_contexts_symbol_market_date',
-                set_={
-                    'eod_run_id': func.coalesce(
-                        statement.excluded.eod_run_id,
-                        DailyPriceContext.eod_run_id,
-                    ),
-                    'source': statement.excluded.source,
-                    'context_payload': statement.excluded.context_payload,
-                    'captured_at': statement.excluded.captured_at,
-                    'updated_at': refreshed_at,
-                },
-            )
+    values = {
+        'symbol_id': symbol.id,
+        'eod_run_id': run_id,
+        'market_date': _normalize_trade_date(item['market_date']),
+        'source': item.get('source', 'pykrx'),
+        'context_payload': item['context_payload'],
+        'captured_at': refreshed_at,
+        'updated_at': refreshed_at,
+    }
+    statement = pg_insert(DailyPriceContext).values(values)
+    session.execute(
+        statement.on_conflict_do_update(
+            constraint='uq_daily_price_contexts_symbol_market_date',
+            set_={
+                'eod_run_id': func.coalesce(
+                    statement.excluded.eod_run_id,
+                    DailyPriceContext.eod_run_id,
+                ),
+                'source': statement.excluded.source,
+                'context_payload': statement.excluded.context_payload,
+                'captured_at': statement.excluded.captured_at,
+                'updated_at': refreshed_at,
+            },
+        )
+    )
+
+
+def upsert_daily_price_context(item: dict, *, run_id: int | None = None) -> None:
+    with session_scope() as session:
+        _upsert_daily_price_context_in_session(
+            session,
+            item,
+            run_id=run_id,
         )
 
 
@@ -2032,69 +2393,82 @@ def load_daily_price_context_history(
     ]
 
 
-def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None) -> None:
+def _upsert_daily_technical_snapshot_in_session(
+    session,
+    snapshot: dict,
+    *,
+    run_id: int | None = None,
+) -> None:
     refreshed_at = _utcnow()
-    with session_scope() as session:
-        symbol = _get_symbol(session, snapshot['symbol'])
-        if symbol is None:
-            symbol = Symbol(
-                symbol=snapshot['symbol'],
-                market='KRX',
-                name_ko=snapshot['symbol'],
-                instrument_type='equity',
-                source=snapshot.get('source', 'pykrx'),
-                is_active=True,
-                last_refreshed_at=refreshed_at,
-            )
-            session.add(symbol)
-            session.flush()
+    symbol = _get_symbol(session, snapshot['symbol'])
+    if symbol is None:
+        symbol = Symbol(
+            symbol=snapshot['symbol'],
+            market='KRX',
+            name_ko=snapshot['symbol'],
+            instrument_type='equity',
+            source=snapshot.get('source', 'pykrx'),
+            is_active=True,
+            last_refreshed_at=refreshed_at,
+        )
+        session.add(symbol)
+        session.flush()
 
-        values = {
-            'symbol_id': symbol.id,
-            'eod_run_id': run_id,
-            'market_date': _normalize_trade_date(snapshot['market_date']),
-            'source': snapshot.get('source', 'pykrx'),
-            'close_price': int(snapshot['close_price']),
-            'volume': int(snapshot['volume']),
-            'trend_state': snapshot['trend_state'],
-            'ma_alignment': snapshot['ma_alignment'],
-            'breakout_20d': bool(snapshot['breakout_20d']),
-            'breakdown_20d': bool(snapshot['breakdown_20d']),
-            'return_5d': snapshot.get('return_5d'),
-            'return_20d': snapshot.get('return_20d'),
-            'volume_ratio_20d': snapshot.get('volume_ratio_20d'),
-            'atr_14': snapshot.get('atr_14'),
-            'atr_pct_14': snapshot.get('atr_pct_14'),
-            'signal_payload': snapshot['signal_payload'],
-            'captured_at': refreshed_at,
-            'updated_at': refreshed_at,
-        }
-        statement = pg_insert(DailyTechnicalSnapshot).values(values)
-        session.execute(
-            statement.on_conflict_do_update(
-                constraint='uq_daily_technical_snapshots_symbol_market_date',
-                set_={
-                    'eod_run_id': func.coalesce(
-                        statement.excluded.eod_run_id,
-                        DailyTechnicalSnapshot.eod_run_id,
-                    ),
-                    'source': statement.excluded.source,
-                    'close_price': statement.excluded.close_price,
-                    'volume': statement.excluded.volume,
-                    'trend_state': statement.excluded.trend_state,
-                    'ma_alignment': statement.excluded.ma_alignment,
-                    'breakout_20d': statement.excluded.breakout_20d,
-                    'breakdown_20d': statement.excluded.breakdown_20d,
-                    'return_5d': statement.excluded.return_5d,
-                    'return_20d': statement.excluded.return_20d,
-                    'volume_ratio_20d': statement.excluded.volume_ratio_20d,
-                    'atr_14': statement.excluded.atr_14,
-                    'atr_pct_14': statement.excluded.atr_pct_14,
-                    'signal_payload': statement.excluded.signal_payload,
-                    'captured_at': statement.excluded.captured_at,
-                    'updated_at': refreshed_at,
-                },
-            )
+    values = {
+        'symbol_id': symbol.id,
+        'eod_run_id': run_id,
+        'market_date': _normalize_trade_date(snapshot['market_date']),
+        'source': snapshot.get('source', 'pykrx'),
+        'close_price': int(snapshot['close_price']),
+        'volume': int(snapshot['volume']),
+        'trend_state': snapshot['trend_state'],
+        'ma_alignment': snapshot['ma_alignment'],
+        'breakout_20d': bool(snapshot['breakout_20d']),
+        'breakdown_20d': bool(snapshot['breakdown_20d']),
+        'return_5d': snapshot.get('return_5d'),
+        'return_20d': snapshot.get('return_20d'),
+        'volume_ratio_20d': snapshot.get('volume_ratio_20d'),
+        'atr_14': snapshot.get('atr_14'),
+        'atr_pct_14': snapshot.get('atr_pct_14'),
+        'signal_payload': snapshot['signal_payload'],
+        'captured_at': refreshed_at,
+        'updated_at': refreshed_at,
+    }
+    statement = pg_insert(DailyTechnicalSnapshot).values(values)
+    session.execute(
+        statement.on_conflict_do_update(
+            constraint='uq_daily_technical_snapshots_symbol_market_date',
+            set_={
+                'eod_run_id': func.coalesce(
+                    statement.excluded.eod_run_id,
+                    DailyTechnicalSnapshot.eod_run_id,
+                ),
+                'source': statement.excluded.source,
+                'close_price': statement.excluded.close_price,
+                'volume': statement.excluded.volume,
+                'trend_state': statement.excluded.trend_state,
+                'ma_alignment': statement.excluded.ma_alignment,
+                'breakout_20d': statement.excluded.breakout_20d,
+                'breakdown_20d': statement.excluded.breakdown_20d,
+                'return_5d': statement.excluded.return_5d,
+                'return_20d': statement.excluded.return_20d,
+                'volume_ratio_20d': statement.excluded.volume_ratio_20d,
+                'atr_14': statement.excluded.atr_14,
+                'atr_pct_14': statement.excluded.atr_pct_14,
+                'signal_payload': statement.excluded.signal_payload,
+                'captured_at': statement.excluded.captured_at,
+                'updated_at': refreshed_at,
+            },
+        )
+    )
+
+
+def upsert_daily_technical_snapshot(snapshot: dict, *, run_id: int | None = None) -> None:
+    with session_scope() as session:
+        _upsert_daily_technical_snapshot_in_session(
+            session,
+            snapshot,
+            run_id=run_id,
         )
 
 
@@ -2215,70 +2589,252 @@ def load_daily_technical_snapshot_inputs(
         ]
 
 
-def upsert_daily_action_summary(summary: dict, *, run_id: int | None = None) -> None:
+def _upsert_daily_action_summary_in_session(
+    session,
+    summary: dict,
+    *,
+    run_id: int | None = None,
+) -> None:
     refreshed_at = _utcnow()
-    with session_scope() as session:
-        symbol = _get_symbol(session, summary['symbol'])
-        if symbol is None:
-            symbol = Symbol(
-                symbol=summary['symbol'],
-                market='KRX',
-                name_ko=summary['symbol'],
-                instrument_type='equity',
-                source=summary.get('source', 'pykrx'),
-                is_active=True,
-                last_refreshed_at=refreshed_at,
-            )
-            session.add(symbol)
-            session.flush()
+    symbol = _get_symbol(session, summary['symbol'])
+    if symbol is None:
+        symbol = Symbol(
+            symbol=summary['symbol'],
+            market='KRX',
+            name_ko=summary['symbol'],
+            instrument_type='equity',
+            source=summary.get('source', 'pykrx'),
+            is_active=True,
+            last_refreshed_at=refreshed_at,
+        )
+        session.add(symbol)
+        session.flush()
 
-        values = {
-            'symbol_id': symbol.id,
-            'technical_snapshot_id': summary.get('technical_snapshot_id'),
-            'eod_run_id': run_id,
-            'market_date': _normalize_trade_date(summary['market_date']),
-            'source': summary.get('source', 'pykrx'),
-            'action_label': summary['action_label'],
-            'bias_direction': summary['bias_direction'],
-            'signal_score': int(summary['signal_score']),
-            'confidence_tier': summary['confidence_tier'],
-            'risk_tier': summary['risk_tier'],
-            'trigger_price': summary.get('trigger_price'),
-            'invalidation_price': summary.get('invalidation_price'),
-            'support_price': summary.get('support_price'),
-            'resistance_price': summary.get('resistance_price'),
-            'reasons': summary['reasons'],
-            'summary_payload': summary['summary_payload'],
-            'captured_at': refreshed_at,
-            'updated_at': refreshed_at,
-        }
-        statement = pg_insert(DailyActionSummary).values(values)
+    values = {
+        'symbol_id': symbol.id,
+        'technical_snapshot_id': summary.get('technical_snapshot_id'),
+        'eod_run_id': run_id,
+        'market_date': _normalize_trade_date(summary['market_date']),
+        'source': summary.get('source', 'pykrx'),
+        'action_label': summary['action_label'],
+        'bias_direction': summary['bias_direction'],
+        'signal_score': int(summary['signal_score']),
+        'confidence_tier': summary['confidence_tier'],
+        'risk_tier': summary['risk_tier'],
+        'trigger_price': summary.get('trigger_price'),
+        'invalidation_price': summary.get('invalidation_price'),
+        'support_price': summary.get('support_price'),
+        'resistance_price': summary.get('resistance_price'),
+        'reasons': summary['reasons'],
+        'summary_payload': summary['summary_payload'],
+        'captured_at': refreshed_at,
+        'updated_at': refreshed_at,
+    }
+    statement = pg_insert(DailyActionSummary).values(values)
+    session.execute(
+        statement.on_conflict_do_update(
+            constraint='uq_daily_action_summaries_symbol_market_date',
+            set_={
+                'technical_snapshot_id': statement.excluded.technical_snapshot_id,
+                'eod_run_id': func.coalesce(
+                    statement.excluded.eod_run_id,
+                    DailyActionSummary.eod_run_id,
+                ),
+                'source': statement.excluded.source,
+                'action_label': statement.excluded.action_label,
+                'bias_direction': statement.excluded.bias_direction,
+                'signal_score': statement.excluded.signal_score,
+                'confidence_tier': statement.excluded.confidence_tier,
+                'risk_tier': statement.excluded.risk_tier,
+                'trigger_price': statement.excluded.trigger_price,
+                'invalidation_price': statement.excluded.invalidation_price,
+                'support_price': statement.excluded.support_price,
+                'resistance_price': statement.excluded.resistance_price,
+                'reasons': statement.excluded.reasons,
+                'summary_payload': statement.excluded.summary_payload,
+                'captured_at': statement.excluded.captured_at,
+                'updated_at': refreshed_at,
+            },
+        )
+    )
+
+
+def upsert_daily_action_summary(summary: dict, *, run_id: int | None = None) -> None:
+    with session_scope() as session:
+        _upsert_daily_action_summary_in_session(
+            session,
+            summary,
+            run_id=run_id,
+        )
+
+
+def _replace_daily_derived_rows_exact_scope(
+    *,
+    market_date: str | date,
+    stage_id: str,
+    rows: Sequence[Mapping[str, Any]],
+    exact_symbols: Sequence[str],
+    upsert_in_session: Callable[..., None],
+    run_id: int | None = None,
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Publish one derived stage as a serialized, all-or-nothing attempt.
+
+    Individual malformed rows remain retry debt via savepoints.  The table
+    lock, successful upserts, stale-row deletion, and exact-set verification
+    all live in the same outer transaction, so a crash or verification error
+    cannot expose a half-published attempt or delete a concurrent publisher's
+    rows.
+    """
+
+    model = DAILY_EXACT_SCOPE_RESULT_MODELS.get(stage_id)
+    if model is None:
+        raise ValueError(f'unsupported exact-scope stage: {stage_id}')
+    normalized_date = _normalize_trade_date(market_date)
+    normalized_exact = tuple(
+        sorted(
+            {
+                _normalize_symbol_code(str(symbol))
+                for symbol in exact_symbols
+            }
+        )
+    )
+    if not normalized_exact:
+        raise ValueError('exact stage scope must not be empty')
+    exact_set = set(normalized_exact)
+
+    normalized_rows: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    for raw_row in rows:
+        row = dict(raw_row)
+        symbol = _normalize_symbol_code(str(row.get('symbol') or ''))
+        if symbol in seen_symbols:
+            raise ValueError(
+                'exact derived replacement contains duplicate symbol: '
+                f'{symbol}'
+            )
+        row_date = _normalize_trade_date(row.get('market_date'))
+        if row_date != normalized_date:
+            raise ValueError(
+                'exact derived replacement market_date mismatch: '
+                f'symbol={symbol}, expected={normalized_date.isoformat()}, '
+                f'observed={row_date.isoformat()}'
+            )
+        seen_symbols.add(symbol)
+        row['symbol'] = symbol
+        normalized_rows.append(row)
+    outside_scope = sorted(seen_symbols - exact_set)
+    if outside_scope:
+        raise ValueError(
+            'exact derived publication contains symbols outside scope: '
+            + ','.join(outside_scope[:20])
+        )
+
+    successful_symbols: list[str] = []
+    failed_symbol_errors: list[dict[str, str]] = []
+    with session_scope() as session:
+        # Acquire the serialization boundary before the first row write.
+        # SHARE ROW EXCLUSIVE conflicts with other publishers and ordinary
+        # INSERT/UPDATE/DELETE writers, preventing write/finalize interleaving.
         session.execute(
-            statement.on_conflict_do_update(
-                constraint='uq_daily_action_summaries_symbol_market_date',
-                set_={
-                    'technical_snapshot_id': statement.excluded.technical_snapshot_id,
-                    'eod_run_id': func.coalesce(
-                        statement.excluded.eod_run_id,
-                        DailyActionSummary.eod_run_id,
-                    ),
-                    'source': statement.excluded.source,
-                    'action_label': statement.excluded.action_label,
-                    'bias_direction': statement.excluded.bias_direction,
-                    'signal_score': statement.excluded.signal_score,
-                    'confidence_tier': statement.excluded.confidence_tier,
-                    'risk_tier': statement.excluded.risk_tier,
-                    'trigger_price': statement.excluded.trigger_price,
-                    'invalidation_price': statement.excluded.invalidation_price,
-                    'support_price': statement.excluded.support_price,
-                    'resistance_price': statement.excluded.resistance_price,
-                    'reasons': statement.excluded.reasons,
-                    'summary_payload': statement.excluded.summary_payload,
-                    'captured_at': statement.excluded.captured_at,
-                    'updated_at': refreshed_at,
-                },
+            text(
+                f'LOCK TABLE {model.__tablename__} '
+                'IN SHARE ROW EXCLUSIVE MODE'
             )
         )
+        for row in normalized_rows:
+            symbol = str(row['symbol'])
+            try:
+                with session.begin_nested():
+                    upsert_in_session(
+                        session,
+                        row,
+                        run_id=run_id,
+                    )
+                successful_symbols.append(symbol)
+            except EXACT_SCOPE_ROW_LOCAL_ERRORS as exc:
+                failed_symbol_errors.append(
+                    {'symbol': symbol, 'error': str(exc)}
+                )
+
+        successful_symbols.sort()
+        scope_finalization = (
+            _finalize_daily_derived_stage_exact_scope_in_session(
+                session,
+                market_date=normalized_date,
+                stage_id=stage_id,
+                exact_symbols=normalized_exact,
+                successful_symbols=successful_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+                acquire_table_lock=False,
+            )
+        )
+
+    return {
+        'successful_symbols': successful_symbols,
+        'failed_symbols': [
+            item['symbol'] for item in failed_symbol_errors
+        ],
+        'failed_symbol_errors': failed_symbol_errors,
+        'scope_finalization': scope_finalization,
+    }
+
+
+def replace_daily_price_contexts_exact_scope(
+    *,
+    market_date: str | date,
+    rows: Sequence[Mapping[str, Any]],
+    exact_symbols: Sequence[str],
+    run_id: int | None = None,
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _replace_daily_derived_rows_exact_scope(
+        market_date=market_date,
+        stage_id='price_contexts',
+        rows=rows,
+        exact_symbols=exact_symbols,
+        upsert_in_session=_upsert_daily_price_context_in_session,
+        run_id=run_id,
+        authoritative_market_scope=authoritative_market_scope,
+    )
+
+
+def replace_daily_technical_snapshots_exact_scope(
+    *,
+    market_date: str | date,
+    rows: Sequence[Mapping[str, Any]],
+    exact_symbols: Sequence[str],
+    run_id: int | None = None,
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _replace_daily_derived_rows_exact_scope(
+        market_date=market_date,
+        stage_id='technical_snapshots',
+        rows=rows,
+        exact_symbols=exact_symbols,
+        upsert_in_session=_upsert_daily_technical_snapshot_in_session,
+        run_id=run_id,
+        authoritative_market_scope=authoritative_market_scope,
+    )
+
+
+def replace_daily_action_summaries_exact_scope(
+    *,
+    market_date: str | date,
+    rows: Sequence[Mapping[str, Any]],
+    exact_symbols: Sequence[str],
+    run_id: int | None = None,
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _replace_daily_derived_rows_exact_scope(
+        market_date=market_date,
+        stage_id='action_summaries',
+        rows=rows,
+        exact_symbols=exact_symbols,
+        upsert_in_session=_upsert_daily_action_summary_in_session,
+        run_id=run_id,
+        authoritative_market_scope=authoritative_market_scope,
+    )
 
 
 def load_daily_action_summaries(
@@ -2375,12 +2931,28 @@ def _sort_trending_items(items: list[dict], *, direction: str, limit: int | None
     return filtered
 
 
+def _normalize_trending_scope_symbols(
+    symbols: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if symbols is None:
+        return None
+    normalized = tuple(
+        sorted(_normalize_symbol_code(str(symbol)) for symbol in symbols)
+    )
+    if not normalized:
+        raise ValueError('trending rank scope must not be empty')
+    if len(normalized) != len(set(normalized)):
+        raise ValueError('trending rank scope must be duplicate-free')
+    return normalized
+
+
 def _load_trending_stocks_from_daily_price_bars(
     *,
     normalized_market_date: date,
     direction: str,
     limit: int | None,
     markets: list[str] | None,
+    symbols: Sequence[str] | None = None,
 ) -> list[dict]:
     previous_bar = aliased(DailyPriceBar)
     with session_scope() as session:
@@ -2444,8 +3016,11 @@ def _load_trending_stocks_from_daily_price_bars(
                 & (DailyActionSummary.market_date == DailyPriceBar.trade_date),
             )
             .where(DailyPriceBar.trade_date == normalized_market_date)
-            .where(Symbol.is_active.is_(True))
         )
+        if symbols is None:
+            stmt = stmt.where(Symbol.is_active.is_(True))
+        else:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
         if markets:
             stmt = stmt.where(Symbol.market.in_(markets))
         rows = session.execute(stmt).all()
@@ -2496,6 +3071,7 @@ def _load_trending_stocks_from_snapshots(
     direction: str,
     limit: int | None,
     markets: list[str] | None,
+    symbols: Sequence[str] | None = None,
 ) -> list[dict]:
     if period == '5d':
         metric_expr = DailyTechnicalSnapshot.return_5d
@@ -2543,7 +3119,6 @@ def _load_trending_stocks_from_snapshots(
                     & (DailyTechnicalSnapshot.market_date == DailyActionSummary.market_date),
                 )
                 .where(DailyActionSummary.market_date == normalized_market_date)
-                .where(Symbol.is_active.is_(True))
                 .where(metric_expr.isnot(None))
             )
         else:
@@ -2581,9 +3156,12 @@ def _load_trending_stocks_from_snapshots(
                     & (DailyActionSummary.market_date == DailyTechnicalSnapshot.market_date),
                 )
                 .where(DailyTechnicalSnapshot.market_date == normalized_market_date)
-                .where(Symbol.is_active.is_(True))
                 .where(metric_expr.isnot(None))
             )
+        if symbols is None:
+            stmt = stmt.where(Symbol.is_active.is_(True))
+        else:
+            stmt = stmt.where(Symbol.symbol.in_(symbols))
         if markets:
             stmt = stmt.where(Symbol.market.in_(markets))
         stmt = _apply_trending_order(stmt, metric_expr, direction=direction)
@@ -2739,6 +3317,7 @@ def replace_daily_trending_ranks(
     return len(values)
 
 
+@daily_price_bar_writer_admission
 def compute_and_persist_daily_trending_ranks(
     *,
     market_date: str | date,
@@ -2746,8 +3325,17 @@ def compute_and_persist_daily_trending_ranks(
     source: str = 'pykrx',
     run_id: int | None = None,
     progress_callback: Callable[[dict], None] | None = None,
+    symbols: Sequence[str] | None = None,
+    authoritative_scope: bool = False,
 ) -> dict:
     normalized_market_date = _normalize_trade_date(market_date)
+    normalized_scope_symbols = _normalize_trending_scope_symbols(symbols)
+    if normalized_scope_symbols is None or not authoritative_scope:
+        raise ValueError(
+            'trending rank replacement requires authoritative full '
+            'membership proof and an explicit non-empty scope'
+        )
+    expected_scope_set = set(normalized_scope_symbols or ())
     normalized_periods = [period.strip().lower() for period in (periods or DAY_BASED_TRENDING_PERIODS)]
     seen_periods: set[str] = set()
     deduped_periods: list[str] = []
@@ -2761,15 +3349,12 @@ def compute_and_persist_daily_trending_ranks(
 
     period_results: list[dict] = []
     total_persisted = 0
+    unavailable_periods: list[str] = []
 
     def _emit_progress(payload: dict) -> None:
         if not progress_callback:
             return
-        try:
-            progress_callback(payload)
-        except Exception:
-            # Progress persistence is best-effort and must not interrupt trending rank rebuilds.
-            return
+        progress_callback(payload)
 
     if progress_callback:
         first_period = deduped_periods[0] if deduped_periods else None
@@ -2793,13 +3378,22 @@ def compute_and_persist_daily_trending_ranks(
                 },
             }
         )
-    for period in deduped_periods:
+    for period_index, period in enumerate(deduped_periods):
+        daily_pipeline_live_progress.thread_stage_progress(
+            {
+                'processed': period_index,
+                'total': len(deduped_periods),
+                'current_period': period,
+                'current_step': 'compute_trending_period',
+            }
+        )
         if period == '1d':
             items = _load_trending_stocks_from_daily_price_bars(
                 normalized_market_date=normalized_market_date,
                 direction='both',
                 limit=None,
                 markets=None,
+                symbols=normalized_scope_symbols,
             )
         else:
             items = _load_trending_stocks_from_snapshots(
@@ -2808,7 +3402,18 @@ def compute_and_persist_daily_trending_ranks(
                 direction='both',
                 limit=None,
                 markets=None,
+                symbols=normalized_scope_symbols,
             )
+        observed_symbols = {
+            str(item.get('symbol') or '').strip().upper()
+            for item in items
+            if str(item.get('symbol') or '').strip()
+        }
+        missing_scope_symbols = (
+            sorted(expected_scope_set - observed_symbols)
+            if normalized_scope_symbols is not None
+            else []
+        )
         persisted_count = replace_daily_trending_ranks(
             market_date=normalized_market_date,
             period=period,
@@ -2817,22 +3422,50 @@ def compute_and_persist_daily_trending_ranks(
             run_id=run_id,
         )
         total_persisted += persisted_count
+        # Membership bounds the cross-sectional population; it does not imply
+        # every member is rankable.  New listings, suspensions, and null 5d/20d
+        # metrics are terminal-not-applicable for that period, not retry debt.
+        period_status = 'completed' if items else 'unavailable'
+        if period_status == 'unavailable':
+            unavailable_periods.append(period)
         period_results.append(
             {
                 'period': period,
+                'status': period_status,
+                'reason': (
+                    None
+                    if items
+                    else 'no_same_day_source_rows'
+                ),
                 'candidates_seen': len(items),
+                'terminal_not_rankable_symbol_count': len(
+                    missing_scope_symbols
+                ),
+                'terminal_not_rankable_symbols': missing_scope_symbols[:50],
                 'trending_ranks_persisted': persisted_count,
             }
         )
         if progress_callback:
             processed_periods = len(period_results)
             next_period = deduped_periods[processed_periods] if processed_periods < len(deduped_periods) else None
+            completed_periods = processed_periods - len(
+                unavailable_periods
+            )
+            progress_status = (
+                'running'
+                if next_period is not None
+                else (
+                    'partial'
+                    if unavailable_periods
+                    else 'completed'
+                )
+            )
             _emit_progress(
                 {
-                    'status': 'running' if next_period is not None else 'completed',
+                    'status': progress_status,
                     'processed': processed_periods,
-                    'succeeded': processed_periods,
-                    'failed': 0,
+                    'succeeded': completed_periods,
+                    'failed': len(unavailable_periods),
                     'total': len(deduped_periods),
                     'current_period': next_period,
                     'current_step': 'computing_trending_period' if next_period is not None else 'trending_ranks_completed',
@@ -2843,19 +3476,36 @@ def compute_and_persist_daily_trending_ranks(
                     ),
                     'details': {
                         'rows_persisted': total_persisted,
-                        'periods_persisted': processed_periods,
+                        'periods_persisted': completed_periods,
+                        'periods_unavailable': len(
+                            unavailable_periods
+                        ),
                     },
                 }
             )
 
+    completed_periods = len(period_results) - len(unavailable_periods)
     return {
         'market_date': normalized_market_date.isoformat(),
         'source': source,
+        'status': 'partial' if unavailable_periods else 'completed',
+        'reason': (
+            'trending_source_periods_unavailable'
+            if unavailable_periods
+            else None
+        ),
         'periods': period_results,
-        'periods_persisted': len(period_results),
+        'periods_persisted': completed_periods,
         'periods_failed': 0,
+        'periods_unavailable': len(unavailable_periods),
+        'unavailable_periods': unavailable_periods,
         'periods_total': len(deduped_periods),
         'trending_ranks_persisted': total_persisted,
+        'exact_scope': normalized_scope_symbols is not None,
+        'scope_symbol_count': len(normalized_scope_symbols or ()),
+        'scope_membership_sha256': market_membership_sha256(
+            normalized_scope_symbols or ()
+        ),
     }
 
 
@@ -2972,17 +3622,10 @@ def upsert_daily_signal_feature(feature: dict) -> None:
     with session_scope() as session:
         symbol = _get_symbol(session, feature['symbol'])
         if symbol is None:
-            symbol = Symbol(
-                symbol=feature['symbol'],
-                market=feature.get('market', 'KRX'),
-                name_ko=feature.get('name_ko') or feature['symbol'],
-                instrument_type='equity',
-                source=feature.get('source', 'kis_ranking'),
-                is_active=True,
-                last_refreshed_at=refreshed_at,
+            raise ValueError(
+                'Daily signal features require an authoritative symbol master row; '
+                f"missing symbol={feature['symbol']}"
             )
-            session.add(symbol)
-            session.flush()
         elif feature.get('name_ko') and symbol.name_ko == symbol.symbol:
             symbol.name_ko = feature['name_ko']
             symbol.last_refreshed_at = refreshed_at
@@ -3023,77 +3666,374 @@ def upsert_daily_signal_feature(feature: dict) -> None:
         )
 
 
-def upsert_daily_signal_features(features: Sequence[dict]) -> int:
+def upsert_daily_signal_features(
+    features: Sequence[dict],
+    *,
+    delete_rows_outside_scope: bool = True,
+) -> int:
+    with session_scope() as session:
+        return _upsert_daily_signal_features_in_session(
+            session,
+            features,
+            delete_rows_outside_scope=delete_rows_outside_scope,
+        )
+
+
+def _upsert_daily_signal_features_in_session(
+    session,
+    features: Sequence[dict],
+    *,
+    delete_rows_outside_scope: bool = True,
+) -> int:
+    """Upsert signal features without owning the caller's transaction."""
+
     if not features:
         return 0
 
     refreshed_at = _utcnow()
     symbols = list(dict.fromkeys(feature['symbol'] for feature in features))
-    with session_scope() as session:
-        symbol_rows = session.execute(select(Symbol).where(Symbol.symbol.in_(symbols))).scalars().all()
-        symbol_map = {symbol.symbol: symbol for symbol in symbol_rows}
-        for feature in features:
-            symbol_code = feature['symbol']
-            symbol = symbol_map.get(symbol_code)
-            if symbol is None:
-                symbol = Symbol(
-                    symbol=symbol_code,
-                    market=feature.get('market', 'KRX'),
-                    name_ko=feature.get('name_ko') or symbol_code,
-                    instrument_type='equity',
-                    source=feature.get('source', 'kis_ranking'),
-                    is_active=True,
-                    last_refreshed_at=refreshed_at,
-                )
-                session.add(symbol)
-                symbol_map[symbol_code] = symbol
-            elif feature.get('name_ko') and symbol.name_ko == symbol.symbol:
-                symbol.name_ko = feature['name_ko']
-                symbol.last_refreshed_at = refreshed_at
-        session.flush()
+    market_dates = {
+        _normalize_trade_date(feature['market_date'])
+        for feature in features
+    }
+    if len(market_dates) != 1:
+        raise ValueError(
+            'Daily signal feature replacement requires exactly one market_date; '
+            f'market_dates={sorted(item.isoformat() for item in market_dates)}'
+        )
+    market_date = next(iter(market_dates))
 
-        symbol_ids = {symbol_code: symbol.id for symbol_code, symbol in symbol_map.items()}
+    symbol_rows = session.execute(
+        select(Symbol).where(Symbol.symbol.in_(symbols))
+    ).scalars().all()
+    symbol_map = {symbol.symbol: symbol for symbol in symbol_rows}
+    missing_symbols = sorted(set(symbols) - set(symbol_map))
+    if missing_symbols:
+        raise ValueError(
+            'Daily signal features require authoritative symbol master rows; '
+            f'missing symbols={missing_symbols[:50]}'
+        )
+    for feature in features:
+        symbol_code = feature['symbol']
+        symbol = symbol_map.get(symbol_code)
+        if (
+            feature.get('name_ko')
+            and symbol is not None
+            and symbol.name_ko == symbol.symbol
+        ):
+            symbol.name_ko = feature['name_ko']
+            symbol.last_refreshed_at = refreshed_at
+    session.flush()
+
+    symbol_ids = {
+        symbol_code: symbol.id
+        for symbol_code, symbol in symbol_map.items()
+    }
+    if delete_rows_outside_scope:
+        authoritative_symbol_ids = list(symbol_ids.values())
+        session.execute(
+            delete(DailySignalFeature).where(
+                DailySignalFeature.market_date == market_date,
+                DailySignalFeature.symbol_id.not_in(
+                    authoritative_symbol_ids
+                ),
+            )
+        )
 
     values = [
         {
             'symbol_id': symbol_ids[feature['symbol']],
-            'market_date': _normalize_trade_date(feature['market_date']),
+            'market_date': market_date,
             'source': feature.get('source', 'kis_ranking'),
             'signal_count': int(feature.get('signal_count') or 0),
             'volume_power_rank': feature.get('volume_power_rank'),
             'volume_power': feature.get('volume_power'),
             'overtime_volume_rank': feature.get('overtime_volume_rank'),
             'overtime_volume': feature.get('overtime_volume'),
-            'overtime_fluctuation_rank': feature.get('overtime_fluctuation_rank'),
-            'overtime_fluctuation_rate': feature.get('overtime_fluctuation_rate'),
+            'overtime_fluctuation_rank': feature.get(
+                'overtime_fluctuation_rank'
+            ),
+            'overtime_fluctuation_rate': feature.get(
+                'overtime_fluctuation_rate'
+            ),
             'feature_payload': feature['feature_payload'],
             'captured_at': refreshed_at,
             'updated_at': refreshed_at,
         }
         for feature in features
     ]
-    for start in range(0, len(values), DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE):
-        with session_scope() as session:
-            statement = pg_insert(DailySignalFeature).values(values[start:start + DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE])
-            session.execute(
-                statement.on_conflict_do_update(
-                    constraint='uq_daily_signal_features_symbol_market_date',
-                    set_={
-                        'source': statement.excluded.source,
-                        'signal_count': statement.excluded.signal_count,
-                        'volume_power_rank': statement.excluded.volume_power_rank,
-                        'volume_power': statement.excluded.volume_power,
-                        'overtime_volume_rank': statement.excluded.overtime_volume_rank,
-                        'overtime_volume': statement.excluded.overtime_volume,
-                        'overtime_fluctuation_rank': statement.excluded.overtime_fluctuation_rank,
-                        'overtime_fluctuation_rate': statement.excluded.overtime_fluctuation_rate,
-                        'feature_payload': statement.excluded.feature_payload,
-                        'captured_at': statement.excluded.captured_at,
-                        'updated_at': refreshed_at,
-                    },
-                )
+    for start in range(
+        0,
+        len(values),
+        DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE,
+    ):
+        statement = pg_insert(DailySignalFeature).values(
+            values[start : start + DAILY_SIGNAL_FEATURE_UPSERT_CHUNK_SIZE]
+        )
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint='uq_daily_signal_features_symbol_market_date',
+                set_={
+                    'source': statement.excluded.source,
+                    'signal_count': statement.excluded.signal_count,
+                    'volume_power_rank': statement.excluded.volume_power_rank,
+                    'volume_power': statement.excluded.volume_power,
+                    'overtime_volume_rank': (
+                        statement.excluded.overtime_volume_rank
+                    ),
+                    'overtime_volume': statement.excluded.overtime_volume,
+                    'overtime_fluctuation_rank': (
+                        statement.excluded.overtime_fluctuation_rank
+                    ),
+                    'overtime_fluctuation_rate': (
+                        statement.excluded.overtime_fluctuation_rate
+                    ),
+                    'feature_payload': statement.excluded.feature_payload,
+                    'captured_at': statement.excluded.captured_at,
+                    'updated_at': refreshed_at,
+                },
             )
+        )
     return len(values)
+
+
+def replace_daily_signal_features_exact_scope(
+    *,
+    market_date: str | date,
+    features: Sequence[dict],
+    exact_symbols: Sequence[str],
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically publish successes and remove stale exact-scope rows.
+
+    The bulk write is attempted behind a savepoint.  If one feature is
+    malformed, per-row savepoints preserve other durable successes while the
+    final stale-row cleanup remains part of the same outer transaction.
+    """
+
+    normalized_date = _normalize_trade_date(market_date)
+    normalized_exact_symbols = {
+        _normalize_symbol_code(str(symbol)) for symbol in exact_symbols
+    }
+    if not normalized_exact_symbols:
+        raise ValueError('exact stage scope must not be empty')
+    normalized_features: list[dict] = []
+    seen_symbols: set[str] = set()
+    for raw_feature in features:
+        feature = dict(raw_feature)
+        symbol = _normalize_symbol_code(str(feature.get('symbol') or ''))
+        if symbol in seen_symbols:
+            raise ValueError(
+                'exact signal-feature replacement contains duplicate symbol: '
+                f'{symbol}'
+            )
+        feature_date = _normalize_trade_date(feature.get('market_date'))
+        if feature_date != normalized_date:
+            raise ValueError(
+                'exact signal-feature replacement market_date mismatch: '
+                f'symbol={symbol}, expected={normalized_date.isoformat()}, '
+                f'observed={feature_date.isoformat()}'
+            )
+        seen_symbols.add(symbol)
+        feature['symbol'] = symbol
+        normalized_features.append(feature)
+    outside_exact_scope = sorted(seen_symbols - normalized_exact_symbols)
+    if outside_exact_scope:
+        raise ValueError(
+            'exact signal-feature publication contains symbols outside scope: '
+            + ','.join(outside_exact_scope[:20])
+        )
+
+    successful_symbols: list[str] = []
+    failed_symbol_errors: list[dict[str, str]] = []
+    batch_error: str | None = None
+    with session_scope() as session:
+        session.execute(
+            text(
+                'LOCK TABLE daily_signal_features '
+                'IN SHARE ROW EXCLUSIVE MODE'
+            )
+        )
+        if normalized_features:
+            try:
+                with session.begin_nested():
+                    _upsert_daily_signal_features_in_session(
+                        session,
+                        normalized_features,
+                        delete_rows_outside_scope=False,
+                    )
+                successful_symbols = sorted(seen_symbols)
+            except EXACT_SCOPE_ROW_LOCAL_ERRORS as exc:
+                batch_error = str(exc)
+                for feature in normalized_features:
+                    symbol = str(feature['symbol'])
+                    try:
+                        with session.begin_nested():
+                            _upsert_daily_signal_features_in_session(
+                                session,
+                                [feature],
+                                delete_rows_outside_scope=False,
+                            )
+                        successful_symbols.append(symbol)
+                    except EXACT_SCOPE_ROW_LOCAL_ERRORS as item_exc:
+                        failed_symbol_errors.append(
+                            {
+                                'symbol': symbol,
+                                'error': str(item_exc),
+                            }
+                        )
+                successful_symbols.sort()
+
+        scope_finalization = (
+            _finalize_daily_derived_stage_exact_scope_in_session(
+                session,
+                market_date=normalized_date,
+                stage_id='signal_features',
+                exact_symbols=exact_symbols,
+                successful_symbols=successful_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+                acquire_table_lock=False,
+            )
+        )
+
+    return {
+        'features_persisted': len(successful_symbols),
+        'successful_symbols': successful_symbols,
+        'failed_symbols': [
+            item['symbol'] for item in failed_symbol_errors
+        ],
+        'failed_symbol_errors': failed_symbol_errors,
+        'batch_error': batch_error,
+        'scope_finalization': scope_finalization,
+    }
+
+
+def sanitize_daily_signal_feature_metrics(
+    *,
+    signal_count: int | None,
+    volume_power_rank: int | None,
+    volume_power: Any,
+    overtime_volume_rank: int | None,
+    overtime_volume: Any,
+    overtime_fluctuation_rank: int | None,
+) -> dict[str, Any]:
+    """Remove provider placeholders from persisted strategy-facing fields.
+
+    This read-side guard protects consumers from stale rows written before the
+    source validity contract was introduced or left behind by a failed retry.
+    """
+
+    normalized_volume_power = _decimal_to_float(volume_power)
+    volume_power_valid = (
+        volume_power_rank is not None
+        and normalized_volume_power is not None
+        and normalized_volume_power > 0
+        and abs(normalized_volume_power - 999.99) >= 1e-9
+    )
+    normalized_overtime_volume = (
+        int(overtime_volume)
+        if overtime_volume is not None
+        else None
+    )
+    overtime_volume_valid = (
+        overtime_volume_rank is not None
+        and normalized_overtime_volume is not None
+        and normalized_overtime_volume > 0
+    )
+    normalized_volume_power_rank = volume_power_rank if volume_power_valid else None
+    normalized_overtime_volume_rank = overtime_volume_rank if overtime_volume_valid else None
+    normalized_fluctuation_rank = overtime_fluctuation_rank
+    has_persisted_signal_row = signal_count is not None
+    normalized_signal_count = (
+        sum(
+            rank is not None
+            for rank in (
+                normalized_volume_power_rank,
+                normalized_overtime_volume_rank,
+                normalized_fluctuation_rank,
+            )
+        )
+        if has_persisted_signal_row
+        else None
+    )
+    return {
+        'signal_count': normalized_signal_count,
+        'volume_power_rank': normalized_volume_power_rank,
+        'volume_power': normalized_volume_power if volume_power_valid else None,
+        'overtime_volume_rank': normalized_overtime_volume_rank,
+        'overtime_volume': normalized_overtime_volume if overtime_volume_valid else None,
+        'overtime_fluctuation_rank': normalized_fluctuation_rank,
+    }
+
+
+def sanitize_daily_signal_feature_payload(payload: Any) -> dict[str, Any]:
+    """Remove invalid legacy provider rows from nested strategy evidence.
+
+    Older persisted rows can contain a provider placeholder in
+    ``feature_payload.sources`` even when the normalized table columns are
+    sanitized on read.  Returning that raw nested row would let agent context
+    treat rejected provider data as evidence, so invalid direct-source entries
+    are removed from the read-side copy as well.
+    """
+
+    if not isinstance(payload, Mapping):
+        return {}
+    sanitized = deepcopy(dict(payload))
+    raw_sources = sanitized.get('sources')
+    if not isinstance(raw_sources, Mapping):
+        sanitized['sources'] = {}
+        return sanitized
+    sources = {
+        str(source): deepcopy(value)
+        for source, value in raw_sources.items()
+        if isinstance(value, Mapping)
+        and direct_signal_source_is_decision_usable(
+            source=str(source),
+            payload=value,
+        )
+    }
+
+    sanitized['sources'] = sources
+    return sanitized
+
+
+def daily_signal_feature_order_by() -> tuple[Any, ...]:
+    """Order persisted signal rows by the same metrics exposed to readers."""
+
+    volume_power_valid = and_(
+        DailySignalFeature.volume_power_rank.is_not(None),
+        DailySignalFeature.volume_power.is_not(None),
+        DailySignalFeature.volume_power > 0,
+        func.abs(DailySignalFeature.volume_power - Decimal('999.99'))
+        >= Decimal('0.000000001'),
+    )
+    overtime_volume_valid = and_(
+        DailySignalFeature.overtime_volume_rank.is_not(None),
+        DailySignalFeature.overtime_volume.is_not(None),
+        DailySignalFeature.overtime_volume > 0,
+    )
+    sanitized_signal_count = (
+        case((volume_power_valid, 1), else_=0)
+        + case((overtime_volume_valid, 1), else_=0)
+        + case(
+            (DailySignalFeature.overtime_fluctuation_rank.is_not(None), 1),
+            else_=0,
+        )
+    )
+    sanitized_volume_power_rank = case(
+        (volume_power_valid, DailySignalFeature.volume_power_rank),
+        else_=None,
+    )
+    sanitized_overtime_volume_rank = case(
+        (overtime_volume_valid, DailySignalFeature.overtime_volume_rank),
+        else_=None,
+    )
+    return (
+        sanitized_signal_count.desc(),
+        sanitized_volume_power_rank.asc().nullslast(),
+        sanitized_overtime_volume_rank.asc().nullslast(),
+        DailySignalFeature.overtime_fluctuation_rank.asc().nullslast(),
+    )
 
 
 def upsert_daily_market_risk_snapshot(snapshot: dict) -> None:
@@ -3405,41 +4345,266 @@ def _upsert_daily_derived_results(
     *,
     model,
     constraint: str,
+    replace_market_date: str | date | None = None,
 ) -> int:
     normalized_results = list(results)
-    if not normalized_results:
+    if not normalized_results and replace_market_date is None:
         return 0
 
-    refreshed_at = _utcnow()
+    normalized_replace_market_date = (
+        _normalize_trade_date(replace_market_date)
+        if replace_market_date is not None
+        else None
+    )
+    if normalized_replace_market_date is not None:
+        mismatched_market_dates = sorted(
+            {
+                _normalize_trade_date(result['market_date']).isoformat()
+                for result in normalized_results
+                if _normalize_trade_date(result['market_date'])
+                != normalized_replace_market_date
+            }
+        )
+        if mismatched_market_dates:
+            raise ValueError(
+                'Derived result replacement requires one exact market_date; '
+                f'expected={normalized_replace_market_date.isoformat()} '
+                f'mismatched={mismatched_market_dates}'
+            )
+
     with session_scope() as session:
-        symbol_ids = _resolve_derived_symbol_ids(
+        _upsert_daily_derived_results_in_session(
+            session,
+            normalized_results,
+            model=model,
+            constraint=constraint,
+            replace_market_date=normalized_replace_market_date,
+        )
+    return len(normalized_results)
+
+
+def _upsert_daily_derived_results_in_session(
+    session,
+    results: Sequence[dict],
+    *,
+    model,
+    constraint: str,
+    replace_market_date: str | date | None = None,
+) -> int:
+    """Upsert derived rows without owning the surrounding transaction."""
+
+    normalized_results = list(results)
+    normalized_replace_market_date = (
+        _normalize_trade_date(replace_market_date)
+        if replace_market_date is not None
+        else None
+    )
+    refreshed_at = _utcnow()
+    symbol_ids = (
+        _resolve_derived_symbol_ids(
             session,
             normalized_results,
             refreshed_at=refreshed_at,
         )
-        for start in range(0, len(normalized_results), FACTOR_RESULT_UPSERT_CHUNK_SIZE):
-            result_chunk = normalized_results[start:start + FACTOR_RESULT_UPSERT_CHUNK_SIZE]
-            values = [
-                _derived_result_values(
-                    model=model,
-                    result=result,
-                    symbol_id=symbol_ids[str(result['symbol'])],
-                    refreshed_at=refreshed_at,
-                )
-                for result in result_chunk
-            ]
-            statement = pg_insert(model).values(values)
-            session.execute(
-                statement.on_conflict_do_update(
-                    constraint=constraint,
-                    set_={
-                        column_name: getattr(statement.excluded, column_name)
-                        for column_name in values[0]
-                        if column_name not in {'symbol_id', 'market_date'}
-                    },
-                )
+        if normalized_results
+        else {}
+    )
+    if normalized_replace_market_date is not None:
+        authoritative_symbol_ids = sorted(set(symbol_ids.values()))
+        delete_statement = delete(model).where(
+            model.market_date == normalized_replace_market_date
+        )
+        if authoritative_symbol_ids:
+            delete_statement = delete_statement.where(
+                model.symbol_id.not_in(authoritative_symbol_ids)
             )
+        session.execute(delete_statement)
+    for start in range(
+        0,
+        len(normalized_results),
+        FACTOR_RESULT_UPSERT_CHUNK_SIZE,
+    ):
+        result_chunk = normalized_results[
+            start:start + FACTOR_RESULT_UPSERT_CHUNK_SIZE
+        ]
+        values = [
+            _derived_result_values(
+                model=model,
+                result=result,
+                symbol_id=symbol_ids[str(result['symbol'])],
+                refreshed_at=refreshed_at,
+            )
+            for result in result_chunk
+        ]
+        statement = pg_insert(model).values(values)
+        session.execute(
+            statement.on_conflict_do_update(
+                constraint=constraint,
+                set_={
+                    column_name: getattr(statement.excluded, column_name)
+                    for column_name in values[0]
+                    if column_name not in {'symbol_id', 'market_date'}
+                },
+            )
+        )
     return len(normalized_results)
+
+
+def replace_daily_derived_results_exact_scope(
+    *,
+    market_date: str | date,
+    stage_id: str,
+    results: Sequence[Mapping[str, Any]],
+    exact_symbols: Sequence[str],
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically publish one deterministic factor/filter stage attempt.
+
+    A batch write is attempted first for normal throughput.  If one row is
+    malformed, savepoints isolate that row while keeping valid symbols.  The
+    successful writes, removal of failed/missing same-date rows, and exact
+    membership verification are committed together under the result table's
+    writer lock.
+    """
+
+    model = DAILY_EXACT_SCOPE_RESULT_MODELS.get(stage_id)
+    constraint = DAILY_DERIVED_RESULT_CONSTRAINTS.get(stage_id)
+    if model is None or constraint is None:
+        raise ValueError(
+            f'unsupported atomic exact-scope derived stage: {stage_id}'
+        )
+    normalized_date = _normalize_trade_date(market_date)
+    normalized_exact = tuple(
+        sorted(
+            {
+                _normalize_symbol_code(str(symbol))
+                for symbol in exact_symbols
+            }
+        )
+    )
+    if not normalized_exact:
+        raise ValueError('exact stage scope must not be empty')
+    exact_set = set(normalized_exact)
+
+    normalized_results: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    for raw_result in results:
+        result = dict(raw_result)
+        symbol = _normalize_symbol_code(str(result.get('symbol') or ''))
+        if symbol in seen_symbols:
+            raise ValueError(
+                'exact derived replacement contains duplicate symbol: '
+                f'{symbol}'
+            )
+        result_date = _normalize_trade_date(result.get('market_date'))
+        if result_date != normalized_date:
+            raise ValueError(
+                'exact derived replacement market_date mismatch: '
+                f'symbol={symbol}, expected={normalized_date.isoformat()}, '
+                f'observed={result_date.isoformat()}'
+            )
+        seen_symbols.add(symbol)
+        result['symbol'] = symbol
+        normalized_results.append(result)
+    outside_scope = sorted(seen_symbols - exact_set)
+    if outside_scope:
+        raise ValueError(
+            'exact derived publication contains symbols outside scope: '
+            + ','.join(outside_scope[:20])
+        )
+
+    successful_symbols: list[str] = []
+    failed_symbol_errors: list[dict[str, str]] = []
+    batch_error: str | None = None
+    with session_scope() as session:
+        session.execute(
+            text(
+                f'LOCK TABLE {model.__tablename__} '
+                'IN SHARE ROW EXCLUSIVE MODE'
+            )
+        )
+        if normalized_results:
+            try:
+                with session.begin_nested():
+                    _upsert_daily_derived_results_in_session(
+                        session,
+                        normalized_results,
+                        model=model,
+                        constraint=constraint,
+                    )
+                successful_symbols = sorted(seen_symbols)
+            except EXACT_SCOPE_ROW_LOCAL_ERRORS as exc:
+                batch_error = str(exc)
+                for result in normalized_results:
+                    symbol = str(result['symbol'])
+                    try:
+                        with session.begin_nested():
+                            _upsert_daily_derived_results_in_session(
+                                session,
+                                [result],
+                                model=model,
+                                constraint=constraint,
+                            )
+                        successful_symbols.append(symbol)
+                    except EXACT_SCOPE_ROW_LOCAL_ERRORS as item_exc:
+                        failed_symbol_errors.append(
+                            {
+                                'symbol': symbol,
+                                'error': str(item_exc),
+                            }
+                        )
+                successful_symbols.sort()
+
+        scope_finalization = (
+            _finalize_daily_derived_stage_exact_scope_in_session(
+                session,
+                market_date=normalized_date,
+                stage_id=stage_id,
+                exact_symbols=normalized_exact,
+                successful_symbols=successful_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+                acquire_table_lock=False,
+            )
+        )
+
+    return {
+        'results_persisted': len(successful_symbols),
+        'results_failed': len(failed_symbol_errors),
+        'successful_symbols': successful_symbols,
+        'failed_symbols': [
+            item['symbol'] for item in failed_symbol_errors
+        ],
+        'failed_symbol_errors': failed_symbol_errors,
+        'batch_error': batch_error,
+        'scope_finalization': scope_finalization,
+    }
+
+
+def replace_daily_market_risk_filter_results_exact_scope(
+    *,
+    market_date: str | date,
+    results: Sequence[Mapping[str, Any]],
+    exact_symbols: Sequence[str],
+    authoritative_market_scope: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_results = [
+        {
+            **{
+                key: value
+                for key, value in result.items()
+                if key != '_snapshot_fields'
+            },
+            **dict(result.get('_snapshot_fields') or {}),
+        }
+        for result in results
+    ]
+    return replace_daily_derived_results_exact_scope(
+        market_date=market_date,
+        stage_id='market_risk_filter',
+        results=normalized_results,
+        exact_symbols=exact_symbols,
+        authoritative_market_scope=authoritative_market_scope,
+    )
 
 
 def upsert_daily_momentum_factor_results(results: Sequence[dict]) -> int:
@@ -3498,11 +4663,16 @@ def upsert_daily_quality_factor_results(results: Sequence[dict]) -> int:
     )
 
 
-def upsert_daily_composite_factor_results(results: Sequence[dict]) -> int:
+def upsert_daily_composite_factor_results(
+    results: Sequence[dict],
+    *,
+    replace_market_date: str | date | None = None,
+) -> int:
     return _upsert_daily_derived_results(
         results,
         model=DailyCompositeFactorResult,
         constraint='uq_daily_composite_factor_results_symbol_market_date',
+        replace_market_date=replace_market_date,
     )
 
 
@@ -3745,19 +4915,26 @@ def load_daily_market_risk_filter_results(
         stmt = (
             select(DailyMarketRiskFilterResult, Symbol.symbol, Symbol.name_ko, Symbol.market)
             .join(Symbol, Symbol.id == DailyMarketRiskFilterResult.symbol_id)
-            .where(DailyMarketRiskFilterResult.market_date == _normalize_trade_date(market_date))
-            .order_by(
-                DailyMarketRiskFilterResult.passed_filter.asc(),
-                DailyMarketRiskFilterResult.watchlist_flagged.desc(),
-                Symbol.symbol.asc(),
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == DailyMarketRiskFilterResult.symbol_id,
+                    DailyPriceBar.trade_date == DailyMarketRiskFilterResult.market_date,
+                ),
             )
+            .where(DailyMarketRiskFilterResult.market_date == _normalize_trade_date(market_date))
         )
-        if limit is not None:
-            stmt = stmt.limit(limit)
         if symbols:
             stmt = stmt.where(Symbol.symbol.in_(symbols))
         if passed_filter is not None:
             stmt = stmt.where(DailyMarketRiskFilterResult.passed_filter == passed_filter)
+        stmt = stmt.order_by(
+            DailyMarketRiskFilterResult.passed_filter.asc(),
+            DailyMarketRiskFilterResult.watchlist_flagged.desc(),
+            Symbol.symbol.asc(),
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
 
         rows = session.execute(stmt).all()
         return [
@@ -3785,7 +4962,17 @@ def load_latest_available_daily_market_risk_filter_result_date(
     symbols: list[str] | None = None,
 ) -> str | None:
     with session_scope() as session:
-        stmt = select(func.max(DailyMarketRiskFilterResult.market_date)).select_from(DailyMarketRiskFilterResult)
+        stmt = (
+            select(func.max(DailyMarketRiskFilterResult.market_date))
+            .select_from(DailyMarketRiskFilterResult)
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == DailyMarketRiskFilterResult.symbol_id,
+                    DailyPriceBar.trade_date == DailyMarketRiskFilterResult.market_date,
+                ),
+            )
+        )
         if symbols:
             stmt = (
                 stmt.join(Symbol, Symbol.id == DailyMarketRiskFilterResult.symbol_id)
@@ -3809,19 +4996,26 @@ def load_daily_piotroski_filter_results(
         stmt = (
             select(DailyPiotroskiFilterResult, Symbol.symbol)
             .join(Symbol, Symbol.id == DailyPiotroskiFilterResult.symbol_id)
-            .where(DailyPiotroskiFilterResult.market_date == _normalize_trade_date(market_date))
-            .order_by(
-                DailyPiotroskiFilterResult.passed_filter.desc(),
-                DailyPiotroskiFilterResult.pbr_percentile_rank.asc().nullslast(),
-                Symbol.symbol.asc(),
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == DailyPiotroskiFilterResult.symbol_id,
+                    DailyPriceBar.trade_date == DailyPiotroskiFilterResult.market_date,
+                ),
             )
+            .where(DailyPiotroskiFilterResult.market_date == _normalize_trade_date(market_date))
         )
-        if limit is not None:
-            stmt = stmt.limit(limit)
         if symbols:
             stmt = stmt.where(Symbol.symbol.in_(symbols))
         if passed_filter is not None:
             stmt = stmt.where(DailyPiotroskiFilterResult.passed_filter == passed_filter)
+        stmt = stmt.order_by(
+            DailyPiotroskiFilterResult.passed_filter.desc(),
+            DailyPiotroskiFilterResult.pbr_percentile_rank.asc().nullslast(),
+            Symbol.symbol.asc(),
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
 
         rows = session.execute(stmt).all()
         return [
@@ -3853,7 +5047,17 @@ def load_latest_available_daily_piotroski_filter_result_date(
     symbols: list[str] | None = None,
 ) -> str | None:
     with session_scope() as session:
-        stmt = select(func.max(DailyPiotroskiFilterResult.market_date)).select_from(DailyPiotroskiFilterResult)
+        stmt = (
+            select(func.max(DailyPiotroskiFilterResult.market_date))
+            .select_from(DailyPiotroskiFilterResult)
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == DailyPiotroskiFilterResult.symbol_id,
+                    DailyPriceBar.trade_date == DailyPiotroskiFilterResult.market_date,
+                ),
+            )
+        )
         if symbols:
             stmt = (
                 stmt.join(Symbol, Symbol.id == DailyPiotroskiFilterResult.symbol_id)
@@ -3883,7 +5087,9 @@ def load_agent_feedback_candidate_score_rows(
                 DailyActionSummary.captured_at,
                 DailySignalFeature.signal_count,
                 DailySignalFeature.volume_power_rank,
+                DailySignalFeature.volume_power,
                 DailySignalFeature.overtime_volume_rank,
+                DailySignalFeature.overtime_volume,
                 DailySignalFeature.overtime_fluctuation_rank,
                 DailySignalFeature.captured_at,
                 DailyMomentumFactorResult.momentum_percentile,
@@ -3904,6 +5110,13 @@ def load_agent_feedback_candidate_score_rows(
                 and_(
                     DailyActionSummary.symbol_id == Symbol.id,
                     DailyActionSummary.market_date == normalized_market_date,
+                ),
+            )
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == Symbol.id,
+                    DailyPriceBar.trade_date == normalized_market_date,
                 ),
             )
             .outerjoin(
@@ -3943,10 +5156,14 @@ def load_agent_feedback_candidate_score_rows(
                     if action_captured_at
                     else None
                 ),
-                'signal_count': signal_count,
-                'volume_power_rank': volume_power_rank,
-                'overtime_volume_rank': overtime_volume_rank,
-                'overtime_fluctuation_rank': overtime_fluctuation_rank,
+                **sanitize_daily_signal_feature_metrics(
+                    signal_count=signal_count,
+                    volume_power_rank=volume_power_rank,
+                    volume_power=volume_power,
+                    overtime_volume_rank=overtime_volume_rank,
+                    overtime_volume=overtime_volume,
+                    overtime_fluctuation_rank=overtime_fluctuation_rank,
+                ),
                 'signal_captured_at': (
                     signal_captured_at.isoformat()
                     if signal_captured_at
@@ -3990,7 +5207,9 @@ def load_agent_feedback_candidate_score_rows(
                 action_captured_at,
                 signal_count,
                 volume_power_rank,
+                volume_power,
                 overtime_volume_rank,
+                overtime_volume,
                 overtime_fluctuation_rank,
                 signal_captured_at,
                 momentum_percentile,
@@ -5042,39 +6261,64 @@ def load_daily_composite_factor_results(
 def load_daily_signal_feature_context_rows(
     *,
     market_date: str | date,
+    symbols: Sequence[str] | None = None,
 ) -> list[dict]:
     normalized_market_date = _normalize_trade_date(market_date)
     with session_scope() as session:
-        rows = session.execute(
+        statement = (
             select(DailySignalFeature, Symbol)
             .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == DailySignalFeature.symbol_id,
+                    DailyPriceBar.trade_date == DailySignalFeature.market_date,
+                ),
+            )
             .where(DailySignalFeature.market_date == normalized_market_date)
             .order_by(
-                DailySignalFeature.signal_count.desc(),
-                DailySignalFeature.volume_power_rank.asc().nullslast(),
-                DailySignalFeature.overtime_volume_rank.asc().nullslast(),
-                DailySignalFeature.overtime_fluctuation_rank.asc().nullslast(),
+                *daily_signal_feature_order_by(),
                 Symbol.symbol.asc(),
             )
-        ).all()
+        )
+        if symbols is not None:
+            normalized_symbols = sorted(
+                {
+                    _normalize_symbol_code(str(symbol))
+                    for symbol in symbols
+                }
+            )
+            if not normalized_symbols:
+                return []
+            statement = statement.where(
+                Symbol.symbol.in_(normalized_symbols)
+            )
+        rows = session.execute(statement).all()
 
         return [
             {
                 'symbol': symbol.symbol,
                 'name_ko': symbol.name_ko,
                 'market': symbol.market,
-                'signal_count': feature.signal_count,
-                'volume_power_rank': feature.volume_power_rank,
-                'volume_power': _decimal_to_float(feature.volume_power),
-                'overtime_volume_rank': feature.overtime_volume_rank,
-                'overtime_volume': int(feature.overtime_volume) if feature.overtime_volume is not None else None,
-                'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
+                **sanitize_daily_signal_feature_metrics(
+                    signal_count=feature.signal_count,
+                    volume_power_rank=feature.volume_power_rank,
+                    volume_power=feature.volume_power,
+                    overtime_volume_rank=feature.overtime_volume_rank,
+                    overtime_volume=feature.overtime_volume,
+                    overtime_fluctuation_rank=feature.overtime_fluctuation_rank,
+                ),
                 'overtime_fluctuation_rate': _decimal_to_float(feature.overtime_fluctuation_rate),
-                'feature_payload': feature.feature_payload or {},
-                'row_kind': ((feature.feature_payload or {}).get('row_provenance') or {}).get('row_kind'),
-                'provenance': (feature.feature_payload or {}).get('row_provenance'),
+                'feature_payload': payload,
+                'row_kind': (payload.get('row_provenance') or {}).get('row_kind'),
+                'provenance': payload.get('row_provenance'),
             }
             for feature, symbol in rows
+            for payload in [
+                sanitize_daily_signal_feature_payload(
+                    feature.feature_payload
+                )
+            ]
         ]
 
 
@@ -5088,8 +6332,15 @@ def load_daily_signal_features(
         stmt = (
             select(DailySignalFeature, Symbol.symbol, Symbol.name_ko, Symbol.market)
             .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+            .join(
+                DailyPriceBar,
+                and_(
+                    DailyPriceBar.symbol_id == DailySignalFeature.symbol_id,
+                    DailyPriceBar.trade_date == DailySignalFeature.market_date,
+                ),
+            )
             .where(DailySignalFeature.market_date == _normalize_trade_date(market_date))
-            .order_by(DailySignalFeature.signal_count.desc(), Symbol.symbol.asc())
+            .order_by(*daily_signal_feature_order_by(), Symbol.symbol.asc())
             .limit(limit)
         )
         if symbols:
@@ -5103,19 +6354,85 @@ def load_daily_signal_features(
                 'market': market,
                 'market_date': feature.market_date.isoformat(),
                 'source': feature.source,
-                'signal_count': int(feature.signal_count),
-                'volume_power_rank': feature.volume_power_rank,
-                'volume_power': _decimal_to_float(feature.volume_power),
-                'overtime_volume_rank': feature.overtime_volume_rank,
-                'overtime_volume': int(feature.overtime_volume) if feature.overtime_volume is not None else None,
-                'overtime_fluctuation_rank': feature.overtime_fluctuation_rank,
+                **sanitize_daily_signal_feature_metrics(
+                    signal_count=feature.signal_count,
+                    volume_power_rank=feature.volume_power_rank,
+                    volume_power=feature.volume_power,
+                    overtime_volume_rank=feature.overtime_volume_rank,
+                    overtime_volume=feature.overtime_volume,
+                    overtime_fluctuation_rank=feature.overtime_fluctuation_rank,
+                ),
                 'overtime_fluctuation_rate': _decimal_to_float(feature.overtime_fluctuation_rate),
-                'feature_payload': feature.feature_payload,
-                'row_kind': ((feature.feature_payload or {}).get('row_provenance') or {}).get('row_kind'),
-                'provenance': (feature.feature_payload or {}).get('row_provenance'),
-                'freshness': (feature.feature_payload or {}).get('freshness'),
-                'fallback_features': (feature.feature_payload or {}).get('fallback_features'),
+                'feature_payload': payload,
+                'row_kind': (payload.get('row_provenance') or {}).get('row_kind'),
+                'provenance': payload.get('row_provenance'),
+                'freshness': payload.get('freshness'),
+                'fallback_features': payload.get('fallback_features'),
                 'captured_at': feature.captured_at.isoformat() if feature.captured_at else None,
+            }
+            for feature, symbol, name_ko, market in rows
+            for payload in [
+                sanitize_daily_signal_feature_payload(
+                    feature.feature_payload
+                )
+            ]
+        ]
+
+
+def load_raw_daily_signal_features_for_repair(
+    *,
+    market_date: str | date,
+    symbols: Sequence[str],
+) -> list[dict]:
+    """Load stored signal rows without consumer-facing sanitization.
+
+    Historical exact repair must preserve the original provider columns and
+    payload even when current readers reject that evidence for strategy use.
+    The caller must provide the exact authority scope.  That keeps this raw
+    path aligned with repair proof queries without broadening ordinary reads.
+    """
+
+    normalized_market_date = _normalize_trade_date(market_date)
+    normalized_symbols = sorted(
+        {_normalize_symbol_code(str(symbol)) for symbol in symbols}
+    )
+    if not normalized_symbols:
+        return []
+    with session_scope() as session:
+        statement = (
+            select(
+                DailySignalFeature,
+                Symbol.symbol,
+                Symbol.name_ko,
+                Symbol.market,
+            )
+            .join(Symbol, Symbol.id == DailySignalFeature.symbol_id)
+            .where(
+                DailySignalFeature.market_date == normalized_market_date,
+                Symbol.symbol.in_(normalized_symbols),
+            )
+            .order_by(Symbol.symbol.asc())
+        )
+        rows = session.execute(statement).all()
+        return [
+            {
+                'symbol': symbol,
+                'name_ko': name_ko,
+                'market': market,
+                'market_date': feature.market_date.isoformat(),
+                'source': feature.source,
+                'signal_count': feature.signal_count,
+                'volume_power_rank': feature.volume_power_rank,
+                'volume_power': feature.volume_power,
+                'overtime_volume_rank': feature.overtime_volume_rank,
+                'overtime_volume': feature.overtime_volume,
+                'overtime_fluctuation_rank': (
+                    feature.overtime_fluctuation_rank
+                ),
+                'overtime_fluctuation_rate': (
+                    feature.overtime_fluctuation_rate
+                ),
+                'feature_payload': deepcopy(feature.feature_payload or {}),
             }
             for feature, symbol, name_ko, market in rows
         ]
@@ -5216,23 +6533,9 @@ def upsert_daily_pykrx_enrichment_rows(
         sorted(
             {
                 _normalize_trade_date(raw['market_date'])
-                for raw in rows
-                if str(raw.get('category') or '').strip()
+                for raw in (*rows, *(replace_scopes or ()))
+                if str(raw.get('category') or '').strip().lower()
                 == 'valuation_snapshot'
-                and str(raw.get('scope_type') or '').strip().lower()
-                == 'symbol'
-                and raw.get('symbol') is not None
-                and any(
-                    (raw.get('payload') or {}).get(field) is not None
-                    for field in (
-                        'per',
-                        'pbr',
-                        'bps',
-                        'eps',
-                        'dividend_yield',
-                        'dps',
-                    )
-                )
             }
         )
     )

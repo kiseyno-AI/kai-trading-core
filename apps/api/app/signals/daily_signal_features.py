@@ -3,13 +3,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, Sequence
+import math
+import re
+from typing import Any, Iterable, Mapping, Sequence
 
 from app.agent_context.derived_contexts import build_price_context, daily_market_participation_context_service
 from app.agent_context.eligibility import load_agent_feedback_eligible_symbols
 from app.brokers.kis.provider import kis_client
+from app.eod.market_membership import market_membership_sha256
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     list_symbols_with_daily_bar_on_date,
     load_current_quotes,
@@ -25,15 +29,31 @@ from app.market_data_store import (
     load_daily_signal_features,
     load_daily_unified_value_factor_results,
     load_daily_value_factor_results,
+    load_raw_daily_signal_features_for_repair,
     load_recent_price_bars_by_symbol,
     load_symbols,
+    replace_daily_signal_features_exact_scope,
     upsert_daily_signal_feature,
     upsert_daily_signal_features,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.overtime_ranking_capture import OvertimeRankingCaptureStore
+from app.signals.signal_feature_readiness import (
+    SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
+    classify_signal_feature_readiness,
+    decision_usable_direct_signal_sources,
+    quote_snapshot_is_decision_usable,
+)
+from app.eod.live_progress import daily_pipeline_live_progress
 
 SIGNAL_FEATURE_VERSION = 'daily_signal_features_v2'
 SIGNAL_FEATURE_SOURCE = 'kis_ranking'
 SIGNAL_FEATURE_ITEM_PREVIEW_LIMIT = 100
+SIGNAL_FEATURE_SCOPE_OUTCOME_MANIFEST_VERSION = (
+    'signal_features_scope_outcomes_v1'
+)
+
+STORED_FALLBACK_BACKFILL_MODE = 'stored_owned_fallback_missing_row_backfill'
 
 ROW_KIND_DIRECT_ONLY = 'direct_only'
 ROW_KIND_DIRECT_PLUS_FALLBACK = 'direct_plus_fallback'
@@ -49,6 +69,21 @@ VOLUME_POWER = 'volume-power'
 OVERTIME_VOLUME = 'overtime-volume'
 OVERTIME_FLUCTUATION = 'overtime-fluctuation'
 SUPPORTED_SIGNAL_SOURCES = (VOLUME_POWER, OVERTIME_VOLUME, OVERTIME_FLUCTUATION)
+SIGNAL_SOURCE_MAX_ATTEMPTS = 2
+SIGNAL_SOURCE_RETRY_BASE_SECONDS = 0.25
+SIGNAL_SOURCE_DIAGNOSTIC_PREVIEW_LIMIT = 100
+VOLUME_POWER_PLACEHOLDER = 999.99
+# The unfiltered volume-power ranking (all instruments, no volume floor) is
+# topped by ETN/ETF/bond codes with the 999.99 placeholder, so every row was
+# rejected (raw 30 / valid 0 every day). Query common stock per market with a
+# volume floor instead; a 2026-11-07 probe returned 30/30 (KOSPI) and 29/30
+# (KOSDAQ) valid rows.
+VOLUME_POWER_MARKET_SEGMENTS: tuple[tuple[str, str], ...] = (
+    ('KOSPI', '0001'),
+    ('KOSDAQ', '1001'),
+)
+VOLUME_POWER_COMMON_STOCK_DIV_CLS_CODE = '1'
+VOLUME_POWER_MIN_VOLUME = '100000'
 
 FACTOR_SCORE_FIELD_SPECS: dict[str, dict[str, str | None]] = {
     'value': {
@@ -165,8 +200,9 @@ def _to_int(value: Any) -> int | None:
     if text is None:
         return None
     try:
-        return int(float(text))
-    except ValueError:
+        numeric = float(text)
+        return int(numeric) if math.isfinite(numeric) else None
+    except (OverflowError, ValueError):
         return None
 
 
@@ -175,7 +211,8 @@ def _to_float(value: Any) -> float | None:
     if text is None:
         return None
     try:
-        return float(text)
+        numeric = float(text)
+        return numeric if math.isfinite(numeric) else None
     except ValueError:
         return None
 
@@ -184,7 +221,8 @@ def _round_float(value: Any, *, digits: int = 6) -> float | None:
     if value is None:
         return None
     try:
-        return round(float(value), digits)
+        numeric = float(value)
+        return round(numeric, digits) if math.isfinite(numeric) else None
     except (TypeError, ValueError):
         return None
 
@@ -397,6 +435,12 @@ def _build_quote_snapshot_features(*, quote_row: dict[str, Any] | None, market_d
             'captured_at': quote_row.get('captured_at'),
         }
     )
+    if not quote_snapshot_is_decision_usable(
+        payload=payload,
+        freshness=freshness,
+        expected_market_date=market_date,
+    ):
+        return None, None
     return (payload or None), (freshness or None)
 
 
@@ -521,8 +565,10 @@ def _resolve_generation_universe(
     *,
     market_date: str,
     direct_symbols: Sequence[str],
+    provider_symbols: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    active_symbols = list_symbols_with_daily_bar_on_date(market_date)
+    active_symbols = sorted(set(list_symbols_with_daily_bar_on_date(market_date)))
+    active_symbol_set = set(active_symbols)
     try:
         candidate_metadata = _candidate_universe_metadata(market_date=market_date)
     except Exception as exc:
@@ -533,17 +579,200 @@ def _resolve_generation_universe(
             'has_market_risk_rows': False,
             'error': str(exc),
         }
-    candidate_symbols = list(candidate_metadata.get('symbols') or [])
-    target_symbols = sorted(set(direct_symbols) | set(active_symbols) | set(candidate_symbols))
+    raw_candidate_symbols = sorted(set(candidate_metadata.get('symbols') or []))
+    candidate_symbols = [symbol for symbol in raw_candidate_symbols if symbol in active_symbol_set]
+    raw_provider_symbols = sorted(set(provider_symbols or direct_symbols))
+    excluded_provider_symbols = [symbol for symbol in raw_provider_symbols if symbol not in active_symbol_set]
+    excluded_candidate_symbols = [symbol for symbol in raw_candidate_symbols if symbol not in active_symbol_set]
+    target_symbols = active_symbols
     return {
         'target_symbols': target_symbols,
         'active_symbols': active_symbols,
         'candidate_symbols': candidate_symbols,
+        'excluded_provider_symbols': excluded_provider_symbols,
+        'excluded_provider_symbol_count': len(excluded_provider_symbols),
+        'excluded_candidate_symbols': excluded_candidate_symbols,
+        'excluded_candidate_symbol_count': len(excluded_candidate_symbols),
         'candidate_universe_availability': candidate_metadata.get('availability', FILTER_UNIVERSE_UNAVAILABLE),
         'candidate_universe_inputs': {
             'has_piotroski_rows': bool(candidate_metadata.get('has_piotroski_rows')),
             'has_market_risk_rows': bool(candidate_metadata.get('has_market_risk_rows')),
             'error': candidate_metadata.get('error'),
+        },
+    }
+
+
+def _resolve_exact_repair_generation_universe(
+    *,
+    market_date: str,
+    exact_symbols: Sequence[str],
+    provider_symbols: Sequence[str] | None = None,
+    require_daily_bars: bool = True,
+) -> dict[str, Any]:
+    """Bind a deterministic historical rebuild to its frozen bar scope."""
+
+    raw_symbols = [
+        _normalize_symbol(value)
+        for value in exact_symbols
+    ]
+    if any(symbol is None for symbol in raw_symbols):
+        raise ValueError(
+            'exact signal-feature scope contains an invalid symbol'
+        )
+    normalized_symbols = tuple(sorted(symbol for symbol in raw_symbols if symbol))
+    if not normalized_symbols or len(set(normalized_symbols)) != len(normalized_symbols):
+        raise ValueError('exact signal-feature repair scope must not be empty')
+    stored_bar_symbols = set(
+        list_symbols_with_daily_bar_on_date(market_date)
+    )
+    missing_bar_symbols = sorted(
+        set(normalized_symbols).difference(stored_bar_symbols)
+    )
+    if require_daily_bars and missing_bar_symbols:
+        raise RuntimeError(
+            'exact signal-feature repair scope is missing daily bars: '
+            f'market_date={market_date}, missing_count='
+            f'{len(missing_bar_symbols)}, preview={missing_bar_symbols[:20]}'
+        )
+    try:
+        piotroski_rows = load_daily_piotroski_filter_results(
+            market_date=market_date,
+            symbols=list(normalized_symbols),
+            passed_filter=None,
+            limit=None,
+        )
+        market_risk_rows = load_daily_market_risk_filter_results(
+            market_date=market_date,
+            symbols=list(normalized_symbols),
+            passed_filter=None,
+            limit=None,
+        )
+        market_risk_symbols = sorted(
+            {
+                str(row.get('symbol') or '').strip().upper()
+                for row in market_risk_rows
+                if str(row.get('symbol') or '').strip()
+            }
+        )
+        missing_market_risk_symbols = sorted(
+            set(normalized_symbols).difference(market_risk_symbols)
+        )
+        if not missing_market_risk_symbols:
+            market_risk_coverage_status = 'complete'
+            availability = FILTER_UNIVERSE_AVAILABLE
+        elif not market_risk_symbols:
+            market_risk_coverage_status = 'unavailable'
+            availability = FILTER_UNIVERSE_UNAVAILABLE
+        else:
+            market_risk_coverage_status = 'partial'
+            availability = FILTER_UNIVERSE_PARTIAL
+        candidate_metadata = {
+            'availability': availability,
+            'symbols': load_agent_feedback_eligible_symbols(
+                market_date=date.fromisoformat(market_date),
+                requested_symbols=normalized_symbols,
+            ),
+            'has_piotroski_rows': bool(piotroski_rows),
+            'has_market_risk_rows': bool(market_risk_rows),
+            'market_risk_coverage_status': (
+                market_risk_coverage_status
+            ),
+            'market_risk_present_symbol_count': len(
+                market_risk_symbols
+            ),
+            'market_risk_present_membership_sha256': (
+                market_membership_sha256(market_risk_symbols)
+            ),
+            'market_risk_missing_symbol_count': len(
+                missing_market_risk_symbols
+            ),
+            'market_risk_missing_membership_sha256': (
+                market_membership_sha256(missing_market_risk_symbols)
+            ),
+        }
+    except Exception as exc:
+        candidate_metadata = {
+            'availability': FILTER_UNIVERSE_UNAVAILABLE,
+            'symbols': [],
+            'has_piotroski_rows': False,
+            'has_market_risk_rows': False,
+            'market_risk_coverage_status': 'unavailable',
+            'market_risk_present_symbol_count': 0,
+            'market_risk_present_membership_sha256': (
+                market_membership_sha256(())
+            ),
+            'market_risk_missing_symbol_count': len(normalized_symbols),
+            'market_risk_missing_membership_sha256': (
+                market_membership_sha256(normalized_symbols)
+            ),
+            'error': str(exc),
+        }
+    exact_symbol_set = set(normalized_symbols)
+    raw_candidate_symbols = sorted(
+        set(candidate_metadata.get('symbols') or [])
+    )
+    candidate_symbols = [
+        symbol
+        for symbol in raw_candidate_symbols
+        if symbol in exact_symbol_set
+    ]
+    excluded_candidate_symbols = [
+        symbol
+        for symbol in raw_candidate_symbols
+        if symbol not in exact_symbol_set
+    ]
+    raw_provider_symbols = sorted(set(provider_symbols or ()))
+    excluded_provider_symbols = [
+        symbol
+        for symbol in raw_provider_symbols
+        if symbol not in exact_symbol_set
+    ]
+    return {
+        'target_symbols': list(normalized_symbols),
+        'active_symbols': list(normalized_symbols),
+        'candidate_symbols': candidate_symbols,
+        'excluded_provider_symbols': excluded_provider_symbols,
+        'excluded_provider_symbol_count': len(excluded_provider_symbols),
+        'excluded_candidate_symbols': excluded_candidate_symbols,
+        'excluded_candidate_symbol_count': len(
+            excluded_candidate_symbols
+        ),
+        'candidate_universe_availability': candidate_metadata.get(
+            'availability',
+            FILTER_UNIVERSE_UNAVAILABLE,
+        ),
+        'candidate_universe_inputs': {
+            'has_piotroski_rows': bool(
+                candidate_metadata.get('has_piotroski_rows')
+            ),
+            'has_market_risk_rows': bool(
+                candidate_metadata.get('has_market_risk_rows')
+            ),
+            'error': candidate_metadata.get('error'),
+        },
+        'market_risk_coverage_status': candidate_metadata.get(
+            'market_risk_coverage_status'
+        ),
+        'market_risk_present_symbol_count': int(
+            candidate_metadata.get('market_risk_present_symbol_count') or 0
+        ),
+        'market_risk_present_membership_sha256': candidate_metadata.get(
+            'market_risk_present_membership_sha256'
+        ),
+        'market_risk_missing_symbol_count': int(
+            candidate_metadata.get('market_risk_missing_symbol_count') or 0
+        ),
+        'market_risk_missing_membership_sha256': candidate_metadata.get(
+            'market_risk_missing_membership_sha256'
+        ),
+        'missing_bar_symbols': missing_bar_symbols,
+        'missing_bar_symbol_count': len(missing_bar_symbols),
+        'repair_scope': {
+            'kind': 'frozen_historical_membership',
+            'symbol_count': len(normalized_symbols),
+            'membership_sha256': market_membership_sha256(
+                normalized_symbols
+            ),
         },
     }
 
@@ -616,6 +845,15 @@ def _build_feature_coverage_summary(
         'market_date': market_date,
         'persisted_row_count': len(persisted_rows),
         'direct_signal_source_row_count': direct_signal_source_rows,
+        'direct_signal_source_coverage_ratio': (
+            _round_float(direct_signal_source_rows / len(persisted_rows), digits=6)
+            if persisted_rows
+            else None
+        ),
+        'direct_signal_source_coverage_status': _coverage_status(
+            present_count=direct_signal_source_rows,
+            universe_size=len(persisted_rows),
+        ),
         'fallback_only_row_count': row_kind_counts.get(ROW_KIND_FALLBACK_ONLY, 0),
         'row_kind_counts': row_kind_counts,
         'active_universe': _build_feature_coverage_bucket(
@@ -636,6 +874,75 @@ def _build_feature_coverage_summary(
 
 def _feature_item_preview(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(items[:SIGNAL_FEATURE_ITEM_PREVIEW_LIMIT])
+
+
+def _prepare_signal_feature_publication_items(
+    *,
+    items: Sequence[dict[str, Any]],
+    expected_market_date: str,
+    incomplete_sources: Sequence[str],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, str],
+    dict[str, int],
+]:
+    """Select rows whose persisted evidence is decision-usable.
+
+    Every row must satisfy the same readiness contract before publication.
+    A shared source gap downgrades otherwise-usable rows instead of turning
+    the whole scope into retry debt.  Unusable rows never advance.
+    """
+
+    quality_by_symbol: dict[str, str] = {}
+    quality_reason_counts: dict[str, int] = {}
+    publication_items: list[dict[str, Any]] = []
+    for item in items:
+        symbol = str(item.get('symbol') or '').strip()
+        readiness = classify_signal_feature_readiness(
+            signal_count=item.get('signal_count'),
+            feature_payload=item.get('feature_payload'),
+            expected_market_date=expected_market_date,
+        )
+        reasons = list(readiness.get('quality_reasons') or [])
+        if not readiness.get('semantic_ready'):
+            if symbol:
+                quality_by_symbol[symbol] = 'retry'
+            for reason in reasons:
+                reason_text = str(reason).strip()
+                if reason_text:
+                    quality_reason_counts[reason_text] = (
+                        quality_reason_counts.get(reason_text, 0) + 1
+                    )
+            continue
+
+        quality_status = str(readiness.get('quality_status') or 'complete')
+        if incomplete_sources:
+            quality_status = 'degraded'
+            if 'source_incomplete' not in reasons:
+                reasons.append('source_incomplete')
+        annotated_readiness = {
+            **readiness,
+            'quality_status': quality_status,
+            'quality_reasons': reasons,
+            'incomplete_sources': list(incomplete_sources),
+        }
+        publication_item = deepcopy(item)
+        feature_payload = dict(
+            publication_item.get('feature_payload') or {}
+        )
+        feature_payload['readiness'] = annotated_readiness
+        publication_item['feature_payload'] = feature_payload
+        publication_items.append(publication_item)
+        if symbol:
+            quality_by_symbol[symbol] = quality_status
+        for reason in reasons:
+            reason_text = str(reason).strip()
+            if reason_text:
+                quality_reason_counts[reason_text] = (
+                    quality_reason_counts.get(reason_text, 0) + 1
+                )
+
+    return publication_items, quality_by_symbol, quality_reason_counts
 
 
 def _load_support_maps(
@@ -748,6 +1055,8 @@ def _merge_owned_fallback_features(
     support_maps: dict[str, Any],
     collection_payload: dict[str, Any],
     source_errors: dict[str, str],
+    preserve_collection_shape: bool = False,
+    preserve_quote_snapshot_shape: bool = False,
 ) -> dict[str, Any] | None:
     symbol = entry['symbol']
     symbol_metadata = (support_maps.get('symbol_map') or {}).get(symbol)
@@ -782,9 +1091,22 @@ def _merge_owned_fallback_features(
         momentum_row=momentum_row,
         low_risk_row=low_risk_row,
     )
-    quote_snapshot_features, quote_freshness = _build_quote_snapshot_features(
+    (
+        normalized_quote_snapshot,
+        quote_freshness,
+    ) = _build_quote_snapshot_features(
         quote_row=quote_row,
         market_date=market_date,
+    )
+    # Exact repair fingerprints bind the stored quote as historical evidence.
+    # Preserve that raw shape while the rebuilt freshness/readiness contract
+    # continues to decide whether the quote is strategy-usable.
+    quote_snapshot_features = (
+        deepcopy(quote_row)
+        if preserve_quote_snapshot_shape
+        and isinstance(quote_row, dict)
+        and quote_row
+        else normalized_quote_snapshot
     )
 
     fallback_features = _clean_mapping(
@@ -794,15 +1116,15 @@ def _merge_owned_fallback_features(
             'returns': return_features,
             'volatility': volatility_features,
             'factor_scores': factor_score_features,
-            'quote_snapshot': quote_snapshot_features,
         }
     )
-    direct_sources = sorted(((entry.get('feature_payload') or {}).get('sources') or {}).keys())
+    if quote_snapshot_features is not None:
+        fallback_features['quote_snapshot'] = quote_snapshot_features
+    direct_sources = decision_usable_direct_signal_sources(
+        entry.get('feature_payload')
+    )
     fallback_groups_present = _count_present_feature_groups(fallback_features)
     direct_signal_source_count = len(direct_sources)
-
-    if direct_signal_source_count <= 0 and not fallback_groups_present:
-        return None
 
     factor_captured_at_values = [
         (row or {}).get('captured_at')
@@ -850,14 +1172,45 @@ def _merge_owned_fallback_features(
     payload = dict(entry['feature_payload'])
     payload['feature_version'] = SIGNAL_FEATURE_VERSION
     payload['collection'] = dict(payload.get('collection') or {})
-    payload['collection']['collected_at'] = collection_payload.get('collected_at')
-    payload['collection']['source_errors'] = dict(source_errors)
-    payload['collection']['universe'] = {
+    if not preserve_collection_shape or 'collected_at' in collection_payload:
+        payload['collection']['collected_at'] = collection_payload.get(
+            'collected_at'
+        )
+    if preserve_collection_shape and 'source_errors' in collection_payload:
+        payload['collection']['source_errors'] = deepcopy(
+            collection_payload.get('source_errors')
+        )
+    elif not preserve_collection_shape or source_errors:
+        payload['collection']['source_errors'] = dict(source_errors)
+    universe_payload = {
         'target_symbol_count': len(universe.get('target_symbols') or []),
         'active_symbol_count': len(universe.get('active_symbols') or []),
         'candidate_symbol_count': len(universe.get('candidate_symbols') or []),
+        'excluded_provider_symbol_count': int(universe.get('excluded_provider_symbol_count') or 0),
+        'excluded_candidate_symbol_count': int(universe.get('excluded_candidate_symbol_count') or 0),
         'candidate_universe_availability': universe.get('candidate_universe_availability'),
     }
+    if universe.get('market_risk_coverage_status') is not None:
+        universe_payload.update(
+            {
+                'market_risk_coverage_status': universe.get(
+                    'market_risk_coverage_status'
+                ),
+                'market_risk_present_symbol_count': int(
+                    universe.get('market_risk_present_symbol_count') or 0
+                ),
+                'market_risk_present_membership_sha256': universe.get(
+                    'market_risk_present_membership_sha256'
+                ),
+                'market_risk_missing_symbol_count': int(
+                    universe.get('market_risk_missing_symbol_count') or 0
+                ),
+                'market_risk_missing_membership_sha256': universe.get(
+                    'market_risk_missing_membership_sha256'
+                ),
+            }
+        )
+    payload['collection']['universe'] = universe_payload
     payload['row_provenance'] = row_provenance
     payload['freshness'] = freshness
     payload['fallback_features'] = fallback_features
@@ -889,10 +1242,21 @@ def _expand_rows_with_owned_fallback(
     direct_rows: list[dict[str, Any]],
     collection_payload: dict[str, Any],
     source_errors: dict[str, str],
+    exact_symbols: Sequence[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    universe = _resolve_generation_universe(
-        market_date=market_date,
-        direct_symbols=[item['symbol'] for item in direct_rows],
+    universe = (
+        _resolve_exact_repair_generation_universe(
+            market_date=market_date,
+            exact_symbols=exact_symbols,
+            provider_symbols=collection_payload.get('provider_symbols'),
+            require_daily_bars=False,
+        )
+        if exact_symbols is not None
+        else _resolve_generation_universe(
+            market_date=market_date,
+            direct_symbols=[item['symbol'] for item in direct_rows],
+            provider_symbols=collection_payload.get('provider_symbols'),
+        )
     )
     support_maps = _load_support_maps(
         market_date=market_date,
@@ -901,7 +1265,16 @@ def _expand_rows_with_owned_fallback(
 
     direct_map = {item['symbol']: item for item in direct_rows}
     items: list[dict[str, Any]] = []
-    for symbol in universe['target_symbols']:
+    target_total = len(universe['target_symbols'])
+    for index, symbol in enumerate(universe['target_symbols']):
+        daily_pipeline_live_progress.thread_stage_progress(
+            {
+                'processed': index,
+                'total': target_total,
+                'current_symbol': symbol,
+                'current_step': 'build_signal_feature_row',
+            }
+        )
         entry = direct_map.get(symbol)
         if entry is None:
             entry = _empty_feature_row(
@@ -934,20 +1307,145 @@ def _expand_rows_with_owned_fallback(
 
 
 def _normalize_symbol(value: Any) -> str | None:
-    symbol = str(value or '').strip()
+    symbol = str(value or '').strip().upper()
     if not symbol:
         return None
     if symbol.isdigit():
         symbol = symbol.zfill(6)
-    if len(symbol) != 6:
+    if re.fullmatch(r'[0-9]{4}[0-9A-Z]{2}', symbol) is None:
         return None
     return symbol
+
+
+overtime_capture_store = OvertimeRankingCaptureStore()
+
+
+def _merge_volume_power_segments(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge per-market volume-power rows into one strength-ordered ranking.
+
+    Each segment's ``data_rank`` restarts at 1, so the merged list is
+    re-ranked by volume power (placeholders and unparseable values last) and
+    the per-market rank is kept as ``market_data_rank``.
+    """
+
+    def strength(row: Mapping[str, Any]) -> float:
+        value = _to_float(row.get('tday_rltv'))
+        if value is None or abs(value - VOLUME_POWER_PLACEHOLDER) < 1e-9:
+            return float('-inf')
+        return value
+
+    ordered = sorted(rows, key=strength, reverse=True)
+    merged: list[dict[str, Any]] = []
+    for index, row in enumerate(ordered, start=1):
+        merged.append({**row, 'market_data_rank': row.get('data_rank'), 'data_rank': str(index)})
+    return merged
 
 
 def _source_symbol(source: str, row: dict[str, Any]) -> str | None:
     if source == OVERTIME_FLUCTUATION:
         return _normalize_symbol(row.get('mksc_shrn_iscd') or row.get('stck_shrn_iscd'))
     return _normalize_symbol(row.get('stck_shrn_iscd') or row.get('mksc_shrn_iscd'))
+
+
+def _source_row_invalid_reason(source: str, row: dict[str, Any]) -> str | None:
+    """Classify syntactically successful KIS rows that are not evidence."""
+
+    if _source_symbol(source, row) is None:
+        return 'invalid_source_symbol'
+
+    if source == OVERTIME_VOLUME:
+        overtime_volume = _to_int(row.get('ovtm_untp_vol'))
+        if overtime_volume is None:
+            return 'missing_overtime_volume'
+        if overtime_volume <= 0:
+            return 'non_positive_overtime_volume'
+    elif source == VOLUME_POWER:
+        volume_power = _to_float(row.get('tday_rltv'))
+        if volume_power is None:
+            return 'missing_volume_power'
+        if volume_power <= 0:
+            return 'non_positive_volume_power'
+        if abs(volume_power - VOLUME_POWER_PLACEHOLDER) < 1e-9:
+            return 'placeholder_volume_power'
+    elif source == OVERTIME_FLUCTUATION:
+        if _to_float(row.get('ovtm_untp_prdy_ctrt')) is None:
+            return 'missing_overtime_fluctuation_rate'
+    return None
+
+
+def _partition_valid_source_rows(
+    *,
+    source_rows: dict[str, list[dict[str, Any]]],
+    sources: Sequence[str],
+    source_errors: dict[str, str] | None = None,
+    pagination_truncated_sources: Iterable[str] | None = None,
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+]:
+    valid_rows: dict[str, list[dict[str, Any]]] = {}
+    raw_counts: dict[str, int] = {}
+    valid_counts: dict[str, int] = {}
+    health: dict[str, dict[str, Any]] = {}
+    diagnostics: dict[str, list[dict[str, Any]]] = {}
+    errors = source_errors or {}
+    truncated_sources = set(pagination_truncated_sources or ())
+
+    for source in sources:
+        raw_rows = list(source_rows.get(source, []))
+        source_valid_rows: list[dict[str, Any]] = []
+        source_diagnostics: list[dict[str, Any]] = []
+        for row in raw_rows:
+            invalid_reason = _source_row_invalid_reason(source, row)
+            if invalid_reason is None:
+                source_valid_rows.append(row)
+                continue
+            if len(source_diagnostics) < SIGNAL_SOURCE_DIAGNOSTIC_PREVIEW_LIMIT:
+                source_diagnostics.append(
+                    {
+                        'symbol': _source_symbol(source, row),
+                        'reason': invalid_reason,
+                        'raw': row,
+                    }
+                )
+
+        raw_count = len(raw_rows)
+        valid_count = len(source_valid_rows)
+        invalid_count = raw_count - valid_count
+        if source in errors:
+            status = 'unavailable'
+            reason = 'source_error'
+        elif valid_count <= 0:
+            status = 'unavailable'
+            reason = 'all_rows_invalid' if raw_count else 'empty_response'
+        elif source in truncated_sources:
+            status = 'partial'
+            reason = 'pagination_truncated'
+        elif invalid_count:
+            status = 'partial'
+            reason = 'some_rows_invalid'
+        else:
+            status = 'available'
+            reason = None
+
+        valid_rows[source] = source_valid_rows
+        raw_counts[source] = raw_count
+        valid_counts[source] = valid_count
+        diagnostics[source] = source_diagnostics
+        health[source] = {
+            'status': status,
+            'reason': reason,
+            'raw_count': raw_count,
+            'valid_count': valid_count,
+            'invalid_count': invalid_count,
+            'pagination_truncated': source in truncated_sources,
+            'diagnostics_truncated': invalid_count > len(source_diagnostics),
+        }
+
+    return valid_rows, raw_counts, valid_counts, health, diagnostics
 
 
 def _base_feature(row: dict[str, Any], *, rank: int) -> dict[str, Any]:
@@ -1059,12 +1557,16 @@ def build_daily_signal_feature_rows(
     collection: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     normalized_market_date = _normalize_market_date(market_date)
-    source_counts = {source: len(rows) for source, rows in source_rows.items()}
+    selected_sources = [source for source in SUPPORTED_SIGNAL_SOURCES if source in source_rows]
+    valid_source_rows, _, source_counts, _, _ = _partition_valid_source_rows(
+        source_rows=source_rows,
+        sources=selected_sources,
+    )
     collection_payload = collection or {}
     by_symbol: dict[str, dict[str, Any]] = {}
 
     for source in SUPPORTED_SIGNAL_SOURCES:
-        for index, row in enumerate(source_rows.get(source, []), start=1):
+        for index, row in enumerate(valid_source_rows.get(source, []), start=1):
             symbol = _source_symbol(source, row)
             if symbol is None:
                 continue
@@ -1102,11 +1604,34 @@ class DailySignalFeatureCollection:
     source_errors: dict[str, str]
     universe: dict[str, Any]
     items: list[dict[str, Any]]
+    raw_source_counts: dict[str, int] = field(default_factory=dict)
+    source_health: dict[str, dict[str, Any]] = field(default_factory=dict)
+    source_diagnostics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 class DailySignalFeatureService:
     def __init__(self, *, client=None) -> None:
         self.client = client or kis_client
+
+    async def _fetch_ranking_source(self, fetch, **kwargs) -> dict[str, Any]:
+        """Run one read-only ranking call with one bounded retry.
+
+        KIS client exceptions carry an explicit ``retryable`` classification.
+        Restricting retries to that signal keeps request/configuration failures
+        fail-fast and avoids adding retries to the generic client where order
+        submissions also flow.
+        """
+
+        for attempt in range(SIGNAL_SOURCE_MAX_ATTEMPTS):
+            try:
+                return await fetch(**kwargs)
+            except Exception as exc:
+                is_final_attempt = attempt + 1 >= SIGNAL_SOURCE_MAX_ATTEMPTS
+                if is_final_attempt or getattr(exc, 'retryable', False) is not True:
+                    raise
+                await asyncio.sleep(SIGNAL_SOURCE_RETRY_BASE_SECONDS * (2**attempt))
+
+        raise AssertionError('unreachable signal source retry state')
 
     async def collect_features(
         self,
@@ -1116,6 +1641,7 @@ class DailySignalFeatureService:
         max_pages: int = 10,
         overtime_volume_rank_sort_cls_code: str = '2',
         overtime_fluctuation_div_cls_code: str = '2',
+        exact_symbols: Sequence[str] | None = None,
     ) -> DailySignalFeatureCollection:
         normalized_market_date = _normalize_market_date(market_date)
         selected_sources = _normalize_sources(sources)
@@ -1129,56 +1655,134 @@ class DailySignalFeatureService:
         }
 
         if VOLUME_POWER in selected_sources:
-            try:
-                response = await self.client.fetch_domestic_ranking_volume_power(max_pages=max_pages)
-                source_rows[VOLUME_POWER] = list(response.get('output') or [])
-                collection[VOLUME_POWER] = {
+            segment_rows: list[dict[str, Any]] = []
+            segment_meta: dict[str, Any] = {}
+            segment_errors: dict[str, str] = {}
+            for segment, input_iscd in VOLUME_POWER_MARKET_SEGMENTS:
+                try:
+                    response = await self._fetch_ranking_source(
+                        self.client.fetch_domestic_ranking_volume_power,
+                        input_iscd=input_iscd,
+                        div_cls_code=VOLUME_POWER_COMMON_STOCK_DIV_CLS_CODE,
+                        min_volume=VOLUME_POWER_MIN_VOLUME,
+                        max_pages=max_pages,
+                    )
+                except Exception as exc:
+                    segment_errors[segment] = str(exc).strip() or type(exc).__name__
+                    continue
+                rows = [row for row in response.get('output') or [] if isinstance(row, dict)]
+                segment_rows.extend({**row, 'market_segment': segment} for row in rows)
+                segment_meta[segment] = {
                     'page_count': response.get('page_count'),
                     'max_pages_reached': response.get('max_pages_reached'),
+                    'raw_count': len(rows),
                 }
-            except Exception as exc:
-                source_rows[VOLUME_POWER] = []
-                source_errors[VOLUME_POWER] = str(exc)
-                collection[VOLUME_POWER] = {'error': str(exc)}
+            source_rows[VOLUME_POWER] = _merge_volume_power_segments(segment_rows)
+            collection[VOLUME_POWER] = {
+                'query': {
+                    'segments': [segment for segment, _ in VOLUME_POWER_MARKET_SEGMENTS],
+                    'div_cls_code': VOLUME_POWER_COMMON_STOCK_DIV_CLS_CODE,
+                    'min_volume': VOLUME_POWER_MIN_VOLUME,
+                },
+                'segments': segment_meta,
+                'max_pages_reached': any(
+                    meta.get('max_pages_reached') is True for meta in segment_meta.values()
+                ),
+            }
+            if segment_errors:
+                collection[VOLUME_POWER]['segment_errors'] = segment_errors
+            if len(segment_errors) == len(VOLUME_POWER_MARKET_SEGMENTS):
+                distinct_messages = list(dict.fromkeys(segment_errors.values()))
+                source_errors[VOLUME_POWER] = (
+                    distinct_messages[0]
+                    if len(distinct_messages) == 1
+                    else '; '.join(
+                        f'{segment}: {message}'
+                        for segment, message in segment_errors.items()
+                    )
+                )
 
         if OVERTIME_VOLUME in selected_sources:
-            try:
-                response = await self.client.fetch_domestic_ranking_overtime_volume(
-                    rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
-                    max_pages=max_pages,
-                )
-                source_rows[OVERTIME_VOLUME] = list(response.get('output2') or [])
-                collection[OVERTIME_VOLUME] = {
-                    'page_count': response.get('page_count'),
-                    'max_pages_reached': response.get('max_pages_reached'),
-                    'summary_rows': response.get('output1') or [],
-                }
-            except Exception as exc:
-                source_rows[OVERTIME_VOLUME] = []
-                source_errors[OVERTIME_VOLUME] = str(exc)
-                collection[OVERTIME_VOLUME] = {'error': str(exc)}
+            captured = overtime_capture_store.usable_rows(normalized_market_date, OVERTIME_VOLUME)
+            if captured is not None:
+                source_rows[OVERTIME_VOLUME], collection[OVERTIME_VOLUME] = captured
+            else:
+                try:
+                    response = await self._fetch_ranking_source(
+                        self.client.fetch_domestic_ranking_overtime_volume,
+                        rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
+                        max_pages=max_pages,
+                    )
+                    source_rows[OVERTIME_VOLUME] = list(response.get('output2') or [])
+                    collection[OVERTIME_VOLUME] = {
+                        'origin': 'live',
+                        'page_count': response.get('page_count'),
+                        'max_pages_reached': response.get('max_pages_reached'),
+                        'summary_rows': response.get('output1') or [],
+                    }
+                except Exception as exc:
+                    error_message = str(exc).strip() or type(exc).__name__
+                    source_rows[OVERTIME_VOLUME] = []
+                    source_errors[OVERTIME_VOLUME] = error_message
+                    collection[OVERTIME_VOLUME] = {'error': error_message}
 
-        if OVERTIME_FLUCTUATION in selected_sources:
+        if OVERTIME_FLUCTUATION in selected_sources and (
+            captured := overtime_capture_store.usable_rows(
+                normalized_market_date, OVERTIME_FLUCTUATION
+            )
+        ) is not None:
+            source_rows[OVERTIME_FLUCTUATION], collection[OVERTIME_FLUCTUATION] = captured
+        elif OVERTIME_FLUCTUATION in selected_sources:
             try:
-                response = await self.client.fetch_domestic_ranking_overtime_fluctuation(
+                response = await self._fetch_ranking_source(
+                    self.client.fetch_domestic_ranking_overtime_fluctuation,
                     div_cls_code=overtime_fluctuation_div_cls_code,
                     max_pages=max_pages,
                 )
                 source_rows[OVERTIME_FLUCTUATION] = list(response.get('output2') or [])
                 collection[OVERTIME_FLUCTUATION] = {
+                    'origin': 'live',
                     'page_count': response.get('page_count'),
                     'max_pages_reached': response.get('max_pages_reached'),
                     'summary_rows': response.get('output1') or [],
                 }
             except Exception as exc:
+                error_message = str(exc).strip() or type(exc).__name__
                 source_rows[OVERTIME_FLUCTUATION] = []
-                source_errors[OVERTIME_FLUCTUATION] = str(exc)
-                collection[OVERTIME_FLUCTUATION] = {'error': str(exc)}
+                source_errors[OVERTIME_FLUCTUATION] = error_message
+                collection[OVERTIME_FLUCTUATION] = {'error': error_message}
 
-        collection['source_counts'] = {source: len(source_rows.get(source, [])) for source in selected_sources}
+        (
+            valid_source_rows,
+            raw_source_counts,
+            source_counts,
+            source_health,
+            source_diagnostics,
+        ) = _partition_valid_source_rows(
+            source_rows=source_rows,
+            sources=selected_sources,
+            source_errors=source_errors,
+            pagination_truncated_sources=(
+                source
+                for source in selected_sources
+                if (collection.get(source) or {}).get('max_pages_reached') is True
+            ),
+        )
+        provider_symbols = sorted(
+            {
+                symbol
+                for source in selected_sources
+                for row in source_rows.get(source, [])
+                if (symbol := _source_symbol(source, row)) is not None
+            }
+        )
+        collection['raw_source_counts'] = raw_source_counts
+        collection['source_counts'] = source_counts
+        collection['source_health'] = source_health
+        collection['provider_symbols'] = provider_symbols
         direct_rows = build_daily_signal_feature_rows(
             market_date=normalized_market_date,
-            source_rows=source_rows,
+            source_rows=valid_source_rows,
             collection=collection,
         )
         items, universe = _expand_rows_with_owned_fallback(
@@ -1186,16 +1790,21 @@ class DailySignalFeatureService:
             direct_rows=direct_rows,
             collection_payload=collection,
             source_errors=source_errors,
+            exact_symbols=exact_symbols,
         )
         return DailySignalFeatureCollection(
             market_date=normalized_market_date,
             sources=selected_sources,
-            source_counts={source: len(source_rows.get(source, [])) for source in selected_sources},
+            source_counts=source_counts,
             source_errors=source_errors,
             universe=universe,
             items=items,
+            raw_source_counts=raw_source_counts,
+            source_health=source_health,
+            source_diagnostics=source_diagnostics,
         )
 
+    @daily_price_bar_writer_admission
     async def refresh_for_market_date(
         self,
         *,
@@ -1205,41 +1814,256 @@ class DailySignalFeatureService:
         overtime_volume_rank_sort_cls_code: str = '2',
         overtime_fluctuation_div_cls_code: str = '2',
         include_retry_metadata: bool = False,
+        exact_symbols: Sequence[str] | None = None,
+        admitted_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        generation_symbols = (
+            admitted_symbols
+            if admitted_symbols is not None
+            else exact_symbols
+        )
+        if exact_symbols is not None and admitted_symbols is not None:
+            normalized_exact = {
+                symbol
+                for value in exact_symbols
+                if (symbol := _normalize_symbol(value)) is not None
+            }
+            normalized_admitted = {
+                symbol
+                for value in admitted_symbols
+                if (symbol := _normalize_symbol(value)) is not None
+            }
+            outside_authority = sorted(
+                normalized_admitted - normalized_exact
+            )
+            if outside_authority:
+                raise ValueError(
+                    'admitted signal-feature symbols must be contained in '
+                    'the exact finalization scope: '
+                    + ','.join(outside_authority[:20])
+                )
+        if authoritative_market_scope is not None:
+            if exact_symbols is None:
+                raise ValueError(
+                    'authoritative signal-feature replacement requires '
+                    'an exact official scope'
+                )
+            normalized_exact = {
+                symbol
+                for value in exact_symbols
+                if (symbol := _normalize_symbol(value)) is not None
+            }
+            normalized_generation = {
+                symbol
+                for value in generation_symbols or ()
+                if (symbol := _normalize_symbol(value)) is not None
+            }
+            if (
+                not normalized_exact
+                or normalized_generation != normalized_exact
+            ):
+                raise ValueError(
+                    'authoritative signal-feature replacement cannot use '
+                    'a narrowed admitted scope'
+                )
+        daily_pipeline_live_progress.publish_substep(
+            step='collect_kis_rankings_and_build_rows', status='running'
+        )
         collection = await self.collect_features(
             market_date=market_date,
             sources=sources,
             max_pages=max_pages,
             overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
+            exact_symbols=generation_symbols,
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='collect_kis_rankings_and_build_rows',
+            status='completed',
+            detail={
+                'rows': len(collection.items),
+                'source_errors': len(collection.source_errors or {}),
+            },
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='validate_and_persist_signal_features', status='running'
         )
 
-        failed_symbols: list[str] = []
-        persisted_items: list[dict[str, Any]] = []
-        try:
-            upsert_daily_signal_features(collection.items)
-            persisted_items = list(collection.items)
-        except Exception:
-            for item in collection.items:
-                try:
-                    upsert_daily_signal_feature(item)
-                    persisted_items.append(item)
-                except Exception:
-                    failed_symbols.append(item['symbol'])
-
-        try:
-            participation_context = daily_market_participation_context_service.rebuild_for_market_date(
-                market_date=collection.market_date,
-                market='KRX',
-                source=SIGNAL_FEATURE_SOURCE,
+        # Source health is an authority gate, not merely response metadata.
+        # Determine it before any write so incomplete rankings publish only
+        # rows whose direct or owned-fallback evidence is decision-usable.
+        incomplete_sources = sorted(
+            {
+                *(
+                    str(source)
+                    for source in collection.source_errors
+                    if str(source).strip()
+                ),
+                *(
+                    str(source)
+                    for source, health in collection.source_health.items()
+                    if str((health or {}).get('status') or '')
+                    .strip()
+                    .lower()
+                    != 'available'
+                ),
+            }
+        )
+        raw_selected_scope = collection.universe.get('target_symbols')
+        if raw_selected_scope is None:
+            raw_selected_scope = [
+                item.get('symbol') for item in collection.items
+            ]
+        selected_scope_symbols = list(
+            dict.fromkeys(
+                str(symbol).strip()
+                for symbol in (raw_selected_scope or [])
+                if str(symbol).strip()
             )
-        except Exception as exc:
+        )
+        generated_symbols = {
+            str(item.get('symbol') or '').strip()
+            for item in collection.items
+            if str(item.get('symbol') or '').strip()
+        }
+        (
+            publication_items,
+            quality_by_symbol,
+            quality_reason_counts,
+        ) = _prepare_signal_feature_publication_items(
+            items=collection.items,
+            expected_market_date=collection.market_date,
+            incomplete_sources=incomplete_sources,
+        )
+        publication_symbol_set = {
+            str(item.get('symbol') or '').strip()
+            for item in publication_items
+            if str(item.get('symbol') or '').strip()
+        }
+        failed_symbols: list[str] = []
+        failed_symbols.extend(
+            symbol
+            for symbol in selected_scope_symbols
+            if symbol not in generated_symbols
+        )
+        persisted_items: list[dict[str, Any]] = []
+        scope_finalization: dict[str, Any] | None = None
+        if exact_symbols is not None:
+            finalization_scope = (
+                admitted_symbols
+                if admitted_symbols is not None
+                else exact_symbols
+            )
+            exact_publication = replace_daily_signal_features_exact_scope(
+                market_date=collection.market_date,
+                # Publish decision-usable degraded rows even when a shared
+                # source is partial.  The exact-scope transaction still
+                # removes stale rows for symbols that remain retry debt.
+                features=publication_items,
+                exact_symbols=finalization_scope,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            exact_successful = set(
+                exact_publication.get('successful_symbols') or []
+            )
+            persisted_items = [
+                item
+                for item in publication_items
+                if str(item.get('symbol') or '').strip()
+                in exact_successful
+            ]
+            failed_symbols.extend(
+                exact_publication.get('failed_symbols') or []
+            )
+            scope_finalization = exact_publication.get(
+                'scope_finalization'
+            )
+        elif publication_items:
+            try:
+                upsert_daily_signal_features(
+                    publication_items,
+                    # A non-exact invocation cannot delete unrelated rows.
+                    delete_rows_outside_scope=False,
+                )
+                persisted_items = list(publication_items)
+            except Exception:
+                for item in publication_items:
+                    try:
+                        upsert_daily_signal_feature(item)
+                        persisted_items.append(item)
+                    except Exception:
+                        failed_symbols.append(item['symbol'])
+
+        failed_symbols = list(dict.fromkeys(failed_symbols))
+        persisted_symbol_set = {
+            str(item.get('symbol') or '').strip()
+            for item in persisted_items
+            if str(item.get('symbol') or '').strip()
+        }
+        successful_scope_symbols = [
+            symbol
+            for symbol in selected_scope_symbols
+            if symbol in persisted_symbol_set
+        ]
+        successful_scope_set = set(successful_scope_symbols)
+        scope_outcome = build_exact_symbol_scope_outcome(
+            manifest_version=(
+                SIGNAL_FEATURE_SCOPE_OUTCOME_MANIFEST_VERSION
+            ),
+            selected_symbols=selected_scope_symbols,
+            successful_symbols=successful_scope_symbols,
+            retry_debt_symbols=[
+                symbol
+                for symbol in selected_scope_symbols
+                if symbol not in successful_scope_set
+            ],
+        )
+        retry_failed_symbols = list(
+            scope_outcome.get('retry_debt_stock_codes') or []
+        )
+        complete_scope_symbols = [
+            symbol
+            for symbol in successful_scope_symbols
+            if quality_by_symbol.get(symbol) == 'complete'
+        ]
+        degraded_scope_symbols = [
+            symbol
+            for symbol in successful_scope_symbols
+            if quality_by_symbol.get(symbol) == 'degraded'
+        ]
+        quality_status = (
+            'degraded'
+            if degraded_scope_symbols
+            or (successful_scope_symbols and retry_failed_symbols)
+            else ('healthy' if successful_scope_symbols else 'unavailable')
+        )
+
+        if not persisted_items and exact_symbols is None:
             participation_context = {
-                'market': 'KRX',
                 'market_date': collection.market_date,
                 'source': SIGNAL_FEATURE_SOURCE,
-                'error': str(exc),
+                'status': 'skipped',
+                'reason': (
+                    'signal_feature_sources_incomplete'
+                    if incomplete_sources
+                    else 'no_signal_features_persisted'
+                ),
             }
+        else:
+            participation_context = (
+                daily_market_participation_context_service.
+                rebuild_for_market_date(
+                    market_date=collection.market_date,
+                    market='KRX',
+                    source=SIGNAL_FEATURE_SOURCE,
+                    exact_symbols=(
+                        exact_symbols
+                        if exact_symbols is not None
+                        else None
+                    ),
+                )
+            )
 
         coverage = _build_feature_coverage_summary(
             market_date=collection.market_date,
@@ -1252,28 +2076,105 @@ class DailySignalFeatureService:
         )
 
         result = {
+            **scope_outcome,
             'market_date': collection.market_date,
             'source': SIGNAL_FEATURE_SOURCE,
             'sources': collection.sources,
             'source_counts': collection.source_counts,
+            'raw_source_counts': collection.raw_source_counts,
+            'source_health': collection.source_health,
+            'source_diagnostics': collection.source_diagnostics,
             'source_errors': collection.source_errors,
+            'source_completeness_status': (
+                'partial' if incomplete_sources else 'complete'
+            ),
+            'incomplete_sources': incomplete_sources,
+            'quality_contract_version': (
+                SIGNAL_FEATURE_READINESS_CONTRACT_VERSION
+            ),
+            'quality_status': quality_status,
+            'complete_stock_codes': complete_scope_symbols,
+            'degraded_stock_codes': degraded_scope_symbols,
+            'complete_stock_code_count': len(complete_scope_symbols),
+            'degraded_stock_code_count': len(degraded_scope_symbols),
+            'semantic_ready_count': sum(
+                symbol in publication_symbol_set
+                for symbol in selected_scope_symbols
+            ),
+            'semantic_retry_count': sum(
+                symbol not in publication_symbol_set
+                for symbol in selected_scope_symbols
+            ),
+            'quality_reason_counts': quality_reason_counts,
+            'status': (
+                'partial'
+                if incomplete_sources
+                or failed_symbols
+                or retry_failed_symbols
+                else 'completed'
+            ),
+            'reason': (
+                'signal_feature_sources_incomplete'
+                if incomplete_sources
+                else (
+                    'signal_feature_persistence_incomplete'
+                    if failed_symbols
+                    else (
+                        'signal_feature_evidence_incomplete'
+                        if retry_failed_symbols
+                        else None
+                    )
+                )
+            ),
             'features_persisted': len(persisted_items),
             'features_failed': len(failed_symbols),
             'failed_symbols': failed_symbols[:50],
             'coverage': coverage,
             'participation_context': participation_context,
+            'scope_finalization': scope_finalization,
+            'exact_scope': exact_symbols is not None,
+            'authoritative_market_scope': (
+                authoritative_market_scope is not None
+            ),
+            'scope_symbol_count': len(
+                collection.universe.get('target_symbols') or []
+            ),
+            'scope_membership_sha256': market_membership_sha256(
+                collection.universe.get('target_symbols') or []
+            ),
+            'finalization_scope_symbol_count': len(
+                (
+                    admitted_symbols
+                    if admitted_symbols is not None
+                    else exact_symbols
+                )
+                or ()
+            ),
+            'finalization_scope_membership_sha256': (
+                market_membership_sha256(
+                    admitted_symbols
+                    if admitted_symbols is not None
+                    else exact_symbols
+                )
+                if exact_symbols is not None
+                else None
+            ),
             'items_total': len(persisted_items),
             'items_returned': min(len(persisted_items), SIGNAL_FEATURE_ITEM_PREVIEW_LIMIT),
             'items': _feature_item_preview(persisted_items),
         }
         if include_retry_metadata:
-            result['_retry_metadata'] = {'failed_symbols': failed_symbols}
+            result['_retry_metadata'] = {
+                'failed_symbols': retry_failed_symbols,
+            }
         return result
 
+    @daily_price_bar_writer_admission
     def rebuild_stored_owned_fallback_for_market_date(
         self,
         *,
         market_date: str | date,
+        exact_symbols: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Refresh deterministic fallback fields without refetching rankings.
 
@@ -1286,27 +2187,73 @@ class DailySignalFeatureService:
         """
 
         normalized_market_date = _normalize_market_date(market_date)
-        stored_rows = load_daily_signal_features(
-            market_date=normalized_market_date,
-            symbols=None,
-            limit=None,
+        normalized_exact_symbols: list[str] | None = None
+        if exact_symbols is not None:
+            normalized_exact_symbols = []
+            for value in exact_symbols:
+                normalized_symbol = _normalize_symbol(value)
+                if normalized_symbol is None:
+                    raise ValueError(
+                        'exact signal-feature repair scope contains an '
+                        f'invalid symbol: {value!r}'
+                    )
+                normalized_exact_symbols.append(normalized_symbol)
+            if (
+                not normalized_exact_symbols
+                or len(set(normalized_exact_symbols))
+                != len(normalized_exact_symbols)
+            ):
+                raise ValueError(
+                    'exact signal-feature repair scope must be non-empty '
+                    'and duplicate-free'
+                )
+            normalized_exact_symbols.sort()
+        repair_symbols = (
+            normalized_exact_symbols
+            if normalized_exact_symbols is not None
+            else list_symbols_with_daily_bar_on_date(
+                normalized_market_date
+            )
         )
-        if not stored_rows:
+        stored_rows = load_raw_daily_signal_features_for_repair(
+            market_date=normalized_market_date,
+            symbols=repair_symbols,
+        )
+        if not stored_rows and normalized_exact_symbols is None:
             return {
                 'market_date': normalized_market_date,
                 'stored_rows': 0,
                 'features_persisted': 0,
                 'preserved_direct_source_rows': 0,
+                'scope_symbol_count': 0,
+                'scope_membership_sha256': market_membership_sha256(()),
+                'exact_scope': False,
             }
 
-        stored_symbols = [str(item['symbol']) for item in stored_rows]
-        universe = _resolve_generation_universe(
-            market_date=normalized_market_date,
-            direct_symbols=stored_symbols,
+        stored_map = {
+            str(item['symbol']): item
+            for item in stored_rows
+        }
+        if len(stored_map) != len(stored_rows):
+            raise RuntimeError(
+                'stored signal-feature repair scope contains duplicate rows'
+            )
+        stored_symbols = sorted(stored_map)
+        universe = (
+            _resolve_exact_repair_generation_universe(
+                market_date=normalized_market_date,
+                exact_symbols=normalized_exact_symbols,
+            )
+            if normalized_exact_symbols is not None
+            else _resolve_generation_universe(
+                market_date=normalized_market_date,
+                direct_symbols=stored_symbols,
+            )
         )
+        target_symbols = list(universe.get('target_symbols') or [])
         support_maps = _load_support_maps(
             market_date=normalized_market_date,
-            target_symbols=stored_symbols,
+            target_symbols=target_symbols,
         )
 
         # Do not let today's quote cache rewrite historical quote evidence.
@@ -1324,29 +2271,59 @@ class DailySignalFeatureService:
 
         rebuilt_rows: list[dict[str, Any]] = []
         preserved_direct_source_rows = 0
-        for stored_row in stored_rows:
-            entry = {
-                key: deepcopy(stored_row.get(key))
-                for key in (
-                    'symbol',
-                    'name_ko',
-                    'market',
-                    'market_date',
-                    'source',
-                    'signal_count',
-                    'volume_power_rank',
-                    'volume_power',
-                    'overtime_volume_rank',
-                    'overtime_volume',
-                    'overtime_fluctuation_rank',
-                    'overtime_fluctuation_rate',
-                    'feature_payload',
+        repair_collection_payload = {
+            'collected_at': _utcnow_iso(),
+            'source_errors': {},
+            'source_counts': {
+                source: 0 for source in SUPPORTED_SIGNAL_SOURCES
+            },
+            'repair_mode': 'stored_owned_fallback_exact_scope',
+            'provider_symbols': [],
+        }
+        for symbol in target_symbols:
+            stored_row = stored_map.get(symbol)
+            if stored_row is None:
+                entry = _empty_feature_row(
+                    symbol=symbol,
+                    market_date=normalized_market_date,
+                    source_counts={
+                        source: 0 for source in SUPPORTED_SIGNAL_SOURCES
+                    },
+                    collection=repair_collection_payload,
                 )
-            }
+                collection_payload = repair_collection_payload
+                source_errors: dict[str, str] = {}
+            else:
+                entry = {
+                    key: deepcopy(stored_row.get(key))
+                    for key in (
+                        'symbol',
+                        'name_ko',
+                        'market',
+                        'market_date',
+                        'source',
+                        'signal_count',
+                        'volume_power_rank',
+                        'volume_power',
+                        'overtime_volume_rank',
+                        'overtime_volume',
+                        'overtime_fluctuation_rank',
+                        'overtime_fluctuation_rate',
+                        'feature_payload',
+                    )
+                }
+                stored_payload = dict(
+                    entry.get('feature_payload') or {}
+                )
+                entry['feature_payload'] = stored_payload
+                collection_payload = dict(
+                    stored_payload.get('collection') or {}
+                )
+                source_errors = dict(
+                    collection_payload.get('source_errors') or {}
+                )
             payload = dict(entry.get('feature_payload') or {})
             entry['feature_payload'] = payload
-            collection_payload = dict(payload.get('collection') or {})
-            source_errors = dict(collection_payload.get('source_errors') or {})
             direct_sources_before = deepcopy(payload.get('sources') or {})
             direct_columns_before = tuple(
                 entry.get(key)
@@ -1367,11 +2344,13 @@ class DailySignalFeatureService:
                 support_maps=support_maps,
                 collection_payload=collection_payload,
                 source_errors=source_errors,
+                preserve_collection_shape=True,
+                preserve_quote_snapshot_shape=True,
             )
             if merged is None:
                 raise RuntimeError(
                     'stored signal feature lost every direct and deterministic '
-                    f'fallback input during repair: {stored_row["symbol"]}'
+                    f'fallback input during repair: {symbol}'
                 )
             direct_columns_after = tuple(
                 merged.get(key)
@@ -1392,13 +2371,16 @@ class DailySignalFeatureService:
             ):
                 raise RuntimeError(
                     'deterministic signal-feature repair changed preserved KIS '
-                    f'ranking evidence for {stored_row["symbol"]}'
+                    f'ranking evidence for {symbol}'
                 )
             if direct_sources_before:
                 preserved_direct_source_rows += 1
             rebuilt_rows.append(merged)
 
-        persisted_count = upsert_daily_signal_features(rebuilt_rows)
+        persisted_count = upsert_daily_signal_features(
+            rebuilt_rows,
+            delete_rows_outside_scope=False,
+        )
         if persisted_count != len(rebuilt_rows):
             raise RuntimeError(
                 'deterministic signal-feature repair persistence mismatch: '
@@ -1409,6 +2391,91 @@ class DailySignalFeatureService:
             'stored_rows': len(stored_rows),
             'features_persisted': persisted_count,
             'preserved_direct_source_rows': preserved_direct_source_rows,
+            'scope_symbol_count': len(target_symbols),
+            'scope_membership_sha256': market_membership_sha256(
+                target_symbols
+            ),
+            'exact_scope': normalized_exact_symbols is not None,
+        }
+
+    def build_stored_owned_fallback_rows(
+        self,
+        *,
+        market_date: str | date,
+        symbols: Sequence[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build fallback-only rows from stored data alone, persisting nothing.
+
+        Used to backfill a trading day whose signal-feature rows were never
+        written.  Nothing is fetched: the rows carry no KIS ranking evidence
+        (``signal_count`` 0, ``row_kind`` ``fallback_only``) and no quote
+        snapshot, because today's quote cache is not historical evidence.
+        Every row is tagged ``collection.repair_mode`` so it can always be told
+        apart from rows produced by the live collection.  Symbols with no
+        stored bar or factor input are reported, not written.
+        """
+
+        normalized_market_date = _normalize_market_date(market_date)
+        requested: list[str] = []
+        for value in symbols:
+            normalized_symbol = _normalize_symbol(value)
+            if normalized_symbol is None:
+                raise ValueError(
+                    f'stored fallback backfill got an invalid symbol: {value!r}'
+                )
+            requested.append(normalized_symbol)
+        requested = sorted(set(requested))
+        universe = _resolve_generation_universe(
+            market_date=normalized_market_date,
+            direct_symbols=[],
+        )
+        not_active = sorted(set(requested) - set(universe['target_symbols']))
+        if not_active:
+            raise ValueError(
+                'stored fallback backfill symbols have no daily bar on '
+                f'{normalized_market_date}: {not_active[:5]}'
+            )
+        support_maps = _load_support_maps(
+            market_date=normalized_market_date,
+            target_symbols=requested,
+        )
+        support_maps['quote_map'] = {}
+        collection_payload = {
+            'collected_at': _utcnow_iso(),
+            'source_errors': {},
+            'source_counts': {source: 0 for source in SUPPORTED_SIGNAL_SOURCES},
+            'repair_mode': STORED_FALLBACK_BACKFILL_MODE,
+            'provider_symbols': [],
+        }
+        rows: list[dict[str, Any]] = []
+        without_inputs: list[str] = []
+        for symbol in requested:
+            entry = _empty_feature_row(
+                symbol=symbol,
+                market_date=normalized_market_date,
+                source_counts=dict(collection_payload['source_counts']),
+                collection=dict(collection_payload),
+            )
+            merged = _merge_owned_fallback_features(
+                entry=entry,
+                market_date=normalized_market_date,
+                universe=universe,
+                support_maps=support_maps,
+                collection_payload=collection_payload,
+                source_errors={},
+            )
+            provenance = ((merged or {}).get('feature_payload') or {}).get(
+                'row_provenance'
+            ) or {}
+            if merged is None or not provenance.get('fallback_groups_present'):
+                without_inputs.append(symbol)
+                continue
+            rows.append(merged)
+        return rows, {
+            'market_date': normalized_market_date,
+            'requested_symbol_count': len(requested),
+            'built_row_count': len(rows),
+            'without_stored_inputs': without_inputs,
         }
 
     def inspect(
@@ -1483,7 +2550,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     result = asyncio.run(_run_from_args(args))
     print(result)
-    return 0
+    return 0 if result.get('status') == 'completed' else 2
 
 
 if __name__ == '__main__':

@@ -11,8 +11,8 @@ Returns a compact market-condition payload for the dashboard card from Core’s 
 Runtime requirements:
 - KIS reads resolve to the real domain by default through `MARKET_SNAPSHOT_KIS_USE_REAL=true`, because the selected KIS index and investor-flow APIs are real-domain only
 - required secrets: `KIS_APP_KEY`, `KIS_APP_SECRET`, `KOREAEXIM_API_KEY`
-- the full snapshot/optional-leg cadence is controlled by `MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS` (default `3600`)
-- while the provider-reported market clock is between `09:00:00` and `14:30:59` KST, the index leg is refreshed in independently claimed buckets controlled by `MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS` (default `300`)
+- the normal full-snapshot and FX cadence is controlled by `MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS` (default `3600`)
+- on a KRX trading day, the half-open `08:50:00`–`15:31:00` KST open-drive window refreshes both the index and investor-flow legs in independently claimed buckets controlled by `MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS` (default `300`); FX remains on its normal cadence
 - `MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS` (default `360`) is the maximum provider-observation age accepted by the open-drive decision path; the refresh interval cannot exceed it
 - a timed-out background refresh remains single-flight and shielded from cancellation. A later successful completion clears its timeout cooldown instead of allowing a duplicate provider request
 - `GET /broker/kis/health` exposes `market_snapshot_runtime` for readiness/debugging
@@ -29,6 +29,9 @@ Degradation behavior:
 - when no cached USD/KRW value exists, the snapshot becomes partial and `missing_fields` includes the missing FX fields
 - `freshness` reports the current cache cadence, last refresh attempt/success timestamps, next due time, and whether the last refresh was `success`, `degraded`, or `error`
 - each market row binds its value to `provider_business_date`, `provider_session_time`, and timezone-aware `provider_observed_at`; `index_leg.status: "ready"` also requires a matching KIS intraday-bar observation and receipt-time freshness proof
+- the 08:50 PREOPEN refresh may retain prior-session evidence, but `flow_leg.current_session` remains false and live KRX BUY stays fail-closed until the first same-day regular-session provider proof at or after 09:00
+- during OPEN, `flow_leg.status: "ready"` requires same-day regular-session provenance and observation age no greater than `MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS`
+- after close, an unavailable or unverified flow refresh preserves the last trusted same-date closing flow as `flow_leg.status: "cached"` with its original provider timestamp. That evidence is valid only for same-market-date EOD context; live execution still fails the freshness gate, and a next-day PREOPEN date mismatch cannot revive it
 - `trading_value` keeps KIS `acml_tr_pbmn` semantics and is paired with `trading_value_unit: "million_krw"`
 - `foreign_net_value` and `institution_net_value` are normalized from KIS `*_tr_pbmn` fields into raw KRW and are paired with `investor_flow_value_unit: "krw"`
 
@@ -80,6 +83,19 @@ GET /market/snapshot
         "observation_age_seconds": 2.0,
         "observation_payload_match": true,
         "error": null
+      },
+      "flow_leg": {
+        "status": "ready",
+        "source": "kis_investor_time_by_market",
+        "observation_source": "current_session_index_anchor",
+        "collected_at": "2026-04-30T13:15:02+09:00",
+        "provider_observed_at": "2026-04-30T13:15:00+09:00",
+        "provider_business_date": "2026-04-30",
+        "provider_session_time": "13:15:00",
+        "observation_age_seconds": 2.0,
+        "current_session": true,
+        "max_age_seconds": 360,
+        "error": null
       }
     },
     "kosdaq": {
@@ -116,6 +132,19 @@ GET /market/snapshot
         "provider_observed_at": "2026-04-30T13:15:00+09:00",
         "observation_age_seconds": 3.0,
         "observation_payload_match": true,
+        "error": null
+      },
+      "flow_leg": {
+        "status": "ready",
+        "source": "kis_investor_time_by_market",
+        "observation_source": "current_session_index_anchor",
+        "collected_at": "2026-04-30T13:15:03+09:00",
+        "provider_observed_at": "2026-04-30T13:15:00+09:00",
+        "provider_business_date": "2026-04-30",
+        "provider_session_time": "13:15:00",
+        "observation_age_seconds": 3.0,
+        "current_session": true,
+        "max_age_seconds": 360,
         "error": null
       }
     }

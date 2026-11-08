@@ -3,7 +3,8 @@ import inspect
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -137,7 +138,40 @@ def _runtime_source(
     )
 
 
+def _market_state(
+    state: str,
+    *,
+    calendar_source: str = 'kis_chk_holiday',
+    calendar_source_status: str = 'ok',
+    calendar_source_error: str | None = None,
+) -> SimpleNamespace:
+    now = datetime.now(timezone.utc)
+    normalized = state.strip().upper()
+    is_trading_day = normalized not in {'WEEKEND', 'HOLIDAY'}
+    return SimpleNamespace(
+        market='KRX',
+        state=normalized,
+        is_trading_day=is_trading_day,
+        is_open=normalized == 'OPEN',
+        server_time=now.isoformat(),
+        session_open_at=(now - timedelta(hours=1)).isoformat(),
+        session_close_at=(now + timedelta(hours=1)).isoformat(),
+        calendar_source=calendar_source,
+        calendar_source_status=calendar_source_status,
+        calendar_source_error=calendar_source_error,
+    )
+
+
+def _record_open_market_session(service: KISRealtimePriceService) -> None:
+    service._record_market_session(_market_state('OPEN'), active=True)
+
+
 class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_service_has_no_wait_recheck_dependency(self) -> None:
+        implementation = inspect.getsource(kis_realtime_prices)
+
+        self.assertNotIn('wait_recheck', implementation)
+
     def setUp(self) -> None:
         self.original_settings = {
             'kis_realtime_price_max_subscriptions': settings.kis_realtime_price_max_subscriptions,
@@ -153,6 +187,142 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         for key, value in self.original_settings.items():
             setattr(settings, key, value)
+
+    async def _assert_idle_market_transition_connects(
+        self,
+        *,
+        initial_market: SimpleNamespace,
+        expected_idle_status: str,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        trace: list[str] = []
+        idle_statuses: list[str] = []
+        authoritative_open = _market_state('OPEN')
+        market_state = AsyncMock(
+            side_effect=(
+                initial_market,
+                authoritative_open,
+                authoritative_open,
+                authoritative_open,
+                authoritative_open,
+                authoritative_open,
+            )
+        )
+
+        async def wait_once(_: float) -> None:
+            trace.append('idle_wait')
+            idle_statuses.append(service.health_snapshot()['status'])
+
+        wait_for_change = AsyncMock(side_effect=wait_once)
+
+        async def refresh_once(**_: object) -> dict:
+            trace.append('refresh')
+            return {}
+
+        refresh = AsyncMock(side_effect=refresh_once)
+
+        async def issue_approval() -> dict[str, str]:
+            trace.append('approval')
+            return {'approval_key': 'approval-test'}
+
+        service.client.issue_approval_key = AsyncMock(
+            side_effect=issue_approval
+        )
+        websocket = FakeWebSocket()
+
+        async def send_subscription(message: str) -> None:
+            trace.append('subscription')
+            websocket.sent.append(json.loads(message))
+
+        websocket.send = AsyncMock(side_effect=send_subscription)
+
+        async def stop_after_subscription(*_: object, **__: object) -> None:
+            service._stop_requested = True
+
+        receive_or_refresh = AsyncMock(side_effect=stop_after_subscription)
+
+        class FakeConnection:
+            async def __aenter__(self) -> FakeWebSocket:
+                return websocket
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+        def open_connection(*_: object, **__: object) -> FakeConnection:
+            trace.append('connect')
+            return FakeConnection()
+
+        connect = Mock(side_effect=open_connection)
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                market_state,
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+            patch.object(
+                service,
+                '_wait_for_change_or_timeout',
+                wait_for_change,
+            ),
+            patch.object(
+                service,
+                '_receive_or_refresh',
+                receive_or_refresh,
+            ),
+            patch.object(
+                service,
+                '_is_configured',
+                return_value=(True, None),
+            ),
+        ):
+            await service._run()
+
+        self.assertEqual(
+            trace,
+            ['idle_wait', 'refresh', 'approval', 'connect', 'subscription'],
+        )
+        self.assertEqual(idle_statuses, [expected_idle_status])
+        wait_for_change.assert_awaited_once_with(
+            settings.kis_realtime_price_idle_poll_seconds
+        )
+        refresh.assert_awaited_once_with(trigger='background', force=False)
+        service.client.issue_approval_key.assert_awaited_once_with()
+        connect.assert_called_once_with(
+            'ws://example.test:31000',
+            ping_interval=30.0,
+            ping_timeout=10.0,
+        )
+        websocket.send.assert_awaited_once()
+        receive_or_refresh.assert_awaited_once_with(
+            websocket,
+            approval_key='approval-test',
+        )
+        self.assertEqual(
+            [
+                (
+                    item['header']['tr_type'],
+                    item['body']['input']['tr_key'],
+                )
+                for item in websocket.sent
+            ],
+            [('1', '005930')],
+        )
+        self.assertEqual(market_state.await_count, 6)
+        health = service.health_snapshot()
+        self.assertEqual(health['market_state'], 'OPEN')
+        self.assertTrue(health['market_session_active'])
+        self.assertFalse(health['websocket_connected'])
+        self.assertEqual(health['market_calendar_source'], 'kis_chk_holiday')
+        self.assertEqual(health['market_calendar_source_status'], 'ok')
+        self.assertEqual(health['reconnect_attempts'], 0)
+        self.assertIsNone(health['last_error'])
 
     async def test_parse_realtime_price_message_handles_multiple_ticks(self) -> None:
         received_at = datetime(2026, 4, 30, 0, 16, tzinfo=timezone.utc)
@@ -201,6 +371,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_subscription_limit_and_dedupe(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
         websocket = FakeWebSocket()
+        _record_open_market_session(service)
 
         snapshot = service.observe_monitored_symbols(
             ['005930', '000660', '005930', '035420'],
@@ -223,6 +394,460 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
             [('2', '000660'), ('2', '005930'), ('1', '035420')],
         )
 
+    async def test_background_connection_uses_official_transport_heartbeat(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        websocket = FakeWebSocket()
+        ping_message = json.dumps(
+            {'header': {'tr_id': 'PINGPONG'}, 'body': {}}
+        )
+
+        async def receive_ping_once() -> str:
+            service._stop_requested = True
+            return ping_message
+
+        websocket.recv = AsyncMock(side_effect=receive_ping_once)
+
+        class FakeConnection:
+            async def __aenter__(self) -> FakeWebSocket:
+                return websocket
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+        connect = Mock(return_value=FakeConnection())
+        refresh = AsyncMock(return_value={})
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(return_value=_market_state('OPEN')),
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+        ):
+            await service._run()
+
+        connect.assert_called_once_with(
+            'ws://example.test:31000',
+            ping_interval=30.0,
+            ping_timeout=10.0,
+        )
+        self.assertIn({'pong': ping_message}, websocket.sent)
+        self.assertEqual(
+            service.health_snapshot()['metrics']['system_messages'],
+            1,
+        )
+
+    async def test_background_stream_does_not_connect_when_market_is_weekend(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        refresh = AsyncMock(return_value={})
+        connect = Mock()
+
+        async def stop_after_idle(_: float) -> None:
+            service._stop_requested = True
+
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(return_value=_market_state('WEEKEND')),
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+            patch.object(
+                service,
+                '_wait_for_change_or_timeout',
+                AsyncMock(side_effect=stop_after_idle),
+            ),
+        ):
+            await service._run()
+
+        service.client.issue_approval_key.assert_not_awaited()
+        refresh.assert_not_awaited()
+        connect.assert_not_called()
+        health = service.health_snapshot()
+        self.assertEqual(health['status'], 'idle_market_weekend')
+        self.assertEqual(health['market_state'], 'WEEKEND')
+        self.assertFalse(health['market_session_active'])
+        self.assertFalse(health['websocket_connected'])
+        self.assertEqual(health['reconnect_attempts'], 0)
+
+    def test_closed_market_snapshot_preserves_desired_membership_without_pending_or_limited_items(
+        self,
+    ) -> None:
+        with (
+            patch.object(settings, 'kis_realtime_price_enabled', True),
+            patch.object(settings, 'kis_app_key', 'test-key'),
+            patch.object(settings, 'kis_app_secret', 'test-secret'),
+        ):
+            service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+            service.observe_monitored_symbols(
+                ['005930', '000660', '035420'],
+                trigger='test',
+            )
+            service._set_market_idle(_market_state('WEEKEND'))
+
+            closed = service.monitored_snapshot()
+
+            self.assertEqual(closed['summary']['desired_count'], 3)
+            self.assertEqual(closed['summary']['pending_count'], 0)
+            self.assertEqual(closed['summary']['limited_count'], 0)
+            self.assertEqual(
+                {item['price_status'] for item in closed['items']},
+                {'market_closed'},
+            )
+            self.assertEqual(
+                {item['realtime_subscription_reason'] for item in closed['items']},
+                {'market_weekend'},
+            )
+
+            _record_open_market_session(service)
+            service.subscription_snapshot()
+            reopened = service.monitored_snapshot()
+
+            self.assertEqual(reopened['summary']['desired_count'], 3)
+            self.assertEqual(reopened['summary']['pending_count'], 2)
+            self.assertEqual(reopened['summary']['limited_count'], 1)
+            self.assertEqual(
+                {item['price_status'] for item in reopened['items']},
+                {'pending', 'limited'},
+            )
+
+    async def test_background_stream_fails_closed_when_calendar_is_unverified(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        refresh = AsyncMock(return_value={})
+        connect = Mock()
+
+        async def stop_after_idle(_: float) -> None:
+            service._stop_requested = True
+
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(
+                    return_value=_market_state(
+                        'OPEN',
+                        calendar_source='exchange_calendars',
+                        calendar_source_status='fallback',
+                        calendar_source_error='kis calendar unavailable',
+                    )
+                ),
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+            patch.object(
+                service,
+                '_wait_for_change_or_timeout',
+                AsyncMock(side_effect=stop_after_idle),
+            ),
+        ):
+            await service._run()
+
+        service.client.issue_approval_key.assert_not_awaited()
+        refresh.assert_not_awaited()
+        connect.assert_not_called()
+        health = service.health_snapshot()
+        self.assertEqual(health['status'], 'idle_market_unverified')
+        self.assertEqual(health['market_state'], 'OPEN')
+        self.assertFalse(health['market_session_active'])
+        self.assertFalse(health['websocket_connected'])
+        self.assertEqual(
+            health['market_calendar_source_status'],
+            'fallback',
+        )
+
+    async def test_preopen_transitions_to_authoritative_open_without_reconnect(
+        self,
+    ) -> None:
+        await self._assert_idle_market_transition_connects(
+            initial_market=_market_state('PREOPEN'),
+            expected_idle_status='idle_market_preopen',
+        )
+
+    async def test_closed_transitions_to_next_open_without_reconnect(
+        self,
+    ) -> None:
+        await self._assert_idle_market_transition_connects(
+            initial_market=_market_state('CLOSED'),
+            expected_idle_status='idle_market_closed',
+        )
+
+    async def test_fallback_calendar_transitions_to_authoritative_open_without_reconnect(
+        self,
+    ) -> None:
+        await self._assert_idle_market_transition_connects(
+            initial_market=_market_state(
+                'OPEN',
+                calendar_source='exchange_calendars',
+                calendar_source_status='fallback',
+                calendar_source_error='kis calendar unavailable',
+            ),
+            expected_idle_status='idle_market_unverified',
+        )
+
+    async def test_inactive_market_resets_active_session_reconnect_backoff(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        service.client.issue_approval_key = AsyncMock(
+            side_effect=RuntimeError('transient approval failure')
+        )
+        market_state = AsyncMock(
+            side_effect=(
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+                _market_state('CLOSED'),
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+            )
+        )
+        sleep_delays: list[float] = []
+
+        async def record_reconnect_sleep(delay: float) -> None:
+            sleep_delays.append(delay)
+            if len(sleep_delays) == 3:
+                service._stop_requested = True
+
+        with (
+            patch.object(
+                settings,
+                'kis_realtime_reconnect_base_delay_seconds',
+                3.0,
+            ),
+            patch.object(
+                settings,
+                'kis_realtime_reconnect_max_delay_seconds',
+                30.0,
+            ),
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                market_state,
+            ),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                service,
+                '_wait_for_change_or_timeout',
+                AsyncMock(),
+            ),
+            patch.object(
+                kis_realtime_prices.asyncio,
+                'sleep',
+                AsyncMock(side_effect=record_reconnect_sleep),
+            ),
+        ):
+            await service._run()
+
+        self.assertEqual(sleep_delays, [3.0, 6.0, 3.0])
+        self.assertEqual(market_state.await_count, 7)
+        self.assertEqual(
+            service.client.issue_approval_key.await_count,
+            3,
+        )
+        self.assertEqual(
+            service.health_snapshot()['reconnect_attempts'],
+            3,
+        )
+
+    async def test_market_state_error_invalidates_open_session(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service._record_market_session(_market_state('OPEN'), active=True)
+        with service._state_lock:
+            service._base_symbols = {'000660'}
+            service._base_symbol_order = ['000660']
+            service._desired_symbols = {'000660'}
+            service._desired_symbol_order = ['000660']
+            service._sync_health_symbols_locked()
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        refresh = AsyncMock(return_value={})
+        connect = Mock()
+
+        async def stop_after_idle(_: float) -> None:
+            service._stop_requested = True
+
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(side_effect=RuntimeError('calendar lookup failed')),
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+            patch.object(
+                service,
+                '_wait_for_change_or_timeout',
+                AsyncMock(side_effect=stop_after_idle),
+            ),
+        ):
+            await service._run()
+
+        service.client.issue_approval_key.assert_not_awaited()
+        refresh.assert_not_awaited()
+        connect.assert_not_called()
+        health = service.health_snapshot()
+        self.assertEqual(health['status'], 'idle_market_unverified')
+        self.assertEqual(health['market_state'], 'UNKNOWN')
+        self.assertFalse(health['market_session_active'])
+        self.assertFalse(health['websocket_connected'])
+        self.assertEqual(health['market_calendar_source_status'], 'unavailable')
+        self.assertEqual(health['desired_symbols'], ['000660'])
+        self.assertEqual(health['reconnect_attempts'], 0)
+        self.assertEqual(health['last_error']['stage'], 'market_state')
+
+    async def test_background_stream_disconnects_when_open_market_closes(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        with service._state_lock:
+            service._base_symbols = {'000660'}
+            service._base_symbol_order = ['000660']
+            service._desired_symbols = {'000660'}
+            service._desired_symbol_order = ['000660']
+            service._sync_health_symbols_locked()
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        websocket = FakeWebSocket()
+        websocket.recv = AsyncMock()
+
+        class FakeConnection:
+            async def __aenter__(self) -> FakeWebSocket:
+                return websocket
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+        connect = Mock(return_value=FakeConnection())
+        refresh = AsyncMock(return_value={})
+        market_states = iter(
+            (
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+                _market_state('OPEN'),
+                _market_state('CLOSED'),
+            )
+        )
+
+        async def next_market_state() -> SimpleNamespace:
+            market = next(market_states)
+            if market.state == 'CLOSED':
+                service._stop_requested = True
+            return market
+
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(side_effect=next_market_state),
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+        ):
+            await service._run()
+
+        connect.assert_called_once()
+        websocket.recv.assert_not_awaited()
+        health = service.health_snapshot()
+        self.assertEqual(health['status'], 'idle_market_closed')
+        self.assertEqual(health['market_state'], 'CLOSED')
+        self.assertFalse(health['market_session_active'])
+        self.assertFalse(health['websocket_connected'])
+        self.assertEqual(health['subscribed_symbols'], [])
+        self.assertEqual(health['desired_symbols'], ['000660'])
+
+    async def test_market_close_after_source_refresh_prevents_approval_and_connect(
+        self,
+    ) -> None:
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(['005930'], trigger='test')
+        service.client.issue_approval_key = AsyncMock(
+            return_value={'approval_key': 'approval-test'}
+        )
+        refresh = AsyncMock(return_value={})
+        connect = Mock()
+        market_states = iter(
+            (_market_state('OPEN'), _market_state('CLOSED'))
+        )
+
+        async def next_market_state() -> SimpleNamespace:
+            market = next(market_states)
+            if market.state == 'CLOSED':
+                service._stop_requested = True
+            return market
+
+        with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(side_effect=next_market_state),
+            ),
+            patch.object(kis_realtime_prices.websockets, 'connect', connect),
+            patch.object(
+                service,
+                'refresh_subscription_source_if_due',
+                refresh,
+            ),
+        ):
+            await service._run()
+
+        refresh.assert_awaited_once()
+        service.client.issue_approval_key.assert_not_awaited()
+        connect.assert_not_called()
+        health = service.health_snapshot()
+        self.assertEqual(health['status'], 'idle_market_closed')
+        self.assertFalse(health['websocket_connected'])
+
     async def test_subscription_limit_preserves_priority_order_when_requested(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
 
@@ -243,6 +868,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        _record_open_market_session(service)
         service.observe_monitored_symbols(['005930'], trigger='dashboard')
         release_loader = asyncio.Event()
 
@@ -294,6 +920,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        _record_open_market_session(service)
         service.observe_monitored_symbols(['005930'], trigger='dashboard')
         release_loader = asyncio.Event()
 
@@ -348,6 +975,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        _record_open_market_session(service)
         service.observe_monitored_symbols(['005930'], trigger='initial-dashboard')
         loader_started = asyncio.Event()
         release_loader = asyncio.Event()
@@ -401,6 +1029,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unversioned_empty_source_cannot_clear_current_symbols(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        _record_open_market_session(service)
         service.observe_monitored_symbols(
             ['027710'],
             trigger='current-dashboard',
@@ -629,6 +1258,38 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot['limited_symbols'], ['005930'])
         self.assertEqual(snapshot['protected_symbols'], ['030000'])
 
+    async def test_partial_source_prioritizes_active_exec_watch_over_passive_observation(
+        self,
+    ) -> None:
+        settings.kis_realtime_price_max_subscriptions = 1
+        service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        service.observe_monitored_symbols(
+            ['005930'],
+            trigger='cached-passive-observation',
+            preserve_order=True,
+        )
+        payload = _runtime_source_payload(
+            ['005930', '030000'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=False,
+        )
+        payload['items'][1].update(
+            {
+                'monitoring_state': 'watching_fill',
+                'exec_monitoring_active': True,
+                'exec_runtime_showable': True,
+            }
+        )
+
+        snapshot = service.observe_runtime_monitored_payload(
+            payload,
+            trigger='partial-active-exec-watch',
+        )
+
+        self.assertEqual(snapshot['allowed_symbols'], ['030000'])
+        self.assertEqual(snapshot['limited_symbols'], ['005930'])
+        self.assertEqual(snapshot['protected_symbols'], ['030000'])
+
     async def test_planned_exit_intents_alone_do_not_take_capacity(self) -> None:
         settings.kis_realtime_price_max_subscriptions = 1
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
@@ -713,6 +1374,38 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_krx_symbol_revokes_complete_membership_authority(self) -> None:
         payload = _runtime_source_payload(
             ['005930', 'AAPL'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertEqual(source.symbols, ('005930',))
+        self.assertFalse(source.membership_complete)
+
+    async def test_alphanumeric_krx_symbol_preserves_complete_membership_authority(
+        self,
+    ) -> None:
+        payload = _runtime_source_payload(
+            ['0010A0'],
+            generated_at=datetime.now(timezone.utc),
+            membership_complete=True,
+        )
+
+        source = KISRealtimePriceService._runtime_monitored_source_from_payload(
+            payload
+        )
+
+        self.assertEqual(source.symbols, ('0010A0',))
+        self.assertTrue(source.membership_complete)
+
+    async def test_malformed_alphanumeric_krx_shape_revokes_complete_authority(
+        self,
+    ) -> None:
+        payload = _runtime_source_payload(
+            ['005930', '12A456'],
             generated_at=datetime.now(timezone.utc),
             membership_complete=True,
         )
@@ -1013,6 +1706,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+        _record_open_market_session(service)
         now = datetime.now(timezone.utc)
         source = KISRealtimeMonitoredSymbolSource(
             symbols=('027710',),
@@ -1064,6 +1758,11 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
         refresh = AsyncMock(side_effect=_stop_after_refresh)
         wait_for_change = AsyncMock()
         with (
+            patch.object(
+                kis_realtime_prices,
+                'async_get_market_state',
+                AsyncMock(return_value=_market_state('OPEN')),
+            ),
             patch.object(service, 'refresh_subscription_source_if_due', refresh),
             patch.object(service, '_wait_for_change_or_timeout', wait_for_change),
         ):
@@ -1075,6 +1774,7 @@ class KISRealtimePriceServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_subscription_ack_clears_subscribed_symbol_for_retry(self) -> None:
         service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
         websocket = FakeWebSocket()
+        _record_open_market_session(service)
 
         service.observe_monitored_symbols(['005930'], trigger='test')
         await service._sync_subscriptions(websocket, approval_key='approval-test')

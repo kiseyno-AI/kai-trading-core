@@ -81,6 +81,7 @@ class AgentContextStatusService:
             raise ValueError('symbols is required')
         prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
             market_date=normalized_market_date,
+            symbols=normalized_symbols,
         )
         try:
             latest_run = agent_context_feedback_run_state_service.find_latest_run(

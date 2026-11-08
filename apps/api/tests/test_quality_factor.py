@@ -40,6 +40,29 @@ def _highlight_row(
     }
 
 
+def _statement_row(
+    row_key: str,
+    *,
+    statement_type: str,
+    account_id: str,
+    account_name: str,
+    amount: int,
+    row_order: int,
+) -> dict:
+    return {
+        'row_key': row_key,
+        'statement_type': statement_type,
+        'statement_name': 'financial_statement',
+        'account_id': account_id,
+        'account_name': account_name,
+        'account_detail': None,
+        'current_amount': amount,
+        'current_cumulative_amount': None,
+        'row_order': row_order,
+        'currency': 'KRW',
+    }
+
+
 def _snapshot(
     symbol: str,
     *,
@@ -164,6 +187,19 @@ def _input(
 
 
 class DailyQualityFactorServiceTests(unittest.TestCase):
+    def test_explicit_empty_scope_is_completed_noop(self) -> None:
+        result = DailyQualityFactorService().rebuild_for_market_date(
+            market_date='2026-04-24',
+            symbols=[],
+            ranking_symbols=[],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['reason'], 'explicit_empty_scope_noop')
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['blocking_status'], 'non_blocking')
+        self.assertEqual(result['selected_stock_codes'], [])
+
     def test_negative_equity_cannot_rank_as_low_leverage(self) -> None:
         service = DailyQualityFactorService()
         market_date = date(2026, 4, 24)
@@ -232,6 +268,67 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
         self.assertEqual(gross_profit_audit['formula'], 'gross_profit / total_assets')
         self.assertEqual(gross_profit_audit['gross_profit']['metric_key'], 'gross_profit')
         self.assertEqual(gross_profit_audit['total_assets']['metric_key'], 'total_assets')
+
+    def test_build_uses_statement_rows_when_canonical_quality_highlights_are_missing(self) -> None:
+        service = DailyQualityFactorService()
+        market_date = date(2026, 4, 24)
+        snapshot = _snapshot(
+            '005930',
+            total_equity=800,
+            total_liabilities=160,
+            net_income=240,
+            total_assets=1_000,
+            operating_cash_flow=300,
+            gross_margin=None,
+            asset_turnover=None,
+            debt_ratio=None,
+        )
+        snapshot.highlights_by_key.pop('net_income')
+        snapshot.highlights_by_key.pop('total_assets')
+        snapshot.statement_rows.extend(
+            [
+                _statement_row(
+                    'profit_loss',
+                    statement_type='CIS',
+                    account_id='ifrs-full_ProfitLoss',
+                    account_name='당기순이익',
+                    amount=240,
+                    row_order=1,
+                ),
+                _statement_row(
+                    'assets',
+                    statement_type='BS',
+                    account_id='ifrs-full_Assets',
+                    account_name='자산총계',
+                    amount=1_000,
+                    row_order=2,
+                ),
+                _statement_row(
+                    'gross_profit',
+                    statement_type='CIS',
+                    account_id='ifrs-full_GrossProfit',
+                    account_name='매출총이익',
+                    amount=250,
+                    row_order=3,
+                ),
+            ]
+        )
+
+        result = service._build_symbol_result(
+            input_row=_input('005930', market_date, snapshot=snapshot),
+            market_date=market_date,
+            source=QUALITY_FACTOR_VERSION,
+        )
+
+        self.assertEqual(result['roe'], 0.3)
+        self.assertEqual(result['roa'], 0.24)
+        self.assertEqual(result['gross_profit_to_assets'], 0.25)
+        self.assertEqual(result['_net_income_source']['source_type'], 'statement_row')
+        self.assertEqual(result['_total_assets_source']['source_type'], 'statement_row')
+        self.assertEqual(
+            result['_gross_profit_to_assets_source']['gross_profit']['source_type'],
+            'statement_row',
+        )
 
     def test_rebuild_scores_complete_universe_and_uses_required_accruals_formula(self) -> None:
         service = DailyQualityFactorService()
@@ -355,6 +452,21 @@ class DailyQualityFactorServiceTests(unittest.TestCase):
         self.assertFalse(persisted['is_quality_score_complete'])
         self.assertIsNotNone(persisted['quality_score'])
         self.assertEqual(result['summary']['scored_partial_count'], 1)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['summary']['coverage_status'], 'completed')
+        self.assertEqual(result['summary']['persisted_count'], 1)
+        self.assertEqual(result['summary']['ready_count'], 1)
+        self.assertEqual(result['summary']['complete_count'], 0)
+        self.assertEqual(result['summary']['partial_count'], 1)
+        self.assertEqual(result['summary']['unusable_count'], 0)
+        self.assertEqual(result['summary']['quality_status'], 'degraded')
+        self.assertEqual(result['summary']['quality_warning'], 'partial_input_factor_cohort')
+        self.assertEqual(
+            result['summary']['input_family_cohort_coverage']['gross_profit_to_assets'][
+                'unavailable_count'
+            ],
+            1,
+        )
 
     def test_rebuild_marks_missing_fundamentals_as_insufficient_fundamentals(self) -> None:
         service = DailyQualityFactorService()
@@ -491,7 +603,7 @@ class DailyQualityFactorPersistenceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = DailyQualityFactorService()
         self.market_date = date(2026, 4, 24)
-        self.symbols = ['TQF2601', 'TQF2602']
+        self.symbols = ['9261Q1', '9261Q2']
 
     def tearDown(self) -> None:
         with session_scope() as session:

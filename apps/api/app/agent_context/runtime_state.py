@@ -370,6 +370,10 @@ class RuntimeFeedbackRunState:
             'progress_ratio': progress_fields['progress_ratio'],
             'progress_percent': progress_fields['progress_percent'],
             'failed_items': failed_items,
+            'failed_symbols_by_role': {
+                role: sorted(symbols)
+                for role, symbols in self.failed_symbols_by_role.items()
+            },
             'completed_feedback_count': completed_feedback_count,
             'computed_feedback_count': computed_feedback_count,
             'reused_feedback_count': reused_feedback_count,

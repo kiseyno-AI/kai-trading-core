@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from time import perf_counter
 from types import SimpleNamespace
 import unittest
@@ -12,6 +12,8 @@ from app.market.clock import async_get_market_state, get_market_state
 from app.market.session import (
     CALENDAR_SOURCE_EXCHANGE_CALENDARS,
     CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
+    get_krx_exchange_calendar_day,
+    InMemoryKrxCalendarCache,
     RECOMMENDATION_BASIS_LATEST_COMPLETED_EOD,
     RECOMMENDATION_BASIS_LIVE_INTRADAY,
     build_market_session_metadata,
@@ -160,9 +162,8 @@ class MarketSessionTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
 
     def test_kis_provider_falls_back_with_metadata_on_upstream_failure(self):
-        provider = KisKrxTradingCalendarProvider(
-            client=FakeCalendarClient(error=RuntimeError('kis down'))
-        )
+        client = FakeCalendarClient(error=RuntimeError('kis down'))
+        provider = KisKrxTradingCalendarProvider(client=client)
 
         result = provider.lookup_day(date(2026, 4, 29), allow_fallback=True)
 
@@ -172,6 +173,196 @@ class MarketSessionTests(unittest.TestCase):
         self.assertIn('kis down', result.calendar_source_error or '')
         with self.assertRaises(KrxCalendarUnavailableError):
             provider.lookup_day(date(2026, 4, 29), allow_fallback=False)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_kis_provider_refetches_non_authoritative_primary_cache(self):
+        target_date = date(2026, 4, 29)
+        cache = InMemoryKrxCalendarCache()
+        cache.store_days(
+            [
+                get_krx_exchange_calendar_day(
+                    target_date,
+                    status='fallback',
+                    error='seeded fallback',
+                )
+            ]
+        )
+        client = FakeCalendarClient(
+            {'output': [{'bass_dt': '20260429', 'opnd_yn': 'Y'}]}
+        )
+        provider = KisKrxTradingCalendarProvider(client=client, cache=cache)
+
+        permissive = provider.lookup_day(target_date, allow_fallback=True)
+
+        self.assertEqual(
+            permissive.calendar_source,
+            CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
+        )
+        self.assertEqual(permissive.calendar_source_status, 'ok')
+        strict = provider.lookup_day(target_date, allow_fallback=False)
+        self.assertEqual(strict.calendar_source, CALENDAR_SOURCE_KIS_CHK_HOLIDAY)
+        self.assertEqual(strict.calendar_source_status, 'ok')
+        self.assertEqual(len(client.calls), 1)
+
+    def test_kis_provider_revalidates_primary_cache_after_fetch(self):
+        target_date = date(2026, 4, 29)
+        cache = InMemoryKrxCalendarCache()
+
+        class CacheSeedingCalendarClient:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def fetch_krx_holiday_calendar(self, **kwargs):
+                self.calls.append(kwargs)
+                cache.store_days(
+                    [
+                        get_krx_exchange_calendar_day(
+                            target_date,
+                            status='fallback',
+                            error='concurrent seeded fallback',
+                        )
+                    ]
+                )
+                return {'output': []}
+
+        client = CacheSeedingCalendarClient()
+        provider = KisKrxTradingCalendarProvider(client=client, cache=cache)
+
+        with self.assertRaises(KrxCalendarUnavailableError):
+            provider.lookup_day(target_date, allow_fallback=False)
+        permissive = provider.lookup_day(target_date, allow_fallback=True)
+
+        self.assertEqual(
+            permissive.calendar_source,
+            CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+        )
+        self.assertEqual(permissive.calendar_source_status, 'missing_date')
+        self.assertEqual(len(client.calls), 1)
+
+    def test_async_market_state_reuses_failure_fallback_within_retry_ttl(self):
+        async def scenario():
+            client = FakeCalendarClient(error=RuntimeError('kis down'))
+            set_krx_calendar_provider(
+                KisKrxTradingCalendarProvider(client=client)
+            )
+            current_time = datetime(2026, 4, 29, 12, 0, tzinfo=KST)
+
+            first = await async_get_market_state(current_time)
+            second = await async_get_market_state(current_time)
+
+            self.assertEqual(first.calendar_source, CALENDAR_SOURCE_EXCHANGE_CALENDARS)
+            self.assertEqual(first.calendar_source_status, 'fallback')
+            self.assertIn('kis down', first.calendar_source_error or '')
+            self.assertEqual(second.calendar_source, CALENDAR_SOURCE_EXCHANGE_CALENDARS)
+            self.assertEqual(second.calendar_source_status, 'fallback')
+            self.assertIn('kis down', second.calendar_source_error or '')
+            self.assertEqual(len(client.calls), 1)
+
+        self.loop_run(scenario())
+
+    def test_kis_provider_reuses_missing_date_fallback_within_retry_ttl(self):
+        async def scenario():
+            client = FakeCalendarClient({'output': []})
+            provider = KisKrxTradingCalendarProvider(client=client)
+
+            first = await provider.lookup_day_async(
+                date(2026, 4, 29),
+                allow_fallback=True,
+            )
+            second = await provider.lookup_day_async(
+                date(2026, 4, 29),
+                allow_fallback=True,
+            )
+
+            self.assertEqual(first.calendar_source_status, 'missing_date')
+            self.assertEqual(second.calendar_source_status, 'missing_date')
+            self.assertEqual(len(client.calls), 1)
+
+        self.loop_run(scenario())
+
+    def test_fallback_cache_expires_and_recovers_authoritative_kis(self):
+        async def scenario():
+            cache_time = datetime(2026, 4, 29, tzinfo=timezone.utc)
+            client = FakeCalendarClient(error=RuntimeError('kis down'))
+            provider = KisKrxTradingCalendarProvider(
+                client=client,
+                fallback_cache=InMemoryKrxCalendarCache(
+                    ttl=timedelta(seconds=60)
+                ),
+            )
+
+            with patch(
+                'app.market.session.datetime',
+                fixed_datetime_class(cache_time),
+            ):
+                first = await provider.lookup_day_async(
+                    date(2026, 4, 29),
+                    allow_fallback=True,
+                )
+
+            client.error = None
+            client.payload = {
+                'output': [{'bass_dt': '20260429', 'opnd_yn': 'Y'}]
+            }
+            with patch(
+                'app.market.session.datetime',
+                fixed_datetime_class(cache_time + timedelta(seconds=59)),
+            ):
+                cached = await provider.lookup_day_async(
+                    date(2026, 4, 29),
+                    allow_fallback=True,
+                )
+            with patch(
+                'app.market.session.datetime',
+                fixed_datetime_class(cache_time + timedelta(seconds=61)),
+            ):
+                recovered = await provider.lookup_day_async(
+                    date(2026, 4, 29),
+                    allow_fallback=True,
+                )
+
+            self.assertEqual(first.calendar_source_status, 'fallback')
+            self.assertEqual(cached.calendar_source_status, 'fallback')
+            self.assertEqual(recovered.calendar_source, CALENDAR_SOURCE_KIS_CHK_HOLIDAY)
+            self.assertEqual(recovered.calendar_source_status, 'ok')
+            self.assertIsNone(recovered.calendar_source_error)
+            self.assertEqual(len(client.calls), 2)
+
+        self.loop_run(scenario())
+
+    def test_kis_provider_clear_cache_clears_authoritative_and_fallback_rows(self):
+        async def scenario():
+            client = FakeCalendarClient(
+                {'output': [{'bass_dt': '20260429', 'opnd_yn': 'Y'}]}
+            )
+            provider = KisKrxTradingCalendarProvider(client=client)
+
+            authoritative = await provider.lookup_day_async(
+                date(2026, 4, 29),
+                allow_fallback=True,
+            )
+            client.error = RuntimeError('kis down')
+            fallback = await provider.lookup_day_async(
+                date(2026, 4, 30),
+                allow_fallback=True,
+            )
+            provider.clear_cache()
+            formerly_authoritative = await provider.lookup_day_async(
+                date(2026, 4, 29),
+                allow_fallback=True,
+            )
+            formerly_fallback = await provider.lookup_day_async(
+                date(2026, 4, 30),
+                allow_fallback=True,
+            )
+
+            self.assertEqual(authoritative.calendar_source_status, 'ok')
+            self.assertEqual(fallback.calendar_source_status, 'fallback')
+            self.assertEqual(formerly_authoritative.calendar_source_status, 'fallback')
+            self.assertEqual(formerly_fallback.calendar_source_status, 'fallback')
+            self.assertEqual(len(client.calls), 4)
+
+        self.loop_run(scenario())
 
     def test_sync_provider_still_resolves_async_client_outside_running_loop(self):
         client = FakeCalendarClient({'output': [{'bass_dt': '20260604', 'opnd_yn': 'Y'}]})
@@ -182,6 +373,39 @@ class MarketSessionTests(unittest.TestCase):
         self.assertTrue(result.is_open)
         self.assertEqual(result.calendar_source, CALENDAR_SOURCE_KIS_CHK_HOLIDAY)
         self.assertEqual(len(client.calls), 1)
+
+    def test_sync_fallback_inside_running_loop_does_not_poison_async_lookup(self):
+        async def scenario():
+            target_date = date(2026, 4, 30)
+            client = FakeCalendarClient(
+                {'output': [{'bass_dt': '20260430', 'opnd_yn': 'Y'}]}
+            )
+            provider = KisKrxTradingCalendarProvider(client=client)
+
+            fallback = provider.lookup_day(target_date, allow_fallback=True)
+            recovered = await provider.lookup_day_async(
+                target_date,
+                allow_fallback=True,
+            )
+
+            self.assertEqual(
+                fallback.calendar_source,
+                CALENDAR_SOURCE_EXCHANGE_CALENDARS,
+            )
+            self.assertEqual(fallback.calendar_source_status, 'fallback')
+            self.assertIn(
+                'must be awaited from async callers',
+                fallback.calendar_source_error or '',
+            )
+            self.assertEqual(
+                recovered.calendar_source,
+                CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
+            )
+            self.assertEqual(recovered.calendar_source_status, 'ok')
+            self.assertIsNone(recovered.calendar_source_error)
+            self.assertEqual(len(client.calls), 1)
+
+        self.loop_run(scenario())
 
     def test_get_market_state_uses_kis_holiday_truth(self):
         provider = KisKrxTradingCalendarProvider(
@@ -203,6 +427,57 @@ class MarketSessionTests(unittest.TestCase):
         self.assertEqual(result.latest_valid_trading_date, '2026-05-04')
         self.assertEqual(result.calendar_source, CALENDAR_SOURCE_KIS_CHK_HOLIDAY)
         self.assertEqual(result.calendar_source_status, 'ok')
+
+    def test_market_state_recomputes_preopen_to_open_with_hot_authoritative_day(self):
+        async def scenario():
+            client = FakeCalendarClient(
+                {'output': [{'bass_dt': '20260429', 'opnd_yn': 'Y'}]}
+            )
+            set_krx_calendar_provider(
+                KisKrxTradingCalendarProvider(client=client)
+            )
+
+            preopen = await async_get_market_state(
+                datetime(2026, 4, 29, 8, 59, 59, tzinfo=KST)
+            )
+            opened = await async_get_market_state(
+                datetime(2026, 4, 29, 9, 0, 1, tzinfo=KST)
+            )
+
+            self.assertEqual(preopen.state, 'PREOPEN')
+            self.assertFalse(preopen.is_open)
+            self.assertEqual(opened.state, 'OPEN')
+            self.assertTrue(opened.is_open)
+            self.assertEqual(len(client.calls), 1)
+
+        self.loop_run(scenario())
+
+    def test_closed_fallback_does_not_suppress_next_date_open(self):
+        async def scenario():
+            client = FakeCalendarClient(error=RuntimeError('kis down'))
+            set_krx_calendar_provider(
+                KisKrxTradingCalendarProvider(client=client)
+            )
+
+            closed = await async_get_market_state(
+                datetime(2026, 4, 29, 15, 31, tzinfo=KST)
+            )
+            client.error = None
+            client.payload = {
+                'output': [{'bass_dt': '20260430', 'opnd_yn': 'Y'}]
+            }
+            opened = await async_get_market_state(
+                datetime(2026, 4, 30, 9, 0, 1, tzinfo=KST)
+            )
+
+            self.assertEqual(closed.state, 'CLOSED')
+            self.assertEqual(closed.calendar_source_status, 'fallback')
+            self.assertEqual(opened.state, 'OPEN')
+            self.assertEqual(opened.calendar_source, CALENDAR_SOURCE_KIS_CHK_HOLIDAY)
+            self.assertEqual(opened.calendar_source_status, 'ok')
+            self.assertEqual(len(client.calls), 2)
+
+        self.loop_run(scenario())
 
     def test_async_get_market_state_does_not_block_loop_on_slow_calendar_lookup(self):
         async def scenario():

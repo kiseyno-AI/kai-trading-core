@@ -26,7 +26,7 @@ def test_safe_reader_reads_bounded_regular_file(tmp_path) -> None:
     assert set(snapshot.fingerprint) == {'dev', 'ino', 'size', 'mtime_ns', 'ctime_ns'}
     assert len(snapshot.path_fingerprint) >= 2
     assert all(
-        set(component) == {'dev', 'ino', 'mode', 'size', 'mtime_ns', 'ctime_ns'}
+        set(component) == {'dev', 'ino', 'mode'}
         for component in snapshot.path_fingerprint
     )
 
@@ -149,7 +149,9 @@ def test_safe_reader_rejects_oversized_target(tmp_path) -> None:
         read_bounded_regular_file(target, max_bytes=16)
 
 
-def test_safe_reader_path_fingerprint_changes_when_parent_directory_changes(tmp_path) -> None:
+def test_safe_reader_path_fingerprint_ignores_parent_directory_metadata_changes(
+    tmp_path,
+) -> None:
     target = _write_contract(tmp_path)
     before = read_bounded_regular_file(target, max_bytes=1024)
 
@@ -160,6 +162,21 @@ def test_safe_reader_path_fingerprint_changes_when_parent_directory_changes(tmp_
 
     assert before.content == after.content
     assert before.fingerprint == after.fingerprint
+    assert before.path_fingerprint == after.path_fingerprint
+
+
+def test_safe_reader_path_fingerprint_changes_when_contract_directory_is_replaced(
+    tmp_path,
+) -> None:
+    target = _write_contract(tmp_path)
+    before = read_bounded_regular_file(target, max_bytes=1024)
+    displaced = tmp_path / 'workspace-displaced'
+
+    target.parent.rename(displaced)
+    replacement = _write_contract(tmp_path)
+    after = read_bounded_regular_file(replacement, max_bytes=1024)
+
+    assert before.content == after.content
     assert before.path_fingerprint != after.path_fingerprint
 
 

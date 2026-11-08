@@ -665,6 +665,22 @@ class DailyPriceBar(Base):
             'repair_origin_eod_run_id',
             postgresql_where=text('repair_origin_eod_run_id IS NOT NULL'),
         ),
+        Index(
+            'ix_daily_price_bars_symbol_trade_date_desc_cover',
+            'symbol_id',
+            desc('trade_date'),
+            postgresql_include=[
+                'open_price',
+                'high_price',
+                'low_price',
+                'close_price',
+                'volume',
+                'turnover',
+                'pbr',
+                'per',
+                'dividend_yield',
+            ],
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -993,6 +1009,17 @@ class DailyTechnicalSnapshot(Base, TimestampMixin):
             desc('captured_at'),
             'id',
         ),
+        Index(
+            'ix_daily_technical_snapshots_eod_run_symbol_captured',
+            'eod_run_id',
+            'symbol_id',
+            'captured_at',
+        ),
+        Index(
+            'ix_daily_technical_snapshots_market_symbol',
+            'market_date',
+            'symbol_id',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1055,6 +1082,7 @@ class DailyTrendingRank(Base, TimestampMixin):
         Index('ix_daily_trending_ranks_market_period_absolute', 'market_date', 'period', 'absolute_rank'),
         Index('ix_daily_trending_ranks_market_period_up', 'market_date', 'period', 'up_rank'),
         Index('ix_daily_trending_ranks_market_period_down', 'market_date', 'period', 'down_rank'),
+        Index('ix_daily_trending_ranks_eod_run_captured', 'eod_run_id', 'captured_at'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1186,6 +1214,7 @@ class DailyPiotroskiFilterResult(Base, TimestampMixin):
         Index('ix_daily_piotroski_filter_results_market_passed', 'market_date', 'passed_filter'),
         Index('ix_daily_piotroski_filter_results_market_pbr_rank', 'market_date', 'pbr_percentile_rank'),
         Index('ix_daily_piotroski_filter_results_market_score', 'market_date', 'piotroski_score'),
+        Index('ix_daily_piotroski_filter_results_market_date_cover', 'market_date', 'id'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1349,12 +1378,16 @@ class DailyAdvancedValueFactorResult(Base, TimestampMixin):
             'id',
         ),
         Index(
-            'ix_daily_advanced_value_factor_results_fcf_yield_valid',
+            'ix_daily_advanced_value_factor_results_fcf_yield_valid__ba82',
             'fcf_yield_valid_for_scoring',
         ),
         Index(
-            'ix_daily_advanced_value_factor_results_ev_to_ebitda_valid',
+            'ix_daily_advanced_value_factor_results_ev_to_ebitda_val_13f1',
             'ev_to_ebitda_valid_for_scoring',
+        ),
+        Index(
+            'ix_daily_advanced_value_factor_results_advanced_value_c_0a02',
+            'advanced_value_classification',
         ),
     )
 
@@ -1413,6 +1446,13 @@ class DailyUnifiedValueFactorResult(Base, TimestampMixin):
             'captured_at',
             'id',
         ),
+        Index('ix_daily_unified_value_factor_results_dividend_yield_rank', 'dividend_yield_rank'),
+        Index('ix_daily_unified_value_factor_results_ev_to_ebitda_rank', 'ev_to_ebitda_rank'),
+        Index('ix_daily_unified_value_factor_results_fcf_yield_rank', 'fcf_yield_rank'),
+        Index('ix_daily_unified_value_factor_results_pbr_rank', 'pbr_rank'),
+        Index('ix_daily_unified_value_factor_results_per_rank', 'per_rank'),
+        Index('ix_daily_unified_value_factor_results_unified_value_rank', 'unified_value_rank'),
+        Index('ix_daily_unified_value_factor_results_unified_value_status', 'unified_value_status'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1464,6 +1504,18 @@ class DailyQualityFactorResult(Base, TimestampMixin):
         Index('ix_daily_quality_factor_results_market_score', 'market_date', 'quality_score'),
         Index('ix_daily_quality_factor_results_market_status', 'market_date', 'quality_status'),
         Index('ix_daily_quality_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
+        Index('ix_daily_quality_factor_results_accruals_ratio_rank', 'accruals_ratio_rank'),
+        Index('ix_daily_quality_factor_results_debt_ratio_rank', 'debt_ratio_rank'),
+        Index(
+            'ix_daily_quality_factor_results_gross_profit_to_assets_rank',
+            'gross_profit_to_assets_rank',
+        ),
+        Index(
+            'ix_daily_quality_factor_results_operating_cash_flow_to__24ef',
+            'operating_cash_flow_to_net_income_rank',
+        ),
+        Index('ix_daily_quality_factor_results_roa_rank', 'roa_rank'),
+        Index('ix_daily_quality_factor_results_roe_rank', 'roe_rank'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1531,6 +1583,10 @@ class DailyCompositeFactorResult(Base, TimestampMixin):
             'composite_classification',
         ),
         Index('ix_daily_composite_factor_results_symbol_recent', 'symbol_id', 'market_date', 'captured_at', 'id'),
+        Index(
+            'ix_daily_composite_factor_results_composite_classification',
+            'composite_classification',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1636,6 +1692,21 @@ class DailyPykrxEnrichmentRow(Base, TimestampMixin):
         ),
         Index('ix_daily_pykrx_enrichment_rows_market_category', 'market_date', 'category'),
         Index('ix_daily_pykrx_enrichment_rows_symbol_market_category', 'symbol_id', 'market_date', 'category'),
+        Index('ix_daily_pykrx_enrichment_rows_category', 'category'),
+        Index('ix_daily_pykrx_enrichment_rows_market', 'market'),
+        Index('ix_daily_pykrx_enrichment_rows_market_date', 'market_date'),
+        Index('ix_daily_pykrx_enrichment_rows_scope_key', 'scope_key'),
+        Index('ix_daily_pykrx_enrichment_rows_scope_type', 'scope_type'),
+        Index('ix_daily_pykrx_enrichment_rows_source', 'source'),
+        Index('ix_daily_pykrx_enrichment_rows_symbol_id', 'symbol_id'),
+        Index(
+            'ix_pykrx_enrichment_market_category_order',
+            'market_date',
+            'category',
+            'market',
+            'scope_type',
+            'scope_key',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1668,6 +1739,27 @@ class AgentContextFeedback(Base, TimestampMixin):
             'market_date',
             'received_at',
             'id',
+        ),
+        Index(
+            'ix_agent_context_feedback_market_agent_symbol_received_desc',
+            'market_date',
+            'agent_name',
+            'symbol',
+            desc('received_at'),
+            desc('id'),
+        ),
+        Index(
+            'ix_agent_context_feedback_symbol_agent_market_received',
+            'symbol',
+            'agent_name',
+            desc('market_date'),
+            desc('received_at'),
+        ),
+        Index(
+            'ix_agent_context_feedback_symbol_market_received',
+            'symbol',
+            desc('market_date'),
+            desc('received_at'),
         ),
     )
 
@@ -1727,6 +1819,14 @@ class SignalDeciderDecisionSnapshot(Base, TimestampMixin):
             desc('id'),
         ),
         Index(
+            'ix_signal_decider_snapshots_market_symbol_agent_created_desc',
+            'market_date',
+            'symbol',
+            'agent_name',
+            desc('created_at'),
+            desc('id'),
+        ),
+        Index(
             'uq_signal_decider_snapshots_content_fingerprint',
             'content_fingerprint',
             unique=True,
@@ -1777,7 +1877,16 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
         UniqueConstraint(
             'target_trade_date',
             'symbol',
-            name='uq_signal_decider_wait_recheck_target_symbol',
+            'agent_name',
+            'source_snapshot_id',
+            name='uq_signal_decider_wait_recheck_target_symbol_agent_source',
+        ),
+        CheckConstraint(
+            'generation >= 1 '
+            'AND ((generation = 1 AND rearmed_from_event_id IS NULL) '
+            'OR (generation > 1 AND rearmed_from_event_id IS NOT NULL)) '
+            'AND (rearmed_from_event_id IS NULL OR rearmed_from_event_id <> id)',
+            name='ck_signal_decider_wait_recheck_generation_lineage',
         ),
         CheckConstraint(
             "status IN ('queued', 'running', 'completed', 'failed', 'expired')",
@@ -1805,9 +1914,26 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
             'ix_signal_decider_wait_recheck_source_snapshot',
             'source_snapshot_id',
         ),
+        Index(
+            'ix_signal_decider_wait_recheck_rearmed_from',
+            'rearmed_from_event_id',
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generation: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text('1'),
+    )
+    rearmed_from_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            'signal_decider_wait_recheck_events.id',
+            ondelete='RESTRICT',
+            name='fk_signal_decider_wait_recheck_rearmed_from',
+        ),
+    )
     source_snapshot_id: Mapped[int] = mapped_column(
         ForeignKey('signal_decider_decision_snapshots.id', ondelete='RESTRICT'),
         nullable=False,
@@ -1837,6 +1963,12 @@ class SignalDeciderWaitRecheckEvent(Base, TimestampMixin):
     result_action: Mapped[str | None] = mapped_column(String(32))
     context_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     context_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_history_payload: Mapped[list | dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
     last_error_payload: Mapped[dict | None] = mapped_column(JSON)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -2608,6 +2740,18 @@ class AgentContextFeedbackRun(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint('run_id', name='uq_agent_context_feedback_runs_run_id'),
         Index('ix_agent_context_feedback_runs_market_date_status_started', 'market_date', 'status', 'started_at'),
+        Index(
+            'ix_agent_context_feedback_runs_market_started_desc',
+            'market_date',
+            desc('started_at'),
+            desc('id'),
+        ),
+        Index(
+            'ix_agent_context_feedback_runs_market_started_id',
+            'market_date',
+            desc('started_at'),
+            desc('id'),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -2700,6 +2844,13 @@ class DartDisclosureEvent(Base, TimestampMixin):
                 "AND fundamentals_capture_status = 'failed'"
             ),
         ),
+        Index(
+            'ix_dart_events_captured_stock_receipt_id',
+            'stock_code',
+            desc('receipt_date').nulls_last(),
+            'id',
+            postgresql_where=text("fundamentals_capture_status = 'captured'"),
+        ).ddl_if(dialect='postgresql'),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -2799,6 +2950,24 @@ class DartFundamentalsSnapshot(Base, TimestampMixin):
             'fs_div',
             'updated_at',
             'stock_code',
+        ),
+        Index(
+            'ix_dart_fund_snap_fs_report_period_year_captured',
+            'fs_div',
+            'report_code',
+            'period_type',
+            'business_year',
+            desc('captured_at'),
+            'disclosure_event_id',
+        ),
+        Index(
+            'ix_dart_fund_snap_symbol_fs_event_order',
+            'stock_code',
+            'fs_div',
+            'disclosure_event_id',
+            desc('business_year'),
+            desc('report_code'),
+            desc('id'),
         ),
     )
 
@@ -2944,3 +3113,103 @@ class DartDilutionSignal(Base, TimestampMixin):
     security_type: Mapped[str | None] = mapped_column(String(64))
     reason: Mapped[str | None] = mapped_column(String(255))
     payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MarketNewsItem(Base, TimestampMixin):
+    """One article returned for one market/business-line news topic.
+
+    ``first_seen_at`` is when Core first observed it (the point-in-time
+    cutoff); ``published_at`` is the publisher's time when known.
+    """
+
+    __tablename__ = 'market_news_items'
+    __table_args__ = (
+        UniqueConstraint('topic_key', 'url_hash', name='uq_market_news_items_topic_url'),
+        Index('ix_market_news_items_topic_published', 'topic_key', 'published_at'),
+        Index('ix_market_news_items_published_at', 'published_at'),
+        Index('ix_market_news_items_first_seen_at', 'first_seen_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class SymbolIndustryProfile(Base, TimestampMixin):
+    """Industry and business line of one symbol from ``effective_from`` on.
+
+    A new row is written only when the KSIC code or business line changes,
+    so past dates can be classified with what was known then.
+    """
+
+    __tablename__ = 'symbol_industry_profiles'
+    __table_args__ = (
+        UniqueConstraint('symbol', 'effective_from', name='uq_symbol_industry_profiles_symbol_from'),
+        Index('ix_symbol_industry_profiles_business_line', 'business_line'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    corp_code: Mapped[str | None] = mapped_column(String(16))
+    corp_name: Mapped[str | None] = mapped_column(String(255))
+    ksic_code: Mapped[str | None] = mapped_column(String(16))
+    krx_sector: Mapped[str | None] = mapped_column(String(64))
+    business_line: Mapped[str] = mapped_column(String(64), nullable=False)
+    line_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MacroSeriesHistory(Base, TimestampMixin):
+    """Research history of macro series with the date each value became public.
+
+    ``released_on`` comes from ALFRED first releases where FRED serves them
+    (``release_basis='alfred_initial_release'``); dense daily market series
+    are public the same US day after the close (``'same_day_close'``).
+    """
+
+    __tablename__ = 'macro_series_history'
+    __table_args__ = (
+        UniqueConstraint('source', 'series_id', 'observation_date', name='uq_macro_series_history_obs'),
+        Index('ix_macro_series_history_series_released', 'series_id', 'released_on'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    observation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    value: Mapped[float] = mapped_column(Numeric(24, 8), nullable=False)
+    released_on: Mapped[date] = mapped_column(Date, nullable=False)
+    release_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BusinessLineDailyMetric(Base, TimestampMixin):
+    """Equal-weight daily return of one business line against the market."""
+
+    __tablename__ = 'business_line_daily_metrics'
+    __table_args__ = (
+        UniqueConstraint('trade_date', 'business_line', name='uq_business_line_daily_metrics_day_line'),
+        Index('ix_business_line_daily_metrics_line_day', 'business_line', 'trade_date'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    business_line: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbols: Mapped[int] = mapped_column(Integer, nullable=False)
+    ew_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    market_ew_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    excess_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    advancers_ratio: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False)
+    turnover: Mapped[float | None] = mapped_column(Numeric(24, 2))
+    turnover_share: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    classification_basis: Mapped[str] = mapped_column(String(32), nullable=False)

@@ -88,6 +88,14 @@ GET /broker/kis/health
     "enabled": true,
     "configured": true,
     "status": "subscribed",
+    "websocket_connected": true,
+    "market_state": "OPEN",
+    "market_session_active": true,
+    "market_calendar_source": "kis_chk_holiday",
+    "market_calendar_source_status": "ok",
+    "market_calendar_source_error": null,
+    "market_session_open_at": "2026-04-30T09:00:00+09:00",
+    "market_session_close_at": "2026-04-30T15:30:00+09:00",
     "tr_id": "H0STCNT0",
     "max_subscriptions": 40,
     "desired_symbols": ["005930"],
@@ -107,6 +115,8 @@ GET /broker/kis/health
 
 ## Notes
 - `realtime_prices` is process-local live dashboard state. It does not imply realtime ticks are persisted to the database.
+- `realtime_prices.enabled` reports configuration, not an active socket. `market_session_active=true` requires an authoritative KIS `chk-holiday` OPEN day and both server/local clocks inside the regular KRX session. `websocket_connected` is the direct socket signal.
+- Outside a verified OPEN session, realtime prices stay disconnected without approval or reconnect churn. Expected idle statuses are `idle_market_preopen`, `idle_market_closed`, `idle_market_weekend`, `idle_market_holiday`, and `idle_market_unverified`. The replaceable WAIT-recheck partition is empty while base holding/Exec membership remains available for the next verified open.
 - `market_snapshot_runtime` and `portfolio_summary_runtime` are route-specific readiness summaries for deploy and operator checks.
 - `intraday_snapshot_runtime` is the readiness summary for the separate KIS intraday execution-context capture path. `ready=false` means Core will safely return `status=disabled` from the collect route instead of attempting live KIS calls.
 - `portfolio_summary_runtime.ready=false` means `/portfolio/summary` is still blocked by config such as missing `PORTFOLIO_ACCOUNT_REFERENCES`, missing KIS secrets, or `KIS_USE_MOCK=true` in `APP_ENV=production`.

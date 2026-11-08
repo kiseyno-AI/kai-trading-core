@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from app.eod.master import get_master_symbols
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.scanner.state import scanner_state
 
 
@@ -29,7 +30,7 @@ class UniverseService:
                         name_ko=item.name_ko,
                     )
                     for item in get_master_symbols()
-                    if item.symbol.isdigit() and len(item.symbol) == 6
+                    if is_canonical_krx_short_code(item.symbol)
                 ]
             except Exception:
                 pass

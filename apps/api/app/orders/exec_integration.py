@@ -8,9 +8,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import logging
 import math
 import re
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,7 @@ from app.market.session import (
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
     async_get_krx_calendar_day,
 )
+from app.market.symbol_codes import is_canonical_krx_short_code
 from app.orders.execution_handoff_contract import (
     EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
     EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
@@ -91,6 +93,7 @@ from app.orders.next_open_execution import (
     _PlanRefreshRevisionConflict,
     _execution_plan_row_authority_fingerprint,
     _current_route_live_market_buy_authority,
+    _is_krx_next_open_snapshot,
     _is_canonical_closed_market_cost_absence,
     _load_live_market_snapshot_context,
     _row_is_monitor_only_intraday_watch,
@@ -109,6 +112,9 @@ from app.quotes.kis_realtime_prices import (
     kis_realtime_price_service,
 )
 from app.repositories.symbol_repository import load_symbols
+
+
+logger = logging.getLogger(__name__)
 
 INTEGRATION_MODE_DISABLED = 'disabled'
 INTEGRATION_MODE_OBSERVE = 'observe'
@@ -173,6 +179,34 @@ EXEC_DECIDER_HANDOFF_MAX_BYTES = 12 * 1024
 EXEC_FLOW_SHORT_SECTOR_CONTEXT_MAX_BYTES = 8 * 1024
 EXEC_ENTRY_RISK_CONTEXT_MAX_BYTES = 32 * 1024
 EXEC_EXIT_RISK_CONTEXT_MAX_BYTES = 8 * 1024
+_CROSS_LANE_ALIGNMENT_MARKER_KEYS = frozenset(
+    {
+        'signal_decider_alignment',
+        'alignment_gate_action',
+        'alignment_gate_reason',
+        'alignment_signal_decider_decision_snapshot_id',
+        'alignment_gate',
+        'final_enforcement_decision',
+        'signal_decider_crosscheck',
+    }
+)
+_CROSS_LANE_ALIGNMENT_QUANTITY_KEYS = frozenset(
+    {'requested_quantity', 'final_quantity', 'enforcement_source'}
+)
+_CROSS_LANE_ALIGNMENT_REASON_CODES = frozenset(
+    {
+        'signal_decider_alignment_audit_only',
+        'signal_decider_context_unavailable_gate',
+        'signal_decider_context_unavailable_gate_downsized',
+        'signal_decider_context_unavailable_gate_report_only',
+        'signal_decider_reject_cross_lane_observation',
+        'signal_decider_wait_conflict_gate',
+        'signal_decider_wait_conflict_gate_downsized',
+        'signal_decider_wait_conflict_gate_report_only',
+        'signal_decider_wait_conflict_override',
+        'signal_decider_wait_cross_lane_observation',
+    }
+)
 EXEC_PROTECTIVE_EXIT_RISK_CONTEXT_ESSENTIAL_KEYS = (
     '_core_activation',
     'trigger_rule',
@@ -389,10 +423,16 @@ EXEC_AGENT_ACCEPTED_ENTRY_STATUSES = {
 }
 EXEC_WATCH_STATE_SYNC_SCHEMA_VERSION = 'exec_watch_state_sync_v1'
 EXEC_WATCH_STATE_SYNC_WARNING_CODE = 'exec_watch_state_divergence'
-EXEC_WATCH_READBACK_ACTIVE_STATUSES = EXEC_MONITORING_ACTIVE_STATUSES | EXEC_AGENT_ACCEPTED_ENTRY_STATUSES | {
-    'watch_buy_submitted',
+EXEC_WATCH_READBACK_NONACTIVE_PENDING_STATUSES = EXEC_V4_PENDING_ITEM_STATUSES | REMOTE_SCHEDULED_STATUSES | {
+    'scheduled',
     'watch_monitoring_pending',
-} | EXEC_V4_PENDING_ITEM_STATUSES | EXEC_V4_WORKING_ITEM_STATUSES
+}
+EXEC_WATCH_READBACK_ACTIVE_STATUSES = (
+    EXEC_MONITORING_ACTIVE_STATUSES
+    | EXEC_AGENT_ACCEPTED_ENTRY_STATUSES
+    | {'watch_buy_submitted'}
+    | EXEC_V4_WORKING_ITEM_STATUSES
+) - EXEC_WATCH_READBACK_NONACTIVE_PENDING_STATUSES
 MARKET_REGIME_AGGRESSIVE_OPEN_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_TREND_DAY_MULTIPLIER_CAP = Decimal('1.0')
 MARKET_REGIME_DEFAULT_MULTIPLIER_CAP = Decimal('1.0')
@@ -836,6 +876,114 @@ def _normalize_decision_agent_name(value: Any) -> str:
     return normalized or SIGNAL_DECIDER_AGENT_NAME
 
 
+def _snapshot_requests_signal_trigger_entry(
+    snapshot: SignalDeciderDecisionSnapshot | None,
+) -> bool:
+    return bool(
+        snapshot is not None
+        and _normalize_decision_agent_name(snapshot.agent_name)
+        == SIGNAL_DECIDER_AGENT_NAME
+        and _normalize_optional_text(snapshot.next_day_open_action, lowercase=True)
+        == 'buy'
+        and _normalize_optional_text(snapshot.entry_price_basis, lowercase=True)
+        == 'trigger_limit'
+    )
+
+
+def _validated_signal_trigger_entry_levels(
+    snapshot: SignalDeciderDecisionSnapshot,
+) -> dict[str, Any] | None:
+    response_payload = (
+        snapshot.response_payload
+        if isinstance(snapshot.response_payload, dict)
+        else {}
+    )
+    trigger_price = _positive_decimal(response_payload.get('trigger_price'))
+    chase_limit_price = _positive_decimal(
+        response_payload.get('chase_limit_price')
+    )
+    target_price = _positive_decimal(
+        snapshot.target_price
+        if snapshot.target_price is not None
+        else response_payload.get('target_price')
+    )
+    stop_loss_price = _positive_decimal(
+        snapshot.stop_loss_price
+        if snapshot.stop_loss_price is not None
+        else response_payload.get('stop_loss_price')
+    )
+    trigger_conditions = response_payload.get('trigger_conditions')
+    if (
+        trigger_price is None
+        or chase_limit_price is None
+        or target_price is None
+        or stop_loss_price is None
+        or not isinstance(trigger_conditions, list)
+        or not any(_normalize_optional_text(item) for item in trigger_conditions)
+        or not (
+            stop_loss_price
+            < trigger_price
+            <= chase_limit_price
+            < target_price
+        )
+    ):
+        return None
+    return {
+        'trigger_price': trigger_price,
+        'chase_limit_price': chase_limit_price,
+        'target_price': target_price,
+        'stop_loss_price': stop_loss_price,
+        'trigger_conditions': copy.deepcopy(trigger_conditions),
+    }
+
+
+def _signal_trigger_plan_contract_mismatch(
+    *,
+    row: SignalDeciderExecutionPlanItem,
+    levels: Mapping[str, Any],
+) -> str | None:
+    traceability = (
+        row.traceability_payload
+        if isinstance(row.traceability_payload, dict)
+        else {}
+    )
+    exact_text_fields = (
+        ('planned_order_type', row.planned_order_type, 'limit'),
+        (
+            'eligibility_status',
+            row.eligibility_status,
+            ELIGIBILITY_MONITOR_CANDIDATE,
+        ),
+        (
+            'handoff_intent',
+            traceability.get('handoff_intent'),
+            EXEC_INTENT_INTRADAY_WATCH_BUY,
+        ),
+        (
+            'entry_execution_mode',
+            traceability.get('entry_execution_mode'),
+            'pending_trigger_limit',
+        ),
+    )
+    for field, observed, expected in exact_text_fields:
+        if _normalize_optional_text(observed, lowercase=True) != expected:
+            return field
+    for field in ('handoff_active', 'exec_monitoring_active'):
+        if traceability.get(field) is not True:
+            return field
+    for field in (
+        'trigger_price',
+        'chase_limit_price',
+        'target_price',
+        'stop_loss_price',
+    ):
+        if _safe_decimal(traceability.get(field)) != _safe_decimal(
+            levels.get(field)
+        ):
+            return field
+    return None
+
+
 def _normalize_short_term_generic_action(*, raw_action: Any, generic_action: Any) -> Any:
     tactical_action = _normalize_optional_text(raw_action, lowercase=True)
     if tactical_action == 'watch_for_trigger':
@@ -1087,6 +1235,87 @@ def _strip_signal_decider_only_labels(payload: dict[str, Any], *, decision_agent
         for key, value in payload.items()
         if key not in {'role', 'agent_name'}
     }
+
+
+def _contains_cross_lane_quantity_enforcement(value: Any) -> bool:
+    if isinstance(value, dict):
+        alignment_context = any(
+            key in value for key in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
+        )
+        gate_action = _normalize_optional_text(
+            value.get('alignment_gate_action'),
+            lowercase=True,
+        )
+        enforcement_mode = _normalize_optional_text(
+            value.get('enforcement_mode'),
+            lowercase=True,
+        )
+        enforcement_decision = _normalize_optional_text(
+            value.get('final_enforcement_decision')
+            or value.get('enforcement_decision'),
+            lowercase=True,
+        )
+        reason_code = str(value.get('code') or '')
+        if (
+            alignment_context
+            and (
+                gate_action in {'block', 'downsize_probe'}
+                or enforcement_mode in {'hard_block', 'downsize_probe'}
+                or enforcement_decision in {'blocked', 'downsized'}
+            )
+            or reason_code
+            in {
+                'signal_decider_context_unavailable_gate',
+                'signal_decider_context_unavailable_gate_downsized',
+                'signal_decider_wait_conflict_gate',
+                'signal_decider_wait_conflict_gate_downsized',
+            }
+        ):
+            return True
+        return any(
+            _contains_cross_lane_quantity_enforcement(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_cross_lane_quantity_enforcement(item)
+            for item in value
+        )
+    return False
+
+
+def _strip_cross_lane_alignment_audit(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep legacy opposite-lane evidence in Core, never in Exec input.
+
+    Alignment-owned requested/final quantities are removed recursively, while
+    this lane's planned quantity and notional remain available as sizing
+    context.  A historical sibling-lane marker must never erase own-lane
+    evidence.
+    """
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: sanitize(item)
+                for key, item in value.items()
+                if key not in _CROSS_LANE_ALIGNMENT_MARKER_KEYS
+                and key not in _CROSS_LANE_ALIGNMENT_QUANTITY_KEYS
+            }
+        if isinstance(value, list):
+            return [
+                sanitize(item)
+                for item in value
+                if not (
+                    isinstance(item, dict)
+                    and str(item.get('code') or '')
+                    in _CROSS_LANE_ALIGNMENT_REASON_CODES
+                )
+            ]
+        return copy.deepcopy(value)
+
+    sanitized = sanitize(payload)
+
+    return sanitized
 
 
 def _decision_input_quality_from_payloads(
@@ -6233,7 +6462,10 @@ class SignalDeciderExecIntegrationService:
                     expected_observation_revision=observation_revision,
                 )
             except Exception:
-                pass
+                logger.warning(
+                    'Realtime monitored-symbol observation failed; keeping the built payload',
+                    exc_info=True,
+                )
         return payload
 
     async def load_realtime_monitored_symbol_source(
@@ -6464,8 +6696,11 @@ class SignalDeciderExecIntegrationService:
             return self._degraded_cached_portfolio_holding_membership(
                 market_date
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                'Realtime portfolio membership refresh failed; using the completed-task result: %s',
+                exc,
+            )
         return self._take_completed_realtime_portfolio_membership(
             market_date=market_date,
             task=task,
@@ -6630,7 +6865,7 @@ class SignalDeciderExecIntegrationService:
             if (
                 not symbol
                 or symbol != item
-                or re.fullmatch(r'[0-9]{6}', symbol) is None
+                or not is_canonical_krx_short_code(symbol)
             ):
                 return self._degraded_cached_exec_monitoring_membership(
                     market_date
@@ -6800,7 +7035,7 @@ class SignalDeciderExecIntegrationService:
                 quantity = _safe_decimal(holding.get('quantity'))
                 if (
                     symbol is None
-                    or re.fullmatch(r'[0-9]{6}', symbol) is None
+                    or not is_canonical_krx_short_code(symbol)
                     or quantity is None
                     or quantity < Decimal('0')
                 ):
@@ -7169,6 +7404,22 @@ class SignalDeciderExecIntegrationService:
             market_date=market_date,
             trigger=trigger,
         )
+        passive_signal_wait_observations: list[dict[str, Any]] = []
+        try:
+            source_market_date = await _async_previous_trading_day(
+                market_date
+            )
+            passive_signal_wait_observations = await asyncio.to_thread(
+                self._load_passive_signal_wait_observations,
+                source_market_date=source_market_date,
+                target_trade_date=market_date,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Could not load passive signal WAIT observations for %s: %s',
+                market_date.isoformat(),
+                exc,
+            )
         payload = await asyncio.to_thread(
             self._build_runtime_monitored_symbols_payload,
             board=board,
@@ -7180,6 +7431,9 @@ class SignalDeciderExecIntegrationService:
                 live_portfolio_holding_membership
             ),
             live_exec_monitoring_membership=live_exec_monitoring_membership,
+            passive_signal_wait_observations=(
+                passive_signal_wait_observations
+            ),
         )
         self._store_dashboard_cached_payload(
             endpoint=DASHBOARD_ENDPOINT_MONITORED_SYMBOLS,
@@ -7188,6 +7442,80 @@ class SignalDeciderExecIntegrationService:
             payload=payload,
         )
         return payload
+
+    @staticmethod
+    def _load_passive_signal_wait_observations(
+        *,
+        source_market_date: date,
+        target_trade_date: date,
+    ) -> list[dict[str, Any]]:
+        generation_state = (
+            signal_decider_next_open_execution_service
+            ._load_latest_snapshot_generation_state(
+                source_market_date=source_market_date,
+                target_trade_date=target_trade_date,
+                allow_post_open_intraday_watch=False,
+            )
+        )
+        snapshots_by_symbol: dict[
+            str,
+            list[SignalDeciderDecisionSnapshot],
+        ] = defaultdict(list)
+        for snapshot in generation_state.get('snapshots') or []:
+            if not isinstance(snapshot, SignalDeciderDecisionSnapshot) and not hasattr(
+                snapshot,
+                'id',
+            ):
+                continue
+            if getattr(snapshot, 'market_date', None) != source_market_date:
+                continue
+            if (
+                _normalize_optional_text(
+                    getattr(snapshot, 'agent_name', None),
+                    lowercase=True,
+                )
+                != SIGNAL_DECIDER_AGENT_NAME
+            ):
+                continue
+            symbol = _normalize_optional_text(getattr(snapshot, 'symbol', None))
+            if not symbol:
+                continue
+            symbol = symbol.upper()
+            snapshots_by_symbol[symbol].append(snapshot)
+
+        observations: list[dict[str, Any]] = []
+        for symbol, snapshots in sorted(snapshots_by_symbol.items()):
+            # The validated generation loader already owns latest-per-symbol
+            # selection. More than one signal snapshot for one symbol means
+            # the source scope is conflicting, so observation also fails shut.
+            if len(snapshots) != 1:
+                continue
+            snapshot = snapshots[0]
+            action = _normalize_optional_text(
+                getattr(snapshot, 'next_day_open_action', None)
+                or getattr(snapshot, 'decision_action', None),
+                lowercase=True,
+            )
+            if action != 'wait' or not _is_krx_next_open_snapshot(snapshot):
+                continue
+            observed_at = (
+                getattr(snapshot, 'feedback_received_at', None)
+                or getattr(snapshot, 'created_at', None)
+            )
+            observations.append(
+                {
+                    'symbol': symbol,
+                    'decision_snapshot_id': int(snapshot.id),
+                    'decision_agent_name': SIGNAL_DECIDER_AGENT_NAME,
+                    'source_market_date': source_market_date.isoformat(),
+                    'observed_at': (
+                        observed_at.isoformat()
+                        if hasattr(observed_at, 'isoformat')
+                        else None
+                    ),
+                }
+            )
+        return observations
 
     async def _build_and_cache_runtime_symbol_detail(
         self,
@@ -7294,6 +7622,7 @@ class SignalDeciderExecIntegrationService:
             PortfolioHoldingSymbolMembership | None
         ) = None,
         live_exec_monitoring_membership: ExecRuntimeMonitoredSymbolMembership | None = None,
+        passive_signal_wait_observations: Sequence[dict[str, Any]] = (),
     ) -> dict[str, Any]:
         resolved_market_date = date.fromisoformat(str(board['market_date']))
         if live_portfolio_holding_membership is not None:
@@ -7361,6 +7690,16 @@ class SignalDeciderExecIntegrationService:
             *(live_holding_symbols or set()),
             *live_exec_monitoring_symbols,
         }
+        passive_signal_wait_by_symbol = {
+            symbol: observation
+            for observation in passive_signal_wait_observations
+            if isinstance(observation, dict)
+            and (
+                symbol := _normalize_optional_text(
+                    observation.get('symbol')
+                )
+            )
+        }
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in board_items:
             symbol = _normalize_optional_text(item.get('symbol'))
@@ -7383,21 +7722,61 @@ class SignalDeciderExecIntegrationService:
             for symbol in realtime_symbols
         ]
         included_symbols = {item['symbol'] for item in items}
-        missing_symbols = sorted(direct_membership_symbols - included_symbols)
+        candidate_missing_symbols = sorted(
+            (
+                direct_membership_symbols
+                | set(passive_signal_wait_by_symbol)
+            )
+            - included_symbols
+        )
+        symbol_metadata_map = self._load_symbol_metadata_map(
+            candidate_missing_symbols
+        )
+        passive_signal_wait_by_symbol = {
+            symbol: observation
+            for symbol, observation in passive_signal_wait_by_symbol.items()
+            if symbol in symbol_metadata_map
+            and _normalize_optional_text(
+                symbol_metadata_map[symbol].get('market'),
+                lowercase=True,
+            )
+            in {'krx', 'kospi', 'kosdaq', 'konex'}
+        }
+        missing_symbols = sorted(
+            (
+                direct_membership_symbols
+                | set(passive_signal_wait_by_symbol)
+            )
+            - included_symbols
+        )
         if missing_symbols:
-            symbol_metadata_map = self._load_symbol_metadata_map(missing_symbols)
             items.extend(
-                self._build_direct_runtime_membership_item(
-                    symbol=symbol,
-                    market_date=resolved_market_date,
-                    metadata=symbol_metadata_map.get(symbol),
-                    held_position=bool(
-                        live_holding_symbols is not None
-                        and symbol in live_holding_symbols
-                    ),
-                    exec_monitoring_active=(
-                        symbol in live_exec_monitoring_symbols
-                    ),
+                (
+                    self._build_passive_signal_wait_observation_item(
+                        observation=passive_signal_wait_by_symbol[symbol],
+                        market_date=resolved_market_date,
+                        metadata=symbol_metadata_map[symbol],
+                    )
+                    if (
+                        symbol in passive_signal_wait_by_symbol
+                        and not bool(
+                            live_holding_symbols is not None
+                            and symbol in live_holding_symbols
+                        )
+                        and symbol not in live_exec_monitoring_symbols
+                    )
+                    else self._build_direct_runtime_membership_item(
+                        symbol=symbol,
+                        market_date=resolved_market_date,
+                        metadata=symbol_metadata_map.get(symbol),
+                        held_position=bool(
+                            live_holding_symbols is not None
+                            and symbol in live_holding_symbols
+                        ),
+                        exec_monitoring_active=(
+                            symbol in live_exec_monitoring_symbols
+                        ),
+                    )
                 )
                 for symbol in missing_symbols
             )
@@ -7413,6 +7792,12 @@ class SignalDeciderExecIntegrationService:
             ranking_groups
         )
         items = [item_by_symbol[symbol] for symbol in realtime_symbols]
+        observation_only_symbols = [
+            symbol
+            for symbol in realtime_symbols
+            if 'signal_wait_observation_only'
+            in (item_by_symbol[symbol].get('monitoring_statuses') or [])
+        ]
         monitoring_facts_by_symbol: dict[
             str,
             list[dict[str, Any]],
@@ -7457,6 +7842,7 @@ class SignalDeciderExecIntegrationService:
             'realtime_subscription': {
                 'desired_symbols': realtime_symbols,
                 'desired_symbol_count': len(realtime_symbols),
+                'observation_only_symbols': observation_only_symbols,
                 'max_subscriptions': settings.kis_realtime_price_max_subscriptions,
             },
             'source_coverage': {
@@ -7608,12 +7994,12 @@ class SignalDeciderExecIntegrationService:
         if exec_monitoring_active:
             result['exec_monitoring_active'] = True
             result['exec_runtime_showable'] = True
-            result['exec_runtime_state'] = (
-                item.get('exec_runtime_state')
-                if original_exec_showable
-                or item.get('exec_agent_approved') is True
-                else 'runtime_membership_confirmed'
-            )
+            if item.get('exec_agent_approved') is True:
+                result['exec_runtime_state'] = 'exec_approved_watch'
+            elif original_exec_showable:
+                result['exec_runtime_state'] = item.get('exec_runtime_state')
+            else:
+                result['exec_runtime_state'] = 'runtime_membership_confirmed'
             result['exec_runtime_exclusion_reason'] = None
             result['exec_runtime_exclusion_reasons'] = []
         elif exec_membership_complete:
@@ -7635,6 +8021,7 @@ class SignalDeciderExecIntegrationService:
             and exec_membership_complete
             and monitoring_state
             in {
+                UI_MONITORING_STATE_WATCHING_FILL,
                 UI_MONITORING_STATE_WATCHING_TARGET_STOP,
                 UI_MONITORING_STATE_RECONCILING,
             }
@@ -7654,6 +8041,16 @@ class SignalDeciderExecIntegrationService:
             monitoring_statuses.discard('runtime_membership_active')
             if exec_monitoring_active:
                 monitoring_statuses.add('runtime_membership_active')
+                if (
+                    item.get('exec_agent_approved') is True
+                    and _normalize_optional_text(
+                        item.get('intent'),
+                        lowercase=True,
+                    )
+                    in EXEC_ENTRY_BUY_INTENTS
+                ):
+                    monitoring_statuses.discard('watch_monitoring_pending')
+                    monitoring_statuses.add('watch_monitoring_active')
         result['monitoring_statuses'] = sorted(monitoring_statuses)
 
         if exec_monitoring_active and not result.get('exec_agent_approved'):
@@ -7730,6 +8127,55 @@ class SignalDeciderExecIntegrationService:
             'expected_holding_period': None,
             'decision_agent_names': [],
             'last_event_at': None,
+            'account_references': [],
+            'status_counts': {},
+        }
+
+    def _build_passive_signal_wait_observation_item(
+        self,
+        *,
+        observation: dict[str, Any],
+        market_date: date,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        symbol = str(observation['symbol'])
+        exclusion_reason = 'observation_only_no_order_authority'
+        return {
+            'symbol': symbol,
+            'name': metadata['name'],
+            'market': metadata['market'],
+            **self._price_fields_for_symbol(symbol, market_date=market_date),
+            'monitoring_state': UI_MONITORING_STATE_IDLE,
+            'exec_monitoring_active': False,
+            'exec_runtime_showable': False,
+            'exec_runtime_state': 'signal_wait_observation_requested',
+            'exec_runtime_exclusion_reason': exclusion_reason,
+            'exec_runtime_exclusion_reasons': [exclusion_reason],
+            'core_state_divergence_count': 0,
+            'core_state_divergence_warnings': [],
+            'exec_agent_approved': False,
+            'exec_agent_action': None,
+            'exec_agent_reason_code': None,
+            'exec_agent_target_profile': None,
+            'exec_agent_target_tag': None,
+            'exec_agent_special_tactical_scalp': None,
+            'held_position': False,
+            'position_quantity': 0,
+            'position_average_price': None,
+            'approved_quantity': None,
+            'approved_notional': None,
+            'monitoring_statuses': ['signal_wait_observation_only'],
+            'position_side': None,
+            'planned_intents': [],
+            'tactical_actions': [],
+            'handoff_intents': [],
+            'target_price': None,
+            'stop_loss_price': None,
+            'trigger_price': None,
+            'chase_limit_price': None,
+            'expected_holding_period': None,
+            'decision_agent_names': [SIGNAL_DECIDER_AGENT_NAME],
+            'last_event_at': observation.get('observed_at'),
             'account_references': [],
             'status_counts': {},
         }
@@ -8054,6 +8500,7 @@ class SignalDeciderExecIntegrationService:
         live_holding_symbols = None
         live_portfolio_holding_membership = None
         live_exec_monitoring_membership = None
+        passive_signal_wait_observations: list[dict[str, Any]] = []
         if symbol is None:
             background_trigger = f'{trigger}:dashboard_background_refresh'
             live_portfolio_holding_membership = (
@@ -8071,6 +8518,21 @@ class SignalDeciderExecIntegrationService:
                 market_date=target_trade_date,
                 trigger=background_trigger,
             )
+            try:
+                source_market_date = await _async_previous_trading_day(
+                    target_trade_date
+                )
+                passive_signal_wait_observations = await asyncio.to_thread(
+                    self._load_passive_signal_wait_observations,
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'Could not load passive signal WAIT observations for %s: %s',
+                    target_trade_date.isoformat(),
+                    exc,
+                )
         await self._store_dashboard_caches_from_overview(
             market_date=target_trade_date,
             symbol=symbol,
@@ -8081,6 +8543,9 @@ class SignalDeciderExecIntegrationService:
                 live_portfolio_holding_membership
             ),
             live_exec_monitoring_membership=live_exec_monitoring_membership,
+            passive_signal_wait_observations=(
+                passive_signal_wait_observations
+            ),
         )
 
     def _finalize_dashboard_refresh_task(
@@ -8120,6 +8585,7 @@ class SignalDeciderExecIntegrationService:
             PortfolioHoldingSymbolMembership | None
         ) = None,
         live_exec_monitoring_membership: ExecRuntimeMonitoredSymbolMembership | None = None,
+        passive_signal_wait_observations: Sequence[dict[str, Any]] = (),
     ) -> None:
         if symbol:
             detail_cache_key = self._dashboard_cache_key(
@@ -8197,6 +8663,9 @@ class SignalDeciderExecIntegrationService:
                 ),
                 live_exec_monitoring_membership=(
                     live_exec_monitoring_membership
+                ),
+                passive_signal_wait_observations=(
+                    passive_signal_wait_observations
                 ),
             )
             self._store_dashboard_cached_payload(
@@ -8794,12 +9263,41 @@ class SignalDeciderExecIntegrationService:
         ):
             return False
         decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+        raw_validation = (
+            row.validation_payload
+            if isinstance(row.validation_payload, dict)
+            else {}
+        )
+        validation = _strip_cross_lane_alignment_audit(raw_validation)
+        raw_blocking_reasons = raw_validation.get('blocking_reasons')
+        legacy_alignment_only_block = bool(
+            decision_agent_name
+            in {
+                SIGNAL_DECIDER_AGENT_NAME,
+                SHORT_TERM_DECIDER_AGENT_NAME,
+            }
+            and row.eligibility_status == ELIGIBILITY_BLOCKED
+            and _normalize_optional_text(
+                getattr(row, 'execution_status', None),
+                lowercase=True,
+            )
+            in {
+                EXECUTION_STATUS_PLANNED,
+                EXECUTION_STATUS_SUBMIT_FAILED,
+            }
+            and _contains_cross_lane_quantity_enforcement(raw_validation)
+            and isinstance(raw_blocking_reasons, list)
+            and bool(raw_blocking_reasons)
+            and not validation.get('blocking_reasons')
+        )
         if row.eligibility_status == ELIGIBILITY_MONITOR_CANDIDATE:
-            if decision_agent_name != SHORT_TERM_DECIDER_AGENT_NAME:
+            if not _row_is_monitor_only_intraday_watch(row):
                 return False
-        elif row.eligibility_status != ELIGIBILITY_ELIGIBLE:
+        elif (
+            row.eligibility_status != ELIGIBILITY_ELIGIBLE
+            and not legacy_alignment_only_block
+        ):
             return False
-        validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
         if decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
             if (
                 validation.get('execution_cost_evidence_policy_version')
@@ -8894,6 +9392,11 @@ class SignalDeciderExecIntegrationService:
         decision_traceability: dict[str, Any],
     ) -> dict[str, Any]:
         row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
+        traceability = _strip_cross_lane_alignment_audit(traceability)
+        validation = _strip_cross_lane_alignment_audit(validation)
+        decision_traceability = _strip_cross_lane_alignment_audit(
+            decision_traceability
+        )
         pre_decider_enrichment_context = (
             traceability.get('pre_decider_enrichment_context')
             if isinstance(traceability.get('pre_decider_enrichment_context'), dict)
@@ -8916,20 +9419,31 @@ class SignalDeciderExecIntegrationService:
                 dict,
             ):
                 pre_decider_enrichment_context = symbol_day_context['pre_decider_enrichment_context']
+        pre_decider_enrichment_context = _strip_cross_lane_alignment_audit(
+            pre_decider_enrichment_context
+        )
+        request_payload = _strip_cross_lane_alignment_audit(request_payload)
         input_feature_snapshot_payload = (
             snapshot.input_feature_snapshot_payload
             if snapshot is not None and isinstance(snapshot.input_feature_snapshot_payload, dict)
             else {}
+        )
+        input_feature_snapshot_payload = _strip_cross_lane_alignment_audit(
+            input_feature_snapshot_payload
         )
         response_payload = (
             snapshot.response_payload
             if snapshot is not None and isinstance(snapshot.response_payload, dict)
             else {}
         )
+        response_payload = _strip_cross_lane_alignment_audit(response_payload)
         response_summary_payload = (
             snapshot.response_summary_payload
             if snapshot is not None and isinstance(snapshot.response_summary_payload, dict)
             else {}
+        )
+        response_summary_payload = _strip_cross_lane_alignment_audit(
+            response_summary_payload
         )
         decision_input_quality_context = _decision_input_quality_from_payloads(
             symbol=row.symbol,
@@ -8965,33 +9479,6 @@ class SignalDeciderExecIntegrationService:
                 handoff_intent = 'tactical_buy'
             elif raw_action == 'watch_for_trigger':
                 handoff_intent = EXEC_INTENT_INTRADAY_WATCH_BUY
-        alignment_gate = (
-            traceability.get('alignment_gate')
-            if isinstance(traceability.get('alignment_gate'), dict)
-            else validation.get('alignment_gate')
-            if isinstance(validation.get('alignment_gate'), dict)
-            else None
-        )
-        final_enforcement_decision = (
-            alignment_gate.get('enforcement_decision')
-            if isinstance(alignment_gate, dict)
-            else traceability.get('final_enforcement_decision')
-            or validation.get('final_enforcement_decision')
-        )
-        requested_quantity = (
-            alignment_gate.get('requested_quantity')
-            if isinstance(alignment_gate, dict)
-            else traceability.get('requested_quantity')
-            if traceability.get('requested_quantity') is not None
-            else validation.get('requested_quantity')
-        )
-        final_quantity = (
-            alignment_gate.get('final_quantity')
-            if isinstance(alignment_gate, dict)
-            else traceability.get('final_quantity')
-            if traceability.get('final_quantity') is not None
-            else validation.get('final_quantity')
-        )
         return serialize_exec_agent_decider_handoff_payload(
             _json_safe(
                 {
@@ -9013,20 +9500,6 @@ class SignalDeciderExecIntegrationService:
                         'tactical_action': traceability.get('tactical_action'),
                         'generic_action': generic_action,
                         'handoff_intent': handoff_intent,
-                        'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                        or validation.get('signal_decider_alignment'),
-                        'alignment_gate_action': traceability.get('alignment_gate_action')
-                        or validation.get('alignment_gate_action'),
-                        'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                        or validation.get('alignment_gate_reason'),
-                        'alignment_signal_decider_decision_snapshot_id': traceability.get(
-                            'alignment_signal_decider_decision_snapshot_id'
-                        )
-                        or validation.get('alignment_signal_decider_decision_snapshot_id'),
-                        'alignment_gate': alignment_gate,
-                        'final_enforcement_decision': final_enforcement_decision,
-                        'requested_quantity': requested_quantity,
-                        'final_quantity': final_quantity,
                         'decision_traceability': decision_traceability,
                     },
                     'decider_input_context': {
@@ -9046,16 +9519,6 @@ class SignalDeciderExecIntegrationService:
                         'tactical_action': traceability.get('tactical_action'),
                         'generic_action': generic_action,
                         'handoff_intent': handoff_intent,
-                        'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                        or validation.get('signal_decider_alignment'),
-                        'alignment_gate_action': traceability.get('alignment_gate_action')
-                        or validation.get('alignment_gate_action'),
-                        'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                        or validation.get('alignment_gate_reason'),
-                        'alignment_gate': alignment_gate,
-                        'final_enforcement_decision': final_enforcement_decision,
-                        'requested_quantity': requested_quantity,
-                        'final_quantity': final_quantity,
                         'entry_price_basis': snapshot.entry_price_basis
                         if snapshot is not None
                         else traceability.get('entry_price_basis'),
@@ -9151,7 +9614,17 @@ class SignalDeciderExecIntegrationService:
         for row in rows:
             snapshot = snapshots.get(int(row.decision_snapshot_id))
             row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
-            traceability = row.traceability_payload if isinstance(row.traceability_payload, dict) else {}
+            raw_traceability = (
+                row.traceability_payload
+                if isinstance(row.traceability_payload, dict)
+                else {}
+            )
+            raw_validation = (
+                row.validation_payload
+                if isinstance(row.validation_payload, dict)
+                else {}
+            )
+            traceability = raw_traceability
             unsupported_route_reason = _unsupported_exec_sizing_route_reason(
                 traceability
             )
@@ -9160,6 +9633,7 @@ class SignalDeciderExecIntegrationService:
                     f'{row_decision_agent_name}:{row.id}:'
                     f'{unsupported_route_reason}'
                 )
+            traceability = _strip_cross_lane_alignment_audit(traceability)
             execution_scope = {
                 'asset_class': 'stock',
                 'market': 'KRX',
@@ -9174,12 +9648,40 @@ class SignalDeciderExecIntegrationService:
                     'allow_extended_hours': False,
                 },
             }
-            validation = row.validation_payload if isinstance(row.validation_payload, dict) else {}
+            validation = raw_validation
             validation = _strip_signal_decider_fixed_sizing_preview(
                 validation,
                 decision_agent_name=row_decision_agent_name,
             )
+            validation = _strip_cross_lane_alignment_audit(validation)
             is_short_term = row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+            signal_trigger_entry = _snapshot_requests_signal_trigger_entry(
+                snapshot
+            )
+            signal_trigger_levels = (
+                _validated_signal_trigger_entry_levels(snapshot)
+                if signal_trigger_entry and snapshot is not None
+                else None
+            )
+            if signal_trigger_entry and signal_trigger_levels is None:
+                raise SignalDeciderExecPayloadContractError(
+                    f'{row_decision_agent_name}:{row.id}:'
+                    'invalid_signal_trigger_geometry'
+                )
+            if signal_trigger_levels is not None:
+                trigger_contract_mismatch = (
+                    _signal_trigger_plan_contract_mismatch(
+                        row=row,
+                        levels=signal_trigger_levels,
+                    )
+                )
+                if trigger_contract_mismatch is not None:
+                    raise SignalDeciderExecPayloadContractError(
+                        f'{row_decision_agent_name}:{row.id}:'
+                        'signal_trigger_plan_contract_mismatch:'
+                        f'{trigger_contract_mismatch}'
+                    )
+            uses_trigger_entry = is_short_term or signal_trigger_entry
             short_term_context = (
                 validation.get('short_term')
                 if isinstance(validation.get('short_term'), dict)
@@ -9188,6 +9690,9 @@ class SignalDeciderExecIntegrationService:
             decision_traceability = traceability.get('decision_traceability') or traceability.get('signal_traceability') or {}
             if not isinstance(decision_traceability, dict):
                 decision_traceability = {}
+            decision_traceability = _strip_cross_lane_alignment_audit(
+                decision_traceability
+            )
             response_summary = (
                 short_term_context.get('response_summary')
                 if short_term_context.get('response_summary') is not None
@@ -9208,17 +9713,39 @@ class SignalDeciderExecIntegrationService:
                 SIGNAL_DECIDER_AGENT_NAME,
                 SHORT_TERM_DECIDER_AGENT_NAME,
             }
-            target_price = snapshot.target_price if snapshot is not None else traceability.get('target_price')
-            stop_loss_price = snapshot.stop_loss_price if snapshot is not None else traceability.get('stop_loss_price')
-            trigger_price = traceability.get('trigger_price')
-            chase_limit_price = traceability.get('chase_limit_price')
+            target_price = (
+                signal_trigger_levels['target_price']
+                if signal_trigger_levels is not None
+                else snapshot.target_price
+                if snapshot is not None
+                else traceability.get('target_price')
+            )
+            stop_loss_price = (
+                signal_trigger_levels['stop_loss_price']
+                if signal_trigger_levels is not None
+                else snapshot.stop_loss_price
+                if snapshot is not None
+                else traceability.get('stop_loss_price')
+            )
+            trigger_price = (
+                signal_trigger_levels['trigger_price']
+                if signal_trigger_levels is not None
+                else traceability.get('trigger_price')
+            )
+            chase_limit_price = (
+                signal_trigger_levels['chase_limit_price']
+                if signal_trigger_levels is not None
+                else traceability.get('chase_limit_price')
+            )
             raw_action = traceability.get('raw_action') or traceability.get('tactical_action')
             generic_action = _normalize_short_term_generic_action(
                 raw_action=raw_action,
                 generic_action=traceability.get('generic_action'),
             )
             handoff_intent = (
-                _normalize_optional_text(traceability.get('handoff_intent'), lowercase=True)
+                EXEC_INTENT_INTRADAY_WATCH_BUY
+                if signal_trigger_entry
+                else _normalize_optional_text(traceability.get('handoff_intent'), lowercase=True)
                 or (
                     'tactical_buy'
                     if is_short_term and raw_action == 'scalp_buy_candidate'
@@ -9227,16 +9754,49 @@ class SignalDeciderExecIntegrationService:
                     else EXEC_INTENT_NEXT_OPEN_BUY
                 )
             )
-            entry_intent = EXEC_INTENT_INTRADAY_WATCH_BUY if is_short_term else EXEC_INTENT_NEXT_OPEN_BUY
+            entry_intent = (
+                EXEC_INTENT_INTRADAY_WATCH_BUY
+                if uses_trigger_entry
+                else EXEC_INTENT_NEXT_OPEN_BUY
+            )
             entry_execution_mode = (
-                _normalize_optional_text(traceability.get('entry_execution_mode'))
+                'pending_trigger_limit'
+                if signal_trigger_entry
+                else _normalize_optional_text(traceability.get('entry_execution_mode'))
                 or ('pending_trigger_limit' if is_short_term else 'next_open_market')
             )
             core_entry_key = f'core-plan-{row.id}:{entry_intent}'
+            dispatch_traceability = {
+                **traceability,
+                **(
+                    {
+                        'handoff_intent': handoff_intent,
+                        'handoff_active': True,
+                        'entry_execution_mode': entry_execution_mode,
+                        'trigger_price': _to_json_number(
+                            _safe_decimal(trigger_price)
+                        ),
+                        'chase_limit_price': _to_json_number(
+                            _safe_decimal(chase_limit_price)
+                        ),
+                        'target_price': _to_json_number(
+                            _safe_decimal(target_price)
+                        ),
+                        'stop_loss_price': _to_json_number(
+                            _safe_decimal(stop_loss_price)
+                        ),
+                        'trigger_conditions': copy.deepcopy(
+                            signal_trigger_levels['trigger_conditions']
+                        ),
+                    }
+                    if signal_trigger_levels is not None
+                    else {}
+                ),
+            }
             full_decider_handoff_context = self._build_decider_handoff_context(
                 row=row,
                 snapshot=snapshot,
-                traceability=traceability,
+                traceability=dispatch_traceability,
                 validation=validation,
                 decision_traceability=decision_traceability,
             )
@@ -9327,31 +9887,6 @@ class SignalDeciderExecIntegrationService:
                 )
             delegated_gate_codes = [gate['code'] for gate in delegated_gates]
             delegated_gate_confirmation_required = bool(delegated_gates)
-            alignment_gate = (
-                traceability.get('alignment_gate')
-                if isinstance(traceability.get('alignment_gate'), dict)
-                else validation.get('alignment_gate')
-                if isinstance(validation.get('alignment_gate'), dict)
-                else None
-            )
-            final_enforcement_decision = (
-                alignment_gate.get('enforcement_decision')
-                if isinstance(alignment_gate, dict)
-                else traceability.get('final_enforcement_decision')
-                or validation.get('final_enforcement_decision')
-            )
-            requested_enforcement_quantity = (
-                _safe_decimal(alignment_gate.get('requested_quantity'))
-                if isinstance(alignment_gate, dict)
-                else _safe_decimal(traceability.get('requested_quantity'))
-                or _safe_decimal(validation.get('requested_quantity'))
-            )
-            final_enforcement_quantity = (
-                _safe_decimal(alignment_gate.get('final_quantity'))
-                if isinstance(alignment_gate, dict)
-                else _safe_decimal(traceability.get('final_quantity'))
-                or _safe_decimal(validation.get('final_quantity'))
-            )
             max_holding_close_policy = (
                 {
                     'enabled': True,
@@ -9407,17 +9942,11 @@ class SignalDeciderExecIntegrationService:
                     'warnings',
                     'short_term_entry_quality',
                     'performance_gate',
-                    'alignment_gate',
-                    'signal_decider_alignment',
-                    'alignment_gate_action',
-                    'alignment_gate_reason',
-                    'alignment_signal_decider_decision_snapshot_id',
                     'pricing_note',
                 ),
                 compact_nested_keys=(
                     'short_term_entry_quality',
                     'performance_gate',
-                    'alignment_gate',
                 ),
             )
             traceability_projection = _bounded_dispatch_object(
@@ -9503,23 +10032,17 @@ class SignalDeciderExecIntegrationService:
                 'tactical_action': traceability.get('tactical_action'),
                 'generic_action': generic_action,
                 'handoff_intent': handoff_intent,
-                'signal_decider_alignment': traceability.get('signal_decider_alignment')
-                or validation.get('signal_decider_alignment'),
-                'alignment_gate_action': traceability.get('alignment_gate_action')
-                or validation.get('alignment_gate_action'),
-                'alignment_gate_reason': traceability.get('alignment_gate_reason')
-                or validation.get('alignment_gate_reason'),
-                'alignment_signal_decider_decision_snapshot_id': traceability.get(
-                    'alignment_signal_decider_decision_snapshot_id'
-                )
-                or validation.get('alignment_signal_decider_decision_snapshot_id'),
-                'alignment_gate': alignment_gate,
-                'final_enforcement_decision': final_enforcement_decision,
-                'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
-                'final_quantity': _decimal_to_text(final_enforcement_quantity),
-                'handoff_active': bool(traceability.get('handoff_active')) if is_short_term else True,
-                'original_watch_trigger_price': trigger_price,
-                'original_watch_chase_limit_price': chase_limit_price,
+                'handoff_active': (
+                    bool(dispatch_traceability.get('handoff_active'))
+                    if uses_trigger_entry
+                    else True
+                ),
+                'original_watch_trigger_price': _to_json_number(
+                    _safe_decimal(trigger_price)
+                ),
+                'original_watch_chase_limit_price': _to_json_number(
+                    _safe_decimal(chase_limit_price)
+                ),
                 'allocation_mode': (
                     _normalize_optional_text(traceability.get('allocation_mode'))
                     or (
@@ -9529,8 +10052,10 @@ class SignalDeciderExecIntegrationService:
                     )
                 ),
                 'entry_execution_mode': entry_execution_mode,
-                'monitoring_candidate': bool(is_short_term),
-                'monitoring_intent': entry_intent if is_short_term else None,
+                'monitoring_candidate': bool(uses_trigger_entry),
+                'monitoring_intent': (
+                    entry_intent if uses_trigger_entry else None
+                ),
                 'decider_handoff_context_digest': decider_handoff_context_digest,
             }
             entry_common_risk_context = {
@@ -9548,40 +10073,19 @@ class SignalDeciderExecIntegrationService:
                     else {}
                 ),
             }
-            enforced_probe = bool(
-                is_short_term
-                and final_enforcement_decision == 'downsized'
-                and final_enforcement_quantity is not None
-                and final_enforcement_quantity > Decimal('0')
-            )
-            if enforced_probe:
-                quantity_policy = {
-                    'type': 'exec_agent_sized',
-                    # The v4 boundary delegates the final order quantity to
-                    # Exec. Core's WAIT-conflict decision is a hard ceiling,
-                    # not executable fixed sizing.
-                    'max_quantity': _decimal_to_text(final_enforcement_quantity),
-                    'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
-                    'allocation_mode': traceability.get('allocation_mode') or 'specified',
-                    'account_reference': row.account_reference,
-                    'account_label': row.account_label,
-                    'estimated_reference_price': row.estimated_reference_price,
-                    'estimated_notional_krw': _decimal_to_text(_safe_decimal(row.estimated_notional_krw)),
-                    'pricing_note': 'Core-enforced deterministic WAIT-conflict probe quantity.',
-                    'enforcement_source': 'core_wait_conflict_alignment_gate',
-                    'market_regime_sizing': market_regime_sizing_policy,
-                }
-            elif uses_exec_agent_sizing:
-                if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
-                    estimated_notional_krw = None
-                    pricing_note = 'Sizing for signal-decider dispatch is delegated to exec-agent.'
-                else:
-                    estimated_notional_krw = _decimal_to_text(_safe_decimal(row.estimated_notional_krw))
-                    pricing_note = (
-                        validation.get('pricing_note')
-                        if isinstance(validation.get('pricing_note'), str)
-                        else None
+            if uses_exec_agent_sizing:
+                estimated_notional_krw = _decimal_to_text(
+                    _safe_decimal(row.estimated_notional_krw)
+                )
+                pricing_note = (
+                    validation.get('pricing_note')
+                    if isinstance(validation.get('pricing_note'), str)
+                    else (
+                        'Sizing for signal-decider dispatch is delegated to exec-agent.'
+                        if row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME
+                        else 'Sizing for short-term-decider dispatch is delegated to exec-agent.'
                     )
+                )
                 quantity_policy = {
                     'type': 'exec_agent_sized',
                     'budget_krw': _decimal_to_text(_safe_decimal(row.allocation_budget_krw)),
@@ -9607,9 +10111,6 @@ class SignalDeciderExecIntegrationService:
                 }
             quantity_policy.update(
                 {
-                    'final_enforcement_decision': final_enforcement_decision,
-                    'requested_quantity': _decimal_to_text(requested_enforcement_quantity),
-                    'final_quantity': _decimal_to_text(final_enforcement_quantity),
                     'market_regime': market_regime_sizing_policy['market_regime'],
                     'quantity_multiplier': market_regime_sizing_policy['quantity_multiplier'],
                     'quantity_multiplier_cap': market_regime_sizing_policy['quantity_multiplier_cap'],
@@ -9664,13 +10165,6 @@ class SignalDeciderExecIntegrationService:
                     'target_price',
                     'stop_loss_price',
                     'allocation_budget_krw',
-                    'signal_decider_alignment',
-                    'alignment_gate_action',
-                    'alignment_gate_reason',
-                    'alignment_signal_decider_decision_snapshot_id',
-                    'final_enforcement_decision',
-                    'requested_quantity',
-                    'final_quantity',
                     'entry_execution_mode',
                     'delegated_gate_codes',
                     'delegated_gate_confirmation_required',
@@ -9747,8 +10241,16 @@ class SignalDeciderExecIntegrationService:
                 'tactical_action': traceability.get('tactical_action'),
                 'generic_action': generic_action,
                 'quantity_policy': quantity_policy,
-                'limit_price': _to_json_number(_safe_decimal(chase_limit_price)) if is_short_term else None,
-                'trigger_price': _to_json_number(_safe_decimal(trigger_price)) if is_short_term else None,
+                'limit_price': (
+                    _to_json_number(_safe_decimal(chase_limit_price))
+                    if uses_trigger_entry
+                    else None
+                ),
+                'trigger_price': (
+                    _to_json_number(_safe_decimal(trigger_price))
+                    if uses_trigger_entry
+                    else None
+                ),
                 'time_in_force': row.planned_time_in_force,
                 'risk_context': entry_risk_context,
                 'decision_snapshot_id': str(row.decision_snapshot_id),
@@ -9763,12 +10265,12 @@ class SignalDeciderExecIntegrationService:
                     'symbol': row.symbol,
                     'trigger_price': (
                         _to_json_number(_safe_decimal(trigger_price))
-                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        if uses_trigger_entry
                         else None
                     ),
                     'limit_price': (
                         _to_json_number(_safe_decimal(chase_limit_price))
-                        if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                        if uses_trigger_entry
                         else None
                     ),
                 }
@@ -11018,7 +11520,15 @@ class SignalDeciderExecIntegrationService:
                     ),
                 }
                 row_decision_agent_name = _normalize_decision_agent_name(row.decision_agent_name)
-                if row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+                row_uses_trigger_watch = any(
+                    _normalize_optional_text(link.get('intent'), lowercase=True)
+                    == EXEC_INTENT_INTRADAY_WATCH_BUY
+                    for link in row_links.get(row.id, [])
+                )
+                if (
+                    row_decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME
+                    or row_uses_trigger_watch
+                ):
                     row.execution_status = EXECUTION_STATUS_DELEGATED_FOR_EXEC_AGENT_SIZING
                 elif row_decision_agent_name == SIGNAL_DECIDER_AGENT_NAME:
                     row.execution_status = (
@@ -12107,7 +12617,7 @@ class SignalDeciderExecIntegrationService:
         watch_expired_reconciliation = bool(
             acknowledged_revocation is None
             and terminal_status == 'watch_expired'
-            and cls._is_short_term_watch_buy_row(row)
+            and cls._is_intraday_watch_buy_row(row)
             and all(
                 (derived_state.get('endpoint_statuses') or {}).get(endpoint)
                 == REMOTE_FETCH_STATUS_OK
@@ -12287,8 +12797,14 @@ class SignalDeciderExecIntegrationService:
         }
 
     @classmethod
-    def _is_short_term_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
-        if _normalize_decision_agent_name(row.decision_agent_name) != SHORT_TERM_DECIDER_AGENT_NAME:
+    def _is_intraday_watch_buy_row(cls, row: SignalDeciderExecutionPlanItem) -> bool:
+        decision_agent_name = _normalize_decision_agent_name(
+            row.decision_agent_name
+        )
+        if decision_agent_name not in {
+            SIGNAL_DECIDER_AGENT_NAME,
+            SHORT_TERM_DECIDER_AGENT_NAME,
+        }:
             return False
         if _normalize_optional_text(row.planned_side, lowercase=True) != 'buy':
             return False
@@ -12306,12 +12822,47 @@ class SignalDeciderExecIntegrationService:
             traceability.get('handoff_intent') or short_term.get('handoff_intent'),
             lowercase=True,
         )
+        if decision_agent_name == SHORT_TERM_DECIDER_AGENT_NAME:
+            return bool(
+                raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}
+                or handoff_intent
+                in {
+                    'tactical_buy',
+                    EXEC_INTENT_INTRADAY_WATCH_BUY,
+                    EXEC_INTENT_NEXT_OPEN_BUY,
+                }
+            )
+        trigger_price = _positive_decimal(traceability.get('trigger_price'))
+        chase_limit_price = _positive_decimal(
+            traceability.get('chase_limit_price')
+        )
+        target_price = _positive_decimal(traceability.get('target_price'))
+        stop_loss_price = _positive_decimal(
+            traceability.get('stop_loss_price')
+        )
         return bool(
-            raw_action in {'scalp_buy_candidate', 'watch_for_trigger'}
-            or handoff_intent in {'tactical_buy', EXEC_INTENT_INTRADAY_WATCH_BUY, EXEC_INTENT_NEXT_OPEN_BUY}
+            _normalize_optional_text(
+                traceability.get('entry_price_basis'),
+                lowercase=True,
+            )
+            == 'trigger_limit'
+            and handoff_intent == EXEC_INTENT_INTRADAY_WATCH_BUY
+            and _normalize_optional_text(
+                traceability.get('entry_execution_mode'),
+                lowercase=True,
+            )
+            == 'pending_trigger_limit'
+            and trigger_price is not None
+            and chase_limit_price is not None
+            and target_price is not None
+            and stop_loss_price is not None
+            and stop_loss_price
+            < trigger_price
+            <= chase_limit_price
+            < target_price
         )
 
-    def _sync_short_term_exec_watch_state(
+    def _sync_intraday_exec_watch_state(
         self,
         *,
         row: SignalDeciderExecutionPlanItem,
@@ -12319,7 +12870,7 @@ class SignalDeciderExecIntegrationService:
         now: datetime,
         trigger: str,
     ) -> dict[str, Any] | None:
-        if not self._is_short_term_watch_buy_row(row):
+        if not self._is_intraday_watch_buy_row(row):
             return None
         if _normalize_optional_text(row.execution_status, lowercase=True) in {
             'revocation_pending',
@@ -12381,7 +12932,7 @@ class SignalDeciderExecIntegrationService:
         warning = {
             'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
             'message': (
-                'Exec readback shows active or pending watch monitoring while core still had blocked/planned '
+                'Exec readback shows active watch monitoring while core still had blocked/planned '
                 'or failed state; preserving original gate evidence and surfacing Exec watch state for monitoring.'
             ),
             'severity': 'warning',
@@ -12695,7 +13246,7 @@ class SignalDeciderExecIntegrationService:
                 )
                 core_state_sync = exec_dispatch.get('core_state_sync')
                 if observed_terminal_state_sync is None and terminal_state_sync is None:
-                    core_state_sync = self._sync_short_term_exec_watch_state(
+                    core_state_sync = self._sync_intraday_exec_watch_state(
                         row=row,
                         item_links=item_links,
                         now=now,
@@ -13272,7 +13823,6 @@ class SignalDeciderExecIntegrationService:
         has_entry_fill_evidence = (
             buy_quantity > Decimal('0')
             or self._has_order_fill_evidence(orders=orders, side='buy')
-            or bool(order_status_counts.keys() & REMOTE_PARTIAL_STATUSES)
         )
         has_exit_fill_evidence = sell_quantity > Decimal('0') or self._has_order_fill_evidence(orders=orders, side='sell')
         has_plan_fill_evidence = has_entry_fill_evidence or has_exit_fill_evidence
@@ -13316,6 +13866,10 @@ class SignalDeciderExecIntegrationService:
             item_statuses & EXEC_V4_PENDING_ITEM_STATUSES
         ):
             derived_status = 'pending'
+        elif item_statuses & REMOTE_SCHEDULED_STATUSES:
+            # Scheduling/dispatch acknowledgement is useful readback state,
+            # but it is not proof that Exec has started monitoring the item.
+            derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
         elif any(status in EXEC_WATCH_READBACK_ACTIVE_STATUSES for status in item_statuses):
             derived_status = EXEC_DISPATCH_STATUS_ACCEPTED
 
@@ -13384,7 +13938,7 @@ class SignalDeciderExecIntegrationService:
         return {
             'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
             'message': (
-                'Exec has active or pending watch monitoring while core still had blocked/planned state; '
+                'Exec has active watch monitoring while core still had blocked/planned state; '
                 'runtime views are using Exec watch truth and preserving original core gate evidence.'
             ),
             'core_state_before': core_state_before,
@@ -13460,20 +14014,55 @@ class SignalDeciderExecIntegrationService:
                 else None
             )
         )
-        exec_agent_approved = bool(agent_decision['approved'])
+        held_position = (
+            _positive_decimal(derived_state.get('open_quantity'))
+            or Decimal('0')
+        ) > Decimal('0')
+        active_exec_statuses = self._entry_link_active_statuses(
+            item_links=dispatch_payload.get('item_links') or [],
+        )
+        readback_orders = (
+            _extract_field(readback, 'orders', 'items')
+            or []
+        )
+        readback_executions = (
+            _extract_field(readback, 'executions', 'items')
+            or []
+        )
+        readback_proves_exec_activity = bool(
+            held_position
+            or active_exec_statuses
+            or _positive_decimal(
+                derived_state.get('entry_filled_quantity')
+            )
+            or self._has_active_order_evidence(
+                orders=readback_orders,
+                side='buy',
+            )
+            or self._sum_execution_quantity(
+                executions=readback_executions,
+                side='buy',
+            )
+            > Decimal('0')
+        )
+        exec_agent_approved = bool(
+            agent_decision['approved']
+            or (
+                readback_proves_exec_activity
+                and not agent_decision['rejected']
+            )
+        )
         exec_agent_rejected = bool(agent_decision['rejected'])
         terminal = remote_status in EXEC_MONITORING_TERMINAL_STATUSES or dispatch_status in {
             EXEC_DISPATCH_STATUS_FAILED,
             EXEC_DISPATCH_STATUS_CONTRACT_ERROR,
             EXEC_DISPATCH_STATUS_UNAVAILABLE,
         }
-        held_position = (_positive_decimal(derived_state.get('open_quantity')) or Decimal('0')) > Decimal('0')
-        active_remote = (
-            dispatch_status in {EXEC_DISPATCH_STATUS_ACCEPTED, EXEC_DISPATCH_STATUS_PARTIAL}
-            or remote_status in EXEC_MONITORING_ACTIVE_STATUSES
+        active_remote = readback_proves_exec_activity
+        exec_monitoring_active = bool(
+            held_position
+            or (exec_agent_approved and active_remote and not terminal)
         )
-        exec_monitoring_active = bool(held_position or (exec_agent_approved and active_remote and not terminal))
-        active_exec_statuses = self._entry_link_active_statuses(item_links=dispatch_payload.get('item_links') or [])
         core_was_blocked_or_planned = bool(
             item.get('eligibility_status') == ELIGIBILITY_BLOCKED
             or _normalize_status(item.get('execution_status'))
@@ -13544,8 +14133,8 @@ class SignalDeciderExecIntegrationService:
                 'open_quantity': derived_state.get('open_quantity'),
                 'closed_quantity': derived_state.get('closed_quantity'),
                 'plan_item_status_counts': derived_state.get('plan_item_status_counts') or {},
-                'orders': _extract_field(readback, 'orders', 'items') or [],
-                'executions': _extract_field(readback, 'executions', 'items') or [],
+                'orders': readback_orders,
+                'executions': readback_executions,
                 'positions': _extract_field(readback, 'positions', 'items') or [],
                 'endpoint_statuses': derived_state.get('endpoint_statuses') or {},
             },
@@ -13571,7 +14160,7 @@ class SignalDeciderExecIntegrationService:
                 {
                     'code': EXEC_WATCH_STATE_SYNC_WARNING_CODE,
                     'message': (
-                        'Exec has active or pending watch monitoring for rows that core still had as blocked/planned.'
+                        'Exec has active watch monitoring for rows that core still had as blocked/planned.'
                     ),
                     'count': len(divergence_items),
                     'symbols': sorted(
@@ -14330,15 +14919,17 @@ class SignalDeciderExecIntegrationService:
                 statuses.add('stop_sell_monitoring')
 
         active_entry_status = status in {
-            UI_BOARD_STATUS_ACCEPTED,
-            UI_BOARD_STATUS_SCHEDULED,
             UI_BOARD_STATUS_SUBMITTED,
             UI_BOARD_STATUS_PARTIAL,
         }
         if exec_agent_approved and intent in EXEC_ENTRY_BUY_INTENTS:
-            if monitoring_state == UI_MONITORING_STATE_WATCHING_FILL or active_entry_status:
+            if active_entry_status:
                 statuses.add('watch_monitoring_active')
-            elif status == UI_BOARD_STATUS_PLANNED:
+            elif status in {
+                UI_BOARD_STATUS_PLANNED,
+                UI_BOARD_STATUS_ACCEPTED,
+                UI_BOARD_STATUS_SCHEDULED,
+            }:
                 statuses.add('watch_monitoring_pending')
 
         return sorted(statuses)
@@ -14349,9 +14940,7 @@ class SignalDeciderExecIntegrationService:
             normalized = _normalize_status(status)
             if not normalized or normalized in EXEC_MONITORING_TERMINAL_STATUSES:
                 continue
-            if normalized in EXEC_MONITORING_ACTIVE_STATUSES:
-                return True
-            if normalized.endswith('_monitoring') or normalized.startswith('watch_monitoring_'):
+            if normalized in EXEC_WATCH_READBACK_ACTIVE_STATUSES:
                 return True
         return False
 
@@ -14375,7 +14964,36 @@ class SignalDeciderExecIntegrationService:
     ) -> dict[str, Any]:
         held_position = position_quantity > Decimal('0')
         agent_decision = cls._extract_exec_agent_decision(item)
-        exec_agent_approved = bool(agent_decision['approved'])
+        overview_exec_monitoring_active = bool(
+            item.get('exec_monitoring_active')
+            and item.get('exec_agent_approved')
+        )
+        remote_state = item.get('remote_state') if isinstance(item.get('remote_state'), dict) else {}
+        orders = remote_state.get('orders') if isinstance(remote_state.get('orders'), list) else []
+        executions = remote_state.get('executions') if isinstance(remote_state.get('executions'), list) else []
+        readback_proves_exec_activity = bool(
+            held_position
+            or overview_exec_monitoring_active
+            or _positive_decimal(
+                remote_state.get('entry_filled_quantity')
+            )
+            or cls._has_active_order_evidence(
+                orders=orders,
+                side='buy',
+            )
+            or cls._sum_execution_quantity(
+                executions=executions,
+                side='buy',
+            )
+            > Decimal('0')
+        )
+        exec_agent_approved = bool(
+            agent_decision['approved']
+            or (
+                readback_proves_exec_activity
+                and not agent_decision['rejected']
+            )
+        )
         monitoring_statuses = cls._collect_runtime_monitoring_statuses(
             item=item,
             status=status,
@@ -14385,8 +15003,19 @@ class SignalDeciderExecIntegrationService:
             held_position=held_position,
             exec_agent_approved=exec_agent_approved,
         )
+        if overview_exec_monitoring_active:
+            monitoring_statuses = sorted(
+                (
+                    set(monitoring_statuses)
+                    - {'watch_monitoring_pending'}
+                )
+                | {'watch_monitoring_active'}
+            )
         terminal = cls._has_terminal_exec_monitoring_status(status=status, statuses=monitoring_statuses)
-        active_monitoring = cls._has_active_exec_monitoring_status(monitoring_statuses)
+        active_monitoring = bool(
+            overview_exec_monitoring_active
+            or cls._has_active_exec_monitoring_status(monitoring_statuses)
+        )
         exec_monitoring_active = held_position or (exec_agent_approved and active_monitoring and not terminal)
         has_execution_plan = bool(_normalize_optional_text((item.get('dispatch') or {}).get('plan_id')))
 
@@ -14524,6 +15153,11 @@ class SignalDeciderExecIntegrationService:
             position_quantity=contract_position_quantity,
             position_average_price=position_average_price,
         )
+        if (
+            not bool(exec_contract.get('exec_monitoring_active'))
+            and monitoring_state == UI_MONITORING_STATE_WATCHING_FILL
+        ):
+            monitoring_state = UI_MONITORING_STATE_IDLE
         return {
             'plan_item_id': item.get('plan_item_id'),
             'account_reference': item.get('account_reference'),
@@ -15118,6 +15752,34 @@ class SignalDeciderExecIntegrationService:
         return False
 
     @staticmethod
+    def _has_active_order_evidence(
+        *,
+        orders: Sequence[dict[str, Any]],
+        side: str,
+    ) -> bool:
+        active_statuses = (
+            REMOTE_ACTIVE_STATUSES
+            | REMOTE_SUBMITTED_STATUSES
+            | REMOTE_PARTIAL_STATUSES
+            | EXEC_V4_WORKING_ITEM_STATUSES
+        )
+        for order in orders:
+            order_side = _normalize_status(order.get('side'))
+            if side == 'sell':
+                if order_side != 'sell':
+                    continue
+            elif order_side == 'sell':
+                continue
+            status = _normalize_status(
+                order.get('status')
+                or order.get('current_status')
+                or order.get('broker_status')
+            )
+            if status in active_statuses:
+                return True
+        return False
+
+    @staticmethod
     def _sum_position_quantity(*, positions: Sequence[dict[str, Any]]) -> Decimal:
         total = Decimal('0')
         for position in positions:
@@ -15423,7 +16085,13 @@ class SignalDeciderExecIntegrationService:
         if _normalize_decision_agent_name(item.get('decision_agent_name')) != SHORT_TERM_DECIDER_AGENT_NAME:
             return None
         dispatch = item.get('dispatch') if isinstance(item.get('dispatch'), dict) else {}
-        statuses = set(cls._entry_link_active_statuses(item_links=dispatch.get('item_links') or []))
+        statuses: set[str] = set()
+        for link in dispatch.get('item_links') or []:
+            if not isinstance(link, dict):
+                continue
+            if _normalize_optional_text(link.get('intent'), lowercase=True) not in EXEC_ENTRY_BUY_INTENTS:
+                continue
+            statuses.update(cls._entry_link_statuses(link))
         if not statuses:
             return None
         if statuses & REMOTE_PARTIAL_STATUSES:
@@ -15432,7 +16100,11 @@ class SignalDeciderExecIntegrationService:
             return UI_BOARD_STATUS_SUBMITTED
         if statuses & {'watch_monitoring_active', 'active', 'monitoring'}:
             return UI_BOARD_STATUS_ACCEPTED
-        if statuses & ({'watch_monitoring_pending'} | REMOTE_SCHEDULED_STATUSES):
+        if statuses & (
+            EXEC_V4_PENDING_ITEM_STATUSES
+            | REMOTE_SCHEDULED_STATUSES
+            | {'watch_monitoring_pending'}
+        ):
             return UI_BOARD_STATUS_SCHEDULED
         if statuses & EXEC_WATCH_READBACK_ACTIVE_STATUSES:
             return UI_BOARD_STATUS_ACCEPTED
@@ -15510,8 +16182,6 @@ class SignalDeciderExecIntegrationService:
             UI_BOARD_STATUS_SUBMITTED,
             UI_BOARD_STATUS_PARTIAL,
         }:
-            return UI_MONITORING_STATE_WATCHING_FILL
-        if has_target_stop_watch:
             return UI_MONITORING_STATE_WATCHING_FILL
         return UI_MONITORING_STATE_IDLE
 

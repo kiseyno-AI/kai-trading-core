@@ -8,9 +8,12 @@ from app.agent_context.run_modes import (
 )
 
 
-LEGACY_CUTOFF_REPAIR_STAGE_IDS = (
+CUTOFF_REPAIR_STAGE_IDS = (
     'signal_decider',
     'next_open_execution_plan',
+)
+LEGACY_CUTOFF_REPAIR_STAGE_IDS = (
+    *CUTOFF_REPAIR_STAGE_IDS,
     'signal_decider_evaluations',
 )
 SUMMARY_CUTOFF_CONTRACT_REPAIR_VERSION = 1
@@ -29,6 +32,24 @@ def normalize_symbol_codes(symbols: Sequence[object]) -> list[str]:
             normalized = normalized.zfill(6)
         deduped.setdefault(normalized, None)
     return list(deduped)
+
+
+def resolved_cutoff_repair_stage_ids(
+    resolved_stages: object,
+) -> tuple[str, ...] | None:
+    """Resolve only the current or persisted legacy repair contract."""
+
+    if not isinstance(resolved_stages, (list, tuple)):
+        return None
+    normalized = tuple(
+        str(stage_id or '').strip() for stage_id in resolved_stages
+    )
+    if normalized in {
+        CUTOFF_REPAIR_STAGE_IDS,
+        LEGACY_CUTOFF_REPAIR_STAGE_IDS,
+    }:
+        return normalized
+    return None
 
 
 def stage_result_summary(stage: object) -> Mapping[str, Any]:
@@ -224,21 +245,43 @@ def is_summary_cutoff_contract_repair_candidate(
     if not isinstance(metadata, Mapping) or not isinstance(stages, Mapping):
         return False
     persisted_cutoff = metadata.get('feedback_knowledge_cutoff')
+
+    def retired_missing_summary_marker(value: object) -> bool:
+        if not (
+            isinstance(value, Mapping)
+            and value.get('ready') is False
+        ):
+            return False
+        reason = str(value.get('reason') or '').strip()
+        scope_mode = str(
+            value.get('feedback_scope_mode') or ''
+        ).strip()
+        if reason == 'summary_run_missing':
+            return bool(
+                not str(value.get('source_run_id') or '').strip()
+                and scope_mode
+                == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+            )
+        return bool(
+            reason == 'summary_cutoff_proof_unavailable'
+            and all(
+                value.get(field) is None
+                for field in (
+                    'knowledge_cutoff_at',
+                    'source_run_id',
+                    'feedback_scope_mode',
+                    'requested_symbols',
+                )
+            )
+        )
+
     if not (
         metadata.get('synthetic_recovery_parent') is not True
         and str(metadata.get('resume_from_stage') or '').strip()
         == 'signal_decider'
         and str(pipeline_run.get('current_stage') or '').strip()
         == 'signal_decider_evaluations'
-        and isinstance(persisted_cutoff, Mapping)
-        and persisted_cutoff.get('ready') is False
-        and str(persisted_cutoff.get('reason') or '').strip()
-        == 'summary_run_missing'
-        and not str(persisted_cutoff.get('source_run_id') or '').strip()
-        and str(
-            persisted_cutoff.get('feedback_scope_mode') or ''
-        ).strip()
-        == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+        and retired_missing_summary_marker(persisted_cutoff)
     ):
         return False
 
@@ -292,14 +335,7 @@ def is_summary_cutoff_contract_repair_candidate(
         and str(decider_summary.get('reason') or '').strip()
         == 'summary_knowledge_cutoff_unavailable'
         and isinstance(cutoff_resolution, Mapping)
-        and cutoff_resolution.get('ready') is False
-        and str(cutoff_resolution.get('reason') or '').strip()
-        == 'summary_run_missing'
-        and not str(cutoff_resolution.get('source_run_id') or '').strip()
-        and str(
-            cutoff_resolution.get('feedback_scope_mode') or ''
-        ).strip()
-        == FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE
+        and retired_missing_summary_marker(cutoff_resolution)
     ):
         return False
 
@@ -363,21 +399,22 @@ def is_resumable_summary_cutoff_contract_repair(
         or proof_symbols != normalize_symbol_codes(proof_symbols)
     ):
         return False
-    resolved_stages = metadata.get('resolved_stages')
+    resolved_stages = resolved_cutoff_repair_stage_ids(
+        metadata.get('resolved_stages')
+    )
     persisted_stage_ids = set(stages)
     valid_stage_prefixes = {
         frozenset(),
-        frozenset(LEGACY_CUTOFF_REPAIR_STAGE_IDS[:1]),
+        frozenset(CUTOFF_REPAIR_STAGE_IDS[:1]),
     }
     if not (
-        isinstance(resolved_stages, (list, tuple))
-        and tuple(resolved_stages) == LEGACY_CUTOFF_REPAIR_STAGE_IDS
+        resolved_stages is not None
         and frozenset(persisted_stage_ids) in valid_stage_prefixes
     ):
         return False
     current_stage = str(pipeline_run.get('current_stage') or '').strip()
     expected_current_stage = (
-        LEGACY_CUTOFF_REPAIR_STAGE_IDS[len(persisted_stage_ids) - 1]
+        resolved_stages[len(persisted_stage_ids) - 1]
         if persisted_stage_ids
         else ''
     )

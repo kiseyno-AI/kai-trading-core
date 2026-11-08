@@ -24,6 +24,9 @@ class _ScalarResult:
     def scalars(self):
         return self
 
+    def mappings(self):
+        return self
+
     def all(self):
         return list(self._values)
 
@@ -39,6 +42,66 @@ class _EvaluationSession:
 
 
 class DeciderPostDecisionEvaluationRepositoryTests(unittest.TestCase):
+    def test_list_feedback_sources_joins_latest_snapshot_once(self):
+        source_row = {
+            'feedback_id': 11,
+            'market_date': date(2026, 4, 23),
+            'symbol': '005930',
+            'agent_name': 'signal-decider',
+            'agent_version': 'openclaw-v1',
+            'run_id': 'run-11',
+            'received_at': datetime(2026, 4, 23, 6, 0, tzinfo=timezone.utc),
+            'normalized_feedback_payload': {},
+            'feedback_payload': {},
+            'decision_snapshot_id': 84,
+            'feedback_received_at': datetime(
+                2026, 4, 23, 6, 1, tzinfo=timezone.utc
+            ),
+            'created_at': datetime(2026, 4, 23, 6, 2, tzinfo=timezone.utc),
+            'decision_request_payload': {},
+        }
+        session = _EvaluationSession([[source_row]])
+
+        @contextmanager
+        def session_scope():
+            yield session
+
+        with patch(
+            'app.agent_context.decider_evaluation_service.session_scope',
+            session_scope,
+        ):
+            result = (
+                DeciderPostDecisionEvaluationRepository()
+                .list_feedback_sources(
+                    market_date_from=date(2026, 4, 1),
+                    market_date_to=date(2026, 4, 30),
+                    agent_names=('signal-decider', 'short-term-decider'),
+                    symbols=('005930', '000660'),
+                )
+            )
+
+        self.assertEqual(result, [source_row])
+        statement = str(session.statements[0])
+        self.assertIn('LEFT OUTER JOIN LATERAL', statement)
+        self.assertEqual(
+            statement.count('FROM signal_decider_decision_snapshots'),
+            1,
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots.created_at DESC',
+            statement,
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots.id DESC',
+            statement,
+        )
+        self.assertIn(
+            'signal_decider_decision_snapshots.feedback_id = '
+            'agent_context_feedback.id',
+            statement,
+        )
+        self.assertIn('agent_context_feedback.symbol IN', statement)
+
     def test_bulk_upsert_serializes_rows_before_session_exit(self):
         record = SimpleNamespace(id=91)
         session = _EvaluationSession([[91], [record]])
@@ -72,6 +135,90 @@ class DeciderPostDecisionEvaluationRepositoryTests(unittest.TestCase):
             )
 
         self.assertEqual(result[0]['evaluation_id'], 91)
+
+    def test_bulk_upsert_chunks_large_writes_below_driver_parameter_limit(self):
+        records = [SimpleNamespace(id=value) for value in range(1, 6)]
+        session = _EvaluationSession(
+            [[1, 2], [3, 4], [5], records]
+        )
+        now = datetime(2026, 11, 3, 16, 0, tzinfo=timezone.utc)
+
+        def evaluation_item(value):
+            return {
+                'feedback_id': value,
+                'decision_snapshot_id': value,
+                'agent_name': 'signal-decider',
+                'market_date': date(2026, 8, 14),
+                'symbol': f'{value:06d}',
+                'window_days': 5,
+                'decision_action': 'wait',
+                'entry_trade_date': None,
+                'entry_price': None,
+                'target_price': None,
+                'stop_loss_price': None,
+                'first_target_hit_trade_date': None,
+                'first_stop_hit_trade_date': None,
+                'mfe_pct': None,
+                'mae_pct': None,
+                'outcome_label': 'not_applicable_wait_or_reject',
+                'outcome_reason': 'wait',
+                'data_quality_warnings_payload': [],
+                'metadata_payload': {},
+                'computed_at': now,
+                'created_at': now,
+                'updated_at': now,
+            }
+
+        @contextmanager
+        def session_scope():
+            yield session
+
+        with (
+            patch(
+                'app.agent_context.decider_evaluation_service.session_scope',
+                session_scope,
+            ),
+            patch(
+                'app.agent_context.decider_evaluation_service.'
+                'DECIDER_EVALUATION_UPSERT_BATCH_SIZE',
+                2,
+                create=True,
+            ),
+            patch(
+                'app.agent_context.decider_evaluation_service.'
+                '_serialize_evaluation',
+                side_effect=lambda row: {'evaluation_id': row.id},
+            ),
+        ):
+            result = (
+                DeciderPostDecisionEvaluationRepository()
+                .bulk_upsert_evaluations(
+                    items=[
+                        evaluation_item(value)
+                        for value in range(1, 6)
+                    ]
+                )
+            )
+
+        self.assertEqual(
+            [item['evaluation_id'] for item in result],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(len(session.statements), 4)
+        self.assertTrue(
+            all(
+                str(statement).startswith('INSERT INTO')
+                for statement in session.statements[:3]
+            )
+        )
+        self.assertEqual(
+            [
+                len(statement.compile().params)
+                for statement in session.statements[:3]
+            ],
+            [44, 44, 22],
+        )
+        self.assertTrue(str(session.statements[3]).startswith('SELECT'))
 
     def test_list_serializes_rows_before_session_exit(self):
         record = SimpleNamespace(id=91)

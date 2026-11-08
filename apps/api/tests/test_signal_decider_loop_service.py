@@ -16,10 +16,12 @@ from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_VERSION,
     DEFAULT_SIGNAL_DECIDER_POLICY_VERSION,
+    SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE,
     SIGNAL_DECIDER_POLICY_ACTIVATION_EVIDENCE_SCHEMA_VERSION,
     SignalDeciderLoopService,
     SignalDeciderLoopRepository,
     _dedupe_decision_snapshot_rows,
+    _iter_snapshot_atomic_bulk_upsert_chunks,
     _merge_policy_metadata_preserving_audit,
     build_signal_decider_feature_snapshot,
 )
@@ -759,6 +761,39 @@ class FakeSignalDeciderLoopRepository:
         return target
 
 
+def _build_evaluation_isolation_fixture():
+    repository = FakeSignalDeciderLoopRepository(
+        [
+            _feedback_row(
+                feedback_id=1,
+                snapshot_id=101,
+                market_date='2026-04-20',
+                symbol='005930',
+                action='buy',
+            ),
+            _feedback_row(
+                feedback_id=2,
+                snapshot_id=102,
+                market_date='2026-04-20',
+                symbol='000660',
+                action='wait',
+            ),
+        ]
+    )
+    service = SignalDeciderLoopService(repository=repository)
+    future_bars = [
+        {
+            'trade_date': '2026-04-21',
+            'open_price': 100,
+            'high_price': 104,
+            'low_price': 99,
+            'close_price': 103,
+            'volume': 1000,
+        },
+    ]
+    return repository, service, future_bars
+
+
 def _apply_calibration_context(
     row,
     *,
@@ -1141,6 +1176,56 @@ def _build_rule_candidate_report(
 
 
 class SignalDeciderLoopServiceTests(unittest.TestCase):
+    def test_evaluation_bulk_chunks_never_split_a_decision_snapshot(self):
+        items = [
+            {
+                'decision_snapshot_id': snapshot_id,
+                'horizon_days': horizon_days,
+            }
+            for snapshot_id in (101, 102, 103)
+            for horizon_days in (1, 3, 5, 10)
+        ]
+
+        chunks = _iter_snapshot_atomic_bulk_upsert_chunks(
+            items,
+            chunk_size=10,
+        )
+
+        self.assertEqual([len(chunk) for chunk in chunks], [8, 4])
+        self.assertEqual(
+            [
+                sorted({item['decision_snapshot_id'] for item in chunk})
+                for chunk in chunks
+            ],
+            [[101, 102], [103]],
+        )
+
+    def test_outcome_repository_uses_snapshot_atomic_chunks(self):
+        items = [
+            {
+                'decision_snapshot_id': snapshot_id,
+                'horizon_days': horizon_days,
+            }
+            for snapshot_id in (101, 102, 103)
+            for horizon_days in (1, 3, 5, 10)
+        ]
+        repository = SignalDeciderLoopRepository()
+
+        with (
+            patch(
+                'app.agent_context.signal_decider_loop_service._iter_snapshot_atomic_bulk_upsert_chunks',
+                return_value=[],
+            ) as atomic_chunker,
+            patch(
+                'app.agent_context.signal_decider_loop_service._iter_bulk_upsert_chunks',
+                side_effect=AssertionError('generic chunker split an outcome snapshot'),
+            ),
+        ):
+            persisted = repository.bulk_upsert_realized_outcomes(items=items)
+
+        self.assertEqual(persisted, [])
+        atomic_chunker.assert_called_once_with(items)
+
     def test_get_active_policy_context_fails_closed_when_registry_is_unavailable(self):
         repository = FakeSignalDeciderLoopRepository([])
         service = SignalDeciderLoopService(repository=repository)
@@ -3386,6 +3471,417 @@ class SignalDeciderLoopServiceTests(unittest.TestCase):
         buy_outcomes = {item['horizon_days']: item for item in items_by_symbol['005930']['outcomes']}
         self.assertEqual(buy_outcomes[1]['entry_trade_date'], '2026-04-21')
         self.assertEqual(buy_outcomes[5]['exit_trade_date'], '2026-04-27')
+
+    def test_compute_evaluations_preserves_valid_snapshots_when_one_row_is_malformed(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        original_build_evaluation_item = service._build_evaluation_item
+
+        def build_evaluation_item(**kwargs):
+            if (
+                kwargs['snapshot_row'].id == 102
+                and kwargs['horizon_days'] == 3
+            ):
+                raise ValueError('malformed evaluation fixture')
+            return original_build_evaluation_item(**kwargs)
+
+        with (
+            patch.object(
+                service,
+                '_build_evaluation_item',
+                side_effect=build_evaluation_item,
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1, 3],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['reason'], 'signal_decider_evaluation_partial_failure')
+        self.assertEqual(result['failure_reason'], result['reason'])
+        self.assertEqual(result['summary']['decisions_considered'], 2)
+        self.assertEqual(result['summary']['outcomes_upserted'], 4)
+        self.assertEqual(result['summary']['evaluations_upserted'], 2)
+        self.assertEqual(result['summary']['failed_count'], 2)
+        self.assertEqual(result['summary']['failed_snapshot_count'], 1)
+        self.assertEqual(result['summary']['retry_debt_count'], 2)
+        self.assertEqual(result['summary']['retry_debt_snapshot_ids'], [102])
+        self.assertEqual(result['summary']['coverage']['count'], 4)
+        self.assertEqual(result['summary']['coverage']['not_computed_count'], 2)
+        self.assertEqual(result['retry_debt_snapshot_ids'], [102])
+        self.assertEqual(
+            result['evaluation_failures'],
+            [
+                {
+                    'decision_snapshot_id': 102,
+                    'feedback_id': 2,
+                    'market_date': '2026-04-20',
+                    'symbol': '000660',
+                    'horizon_days': [1, 3],
+                    'failed_evaluation_count': 2,
+                    'reason': 'signal_decider_evaluation_row_construction_failed',
+                    'failure_reason': 'signal_decider_evaluation_row_construction_failed',
+                    'error_type': 'ValueError',
+                    'error_message': 'malformed evaluation fixture',
+                    'retryable': True,
+                }
+            ],
+        )
+        self.assertEqual(
+            result['evaluation_failure_evidence']['102'],
+            result['evaluation_failures'][0],
+        )
+        items_by_snapshot = {
+            item['snapshot_id']: item
+            for item in result['items']
+        }
+        self.assertEqual(len(items_by_snapshot[101]['evaluations']), 2)
+        self.assertEqual(items_by_snapshot[102]['evaluations'], [])
+        self.assertEqual(
+            items_by_snapshot[102]['evaluation_failure']['reason'],
+            'signal_decider_evaluation_row_construction_failed',
+        )
+        self.assertEqual({key[0] for key in repository.evaluations}, {101})
+
+    def test_compute_evaluations_isolates_decision_snapshot_parse_failure(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        original_build_decision_snapshot = service._build_decision_snapshot
+
+        def build_decision_snapshot(row):
+            if row.id == 102:
+                raise ValueError('malformed decision snapshot fixture')
+            return original_build_decision_snapshot(row)
+
+        with (
+            patch.object(
+                service,
+                '_build_decision_snapshot',
+                side_effect=build_decision_snapshot,
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1, 3],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['summary']['outcomes_upserted'], 2)
+        self.assertEqual(result['summary']['evaluations_upserted'], 2)
+        self.assertEqual(result['retry_debt_snapshot_ids'], [102])
+        self.assertEqual(
+            result['evaluation_failures'][0]['reason'],
+            'signal_decider_outcome_row_construction_failed',
+        )
+        self.assertEqual(
+            result['evaluation_failures'][0]['error_message'],
+            'malformed decision snapshot fixture',
+        )
+        items_by_snapshot = {
+            item['snapshot_id']: item for item in result['items']
+        }
+        self.assertEqual(len(items_by_snapshot[101]['outcomes']), 2)
+        self.assertEqual(len(items_by_snapshot[101]['evaluations']), 2)
+        self.assertEqual(items_by_snapshot[102]['decision'], {})
+        self.assertEqual(items_by_snapshot[102]['outcomes'], [])
+        self.assertEqual(items_by_snapshot[102]['evaluations'], [])
+        self.assertEqual({key[0] for key in repository.outcomes}, {101})
+        self.assertEqual({key[0] for key in repository.evaluations}, {101})
+
+    def test_compute_evaluations_preserves_sibling_when_outcome_construction_fails(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        original_build_realized_outcome_item = service._build_realized_outcome_item
+
+        def build_realized_outcome_item(**kwargs):
+            if (
+                kwargs['snapshot_row'].id == 102
+                and kwargs['horizon_days'] == 3
+            ):
+                raise ValueError('malformed outcome fixture')
+            return original_build_realized_outcome_item(**kwargs)
+
+        with (
+            patch.object(
+                service,
+                '_build_realized_outcome_item',
+                side_effect=build_realized_outcome_item,
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1, 3],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['summary']['outcomes_upserted'], 2)
+        self.assertEqual(result['summary']['evaluations_upserted'], 2)
+        self.assertEqual(result['summary']['failed_count'], 2)
+        self.assertEqual(result['summary']['retry_debt_snapshot_ids'], [102])
+        self.assertEqual(
+            result['evaluation_failures'][0]['reason'],
+            'signal_decider_outcome_row_construction_failed',
+        )
+        self.assertEqual(
+            result['evaluation_failures'][0]['error_message'],
+            'malformed outcome fixture',
+        )
+        items_by_snapshot = {
+            item['snapshot_id']: item
+            for item in result['items']
+        }
+        self.assertEqual(len(items_by_snapshot[101]['outcomes']), 2)
+        self.assertEqual(len(items_by_snapshot[101]['evaluations']), 2)
+        self.assertEqual(items_by_snapshot[102]['outcomes'], [])
+        self.assertEqual(items_by_snapshot[102]['evaluations'], [])
+        self.assertEqual({key[0] for key in repository.outcomes}, {101})
+        self.assertEqual({key[0] for key in repository.evaluations}, {101})
+
+    def test_compute_evaluations_isolates_outcome_persistence_failure_by_snapshot(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        original_bulk_upsert = repository.bulk_upsert_realized_outcomes
+        persistence_calls = []
+
+        def bulk_upsert_realized_outcomes(*, items):
+            persistence_calls.append(list(items))
+            if any(item['decision_snapshot_id'] == 102 for item in items):
+                raise ValueError('malformed outcome persistence fixture')
+            return original_bulk_upsert(items=items)
+
+        with (
+            patch.object(
+                repository,
+                'bulk_upsert_realized_outcomes',
+                side_effect=bulk_upsert_realized_outcomes,
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1, 3],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['summary']['outcomes_upserted'], 2)
+        self.assertEqual(result['summary']['evaluations_upserted'], 2)
+        self.assertEqual(result['summary']['failed_count'], 2)
+        self.assertEqual(result['summary']['retry_debt_snapshot_ids'], [102])
+        self.assertEqual(
+            result['evaluation_failures'][0]['reason'],
+            'signal_decider_outcome_row_persistence_failed',
+        )
+        self.assertEqual(
+            result['evaluation_failures'][0]['error_message'],
+            'malformed outcome persistence fixture',
+        )
+        self.assertEqual(
+            {(key[0], key[1]) for key in repository.outcomes},
+            {(101, 1), (101, 3)},
+        )
+        self.assertEqual(
+            {(key[0], key[1]) for key in repository.evaluations},
+            {(101, 1), (101, 3)},
+        )
+        for call_items in persistence_calls:
+            snapshot_ids = {
+                item['decision_snapshot_id']
+                for item in call_items
+            }
+            if len(snapshot_ids) == 1:
+                self.assertEqual(
+                    sorted(item['horizon_days'] for item in call_items),
+                    [1, 3],
+                )
+
+    def test_compute_evaluations_isolates_bulk_persistence_failure_by_snapshot(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        original_bulk_upsert = repository.bulk_upsert_evaluations
+
+        def bulk_upsert_evaluations(*, items):
+            if any(item['decision_snapshot_id'] == 102 for item in items):
+                raise ValueError('malformed evaluation persistence fixture')
+            return original_bulk_upsert(items=items)
+
+        with (
+            patch.object(
+                repository,
+                'bulk_upsert_evaluations',
+                side_effect=bulk_upsert_evaluations,
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1, 3],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['summary']['evaluations_upserted'], 2)
+        self.assertEqual(result['summary']['failed_count'], 2)
+        self.assertEqual(result['summary']['retry_debt_snapshot_ids'], [102])
+        self.assertEqual(
+            result['evaluation_failures'][0]['reason'],
+            'signal_decider_evaluation_row_persistence_failed',
+        )
+        self.assertEqual(
+            result['evaluation_failures'][0]['error_message'],
+            'malformed evaluation persistence fixture',
+        )
+        self.assertEqual(
+            {(key[0], key[1]) for key in repository.evaluations},
+            {(101, 1), (101, 3)},
+        )
+
+    def test_compute_evaluations_retains_prior_chunk_after_later_chunk_failure(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        repository.snapshot_rows.append(
+            _feedback_row(
+                feedback_id=3,
+                snapshot_id=103,
+                market_date='2026-04-20',
+                symbol='035420',
+                action='buy',
+            )
+        )
+        original_bulk_upsert = repository.bulk_upsert_evaluations
+        outage_started = False
+
+        def bulk_upsert_evaluations(*, items):
+            nonlocal outage_started
+            if outage_started:
+                raise SQLAlchemyError('evaluation repository unavailable')
+            snapshot_ids = {
+                item['decision_snapshot_id']
+                for item in items
+            }
+            if len(items) > SIGNAL_DECIDER_BULK_UPSERT_CHUNK_SIZE:
+                original_bulk_upsert(items=items[:8])
+                outage_started = True
+                raise SQLAlchemyError('evaluation repository unavailable')
+            if snapshot_ids == {101}:
+                outage_started = True
+                raise SQLAlchemyError('evaluation repository unavailable')
+            return original_bulk_upsert(items=items)
+
+        with (
+            patch.object(
+                repository,
+                'bulk_upsert_evaluations',
+                side_effect=bulk_upsert_evaluations,
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1, 3, 5, 10],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['summary']['evaluations_upserted'], 8)
+        self.assertEqual(result['summary']['failed_count'], 4)
+        self.assertEqual(result['summary']['failed_snapshot_count'], 1)
+        self.assertEqual(result['summary']['retry_debt_count'], 4)
+        self.assertEqual(result['summary']['retry_debt_snapshot_ids'], [101])
+        self.assertEqual(
+            {
+                snapshot_id
+                for snapshot_id, _horizon_days, _version
+                in repository.evaluations
+            },
+            {102, 103},
+        )
+        self.assertEqual(
+            result['evaluation_failures'][0]['reason'],
+            'signal_decider_evaluation_row_persistence_failed',
+        )
+        self.assertEqual(
+            result['evaluation_failures'][0]['error_message'],
+            'evaluation repository unavailable',
+        )
+
+    def test_compute_evaluations_reports_all_malformed_snapshots_as_failed_retry_debt(self):
+        repository, service, future_bars = _build_evaluation_isolation_fixture()
+        with (
+            patch.object(
+                repository,
+                'bulk_upsert_evaluations',
+                side_effect=ValueError('all evaluation rows malformed'),
+            ),
+            patch(
+                'app.agent_context.signal_decider_loop_service.load_daily_bars_for_symbol_range',
+                return_value=future_bars,
+            ),
+        ):
+            result = service.compute_evaluations(
+                market_date_from='2026-04-20',
+                market_date_to='2026-04-20',
+                horizons=[1],
+                evaluation_version='signal_decider_eval_test',
+            )
+
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['reason'], 'signal_decider_evaluation_all_failed')
+        self.assertEqual(result['failure_reason'], result['reason'])
+        self.assertEqual(result['summary']['status'], 'failed')
+        self.assertEqual(result['summary']['evaluations_upserted'], 0)
+        self.assertEqual(result['summary']['failed_count'], 2)
+        self.assertEqual(result['summary']['failed_snapshot_count'], 2)
+        self.assertEqual(result['summary']['retry_debt_count'], 2)
+        self.assertEqual(result['summary']['retry_debt_snapshot_ids'], [101, 102])
+        self.assertEqual(result['summary']['coverage']['count'], 2)
+        self.assertEqual(result['summary']['coverage']['not_computed_count'], 2)
+        self.assertEqual(result['retry_debt_snapshot_ids'], [101, 102])
+        self.assertEqual(
+            [failure['decision_snapshot_id'] for failure in result['evaluation_failures']],
+            [101, 102],
+        )
+        self.assertEqual(
+            sorted(result['evaluation_failure_evidence']),
+            ['101', '102'],
+        )
+        self.assertTrue(
+            all(
+                failure['reason']
+                == 'signal_decider_evaluation_row_persistence_failed'
+                for failure in result['evaluation_failures']
+            )
+        )
+        self.assertEqual(repository.evaluations, {})
+        self.assertEqual(
+            [item['evaluations'] for item in result['items']],
+            [[], []],
+        )
 
     def test_compute_evaluations_quarantines_snapshot_observed_at_target_open(self):
         valid_row = _feedback_row(

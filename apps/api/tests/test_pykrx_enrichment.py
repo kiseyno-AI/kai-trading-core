@@ -3,17 +3,23 @@ import hashlib
 import unittest
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pandas as pd
 
 from app.eod.pykrx_enrichment import (
     PykrxEnrichmentService,
     _market_ticker_membership_frame,
+    _preserve_existing_short_selling_components,
+    _resolve_short_balance_as_of_date,
+    is_complete_pykrx_enrichment_row,
 )
 from app.eod.pykrx_enrichment_gate import build_pykrx_enrichment_preflight
+from app.market.session import (
+    previous_krx_trading_date as actual_previous_krx_trading_date,
+)
 
 
 def _filter_rows(
@@ -140,6 +146,24 @@ def _exact_membership_run(
 
 
 class PykrxEnrichmentServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        def previous_weekday(value, **_kwargs):
+            candidate = (
+                value
+                if isinstance(value, date)
+                else date.fromisoformat(str(value))
+            ) - timedelta(days=1)
+            while candidate.weekday() >= 5:
+                candidate -= timedelta(days=1)
+            return candidate
+
+        previous_trading_date_patcher = patch(
+            'app.eod.pykrx_enrichment.previous_krx_trading_date',
+            side_effect=previous_weekday,
+        )
+        self.previous_krx_trading_date_mock = previous_trading_date_patcher.start()
+        self.addCleanup(previous_trading_date_patcher.stop)
+
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_valuation_collection_rejects_unfinalized_date_before_provider_work(
         self,
@@ -915,6 +939,301 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
+    def test_collect_short_selling_uses_t_plus_2_balance_date_with_provenance(
+        self,
+        get_shorting_volume_by_ticker_mock,
+        get_shorting_value_by_ticker_mock,
+        get_shorting_balance_by_ticker_mock,
+    ):
+        self.previous_krx_trading_date_mock.side_effect = [
+            date(2026, 10, 29),
+            date(2026, 10, 28),
+        ]
+        get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
+            {'공매도': [1000], '매수': [20000], '비중': [5.0]},
+            index=['005930'],
+        )
+        get_shorting_value_by_ticker_mock.return_value = pd.DataFrame(
+            {'공매도': [70000000], '매수': [1400000000], '비중': [5.0]},
+            index=['005930'],
+        )
+        get_shorting_balance_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '공매도잔고': [120000],
+                '상장주식수': [5969782550],
+                '공매도금액': [8400000000],
+                '시가총액': [420000000000],
+                '비중': [0.45],
+            },
+            index=['005930'],
+        )
+
+        service = PykrxEnrichmentService()
+        service._request_pause_seconds = 0.0
+        rows, details = service._collect_short_selling_rows(
+            market_date_iso='2026-10-30',
+            market_date_yyyymmdd='20261030',
+            markets=['KOSPI'],
+            symbol_filter={'005930'},
+            symbol_meta={'005930': {'market': 'KOSPI', 'name_ko': '삼성전자'}},
+            cache={},
+        )
+
+        self.assertEqual(details['errors'], [])
+        self.assertEqual(
+            self.previous_krx_trading_date_mock.call_args_list,
+            [
+                call(date(2026, 10, 30), allow_fallback=True),
+                call(date(2026, 10, 29), allow_fallback=True),
+            ],
+        )
+        self.assertEqual(
+            get_shorting_volume_by_ticker_mock.call_args.kwargs['date'],
+            '20261030',
+        )
+        self.assertEqual(
+            get_shorting_value_by_ticker_mock.call_args.kwargs['date'],
+            '20261030',
+        )
+        self.assertEqual(
+            get_shorting_balance_by_ticker_mock.call_args.kwargs['date'],
+            '20261028',
+        )
+        self.assertEqual(
+            rows[0]['payload']['short_balance']['as_of_date'],
+            '2026-10-28',
+        )
+        self.assertEqual(
+            rows[0]['payload']['short_balance']['availability_lag_trading_days'],
+            2,
+        )
+        self.assertEqual(
+            rows[0]['payload']['short_balance']['availability_contract'],
+            'krx_t_plus_2',
+        )
+
+    def test_short_balance_date_crosses_weekend_with_real_krx_calendar(self) -> None:
+        with patch(
+            'app.eod.pykrx_enrichment.previous_krx_trading_date',
+            side_effect=actual_previous_krx_trading_date,
+        ):
+            self.assertEqual(
+                _resolve_short_balance_as_of_date('2026-10-26'),
+                date(2026, 10, 22),
+            )
+
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
+    def test_short_balance_calendar_failure_keeps_same_day_trade_data(
+        self,
+        get_shorting_volume_by_ticker_mock,
+        get_shorting_value_by_ticker_mock,
+        get_shorting_balance_by_ticker_mock,
+    ) -> None:
+        self.previous_krx_trading_date_mock.side_effect = [
+            date(2026, 10, 29),
+            None,
+        ]
+        get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
+            {'공매도': [1000], '매수': [20000], '비중': [5.0]},
+            index=['005930'],
+        )
+        get_shorting_value_by_ticker_mock.return_value = pd.DataFrame(
+            {'공매도': [70000000], '매수': [1400000000], '비중': [5.0]},
+            index=['005930'],
+        )
+
+        service = PykrxEnrichmentService()
+        service._request_pause_seconds = 0.0
+        rows, details = service._collect_short_selling_rows(
+            market_date_iso='2026-10-30',
+            market_date_yyyymmdd='20261030',
+            markets=['KOSPI'],
+            symbol_filter={'005930'},
+            symbol_meta={'005930': {'market': 'KOSPI', 'name_ko': '삼성전자'}},
+            cache={},
+        )
+
+        self.assertEqual(rows[0]['payload']['short_volume']['short_volume'], 1000)
+        self.assertEqual(rows[0]['payload']['short_volume']['short_value'], 70000000)
+        self.assertEqual(rows[0]['payload']['missing_fields'], ['short_balance'])
+        self.assertEqual(details['errors'][0]['operation'], 'short_selling_balance')
+        self.assertIn(
+            'availability date resolution failed',
+            details['errors'][0]['error'],
+        )
+        get_shorting_balance_by_ticker_mock.assert_not_called()
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_ticker_list')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
+    def test_short_balance_excludes_new_listing_from_retry_debt(
+        self,
+        get_shorting_volume_by_ticker_mock,
+        get_shorting_value_by_ticker_mock,
+        get_shorting_balance_by_ticker_mock,
+        get_market_ticker_list_mock,
+    ) -> None:
+        get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '공매도': [1000, 25],
+                '매수': [20000, 500],
+                '비중': [5.0, 5.0],
+            },
+            index=['005930', '999999'],
+        )
+        get_shorting_value_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '공매도': [70000000, 250000],
+                '매수': [1400000000, 5000000],
+                '비중': [5.0, 5.0],
+            },
+            index=['005930', '999999'],
+        )
+        get_shorting_balance_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '공매도잔고': [100],
+                '상장주식수': [10000],
+                '공매도금액': [1000000],
+                '시가총액': [100000000],
+                '비중': [1.0],
+            },
+            index=['000660'],
+        )
+        get_market_ticker_list_mock.side_effect = lambda *, date, market: {
+            'KOSPI': ['000660', '005930'],
+            'KOSDAQ': ['111111'],
+            'KONEX': ['222222'],
+        }[market]
+
+        service = PykrxEnrichmentService()
+        service._request_pause_seconds = 0.0
+        rows, details = service._collect_short_selling_rows(
+            market_date_iso='2026-04-21',
+            market_date_yyyymmdd='20260421',
+            markets=['KOSPI'],
+            symbol_filter={'005930', '999999'},
+            symbol_meta={
+                '005930': {'market': 'KOSPI', 'name_ko': '삼성전자'},
+                '999999': {'market': 'KOSPI', 'name_ko': '신규상장'},
+            },
+            cache={},
+        )
+
+        rows_by_symbol = {row['symbol']: row for row in rows}
+        established_row = rows_by_symbol['005930']
+        new_listing_row = rows_by_symbol['999999']
+        get_market_ticker_list_mock.assert_has_calls(
+            [
+                call(date='20260417', market='KOSPI'),
+                call(date='20260417', market='KOSDAQ'),
+                call(date='20260417', market='KONEX'),
+            ],
+            any_order=True,
+        )
+        self.assertEqual(get_market_ticker_list_mock.call_count, 3)
+        self.assertEqual(
+            new_listing_row['payload']['short_balance']['availability_status'],
+            'not_applicable_new_listing',
+        )
+        self.assertNotIn(
+            'short_balance',
+            new_listing_row['payload']['missing_fields'],
+        )
+        self.assertEqual(
+            established_row['payload']['missing_fields'],
+            ['short_balance'],
+        )
+        self.assertEqual(
+            details['short_balance_not_applicable_new_listing_symbols'],
+            ['999999'],
+        )
+        self.assertEqual(
+            details['component_retry_debt'][0]['affected_symbols'],
+            ['005930'],
+        )
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_ticker_list')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
+    def test_short_balance_market_transfer_retains_retry_debt(
+        self,
+        get_shorting_volume_by_ticker_mock,
+        get_shorting_value_by_ticker_mock,
+        get_shorting_balance_by_ticker_mock,
+        get_market_ticker_list_mock,
+    ) -> None:
+        get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
+            {'공매도': [25], '매수': [500], '비중': [5.0]},
+            index=['999999'],
+        )
+        get_shorting_value_by_ticker_mock.return_value = pd.DataFrame(
+            {'공매도': [250000], '매수': [5000000], '비중': [5.0]},
+            index=['999999'],
+        )
+        get_shorting_balance_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '공매도잔고': [100],
+                '상장주식수': [10000],
+                '공매도금액': [1000000],
+                '시가총액': [100000000],
+                '비중': [1.0],
+            },
+            index=['000660'],
+        )
+        get_market_ticker_list_mock.side_effect = (
+            lambda *, date, market: {
+                'KOSPI': ['000660'],
+                'KOSDAQ': ['999999'],
+                'KONEX': ['222222'],
+            }[market]
+        )
+
+        service = PykrxEnrichmentService()
+        service._request_pause_seconds = 0.0
+        rows, details = service._collect_short_selling_rows(
+            market_date_iso='2026-04-21',
+            market_date_yyyymmdd='20260421',
+            markets=['KOSPI'],
+            symbol_filter={'999999'},
+            symbol_meta={
+                '999999': {
+                    'market': 'KOSPI',
+                    'name_ko': '시장 이전 종목',
+                }
+            },
+            cache={},
+        )
+
+        self.assertEqual(rows[0]['payload']['missing_fields'], ['short_balance'])
+        self.assertNotEqual(
+            rows[0]['payload']['short_balance'].get('availability_status'),
+            'not_applicable_new_listing',
+        )
+        self.assertEqual(
+            details['short_balance_not_applicable_new_listing_symbols'],
+            [],
+        )
+        self.assertEqual(
+            details['component_retry_debt'][0]['affected_symbols'],
+            ['999999'],
+        )
+        get_market_ticker_list_mock.assert_has_calls(
+            [
+                call(date='20260417', market='KOSPI'),
+                call(date='20260417', market='KOSDAQ'),
+                call(date='20260417', market='KONEX'),
+            ],
+            any_order=True,
+        )
+        self.assertEqual(get_market_ticker_list_mock.call_count, 3)
+
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
     def test_collect_short_selling_rows_keeps_multiindex_value_fallback(
         self,
         get_shorting_volume_by_ticker_mock,
@@ -967,6 +1286,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]['payload']['short_volume']['total_value'], 1400000000)
         self.assertEqual(rows[0]['payload']['short_volume']['short_value_ratio_pct'], 5.0)
 
+    @patch('app.eod.pykrx_enrichment.stock.get_market_ticker_list')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
@@ -975,6 +1295,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         get_shorting_volume_by_ticker_mock,
         get_shorting_value_by_ticker_mock,
         get_shorting_balance_by_ticker_mock,
+        get_market_ticker_list_mock,
     ):
         get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
             {'공매도': [1000], '매수': [20000], '비중': [5.0]},
@@ -985,6 +1306,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             index=['005930'],
         )
         get_shorting_balance_by_ticker_mock.side_effect = IndexError('no balance rows')
+        get_market_ticker_list_mock.return_value = ['005930']
 
         service = PykrxEnrichmentService()
         service._request_pause_seconds = 0.0
@@ -1003,9 +1325,51 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(details['errors'][0]['operation'], 'short_selling_balance')
         self.assertEqual(rows[0]['payload']['short_volume']['short_volume'], 1000)
         self.assertEqual(rows[0]['payload']['short_volume']['short_value'], 70000000)
+        self.assertEqual(
+            get_shorting_balance_by_ticker_mock.call_args.kwargs['date'],
+            '20260417',
+        )
+        self.assertEqual(
+            rows[0]['payload']['short_balance']['as_of_date'],
+            '2026-04-17',
+        )
+        self.assertEqual(
+            rows[0]['payload']['short_balance']['availability_lag_trading_days'],
+            2,
+        )
+        self.assertEqual(
+            rows[0]['payload']['short_balance']['availability_contract'],
+            'krx_t_plus_2',
+        )
         self.assertIsNone(rows[0]['payload']['short_balance']['short_balance_qty'])
         self.assertEqual(rows[0]['payload']['missing_fields'], ['short_balance'])
+        self.assertEqual(
+            details['component_retry_debt'],
+            [
+                {
+                    'component': 'short_balance',
+                    'operation': 'short_selling_balance',
+                    'status': 'retry_debt',
+                    'retryable': True,
+                    'action_required': 'retry_pykrx_enrichment_for_market_date',
+                    'market_date': '2026-04-21',
+                    'expected_as_of_date': '2026-04-17',
+                    'affected_symbol_count': 1,
+                    'affected_symbols': ['005930'],
+                    'affected_symbols_preview': ['005930'],
+                    'provider_errors': [
+                        {
+                            'market': 'KOSPI',
+                            'operation': 'short_selling_balance',
+                            'error': 'no balance rows',
+                        }
+                    ],
+                    'reason': 'no balance rows',
+                }
+            ],
+        )
 
+    @patch('app.eod.pykrx_enrichment.stock.get_market_ticker_list')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_value_by_ticker')
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_volume_by_ticker')
@@ -1014,6 +1378,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         get_shorting_volume_by_ticker_mock,
         get_shorting_value_by_ticker_mock,
         get_shorting_balance_by_ticker_mock,
+        get_market_ticker_list_mock,
     ):
         get_shorting_volume_by_ticker_mock.return_value = pd.DataFrame(
             {'공매도': [1000], '매수': [20000], '비중': [5.0]},
@@ -1021,6 +1386,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         )
         get_shorting_value_by_ticker_mock.return_value = pd.DataFrame()
         get_shorting_balance_by_ticker_mock.return_value = pd.DataFrame()
+        get_market_ticker_list_mock.return_value = ['005930']
 
         service = PykrxEnrichmentService()
         service._request_pause_seconds = 0.0
@@ -1043,6 +1409,339 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(
             rows[0]['payload']['missing_fields'],
             ['short_value', 'short_balance'],
+        )
+        self.assertEqual(
+            [item['component'] for item in details['component_retry_debt']],
+            ['short_value', 'short_balance'],
+        )
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_collect_for_market_date_exposes_nonblocking_component_retry_debt(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI', 'name_ko': '삼성전자'},
+        ]
+        service = PykrxEnrichmentService()
+        row = {
+            'market_date': '2026-04-21',
+            'market': 'KOSPI',
+            'category': 'short_selling',
+            'scope_type': 'symbol',
+            'scope_key': '005930',
+            'source': 'pykrx',
+            'symbol': '005930',
+            'payload': {
+                'short_volume': {'short_volume': 1000},
+                'short_balance': {'as_of_date': '2026-04-17'},
+                'missing_fields': ['short_balance'],
+            },
+        }
+        debt = {
+            'component': 'short_balance',
+            'operation': 'short_selling_balance',
+            'status': 'retry_debt',
+            'retryable': True,
+            'action_required': 'retry_pykrx_enrichment_for_market_date',
+            'market_date': '2026-04-21',
+            'expected_as_of_date': '2026-04-17',
+            'affected_symbol_count': 1,
+            'affected_symbols_preview': ['005930'],
+            'provider_errors': [],
+            'reason': 'short_balance is incomplete for persisted rows',
+        }
+        coverage = {
+            'market_date': '2026-04-21',
+            'requested_symbol_count': 1,
+            'requested_market_count': 1,
+            'categories': {
+                'short_selling': {
+                    'present_rows': 1,
+                    'expected_rows': 1,
+                    'coverage_status': 'complete',
+                },
+            },
+        }
+        with (
+            patch.object(
+                service,
+                '_collect_short_selling_rows',
+                return_value=(
+                    [row],
+                    {
+                        'category': 'short_selling',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 1,
+                        'errors': [],
+                        'component_retry_debt': [debt],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value=coverage,
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=1,
+            ),
+        ):
+            result = service.collect_for_market_date(
+                market_date='2026-04-21',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['short_selling'],
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['retry_debt_categories'], ['short_selling'])
+        self.assertEqual(
+            result['component_retry_debt'],
+            [{'category': 'short_selling', **debt}],
+        )
+        self.assertEqual(
+            result['categories']['short_selling']['status'],
+            'partial',
+        )
+
+    def test_same_date_short_components_preserve_prior_success(self):
+        row = {
+            'market_date': '2026-04-21',
+            'market': 'KOSPI',
+            'category': 'short_selling',
+            'scope_type': 'symbol',
+            'scope_key': '005930',
+            'source': 'pykrx',
+            'symbol': '005930',
+            'payload': {
+                'short_volume': {
+                    'short_volume': 10,
+                    'total_volume': 100,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': None,
+                    'total_value': None,
+                    'short_value_ratio_pct': None,
+                },
+                'short_balance': {
+                    'as_of_date': '2026-04-17',
+                    'short_balance_qty': None,
+                    'listed_shares': None,
+                    'short_balance_amount': None,
+                    'market_cap': None,
+                    'short_balance_ratio_pct': None,
+                },
+                'missing_fields': ['short_value', 'short_balance'],
+            },
+        }
+        existing = {
+            **row,
+            'payload': {
+                'short_volume': {
+                    'short_volume': 9,
+                    'total_volume': 90,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': 1_000,
+                    'total_value': 10_000,
+                    'short_value_ratio_pct': 10.0,
+                },
+                'short_balance': {
+                    'as_of_date': '2026-04-17',
+                    'short_balance_qty': 50,
+                    'listed_shares': 1_000,
+                    'short_balance_amount': 500,
+                    'market_cap': 10_000,
+                    'short_balance_ratio_pct': 5.0,
+                },
+                'missing_fields': [],
+            },
+        }
+        debts = [
+            {
+                'component': 'short_value',
+                'expected_as_of_date': '2026-04-21',
+            },
+            {
+                'component': 'short_balance',
+                'expected_as_of_date': '2026-04-17',
+            },
+        ]
+
+        rows, unresolved, preserved = (
+            _preserve_existing_short_selling_components(
+                rows=[row],
+                existing_rows=[existing],
+                component_retry_debt=debts,
+            )
+        )
+
+        payload = rows[0]['payload']
+        self.assertEqual(payload['short_volume']['short_volume'], 10)
+        self.assertEqual(payload['short_volume']['short_value'], 1_000)
+        self.assertEqual(payload['short_balance']['short_balance_qty'], 50)
+        self.assertEqual(payload['missing_fields'], [])
+        self.assertEqual(
+            payload['preserved_components_from_existing'],
+            ['short_balance', 'short_value'],
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(
+            preserved,
+            {'short_value': 1, 'short_balance': 1},
+        )
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_failed_full_market_short_scope_is_not_destructively_replaced(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI'},
+        ]
+        service = PykrxEnrichmentService()
+        coverage = {
+            'market_date': '2026-04-21',
+            'requested_symbol_count': 1,
+            'requested_market_count': 1,
+            'categories': {},
+        }
+        with (
+            patch.object(
+                service,
+                '_collect_short_selling_rows',
+                return_value=(
+                    [],
+                    {
+                        'category': 'short_selling',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 0,
+                        'errors': [
+                            {
+                                'market': 'KOSPI',
+                                'operation': 'short_selling_volume',
+                                'error': 'provider unavailable',
+                            }
+                        ],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value=coverage,
+            ),
+            patch.object(
+                service,
+                '_collect_fallback_rows',
+                return_value=([], {'rows_prepared': 0}),
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=0,
+            ) as upsert_mock,
+        ):
+            service.collect_for_market_date(
+                market_date='2026-04-21',
+                markets=['KOSPI'],
+                symbols=['005930'],
+                categories=['short_selling'],
+                use_full_market_coverage=True,
+            )
+
+        self.assertEqual(
+            upsert_mock.call_args_list[0].kwargs['replace_scopes'],
+            [],
+        )
+
+    @patch('app.eod.pykrx_enrichment.load_symbols')
+    def test_failed_full_market_valuation_rows_do_not_overwrite_prior_snapshot(
+        self,
+        load_symbols_mock,
+    ):
+        load_symbols_mock.return_value = [
+            {'symbol': '005930', 'market': 'KOSPI'},
+            {'symbol': '035720', 'market': 'KOSDAQ'},
+        ]
+        failed_market_row = {
+            'market_date': '2026-06-09',
+            'market': 'KOSPI',
+            'category': 'valuation_snapshot',
+            'scope_type': 'symbol',
+            'scope_key': '005930',
+            'source': 'pykrx',
+            'symbol': '005930',
+            'payload': {'market_cap': 420_000_000_000, 'per': None},
+        }
+        successful_market_row = {
+            'market_date': '2026-06-09',
+            'market': 'KOSDAQ',
+            'category': 'valuation_snapshot',
+            'scope_type': 'symbol',
+            'scope_key': '035720',
+            'source': 'pykrx',
+            'symbol': '035720',
+            'payload': {'market_cap': 30_000_000_000, 'per': 18.0},
+        }
+        service = PykrxEnrichmentService()
+        with (
+            patch.object(
+                service,
+                '_collect_valuation_snapshot_rows',
+                return_value=(
+                    [failed_market_row, successful_market_row],
+                    {
+                        'category': 'valuation_snapshot',
+                        'scope_type': 'symbol',
+                        'rows_prepared': 2,
+                        'errors': [
+                            {
+                                'market': 'KOSPI',
+                                'operation': 'valuation_fundamentals',
+                                'error': 'provider unavailable',
+                            }
+                        ],
+                    },
+                ),
+            ),
+            patch.object(
+                service,
+                '_build_coverage_summary',
+                return_value={
+                    'market_date': '2026-06-09',
+                    'requested_symbol_count': 2,
+                    'requested_market_count': 2,
+                    'categories': {},
+                },
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.upsert_daily_pykrx_enrichment_rows',
+                return_value=1,
+            ) as upsert_mock,
+        ):
+            service.collect_for_market_date(
+                market_date='2026-06-09',
+                markets=['KOSPI', 'KOSDAQ'],
+                symbols=['005930', '035720'],
+                categories=['valuation_snapshot'],
+                use_full_market_coverage=True,
+            )
+
+        provider_call = upsert_mock.call_args_list[0]
+        self.assertEqual(
+            [row['market'] for row in provider_call.kwargs['rows']],
+            ['KOSDAQ'],
+        )
+        self.assertEqual(
+            provider_call.kwargs['replace_scopes'],
+            [
+                {
+                    'market_date': '2026-06-09',
+                    'market': 'KOSDAQ',
+                    'category': 'valuation_snapshot',
+                    'source': 'pykrx',
+                }
+            ],
         )
 
     @patch('app.eod.pykrx_enrichment.stock.get_shorting_balance_by_ticker')
@@ -1337,6 +2036,68 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
         self.assertFalse(is_complete_pykrx_enrichment_row(row))
 
+    def test_coverage_completeness_accepts_new_listing_without_t_plus_2_balance(
+        self,
+    ) -> None:
+        from app.eod.pykrx_enrichment import is_complete_pykrx_enrichment_row
+
+        row = {
+            'category': 'short_selling',
+            'market': 'KOSPI',
+            'scope_key': '999999',
+            'symbol': '999999',
+            'source': 'pykrx',
+            'payload': {
+                'short_volume': {
+                    'short_volume': 10,
+                    'total_volume': 100,
+                    'short_volume_ratio_pct': 10.0,
+                    'short_value': 1000,
+                    'total_value': 10000,
+                    'short_value_ratio_pct': 10.0,
+                },
+                'short_balance': {
+                    'as_of_date': '2026-04-17',
+                    'availability_status': 'not_applicable_new_listing',
+                },
+                'missing_fields': [],
+            },
+        }
+
+        self.assertTrue(is_complete_pykrx_enrichment_row(row))
+
+        service = PykrxEnrichmentService()
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '999999', 'market': 'KOSPI'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[row],
+            ),
+        ):
+            result = service._build_coverage_summary(
+                market_date='2026-04-21',
+                markets=['KOSPI'],
+                symbols=['999999'],
+                categories=['short_selling'],
+            )
+
+        coverage = result['categories']['short_selling']
+        self.assertEqual(coverage['complete_present_rows'], 1)
+        self.assertEqual(coverage['missing_component_rows'], 0)
+        self.assertEqual(
+            coverage['component_coverage']['short_balance'],
+            {
+                'present_rows': 1,
+                'missing_rows': 0,
+                'coverage_ratio': 1.0,
+                'coverage_status': 'complete',
+            },
+        )
+
     def test_coverage_completeness_requires_observed_valuation_market_cap(self):
         from app.eod.pykrx_enrichment import is_complete_pykrx_enrichment_row
 
@@ -1353,6 +2114,36 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
 
         self.assertFalse(is_complete_pykrx_enrichment_row(reconstructed))
         self.assertTrue(is_complete_pykrx_enrichment_row(observed))
+
+    def test_coverage_completeness_rejects_all_zero_valuation_metrics_without_mutation(
+        self,
+    ):
+        from app.eod.pykrx_enrichment import is_complete_pykrx_enrichment_row
+
+        payload = {
+            'per': 0.0,
+            'pbr': 0.0,
+            'dividend_yield': 0.0,
+            'market_cap': 2_000_000,
+            'provenance': {'provider': 'pykrx', 'observed': True},
+        }
+        row = {
+            'category': 'valuation_snapshot',
+            'source': 'pykrx',
+            'payload': payload,
+        }
+
+        self.assertFalse(is_complete_pykrx_enrichment_row(row))
+        self.assertEqual(
+            row['payload'],
+            {
+                'per': 0.0,
+                'pbr': 0.0,
+                'dividend_yield': 0.0,
+                'market_cap': 2_000_000,
+                'provenance': {'provider': 'pykrx', 'observed': True},
+            },
+        )
 
     def test_short_coverage_exposes_partial_component_completeness(self):
         service = PykrxEnrichmentService()
@@ -1396,8 +2187,34 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         coverage = result['categories']['short_selling']
         self.assertEqual(coverage['present_rows'], 1)
         self.assertEqual(coverage['coverage_status'], 'complete')
+        self.assertEqual(coverage['decision_usable_present_rows'], 1)
+        self.assertEqual(coverage['decision_usable_ratio'], 1.0)
+        self.assertEqual(coverage['decision_usable_status'], 'complete')
         self.assertEqual(coverage['complete_present_rows'], 0)
         self.assertEqual(coverage['completeness_status'], 'missing')
+        self.assertEqual(
+            coverage['component_coverage'],
+            {
+                'short_volume': {
+                    'present_rows': 1,
+                    'missing_rows': 0,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
+                'short_value': {
+                    'present_rows': 1,
+                    'missing_rows': 0,
+                    'coverage_ratio': 1.0,
+                    'coverage_status': 'complete',
+                },
+                'short_balance': {
+                    'present_rows': 0,
+                    'missing_rows': 1,
+                    'coverage_ratio': 0.0,
+                    'coverage_status': 'missing',
+                },
+            },
+        )
 
     def test_valuation_coverage_exposes_incomplete_observation_without_counting_it_ready(self):
         service = PykrxEnrichmentService()
@@ -1436,9 +2253,54 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         coverage = result['categories']['valuation_snapshot']
         self.assertEqual(coverage['present_rows'], 0)
         self.assertEqual(coverage['raw_present_rows'], 1)
+        self.assertEqual(coverage['decision_usable_present_rows'], 0)
+        self.assertEqual(coverage['decision_usable_status'], 'missing')
         self.assertEqual(coverage['complete_present_rows'], 0)
         self.assertEqual(coverage['missing_component_rows'], 1)
         self.assertEqual(coverage['coverage_status'], 'missing')
+
+    def test_valuation_coverage_counts_terminal_provider_absence_as_resolved(self):
+        service = PykrxEnrichmentService()
+        row = {
+            'category': 'valuation_snapshot',
+            'market': 'KOSDAQ',
+            'scope_key': '123450',
+            'symbol': '123450',
+            'source': 'pykrx',
+            'payload': {
+                'per': 0.0,
+                'pbr': 0.0,
+                'dividend_yield': 0.0,
+                'market_cap': 12600000000,
+                'valuation_availability_status': (
+                    'provider_reported_unavailable'
+                ),
+            },
+        }
+
+        with (
+            patch.object(
+                service,
+                '_load_coverage_symbol_rows',
+                return_value=[{'symbol': '123450', 'market': 'KOSDAQ'}],
+            ),
+            patch(
+                'app.eod.pykrx_enrichment.load_daily_pykrx_enrichment_rows',
+                return_value=[row],
+            ),
+        ):
+            result = service._build_coverage_summary(
+                market_date='2026-11-02',
+                markets=['KOSDAQ'],
+                symbols=['123450'],
+                categories=['valuation_snapshot'],
+            )
+
+        coverage = result['categories']['valuation_snapshot']
+        self.assertEqual(coverage['present_rows'], 1)
+        self.assertEqual(coverage['decision_usable_present_rows'], 1)
+        self.assertEqual(coverage['complete_present_rows'], 1)
+        self.assertEqual(coverage['coverage_status'], 'complete')
 
     @patch('app.eod.pykrx_enrichment.stock.get_market_net_purchases_of_equities_by_ticker')
     def test_symbol_investor_rows_zero_fill_absent_investor_activity(
@@ -1750,13 +2612,15 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertTrue(preflight['allowed'])
         self.assertEqual(preflight['status'], 'ready')
 
-    def test_valuation_coverage_uses_fresh_stock_universe_not_active_etf_scope(self):
+    def test_valuation_coverage_uses_exact_eod_membership_not_broader_sector_universe(
+        self,
+    ):
         service = PykrxEnrichmentService()
-        stock_symbols = ['005930', '000660']
+        eod_symbols = ['005930', '000660']
+        broader_sector_symbols = [*eod_symbols, '069500']
         active_rows = [
             {'symbol': '005930', 'market': 'KOSPI'},
             {'symbol': '000660', 'market': 'KOSPI'},
-            {'symbol': '069500', 'market': 'KOSPI'},
         ]
         sector_rows = [
             {
@@ -1766,11 +2630,11 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                 'symbol': symbol,
                 'source': 'pykrx',
                 'payload': {
-                    **_universe_reference_payload(stock_symbols),
+                    **_universe_reference_payload(broader_sector_symbols),
                     'sector_name': '반도체',
                 },
             }
-            for symbol in stock_symbols
+            for symbol in broader_sector_symbols
         ]
         short_rows = [
             {
@@ -1787,7 +2651,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                     }
                 },
             }
-            for symbol in stock_symbols
+            for symbol in broader_sector_symbols
         ]
         valuation_rows = [
             {
@@ -1803,7 +2667,7 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                     'dividend_yield': 2.0,
                 },
             }
-            for symbol in stock_symbols
+            for symbol in eod_symbols
         ]
 
         with (
@@ -1825,16 +2689,14 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
             )
 
         requested_categories = set(load_rows_mock.call_args.kwargs['categories'])
-        self.assertEqual(
-            requested_categories,
-            {'sector_classification', 'short_selling', 'valuation_snapshot'},
-        )
+        self.assertEqual(requested_categories, {'valuation_snapshot'})
         coverage = result['categories']['valuation_snapshot']
         self.assertEqual(coverage['expected_rows'], 2)
         self.assertEqual(coverage['present_rows'], 2)
+        self.assertEqual(coverage['expected_scope_keys'], sorted(eod_symbols))
         self.assertEqual(
             coverage['expected_universe_source'],
-            'fresh_pykrx_sector_classification',
+            'validated_eod_run_market_membership',
         )
         preflight = build_pykrx_enrichment_preflight(
             market_date='2026-09-18',
@@ -2537,6 +3399,143 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
         self.assertEqual(rows[0]['symbol'], '005930')
         self.assertEqual(rows[0]['payload']['market_cap'], 420000000000)
         self.assertIsNone(rows[0]['payload']['per'])
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_error',
+        )
+        self.assertFalse(is_complete_pykrx_enrichment_row(rows[0]))
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_resolves_provider_reported_zero_metrics(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [2100],
+                '시가총액': [12600000000],
+                '거래량': [1000],
+                '거래대금': [2100000],
+                '상장주식수': [6000000],
+            },
+            index=['123450'],
+        )
+        get_market_fundamental_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                'BPS': [0],
+                'PER': [0],
+                'PBR': [0],
+                'EPS': [0],
+                'DIV': [0],
+                'DPS': [0],
+            },
+            index=['123450'],
+        )
+
+        rows, details = PykrxEnrichmentService()._collect_valuation_snapshot_rows(
+            market_date_iso='2026-11-02',
+            market_date_yyyymmdd='20261102',
+            markets=['KOSDAQ'],
+            symbol_filter={'123450'},
+            symbol_meta={'123450': {'name_ko': '테스트스팩'}},
+            cache={},
+        )
+
+        self.assertEqual(details['errors'], [])
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_reported_unavailable',
+        )
+        self.assertTrue(is_complete_pykrx_enrichment_row(rows[0]))
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_resolves_provider_scope_absence(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        support_symbols = [f'{value:06d}' for value in range(1, 20)]
+        market_cap_symbols = ['950001', *support_symbols]
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [5000] * len(market_cap_symbols),
+                '시가총액': [50000000000] * len(market_cap_symbols),
+                '거래량': [1000] * len(market_cap_symbols),
+                '거래대금': [5000000] * len(market_cap_symbols),
+                '상장주식수': [10000000] * len(market_cap_symbols),
+            },
+            index=market_cap_symbols,
+        )
+        get_market_fundamental_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                'BPS': [1000] * len(support_symbols),
+                'PER': [10] * len(support_symbols),
+                'PBR': [1] * len(support_symbols),
+                'EPS': [500] * len(support_symbols),
+                'DIV': [2] * len(support_symbols),
+                'DPS': [100] * len(support_symbols),
+            },
+            index=support_symbols,
+        )
+
+        rows, details = PykrxEnrichmentService()._collect_valuation_snapshot_rows(
+            market_date_iso='2026-11-02',
+            market_date_yyyymmdd='20261102',
+            markets=['KOSDAQ'],
+            symbol_filter={'950001'},
+            symbol_meta={'950001': {'name_ko': '테스트외국주'}},
+            cache={},
+        )
+
+        self.assertEqual(details['errors'], [])
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_scope_absent',
+        )
+        self.assertTrue(is_complete_pykrx_enrichment_row(rows[0]))
+
+    @patch('app.eod.pykrx_enrichment.stock.get_market_fundamental_by_ticker')
+    @patch('app.eod.pykrx_enrichment.stock.get_market_cap_by_ticker')
+    def test_collect_valuation_snapshot_rejects_empty_fundamental_scope(
+        self,
+        get_market_cap_by_ticker_mock,
+        get_market_fundamental_by_ticker_mock,
+    ):
+        get_market_cap_by_ticker_mock.return_value = pd.DataFrame(
+            {
+                '종가': [5000],
+                '시가총액': [50000000000],
+                '거래량': [1000],
+                '거래대금': [5000000],
+                '상장주식수': [10000000],
+            },
+            index=['950001'],
+        )
+        get_market_fundamental_by_ticker_mock.return_value = pd.DataFrame(
+            columns=['BPS', 'PER', 'PBR', 'EPS', 'DIV', 'DPS']
+        )
+
+        rows, details = PykrxEnrichmentService()._collect_valuation_snapshot_rows(
+            market_date_iso='2026-11-02',
+            market_date_yyyymmdd='20261102',
+            markets=['KOSDAQ'],
+            symbol_filter={'950001'},
+            symbol_meta={'950001': {'name_ko': '테스트외국주'}},
+            cache={},
+        )
+
+        self.assertEqual(
+            details['errors'][0]['operation'],
+            'valuation_fundamentals_scope',
+        )
+        self.assertEqual(
+            rows[0]['payload']['valuation_availability_status'],
+            'provider_error',
+        )
+        self.assertFalse(is_complete_pykrx_enrichment_row(rows[0]))
 
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_collect_for_market_date_falls_back_for_market_cap_only_valuation_rows(self, load_symbols_mock):

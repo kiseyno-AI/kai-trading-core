@@ -5,12 +5,18 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from enum import StrEnum
 
 from app.core.settings import settings
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
+from app.eod.pykrx_pipeline_support import (
+    build_daily_skip_result,
+    compact_daily_pipeline_result,
+)
 from app.market.clock import KST, async_get_market_state
 from app.market.session import async_previous_krx_trading_date
 from app.repositories.eod_run_repository import (
+    load_latest_eod_collection_run,
     load_oldest_outstanding_auto_eod_recovery_target,
 )
 
@@ -22,6 +28,15 @@ _INCOMPLETE_UNIVERSE_ERROR_PREFIX = (
 _INCOMPLETE_UNIVERSE_RETRY_BASE_MINUTES = 30
 _INCOMPLETE_UNIVERSE_RETRY_MAX_MINUTES = 240
 _RECOVERY_WINDOW_SESSION_COUNT = 5
+
+
+class RecoveryOnlyScheduleDisposition(StrEnum):
+    """OPEN recovery admission result; only NO_DEBT permits trading work."""
+
+    NO_DEBT = 'no_debt'
+    DUE_STARTED = 'due_started'
+    DUE_BLOCKED = 'due_blocked'
+    UNKNOWN = 'unknown'
 
 
 def _utcnow() -> str:
@@ -62,6 +77,34 @@ def _parse_markets(raw: str | None) -> tuple[str, ...]:
         return DEFAULT_MARKETS
     markets = tuple(item.strip().upper() for item in raw.split(',') if item.strip())
     return markets or DEFAULT_MARKETS
+
+
+def _terminal_run_skip_reason(run: dict | None) -> str | None:
+    if not isinstance(run, dict) or int(run.get('symbols_failed') or 0) != 0:
+        return None
+    status = str(run.get('status') or '').strip().lower()
+    if status == 'completed':
+        return 'already_completed'
+    if status != 'completed_with_errors':
+        return None
+    metadata = (
+        run.get('run_metadata')
+        if isinstance(run.get('run_metadata'), dict)
+        else {}
+    )
+    retry_symbols = {
+        str(symbol).strip()
+        for key in (
+            'failed_symbols',
+            'unattempted_symbols',
+            'price_retry_symbols',
+            'downstream_retry_symbols',
+            'inherited_downstream_retry_symbols',
+        )
+        for symbol in (metadata.get(key) or [])
+        if str(symbol).strip()
+    }
+    return 'already_completed_with_errors' if not retry_symbols else None
 
 
 async def _oldest_recovery_window_date(latest_session_date: str) -> str:
@@ -105,7 +148,7 @@ class AutoPykrxEODState:
             'last_completed_at': self.last_completed_at,
             'last_status': self.last_status,
             'last_reason': self.last_reason,
-            'last_result': self.last_result,
+            'last_result': compact_daily_pipeline_result(self.last_result),
             'preflight_failure_market_date': self.preflight_failure_market_date,
             'preflight_failure_markets': list(self.preflight_failure_markets),
             'preflight_failure_count': self.preflight_failure_count,
@@ -143,6 +186,37 @@ class AutoPykrxEODScheduler:
         *,
         expected_market_state: str | None = None,
     ) -> None:
+        await self._schedule_pipeline_if_due(
+            expected_market_state=expected_market_state,
+            recovery_only=False,
+        )
+
+    async def schedule_recovery_if_due(
+        self,
+        *,
+        expected_market_state: str,
+    ) -> RecoveryOnlyScheduleDisposition:
+        """Inspect older debt without starting pipeline work during live sessions."""
+
+        disposition = await self._schedule_pipeline_if_due(
+            expected_market_state=expected_market_state,
+            recovery_only=True,
+        )
+        return (
+            disposition
+            if isinstance(
+                disposition,
+                RecoveryOnlyScheduleDisposition,
+            )
+            else RecoveryOnlyScheduleDisposition.UNKNOWN
+        )
+
+    async def _schedule_pipeline_if_due(
+        self,
+        *,
+        expected_market_state: str | None,
+        recovery_only: bool,
+    ) -> RecoveryOnlyScheduleDisposition | None:
         self._state.enabled = settings.eod_auto_pykrx_enabled
         market = await async_get_market_state()
         self._state.last_checked_at = _utcnow()
@@ -155,17 +229,25 @@ class AutoPykrxEODScheduler:
             self._state.last_reason = (
                 f'market_state_changed:{expected_market_state}->{market.state}'
             )
-            return
+            return (
+                RecoveryOnlyScheduleDisposition.UNKNOWN
+                if recovery_only
+                else None
+            )
 
-        if not settings.eod_auto_pykrx_enabled:
+        if not settings.eod_auto_pykrx_enabled and not recovery_only:
             self._state.last_status = 'disabled'
             self._state.last_reason = 'disabled_by_config'
-            return
+            return None
 
         if self._task and not self._task.done():
             self._state.active_task = True
             self._state.last_status = 'running'
-            return
+            return (
+                RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+                if recovery_only
+                else None
+            )
 
         if self._task and self._task.done():
             try:
@@ -195,7 +277,11 @@ class AutoPykrxEODScheduler:
             logger.exception('Could not inspect automatic EOD recovery state: %s', exc)
             self._state.last_status = 'blocked'
             self._state.last_reason = 'recovery_state_unavailable'
-            return
+            return (
+                RecoveryOnlyScheduleDisposition.UNKNOWN
+                if recovery_only
+                else None
+            )
 
         recovery_market_date = (
             recovery_target.trade_date
@@ -206,6 +292,36 @@ class AutoPykrxEODScheduler:
             recovery_market_date is not None
             and recovery_market_date < current_market_date
         )
+        previous_session_preopen_recovery_due = False
+        if recovery_only:
+            if not older_recovery_due:
+                self._clear_preflight_backoff()
+                self._state.last_status = 'idle'
+                self._state.last_reason = 'no_older_recovery_debt'
+                return RecoveryOnlyScheduleDisposition.NO_DEBT
+            if market.state == 'PREOPEN':
+                previous_session_date = (
+                    await async_previous_krx_trading_date(
+                        date.fromisoformat(current_market_date),
+                        allow_fallback=True,
+                    )
+                )
+                previous_session_preopen_recovery_due = bool(
+                    previous_session_date is not None
+                    and recovery_market_date
+                    == previous_session_date.isoformat()
+                )
+            if not previous_session_preopen_recovery_due:
+                self._state.last_market_date = recovery_market_date
+                self._state.last_status = 'blocked'
+                self._state.last_reason = 'older_recovery_debt_pending'
+                return RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+        if market.state in {'PREOPEN', 'OPEN'} and not (
+            recovery_only and previous_session_preopen_recovery_due
+        ):
+            self._state.last_status = 'idle'
+            self._state.last_reason = f'market_not_closed:{market.state}'
+            return None
         if recovery_market_date is not None:
             target_market_date = recovery_market_date
         elif market.state == 'CLOSED':
@@ -215,6 +331,47 @@ class AutoPykrxEODScheduler:
         else:
             target_market_date = None
         self._state.last_market_date = target_market_date or current_market_date
+
+        if (
+            recovery_target is None
+            and target_market_date is not None
+            and market.state in {'WEEKEND', 'HOLIDAY'}
+        ):
+            try:
+                latest_terminal_run = await asyncio.to_thread(
+                    load_latest_eod_collection_run,
+                    market='KRX',
+                    trade_date=target_market_date,
+                    source='pykrx',
+                )
+            except Exception as exc:
+                logger.exception(
+                    'Could not inspect terminal EOD proof for %s: %s',
+                    target_market_date,
+                    exc,
+                )
+                self._state.last_status = 'blocked'
+                self._state.last_reason = 'terminal_state_unavailable'
+                return None
+            terminal_skip_reason = _terminal_run_skip_reason(
+                latest_terminal_run
+            )
+            if terminal_skip_reason is not None:
+                result = build_daily_skip_result(
+                    reason=terminal_skip_reason,
+                    market_date=target_market_date,
+                    latest_available_trade_date=target_market_date,
+                    existing_run=latest_terminal_run,
+                )
+                self._clear_preflight_backoff()
+                self._state.last_result = compact_daily_pipeline_result(result)
+                self._state.last_status = (
+                    'completed'
+                    if terminal_skip_reason == 'already_completed'
+                    else 'partial'
+                )
+                self._state.last_reason = terminal_skip_reason
+                return None
 
         configured_markets = _parse_markets(settings.eod_auto_pykrx_markets)
         same_preflight_failure = (
@@ -228,26 +385,30 @@ class AutoPykrxEODScheduler:
         ):
             self._state.last_status = 'blocked'
             self._state.last_reason = 'incomplete_universe_preflight_backoff'
-            return
+            return (
+                RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+                if recovery_only
+                else None
+            )
         if self._state.preflight_failure_market_date is not None and not same_preflight_failure:
             self._clear_preflight_backoff()
 
         if not older_recovery_due and market.state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
             self._state.last_status = 'idle'
             self._state.last_reason = f'market_not_closed:{market.state}'
-            return
+            return None
 
         if target_market_date is None:
             self._state.last_status = 'idle'
             self._state.last_reason = 'missing_latest_valid_trading_date'
-            return
+            return None
 
-        if not older_recovery_due and market.state == 'CLOSED' and not market.session_close_at:
+        if market.state == 'CLOSED' and not market.session_close_at:
             self._state.last_status = 'idle'
             self._state.last_reason = 'missing_session_close'
-            return
+            return None
 
-        if not older_recovery_due and market.state == 'CLOSED':
+        if market.state == 'CLOSED':
             close_at = datetime.fromisoformat(market.session_close_at)
             eligible_at = close_at + timedelta(
                 minutes=settings.eod_auto_pykrx_after_close_minutes
@@ -255,7 +416,11 @@ class AutoPykrxEODScheduler:
             if datetime.now(KST) < eligible_at:
                 self._state.last_status = 'idle'
                 self._state.last_reason = f'waiting_until:{eligible_at.isoformat()}'
-                return
+                return (
+                    RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+                    if recovery_only
+                    else None
+                )
 
         if expected_market_state is not None:
             latest_market = await async_get_market_state()
@@ -267,7 +432,11 @@ class AutoPykrxEODScheduler:
                     f'market_state_changed:{expected_market_state}'
                     f'->{latest_market.state}'
                 )
-                return
+                return (
+                    RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+                    if recovery_only
+                    else None
+                )
 
         self._state.active_task = True
         self._state.last_started_at = _utcnow()
@@ -293,6 +462,11 @@ class AutoPykrxEODScheduler:
                 ),
             ),
             name='auto-pykrx-eod',
+        )
+        return (
+            RecoveryOnlyScheduleDisposition.DUE_STARTED
+            if recovery_only
+            else None
         )
 
     async def _run_scheduled_daily_pipeline(
@@ -320,7 +494,7 @@ class AutoPykrxEODScheduler:
                 **run_kwargs,
             )
             self._clear_preflight_backoff()
-            self._state.last_result = result
+            self._state.last_result = compact_daily_pipeline_result(result)
             self._state.last_status = _scheduled_pipeline_result_status(result)
             self._state.last_reason = result.get('reason') or result.get('status')
         except Exception as exc:

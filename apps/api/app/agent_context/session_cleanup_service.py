@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -1364,6 +1365,10 @@ class AgentFeedbackSessionCleanupService:
     ) -> dict[str, Any]:
         self._require_database_budget(deadline_monotonic)
         now = datetime.now(UTC)
+        raw_error = result.get('error')
+        if not self._has_error_content(raw_error):
+            raw_error = result.get('stderr')
+        last_error = self._normalize_last_error(raw_error)
         with session_scope(
             statement_timeout_ms=settings.agent_feedback_db_statement_timeout_ms,
             lock_timeout_ms=settings.agent_feedback_db_lock_timeout_ms,
@@ -1387,7 +1392,7 @@ class AgentFeedbackSessionCleanupService:
                 cleanup_attempts=attempts,
                 last_attempt_at=now,
                 next_attempt_at=next_attempt_at,
-                last_error=result.get('error') or result.get('stderr') or 'session delete failed',
+                last_error=last_error,
                 cleanup_result=result,
             )
             stmt = stmt.on_conflict_do_update(
@@ -1402,7 +1407,7 @@ class AgentFeedbackSessionCleanupService:
                     'cleanup_attempts': attempts,
                     'last_attempt_at': now,
                     'next_attempt_at': next_attempt_at,
-                    'last_error': result.get('error') or result.get('stderr') or 'session delete failed',
+                    'last_error': last_error,
                     'cleanup_result': result,
                     'updated_at': now,
                 },
@@ -1410,6 +1415,42 @@ class AgentFeedbackSessionCleanupService:
             record_id = session.execute(stmt).scalar_one()
             record = session.get(AgentFeedbackSessionCleanupFailure, record_id)
             return self._serialize_failure(record)
+
+    @staticmethod
+    def _has_error_content(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, Mapping):
+            if not value:
+                return False
+            if set(value) == {'message'}:
+                message = value.get('message')
+                return not isinstance(message, str) or bool(message.strip())
+            return True
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return bool(value)
+        return True
+
+    @staticmethod
+    def _normalize_last_error(value: Any) -> str:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        if isinstance(value, Mapping):
+            message = value.get('message')
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        if value is not None:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        return 'session delete failed'
 
     def _clear_failure(
         self,

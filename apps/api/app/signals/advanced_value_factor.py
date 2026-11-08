@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 import logging
 import re
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.exc import OperationalError
@@ -23,9 +23,26 @@ from app.market_data_store import (
     load_daily_pykrx_enrichment_rows,
     load_recent_price_bars_by_symbol,
     load_symbols,
+    replace_daily_derived_results_exact_scope,
     upsert_daily_advanced_value_factor_result,
     upsert_daily_advanced_value_factor_results,
 )
+from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.factor_coverage import (
+    attach_ranking_dependency_contract,
+    attach_symbol_payloads,
+    build_factor_coverage_contract,
+    build_symbol_results,
+    factor_stage_result_contract,
+    merge_symbol_failures,
+    partition_symbol_failures,
+    persist_symbol_items_with_isolation,
+    run_symbol_computation,
+)
+from app.signals.preferred_share_fundamentals import (
+    resolve_preferred_fundamentals_issuer_symbols,
+)
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
@@ -79,10 +96,36 @@ TOTAL_LIABILITIES_MATCHER = {
     'account_ids': {'ifrs-full_Liabilities', 'ifrs_Liabilities'},
     'account_names': {'부채총계', 'Liabilities'},
 }
+TOTAL_ASSETS_MATCHER = {
+    'statement_types': {'BS'},
+    'account_ids': {'ifrs-full_Assets', 'ifrs_Assets'},
+    'account_names': {'자산총계', 'Assets'},
+}
 TOTAL_EQUITY_MATCHER = {
     'statement_types': {'BS'},
     'account_ids': {'ifrs-full_Equity', 'ifrs_Equity'},
     'account_names': {'자본총계', 'Equity'},
+}
+NET_INCOME_MATCHER = {
+    'statement_types': {'IS', 'CIS'},
+    'account_ids': {
+        'ifrs-full_ProfitLoss',
+        'ifrs_ProfitLoss',
+        'ifrs-full_ProfitLossAttributableToOwnersOfParent',
+    },
+    'account_names': {
+        '당기순이익',
+        '당기순손실',
+        '분기순이익',
+        '반기순이익',
+        'Profit (loss)',
+        '당기순이익(손실)',
+    },
+}
+GROSS_PROFIT_MATCHER = {
+    'statement_types': {'IS', 'CIS'},
+    'account_ids': {'ifrs-full_GrossProfit', 'ifrs_GrossProfit'},
+    'account_names': {'매출총이익', '매출총손실', 'Gross profit'},
 }
 OPERATING_INCOME_MATCHER = {
     'statement_types': {'IS', 'CIS'},
@@ -126,6 +169,7 @@ CAPEX_PPE_MATCHER = {
     'account_ids': {
         'ifrs-full_PurchaseOfPropertyPlantAndEquipment',
         'ifrs-full_AcquisitionOfPropertyPlantAndEquipment',
+        'ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
     },
     'account_names': {
         '유형자산의 취득',
@@ -149,6 +193,7 @@ CAPEX_INTANGIBLE_MATCHER = {
     'account_ids': {
         'ifrs-full_PurchaseOfIntangibleAssets',
         'ifrs-full_AcquisitionOfIntangibleAssetsOtherThanGoodwill',
+        'ifrs-full_PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities',
     },
     'account_names': {
         '무형자산의 취득',
@@ -185,7 +230,10 @@ DEPRECIATION_AND_AMORTIZATION_MATCHER = {
 }
 DEPRECIATION_MATCHER = {
     'statement_types': {'CF', 'IS', 'CIS'},
-    'account_ids': set(),
+    'account_ids': {
+        'ifrs-full_AdjustmentsForDepreciationExpense',
+        'ifrs-full_DepreciationExpense',
+    },
     'account_names': {
         '감가상각비',
         'Depreciation',
@@ -202,7 +250,12 @@ DEPRECIATION_MATCHER = {
 }
 AMORTIZATION_MATCHER = {
     'statement_types': {'CF', 'IS', 'CIS'},
-    'account_ids': set(),
+    'account_ids': {
+        'ifrs-full_AdjustmentsForAmortisationExpense',
+        'ifrs-full_AdjustmentsForAmortizationExpense',
+        'ifrs-full_AmortisationExpense',
+        'ifrs-full_AmortizationExpense',
+    },
     'account_names': {
         '상각비',
         '무형자산상각비',
@@ -223,7 +276,10 @@ AMORTIZATION_MATCHER = {
 
 FUNDAMENTALS_FALLBACK_MATCHERS = (
     TOTAL_LIABILITIES_MATCHER,
+    TOTAL_ASSETS_MATCHER,
     TOTAL_EQUITY_MATCHER,
+    NET_INCOME_MATCHER,
+    GROSS_PROFIT_MATCHER,
     OPERATING_INCOME_MATCHER,
     OPERATING_CASH_FLOW_MATCHER,
     CASH_AND_CASH_EQUIVALENTS_MATCHER,
@@ -233,7 +289,6 @@ FUNDAMENTALS_FALLBACK_MATCHERS = (
     DEPRECIATION_MATCHER,
     AMORTIZATION_MATCHER,
 )
-
 
 def _round(value: float | None, digits: int = 6) -> float | None:
     if value is None:
@@ -247,25 +302,14 @@ def _normalize_market_date(value: str | date) -> date:
     return date.fromisoformat(value)
 
 
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
-
-
 def _matcher_values(key: str) -> set[str]:
     values: set[str] = set()
     for matcher in FUNDAMENTALS_FALLBACK_MATCHERS:
-        values.update(str(value).strip() for value in matcher.get(key, set()) if str(value or '').strip())
+        values.update(
+            str(value).strip()
+            for value in matcher.get(key, set())
+            if str(value or '').strip()
+        )
     return values
 
 
@@ -455,10 +499,19 @@ def _match_score(
     return (score, row_bias, current_amount_present, cumulative_amount_present, 0)
 
 
-def _find_statement_row(rows: Sequence[dict[str, Any]], matcher: dict[str, Any]) -> dict[str, Any] | None:
+def _find_statement_row(
+    rows: Sequence[dict[str, Any]],
+    matcher: dict[str, Any],
+    *,
+    flow: bool,
+) -> dict[str, Any] | None:
     best_row: dict[str, Any] | None = None
     best_score: tuple[int, int, int, int, int] | None = None
     for row in rows:
+        if row.get('current_amount') is None and not (
+            flow and row.get('current_cumulative_amount') is not None
+        ):
+            continue
         score = _match_score(row, matcher=matcher)
         if score is None:
             continue
@@ -479,7 +532,7 @@ def _extract_metric_with_fallback(
     value, amount_field = _highlight_amount(highlight_row, flow=flow, absolute=absolute)
     if value is not None:
         return value, _build_source_metadata(source_type='highlight', row=highlight_row, amount_field=amount_field)
-    matched_row = _find_statement_row(rows, matcher)
+    matched_row = _find_statement_row(rows, matcher, flow=flow)
     value, amount_field = _statement_amount(matched_row, flow=flow, absolute=absolute)
     return value, _build_source_metadata(source_type='statement_row', row=matched_row, amount_field=amount_field)
 
@@ -499,6 +552,8 @@ class AnnualFundamentalsSnapshot:
     currency: str | None
     highlights_by_key: dict[str, dict[str, Any]]
     statement_rows: list[dict[str, Any]]
+    requested_symbol: str | None = None
+    fundamentals_issuer_symbol: str | None = None
 
 
 @dataclass(slots=True)
@@ -528,6 +583,24 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         matcher=TOTAL_LIABILITIES_MATCHER,
         flow=False,
     )
+    total_assets, total_assets_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('total_assets'),
+        rows=rows,
+        matcher=TOTAL_ASSETS_MATCHER,
+        flow=False,
+    )
+    net_income, net_income_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('net_income'),
+        rows=rows,
+        matcher=NET_INCOME_MATCHER,
+        flow=True,
+    )
+    gross_profit, gross_profit_source = _extract_metric_with_fallback(
+        highlight_row=highlights.get('gross_profit'),
+        rows=rows,
+        matcher=GROSS_PROFIT_MATCHER,
+        flow=True,
+    )
     operating_income, operating_income_source = _extract_metric_with_fallback(
         highlight_row=highlights.get('operating_income'),
         rows=rows,
@@ -548,9 +621,13 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         flow=False,
     )
 
-    capex_ppe_row = _find_statement_row(rows, CAPEX_PPE_MATCHER)
+    capex_ppe_row = _find_statement_row(rows, CAPEX_PPE_MATCHER, flow=True)
     capex_ppe, capex_ppe_amount_field = _statement_amount(capex_ppe_row, flow=True, absolute=True)
-    capex_intangible_row = _find_statement_row(rows, CAPEX_INTANGIBLE_MATCHER)
+    capex_intangible_row = _find_statement_row(
+        rows,
+        CAPEX_INTANGIBLE_MATCHER,
+        flow=True,
+    )
     capex_intangible, capex_intangible_amount_field = _statement_amount(
         capex_intangible_row,
         flow=True,
@@ -561,7 +638,11 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         _round(sum(capital_expenditure_components), 4) if capital_expenditure_components else None
     )
 
-    depreciation_and_amortization_row = _find_statement_row(rows, DEPRECIATION_AND_AMORTIZATION_MATCHER)
+    depreciation_and_amortization_row = _find_statement_row(
+        rows,
+        DEPRECIATION_AND_AMORTIZATION_MATCHER,
+        flow=True,
+    )
     depreciation_row = None
     amortization_row = None
     depreciation = None
@@ -576,9 +657,17 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
             absolute=True,
         )
     else:
-        depreciation_row = _find_statement_row(rows, DEPRECIATION_MATCHER)
+        depreciation_row = _find_statement_row(
+            rows,
+            DEPRECIATION_MATCHER,
+            flow=True,
+        )
         depreciation, depreciation_amount_field = _statement_amount(depreciation_row, flow=True, absolute=True)
-        amortization_row = _find_statement_row(rows, AMORTIZATION_MATCHER)
+        amortization_row = _find_statement_row(
+            rows,
+            AMORTIZATION_MATCHER,
+            flow=True,
+        )
         amortization, amortization_amount_field = _statement_amount(amortization_row, flow=True, absolute=True)
         if depreciation is None and amortization is None:
             depreciation_and_amortization = None
@@ -588,6 +677,9 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
     return {
         'total_equity': total_equity,
         'total_liabilities': total_liabilities,
+        'total_assets': total_assets,
+        'net_income': net_income,
+        'gross_profit': gross_profit,
         'operating_income': operating_income,
         'operating_cash_flow': operating_cash_flow,
         'cash_and_cash_equivalents': cash_and_cash_equivalents,
@@ -595,6 +687,10 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         'depreciation_and_amortization': depreciation_and_amortization,
         'audit': {
             'annual_snapshot': {
+                'requested_symbol': snapshot.requested_symbol or snapshot.symbol,
+                'fundamentals_issuer_symbol': (
+                    snapshot.fundamentals_issuer_symbol or snapshot.symbol
+                ),
                 'snapshot_id': snapshot.snapshot_id,
                 'corp_name': snapshot.corp_name,
                 'business_year': snapshot.business_year,
@@ -609,6 +705,9 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
             'matched_inputs': {
                 'total_equity': total_equity_source,
                 'total_liabilities': total_liabilities_source,
+                'total_assets': total_assets_source,
+                'net_income': net_income_source,
+                'gross_profit': gross_profit_source,
                 'operating_income': operating_income_source,
                 'operating_cash_flow': operating_cash_flow_source,
                 'cash_and_cash_equivalents': cash_and_cash_equivalents_source,
@@ -684,6 +783,7 @@ def compute_ev_to_ebitda(*, enterprise_value: float | None, ebitda: float | None
 
 
 class DailyAdvancedValueFactorService:
+    @daily_price_bar_writer_admission
     def rebuild_for_market_date(
         self,
         *,
@@ -691,6 +791,8 @@ class DailyAdvancedValueFactorService:
         symbols: Sequence[str] | None = None,
         ranking_symbols: Sequence[str] | None = None,
         source: str = ADVANCED_VALUE_FACTOR_SOURCE,
+        exact_scope_symbols: Sequence[str] | None = None,
+        authoritative_market_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -708,58 +810,92 @@ class DailyAdvancedValueFactorService:
                 )
         requested_symbols = list(normalized_symbols or [])
         if normalized_symbols == []:
-            return {
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=[],
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
+            result = {
+                **factor_stage_result_contract(
+                    summary,
+                    explicit_empty_scope=True,
+                ),
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': [],
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=[],
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
                 'failed_symbol_errors': [],
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='advanced_value_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
 
         inputs, matched_symbols, missing_symbols = self._load_inputs(
             market_date=normalized_market_date,
             symbols=normalized_symbols,
         )
         if normalized_symbols is not None and not matched_symbols:
-            return {
+            summary = self._build_summary(
+                [],
+                requested_symbols=requested_symbols,
+                matched_symbols=[],
+                missing_symbols=missing_symbols,
+                universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
+            )
+            result = {
+                **factor_stage_result_contract(summary),
                 'market_date': normalized_market_date.isoformat(),
                 'source': source,
                 'feature_version': source,
                 'requested_symbols': requested_symbols,
                 'matched_symbols': [],
                 'missing_symbols': missing_symbols,
-                'summary': self._build_summary(
-                    [],
-                    requested_symbols=requested_symbols,
-                    matched_symbols=[],
-                    missing_symbols=missing_symbols,
-                    universe_counts=EMPTY_RANKING_UNIVERSE_COUNTS,
-                ),
+                'summary': summary,
                 'results_persisted': 0,
                 'results_failed': 0,
                 'failed_symbols': [],
                 'failed_symbol_errors': [],
                 'items': [],
             }
+            if exact_scope_symbols is not None:
+                result['scope_finalization'] = (
+                    replace_daily_derived_results_exact_scope(
+                        market_date=normalized_market_date,
+                        stage_id='advanced_value_factors',
+                        results=[],
+                        exact_symbols=exact_scope_symbols,
+                        authoritative_market_scope=(
+                            authoritative_market_scope
+                        ),
+                    )['scope_finalization']
+                )
+            return result
         ranking_inputs = inputs
+        ranking_missing_symbols: list[str] = []
         if (
             normalized_symbols is not None
             and normalized_symbols != normalized_ranking_symbols
         ):
-            ranking_inputs, _, _ = self._load_inputs(
+            ranking_inputs, _, ranking_missing_symbols = self._load_inputs(
                 market_date=normalized_market_date,
                 symbols=(
                     normalized_ranking_symbols
@@ -768,14 +904,21 @@ class DailyAdvancedValueFactorService:
                 ),
             )
 
-        ranking_items = [
-            self._build_symbol_result(
-                input_row=item,
-                market_date=normalized_market_date,
-                source=source,
-            )
-            for item in ranking_inputs
-        ]
+        (
+            ranking_items,
+            ranking_failed_symbols,
+            ranking_failed_symbol_errors,
+        ) = build_symbol_results(
+            ranking_inputs,
+            symbol_of=lambda item: item.symbol,
+            build=lambda item: run_symbol_computation(
+                lambda: self._build_symbol_result(
+                    input_row=item,
+                    market_date=normalized_market_date,
+                    source=source,
+                )
+            ),
+        )
         universe_counts = self._assign_metric_rankings(ranking_items)
         self._assign_scores_and_classifications(ranking_items)
         universe_counts['advanced_value_score'] = sum(
@@ -786,24 +929,82 @@ class DailyAdvancedValueFactorService:
             items = _sort_items(ranking_items)
         else:
             ranked_items_by_symbol = {item['symbol']: item for item in ranking_items}
+            ranking_failed_symbol_set = set(ranking_failed_symbols)
             items = []
             for input_row in inputs:
+                if input_row.symbol in ranking_failed_symbol_set:
+                    continue
                 item = ranked_items_by_symbol.get(input_row.symbol)
                 if item is None:
-                    item = self._build_symbol_result(
-                        input_row=input_row,
-                        market_date=normalized_market_date,
-                        source=source,
+                    fallback_items, fallback_failed, fallback_errors = (
+                        build_symbol_results(
+                            [input_row],
+                            symbol_of=lambda value: value.symbol,
+                            build=lambda value: run_symbol_computation(
+                                lambda: self._build_symbol_result(
+                                    input_row=value,
+                                    market_date=normalized_market_date,
+                                    source=source,
+                                )
+                            ),
+                        )
                     )
+                    ranking_failed_symbols.extend(fallback_failed)
+                    ranking_failed_symbol_errors.extend(fallback_errors)
+                    if not fallback_items:
+                        continue
+                    item = fallback_items[0]
                     self._assign_scores_and_classifications([item])
                 items.append(item)
 
-        for item in items:
-            item['factor_payload'] = self._build_factor_payload(
-                item=item,
-                source=source,
-                universe_counts=universe_counts,
+        (
+            computation_failed_symbols,
+            computation_failed_symbol_errors,
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = partition_symbol_failures(
+            failed_symbols=ranking_failed_symbols,
+            failed_symbol_errors=ranking_failed_symbol_errors,
+            target_symbols=[input_row.symbol for input_row in inputs],
+        )
+        ranking_dependency_missing_symbols = [
+            symbol
+            for symbol in ranking_missing_symbols
+            if normalized_symbols is None or symbol not in normalized_symbols
+        ]
+        (
+            ranking_dependency_failed_symbols,
+            ranking_dependency_failed_symbol_errors,
+        ) = merge_symbol_failures(
+            (
+                ranking_dependency_failed_symbols,
+                ranking_dependency_failed_symbol_errors,
+            ),
+            (
+                ranking_dependency_missing_symbols,
+                [
+                    {'symbol': symbol, 'error': 'ranking_input_missing'}
+                    for symbol in ranking_dependency_missing_symbols
+                ],
+            ),
+        )
+
+        items, payload_failed_symbols, payload_failed_errors = (
+            attach_symbol_payloads(
+                items,
+                payload_builder=lambda item: self._build_factor_payload(
+                    item=item,
+                    source=source,
+                    universe_counts=universe_counts,
+                ),
             )
+        )
+        computation_failed_symbols, computation_failed_symbol_errors = (
+            merge_symbol_failures(
+                (computation_failed_symbols, computation_failed_symbol_errors),
+                (payload_failed_symbols, payload_failed_errors),
+            )
+        )
         summary = self._build_summary(
             items,
             requested_symbols=requested_symbols,
@@ -815,19 +1016,38 @@ class DailyAdvancedValueFactorService:
             self._strip_internal_fields(item)
 
         persisted_count = 0
-        failed_symbols: list[str] = []
-        failed_symbol_errors: list[dict[str, str]] = []
-        try:
-            upsert_daily_advanced_value_factor_results(items)
-            persisted_count = len(items)
-        except Exception:
-            for item in items:
-                try:
-                    upsert_daily_advanced_value_factor_result(item)
-                    persisted_count += 1
-                except Exception as exc:
-                    failed_symbols.append(item['symbol'])
-                    failed_symbol_errors.append({'symbol': item['symbol'], 'error': str(exc)})
+        failed_symbols = list(computation_failed_symbols)
+        failed_symbol_errors = list(computation_failed_symbol_errors)
+        scope_finalization: dict[str, Any] | None = None
+        if exact_scope_symbols is not None:
+            publication = replace_daily_derived_results_exact_scope(
+                market_date=normalized_market_date,
+                stage_id='advanced_value_factors',
+                results=items,
+                exact_symbols=exact_scope_symbols,
+                authoritative_market_scope=authoritative_market_scope,
+            )
+            persisted_count = int(publication['results_persisted'])
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (publication['failed_symbols'], publication['failed_symbol_errors']),
+            )
+            scope_finalization = publication['scope_finalization']
+        else:
+            (
+                written_items,
+                write_failed_symbols,
+                write_failed_symbol_errors,
+            ) = persist_symbol_items_with_isolation(
+                items,
+                bulk_write=upsert_daily_advanced_value_factor_results,
+                item_write=upsert_daily_advanced_value_factor_result,
+            )
+            persisted_count = len(written_items)
+            failed_symbols, failed_symbol_errors = merge_symbol_failures(
+                (failed_symbols, failed_symbol_errors),
+                (write_failed_symbols, write_failed_symbol_errors),
+            )
 
         failed_symbol_set = set(failed_symbols)
         persisted_items = [
@@ -840,8 +1060,23 @@ class DailyAdvancedValueFactorService:
         )
         summary['persisted_ready_count'] = persisted_ready_count
         summary['persisted_unready_count'] = len(persisted_items) - persisted_ready_count
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=persisted_items,
+                missing_symbols=missing_symbols,
+                failed_symbols=failed_symbols,
+                failed_symbol_errors=failed_symbol_errors,
+            )
+        )
+        attach_ranking_dependency_contract(
+            summary,
+            failed_symbols=ranking_dependency_failed_symbols,
+            failed_symbol_errors=ranking_dependency_failed_symbol_errors,
+        )
 
-        return {
+        result = {
+            **factor_stage_result_contract(summary),
             'market_date': normalized_market_date.isoformat(),
             'source': source,
             'feature_version': source,
@@ -855,6 +1090,9 @@ class DailyAdvancedValueFactorService:
             'failed_symbol_errors': failed_symbol_errors,
             'items': _sort_items(items),
         }
+        if scope_finalization is not None:
+            result['scope_finalization'] = scope_finalization
+        return result
 
     def inspect(
         self,
@@ -994,9 +1232,24 @@ class DailyAdvancedValueFactorService:
             return {}
 
         normalized_symbols = list(dict.fromkeys(symbols))
+        with session_scope() as session:
+            fundamentals_issuer_by_symbol = (
+                resolve_preferred_fundamentals_issuer_symbols(
+                    session,
+                    normalized_symbols,
+                )
+            )
+        query_symbols = list(
+            dict.fromkeys(
+                [
+                    *normalized_symbols,
+                    *fundamentals_issuer_by_symbol.values(),
+                ]
+            )
+        )
         snapshot_rows = []
-        for start in range(0, len(normalized_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
-            symbol_chunk = normalized_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
+        for start in range(0, len(query_symbols), ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE):
+            symbol_chunk = query_symbols[start:start + ADVANCED_VALUE_FUNDAMENTALS_SNAPSHOT_CHUNK_SIZE]
             snapshot_rows.extend(
                 self._load_latest_annual_snapshot_chunk_with_retry(
                     market_date=market_date,
@@ -1062,10 +1315,10 @@ class DailyAdvancedValueFactorService:
                 for row in statement_rows:
                     rows_by_snapshot[row.snapshot_id].append(_serialize_statement_row(row))
 
-            result: dict[str, AnnualFundamentalsSnapshot] = {}
+            snapshot_by_stock_code: dict[str, AnnualFundamentalsSnapshot] = {}
             for symbol, snapshot_id in snapshot_id_by_symbol.items():
                 metadata = snapshot_metadata_by_id[snapshot_id]
-                result[symbol] = AnnualFundamentalsSnapshot(
+                snapshot_by_stock_code[symbol] = AnnualFundamentalsSnapshot(
                     symbol=symbol,
                     snapshot_id=snapshot_id,
                     corp_name=str(metadata['corp_name']),
@@ -1079,6 +1332,24 @@ class DailyAdvancedValueFactorService:
                     currency=metadata['currency'],
                     highlights_by_key=highlights_by_snapshot.get(snapshot_id, {}),
                     statement_rows=rows_by_snapshot.get(snapshot_id, []),
+                    requested_symbol=symbol,
+                    fundamentals_issuer_symbol=symbol,
+                )
+
+            result: dict[str, AnnualFundamentalsSnapshot] = {}
+            for requested_symbol in normalized_symbols:
+                direct_snapshot = snapshot_by_stock_code.get(requested_symbol)
+                if direct_snapshot is not None:
+                    result[requested_symbol] = direct_snapshot
+                    continue
+                issuer_symbol = fundamentals_issuer_by_symbol.get(requested_symbol)
+                issuer_snapshot = snapshot_by_stock_code.get(issuer_symbol or '')
+                if issuer_snapshot is None or issuer_symbol is None:
+                    continue
+                result[requested_symbol] = replace(
+                    issuer_snapshot,
+                    requested_symbol=requested_symbol,
+                    fundamentals_issuer_symbol=issuer_symbol,
                 )
             return result
 
@@ -1529,7 +1800,7 @@ class DailyAdvancedValueFactorService:
         ready_count = sum(
             1 for item in items if item.get('advanced_value_score') is not None
         )
-        return {
+        summary = {
             'requested_symbol_count': len(requested_symbols) if requested_symbols else len(matched_symbols),
             'matched_symbol_count': len(matched_symbols),
             'missing_symbol_count': len(missing_symbols),
@@ -1566,6 +1837,47 @@ class DailyAdvancedValueFactorService:
             ),
             'ranking_universe_counts': universe_counts,
         }
+        summary.update(
+            self._build_coverage_contract(
+                items=items,
+                persisted_items=items,
+                missing_symbols=missing_symbols,
+                failed_symbols=[],
+                failed_symbol_errors=[],
+            )
+        )
+        return summary
+
+    @staticmethod
+    def _build_coverage_contract(
+        *,
+        items: list[dict[str, Any]],
+        persisted_items: list[dict[str, Any]],
+        missing_symbols: list[str],
+        failed_symbols: list[str],
+        failed_symbol_errors: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        return build_factor_coverage_contract(
+            items=items,
+            persisted_items=persisted_items,
+            missing_symbols=missing_symbols,
+            failed_symbols=failed_symbols,
+            failed_symbol_errors=failed_symbol_errors or [],
+            is_ready=lambda item: item.get('advanced_value_score') is not None,
+            is_complete=lambda item: item.get('advanced_value_components_used')
+            == len(ADVANCED_VALUE_SCORE_WEIGHTS),
+            unusable_reason=lambda item: item.get('advanced_value_classification'),
+            input_families={
+                'fcf_yield': (
+                    lambda item: item.get('fcf_yield_valid_for_scoring') is True,
+                    lambda item: item.get('fcf_yield_status'),
+                ),
+                'ev_to_ebitda': (
+                    lambda item: item.get('ev_to_ebitda_valid_for_scoring') is True,
+                    lambda item: item.get('ev_to_ebitda_status'),
+                ),
+            },
+        )
 
     @staticmethod
     def _strip_internal_fields(item: dict[str, Any]) -> None:

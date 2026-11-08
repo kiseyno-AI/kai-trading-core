@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 import json
 from typing import Any
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -20,9 +21,14 @@ from app.eod import exact_factor_repair
 from app.eod.market_membership import market_membership_sha256
 from app.eod.exact_factor_repair import (
     FACTOR_RESULT_MODELS,
+    MEMBERSHIP_POLICY_STORED_ONLY,
     ExactFactorRepairService,
+    _extract_exact_market_membership,
     prune_stale_factor_rows,
     verify_exact_factor_rows,
+)
+from app.eod.price_bar_repair_state import (
+    PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE,
 )
 
 
@@ -51,6 +57,19 @@ def _membership_by_market() -> dict[str, list[str]]:
     }
 
 
+def test_provider_membership_includes_alpha_and_rejects_malformed_codes() -> None:
+    numeric_symbols = [f'{value:06d}' for value in range(700)]
+    symbols, rejected = _extract_exact_market_membership(
+        _Frame([*numeric_symbols, '0010A0', 'ABC123']),
+        market='KOSPI',
+    )
+
+    assert len(symbols) == 701
+    assert '0010A0' in symbols
+    assert 'ABC123' not in symbols
+    assert rejected == ['ABC123']
+
+
 @contextmanager
 def _acquired_lock(**_kwargs):
     yield True
@@ -66,17 +85,30 @@ def _service(
     exact_symbols = sorted(
         symbol
         for symbol in membership['KOSPI'] + membership['KOSDAQ']
-        if symbol.isdigit() and len(symbol) == 6
     )
     calls = apply_results if apply_results is not None else []
 
     def stage_runner(stage_id: str):
         def run(**kwargs):
             calls.append((stage_id, kwargs))
+            membership_hash = market_membership_sha256(exact_symbols)
             return {
                 'results_persisted': len(exact_symbols),
                 'results_failed': 0,
                 'missing_symbols': [],
+                'scope_finalization': {
+                    'stage': stage_id,
+                    'market_date': kwargs['market_date'],
+                    'exact_symbol_count': len(exact_symbols),
+                    'exact_membership_sha256': membership_hash,
+                    'successful_symbol_count': len(exact_symbols),
+                    'successful_membership_sha256': membership_hash,
+                    'authoritative_market_scope': True,
+                    'authoritative_markets': ['KOSDAQ', 'KOSPI'],
+                    'all_market_authority': False,
+                    'deleted_stale_row_count': 0,
+                    'ready': True,
+                },
             }
 
         return run
@@ -115,6 +147,7 @@ def _service(
         applied_scope_verifier=verify,
         stale_pruner=prune,
         completion_recorder=record_completion,
+        pending_batch_loader=lambda: [],
         lock_factory=_acquired_lock,
         stage_runners={
             stage_id: stage_runner(stage_id)
@@ -125,12 +158,37 @@ def _service(
 
 
 def _pinned_membership(exact_symbols: list[str]) -> dict[str, object]:
-    provider_membership = [*exact_symbols, '00104K']
+    provider_membership = list(exact_symbols)
     return {
         'expected_provider_membership_count': len(provider_membership),
         'expected_membership_sha256': market_membership_sha256(
             provider_membership
         ),
+    }
+
+
+def _pending_missing_bar_membership_proof(
+    exact_symbols: list[str],
+) -> dict[str, object]:
+    membership = _membership_by_market()
+    return {
+        'symbols_by_market': {
+            market: list(symbols)
+            for market, symbols in membership.items()
+        },
+        'protected_provider_codes_by_market': {
+            'KOSPI': [],
+            'KOSDAQ': [],
+        },
+        'membership_evidence_source': (
+            PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+        ),
+        'membership_evidence_run_id': None,
+        'membership_evidence_run_source': 'pykrx',
+        'membership_evidence_sha256': 'b' * 64,
+        'membership_evidence_repair_batch_ids': ['missing-bar-authority'],
+        'ranking_membership_count': len(exact_symbols),
+        'ranking_membership_sha256': market_membership_sha256(exact_symbols),
     }
 
 
@@ -257,6 +315,149 @@ def test_trade_date_provider_failure_uses_strict_same_date_eod_membership() -> N
     assert result['membership_evidence_source'] == 'stored_eod_run_metadata'
     assert result['membership_evidence_run_id'] == 321
     assert market_loader_called is False
+
+
+def test_stored_only_policy_never_calls_live_membership_providers() -> None:
+    membership = _membership_by_market()
+    live_calls: list[str] = []
+
+    def resolver(**_kwargs):
+        live_calls.append('trade_date')
+        raise AssertionError('stored-only mode must not resolve a live date')
+
+    def market_loader(_date: str, _market: str):
+        live_calls.append('market_ohlcv')
+        raise AssertionError('stored-only mode must not load live PyKRX')
+
+    service, exact_symbols, _calls = _service()
+    service.trade_date_resolver = resolver
+    service.market_ohlcv_loader = market_loader
+    service.stored_eod_run_loader = lambda **_kwargs: [
+        _stored_eod_membership_run(membership)
+    ]
+
+    result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=False,
+        membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
+    )
+
+    assert result['status'] == 'ready'
+    assert result['exact_membership_count'] == len(exact_symbols)
+    assert result['membership_policy'] == MEMBERSHIP_POLICY_STORED_ONLY
+    assert result['membership_evidence_source'] == 'stored_eod_run_metadata'
+    assert live_calls == []
+
+
+def test_stored_only_pending_proof_preserves_extras_and_pins_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prune_calls: list[dict] = []
+    completion_calls: list[dict] = []
+    service, exact_symbols, stage_calls = _service(
+        prune_calls=prune_calls,
+        completion_calls=completion_calls,
+    )
+    pending_proof = _pending_missing_bar_membership_proof(exact_symbols)
+    resolver_calls: list[dict] = []
+    stale_calls: list[dict] = []
+
+    def no_live_provider(*_args, **_kwargs):
+        raise AssertionError('stored-only pending proof must not call live PyKRX')
+
+    def resolve_pending(**kwargs):
+        resolver_calls.append(kwargs)
+        return pending_proof
+
+    def stale_details(**kwargs):
+        stale_calls.append(kwargs)
+        return {
+            stage_id: {'count': 7, 'symbol_preview': ['999999']}
+            for stage_id in FACTOR_RESULT_MODELS
+        }
+
+    service.trade_date_resolver = no_live_provider
+    service.market_ohlcv_loader = no_live_provider
+    service.stored_eod_run_loader = lambda **_kwargs: []
+    service.pending_batch_loader = lambda: [
+        {'repair_batch_id': 'missing-bar-authority'}
+    ]
+    service.pending_membership_evidence_resolver = resolve_pending
+    service.price_bar_symbols_loader = lambda _date: [
+        *exact_symbols,
+        '999999',
+    ]
+    service.stale_details_loader = stale_details
+    monkeypatch.setattr(
+        exact_factor_repair,
+        'resolve_pending_frozen_price_dependent_membership',
+        lambda **_kwargs: tuple(exact_symbols),
+    )
+
+    dry_result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=False,
+        membership_policy=MEMBERSHIP_POLICY_STORED_ONLY,
+    )
+
+    provider_membership = list(exact_symbols)
+    apply_kwargs = {
+        'market_date': '2026-09-23',
+        'apply': True,
+        'prune_stale': True,
+        'expected_provider_membership_count': len(provider_membership),
+        'expected_membership_sha256': market_membership_sha256(
+            provider_membership
+        ),
+        'expected_membership_evidence_source': (
+            PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+        ),
+        'expected_membership_evidence_run_id': None,
+        'expected_membership_evidence_run_source': 'pykrx',
+        'expected_membership_evidence_repair_batch_ids': [
+            'missing-bar-authority'
+        ],
+        'membership_policy': MEMBERSHIP_POLICY_STORED_ONLY,
+    }
+    mismatched = service.repair_for_market_date(
+        **apply_kwargs,
+        expected_membership_evidence_sha256='c' * 64,
+    )
+
+    assert dry_result['status'] == 'ready'
+    assert dry_result['membership_evidence_source'] == (
+        PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+    )
+    assert dry_result['membership_evidence_sha256'] == 'b' * 64
+    assert dry_result['membership_evidence_repair_batch_ids'] == [
+        'missing-bar-authority'
+    ]
+    assert dry_result['provider_excluded_from_ranking_codes'] == []
+    assert mismatched['status'] == 'blocked'
+    assert mismatched['reason'] == 'expected_membership_lineage_mismatch'
+    assert stage_calls == []
+    assert prune_calls == []
+    assert completion_calls == []
+
+    applied = service.repair_for_market_date(
+        **apply_kwargs,
+        expected_membership_evidence_sha256='b' * 64,
+    )
+
+    assert applied['status'] == 'completed'
+    assert len(stage_calls) == len(FACTOR_RESULT_MODELS)
+    assert prune_calls[0]['protected_symbols'] == []
+    assert completion_calls[0]['membership_evidence_source'] == (
+        PENDING_MISSING_BAR_MEMBERSHIP_EVIDENCE_SOURCE
+    )
+    assert completion_calls[0]['membership_evidence_run_id'] is None
+    assert completion_calls[0]['membership_evidence_run_source'] == 'pykrx'
+    assert completion_calls[0]['membership_evidence_sha256'] == 'b' * 64
+    assert completion_calls[0][
+        'membership_evidence_repair_batch_ids'
+    ] == ['missing-bar-authority']
+    assert len(resolver_calls) == 3
+    assert all(call['protected_symbols'] == [] for call in stale_calls)
 
 
 def test_stored_fallback_skips_newer_unsuitable_retry_for_latest_valid_run() -> None:
@@ -497,15 +698,14 @@ def test_dry_run_discloses_exact_scope_and_never_runs_factor_stage() -> None:
     assert result['applied'] is False
     assert result['exact_membership_count'] == len(exact_symbols)
     assert result['stale_outside_membership_price_bar_count'] == 1
-    assert result['exact_provider_membership_count'] == len(exact_symbols) + 1
-    assert result['provider_excluded_from_ranking_count'] == 1
+    assert result['exact_provider_membership_count'] == len(exact_symbols)
+    assert result['provider_excluded_from_ranking_count'] == 0
+    assert result['provider_excluded_from_ranking_codes'] == []
     assert result['provider_excluded_from_ranking_counts_by_market'] == {
-        'KOSPI': 1,
+        'KOSPI': 0,
         'KOSDAQ': 0,
     }
-    assert result['provider_excluded_from_ranking_preview'] == [
-        {'market': 'KOSPI', 'code': '00104K'}
-    ]
+    assert result['provider_excluded_from_ranking_preview'] == []
     assert result['stale_outside_membership_counts'] == {
         stage_id: 7 for stage_id in FACTOR_RESULT_MODELS
     }
@@ -536,6 +736,12 @@ def test_apply_passes_same_exact_membership_to_every_stage_in_order() -> None:
     for _stage_id, kwargs in calls:
         assert kwargs['symbols'] == exact_symbols
         assert kwargs['ranking_symbols'] == exact_symbols
+        assert kwargs['exact_scope_symbols'] == exact_symbols
+        authority = kwargs['authoritative_market_scope']
+        assert authority['symbol_count'] == len(exact_symbols)
+        assert authority['membership_sha256'] == (
+            market_membership_sha256(exact_symbols)
+        )
 
 
 def test_apply_requires_reviewed_membership_count_and_hash() -> None:
@@ -559,6 +765,41 @@ def test_apply_requires_reviewed_membership_count_and_hash() -> None:
     assert calls == []
 
 
+def test_apply_rejects_provider_membership_that_differs_from_pending_frozen_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_calls: list[tuple[str, dict]] = []
+    prune_calls: list[dict] = []
+    completion_calls: list[dict] = []
+    service, exact_symbols, _ = _service(
+        apply_results=stage_calls,
+        prune_calls=prune_calls,
+        completion_calls=completion_calls,
+    )
+    service.pending_batch_loader = lambda: [object()]
+    monkeypatch.setattr(
+        exact_factor_repair,
+        'resolve_pending_frozen_price_dependent_membership',
+        lambda **_kwargs: tuple(exact_symbols[:-1]),
+    )
+
+    result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=True,
+        **_pinned_membership(exact_symbols),
+    )
+
+    assert result['status'] == 'blocked'
+    assert result['reason'] == (
+        'provider_membership_mismatch_pending_frozen_scope'
+    )
+    assert result['provider_ranking_membership_count'] == len(exact_symbols)
+    assert result['frozen_membership_count'] == len(exact_symbols) - 1
+    assert stage_calls == []
+    assert prune_calls == []
+    assert completion_calls == []
+
+
 def test_apply_stops_partial_when_stage_does_not_persist_exact_membership() -> None:
     service, exact_symbols, _calls = _service()
     stage_runners = dict(service.stage_runners)
@@ -579,6 +820,26 @@ def test_apply_stops_partial_when_stage_does_not_persist_exact_membership() -> N
     assert result['reason'] == 'factor_stage_incomplete'
     assert result['failed_stage'] == 'value_factors'
     assert 'low_risk_factors' not in result['stage_results']
+
+
+def test_apply_rejects_stage_without_atomic_scope_finalization() -> None:
+    service, exact_symbols, _calls = _service()
+    service.stage_runners['value_factors'] = lambda **_kwargs: {
+        'results_persisted': len(exact_symbols),
+        'results_failed': 0,
+        'missing_symbols': [],
+    }
+
+    result = service.repair_for_market_date(
+        market_date='2026-09-23',
+        apply=True,
+        **_pinned_membership(exact_symbols),
+    )
+
+    assert result['status'] == 'partial'
+    assert result['reason'] == 'factor_stage_atomic_finalization_failed'
+    assert result['failed_stage'] == 'value_factors'
+    assert 'atomic exact-scope finalization' in result['error_message']
 
 
 def test_prune_requires_apply() -> None:
@@ -614,7 +875,7 @@ def test_prune_runs_only_after_all_exact_stages_succeed() -> None:
     assert len(stage_calls) == len(FACTOR_RESULT_MODELS)
     assert len(prune_calls) == 1
     assert prune_calls[0]['exact_symbols'] == exact_symbols
-    assert prune_calls[0]['protected_symbols'] == ['00104K']
+    assert prune_calls[0]['protected_symbols'] == []
     assert prune_calls[0]['expected_stale_counts'] == {
         stage_id: 7 for stage_id in FACTOR_RESULT_MODELS
     }
@@ -674,17 +935,14 @@ def test_blocks_when_resolved_date_is_not_requested_session() -> None:
     assert result['reason'] == 'not_an_exact_trading_session'
 
 
-def test_cli_returns_nonzero_for_blocked_result(monkeypatch, capsys) -> None:
-    observed: dict = {}
-
-    def blocked(**kwargs):
-        observed.update(kwargs)
-        return {'status': 'blocked', 'reason': 'test'}
-
+def test_cli_blocks_direct_apply_before_service_dispatch(
+    monkeypatch, capsys
+) -> None:
+    service = Mock()
     monkeypatch.setattr(
         exact_factor_repair.exact_factor_repair_service,
         'repair_for_market_date',
-        blocked,
+        service,
     )
 
     exit_code = exact_factor_repair.main(
@@ -692,14 +950,69 @@ def test_cli_returns_nonzero_for_blocked_result(monkeypatch, capsys) -> None:
     )
 
     assert exit_code == 1
-    assert observed == {
+    service.assert_not_called()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
         'market_date': '2026-09-23',
-        'apply': True,
-        'prune_stale': True,
-        'expected_provider_membership_count': None,
-        'expected_membership_sha256': None,
+        'mode': 'apply',
+        'status': 'blocked',
+        'applied': False,
+        'reason': 'direct_apply_requires_exact_factor_bulk_repair',
+        'required_driver': 'app.eod.exact_factor_bulk_repair',
     }
-    assert json.loads(capsys.readouterr().out)['status'] == 'blocked'
+
+
+def test_cli_reviewed_stored_membership_proof_cannot_bypass_bulk_guard(
+    monkeypatch, capsys
+) -> None:
+    service = Mock()
+    monkeypatch.setattr(
+        exact_factor_repair.exact_factor_repair_service,
+        'repair_for_market_date',
+        service,
+    )
+
+    exit_code = exact_factor_repair.main(
+        [
+            '--market-date',
+            '2026-09-23',
+            '--apply',
+            '--stored-membership-only',
+            '--expected-provider-membership-count',
+            '2705',
+            '--expected-membership-sha256',
+            'a' * 64,
+        ]
+    )
+
+    assert exit_code == 1
+    service.assert_not_called()
+    assert (
+        json.loads(capsys.readouterr().out)['reason']
+        == 'direct_apply_requires_exact_factor_bulk_repair'
+    )
+
+
+def test_cli_explicit_stored_only_policy_is_forwarded(monkeypatch, capsys) -> None:
+    observed: dict = {}
+
+    def ready(**kwargs):
+        observed.update(kwargs)
+        return {'status': 'ready'}
+
+    monkeypatch.setattr(
+        exact_factor_repair.exact_factor_repair_service,
+        'repair_for_market_date',
+        ready,
+    )
+
+    exit_code = exact_factor_repair.main(
+        ['--market-date', '2026-09-23', '--stored-membership-only']
+    )
+
+    assert exit_code == 0
+    assert observed['membership_policy'] == MEMBERSHIP_POLICY_STORED_ONLY
+    assert json.loads(capsys.readouterr().out)['status'] == 'ready'
 
 
 def _unique_numeric_symbol() -> str:
@@ -714,12 +1027,12 @@ def test_stale_scope_query_is_factor_date_index_driven() -> None:
     compiled = str(query.compile(compile_kwargs={'literal_binds': True}))
 
     assert 'FROM daily_advanced_value_factor_results JOIN symbols' in compiled
-    assert "symbols.market IN ('KOSPI', 'KOSDAQ')" in compiled
     assert 'symbols.id = daily_advanced_value_factor_results.symbol_id' in compiled
     assert (
         "daily_advanced_value_factor_results.market_date = '2026-09-23'"
         in compiled
     )
+    assert 'symbols.market' not in compiled
     assert 'NOT IN' not in compiled
 
 
@@ -777,7 +1090,7 @@ def _cleanup_symbols(symbols: list[str]) -> None:
         session.execute(delete(Symbol).where(Symbol.symbol.in_(symbols)))
 
 
-def test_stale_scope_loader_reports_only_symbols_outside_membership(
+def test_stale_scope_loader_includes_all_date_local_rows_outside_membership(
     monkeypatch,
 ) -> None:
     market_date = date(2099, 1, 9)
@@ -789,6 +1102,7 @@ def test_stale_scope_loader_reports_only_symbols_outside_membership(
     while non_krx_symbol in {exact_symbol, stale_symbol}:
         non_krx_symbol = _unique_numeric_symbol()
     symbols = [exact_symbol, stale_symbol, non_krx_symbol]
+    repair_started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     _insert_value_factor_rows(
         market_date=market_date,
         exact_symbol=exact_symbol,
@@ -830,10 +1144,19 @@ def test_stale_scope_loader_reports_only_symbols_outside_membership(
 
         assert result == {
             'value_factors': {
-                'count': 1,
-                'symbol_preview': [stale_symbol],
+                'count': 2,
+                'symbol_preview': sorted([stale_symbol, non_krx_symbol]),
             }
         }
+        assert prune_stale_factor_rows(
+            market_date=market_date,
+            exact_symbols=[exact_symbol],
+            repair_started_at=repair_started_at,
+            expected_stale_counts={
+                stage_id: details['count']
+                for stage_id, details in result.items()
+            },
+        ) == {'value_factors': 2}
     finally:
         _cleanup_symbols(symbols)
 

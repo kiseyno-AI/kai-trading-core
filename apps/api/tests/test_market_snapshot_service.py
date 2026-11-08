@@ -1206,7 +1206,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
             'other_process_same_bucket',
         )
 
-    async def test_forced_index_refresh_reuses_optional_legs_until_their_own_cadence_is_due(self) -> None:
+    async def test_forced_index_refresh_refreshes_investor_flow_but_reuses_fx(self) -> None:
         settings.kis_use_mock = False
         settings.market_snapshot_kis_use_real = True
         client = FakeKISClient()
@@ -1235,12 +1235,153 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.index_calls), 8)
         self.assertEqual(client.index_calls.count('0001'), 4)
         self.assertEqual(client.index_calls.count('1001'), 4)
-        self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')])
+        self.assertEqual(
+            client.flow_calls,
+            [
+                ('KSP', '0001'),
+                ('KSQ', '1001'),
+                ('KSP', '0001'),
+                ('KSQ', '1001'),
+            ],
+        )
         self.assertEqual(len(fx_service.calls), 1)
-        self.assertEqual(result['legs']['flow']['status'], 'cached')
+        self.assertEqual(result['legs']['flow']['status'], 'ready')
         self.assertEqual(result['legs']['fx']['status'], 'cached')
-        self.assertEqual(result['markets']['kospi']['flow_leg']['status'], 'cached')
+        self.assertEqual(result['markets']['kospi']['flow_leg']['status'], 'ready')
+        self.assertTrue(result['markets']['kospi']['flow_leg']['current_session'])
+        self.assertEqual(
+            result['markets']['kospi']['flow_leg']['provider_business_date'],
+            '2026-04-29',
+        )
+        self.assertEqual(
+            result['markets']['kospi']['flow_leg']['provider_session_time'],
+            '09:05:00',
+        )
+        self.assertLessEqual(
+            result['markets']['kospi']['flow_leg']['observation_age_seconds'],
+            settings.market_snapshot_open_drive_max_age_seconds,
+        )
         self.assertEqual(result['markets']['kospi']['foreign_net_value'], -1_455_933_000_000)
+
+    async def test_preopen_flow_is_fetched_but_stays_unverified_until_current_session_row_exists(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        client.provider_business_date = '20260428'
+        client.provider_session_time = '153000'
+        fx_service = FakeFXService()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=fx_service,
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        current = datetime.fromisoformat('2026-04-29T08:50:20+09:00')
+        service._now = lambda: current
+
+        preopen = await service.refresh_market_snapshot_if_due(
+            trigger='preopen_prepare',
+            force_index=True,
+        )
+
+        assert preopen is not None
+        self.assertEqual(preopen['markets']['kospi']['flow_leg']['status'], 'unverified')
+        self.assertFalse(preopen['markets']['kospi']['flow_leg']['current_session'])
+        self.assertEqual(
+            preopen['markets']['kospi']['flow_leg']['provider_business_date'],
+            '2026-04-28',
+        )
+        self.assertIn('markets.investor_flow', preopen['missing_fields'])
+
+        current = datetime.fromisoformat('2026-04-29T09:00:20+09:00')
+        client.provider_business_date = '20260429'
+        client.provider_session_time = '090000'
+        opened = await service.refresh_market_snapshot_if_due(
+            trigger='first_regular_session_bucket',
+            force_index=True,
+        )
+
+        assert opened is not None
+        self.assertEqual(opened['markets']['kospi']['flow_leg']['status'], 'ready')
+        self.assertTrue(opened['markets']['kospi']['flow_leg']['current_session'])
+        self.assertEqual(opened['markets']['kospi']['flow_leg']['provider_business_date'], '2026-04-29')
+        self.assertEqual(opened['markets']['kospi']['flow_leg']['provider_session_time'], '09:00:00')
+        self.assertEqual(len(client.flow_calls), 4)
+        self.assertEqual(len(fx_service.calls), 1)
+
+    async def test_postclose_flow_preserves_same_day_session_provenance_without_live_freshness(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        client.provider_session_time = '153000'
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=FakeFXService(),
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+        )
+        service._now = lambda: datetime.fromisoformat(
+            '2026-04-29T20:10:00+09:00'
+        )
+
+        result = await service.refresh_market_snapshot_if_due(
+            trigger='postclose_eod_context',
+            force_index=True,
+        )
+
+        assert result is not None
+        flow_leg = result['markets']['kospi']['flow_leg']
+        self.assertEqual(flow_leg['status'], 'unverified')
+        self.assertTrue(flow_leg['current_session'])
+        self.assertEqual(flow_leg['provider_business_date'], '2026-04-29')
+        self.assertEqual(flow_leg['provider_session_time'], '15:30:00')
+        self.assertGreater(
+            flow_leg['observation_age_seconds'],
+            settings.market_snapshot_open_drive_max_age_seconds,
+        )
+
+    async def test_postclose_refresh_keeps_last_trusted_same_day_flow_as_cached(self) -> None:
+        settings.kis_use_mock = False
+        settings.market_snapshot_kis_use_real = True
+        client = FakeKISClient()
+        fx_service = FakeFXService()
+        service = MarketSnapshotService(
+            kis_api_client=client,
+            koreaexim_service=fx_service,
+            cache_store=InMemoryCacheStore(),
+            fx_snapshot_store_instance=self.fx_snapshot_store,
+            refresh_interval_seconds=3600,
+        )
+        current = datetime.fromisoformat('2026-04-29T15:30:20+09:00')
+        client.provider_session_time = '153000'
+        service._now = lambda: current
+        trusted = await service.refresh_market_snapshot_if_due(
+            trigger='closing_bucket',
+            force_index=True,
+        )
+        assert trusted is not None
+        trusted_flow = trusted['markets']['kospi']['flow_leg']
+        self.assertEqual(trusted_flow['status'], 'ready')
+
+        current = datetime.fromisoformat('2026-04-29T20:10:00+09:00')
+        refreshed = await service.refresh_market_snapshot_if_due(
+            trigger='postclose_hourly',
+            force=True,
+        )
+
+        assert refreshed is not None
+        cached_flow = refreshed['markets']['kospi']['flow_leg']
+        self.assertEqual(cached_flow['status'], 'cached')
+        self.assertTrue(cached_flow['current_session'])
+        self.assertEqual(
+            cached_flow['provider_observed_at'],
+            trusted_flow['provider_observed_at'],
+        )
+        self.assertEqual(
+            refreshed['markets']['kospi']['foreign_net_value'],
+            trusted['markets']['kospi']['foreign_net_value'],
+        )
 
     async def test_index_only_refresh_does_not_relabel_unavailable_flow_as_cached(self) -> None:
         settings.kis_use_mock = False
@@ -1338,7 +1479,7 @@ class MarketSnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.index_calls), 12)
         self.assertEqual(client.index_calls.count('0001'), 6)
         self.assertEqual(client.index_calls.count('1001'), 6)
-        self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')] * 2)
+        self.assertEqual(client.flow_calls, [('KSP', '0001'), ('KSQ', '1001')] * 3)
         self.assertEqual(len(fx_service.calls), 2)
         self.assertEqual(result['legs']['flow']['status'], 'ready')
         self.assertEqual(result['legs']['fx']['status'], 'ready')
