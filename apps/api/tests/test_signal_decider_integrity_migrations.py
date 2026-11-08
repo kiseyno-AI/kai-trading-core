@@ -10,7 +10,12 @@ from alembic.operations import Operations
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
-from app.db_models import AgentContextFeedback, Base, SignalDeciderDecisionSnapshot
+from app.db_models import (
+    AgentContextFeedback,
+    Base,
+    SignalDeciderDecisionSnapshot,
+    SignalDeciderPolicyCandidate,
+)
 from app.internal.deploy_hygiene import RUNTIME_SCHEMA_UNIQUE_CHECKS
 
 
@@ -86,6 +91,65 @@ class SignalDeciderIntegrityMigrationTests(unittest.TestCase):
             {key: reflected_lengths[key] for key in expected_columns},
             {key: 128 for key in expected_columns},
         )
+
+    def test_bootstrap_migration_does_not_activate_baseline_over_activated_candidate(self):
+        bootstrap = _load_migration('20260428_0035_signal_decider_policy_versions.py')
+        integrity = _load_migration('20260906_0076_single_active_signal_decider_policy.py')
+        for candidate_status in ('activated', 'generated'):
+            for observed_baseline in (False, True):
+                with self.subTest(status=candidate_status, observed=observed_baseline):
+                    engine = create_engine('sqlite+pysqlite:///:memory:')
+                    self.addCleanup(engine.dispose)
+                    candidates = SignalDeciderPolicyCandidate.__table__
+                    Base.metadata.create_all(engine, tables=[candidates])
+                    snapshots = sa.Table(
+                        'signal_decider_decision_snapshots',
+                        sa.MetaData(),
+                        sa.Column('policy_version', sa.String(128)),
+                    )
+                    if observed_baseline:
+                        snapshots.create(engine)
+                    now = datetime(2026, 4, 28, tzinfo=timezone.utc)
+                    with engine.begin() as connection:
+                        connection.execute(candidates.insert().values(
+                            candidate_version='candidate_v2',
+                            base_policy_version=bootstrap.DEFAULT_POLICY_VERSION,
+                            evaluation_version='evaluation_v1',
+                            market_date_from=date(2026, 4, 1),
+                            market_date_to=date(2026, 4, 28),
+                            horizon_days=5,
+                            candidate_kind='feature_gate',
+                            status=candidate_status,
+                            summary='Previously reviewed candidate',
+                            hypothesis='Existing legacy candidate',
+                            evidence_payload={},
+                            recommendation_payload={},
+                            generated_at=now,
+                            activated_at=now if candidate_status == 'activated' else None,
+                        ))
+                        if observed_baseline:
+                            connection.execute(snapshots.insert().values(
+                                policy_version=bootstrap.DEFAULT_POLICY_VERSION,
+                            ))
+                        operations = Operations(MigrationContext.configure(connection))
+                        with patch.object(bootstrap, 'op', operations):
+                            bootstrap.upgrade()
+                        with patch.object(integrity, 'op', operations):
+                            integrity.upgrade()
+                        policies = sa.Table(
+                            integrity.TABLE_NAME, sa.MetaData(), autoload_with=connection,
+                        )
+                        active = connection.execute(sa.select(
+                            policies.c.policy_version,
+                        ).where(policies.c.status == 'active')).scalars().all()
+                        expected = (
+                            'candidate_v2' if candidate_status == 'activated'
+                            else bootstrap.DEFAULT_POLICY_VERSION
+                        )
+                        self.assertEqual(active, [expected])
+                        self.assertEqual(connection.scalar(
+                            sa.select(sa.func.count()).select_from(policies),
+                        ), 2)
 
     def test_single_active_policy_migration_fails_closed_on_existing_conflict(self):
         migration = _load_migration('20260906_0076_single_active_signal_decider_policy.py')
