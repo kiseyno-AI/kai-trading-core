@@ -182,6 +182,16 @@ def test_build_news_payloads_batches_symbols_in_order_and_carries_inputs():
     assert payloads[0]['task'] == 'news_events' and payloads[0]['market_date'] == '2026-11-09'
 
 
+@pytest.mark.parametrize('batch_size', [0, -1])
+def test_nonpositive_news_batch_size_still_preserves_each_symbol(batch_size):
+    inputs = {symbol: {'news': []} for symbol in ('A', 'B', 'C')}
+
+    payloads = build_news_payloads(DAY, inputs, batch_size=batch_size)
+
+    assert [payload['symbols'] for payload in payloads] == [['A'], ['B'], ['C']]
+    assert [item['symbol'] for payload in payloads for item in payload['items']] == ['A', 'B', 'C']
+
+
 # ---- runner --------------------------------------------------------------
 
 class Gateway:

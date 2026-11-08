@@ -132,7 +132,8 @@ def build_news_payloads(
 ) -> list[dict[str, Any]]:
     symbols = list(inputs)
     payloads: list[dict[str, Any]] = []
-    for start in range(0, len(symbols), max(1, batch_size)):
+    batch_size = max(1, batch_size)
+    for start in range(0, len(symbols), batch_size):
         batch = symbols[start : start + batch_size]
         payloads.append(
             {
