@@ -711,6 +711,7 @@ def append_broker_order_event(event: dict[str, Any]) -> dict[str, Any]:
         if order_row is None:
             raise ValueError('broker order not found for event append')
 
+        session.refresh(order_row, with_for_update=True)
         if broker_order_id is not None and client_order_id != order_row.client_order_id:
             raise ValueError('client_order_id does not match resolved broker order')
 
