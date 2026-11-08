@@ -21,7 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from sqlalchemy import text
@@ -117,7 +118,9 @@ def store_daily_metrics(rows: list[dict[str, Any]], *, session_factory=session_s
 def main() -> None:
     parser = argparse.ArgumentParser(description='Rebuild business-line daily metrics from stored bars.')
     parser.add_argument('--start', default='2014-01-01')
-    parser.add_argument('--end', default=date.today().isoformat())
+    # Profiles are dated in KST; the host clock may be on US time, where
+    # 'today' is still the previous day and no profile is effective yet.
+    parser.add_argument('--end', default=datetime.now(ZoneInfo('Asia/Seoul')).date().isoformat())
     args = parser.parse_args()
     end = date.fromisoformat(args.end)
     mapping = profiles_as_of(end)
