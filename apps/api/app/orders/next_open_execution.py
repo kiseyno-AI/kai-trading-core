@@ -5820,6 +5820,8 @@ class SignalDeciderNextOpenExecutionService:
                     SignalDeciderExecutionPlanItem.target_trade_date == target_trade_date,
                     SignalDeciderExecutionPlanItem.source_market_date == source_market_date,
                 )
+                .order_by(SignalDeciderExecutionPlanItem.id.asc())
+                .with_for_update()
             ).scalars().all()
             for row in rows:
                 if (
