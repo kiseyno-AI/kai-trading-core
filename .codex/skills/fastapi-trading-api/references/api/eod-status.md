@@ -44,6 +44,19 @@ GET /eod/status
       "stale_after_seconds": 180,
       "is_stale": false
     },
+    "daily_bar_reconciliation": {
+      "market_date": "2026-04-14",
+      "checked_at": "2026-04-15T08:01:00+09:00",
+      "status": "ok",
+      "warnings": [],
+      "compared_count": 2769,
+      "mismatch_count": 0,
+      "mismatch_by_field": {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0, "turnover": 0},
+      "mismatch_symbols": [],
+      "official_not_stored_count": 12,
+      "attempt": 1,
+      "collection_price_source": {"official_market_frame_bars": 2769, "per_symbol_bars": 0}
+    },
     "label": "Background orchestration runner",
     "scope": "runtime_background_orchestration"
   },
@@ -78,3 +91,10 @@ signal for the current automatic daily pipeline. Use `pykrx_auto` for the
 daily-pipeline scheduler and `background_runner` for process-local orchestration
 health. A runner with `status="stale"`, `staleness.is_stale=true`, or
 `task_alive=false` while enabled needs operator investigation.
+
+`background_runner.daily_bar_reconciliation` is the next-day comparison of the
+latest finalized session's stored bars with the official KRX table (`null` until
+the first check in this process). `status` is `ok`, `mismatch` (stored bars differ;
+restate them, see `docs/TARGETED_REPAIR_TOOLING.md`) or `reference_unavailable`.
+`warnings` may include `collection_used_per_symbol_fallback` (the collection fell
+back to provisional per-symbol bars) and `collection_price_source_unrecorded`.

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # price-bar universe (see app/internal/daily_coverage_audit.py). It only logs and
     # reports through the runner snapshot; it never changes pipeline behavior.
     daily_coverage_audit_enabled: bool = True
+    # Once per finalized session, compare stored daily bars with the official KRX
+    # market-wide table (two KRX reads, cached on disk) and warn on any difference
+    # (see app/eod/daily_bar_reconciliation.py). Read-only.
+    daily_bar_reconciliation_enabled: bool = True
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None

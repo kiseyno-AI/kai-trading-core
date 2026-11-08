@@ -78,6 +78,11 @@ class OfficialReference:
     def covers(self, trade_date: date) -> bool:
         return trade_date in self.covered_dates
 
+    def rows_for(self, trade_date: date) -> dict[str, Values]:
+        """Every official row of one date (empty when the date is not covered)."""
+
+        return {symbol: values for (symbol, day), values in self._rows.items() if day == trade_date}
+
     @classmethod
     def load(
         cls,

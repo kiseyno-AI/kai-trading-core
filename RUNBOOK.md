@@ -540,6 +540,18 @@ The background runner also runs this audit for the latest trading day at most on
 
 The audit only reports. To fill a hole, recompute the affected stage for that date, for example `python -m app.internal.ops eod-momentum-factors-compute --market-date YYYY-MM-DD`; the other factor stages have matching `eod-<name>-factors-compute` commands (see "pykrx EOD backfill"). That writes to the database, so review the dates the audit lists first.
 
+## Daily bar reconciliation (stored bars vs. official KRX table)
+
+Until 2026-11-06 the daily job stored provisional per-symbol bars that differed from the official KRX table on about 2,200 of ~2,700 rows a day, unnoticed for eight weeks. Collection now reads the official market-wide frame first, and the background runner checks the result the next day: once per finalized session, outside the CLOSED window and while no daily pipeline is active, it reads the official frame for the latest stored session (one KRX call per market, cached in `apps/api/var/official-daily-frames/`) and compares open/high/low/close/volume/turnover of every stored KOSPI/KOSDAQ bar.
+
+- Report: `apps/api/var/daily-bar-reconciliation/<date>.json` (counts by field, up to 20 sample rows, the collection's `price_source` counters). A session with status `ok` or `mismatch` is never fetched again, also across restarts; `reference_unavailable` is retried at most three times per process, 30 minutes apart.
+- Status: `GET /eod/status` → `background_runner.daily_bar_reconciliation`.
+- Alert: one WARNING in `kai-trading-core-api.stderr.log` per session when bars differ or the collection used the per-symbol fallback (`price_source.per_symbol_bars > 0`).
+- One-off: `.venv/bin/python -m app.eod.daily_bar_reconciliation --market-date YYYY-MM-DD` (exit `0` ok, `3` mismatch, `1` failure). Run it the way the server runs, i.e. with `.env` loaded (`start-api.sh` does `set -a; source .env`), because PyKRX reads the KRX login from the process environment.
+- `DAILY_BAR_RECONCILIATION_ENABLED=false` turns the runner step off.
+
+The check only reports. Fix a mismatch with `python -m app.eod.official_bar_restatement --official-cache-dir var/official-daily-frames ...` and the mandatory downstream rebuild (`docs/TARGETED_REPAIR_TOOLING.md`).
+
 ## Known ways a daily table ends up partially populated
 
 These are behaviors of the current code, each observed in production data. Use `python -m app.internal.daily_coverage_audit` (see "Daily data coverage audit") to detect them; none of them is fixed by the audit itself.
