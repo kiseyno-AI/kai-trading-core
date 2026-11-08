@@ -260,15 +260,18 @@ def detect_signal_features_missing(market_date: str) -> Gap | None:
     from sqlalchemy import func, select
 
     from app.db import session_scope
-    from app.db_models import DailySignalFeature
+    from app.db_models import DailyPriceBar, DailySignalFeature
     from app.market_data_store import list_symbols_with_daily_bar_on_date
 
     bar_symbols = len(set(list_symbols_with_daily_bar_on_date(market_date)))
     with session_scope() as session:
         stored = int(
             session.scalar(
-                select(func.count()).select_from(DailySignalFeature).where(
-                    DailySignalFeature.market_date == date.fromisoformat(market_date)
+                select(func.count()).select_from(DailySignalFeature).join(
+                    DailyPriceBar, DailyPriceBar.symbol_id == DailySignalFeature.symbol_id
+                ).where(
+                    DailySignalFeature.market_date == date.fromisoformat(market_date),
+                    DailyPriceBar.trade_date == date.fromisoformat(market_date),
                 )
             )
             or 0

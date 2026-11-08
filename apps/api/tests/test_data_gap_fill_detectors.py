@@ -128,6 +128,21 @@ class DetectorSqlTests(unittest.TestCase):
             self._with_session(setup, lambda: gap_fill.detect_signal_features_missing(D1.isoformat()))
         )
 
+    def test_unrelated_features_do_not_hide_missing_bar_members(self) -> None:
+        def setup(session):
+            missing, complete, unrelated = [self._symbol(session) for _ in range(3)]
+            self._bar(session, missing, D1)
+            self._bar(session, complete, D1)
+            self._feature(session, complete, D1)
+            self._feature(session, unrelated, D1)
+            self._feature(session, missing, D2)
+
+        gap = self._with_session(setup, lambda: gap_fill.detect_signal_features_missing(D1.isoformat()))
+
+        self.assertIsNotNone(gap)
+        self.assertEqual(gap.count, 1)
+        self.assertEqual(gap.detail, {'bar_symbols': 2, 'stored_rows': 1})
+
     def test_participation_missing_or_stale_is_a_gap_and_matching_is_not(self) -> None:
         def make(captured):
             def setup(session):
