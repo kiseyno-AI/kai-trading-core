@@ -185,7 +185,7 @@ class Settings(BaseSettings):
     macro_context_world_bank_series: str = 'NY.GDP.MKTP.KD.ZG,FP.CPI.TOTL.ZG,SL.UEM.TOTL.ZS'
     macro_context_world_bank_mrnev: int = 1
     macro_context_fred_enabled: bool = True
-    macro_context_fred_series: str = 'DEXKOUS'
+    macro_context_fred_series: str = 'DEXKOUS,DFF,DGS10,DGS2,T10Y2Y,VIXCLS,BAMLH0A0HYM2,DCOILWTICO,CPIAUCSL,UNRATE'
     fred_api_key: str = ''
     fred_base_url: str = 'https://api.stlouisfed.org'
 
@@ -217,7 +217,10 @@ class Settings(BaseSettings):
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_global_share_issuance_enabled: bool = False
-    dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=100, ge=0, le=500)
+    # Probe every symbol without fundamentals daily (~140 on 2026-11-06). A
+    # limit below that count left a rotating handful as retry debt each day,
+    # so the DART stage was partial every day.
+    dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
 
     sec_edgar_user_agent: str = ''

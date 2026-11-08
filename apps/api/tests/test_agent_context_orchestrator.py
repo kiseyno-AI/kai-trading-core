@@ -10024,6 +10024,110 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertEqual(result['response_correlation']['attribution_status'], 'matched')
         self.assertIsNone(result['response_correlation']['failure_class'])
 
+    def _dispatch_plain_text_batch(self, *, spec, symbol, output_text):
+        response_payload = {
+            'id': f'resp-plain-text-{spec.role}',
+            'status': 'completed',
+            'model': f'openclaw/{spec.agent_name}',
+            'output': [
+                {
+                    'type': 'message',
+                    'content': [{'type': 'output_text', 'text': output_text}],
+                }
+            ],
+        }
+        fake_settings = SimpleNamespace(
+            openclaw_base_url='https://openclaw.example',
+            openclaw_gateway_token='gateway-token',
+            openclaw_agent_timeout_seconds=30,
+            openclaw_agent_max_retries=0,
+            openclaw_agent_retry_backoff_seconds=0,
+            openclaw_agent_max_prompt_chars=0,
+            openclaw_state_dir='/nonexistent-openclaw-state',
+            openclaw_signal_decider_expected_model='openai/gpt-6.1-sol',
+            openclaw_short_term_decider_expected_model='openai/gpt-6.1-sol',
+        )
+
+        def fake_client_factory(*args, **kwargs):
+            return FakeHTTPClient(
+                response=FakeHTTPResponse(200, response_payload),
+                calls=[],
+                **kwargs,
+            )
+
+        with patch.object(orchestrator_module, 'settings', fake_settings):
+            with patch('app.agent_context.orchestrator.httpx.Client', side_effect=fake_client_factory):
+                with patch.object(orchestrator_module, 'log_agent_feedback_event') as log_event:
+                    result = OpenClawAgentClient().dispatch_batch(
+                        spec=spec,
+                        market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                        batch_items=[
+                            {
+                                'symbol': symbol,
+                                'request_run_id': f'symbol-run-2026-04-14-plain-{spec.role}',
+                                'session_slot': 1,
+                                'session_key': f'agent:{spec.agent_name}:feedback/{spec.agent_name}/plain-01',
+                            }
+                        ],
+                    )
+        return result, log_event
+
+    def test_summarizer_plain_text_batch_with_a_dropped_closer_is_repaired(self):
+        feedback = {
+            'role': 'eod-summarizer',
+            'summary': 'Constructive close.',
+            'confidence': 0.6,
+            'risk_flags': [],
+            'details': {'trend': 'up'},
+            'improvement_notes': [],
+        }
+        valid = json.dumps({'items': [{'symbol': '005930', 'feedback': feedback}]})
+        self.assertTrue(valid.endswith('}}]}'))
+        broken = valid[:-4] + '}]}'
+
+        result, log_event = self._dispatch_plain_text_batch(
+            spec=orchestrator_module.DISPATCH_SPECS[0],
+            symbol='005930',
+            output_text=broken,
+        )
+
+        self.assertEqual(result['decoded'], json.loads(valid))
+        self.assertEqual(result['response_correlation']['decoded_source'], 'output_text')
+        self.assertIsNone(result['response_correlation']['failure_class'])
+        self.assertEqual(
+            result['request_provenance']['json_structure_repair'],
+            {'applied': True, 'inserted_closers': 1, 'removed_trailing_commas': 0},
+        )
+        stages = [call.args[0] for call in log_event.call_args_list]
+        self.assertIn('dispatch_batch_json_structure_repaired', stages)
+
+    def test_decider_roles_never_get_json_structure_repair(self):
+        self.assertTrue(
+            set(orchestrator_module.JSON_STRUCTURE_REPAIR_ROLES).isdisjoint(
+                orchestrator_module.DECISION_SUPPORT_AGENT_NAMES
+            )
+        )
+        self.assertEqual(
+            set(orchestrator_module.JSON_STRUCTURE_REPAIR_ROLES),
+            set(orchestrator_module.SUMMARIZER_AGENT_NAMES),
+        )
+        decider_spec = orchestrator_module.DISPATCH_SPECS[-1]
+        self.assertIn(decider_spec.role, orchestrator_module.DECISION_SUPPORT_AGENT_NAMES)
+        valid = json.dumps(
+            {'items': [{'symbol': '005930', 'feedback': _complete_actionable_signal_feedback()}]}
+        )
+        self.assertTrue(valid.endswith('}}]}'))
+
+        result, _ = self._dispatch_plain_text_batch(
+            spec=decider_spec,
+            symbol='005930',
+            output_text=valid[:-4] + '}]}',
+        )
+
+        self.assertNotIn('json_structure_repair', result['request_provenance'])
+        self.assertEqual(result['response_correlation']['decoded_source'], 'core_structured_fallback')
+        self.assertTrue(result['decoded']['items'][0]['feedback']['details']['fallback_generated_by_core'])
+
     def test_openclaw_batch_dispatch_does_not_fall_back_to_text_after_wrong_function_call(self):
         valid_text = json.dumps(
             {

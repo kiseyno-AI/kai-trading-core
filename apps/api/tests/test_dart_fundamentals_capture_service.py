@@ -3738,6 +3738,75 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def _compound_partial_reasons(self, *, fundamentals_retry_debt, issuance_ready):
+        class BulkMappingClient(FakeCaptureClient):
+            async def lookup_corp_codes_for_stocks(self, *, stock_codes):
+                return {
+                    'resolved': [
+                        {'stock_code': stock_code, 'corp_code': f'corp-{stock_code}'}
+                        for stock_code in stock_codes
+                    ],
+                    'unsupported_stock_codes': [],
+                    'conflicting_mappings': [],
+                }
+
+        service = _DartFundamentalsCaptureService(
+            client=BulkMappingClient(),
+            repository=FakeCaptureRepository(),
+            active_symbol_loader=lambda: [{'symbol': '005930'}, {'symbol': '000660'}],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {'enabled': True},
+        )
+        service._run_daily_incremental_refresh = AsyncMock(
+            return_value={
+                'triggered': True,
+                'run_id': 190,
+                'status': 'partial' if fundamentals_retry_debt else 'completed',
+                'partial_reasons': ['scope_retry_debt'] if fundamentals_retry_debt else [],
+                'retry_debt_count': len(fundamentals_retry_debt),
+                **_exact_fundamentals_scope_outcome(
+                    ['000660', '005930'],
+                    retry_debt_stock_codes=fundamentals_retry_debt,
+                ),
+            }
+        )
+        with patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_global_share_issuance_evidence',
+            new_callable=AsyncMock,
+            return_value={
+                'run_id': 902,
+                'status': 'completed',
+                'scan_status': 'completed',
+                'coverage_ready_stock_codes': issuance_ready,
+                'decision_ready_positive_stock_codes': [],
+                'retry_debt_stock_codes': [],
+            },
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 11, 6),
+                fs_div='CFS',
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+        return result
+
+    async def test_fundamentals_only_retry_debt_is_not_labelled_share_issuance(self):
+        result = await self._compound_partial_reasons(
+            fundamentals_retry_debt=['000660'],
+            issuance_ready=['000660', '005930'],
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertIn('scope_retry_debt', result['partial_reasons'])
+        self.assertNotIn('share_issuance_scope_incomplete', result['partial_reasons'])
+
+    async def test_missing_issuance_evidence_is_labelled_share_issuance(self):
+        result = await self._compound_partial_reasons(
+            fundamentals_retry_debt=[],
+            issuance_ready=['005930'],
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], ['000660'])
+        self.assertIn('share_issuance_scope_incomplete', result['partial_reasons'])
+
     async def test_compound_refresh_propagates_core_database_failure(self):
         service, _repository = self._build_global_followup_service()
         service._run_daily_incremental_refresh.side_effect = SQLAlchemyError(

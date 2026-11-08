@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -22,6 +24,10 @@ from app.signals.daily_signal_features import (
     build_daily_signal_feature_rows,
     main,
 )
+from app.signals.overtime_ranking_capture import (
+    CAPTURE_SCHEMA_VERSION,
+    OvertimeRankingCaptureStore,
+)
 from app.signals.signal_feature_readiness import (
     classify_signal_feature_readiness,
 )
@@ -29,6 +35,9 @@ from app.signals.signal_feature_readiness import (
 
 class FakeKISRankingClient:
     async def fetch_domestic_ranking_volume_power(self, **kwargs):
+        # Core queries common stock per market; this fixture's row is KOSPI.
+        if kwargs.get('input_iscd') != '0001':
+            return {'output': [], 'page_count': 1, 'max_pages_reached': False}
         return {
             'output': [
                 {
@@ -112,6 +121,17 @@ class FailingKISRankingClient:
 
 class RetryableRankingError(RuntimeError):
     retryable = True
+
+
+def _kospi_segment_only(response):
+    """Volume-power mock: the given response for KOSPI, empty for KOSDAQ."""
+
+    empty = {'output': [], 'page_count': 1, 'max_pages_reached': False}
+
+    async def fetch(**kwargs):
+        return response if kwargs.get('input_iscd') == '0001' else empty
+
+    return AsyncMock(side_effect=fetch)
 
 
 def _ready_direct_feature_item(
@@ -539,6 +559,151 @@ class DailySignalFeatureBuilderTests(unittest.TestCase):
 
 
 class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Never read real after-hours captures from the checkout's var/ dir.
+        self._capture_dir = tempfile.TemporaryDirectory()
+        self.capture_store = OvertimeRankingCaptureStore(Path(self._capture_dir.name))
+        patcher = patch(
+            'app.signals.daily_signal_features.overtime_capture_store',
+            self.capture_store,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._capture_dir.cleanup)
+
+    def _save_capture(self, market_date, sources):
+        self.capture_store.save(
+            {
+                'schema_version': CAPTURE_SCHEMA_VERSION,
+                'market_date': market_date,
+                'captured_at': f'{market_date}T17:55:00+09:00',
+                'sources': sources,
+                'errors': {},
+            }
+        )
+
+    async def test_volume_power_queries_common_stock_per_market_and_reranks_by_strength(self):
+        calls = []
+
+        async def fetch(**kwargs):
+            calls.append(kwargs)
+            rows = {
+                '0001': [
+                    {'stck_shrn_iscd': '002760', 'data_rank': '1', 'tday_rltv': '364.29'},
+                    {'stck_shrn_iscd': '105630', 'data_rank': '2', 'tday_rltv': '254.14'},
+                ],
+                '1001': [
+                    {'stck_shrn_iscd': '050120', 'data_rank': '1', 'tday_rltv': '999.99'},
+                    {'stck_shrn_iscd': '140070', 'data_rank': '2', 'tday_rltv': '341.14'},
+                ],
+            }[kwargs['input_iscd']]
+            return {'output': rows, 'page_count': 1, 'max_pages_reached': False}
+
+        client = type('SegmentClient', (), {'fetch_domestic_ranking_volume_power': AsyncMock(side_effect=fetch)})()
+        service = DailySignalFeatureService(client=client)
+
+        with patch(
+            'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+            side_effect=lambda **kwargs: (kwargs['direct_rows'], {}),
+        ):
+            result = await service.collect_features(market_date='2026-11-06', sources=[VOLUME_POWER])
+
+        self.assertEqual([c['input_iscd'] for c in calls], ['0001', '1001'])
+        for call_kwargs in calls:
+            self.assertEqual(call_kwargs['div_cls_code'], '1')
+            self.assertEqual(call_kwargs['min_volume'], '100000')
+        self.assertEqual(result.raw_source_counts, {VOLUME_POWER: 4})
+        self.assertEqual(result.source_counts, {VOLUME_POWER: 3})
+        ranks = {item['symbol']: item['volume_power_rank'] for item in result.items}
+        # KOSDAQ 341.14 sits between the two KOSPI rows once merged.
+        self.assertEqual(ranks, {'002760': 1, '140070': 2, '105630': 3})
+        self.assertEqual(
+            {item['reason'] for item in result.source_diagnostics[VOLUME_POWER]},
+            {'placeholder_volume_power'},
+        )
+
+    async def test_volume_power_keeps_the_surviving_market_when_one_segment_fails(self):
+        async def fetch(**kwargs):
+            if kwargs['input_iscd'] == '1001':
+                raise RuntimeError('kosdaq ranking down')
+            return {
+                'output': [{'stck_shrn_iscd': '002760', 'data_rank': '1', 'tday_rltv': '364.29'}],
+                'page_count': 1,
+                'max_pages_reached': False,
+            }
+
+        client = type('HalfClient', (), {'fetch_domestic_ranking_volume_power': AsyncMock(side_effect=fetch)})()
+        service = DailySignalFeatureService(client=client)
+        with patch(
+            'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+            side_effect=lambda **kwargs: (kwargs['direct_rows'], {}),
+        ):
+            result = await service.collect_features(market_date='2026-11-06', sources=[VOLUME_POWER])
+
+        self.assertEqual(result.source_errors, {})
+        self.assertEqual(result.source_counts, {VOLUME_POWER: 1})
+
+    async def test_overtime_sources_use_the_same_day_after_hours_capture(self):
+        self._save_capture(
+            '2026-11-06',
+            {
+                OVERTIME_VOLUME: {
+                    'rows': [{'stck_shrn_iscd': '000660', 'ovtm_untp_vol': '90000', 'ovtm_untp_prdy_ctrt': '1.2'}],
+                    'summary_rows': [{'ovtm_untp_exch_vol': '90000'}],
+                },
+                OVERTIME_FLUCTUATION: {
+                    'rows': [{'mksc_shrn_iscd': '005930', 'ovtm_untp_prdy_ctrt': '3.3'}],
+                    'summary_rows': [],
+                },
+            },
+        )
+        client = type(
+            'LiveClient',
+            (),
+            {
+                'fetch_domestic_ranking_overtime_volume': AsyncMock(),
+                'fetch_domestic_ranking_overtime_fluctuation': AsyncMock(),
+            },
+        )()
+        service = DailySignalFeatureService(client=client)
+        with patch(
+            'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+            side_effect=lambda **kwargs: (kwargs['direct_rows'], {}),
+        ):
+            result = await service.collect_features(
+                market_date='2026-11-06',
+                sources=[OVERTIME_VOLUME, OVERTIME_FLUCTUATION],
+            )
+
+        client.fetch_domestic_ranking_overtime_volume.assert_not_awaited()
+        client.fetch_domestic_ranking_overtime_fluctuation.assert_not_awaited()
+        self.assertEqual(result.source_counts, {OVERTIME_VOLUME: 1, OVERTIME_FLUCTUATION: 1})
+        self.assertEqual(sorted(item['symbol'] for item in result.items), ['000660', '005930'])
+
+    async def test_overtime_falls_back_to_live_when_capture_has_no_usable_rows(self):
+        self._save_capture(
+            '2026-11-06',
+            {OVERTIME_VOLUME: {'rows': [{'stck_shrn_iscd': '000660', 'ovtm_untp_vol': '0'}], 'summary_rows': []}},
+        )
+        live = AsyncMock(
+            return_value={
+                'output1': [],
+                'output2': [{'stck_shrn_iscd': '005930', 'ovtm_untp_vol': '1200'}],
+                'page_count': 1,
+                'max_pages_reached': False,
+            }
+        )
+        client = type('LiveClient', (), {'fetch_domestic_ranking_overtime_volume': live})()
+        service = DailySignalFeatureService(client=client)
+        with patch(
+            'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+            side_effect=lambda **kwargs: (kwargs['direct_rows'], {}),
+        ):
+            result = await service.collect_features(market_date='2026-11-06', sources=[OVERTIME_VOLUME])
+
+        live.assert_awaited_once()
+        self.assertEqual(result.source_counts, {OVERTIME_VOLUME: 1})
+
     async def test_collect_features_rejects_all_rows_without_symbol_or_fluctuation_rate(self):
         client = type(
             'InvalidFluctuationRankingClient',
@@ -663,8 +828,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'PageCappedRankingClient',
             (),
             {
-                'fetch_domestic_ranking_volume_power': AsyncMock(
-                    return_value={
+                'fetch_domestic_ranking_volume_power': _kospi_segment_only(
+                    {
                         'output': [
                             {
                                 'stck_shrn_iscd': '005930',
@@ -703,8 +868,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'ValidityClient',
             (),
             {
-                'fetch_domestic_ranking_volume_power': AsyncMock(
-                    return_value={
+                'fetch_domestic_ranking_volume_power': _kospi_segment_only(
+                    {
                         'output': [
                             {'stck_shrn_iscd': '069500', 'tday_rltv': '999.99'},
                             {'stck_shrn_iscd': '005930', 'tday_rltv': 'NaN'},
@@ -766,6 +931,9 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             {
                 'fetch_domestic_ranking_volume_power': AsyncMock(
                     side_effect=[
+                        # one retry per market segment (KOSPI, then KOSDAQ)
+                        RetryableRankingError('temporary volume power failure'),
+                        {'output': [], 'page_count': 1, 'max_pages_reached': False},
                         RetryableRankingError('temporary volume power failure'),
                         {'output': [], 'page_count': 1, 'max_pages_reached': False},
                     ]
@@ -796,10 +964,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             result = await service.collect_features(market_date='2026-05-06')
 
         self.assertEqual(result.source_errors, {})
-        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 2)
+        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 4)
         self.assertEqual(client.fetch_domestic_ranking_overtime_volume.await_count, 2)
         self.assertEqual(client.fetch_domestic_ranking_overtime_fluctuation.await_count, 2)
-        self.assertEqual(sleep.await_count, 3)
+        self.assertEqual(sleep.await_count, 4)
 
     async def test_collect_features_does_not_retry_nonretryable_kis_ranking_error(self):
         client = type(
@@ -826,7 +994,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.source_errors, {VOLUME_POWER: 'invalid request'})
-        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 1)
+        # no retry: one call per market segment
+        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 2)
         sleep.assert_not_awaited()
 
     async def test_collect_features_stops_after_one_retryable_read_retry(self):
@@ -857,8 +1026,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             result.source_errors,
             {VOLUME_POWER: 'ranking still unavailable'},
         )
-        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 2)
-        sleep.assert_awaited_once_with(SIGNAL_SOURCE_RETRY_BASE_SECONDS)
+        # each market segment: first try plus exactly one retry
+        self.assertEqual(client.fetch_domestic_ranking_volume_power.await_count, 4)
+        self.assertEqual(sleep.await_count, 2)
+        sleep.assert_awaited_with(SIGNAL_SOURCE_RETRY_BASE_SECONDS)
 
     def test_repair_rebuilds_owned_fallback_without_rewriting_direct_evidence(
         self,

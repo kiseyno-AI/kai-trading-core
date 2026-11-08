@@ -22,6 +22,7 @@ from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_serv
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
+from app.signals.overtime_ranking_capture import capture_overtime_rankings_if_due
 
 logger = logging.getLogger(__name__)
 PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
@@ -453,6 +454,24 @@ class EODBackgroundRunner:
                 exc,
             )
 
+    def _start_overtime_ranking_capture_if_due(self, market: object) -> None:
+        # Read-only after-hours ranking snapshot (17:45-18:30 KST), started in
+        # the background so a slow or failing KIS call never delays or fails
+        # a tick; before the pipeline-active short-circuit so a recovery run
+        # cannot starve it. One capture in flight at a time.
+        name = 'kis_overtime_ranking_capture_if_due'
+        if not settings.background_runner_enabled:
+            return
+        running = self._async_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(
+            capture_overtime_rankings_if_due(market=market),
+            name=f'eod-background-async:{name}',
+        )
+        self._async_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
+
     async def _run_loop(self) -> None:
         live_market_snapshot_loop = asyncio.get_running_loop()
         while self._running:
@@ -464,6 +483,7 @@ class EODBackgroundRunner:
             try:
                 market = await async_get_market_state()
                 await self._run_pending_session_cleanup()
+                self._start_overtime_ranking_capture_if_due(market)
                 pipeline_active = auto_pykrx_eod_scheduler.state.active_task
                 if pipeline_active and market.state not in {'PREOPEN', 'OPEN'}:
                     await asyncio.sleep(self.interval_seconds)
