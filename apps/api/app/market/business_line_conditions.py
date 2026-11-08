@@ -32,7 +32,10 @@ from app.market.business_lines import BUSINESS_LINES
 
 HORIZONS = (5, 20)
 MIN_EFFECTIVE = 20
-SPLIT_DATE = pd.Timestamp('2017-01-01')
+SPLIT_DATE = pd.Timestamp('2020-01-01')
+# Stored bars cover the universe only from 2014; days with fewer classified
+# symbols than this are skipped so a handful of names cannot pose as a market.
+MIN_DAILY_SYMBOLS = 500
 
 
 # ---------------------------------------------------------------- inputs
@@ -214,7 +217,15 @@ def transition_matrix(regimes: pd.Series) -> pd.DataFrame:
     return table
 
 
-def build_report(metrics: pd.DataFrame, macro: dict[str, pd.DataFrame]) -> dict[str, Any]:
+def build_report(
+    metrics: pd.DataFrame,
+    macro: dict[str, pd.DataFrame],
+    *,
+    min_daily_symbols: int = MIN_DAILY_SYMBOLS,
+) -> dict[str, Any]:
+    if 'symbols' in metrics.columns:
+        per_day = metrics.groupby('trade_date')['symbols'].transform('sum')
+        metrics = metrics[per_day >= min_daily_symbols]
     days = pd.DatetimeIndex(sorted(metrics['trade_date'].unique()))
     features = feature_frame(days, macro)
     regimes = regime_series(features)
@@ -250,16 +261,29 @@ def build_report(metrics: pd.DataFrame, macro: dict[str, pd.DataFrame]) -> dict[
 
 
 # ---------------------------------------------------------------- markdown
+WEAK_T = 1.5
+
+
 def _significant(rows: list[dict[str, Any]], sign: int) -> list[dict[str, Any]]:
+    """Up to three lines in one direction: |t| >= 2, or 1.5-2 when both halves agree."""
+
     picked = [
         row for row in rows
-        if row['effective'] >= MIN_EFFECTIVE and not math.isnan(row['t']) and abs(row['t']) >= 2 and np.sign(row['lift']) == sign
+        if row['effective'] >= MIN_EFFECTIVE
+        and not math.isnan(row['t'])
+        and np.sign(row['lift']) == sign
+        and (abs(row['t']) >= 2 or (abs(row['t']) >= WEAK_T and row['consistent']))
     ]
-    return sorted(picked, key=lambda row: -sign * row['lift'])[:3]
+    return sorted(picked, key=lambda row: -abs(row['t']))[:3]
 
 
 def _fmt(row: dict[str, Any]) -> str:
-    mark = '' if row['consistent'] else ' (전후반 불일치)'
+    if abs(row['t']) >= 2 and row['consistent']:
+        mark = ' **유의**'
+    elif abs(row['t']) >= 2:
+        mark = ' (전후반 불일치)'
+    else:
+        mark = ' (약한 후보)'
     return f"{BUSINESS_LINES.get(row['line'], row['line'])} {row['lift']:+.2f}%p (t {row['t']:.1f}){mark}"
 
 
@@ -269,7 +293,9 @@ def to_markdown(report: dict[str, Any], news: dict[str, Any] | None = None) -> s
         '',
         f"- 기간: {report['range'][0]} ~ {report['range'][1]} ({report['trading_days']:,} 거래일), 사업군 {len(report['lines'])}개",
         '- 결과값: 조건이 성립한 날부터 20거래일 동안 사업군의 **시장 대비 초과수익 합계**가 평소보다 얼마나 높았나(lift, %p).',
-        f"- 기준: 겹치는 기간을 감안한 유효 표본 {MIN_EFFECTIVE}개 이상, |t| ≥ 2. 2007~2016과 2017~ 두 구간의 방향이 다르면 '전후반 불일치'로 표시.",
+        f"- 표시 기준: 겹치는 기간을 감안한 유효 표본 {MIN_EFFECTIVE}개 이상. |t| ≥ 2이고 {report['range'][0][:4]}~2019와 2020~ 두 구간 방향이 같으면 **유의**, 방향이 다르면 '전후반 불일치', |t| 1.5~2이면서 두 구간 방향이 같으면 '약한 후보'.",
+        '- 빈칸(—)은 그 조건에서 평소와 뚜렷이 다르게 움직인 사업군이 없었다는 뜻입니다. 유효 표본이 20개 미만인 조건(드물게 발생)은 판단하지 않았습니다.',
+        f"- 저장된 일봉은 2014년부터 전 종목이 있어서, 분류 종목이 하루 {MIN_DAILY_SYMBOLS}개 미만인 날은 뺐습니다.",
         '- 거시 값은 한국 장 시작 전에 이미 공표된 값만 사용했습니다(공표일 기준).',
         '',
     ]

@@ -56,7 +56,7 @@ class PlantedEffectTests(unittest.TestCase):
         metrics = pd.concat(frames)
         macro = {'VIXCLS': _series(days - pd.Timedelta(days=1), vix)}
 
-        report = bc.build_report(metrics, macro)
+        report = bc.build_report(metrics, macro, min_daily_symbols=0)
         rows = {row['line']: row for row in report['conditions']['vix_ge30']['h20']}
 
         self.assertGreater(rows['defense']['lift'], 2.0)
