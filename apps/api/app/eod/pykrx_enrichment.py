@@ -30,6 +30,7 @@ from app.market_data_store import (
 )
 from app.repositories.eod_run_repository import list_eod_collection_runs
 from app.eod.live_progress import daily_pipeline_live_progress
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol, split_symbol_list as _normalize_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -417,21 +418,6 @@ def _current_krx_calendar_date() -> date:
     return datetime.now(ZoneInfo('Asia/Seoul')).date()
 
 
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols or []:
-        text = str(raw_symbol or '').strip().upper()
-        if not text:
-            continue
-        symbol = text.zfill(6) if text.isdigit() else text
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        normalized.append(symbol)
-    return normalized
-
-
 def _normalize_markets(markets: Sequence[str] | None) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -646,11 +632,6 @@ def _has_valuation_snapshot_payload(rows: Sequence[dict[str, Any]]) -> bool:
         if any(payload.get(key) is not None for key in VALUATION_SNAPSHOT_REQUIRED_METRIC_KEYS):
             return True
     return False
-
-
-def _normalize_symbol(value: Any) -> str:
-    text = str(value or '').strip().upper()
-    return text.zfill(6) if text.isdigit() else text
 
 
 def _symbol_membership_sha256(symbols: Sequence[str] | set[str]) -> str:
