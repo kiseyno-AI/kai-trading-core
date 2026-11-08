@@ -54,6 +54,7 @@
 - `GET /broker/kis/intraday-snapshots?symbols=005930,000660&limit=100`
 - `GET /external/news/health`
 - `GET /external/news/market/topics`
+- `GET /market/business-lines?symbols=005930,329180`
 - `POST /external/news/market/collect?topics=line_hbm&pages=1`
 - `GET /external/news/market?topics=line_hbm&as_of=...&limit=50`
 - `POST /external/news/collect?symbols=005930,000660&display=5`

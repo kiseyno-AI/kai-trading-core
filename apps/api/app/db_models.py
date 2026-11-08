@@ -3141,3 +3141,29 @@ class MarketNewsItem(Base, TimestampMixin):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class SymbolIndustryProfile(Base, TimestampMixin):
+    """Industry and business line of one symbol from ``effective_from`` on.
+
+    A new row is written only when the KSIC code or business line changes,
+    so past dates can be classified with what was known then.
+    """
+
+    __tablename__ = 'symbol_industry_profiles'
+    __table_args__ = (
+        UniqueConstraint('symbol', 'effective_from', name='uq_symbol_industry_profiles_symbol_from'),
+        Index('ix_symbol_industry_profiles_business_line', 'business_line'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    corp_code: Mapped[str | None] = mapped_column(String(16))
+    corp_name: Mapped[str | None] = mapped_column(String(255))
+    ksic_code: Mapped[str | None] = mapped_column(String(16))
+    krx_sector: Mapped[str | None] = mapped_column(String(64))
+    business_line: Mapped[str] = mapped_column(String(64), nullable=False)
+    line_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSON)
