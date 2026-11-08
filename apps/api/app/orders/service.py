@@ -1637,7 +1637,7 @@ class TradingOrderService:
             }
 
         append_result = append_broker_order_event(event)
-        refreshed_row = upsert_broker_order(desired_order)
+        refreshed_row = upsert_broker_order(desired_order, observed_at=now)
         local_after = self._build_order_state_snapshot(refreshed_row)
         missing_fill_detail_after = self._has_missing_fill_detail(refreshed_row)
         repair_applied = broker_truth_found and bool(mismatch_reasons)

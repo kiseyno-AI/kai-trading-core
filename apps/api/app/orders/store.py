@@ -414,8 +414,11 @@ def load_order_request(
         return _serialize_order_request(row)
 
 
-def upsert_broker_order(snapshot: dict[str, Any]) -> dict[str, Any]:
+def upsert_broker_order(
+    snapshot: dict[str, Any], *, observed_at: datetime | None = None,
+) -> dict[str, Any]:
     now = _now_utc()
+    observed_at = _normalize_datetime(observed_at, field='observed_at')
     broker_name = _normalize_required_text(snapshot.get('broker_name') or 'kis', field='broker_name', lowercase=True)
     account_reference = _normalize_required_text(snapshot.get('account_reference'), field='account_reference')
     client_order_id = _normalize_required_text(snapshot.get('client_order_id'), field='client_order_id')
@@ -429,6 +432,10 @@ def upsert_broker_order(snapshot: dict[str, Any]) -> dict[str, Any]:
             client_order_id=client_order_id,
             broker_order_id=external_broker_order_id,
         )
+        if row is not None and observed_at is not None:
+            session.refresh(row, with_for_update=True)
+            if row.last_broker_update_at is not None and row.last_broker_update_at > observed_at:
+                return _serialize_broker_order(row)
         if row is None:
             row = BrokerOrder(
                 order_request_id=snapshot.get('order_request_id'),

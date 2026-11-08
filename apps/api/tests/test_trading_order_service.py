@@ -355,9 +355,9 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         fill_at = datetime.now(timezone.utc) + timedelta(seconds=1)
         injected = False
 
-        def save_with_concurrent_fill(snapshot):
+        def save_with_concurrent_fill(snapshot, **kwargs):
             nonlocal injected
-            saved = upsert_broker_order(snapshot)
+            saved = upsert_broker_order(snapshot, **kwargs)
             if not injected and 'last_reconciled_at' not in snapshot:
                 injected = True
                 append_broker_order_event({
@@ -390,6 +390,47 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['order']['last_fill_at'], fill_at)
         self.assertEqual(result['order']['raw_latest_payload'], {'notice': 'newer fill'})
         self.assertIsNotNone(result['order']['last_reconciled_at'])
+
+    async def test_refresh_does_not_overwrite_a_fill_received_during_inquiry(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.daily_fill_result['output1'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'ord_qty': '10',
+            'tot_ccld_qty': '4', 'rmn_qty': '6', 'avg_prvs': '70100',
+        }]
+        fill_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+        async def receive_fill_during_inquiry(**kwargs):
+            append_broker_order_event({
+                'account_reference': self.account_reference,
+                'client_order_id': self.client_order_id,
+                'event_type': 'fill', 'source': 'ws_notice',
+                'event_dedup_key': f'inquiry-fill:{self.client_order_id}',
+                'event_occurred_at': fill_at, 'resulting_status': 'filled',
+                'cumulative_filled_quantity': Decimal('10'),
+                'remaining_quantity': Decimal('0'),
+                'fill_price': Decimal('70200'),
+                'average_fill_price': Decimal('70160'),
+                'raw_payload': {'notice': 'fill during inquiry'},
+                'normalized_payload': {'status': 'filled'},
+            })
+            return self.fake_client.cancelable_result
+
+        with patch.object(
+            self.fake_client, 'fetch_domestic_cancelable_orders',
+            side_effect=receive_fill_during_inquiry,
+        ):
+            result = await self.service.get_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                refresh=True,
+            )
+
+        self.assertEqual(result['order']['current_status'], 'filled')
+        self.assertEqual(result['order']['filled_quantity'], Decimal('10'))
+        self.assertEqual(result['order']['remaining_quantity'], Decimal('0'))
+        self.assertEqual(result['order']['average_fill_price'], Decimal('70160'))
+        self.assertEqual(result['order']['last_fill_at'], fill_at)
+        self.assertEqual(result['order']['raw_latest_payload'], {'notice': 'fill during inquiry'})
 
     async def test_refresh_ignores_unrelated_orders_with_self_referencing_origin_ids(self) -> None:
         await self._submit_buy_order()
