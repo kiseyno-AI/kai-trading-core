@@ -1,0 +1,32 @@
+name: Agent rules guard
+
+# Applies to automation-authored branches only. Human edits of the contracts go through
+# normal review. The guard that runs is the copy on the BASE branch, so a PR cannot
+# weaken the guard that judges it.
+
+on:
+  pull_request:
+    paths:
+      - 'runtime_contracts/**'
+      - 'agent_rules/**'
+      - 'scripts/agent_rules_guard.py'
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    if: startsWith(github.head_ref, 'bot/agent-rules-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run the base branch's guard against this PR
+        run: |
+          git show "origin/${{ github.base_ref }}:scripts/agent_rules_guard.py" > "$RUNNER_TEMP/agent_rules_guard.py"
+          python "$RUNNER_TEMP/agent_rules_guard.py" --base "origin/${{ github.base_ref }}"

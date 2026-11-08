@@ -94,3 +94,8 @@ State data-quality failures only in caller-authorized fields. Advisory lane-spec
 - For `reject`, also use `entry_price_basis=next_open` only as a non-executable schema placeholder and keep trigger/chase levels null with empty trigger conditions.
 - Never use `entry_price_basis=trigger_limit` unless `trigger_price`, `chase_limit_price`, `target_price`, and `stop_loss_price` are all complete, positive, and coherent. If any price is unsupported, return `reject` instead of inventing a level.
 - `expected_return_pct` must be positive and coherent for `buy`; for a `trigger_limit` buy it must not exceed the conservative target upside measured from `chase_limit_price` (apart from insignificant rounding tolerance). It may be null for `wait` or `reject` when no supportable return can be calculated. Core independently re-derives executable economics from server-owned references.
+
+## Calibration notes (auto-maintained)
+
+<!-- BEGIN AUTO-CALIBRATION -->
+<!-- END AUTO-CALIBRATION -->
