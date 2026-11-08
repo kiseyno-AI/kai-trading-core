@@ -42,6 +42,30 @@ class FakeDailyPipelineRunStateService:
 
 
 class InternalAPIClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_ascii_bearer_token_is_rejected_without_calling_route(self) -> None:
+        app = FastAPI()
+        app.middleware('http')(audit_and_require_upstream_bearer_token)
+        route_called = False
+
+        @app.post('/protected')
+        async def protected() -> dict:
+            nonlocal route_called
+            route_called = True
+            return {'ok': True}
+
+        with patch.object(settings, 'upstream_bearer_token', 'internal-secret'):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url='http://testserver'
+            ) as client:
+                response = await client.post(
+                    '/protected', headers={b'Authorization': b'Bearer invalid-\xff'}
+                )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers['www-authenticate'], 'Bearer')
+        self.assertEqual(response.json(), {'detail': 'Unauthorized'})
+        self.assertFalse(route_called)
+
     async def test_client_attaches_bearer_token_for_internal_http_calls(self) -> None:
         original_token = settings.upstream_bearer_token
         settings.upstream_bearer_token = 'internal-secret'
