@@ -1,0 +1,353 @@
+{
+  "reviewer": "root",
+  "repository": "core",
+  "review_base": "2ee26af61fe3107797f41c34c174d59b5ab5a651",
+  "local_revision": "b535596f6aa0bc1639b7400f0e145077e33237a9",
+  "note": "Manual full source reads and connected-flow review only; static scans and tests do not imply manual coverage. The full list excludes known earlier partial reads. BOK/FX clients and audit logging tests were fully read earlier but need their exact paths recorded before inclusion.",
+  "coverage": [
+    {
+      "path": "apps/api/app/core/audit_logging.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          587
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1905
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/store.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          814
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/domain.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          85
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/account_scope.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          39
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/kis_realtime_order_notices.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          903
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_trading_order_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          673
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_order_store.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          503
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_kis_realtime_order_notice_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          314
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/main.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          277
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/db.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          261
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/core/numbers.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          37
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/core/app_logging.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          36
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/__init__.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          23
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/monitoring.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          573
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/reconciliation.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          499
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/account_inquiry_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          498
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/brokers/kis/token_cache.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          965
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/brokers/kis/provider.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          11
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_trading.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          552
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_trading_order_reconciliation_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          206
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/brokers/kis/client.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1723
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/core/settings.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          424
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_trading_account_inquiry_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          294
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_database_url.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          42
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/next_open_execution.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          10986
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/db_models.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          3215
+        ]
+      ],
+      "notes": "Full model definitions read, including new market news, industry, and macro/business metrics. No schema changes proposed."
+    },
+    {
+      "path": "apps/api/app/api/routes_agent_context.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          2270
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_crypto.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          77
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_execution_runtime.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          73
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_external_news.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          82
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_favorite_symbols.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          40
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_fx.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          32
+        ]
+      ]
+    }
+  ],
+  "status": "in_progress",
+  "fixed_findings": [
+    {
+      "local_commit": "b535596f6aa0bc1639b7400f0e145077e33237a9",
+      "problem": "Concurrent older broker event replaces a newer committed fill snapshot after evaluating freshness on a stale row.",
+      "change": "Refresh and lock the resolved order before inserting the event and evaluating the existing freshness predicate.",
+      "reproduction": "test_order_store.py::OrderStorePersistenceTests::test_concurrent_older_event_cannot_replace_a_newer_fill_snapshot",
+      "before": "1 failed, 6 deselected; observed quantity4 instead of8 on actual isolated PostgreSQL.",
+      "after": "38 passed, 4 warnings, 5.15s across order store/service/reconciliation/monitoring/realtime notice suites. Core import and diff checks passed.",
+      "independent_review": "exec_runtime_audit read the connected store/caller paths; no change-induced regression found; no separate rerun.",
+      "limit": "Does not change realtime normalization performed before persistence, equal-time ordering rules, or default unguarded snapshot callers."
+    }
+  ]
+}

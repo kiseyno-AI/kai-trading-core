@@ -1,0 +1,29 @@
+{
+  "drawdown": {
+    "period_returns_pct": [
+      -10,
+      5
+    ],
+    "reported_max_drawdown_pct": 0.0,
+    "initial_capital_peak_drawdown_pct": -10
+  },
+  "selection_depends_on_forward_return_availability": {
+    "rank_1_missing_mean_gross_pct": 20.0,
+    "rank_1_zero_mean_gross_pct": 0.0
+  },
+  "same_week_repeated_runs": [
+    {
+      "action": "text_change",
+      "streak": 2
+    }
+  ],
+  "undated_changelog": {
+    "guard_violations": [],
+    "cooldown_last_change_date": null
+  },
+  "later_collision_overrides_first_target": {
+    "first_target": "2026-04-20",
+    "first_stop": "2026-04-22",
+    "reported_path_marker": "collision"
+  }
+}

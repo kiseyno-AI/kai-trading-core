@@ -1,0 +1,1536 @@
+{
+  "reviewer": "core_research_audit",
+  "review_base": "2ee26af61fe3107797f41c34c174d59b5ab5a651",
+  "local_revision": "186b7d2031a88313bde640fc62323dffa7219cbe",
+  "note": "Manual source reads and caller tracing only. Grep/index scans are excluded. Other files are not claimed reviewed. Range numbers reflect this worker revision.",
+  "coverage": [
+    {
+      "path": "apps/api/app/agent_context/weekly_policy_rebind_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          684
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/run_modes.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          41
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/run_state_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          623
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/safe_file.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          253
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_snapshot_validity.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          72
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/roles.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          66
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/evaluation_refresh.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          161
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/analytics/signal_evaluation.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          307
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/analytics/signal_lab.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          366
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/analytics/improvement_findings.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          209
+        ]
+      ]
+    },
+    {
+      "path": "scripts/agent_improvement_run.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          277
+        ]
+      ]
+    },
+    {
+      "path": "scripts/agent_rules_guard.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          158
+        ]
+      ]
+    },
+    {
+      "path": "scripts/run_decider_evaluation_refresh.sh",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          8
+        ]
+      ]
+    },
+    {
+      "path": "scripts/install_decider_evaluation_refresh_launchd.sh",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          28
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/core/test_database_safety.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          80
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/conftest.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          16
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_weekly_policy_rebind_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          516
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_improvement_run.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          367
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_rules_guard.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          142
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_improvement_findings.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          142
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_evaluation_refresh.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          104
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_run_state_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          437
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_run_state_concurrency.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          72
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/retry_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          7058
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_loop_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          7504
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/next_open_execution.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          2785,
+          2815
+        ],
+        [
+          5420,
+          5455
+        ],
+        [
+          5700,
+          5887
+        ],
+        [
+          10815,
+          10850
+        ],
+        [
+          10945,
+          10988
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_agent_context.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1130,
+          1160
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/db.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          170,
+          256
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/db_models.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1724,
+          1865
+        ],
+        [
+          2530,
+          2630
+        ],
+        [
+          2738,
+          2788
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_feedback_retry_cycles.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          135
+        ],
+        [
+          1100,
+          1225
+        ],
+        [
+          2880,
+          3028
+        ],
+        [
+          3110,
+          3288
+        ],
+        [
+          6440,
+          6530
+        ],
+        [
+          6960,
+          7045
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_market_snapshot_store.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          430,
+          453
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_feedback_retry_admission_concurrency.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          99
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/runtime_state.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          485
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/lease_loss_evidence.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          593
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_weekly_learning_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1443
+        ]
+      ]
+    },
+    {
+      "path": "scripts/run_agent_improvement_local.sh",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          54
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_feedback_retry_knowledge_cutoff.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          62
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_signal_decider_policy_races.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          68
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_signal_decider_loop_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1995,
+          2200
+        ],
+        [
+          4650,
+          4925
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/model_identity.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          491
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/feedback_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          700
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/feedback_failure_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          302
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_evaluation_maintenance_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          410
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_signal_decider_evaluation_maintenance_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          279
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/reuse_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          2020
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/response_contract.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1724
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_response_risk_flags.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          54
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/eod/pykrx_pipeline_runner.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          3390,
+          3450
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/eod/price_bar_repair_state.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          4425,
+          4490
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/main.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          90,
+          140
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/internal/ops.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1635,
+          1730
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/market_data_store.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          2450,
+          2555
+        ],
+        [
+          2640,
+          2740
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_reuse_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          850,
+          985
+        ],
+        [
+          1250,
+          1308
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_response_contract.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          281
+        ],
+        [
+          306,
+          381
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/orchestrator.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          8916
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/orchestrator_runtime_helpers.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          745
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/prerequisite_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          697
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/decision_delta.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          697
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_decision_delta_legacy_wait.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          61
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/wait_reason_taxonomy.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          520
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/progress_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1249
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_progress_empty_scope.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          62
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_progress_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          245
+        ],
+        [
+          710,
+          960
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/status_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          351
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/eod_summaries_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          59
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/eod_summaries_store.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          84
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/openclaw_storage_admission.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          66
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/wait_recheck_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          117
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/logging.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          204
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_log_redaction.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          35
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/core/audit_logging.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          240
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/feedback_failure_taxonomy.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          427
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_performance_criteria.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          198
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_feedback_failure_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          298
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/score_context.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          419
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/payload_builder.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          435
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/session_cleanup_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1636
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/orchestrator_helpers.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          2921
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_orchestrator.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          145
+        ],
+        [
+          260,
+          295
+        ],
+        [
+          4235,
+          4290
+        ],
+        [
+          4669,
+          4760
+        ],
+        [
+          5123,
+          5185
+        ],
+        [
+          5195,
+          5265
+        ],
+        [
+          5310,
+          5515
+        ],
+        [
+          6797,
+          6838
+        ],
+        [
+          7000,
+          7407
+        ],
+        [
+          7609,
+          7895
+        ],
+        [
+          12294,
+          12359
+        ],
+        [
+          12000,
+          12310
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_feedback_session_cleanup_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          245
+        ],
+        [
+          420,
+          537
+        ],
+        [
+          1073,
+          1145
+        ],
+        [
+          1206,
+          1276
+        ],
+        [
+          1323,
+          1416
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/read_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          8037
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_envelope.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          670
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/decision_input_quality.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          902
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/derived_contexts.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          716
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_market_context.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          592
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/missing_data_taxonomy.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          683
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/missing_data_report_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          885
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/decider_coverage_report_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          735
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_calendar_review_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          775
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/decider_evaluation_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1597
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_signal_decider_calendar_review_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          476
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/market/snapshot.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          170,
+          290
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_decision_input_quality.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          280
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_calibration_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1640
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/decider_replay_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          2554
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_decider_replay_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          180
+        ],
+        [
+          500,
+          622
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/eligibility.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          2310
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          120
+        ],
+        [
+          265,
+          385
+        ],
+        [
+          475,
+          663
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_agent_context_trajectory_recovery.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          63
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/agent_context/__init__.py",
+      "status": "empty",
+      "line_ranges": []
+    },
+    {
+      "path": "apps/api/app/analytics/__init__.py",
+      "status": "empty",
+      "line_ranges": []
+    },
+    {
+      "path": "apps/api/app/orders/buy_authority_contract.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          252
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/buy_authority_bridge.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          629
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/execution_handoff_contract.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          973
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/exec_integration.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          16330
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_exec_integration_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          360
+        ],
+        [
+          1361,
+          1376
+        ],
+        [
+          2273,
+          2345
+        ],
+        [
+          3600,
+          3726
+        ],
+        [
+          3881,
+          4228
+        ],
+        [
+          5281,
+          5360
+        ],
+        [
+          5822,
+          5940
+        ],
+        [
+          9436,
+          9599
+        ],
+        [
+          9925,
+          10176
+        ],
+        [
+          10401,
+          10501
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/api/routes_trading.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          140,
+          182
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/signal_decider_alignment_gate.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          417
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/signal_decider_performance_gates.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1102
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_next_open_execution_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          148
+        ],
+        [
+          1313,
+          1331
+        ],
+        [
+          1921,
+          2241
+        ],
+        [
+          2538,
+          2958
+        ],
+        [
+          3343,
+          3401
+        ],
+        [
+          4883,
+          5152
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/exec_payload_slimming.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1418
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/signal_decider_execution_outcomes.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1947
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/intraday_auto_sell.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1644
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/app/orders/portfolio_summary_service.py",
+      "status": "full",
+      "line_ranges": [
+        [
+          1,
+          1038
+        ]
+      ]
+    },
+    {
+      "path": "apps/api/tests/test_signal_decider_execution_outcome_service.py",
+      "status": "partial",
+      "line_ranges": [
+        [
+          1,
+          433
+        ],
+        [
+          440,
+          538
+        ]
+      ]
+    }
+  ],
+  "fixed_findings": [
+    {
+      "commit": "8dab40c636de6d03e9dc7155fba67dbd7008bde4",
+      "summary": "Guard now requires a leading valid ISO calendar date in appended automated changelog lines. The undated-changelog case in behavior repro JSON is historical before-fix evidence."
+    },
+    {
+      "commit": "8e59d671bb1006f93d5fe58cfcfb3d60640dae23",
+      "summary": "Malformed generic risk-flag arrays preserve invalid-contract result instead of TypeError. 12 before-fix failures and 64 connected after-fix passes plus app import."
+    },
+    {
+      "commit": "d5155deab351b96c5407194b0d13dd047ad15bdd",
+      "summary": "Decision metadata finite-number guard prevents already-invalid nested upgrade prices crashing response normalization. 149 connected tests + import pass."
+    },
+    {
+      "commit": "d4fc2cd42dc4db25bc082f9d3832edbc472e594d",
+      "summary": "Missing legacy wait reason no longer crashes repeated-WAIT delta comparison. Three before failures; 152 connected tests + import pass."
+    },
+    {
+      "commit": "2defc3d7fc1b4d17d31b469f31b49037813dcb36",
+      "summary": "Progress read preserves explicit empty role scope in result counts and terminal sanitization. 149 connected tests + app import pass."
+    },
+    {
+      "commit": "7d7c639f1d4596752939b04701dd13b7ce633656",
+      "summary": "Raw stringification at feedback log depth limit exposed nested dummy credential; mapping/list temp-log repro and 66 connected tests + smoke pass."
+    },
+    {
+      "commit": "3d8838ca6b418e6ab4fbf38e249d16efd2e458a7",
+      "summary": "Canonical timeout and response-contract failure kinds retain their specific status in grouped summaries. Two before-fix failures; 42 connected tests + app import pass."
+    },
+    {
+      "commit": "7dd158b365913746b79100a89de1389bfa3ac274",
+      "summary": "Subagent batch storage exceptions no longer mark already completed symbols failed. 1 before-fix regression failure; 9 connected subagent tests + app import pass."
+    },
+    {
+      "commit": "c3e2f265961656d5be4573f36aff1904e922ebf6",
+      "summary": "All four read-only SQLite identity/ownership readers explicitly close connections on success and query errors. 2 before-fix regressions; 11 connected tests + app import pass. Disposable local SQLite only."
+    },
+    {
+      "commit": "ddac9fe5eaa4676a4ceb30be21c711a67013e104",
+      "summary": "Role preparation now forwards the existing lease guard before persisting prerequisite failures. Real dispatch regression showed one invalid failure write before fix; 125 connected PostgreSQL tests and import smoke passed."
+    },
+    {
+      "commit": "2f59e2150c4f7e3bb8452abd25cddbe63d402521",
+      "summary": "Malformed list/dict replay schema_version now raises the existing invalid-config ValueError rather than unhashable TypeError before repository access. One before-fix failure; 34 connected replay/internal ops tests and app import pass."
+    },
+    {
+      "commit": "e6853927e1e1f3e2f3337d0611089c7ca73e5a33",
+      "summary": "Open-drive provenance retains turnover baseline coverage instead of overwriting it with current breadth coverage. Only the baseline variable is separated; calculations and admission checks unchanged. Two before-fix failures; 27 connected market-regime/settings tests and app import pass."
+    },
+    {
+      "commit": "acb449eb7e8189c8529e243fdde85e91e1f2582e",
+      "summary": "Trajectory scan and recovery skip decoded scalar/array JSON records instead of raising AttributeError before valid evidence. Twelve before-fix failures; 14 connected local-artifact recovery tests and app import pass. Dictionary event matching, response-id rejection, and valid paths unchanged."
+    },
+    {
+      "commit": "db25cca7e0ef6b3cd361b599311981e00ee3752d",
+      "summary": "Two dispatch recovery calls now respect resolved dry-run before re-sending or activating pending write-ahead plans. Reproduced both unwanted mutations before fix; post-refresh regression also fails when only that guard is removed. 17 connected isolated-PostgreSQL tests passed, 246 deselected; app import and diff check passed. Live recovery, authority synchronization, revocation and strategy predicates unchanged."
+    },
+    {
+      "commit": "065362a8ba44d118dc8d4e0e1e917b1dad218307",
+      "summary": "Runtime activity integer/float parsing now routes OverflowError through the existing invalid-summary outcome instead of aborting empty daily-board construction. One failing before regression; all 33 connected runtime normalization tests passed, including +/-1e309 decoded JSON count fields and a large filled-count integer. Normal arithmetic unchanged; smoke and diff check passed."
+    },
+    {
+      "commit": "186b7d2031a88313bde640fc62323dffa7219cbe",
+      "summary": "Preflight blocker now reads matching plan rows under FOR UPDATE in id order before deciding whether terminal/revocation state must be preserved. Real PostgreSQL interleaving reproduced eligible-to-blocked overwrite after a concurrent submitted-status commit; the concrete case retained submitted execution_status. One before-fix failure; four connected planner/preflight tests and two public dispatch/revocation caller tests pass; smoke/diff check pass. No gate or threshold changes."
+    }
+  ],
+  "confirmed_deferred_findings": [
+    {
+      "path": "apps/api/app/analytics/signal_evaluation.py",
+      "lines": [
+        254,
+        307
+      ],
+      "summary": "Reproduced: returns [-10,5] report drawdown 0 rather than -10 against initial capital; missing forward return for highest-ranked row substitutes next-ranked row. Both change analytical results, so left unchanged under normal-behavior constraint. Evidence: core-research-behavior-repros.json."
+    },
+    {
+      "path": "apps/api/app/analytics/improvement_findings.py",
+      "lines": [
+        41,
+        54
+      ],
+      "summary": "Reproduced: two same-week run IDs produce streak=2 and text_change. Shell normally gates once per ISO week; --force bypasses marker. No change to policy admission. Evidence: core-research-behavior-repros.json."
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_loop_service.py",
+      "summary": "Reproduced: target hit first, then both thresholds hit on a later day, yields path_marker=collision because any-day collision wins. Review/calibration calculation semantics left unchanged. Evidence: core-research-behavior-repros.json."
+    },
+    {
+      "path": "apps/api/app/agent_context/signal_decider_calendar_review_service.py",
+      "summary": "Confirmed disposable-PostgreSQL repro: after two snapshot revisions in one fallback (feedback_id=None) date/symbol/agent cohort, refresh reports one authoritative decision but get_review_date lists both retained materialized reviews. Preserving historical review detail while deduplicating list results changes report cohort semantics; deferred pending root review under behavior-preservation constraint. Evidence: core-calendar-revision-repro.py/.json/.log. This is not evidence of mutable input invalidation: source validity uses the immutable next-open timestamp boundary."
+    },
+    {
+      "path": "apps/api/app/agent_context/decider_replay_service.py",
+      "lines": [
+        1418,
+        1469,
+        1605,
+        1612
+      ],
+      "summary": "Public-service offline reproduction confirms field-predicate validation/evaluation disagreement for single-value values list, path alias, and no-value implicit exists. Each accepted abbreviated form skips zero of one matching trade while its explicit equivalent skips one. Fix changes replay cohort and performance/admission evidence, so deferred under calculation-preservation restriction. Evidence: core-replay-predicate-repro.py/.json/.log."
+    }
+  ],
+  "unconfirmed_or_policy_leads": [
+    {
+      "path": "apps/api/app/analytics/signal_lab.py",
+      "lines": [
+        84,
+        85
+      ],
+      "summary": "Historical loader filters current s.is_active; current-universe semantics may bias historical cohort. No universe changes made."
+    },
+    {
+      "path": "scripts/agent_rules_guard.py",
+      "lines": [
+        32,
+        33
+      ],
+      "summary": "Guard allows 12 lines; agent_rules/POLICY.md says 3 while docs/AGENT_IMPROVEMENT_LOOP.md says 12. Ambiguous policy; no threshold change."
+    },
+    {
+      "path": "apps/api/app/agent_context/payload_builder.py",
+      "lines": [
+        369,
+        420
+      ],
+      "summary": "Historical EOD-run fundamental payload restricts only minimum business year, not an upper as-of filing/capture bound. Called by dispatch_for_eod_run; source-level observation, no fresh data repro. Context-input change deferred."
+    },
+    {
+      "path": "apps/api/app/agent_context/read_service.py",
+      "lines": [
+        1298,
+        1350
+      ],
+      "summary": "Disclosure newer-financial-report count currently includes any report whose receipt ID differs from the current snapshot, without a newer-date check. Source-level observation only; no public-context reproduction yet. Changing agent-input meaning is deferred pending proof."
+    },
+    {
+      "path": "apps/api/app/agent_context/read_service.py",
+      "lines": [
+        2585,
+        2602
+      ],
+      "summary": "Exporter FX keyword it uses substring matching before import-cost keyword matching; utility appears likely to collide. No runtime reproduction yet. This is a strategy/input classification lead, not a behavior-preserving patch."
+    },
+    {
+      "path": "apps/api/app/orders/exec_integration.py",
+      "lines": [
+        2075,
+        2107
+      ],
+      "summary": "Readback revision binding covers plan/row/proof identity but not previously persisted remote state. Concurrent same-generation readbacks might overwrite newer nonterminal/fill display state; terminal monotonic guards exist. No connected interleaving reproduction or authoritative per-endpoint source-time contract established; not a confirmed finding and unchanged."
+    }
+  ],
+  "baseline_interruption_review": {
+    "revision": "2ee26af61fe3107797f41c34c174d59b5ab5a651",
+    "test": "tests/test_agent_context_orchestrator.py::AgentFeedbackOrchestratorTests::test_dispatch_for_symbols_reports_soft_penalized_symbols_without_skipping_them",
+    "status": "Static trace only; no rerun. Test normal path uses fake client/context/feedback/cleanup; real Core DB, runtime RLock, and local logging remain. Truncated full-suite log has no completion or traceback, cause unknown.",
+    "test_ranges": [
+      [
+        4220,
+        4390
+      ],
+      [
+        4669,
+        4718
+      ],
+      [
+        5120,
+        5196
+      ],
+      [
+        5434,
+        5460
+      ],
+      [
+        7761,
+        7845
+      ]
+    ],
+    "baseline_read_paths": [
+      "apps/api/conftest.py",
+      "apps/api/app/agent_context/orchestrator.py",
+      "apps/api/app/agent_context/read_service.py"
+    ],
+    "note": "Baseline ranges separate from current worktree coverage; do not count as current full-file review."
+  },
+  "remaining_assigned_source_inventory": [
+    {
+      "path": "apps/api/app/eod/pykrx_pipeline_runner.py",
+      "total_lines": 7281,
+      "reviewed_ranges": []
+    }
+  ]
+}
