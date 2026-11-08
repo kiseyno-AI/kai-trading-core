@@ -14,6 +14,7 @@ from app.eod.auto_pykrx import (
     RecoveryOnlyScheduleDisposition,
     auto_pykrx_eod_scheduler,
 )
+from app.eod.data_gap_fill import run_if_due as data_gap_fill_run_if_due
 from app.eod.master import refresh_master_if_due
 from app.market.clock import async_get_market_state
 from app.market.snapshot import market_snapshot_service
@@ -22,6 +23,8 @@ from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_serv
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
+from app.market_news.service import market_news_service
+from app.signals.overtime_ranking_capture import capture_overtime_rankings_if_due
 
 logger = logging.getLogger(__name__)
 PREOPEN_EXEC_DISPATCH_TIME_KST = time(8, 0)
@@ -33,6 +36,13 @@ MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(15, 31)
 NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
 OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY = 'signal_decider_exec_dispatch_open_plan'
 BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD = 3
+DAILY_COVERAGE_AUDIT_STEP = 'daily_coverage_audit'
+DAILY_COVERAGE_AUDIT_MIN_INTERVAL = timedelta(hours=1)
+# CLOSED is excluded: the daily pipeline normally runs then, and a table that is
+# still being written would be reported as incomplete.
+DAILY_COVERAGE_AUDIT_MARKET_STATES = frozenset(
+    {'PREOPEN', 'OPEN', 'WEEKEND', 'HOLIDAY'}
+)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
@@ -66,6 +76,9 @@ class EODBackgroundRunner:
         self._last_tick_succeeded_at: datetime | None = None
         self._last_tick_error: dict[str, str] | None = None
         self._tick_count = 0
+        self._last_daily_coverage_audit_at: datetime | None = None
+        self._daily_coverage: dict | None = None
+        self._last_daily_coverage_alert_key: tuple | None = None
 
     def snapshot(self, *, now: datetime | None = None) -> dict:
         current = now or datetime.now(timezone.utc)
@@ -105,6 +118,11 @@ class EODBackgroundRunner:
             'daily_pipeline_enabled': settings.eod_auto_pykrx_enabled,
             'status': status,
             'running': self._running,
+            'daily_coverage': (
+                dict(self._daily_coverage)
+                if self._daily_coverage is not None
+                else None
+            ),
             'task_alive': bool(self._task is not None and not self._task.done()),
             'interval_seconds': self.interval_seconds,
             'started_at': self._started_at.isoformat() if self._started_at else None,
@@ -230,6 +248,86 @@ class EODBackgroundRunner:
             seconds=BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS
         )
 
+    def _daily_coverage_audit_due(
+        self,
+        market: object | None,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if not settings.daily_coverage_audit_enabled or market is None:
+            return False
+        if getattr(market, 'state', None) not in DAILY_COVERAGE_AUDIT_MARKET_STATES:
+            return False
+        if auto_pykrx_eod_scheduler.state.active_task:
+            return False
+        current = now or datetime.now(timezone.utc)
+        if (
+            self._last_daily_coverage_audit_at is not None
+            and current - self._last_daily_coverage_audit_at
+            < DAILY_COVERAGE_AUDIT_MIN_INTERVAL
+        ):
+            return False
+        return True
+
+    def _audit_daily_coverage_sync(self, *, now: datetime | None = None) -> dict | None:
+        """Audit the latest trading day (read-only) and remember/log the outcome."""
+
+        from app.internal.daily_coverage_audit import (
+            load_recent_trade_dates,
+            run_audit,
+        )
+
+        dates = load_recent_trade_dates(1)
+        if not dates:
+            return None
+        report = run_audit(dates)[0]
+        checked_at = now or datetime.now(timezone.utc)
+        problems = [
+            {'table': row['key'], 'rows': row['count'], 'status': row['status']}
+            for row in report['tables']
+            if row['status'] != 'ok'
+        ]
+        self._daily_coverage = {
+            'checked_at': checked_at.isoformat(),
+            'market_date': report['market_date'],
+            'status': report['status'],
+            'price_bar_count': report['baseline_count'],
+            'min_ratio': report['min_ratio'],
+            'problem_tables': problems,
+        }
+        alert_key = (
+            report['market_date'],
+            tuple(sorted(item['table'] for item in problems)),
+        )
+        if report['status'] != 'ok' and alert_key != self._last_daily_coverage_alert_key:
+            logger.warning(
+                'Daily coverage audit: %s has incomplete derived tables '
+                '(price_bars=%s): %s',
+                report['market_date'],
+                report['baseline_count'],
+                ', '.join(
+                    f"{item['table']}={item['rows']}({item['status']})"
+                    for item in problems
+                )
+                or 'no price bars',
+            )
+        self._last_daily_coverage_alert_key = (
+            alert_key if report['status'] != 'ok' else None
+        )
+        return self._daily_coverage
+
+    async def _run_daily_coverage_audit(self) -> None:
+        """Run the audit as a best-effort step that can never abort a tick."""
+
+        self._last_daily_coverage_audit_at = datetime.now(timezone.utc)
+        try:
+            await self._run_blocking_step(
+                DAILY_COVERAGE_AUDIT_STEP,
+                self._audit_daily_coverage_sync,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('Daily coverage audit failed: %s', exc)
+
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
@@ -294,6 +392,21 @@ class EODBackgroundRunner:
             )
             if fail_closed:
                 raise RuntimeError(f'blocking step timed out: {name}')
+        except Exception as exc:
+            # See _run_async_step: only fail-closed steps may abort the tick.
+            if fail_closed:
+                raise
+            self._record_step_failure(name, exc)
+
+    def _start_background_thread_step(self, name: str, func) -> None:
+        """Run a blocking job in a thread without awaiting it; one in flight per name."""
+
+        running = self._blocking_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(asyncio.to_thread(func), name=f'eod-background-blocking:{name}')
+        self._blocking_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_blocking_step(name, completed))
 
     def _finalize_blocking_step(self, name: str, task: asyncio.Task) -> None:
         if self._blocking_step_tasks.get(name) is task:
@@ -356,7 +469,23 @@ class EODBackgroundRunner:
             if fail_closed:
                 raise RuntimeError(f'async step timed out: {name}')
             return False
+        except Exception as exc:
+            # A best-effort step must not abort the rest of the tick (order
+            # reconciliation, protective exits, portfolio refresh). The done
+            # callback has already logged the failure; surface it through the
+            # runner status and let fail-closed steps keep propagating.
+            if fail_closed:
+                raise
+            self._record_step_failure(name, exc)
+            return False
         return task.result() if return_task_result else True
+
+    def _record_step_failure(self, name: str, exc: BaseException) -> None:
+        if self._last_tick_error is None:
+            self._last_tick_error = {
+                'type': type(exc).__name__,
+                'message': f'{name}: {exc}'[:512],
+            }
 
     def _finalize_async_step(self, name: str, task: asyncio.Task) -> None:
         if self._async_step_tasks.get(name) is task:
@@ -453,6 +582,37 @@ class EODBackgroundRunner:
                 exc,
             )
 
+    def _start_market_news_collect_if_due(self) -> None:
+        # Context only: started in the background so a ~20 s collection never
+        # delays a tick's trading steps; one collection in flight at a time.
+        name = 'market_news_collect_if_due'
+        if not settings.market_news_enabled:
+            return
+        running = self._async_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(market_news_service.collect_if_due(), name=f'eod-background-async:{name}')
+        self._async_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
+
+    def _start_overtime_ranking_capture_if_due(self, market: object) -> None:
+        # Read-only after-hours ranking snapshot (17:45-18:30 KST), started in
+        # the background so a slow or failing KIS call never delays or fails
+        # a tick; before the pipeline-active short-circuit so a recovery run
+        # cannot starve it. One capture in flight at a time.
+        name = 'kis_overtime_ranking_capture_if_due'
+        if not settings.background_runner_enabled:
+            return
+        running = self._async_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(
+            capture_overtime_rankings_if_due(market=market),
+            name=f'eod-background-async:{name}',
+        )
+        self._async_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
+
     async def _run_loop(self) -> None:
         live_market_snapshot_loop = asyncio.get_running_loop()
         while self._running:
@@ -464,6 +624,8 @@ class EODBackgroundRunner:
             try:
                 market = await async_get_market_state()
                 await self._run_pending_session_cleanup()
+                self._start_overtime_ranking_capture_if_due(market)
+                self._start_market_news_collect_if_due()
                 pipeline_active = auto_pykrx_eod_scheduler.state.active_task
                 if pipeline_active and market.state not in {'PREOPEN', 'OPEN'}:
                     await asyncio.sleep(self.interval_seconds)
@@ -710,6 +872,18 @@ class EODBackgroundRunner:
                                 trigger=f'background_runner:{market.state.lower()}'
                             ),
                         )
+                        if settings.data_gap_fill_enabled and market.state == 'OPEN':
+                            # Weekday market hours are idle for Core. The job owns its
+                            # schedule, budget and writer fences (docs/DATA_GAP_FILL.md)
+                            # and is report-only unless DATA_GAP_FILL_APPLY is set.
+                            # Started in the background: a budgeted fill can take
+                            # many minutes and must never hold the OPEN tick.
+                            self._start_background_thread_step(
+                                'data_gap_fill_if_due',
+                                data_gap_fill_run_if_due,
+                            )
+                    if self._daily_coverage_audit_due(market):
+                        await self._run_daily_coverage_audit()
             except Exception as exc:
                 tick_failed = True
                 self._last_tick_error = {

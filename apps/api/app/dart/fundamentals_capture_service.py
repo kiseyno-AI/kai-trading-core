@@ -63,6 +63,8 @@ _FILING_CATEGORY_TO_REPORT_CODE = {
 DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_year, 1, 1)
 DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
 DART_NO_DATA_STATUS = '013'
+DART_FILE_NOT_FOUND_STATUS = '014'
+FILE_NOT_FOUND_DAILY_RECHECK_LIMIT = 20
 UNSUPPORTED_CODE_REASON = 'code_unsupported:dart_lookup'
 UPDATED_ENTRIES_PREVIEW_LIMIT = 3
 UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE = 'initial_fundamentals_capture'
@@ -186,6 +188,13 @@ def legacy_cfs_recovery_candidate_manifest_sha256(
     ).hexdigest()
 
 
+def _weekday_index(day: date) -> int:
+    """Monday-Friday count since 0001-01-01 (a Monday); weekends do not advance it."""
+
+    weeks, weekday = divmod(day.toordinal() - 1, 7)
+    return weeks * 5 + min(weekday, 5)
+
+
 def _bounded_missing_probe_codes(
     candidates: list[str],
     *,
@@ -195,9 +204,34 @@ def _bounded_missing_probe_codes(
     if not candidates or probe_limit <= 0:
         return []
     resolved_limit = min(int(probe_limit), len(candidates))
-    rotation_start = (market_date.toordinal() * resolved_limit) % len(candidates)
+    # Rotate by weekday count, not calendar days: the job runs on weekdays,
+    # and a calendar step skips two windows every weekend, which can leave
+    # some candidates unvisited forever (e.g. 7 windows, weekday runs only).
+    rotation_start = (_weekday_index(market_date) * resolved_limit) % len(candidates)
     rotated = candidates[rotation_start:] + candidates[:rotation_start]
     return rotated[:resolved_limit]
+
+
+def _daily_stale_drain_candidate(
+    state: dict[str, Any] | None,
+    *,
+    min_start_date: date,
+) -> bool:
+    """True when the daily check window for this symbol starts before the lookback floor.
+
+    Such symbols used to be skipped every day (``stale_incremental_backfill_deferred``) and
+    only a manual backfill could recover them, so any gap longer than the lookback window
+    stayed open forever. They are now drained a bounded number per day.
+    """
+
+    if not state:
+        return False
+    latest_resolved = _parse_optional_iso_date(
+        state.get('latest_resolved_fundamentals_receipt_date')
+    ) or _parse_optional_iso_date(state.get('latest_fundamentals_receipt_date'))
+    if latest_resolved is None:
+        return False
+    return _date_after(latest_resolved) < min_start_date
 
 
 def _bounded_baseline_repair_codes(
@@ -1003,6 +1037,9 @@ class DartFundamentalsCaptureService:
             or _load_share_issuance_activation_audit
         )
         self.event_timeout_seconds = settings.dart_fundamentals_event_timeout_seconds
+        self.annual_event_timeout_seconds = (
+            settings.dart_fundamentals_annual_event_timeout_seconds
+        )
         self.stale_run_minutes = settings.dart_fundamentals_stale_run_minutes
 
     async def capture_recent_fundamentals(
@@ -1315,6 +1352,7 @@ class DartFundamentalsCaptureService:
                         ),
                     ),
                 )
+                active_timeout_seconds = self.event_timeout_seconds
                 audit_diagnostics: dict[str, Any] | None = None
                 expected_recovery_candidate = (
                     event if legacy_cfs_no_data_recovery else None
@@ -1329,12 +1367,14 @@ class DartFundamentalsCaptureService:
                         event.get('filing_category') == 'annual_report'
                         and '사업보고서' in str(event.get('report_nm') or '')
                     ):
+                        active_timeout_seconds = self.annual_event_timeout_seconds
                         signal_result = await asyncio.wait_for(
                             self.signals_service.capture_signals_for_event(
                                 rcept_no=event['rcept_no'],
                             ),
-                            timeout=self.event_timeout_seconds,
+                            timeout=active_timeout_seconds,
                         )
+                        active_timeout_seconds = self.event_timeout_seconds
                         raw_audit_diagnostics = signal_result.get(
                             'audit_diagnostics'
                         )
@@ -1441,7 +1481,7 @@ class DartFundamentalsCaptureService:
                         success_result['telemetry_warning'] = warning
                 except asyncio.TimeoutError:
                     timeout_message = (
-                        f'Capture timed out after {self.event_timeout_seconds}s '
+                        f'Capture timed out after {active_timeout_seconds}s '
                         f'for event_id={event["id"]} rcept_no={event["rcept_no"]}'
                     )
                     status_write_drift = (
@@ -1583,7 +1623,15 @@ class DartFundamentalsCaptureService:
                         terminal_result['telemetry_warning'] = warning
                 except Exception as exc:
                     error_message = str(exc)
-                    if f'DART fundamentals returned [{DART_NO_DATA_STATUS}]' in error_message:
+                    if (
+                        f'DART fundamentals returned [{DART_NO_DATA_STATUS}]'
+                        in error_message
+                        # The provider no longer serves this filing's document
+                        # (typically an attachment-only amendment), so every
+                        # retry fails identically and leaves permanent debt.
+                        or f'DART request failed [{DART_FILE_NOT_FOUND_STATUS}]'
+                        in error_message
+                    ):
                         capture_status = CAPTURE_STATUS_NO_DATA
                         status_write_drift = (
                             self._mark_event_capture_terminal_if_current(
@@ -2680,7 +2728,17 @@ class DartFundamentalsCaptureService:
             else ('partial' if successful_stock_codes or terminal_not_applicable else 'failed')
         )
         partial_reasons = list(fundamentals_result.get('partial_reasons') or [])
-        if retry_debt_stock_codes and 'share_issuance_scope_incomplete' not in partial_reasons:
+        # Label share-issuance incompleteness only when share issuance is the
+        # cause: fundamentals succeeded but issuance evidence is not ready, or
+        # the corp-code mapping left debt. Fundamentals-only retry debt
+        # already reports its own reason.
+        issuance_retry_debt = {
+            stock_code
+            for stock_code in retry_debt_stock_codes
+            if stock_code in fundamentals_success
+            and stock_code not in issuance_ready
+        } | (set(mapping_retry_debt_stock_codes or []) & selected_stock_code_set)
+        if issuance_retry_debt and 'share_issuance_scope_incomplete' not in partial_reasons:
             partial_reasons.append('share_issuance_scope_incomplete')
         for partial_reason in followup_partial_reasons:
             if partial_reason not in partial_reasons:
@@ -3219,6 +3277,25 @@ class DartFundamentalsCaptureService:
             if not initial_backfill_enabled
             else []
         )
+        stale_drain_limit = max(
+            0,
+            int(getattr(settings, 'dart_fundamentals_daily_stale_drain_limit', 100) or 0),
+        )
+        stale_drain_candidates = sorted(
+            stock_code
+            for stock_code in selected_stock_codes
+            if _daily_stale_drain_candidate(
+                states.get(stock_code),
+                min_start_date=daily_incremental_min_start_date,
+            )
+        )
+        bounded_stale_drain_codes = set(
+            _bounded_missing_probe_codes(
+                stale_drain_candidates,
+                probe_limit=stale_drain_limit,
+                market_date=resolved_market_date,
+            )
+        )
         run_metadata: dict[str, Any] = {
             'scope': 'daily_incremental_fundamentals_refresh',
             'market_date': resolved_market_date.isoformat(),
@@ -3233,6 +3310,10 @@ class DartFundamentalsCaptureService:
             'bounded_missing_symbol_probe_limit': missing_probe_limit,
             'bounded_missing_symbol_probe_count': len(bounded_missing_probe_codes),
             'bounded_missing_symbol_probe_sample': _limited_sample(sorted(bounded_missing_probe_codes)),
+            'bounded_stale_drain_limit': stale_drain_limit,
+            'bounded_stale_drain_candidate_count': len(stale_drain_candidates),
+            'bounded_stale_drain_count': len(bounded_stale_drain_codes),
+            'bounded_stale_drain_sample': _limited_sample(sorted(bounded_stale_drain_codes)),
             'retry_cycles_requested': resolved_retry_cycles,
             'scope_outcome_manifest_version': (
                 'dart_fundamentals_scope_outcomes_v1'
@@ -3438,7 +3519,10 @@ class DartFundamentalsCaptureService:
                     symbol_result['state'] = 'missing_recent_probe_deferred'
                     symbol_result['deferred_until_bounded_probe'] = True
                     continue
-                if check_start_date < daily_incremental_min_start_date:
+                if (
+                    check_start_date < daily_incremental_min_start_date
+                    and stock_code not in bounded_stale_drain_codes
+                ):
                     symbol_result['state'] = 'stale_incremental_backfill_deferred'
                     symbol_result['deferred_until_backfill'] = True
                     symbol_result['daily_incremental_min_start_date'] = daily_incremental_min_start_date.isoformat()
@@ -3653,6 +3737,22 @@ class DartFundamentalsCaptureService:
                 )
             else:
                 has_more_candidate_events = False
+
+            # [014] file-not-found events count as resolved, so the date
+            # window above never reaches them again; pull due rechecks for
+            # the selected symbols directly, inside the same capture limit.
+            list_rechecks = getattr(self.repository, 'list_file_not_found_rechecks', None)
+            recheck_room = (
+                FILE_NOT_FOUND_DAILY_RECHECK_LIMIT
+                if capture_limit is None
+                else min(FILE_NOT_FOUND_DAILY_RECHECK_LIMIT, capture_limit - len(candidate_events))
+            )
+            if list_rechecks is not None and recheck_room > 0:
+                known_ids = {int(event['id']) for event in candidate_events}
+                for event in list_rechecks(stock_codes=selected_stock_codes, limit=recheck_room):
+                    if int(event['id']) not in known_ids:
+                        candidate_events.append(event)
+                        known_ids.add(int(event['id']))
 
             events_detected = len(candidate_events)
             candidate_event_ids = [int(event['id']) for event in candidate_events]

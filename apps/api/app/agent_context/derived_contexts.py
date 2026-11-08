@@ -15,6 +15,7 @@ from app.market_data_store import (
 from app.eod.market_membership import market_membership_sha256
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.core.numbers import finite_float as _to_float
 
 
 SIGNAL_PARTICIPATION_SOURCES: tuple[tuple[str, str, str], ...] = (
@@ -31,16 +32,6 @@ PRICE_CONTEXT_ROW_LOCAL_ERRORS = (
     TypeError,
     ValueError,
 )
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
 
 
 def _to_int(value: Any) -> int | None:

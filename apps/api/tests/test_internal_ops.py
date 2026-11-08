@@ -2260,9 +2260,12 @@ class InternalOpsTests(unittest.TestCase):
             )
 
         bootstrap_runtime.assert_called_once_with()
+        # Grading reads snapshots and later price bars only, so the gate is
+        # price-derived readiness rather than the full feedback set.
         inspect_prerequisites.assert_called_once_with(
             market_date='2026-04-30',
             symbols=['005930', '000660'],
+            required_stage_ids=('technical_snapshots',),
         )
         self.assertEqual(result, {'summary': {'evaluations_upserted': 4}})
         self.assertEqual(compute_evaluations.call_args.kwargs['as_of_market_date'], '2026-04-30')
