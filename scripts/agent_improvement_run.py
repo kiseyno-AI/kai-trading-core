@@ -50,7 +50,7 @@ def split_findings(findings: Sequence[Mapping[str, Any]]):
         if f.get('action') != 'code_issue':
             continue
         key = (f['rule'], f['signal'])  # one issue per signal; the strongest horizon represents it
-        if key not in issues or (f.get('evidence') or {}).get('t_hac', 0) ** 2 > (issues[key].get('evidence') or {}).get('t_hac', 0) ** 2:
+        if key not in issues or ((f.get('evidence') or {}).get('t_hac') or 0) ** 2 > ((issues[key].get('evidence') or {}).get('t_hac') or 0) ** 2:
             issues[key] = f
     return list(text), list(issues.values())
 

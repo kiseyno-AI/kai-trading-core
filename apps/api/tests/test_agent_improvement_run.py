@@ -60,6 +60,15 @@ class SelectionTests(unittest.TestCase):
         _, issues = run.split_findings([weaker, ISSUE])
         self.assertEqual([f['id'] for f in issues], [ISSUE['id']])
 
+    def test_issue_selection_accepts_null_significance_from_a_report(self) -> None:
+        unknown = {**ISSUE, 'horizon': 1, 'evidence': {**ISSUE['evidence'], 't_hac': None}}
+        for findings in ([unknown, ISSUE], [ISSUE, unknown]):
+            with self.subTest(findings=findings):
+                _, issues = run.split_findings(findings)
+                self.assertEqual(issues, [ISSUE])
+        _, issues = run.split_findings([unknown, {**unknown, 'horizon': 10}])
+        self.assertEqual(issues, [unknown])
+
     def test_at_most_one_text_change_per_agent_per_run(self) -> None:
         other = {**TEXT, 'id': 'persistent_no_skill:signal_decider_conf|5', 'rule': 'persistent_no_skill'}
         chosen = run.cap_text_changes([TEXT, other])
