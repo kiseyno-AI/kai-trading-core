@@ -47,6 +47,8 @@ def _to_decimal(value: Any, *, field: str, positive: bool = False) -> Decimal:
         normalized = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
         raise TradingAccountInquiryValidationError(f'{field} must be numeric') from exc
+    if not normalized.is_finite():
+        raise TradingAccountInquiryValidationError(f'{field} must be finite')
     if positive and normalized <= Decimal('0'):
         raise TradingAccountInquiryValidationError(f'{field} must be greater than zero')
     return normalized
