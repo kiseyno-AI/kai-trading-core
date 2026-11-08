@@ -141,6 +141,38 @@ def _ready_schema_inspector(
 
 
 class DeployHygieneTests(unittest.TestCase):
+    def test_smoke_check_reports_nonobject_json_for_every_endpoint(self) -> None:
+        report, exit_code = deploy_hygiene.collect_deploy_smoke_check(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])),
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(len(report['checks']), 4)
+        self.assertTrue(all(not check['ok'] for check in report['checks'].values()))
+
+    def test_smoke_health_requires_a_boolean_database_connection_status(self) -> None:
+        for connected in ('false', 'true', 1, ['true'], {'value': True}):
+            with self.subTest(connected=connected):
+                report, exit_code = deploy_hygiene.collect_deploy_smoke_check(
+                    transport=httpx.MockTransport(lambda request: httpx.Response(
+                        200, json={'status': 'ok', 'database': {'connected': connected}},
+                    )),
+                )
+
+                self.assertEqual(exit_code, 1)
+                self.assertFalse(report['checks']['health']['ok'])
+
+    def test_smoke_health_reports_a_malformed_database_object(self) -> None:
+        report, exit_code = deploy_hygiene.collect_deploy_smoke_check(
+            transport=httpx.MockTransport(lambda request: httpx.Response(
+                200, json={'status': 'ok', 'database': ['connected']},
+            )),
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report['checks']['health']['ok'])
+        self.assertEqual(len(report['checks']), 4)
+
     def test_schema_preflight_rejects_partial_unique_index_for_full_upsert_key(self) -> None:
         inspector = _ready_schema_inspector()
         original_indexes = inspector.get_indexes.side_effect
