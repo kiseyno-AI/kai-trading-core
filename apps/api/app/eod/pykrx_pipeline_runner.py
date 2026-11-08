@@ -60,8 +60,12 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_krx_symbol_sequence(
-    values: Sequence[Any],
+    values: Sequence[Any] | None,
 ) -> list[str] | None:
+    if values is None or isinstance(values, (str, bytes)):
+        # An absent or non-sequence scope is not a proven invocation; fail
+        # closed instead of raising TypeError inside scope validation.
+        return None
     normalized: list[str] = []
     for value in values:
         stock_code = normalize_krx_short_code(value)

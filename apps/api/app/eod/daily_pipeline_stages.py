@@ -8166,9 +8166,24 @@ class DailyPipelineStageService:
                 ),
                 atomic_finalization=True,
             )
+            price_scope_invocation = exact_scope_symbols or symbols
+            if price_scope_invocation is None:
+                # Unscoped operator run (e.g. eod-pipeline-run without
+                # --symbols and without price_collection in the same run):
+                # validate against the universe the context rebuild itself
+                # selected, the same rule _combine_technical_scope_outcomes
+                # applies below. A missing manifest still fails closed.
+                selected_context_codes = price_context_result.get(
+                    'selected_stock_codes'
+                )
+                price_scope_invocation = (
+                    selected_context_codes
+                    if isinstance(selected_context_codes, list)
+                    else []
+                )
             price_scope = _validated_exact_scope_outcome(
                 result=price_context_result,
-                invocation_symbols=exact_scope_symbols or symbols,
+                invocation_symbols=price_scope_invocation,
                 status=self._resolve_result_status(price_context_result),
             )
             price_context_successes = (
