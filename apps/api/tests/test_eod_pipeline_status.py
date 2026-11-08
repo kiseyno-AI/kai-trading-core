@@ -2256,7 +2256,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'requested_scope_rows_complete',
         )
 
-    def test_requested_scope_completion_isolates_pending_full_universe_factor_debt(self):
+    def test_requested_scope_completion_isolates_pending_exact_success_cohort(self):
         service = EODPipelineStatusService(
             row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
                 requested_count=2,
@@ -2279,7 +2279,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     'gate_reason': 'missing_rows_intersect_exact_run_universe',
                     'rows_persisted': 2,
                     'expected_rows': 4,
-                    'blocking_stages': ['pykrx_enrichment'],
+                    'blocking_stages': [],
                     'failed_blocking_stages': [],
                     'exact_universe_coverage': _scope_gap_evidence(
                         requested_count=4,
@@ -2304,6 +2304,98 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             stage['details']['gate_reason'],
             'requested_scope_rows_complete',
         )
+
+    def test_requested_scope_does_not_isolate_nonfailed_blocking_dependency(self):
+        service = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                requested_count=1,
+                present_count=1,
+                decision_ready_count=1,
+                decision_degraded_count=0,
+                quality_status='complete',
+            ),
+        )
+        price_stage = {
+            'status': 'completed',
+            'gate_status': 'ready',
+            'blocking_status': 'non_blocking',
+            'total': 2,
+            'succeeded': 2,
+            'details': {},
+        }
+
+        for dependency_status in (
+            'running',
+            'waiting',
+            'blocked',
+            'interrupted',
+            'abandoned',
+        ):
+            with self.subTest(dependency_status=dependency_status):
+                dependency_waiting = dependency_status in {
+                    'running',
+                    'waiting',
+                }
+                pykrx_enrichment_stage = {
+                    'status': dependency_status,
+                    'gate_status': (
+                        'waiting' if dependency_waiting else 'blocked'
+                    ),
+                    'blocking_status': (
+                        'waiting' if dependency_waiting else 'blocking'
+                    ),
+                    'details': {},
+                }
+                stage = service._build_row_count_stage(
+                    stage_id='value_factors',
+                    market_date='2026-11-04',
+                    price_stage=price_stage,
+                    price_rows_persisted=2,
+                    prior_stages={
+                        'price_collection': price_stage,
+                        'pykrx_enrichment': pykrx_enrichment_stage,
+                    },
+                    aggregate={
+                        'persisted': 1,
+                        'decision_ready_count': 1,
+                        'decision_degraded_count': 0,
+                    },
+                    live_symbols_total=2,
+                    feedback_run=None,
+                    scope_symbols=['005930'],
+                )
+                stage = service._apply_exact_universe_coverage_evidence(
+                    stage=stage,
+                    coverage=_scope_gap_evidence(
+                        requested_count=2,
+                        present_count=1,
+                        missing_symbols_sample=['000660'],
+                    ),
+                    expected_count=2,
+                    source_run_id=587,
+                )
+                stage = service._apply_scope_coverage_gate(
+                    stage_id='value_factors',
+                    market_date='2026-11-04',
+                    stage=stage,
+                    scope_symbols=['005930'],
+                )
+
+                self.assertEqual(stage['status'], 'pending')
+                self.assertEqual(stage['gate_status'], 'blocked')
+                self.assertEqual(stage['blocking_status'], 'blocking')
+                self.assertEqual(
+                    stage['details']['blocking_stages'],
+                    ['pykrx_enrichment'],
+                )
+                self.assertEqual(
+                    stage['details']['failed_blocking_stages'],
+                    [],
+                )
+                self.assertEqual(
+                    stage['details']['gate_reason'],
+                    'missing_rows_intersect_exact_run_universe',
+                )
 
     def test_requested_scope_does_not_isolate_pending_failed_dependency(self):
         service = EODPipelineStatusService(
@@ -2817,6 +2909,113 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 scope_symbols=['000660', '005930'],
             )
         )
+
+    def test_pykrx_stored_rows_prove_scope_when_run_has_no_manifest(self):
+        # A past-date operator rerun records no per-symbol outcome manifest;
+        # the scoped stored rows alone must still admit the symbols.
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2,
+            market_count=2,
+            updated_at='2026-11-06T20:31:00+09:00',
+        )
+        run = {
+            'id': 591,
+            'run_metadata': {
+                'stage_progress': {
+                    'pykrx_enrichment': {
+                        'status': 'completed',
+                        'processed': 7,
+                        'total': 7,
+                        'succeeded': 7,
+                        'failed': 0,
+                    }
+                }
+            },
+        }
+        service = EODPipelineStatusService()
+
+        stage = service._build_pykrx_enrichment_stage(
+            market_date='2026-11-06',
+            coverage=coverage,
+            run=run,
+            scope_symbols=['000080', '000810'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['blocking_status'], 'non_blocking')
+        scope = stage['details']['requested_scope_coverage']
+        self.assertTrue(scope['authoritative'])
+        self.assertEqual(scope['evidence_source'], 'stored_rows')
+        self.assertEqual(scope['missing_count'], 0)
+        self.assertTrue(
+            service._dependency_is_ready_for_scope(
+                stage=stage,
+                scope_symbols=['000080', '000810'],
+            )
+        )
+
+    def test_pykrx_stored_rows_never_override_an_existing_manifest(self):
+        # Review case: the latest run marks 005930 as retry debt. Requesting
+        # it together with a symbol the manifest does not list used to fall
+        # back to stored rows and turn both ready.
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2,
+            market_count=2,
+            updated_at='2026-11-06T20:31:00+09:00',
+        )
+        run = {
+            'id': 600,
+            'run_metadata': {
+                'stage_progress': {
+                    'pykrx_enrichment': {
+                        'status': 'partial',
+                        'scope_outcome_manifest_version': 'pykrx_enrichment_scope_outcomes_v1',
+                        'selected_stock_codes': ['005930', '000660'],
+                        'successful_stock_codes': ['000660'],
+                        'retry_debt_stock_codes': ['005930'],
+                        'terminal_not_applicable_stock_codes': [],
+                        'scope_outcome_manifest': [
+                            {'stock_code': '000660', 'outcome': 'success'},
+                            {'stock_code': '005930', 'outcome': 'retry_debt'},
+                        ],
+                    }
+                }
+            },
+        }
+        service = EODPipelineStatusService()
+
+        for scope in (['005930'], ['005930', '035420']):
+            with self.subTest(scope=scope):
+                stage = service._build_pykrx_enrichment_stage(
+                    market_date='2026-11-06', coverage=coverage, run=run, scope_symbols=scope
+                )
+                self.assertEqual(stage['gate_status'], 'blocked')
+                self.assertNotEqual(
+                    stage['details']['requested_scope_coverage']['evidence_source'], 'stored_rows'
+                )
+
+    def test_pykrx_stored_rows_missing_one_symbol_row_stay_blocked(self):
+        coverage = _full_pykrx_enrichment_coverage(
+            symbol_count=2,
+            market_count=2,
+            updated_at='2026-11-06T20:31:00+09:00',
+        )
+        coverage['categories']['short_selling'].update(
+            {'present_rows': 1, 'coverage_status': 'partial'}
+        )
+        service = EODPipelineStatusService()
+
+        stage = service._build_pykrx_enrichment_stage(
+            market_date='2026-11-06',
+            coverage=coverage,
+            scope_symbols=['000080', '000810'],
+        )
+
+        self.assertEqual(stage['gate_status'], 'blocked')
+        scope = stage['details']['requested_scope_coverage']
+        self.assertFalse(scope['authoritative'])
+        self.assertIsNone(scope['evidence_source'])
+        self.assertEqual(scope['missing_count'], 2)
 
     def test_pykrx_exact_success_scope_isolates_symbol_only_global_gap(self):
         coverage = _full_pykrx_enrichment_coverage(
@@ -4414,6 +4613,173 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertIn('daily_pipeline_runs.market_date =', where_sql)
         self.assertIn('daily_pipeline_stage_runs.market_date =', where_sql)
         self.assertIn('daily_pipeline_stage_runs.stage_id IN', where_sql)
+
+    @staticmethod
+    def _pitr_safe_skip(stage_id: str, market_date: str) -> dict:
+        return {
+            'triggered': False,
+            'skipped': True,
+            'safe_skip': True,
+            'status': 'skipped',
+            'reason': 'point_in_time_recovery_current_only_stage',
+            'market_date': market_date,
+            'stage': stage_id,
+        }
+
+    def test_stage_history_prefers_older_evidence_over_a_newer_past_date_safe_skip(self):
+        # Regression: an operator subset run for a past date safe-skips
+        # current-only stages; that newer record replaced the date's real
+        # DART outcome and blocked the agent prerequisite gate.
+        market_date = '2026-11-06'
+        skip_row = SimpleNamespace(
+            stage_id='fundamentals_daily_refresh',
+            details={'result_summary': self._pitr_safe_skip('fundamentals_daily_refresh', market_date)},
+            marker='skip',
+        )
+        evidence_row = SimpleNamespace(
+            stage_id='fundamentals_daily_refresh',
+            details={'result_summary': {'status': 'partial', 'reason': None}},
+            marker='evidence',
+        )
+        only_skip_row = SimpleNamespace(
+            stage_id='signal_features',
+            details={'result_summary': self._pitr_safe_skip('signal_features', market_date)},
+            marker='only-skip',
+        )
+        newer_run, older_run = SimpleNamespace(id=630), SimpleNamespace(id=619)
+
+        class _Result:
+            def all(self):
+                return [(newer_run, skip_row), (newer_run, only_skip_row), (older_run, evidence_row)]
+
+        class _Session:
+            def execute(self, statement):
+                return _Result()
+
+        @contextmanager
+        def _session_scope():
+            yield _Session()
+
+        with (
+            patch('app.eod.pipeline_status.session_scope', _session_scope),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_run',
+                side_effect=lambda row: {'id': row.id},
+            ),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_stage',
+                side_effect=lambda row: {'marker': row.marker},
+            ),
+        ):
+            result = _load_daily_pipeline_stage_history(market_date=market_date)
+
+        self.assertEqual(result['fundamentals_daily_refresh']['run'], {'id': 619})
+        self.assertEqual(result['fundamentals_daily_refresh']['stage'], {'marker': 'evidence'})
+        # With nothing better, the safe-skip is still reported.
+        self.assertEqual(result['signal_features']['stage'], {'marker': 'only-skip'})
+
+    def _history_for(self, rows):
+        class _Result:
+            def all(self):
+                return rows
+
+        class _Session:
+            def execute(self, statement):
+                return _Result()
+
+        @contextmanager
+        def _session_scope():
+            yield _Session()
+
+        with (
+            patch('app.eod.pipeline_status.session_scope', _session_scope),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_run',
+                side_effect=lambda row: {'id': row.id},
+            ),
+            patch(
+                'app.eod.pipeline_status.daily_pipeline_run_state_service._serialize_stage',
+                side_effect=lambda row: {'marker': row.marker},
+            ),
+        ):
+            return _load_daily_pipeline_stage_history(market_date='2026-11-06')
+
+    def test_operator_run_blocked_or_skipped_stage_does_not_hide_earlier_evidence(self):
+        # Regression: an `eod-pipeline-run` test run left composite/signal
+        # stages "blocked: declared_dependencies_incomplete" and the agent
+        # gate then ignored the automatic run's real results.
+        operator_run = SimpleNamespace(id=631, trigger='internal_ops_cli')
+        auto_run = SimpleNamespace(id=619, trigger='auto_close_scheduler')
+
+        def row(stage_id, status, marker):
+            return SimpleNamespace(stage_id=stage_id, status=status, details={'result_summary': {'status': status}}, marker=marker)
+
+        result = self._history_for(
+            [
+                (operator_run, row('signal_features', 'blocked', 'operator-blocked')),
+                (operator_run, row('composite_factors', 'skipped', 'operator-skipped')),
+                (operator_run, row('technical_snapshots', 'completed', 'operator-completed')),
+                (auto_run, row('signal_features', 'partial', 'auto-signal')),
+                (auto_run, row('composite_factors', 'partial', 'auto-composite')),
+                (auto_run, row('technical_snapshots', 'completed', 'auto-technical')),
+            ]
+        )
+
+        self.assertEqual(result['signal_features']['stage'], {'marker': 'auto-signal'})
+        self.assertEqual(result['composite_factors']['stage'], {'marker': 'auto-composite'})
+        # Work an operator run actually did still counts as the latest state.
+        self.assertEqual(result['technical_snapshots']['stage'], {'marker': 'operator-completed'})
+
+    def test_automatic_run_blocked_stage_still_supersedes(self):
+        newer_auto = SimpleNamespace(id=628, trigger='auto_eod_followup_resume')
+        older_auto = SimpleNamespace(id=619, trigger='auto_close_scheduler')
+        result = self._history_for(
+            [
+                (newer_auto, SimpleNamespace(stage_id='signal_decider', status='blocked', details={}, marker='newer-blocked')),
+                (older_auto, SimpleNamespace(stage_id='signal_decider', status='completed', details={}, marker='older')),
+            ]
+        )
+        self.assertEqual(result['signal_decider']['stage'], {'marker': 'newer-blocked'})
+
+    def test_official_run_overlay_ignores_operator_blocked_stage(self):
+        service = EODPipelineStatusService()
+        fallback = {'status': 'partial', 'details': {'marker': 'evidence'}}
+        overlaid = service._overlay_official_run_stages(
+            stages={'signal_features': fallback},
+            official_run={
+                'id': 631,
+                'trigger': 'internal_ops_cli',
+                'stages': {'signal_features': {'status': 'blocked', 'details': {}}},
+            },
+            market_date='2026-11-06',
+        )
+        self.assertIs(overlaid['signal_features'], fallback)
+
+    def test_official_run_overlay_ignores_a_past_date_safe_skip_stage(self):
+        market_date = '2026-11-06'
+        service = EODPipelineStatusService()
+        fallback = {'status': 'partial', 'details': {'marker': 'evidence'}}
+        official_run = {
+            'id': 630,
+            'stages': {
+                'fundamentals_daily_refresh': {
+                    'status': 'completed',
+                    'details': {
+                        'result_summary': self._pitr_safe_skip(
+                            'fundamentals_daily_refresh', market_date
+                        ),
+                    },
+                },
+            },
+        }
+
+        overlaid = service._overlay_official_run_stages(
+            stages={'fundamentals_daily_refresh': fallback},
+            official_run=official_run,
+            market_date=market_date,
+        )
+
+        self.assertIs(overlaid['fundamentals_daily_refresh'], fallback)
 
     def test_load_latest_pipeline_pykrx_run_is_read_only_for_stale_looking_daily_run(self):
         historical_run = {

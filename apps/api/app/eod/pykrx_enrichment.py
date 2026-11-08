@@ -29,6 +29,8 @@ from app.market_data_store import (
     upsert_daily_pykrx_enrichment_rows,
 )
 from app.repositories.eod_run_repository import list_eod_collection_runs
+from app.eod.live_progress import daily_pipeline_live_progress
+from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol, split_symbol_list as _normalize_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -416,21 +418,6 @@ def _current_krx_calendar_date() -> date:
     return datetime.now(ZoneInfo('Asia/Seoul')).date()
 
 
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols or []:
-        text = str(raw_symbol or '').strip().upper()
-        if not text:
-            continue
-        symbol = text.zfill(6) if text.isdigit() else text
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        normalized.append(symbol)
-    return normalized
-
-
 def _normalize_markets(markets: Sequence[str] | None) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -647,11 +634,6 @@ def _has_valuation_snapshot_payload(rows: Sequence[dict[str, Any]]) -> bool:
     return False
 
 
-def _normalize_symbol(value: Any) -> str:
-    text = str(value or '').strip().upper()
-    return text.zfill(6) if text.isdigit() else text
-
-
 def _symbol_membership_sha256(symbols: Sequence[str] | set[str]) -> str:
     normalized = sorted({_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)})
     return hashlib.sha256('\n'.join(normalized).encode('utf-8')).hexdigest()
@@ -812,7 +794,14 @@ class PykrxEnrichmentService:
             None if use_full_market_coverage else symbol_filter
         )
 
-        for category in resolved_categories:
+        for category_index, category in enumerate(resolved_categories):
+            daily_pipeline_live_progress.thread_stage_progress(
+                {
+                    'processed': category_index,
+                    'total': len(resolved_categories),
+                    'current_step': f'collect_{category}',
+                }
+            )
             category_rows: list[dict[str, Any]]
             if category == 'sector_classification':
                 category_rows, details = self._collect_sector_classification_rows(

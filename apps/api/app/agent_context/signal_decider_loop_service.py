@@ -50,6 +50,8 @@ from app.db_models import (
 )
 from app.market_data_store import load_daily_bars_for_symbol_range
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
+from app.core.numbers import finite_float as _to_float
+from app.market.symbol_codes import split_symbol_list as _normalize_symbols
 
 DEFAULT_SIGNAL_DECIDER_POLICY_VERSION = 'signal_decider_policy_v1'
 DEFAULT_SHORT_TERM_DECIDER_POLICY_VERSION = 'short_term_decider_contract_v1'
@@ -58,6 +60,11 @@ DEFAULT_SIGNAL_DECIDER_POLICY_CREATED_BY = 'system:bootstrap'
 DEFAULT_SIGNAL_DECIDER_POLICY_ACTIVATION_MODE = 'manual_only'
 DEFAULT_POLICY_CANDIDATE_STATUS = 'generated'
 DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS = 30
+# Evaluations only read stored decision snapshots and the price bars after
+# each decision, so they gate on price-derived readiness instead of the full
+# feedback prerequisite set (DART, Piotroski, factors). The full set kept this
+# stage blocked every day by unrelated partial fundamentals coverage.
+SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS: tuple[str, ...] = ('technical_snapshots',)
 # Keep each transaction deliberately small because signal-decider rows contain
 # large JSON payloads and maintain several indexes. Every chunk is committed by
 # its own session_scope, releasing locks and memory before the next write.
@@ -323,21 +330,6 @@ def _normalize_optional_symbol(value: str | None) -> str | None:
     return normalized or None
 
 
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
-    if not symbols:
-        return []
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols:
-        for piece in (raw_symbol or '').split(','):
-            symbol = piece.strip().upper()
-            if not symbol or symbol in seen:
-                continue
-            seen.add(symbol)
-            normalized.append(symbol)
-    return normalized
-
-
 def _normalize_optional_action_filter(value: str | None) -> str | None:
     if value is None:
         return None
@@ -555,23 +547,6 @@ def _normalize_short_term_action(value: Any) -> str:
 
 def _short_term_generic_action(tactical_action: str) -> str:
     return short_term_tactical_action_to_decision_action(tactical_action) or 'wait'
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value.strip())
-        except ValueError:
-            return None
-    return None
 
 
 def _to_int(value: Any) -> int | None:

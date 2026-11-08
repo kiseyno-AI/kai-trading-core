@@ -47,12 +47,17 @@
 44. BTC/ETH Upbit crypto strategy context read route for paper/research decision support
 
 ## Current routes
+- `GET /health` (application and database liveness; also subject to bearer auth when `UPSTREAM_BEARER_TOKEN` is set)
 - `POST /broker/kis/token` (operator Bearer auth required; sanitized token metadata only)
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930,000660&market_code=J&max_ranking_pages=2&max_news_items=5&include_news=true`
 - `GET /broker/kis/intraday-snapshots?symbols=005930,000660&limit=100`
 - `GET /external/news/health`
+- `GET /external/news/market/topics`
+- `GET /market/business-lines?symbols=005930,329180`
+- `POST /external/news/market/collect?topics=line_hbm&pages=1`
+- `GET /external/news/market?topics=line_hbm&as_of=...&limit=50`
 - `POST /external/news/collect?symbols=005930,000660&display=5`
 - `GET /external/news?symbols=005930,000660&limit=100`
 - `POST /trading/orders/buy`
@@ -104,6 +109,8 @@
 - `DELETE /symbols/favorites/005930`
 - `GET /symbols/005930/price-bars?start_date=2021-04-09&end_date=2026-04-09`
 - `GET /macro/bok/series?series_id=722Y001/0101000&start_period=20240101&end_period=20240131&cycle=D`
+- `GET /macro/ecos/series?stat_code=722Y001&item_code_1=0101000&start_period=20240101&end_period=20240131&cycle=D`
+- `GET /macro/ecos/catalog` (lists the configured ECOS series aliases)
 - `GET /macro/context?as_of_date=YYYY-MM-DD`
 - `POST /macro/context/refresh?force=true`
 - `GET /fx/koreaexim/rates?search_date=20260408&data=AP01`
@@ -122,6 +129,8 @@
 - `GET /eod/status`
 - `GET /eod/freshness`
 - `GET /eod/pipeline/status?market_date=YYYY-MM-DD&fs_div=CFS&include_diagnostics=false&include_feedback_context=false`
+- `GET /eod/pipeline/live?events=40`
+- `GET /eod/pipeline/live/events?since=0&limit=200`
 - `GET /eod/pipeline/stages`
 - `POST /eod/pipeline/run`
 - `POST /eod/master/refresh-if-due?force=false`
@@ -164,6 +173,9 @@
 - `POST /agent-context/feedback`
 - `POST /agent-context/feedback/dispatch`
 - `POST /agent-context/feedback/dispatch/symbols`
+- `POST /agent-context/feedback/dispatch/subagent-experiment` (experimental per-symbol subagent dispatch)
+- `GET /agent-context/feedback/fundamental-summaries?market_date=YYYY-MM-DD&symbol=005930&limit=50`
+- `POST /agent-context/internal/core/control` (operator-only local process control; `port` may only equal the port this API is serving, see the endpoint reference page)
 - `POST /agent-context/feedback/retry-cycles`
 - `POST /agent-context/feedback/rebind/prepare`
 - `POST /agent-context/feedback/followup`
@@ -253,7 +265,7 @@
 ## Macro context notes
 - `GET /macro/context` reads the compact persisted macro context used by agent/decider inputs. `POST /macro/context/refresh` refreshes it on demand and returns per-source status rather than failing the whole request for optional provider gaps.
 - The MVP persists slow-moving observations in `macro_context_observations` with `source`, `series_id`, `observation_period`, `observation_date`, `value`, `fetched_at`, and `source_status`.
-- World Bank indicators are the default no-key source for Korea GDP growth, CPI inflation, and unemployment. FRED is optional and explicitly reports `disabled_missing_api_key` unless `FRED_API_KEY` is configured.
+- World Bank indicators are the default no-key source for Korea GDP growth, CPI inflation, and unemployment. FRED is optional and explicitly reports `disabled_missing_api_key` unless `FRED_API_KEY` is configured. With a key, the default FRED set covers the US/global drivers of Korean equities: USD/KRW (`DEXKOUS`), the effective fed funds rate (`DFF`), 10y/2y Treasury yields and their spread (`DGS10`, `DGS2`, `T10Y2Y`), VIX (`VIXCLS`), the US high-yield spread (`BAMLH0A0HYM2`), WTI (`DCOILWTICO`), US CPI stored as year-over-year percent (`CPIAUCSL`, computed from the observation 12 months earlier) and US unemployment (`UNRATE`). `macro_regime_summary` adds deterministic threshold labels for each (`us_policy_label`, `us_10y_label`, `us_curve_label`, `risk_label`, `credit_label`, `oil_label`, `us_inflation_label`, `us_labor_label`) and a combined `global_risk_label` (`global_risk_off` on VIX >= 30 or HY spread >= 6, `global_risk_caution` on VIX >= 20 or HY >= 4.5, `global_risk_on` on VIX < 15 with HY < 3.5). These FRED labels use only series whose status is `available`; a stale or missing series is `*_unknown` and, if both VIX and the HY spread are unknown, `global_risk_label` is `global_risk_unknown`. Labels are context, not buy/sell signals.
 - External macro/news/research/market/risk source candidates, access requirements, TTL expectations, and direct-signal eligibility live in [docs/EXTERNAL_CONTEXT_SOURCE_CATALOG.md](./EXTERNAL_CONTEXT_SOURCE_CATALOG.md).
 - The daily pipeline stage `macro_context_refresh` runs before agent feedback by default. Upstream failures or missing keys are represented as `partial`, `unavailable`, or disabled source statuses; they must not block the whole daily pipeline.
 - The refresh cooldown is evaluated per configured series. If one series is missing or due while another was fetched recently, Core refreshes only the missing/due series and returns `retry_scope.mode=missing_or_due_series` plus the exact series keys; it skips the whole stage only when every enabled series is still inside its cooldown.
@@ -398,6 +410,7 @@
 
 ## EOD pipeline status notes
 - Canonical semantics live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
+- `GET /eod/pipeline/live` is the DB-free real-time view of the daily pipeline: every run/stage start, per-symbol progress, heartbeat, sub-step and finish is mirrored into Core memory and into `apps/api/var/pipeline-live/current.json` (atomic, ≤1 write/s plus every status change), with milestone events appended to `apps/api/var/log/daily-pipeline-live.jsonl`. It returns this process's memory or the snapshot file when another process (an operator CLI run) is newer, with `percent`, `elapsed_seconds`, `eta_seconds`, `seconds_since_update` and `stale_suspected` computed at read time. `GET /eod/pipeline/live/events?since=<seq>` returns incremental events from this API process. Use it for polling dashboards and agents instead of `GET /eod/pipeline/status`, which reads the database.
 - `GET /eod/pipeline/status` is the operator-facing live status API for the post-close EOD pipeline. Its default read is polling-safe: expensive row-count missing diagnostics, PyKRX enrichment coverage scans, and feedback-run context are omitted unless `include_diagnostics=true` and/or `include_feedback_context=true` is passed.
 - It stays separate from `GET /eod/freshness`: freshness answers whether the stored data is available, while pipeline status answers which stage is running now and what work is currently in progress.
 - The payload now also includes both `market` and `market_session` blocks. `market` reflects the current exchange clock state, while `market_session` reflects the semantics of the requested `market_date`, including the latest valid trading date and whether quote or intraday data should be expected for that date.
