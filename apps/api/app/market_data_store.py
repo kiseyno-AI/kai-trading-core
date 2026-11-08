@@ -4904,6 +4904,58 @@ def load_latest_available_daily_market_risk_snapshot_date(
         return value.isoformat() if value else None
 
 
+def load_symbols_without_recent_trading(
+    *,
+    market_date: str | date,
+    symbols: Sequence[str],
+    lookback_trading_days: int,
+) -> list[str]:
+    """Return symbols whose last ``lookback_trading_days`` sessions all had zero volume.
+
+    The window is the last N distinct trade dates stored on or before
+    ``market_date``.  A symbol only counts when it has a stored bar for every one
+    of those sessions and none of them traded: a symbol with missing bars is a
+    data gap, not evidence of a halt, and a new listing without a full window is
+    never excluded.  Zero-volume bars keep arriving for halted symbols, so the
+    first session with volume ends the exclusion without any manual step.
+    """
+
+    if lookback_trading_days <= 0:
+        raise ValueError('lookback_trading_days must be positive')
+    normalized_date = _normalize_trade_date(market_date)
+    normalized_symbols = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
+    if not normalized_symbols:
+        return []
+    with session_scope() as session:
+        window_dates = list(
+            session.scalars(
+                select(DailyPriceBar.trade_date)
+                .where(DailyPriceBar.trade_date <= normalized_date)
+                .distinct()
+                .order_by(DailyPriceBar.trade_date.desc())
+                .limit(lookback_trading_days)
+            ).all()
+        )
+        if len(window_dates) < lookback_trading_days:
+            return []
+        rows = session.execute(
+            select(Symbol.symbol)
+            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+            .where(
+                Symbol.symbol.in_(normalized_symbols),
+                DailyPriceBar.trade_date.in_(window_dates),
+            )
+            .group_by(Symbol.symbol)
+            .having(
+                func.count(func.distinct(DailyPriceBar.trade_date))
+                == lookback_trading_days,
+                func.max(DailyPriceBar.volume) <= 0,
+            )
+            .order_by(Symbol.symbol)
+        ).all()
+        return [str(row[0]) for row in rows]
+
+
 def load_daily_market_risk_filter_results(
     *,
     market_date: str | date,

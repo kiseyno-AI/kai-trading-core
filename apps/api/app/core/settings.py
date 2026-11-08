@@ -237,6 +237,11 @@ class Settings(BaseSettings):
     # limit below that count left a rotating handful as retry debt each day,
     # so the DART stage was partial every day.
     dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
+    # A symbol with no positive-volume bar over this many consecutive market
+    # sessions is treated as not tradable (trading halt, long suspension,
+    # wind-down) and is kept out of candidate screening. Data collection keeps
+    # running so a resumption clears the exclusion by itself.
+    market_risk_dormant_lookback_trading_days: int = Field(default=10, ge=3, le=60)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
     dart_fundamentals_daily_stale_drain_limit: int = Field(default=100, ge=0, le=500)
 
