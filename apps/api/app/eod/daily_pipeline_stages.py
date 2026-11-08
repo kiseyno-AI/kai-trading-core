@@ -57,6 +57,7 @@ from app.eod.pykrx_backfill import (
     FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
     PYKRX_BACKFILL_SERVICE,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -7474,9 +7475,25 @@ class DailyPipelineStageService:
         call: Callable[[], dict[str, Any]],
         atomic_finalization: bool = False,
     ) -> dict[str, Any]:
+        daily_pipeline_live_progress.publish_substep(
+            step=stage_id,
+            status='running',
+            detail={
+                'scope_symbols': (
+                    len(exact_scope_symbols)
+                    if exact_scope_symbols is not None
+                    else None
+                )
+            },
+        )
         try:
             result = call()
-        except Exception:
+        except Exception as exc:
+            daily_pipeline_live_progress.publish_substep(
+                step=stage_id,
+                status='failed',
+                detail={'error': f'{type(exc).__name__}: {exc}'[:300]},
+            )
             if exact_scope_symbols is not None and not atomic_finalization:
                 DailyPipelineStageService._finalize_exact_scope_or_raise(
                     market_date=market_date,
@@ -7485,6 +7502,16 @@ class DailyPipelineStageService:
                     result=None,
                 )
             raise
+        daily_pipeline_live_progress.publish_substep(
+            step=stage_id,
+            status='completed',
+            result_status=(
+                str(result.get('status') or '')
+                if isinstance(result, dict)
+                else None
+            )
+            or None,
+        )
         if atomic_finalization:
             if exact_scope_symbols is not None:
                 expected_manifest_versions = (
@@ -8176,6 +8203,9 @@ class DailyPipelineStageService:
                     exact_scope_symbols=exact_scope_symbols,
                     source='stage_orchestrator',
                     run_id=run_id,
+                    progress_callback=(
+                        daily_pipeline_live_progress.thread_stage_progress
+                    ),
                 ),
                 atomic_finalization=True,
             )
@@ -8211,6 +8241,9 @@ class DailyPipelineStageService:
                     exact_scope_symbols=exact_scope_symbols,
                     source='stage_orchestrator',
                     run_id=run_id,
+                    progress_callback=(
+                        daily_pipeline_live_progress.thread_stage_progress
+                    ),
                 ),
                 atomic_finalization=True,
             )
@@ -8570,6 +8603,9 @@ class DailyPipelineStageService:
                         symbols=symbols,
                         display=settings.external_news_default_display,
                         symbol_limit=symbol_limit,
+                        progress_callback=(
+                            daily_pipeline_live_progress.thread_stage_progress
+                        ),
                     )
                 ),
             )

@@ -4,7 +4,7 @@ import threading
 import unittest
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from sqlalchemy.exc import IntegrityError
 
@@ -1713,9 +1713,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'run_id': 7,
         }
         rebuild_contexts.assert_called_once_with(**expected_symbol_scope)
-        rebuild_snapshots.assert_called_once_with(**expected_symbol_scope)
+        rebuild_snapshots.assert_called_once_with(
+            **expected_symbol_scope, progress_callback=ANY
+        )
         rebuild_action_summaries.assert_called_once_with(
-            **expected_symbol_scope
+            **expected_symbol_scope,
+            progress_callback=ANY,
         )
         rebuild_trending_ranks.assert_not_called()
 
@@ -2060,6 +2063,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             exact_scope_symbols=None,
             source='stage_orchestrator',
             run_id=None,
+            progress_callback=ANY,
         )
 
     def test_prior_date_recovery_runs_as_of_piotroski_before_factor_chain(
@@ -9652,7 +9656,9 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'run_id': None,
         }
         rebuild_contexts.assert_called_once_with(**expected_scope)
-        rebuild_snapshots.assert_called_once_with(**expected_scope)
+        rebuild_snapshots.assert_called_once_with(
+            **expected_scope, progress_callback=ANY
+        )
         self.assertEqual(result['contexts_persisted'], 2)
         self.assertEqual(result['contexts_failed'], 0)
         self.assertNotIn('items', result['price_contexts'])
@@ -9912,6 +9918,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             exact_scope_symbols=['005930', '000660'],
             source='stage_orchestrator',
             run_id=None,
+            progress_callback=ANY,
         )
         finalize_scope.assert_not_called()
         self.assertEqual(

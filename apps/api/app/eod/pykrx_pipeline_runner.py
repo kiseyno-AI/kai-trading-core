@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
@@ -3827,6 +3828,20 @@ def run_market_data_pipeline(
             current_symbol=current_symbol,
             current_period=current_period,
             extra=metadata_extra,
+        )
+        daily_pipeline_live_progress.publish_collection_progress(
+            eod_run_id=run_id,
+            market_date=latest_trade_date,
+            stage=stage,
+            status=status,
+            current_step=current_step,
+            current_activity=current_activity,
+            processed=processed,
+            total=total,
+            succeeded=succeeded,
+            failed=failed,
+            current_symbol=current_symbol,
+            current_period=current_period,
         )
         try:
             daily_pipeline_tracker.update_stage(

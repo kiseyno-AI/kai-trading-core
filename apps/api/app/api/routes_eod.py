@@ -15,6 +15,7 @@ from app.eod.daily_pipeline_tracking import (
     run_tracked_market_risk_filter,
 )
 from app.eod.freshness import eod_freshness_service
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.master import refresh_master_if_due
 from app.eod.pipeline_status import eod_pipeline_status_service
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
@@ -196,6 +197,28 @@ async def get_eod_screening_results(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'EOD screening result read failed: {exc}') from exc
+
+
+@router.get('/pipeline/live')
+async def get_eod_pipeline_live(
+    events: int = Query(default=40, ge=0, le=200),
+) -> dict:
+    """DB-free live view of the daily pipeline (memory or shared snapshot file)."""
+
+    snapshot = daily_pipeline_live_progress.read_best_snapshot()
+    if events < len(snapshot.get('recent_events') or []):
+        snapshot['recent_events'] = (snapshot.get('recent_events') or [])[-events:] if events else []
+    return snapshot
+
+
+@router.get('/pipeline/live/events')
+async def get_eod_pipeline_live_events(
+    since: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    """Incremental live events after sequence ``since`` (this API process)."""
+
+    return daily_pipeline_live_progress.events_since(since, limit=limit)
 
 
 @router.get('/pipeline/status')
