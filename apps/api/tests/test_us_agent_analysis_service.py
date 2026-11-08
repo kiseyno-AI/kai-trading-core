@@ -260,6 +260,42 @@ class USAgentAnalysisServiceTests(unittest.TestCase):
                 self.assertEqual(saved_contexts[role], sent_context)
                 self.assertNotIn(role, saved_contexts[role]['upstream_agent_feedback'])
 
+    def test_decider_does_not_use_feedback_whose_persistence_failed(self):
+        dispatcher = SessionCapturingDispatcher()
+        saved_roles = []
+
+        def save_feedback(**kwargs):
+            if kwargs['agent_name'] == 'fundamental-summarizer':
+                raise RuntimeError('feedback write failed')
+            saved_roles.append(kwargs['agent_name'])
+            return len(saved_roles)
+
+        service = USAgentAnalysisService(
+            candidate_loader=lambda **kwargs: [_candidate(0)],
+            dispatcher_getter=lambda: dispatcher,
+        )
+        with patch(
+            'app.us_equities.agent_analysis_service.upsert_us_agent_feedback',
+            side_effect=save_feedback,
+        ):
+            result = service.dispatch(
+                market_date=date(2026, 8, 19),
+                collection_run_id=77,
+                roles=['signal-decider'],
+                persist=True,
+            )
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['completed'], 2)
+        self.assertEqual(result['failed'], 2)
+        self.assertEqual(saved_roles, ['eod-summarizer', 'technical-summarizer'])
+        self.assertNotIn('signal-decider', [call['role'] for call in dispatcher.calls])
+        self.assertTrue(any(
+            item['role'] == 'signal-decider'
+            and item['error'] == 'missing_upstream_feedback:fundamental-summarizer'
+            for item in result['failures']
+        ))
+
     def test_ten_thousand_candidates_are_deterministically_bounded_by_role_caps(self):
         rows = [_candidate(index) for index in range(10_000)]
         service = USAgentAnalysisService(candidate_loader=lambda **kwargs: rows)

@@ -470,7 +470,6 @@ class USAgentAnalysisService:
                         )
                     else:
                         for context, symbol, normalized in staged_feedback:
-                            feedback_by_symbol.setdefault(symbol, {})[role] = normalized
                             feedback_id = None
                             if persist:
                                 feedback_id = upsert_us_agent_feedback(
@@ -482,6 +481,7 @@ class USAgentAnalysisService:
                                     response_payload=jsonable_encoder(batch_result),
                                     normalized_feedback_payload=normalized,
                                 )
+                            feedback_by_symbol.setdefault(symbol, {})[role] = normalized
                             completed.append({'role': role, 'symbol': symbol, 'feedback_id': feedback_id})
                 except Exception as exc:
                     failures.extend(
