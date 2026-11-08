@@ -121,6 +121,45 @@ The `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer` suppl
 
 Plan registration and execution activation are separate boundaries. Core validates the destination, persists dispatch intent, sends the plan, stores the accepted ACK identity, and only then follows the activation contract. Later plans, orders, executions, and positions must match the original destination and accepted identifiers. **Core-local next-open BUY candidates are empty in every mode**; disabling Exec handoff does not enable a local buy fallback. The retained direct-order and auto-sell compatibility paths have their own controls. [Handoff evidence](docs/architecture/README.md#execution) · [Direct orders](docs/architecture/README.md#orders) · [Auto-sell](docs/architecture/README.md#auto-sell).
 
+### Daily process, gates, and recovery
+
+The [daily-process catalog](docs/architecture/DAILY_PROCESS.md) traces the implemented KRX day from PREOPEN recovery inspection through EOD evidence, summaries, decisions, next-open planning, and explicit repair closeout. Its timing table shows source defaults; runtime settings and durable admission gates determine whether a stage actually runs.
+
+```mermaid
+flowchart TD
+    M["KRX market state"] --> P["PREOPEN recovery and plan gates"]
+    M --> O["OPEN authority, dispatch and readback"]
+    M --> C["CLOSED or nontrading-day scheduling"]
+    P -->|debt| R["Exact-lineage recovery"]
+    C -->|eligible| E["Price, disclosure and factor pipeline"]
+    R --> E
+    E --> A["Validated summaries and decision lanes"]
+    A --> N["Next-open plan"]
+    N --> P
+    N --> O
+    O --> X["Exec lifecycle"]
+    X --> O
+```
+
+PREOPEN can start recovery for the immediately previous session. Older unresolved debt blocks new buying work, and OPEN starts no such recovery. With a 15:30 close and the default 280-minute buffer, same-day EOD eligibility begins at **20:10 KST**. The optional daytime gap job is disabled by default and remains report-only until writes are enabled separately. [Scheduling and source evidence](docs/architecture/DAILY_PROCESS.md#1-daily-schedule-and-ownership).
+
+```mermaid
+flowchart TD
+    S["Frozen session membership"] --> P["Validated prices and PyKRX evidence"]
+    S --> D["DART refresh and Piotroski admission"]
+    P --> F["Ordered factor follow-up"]
+    D --> F
+    F --> Q["Features and exact outcome proofs"]
+    Q --> A["Summaries and independent decision lanes"]
+    A --> N["Planning with current evidence gates"]
+    N --> H["Persist intent, register, check ACK and activate"]
+    H --> R["Exec readback and reconciliation"]
+```
+
+The second graph summarizes evidence dependencies, not parallel scheduling. Price/PyKRX and DART cohorts are distinct. At the pinned baseline, an empty DART/Piotroski cohort can still suppress the whole factor caller; the in-progress audit reproduced this boundary. The catalog also distinguishes missing data, retryable debt, terminal outcomes, and pending price-repair obligations. [Factor admission](docs/architecture/DAILY_PROCESS.md#5-factor-cohorts-and-downstream-decision-eligibility) · [Recovery](docs/architecture/DAILY_PROCESS.md#7-recovery-preserves-exact-lineage) · [Audited repair](docs/architecture/DAILY_PROCESS.md#9-official-restatement-and-rebuild-obligations).
+
+The [2026-11-08 audit checkpoint](docs/audit/2026-11-08-checkpoint.md) records partial review coverage and test evidence. Application fixes described as local in that checkpoint are not included in this documentation commit; the full audit remains incomplete.
+
 ### Feature diagrams
 
 The complete catalog covers the 18 registered router modules and their 175 route decorators, plus background jobs, research CLIs, and repair tooling. The count excludes `/health` and FastAPI-generated documentation routes. [Router coverage and counting scope](docs/architecture/README.md#http-surface-coverage).
