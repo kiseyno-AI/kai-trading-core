@@ -320,6 +320,7 @@ class AgentContextFeedbackRunStateService:
                         AgentContextFeedbackRun.status == 'running',
                     )
                     .order_by(AgentContextFeedbackRun.started_at.asc(), AgentContextFeedbackRun.id.asc())
+                    .with_for_update(skip_locked=True)
                 )
                 .scalars()
                 .all()
