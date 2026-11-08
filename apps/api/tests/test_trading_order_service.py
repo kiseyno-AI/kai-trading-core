@@ -167,6 +167,27 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
                     persist.assert_not_called()
                     self.assertEqual(self.fake_client.submit_calls, 0)
 
+    async def test_submit_without_broker_identity_remains_unconfirmed_and_is_not_retried(self) -> None:
+        self.fake_client.submit_result = {'rt_cd': '0', 'output': {}}
+
+        with self.assertRaises(TradingOrderPendingSubmissionError):
+            await self._submit_buy_order()
+
+        request = load_order_request(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        order = load_broker_order(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        self.assertEqual(request['submission_status'], 'submitting')
+        self.assertEqual(order['current_status'], 'pending_submit')
+        self.assertIsNone(order['broker_order_id'])
+
+        replay = await self._submit_buy_order()
+
+        self.assertTrue(replay['idempotent_replay'])
+        self.assertEqual(self.fake_client.submit_calls, 1)
+
     async def test_submit_rejection_persists_rejected_state(self) -> None:
         self.fake_client.submit_exception = KISAPIError(
             'KIS request rejected /uapi/domestic-stock/v1/trading/order-cash: rejected',

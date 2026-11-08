@@ -1045,6 +1045,12 @@ class TradingOrderService:
                 condition_price=_decimal_to_text(normalized.condition_price) or '',
             )
             broker_order_id = _normalize_optional_text(_pick_first(response_payload.get('output'), 'ODNO', 'odno'))
+            if broker_order_id is None:
+                raise KISTransportError(
+                    'KIS order response did not confirm a broker order id',
+                    payload=response_payload,
+                    ambiguous_submission=True,
+                )
             forward_orgno = _normalize_optional_text(
                 _pick_first(response_payload.get('output'), 'KRX_FWDG_ORD_ORGNO', 'krx_fwdg_ord_orgno')
             )
