@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from typing import Literal, Optional
 
@@ -33,6 +34,12 @@ class Settings(BaseSettings):
     # price-bar universe (see app/internal/daily_coverage_audit.py). It only logs and
     # reports through the runner snapshot; it never changes pipeline behavior.
     daily_coverage_audit_enabled: bool = True
+    # First market date decided by the current generation of trading agents (personas
+    # and decider contracts replaced on 2026-11-07, #705/#707). Agent-performance
+    # measurements (signal lab agent rows, the postmortem analyst) never pool rows from
+    # before this date with rows after it. Move it forward whenever the agents are
+    # replaced again; leave it unset to pool everything.
+    agent_generation_start_date: Optional[date] = date(2026, 11, 7)
     # Once per finalized session, compare a date-seeded sample of stored daily bars
     # with Naver's regular-session daily chart (one spaced request per sampled symbol)
     # and warn on a price difference (see app/eod/daily_bar_reconciliation.py). Read-only.
