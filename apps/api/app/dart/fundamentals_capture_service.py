@@ -186,6 +186,13 @@ def legacy_cfs_recovery_candidate_manifest_sha256(
     ).hexdigest()
 
 
+def _weekday_index(day: date) -> int:
+    """Monday-Friday count since 0001-01-01 (a Monday); weekends do not advance it."""
+
+    weeks, weekday = divmod(day.toordinal() - 1, 7)
+    return weeks * 5 + min(weekday, 5)
+
+
 def _bounded_missing_probe_codes(
     candidates: list[str],
     *,
@@ -195,7 +202,10 @@ def _bounded_missing_probe_codes(
     if not candidates or probe_limit <= 0:
         return []
     resolved_limit = min(int(probe_limit), len(candidates))
-    rotation_start = (market_date.toordinal() * resolved_limit) % len(candidates)
+    # Rotate by weekday count, not calendar days: the job runs on weekdays,
+    # and a calendar step skips two windows every weekend, which can leave
+    # some candidates unvisited forever (e.g. 7 windows, weekday runs only).
+    rotation_start = (_weekday_index(market_date) * resolved_limit) % len(candidates)
     rotated = candidates[rotation_start:] + candidates[:rotation_start]
     return rotated[:resolved_limit]
 
@@ -2702,7 +2712,17 @@ class DartFundamentalsCaptureService:
             else ('partial' if successful_stock_codes or terminal_not_applicable else 'failed')
         )
         partial_reasons = list(fundamentals_result.get('partial_reasons') or [])
-        if retry_debt_stock_codes and 'share_issuance_scope_incomplete' not in partial_reasons:
+        # Label share-issuance incompleteness only when share issuance is the
+        # cause: fundamentals succeeded but issuance evidence is not ready, or
+        # the corp-code mapping left debt. Fundamentals-only retry debt
+        # already reports its own reason.
+        issuance_retry_debt = {
+            stock_code
+            for stock_code in retry_debt_stock_codes
+            if stock_code in fundamentals_success
+            and stock_code not in issuance_ready
+        } | (set(mapping_retry_debt_stock_codes or []) & selected_stock_code_set)
+        if issuance_retry_debt and 'share_issuance_scope_incomplete' not in partial_reasons:
             partial_reasons.append('share_issuance_scope_incomplete')
         for partial_reason in followup_partial_reasons:
             if partial_reason not in partial_reasons:

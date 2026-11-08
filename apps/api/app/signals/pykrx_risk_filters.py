@@ -5,6 +5,7 @@ from datetime import date
 from typing import Any, Sequence
 
 from app.market_data_store import load_recent_price_bars_by_symbol, load_symbols
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 TRADING_HALT_LIKE_HEURISTIC = 'pykrx_ohlcv_zero_fill_with_nonzero_close_v1'
 RISK_FILTER_SOURCE = 'pykrx_daily_price_bars'
@@ -24,22 +25,6 @@ def _normalize_market(value: str | None) -> str | None:
     if not normalized:
         raise ValueError('market must not be blank')
     return normalized
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = symbol.strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    normalized = [_normalize_symbol(symbol) for symbol in symbols]
-    return list(dict.fromkeys(normalized))
 
 
 def _round(value: float | None, digits: int = 6) -> float | None:

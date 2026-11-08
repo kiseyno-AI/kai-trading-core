@@ -131,6 +131,116 @@ def decode_strict_agent_json_object(
     return None, 'json_shape_not_object'
 
 
+JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS = 3
+
+
+def repair_agent_json_structure(candidate_text: str | None) -> tuple[str, dict[str, Any]] | None:
+    """Repair only unambiguous container-nesting slips in agent JSON text.
+
+    Runtimes that cannot emit a schema-checked client function call (for
+    example the Claude Code CLI backend) return the batch envelope as plain
+    text, and long nested envelopes occasionally drop one closing brace or
+    leave a trailing comma. This helper fixes exactly those two slips:
+
+    - a closer that skips an open container (``]`` while an object is still
+      open) gets the missing closer(s) inserted right before it;
+    - a comma directly before a closer is removed;
+    - missing closers at the very end are appended only when the text already
+      ends on a closer, so a response cut off mid-value is never completed.
+
+    It never invents keys or values, never drops content, and refuses extra
+    closers, unterminated strings, and more than
+    ``JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS`` insertions. The repaired
+    text must still pass ``decode_strict_agent_json_object`` and every
+    downstream contract check, so a misplaced key fails closed there.
+    """
+    text = str(candidate_text or '').strip()
+    if not text or text[0] not in '{[':
+        return None
+    out: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    inserted = 0
+    removed_commas = 0
+
+    def _drop_trailing_comma() -> None:
+        nonlocal removed_commas
+        index = len(out) - 1
+        while index >= 0 and out[index] in ' \t\r\n':
+            index -= 1
+        if index >= 0 and out[index] == ',':
+            del out[index]
+            removed_commas += 1
+
+    for char in text:
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            continue
+        if char in '{[':
+            stack.append(char)
+            out.append(char)
+            continue
+        if char in '}]':
+            opener = '{' if char == '}' else '['
+            if opener not in stack:
+                return None
+            while stack[-1] != opener:
+                _drop_trailing_comma()
+                out.append('}' if stack.pop() == '{' else ']')
+                inserted += 1
+            _drop_trailing_comma()
+            stack.pop()
+            out.append(char)
+            continue
+        out.append(char)
+    if in_string:
+        return None
+    if stack:
+        if text[-1] not in '}]':
+            return None
+        while stack:
+            _drop_trailing_comma()
+            out.append('}' if stack.pop() == '{' else ']')
+            inserted += 1
+    if inserted > JSON_STRUCTURE_REPAIR_MAX_INSERTED_CLOSERS:
+        return None
+    if inserted == 0 and removed_commas == 0:
+        return None
+    return ''.join(out), {
+        'applied': True,
+        'inserted_closers': inserted,
+        'removed_trailing_commas': removed_commas,
+    }
+
+
+def decode_agent_json_object_with_structure_repair(
+    candidate_text: str | None,
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
+    """Strict decode first; on a plain decode error try the narrow repair."""
+    decoded, failure_class = decode_strict_agent_json_object(candidate_text)
+    if decoded is not None or failure_class != 'json_decode_error':
+        return decoded, failure_class, None
+    repaired = repair_agent_json_structure(candidate_text)
+    if repaired is None:
+        return None, failure_class, None
+    repaired_text, repair_info = repaired
+    repaired_decoded, repaired_failure = decode_strict_agent_json_object(repaired_text)
+    if repaired_decoded is None:
+        return None, failure_class, None
+    return repaired_decoded, repaired_failure, repair_info
+
+
 def _select_feedback_payload(parsed: dict[str, Any] | None, *, symbol: str | None = None) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
