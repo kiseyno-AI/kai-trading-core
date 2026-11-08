@@ -2,7 +2,9 @@
 
 **Status: incomplete; source changes are not ready for release.**
 
-This branch currently preserves documentation and this checkpoint. The source/test patches described below were applied or prepared in the local audit checkout before its execution environment became unavailable. **They are not included in this remote documentation commit.** Some newly added regressions are still failing, and the final full-suite run has not been completed. This is not a certification of the repository or a claim of line-by-line completion.
+This checkpoint records the interrupted audit and accompanies the README/architecture documentation. The source/test patches described below were applied or prepared in the local audit checkout before its execution environment became unavailable. **They are not included in this remote documentation commit.** At interruption, some newly added regressions were still failing, and the final full-suite run had not been completed. This is not a certification of the repository or a claim of line-by-line completion.
+
+**Workspace reconnection update:** On reconnection, the earlier uncommitted audit patches and scratch test artifacts could not be located in the available workspace; the earlier Exec audit checkout was also absent. The findings and test results below describe the last observed pre-interruption work. They do not establish that those source patches are currently available. Code changes must be recovered or recreated and validated before publication.
 
 ## Baseline, scope, and branch
 
@@ -10,7 +12,7 @@ This branch currently preserves documentation and this checkpoint. The source/te
 - Audited base: [`2322295cdda099367e812b09d4187858434e49fc`](https://github.com/kiseyno-AI/kai-trading-core/commit/2322295cdda099367e812b09d4187858434e49fc).
 - Task branch: `codex/core-deep-audit-20261108`.
 - The baseline was the latest observed `main`, including the 2026-11-08 merged changes and the preceding English architecture documentation merge.
-- No task change was applied or merged to `main`. No deployment or live trading action was performed.
+- The user authorized promotion of the README and connected documentation to `main`. No application/source-code or test change from this audit is included in that promotion. No deployment or live trading action was performed.
 
 The tracked-code inventory selected `.py`, `.sh`, `.js`, `.ts`, `.tsx`, `.sql`, `.yml`, `.yaml`, and `.toml` files and counted their lines. Core contained **629 selected files / 555,047 lines**, including **287,778 non-test source/configuration lines**. The test remainder is **267,269 = 555,047 − 287,778**. Generated graph nodes and passing tests do not count as manually inspected source lines.
 
@@ -185,7 +187,7 @@ A test runner was prepared to deny external DNS/socket connections before pytest
 
 The next required steps are:
 
-1. Restore access to the local working tree and inspect its complete diff; preserve the uncommitted fixes and failing regressions.
+1. Inspect the reconnected workspace and recover or recreate the earlier source fixes and regressions; the prior uncommitted audit patches were not found after reconnection.
 2. Apply the five pending source patches and complete the affected factor-test mocks.
 3. Run repair-race and broader tests under the external-network-denying runner.
 4. Resolve the unverified order/runner/research leads with meaningful regressions before changing behavior.
