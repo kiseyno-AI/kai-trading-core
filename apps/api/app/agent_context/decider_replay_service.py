@@ -1316,7 +1316,7 @@ def _normalize_rule_config(rule_config: dict[str, Any] | str | None) -> dict[str
             + ', '.join(sorted(str(key) for key in unexpected_config_keys))
         )
     schema_version = rule_config.get('schema_version')
-    if schema_version not in {None, DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION}:
+    if schema_version not in (None, DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION):
         raise ValueError(
             f'rule_config.schema_version must be {DECIDER_REPLAY_RULE_CONFIG_SCHEMA_VERSION}'
         )

@@ -568,6 +568,8 @@ class DeciderReplayServiceTests(unittest.TestCase):
 
     def test_invalid_rule_config_fails_closed_before_repository_access(self) -> None:
         invalid_configs = (
+            {'schema_version': {}, 'rules': []},
+            {'schema_version': [], 'rules': []},
             {'rules': 'not-a-list'},
             {'rules': [{'name': 'typo', 'predicates': [{'type': 'confidnce', 'value': 5}]}]},
             {'rules': [{'name': 'bad-op', 'predicates': [{'field': 'symbol', 'op': 'approx', 'value': '005930'}]}]},
