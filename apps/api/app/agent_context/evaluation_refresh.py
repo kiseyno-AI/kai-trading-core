@@ -106,7 +106,14 @@ def refresh_signal_decider_evaluations_if_due(
         return {'status': 'skipped', 'reason': 'no_latest_trading_date'}
     root = marker_dir or default_marker_dir()
     marker = _load_marker(root, market_date)
-    if marker is not None and marker.get('status') == 'completed':
+    marker_summary = marker.get('summary') if marker is not None else None
+    if (
+        marker is not None
+        and marker.get('status') == 'completed'
+        and isinstance(marker_summary, dict)
+        and marker_summary.get('status') == 'completed'
+        and not marker_summary.get('gated')
+    ):
         return {'status': 'skipped', 'reason': 'already_refreshed', 'market_date': market_date}
     last = _last_attempt_at.get(market_date)
     if last is not None and now_kst - last < MIN_ATTEMPT_INTERVAL:
@@ -116,7 +123,7 @@ def refresh_signal_decider_evaluations_if_due(
     result = (compute or _default_compute)(market_date)
     summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
     gated = bool(summary.get('gated'))
-    status = 'gated' if gated else 'completed'
+    status = 'gated' if gated else str(summary.get('status') or 'failed')
     _save_marker(
         root,
         market_date,
