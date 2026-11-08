@@ -18,6 +18,14 @@ batch that gates Core startup -- and replaces only the safety predicate:
 * the official reference must cover the date completely (both markets), and a
   close change beyond any KRX daily limit is refused as a basis problem.
 
+Downstream rebuild: every pending batch records, for each date it requires
+rebuilt, the strict same-date EOD membership (``official_bar_restatement_v1``
+evidence). That is the frozen ranking scope the exact factor and signal-feature
+rebuilds require, so the sanctioned rebuild chain can finish the batch. Apply
+refuses up front if any date in the rebuild range lacks that EOD proof, and the
+write rolls back if the proof changes in between, so a batch the chain cannot
+finish is never opened.
+
 Run ``python -m app.eod.official_bar_restatement`` for a dry run;
 ``--apply`` writes. After an apply the documented downstream rebuild of the
 pending batches is mandatory (see ``docs/TARGETED_REPAIR_TOOLING.md``).
@@ -40,8 +48,12 @@ from app.eod.kis_final_bar_repair import (
     KISFinalBarRepairService,
     ProviderFinalBar,
     StoredFinalBar,
+    load_required_rebuild_trade_dates,
     repair_existing_final_bars,
 )
+
+REPAIR_KIND = 'official_bar_restatement'
+EVIDENCE_SCHEMA_VERSION = 'official_bar_restatement_v1'
 
 MARKETS = ('KOSPI', 'KOSDAQ')
 # Same safety floors the turnover repair uses for a complete market frame.
@@ -231,11 +243,52 @@ def make_planner(official: OfficialReference) -> Callable[..., dict[str, Any]]:
     return planner
 
 
+def build_rebuild_evidence(session: Any, required_rebuild_dates: Sequence[date]) -> dict[str, Any]:
+    """Freeze each rebuild date's ranking scope from strict same-date EOD proof.
+
+    Raises when any date lacks the proof or stored bars do not cover it, which
+    rolls the restatement write back instead of leaving an unfinishable batch.
+    """
+
+    from app.eod.missing_bar_repair import _load_downstream_membership_manifests
+
+    manifests = _load_downstream_membership_manifests(
+        session,
+        target_date=date.min,  # no inserted target date: every date is downstream
+        required_rebuild_dates=sorted(required_rebuild_dates),
+    )
+    return {
+        'schema_version': EVIDENCE_SCHEMA_VERSION,
+        'repair_kind': REPAIR_KIND,
+        'price_dependent_membership_by_date': manifests,
+    }
+
+
+def rebuild_proof_gaps(required_rebuild_dates: Sequence[date]) -> list[dict[str, str]]:
+    """Read-only preflight: dates the rebuild chain could not freeze a scope for."""
+
+    from app.db import session_scope
+    from app.eod.missing_bar_repair import _select_strict_stored_membership
+    from app.eod.price_bar_repair_state import exact_daily_price_bar_scope_fingerprint
+
+    gaps: list[dict[str, str]] = []
+    with session_scope() as session:
+        for market_date in sorted(required_rebuild_dates):
+            run, symbols = _select_strict_stored_membership(session, market_date=market_date, for_update=False)
+            if run is None or not symbols:
+                gaps.append({'date': market_date.isoformat(), 'reason': 'no_strict_same_date_eod_membership'})
+                continue
+            _, stored = exact_daily_price_bar_scope_fingerprint(session, market_date=market_date, symbols=symbols)
+            if stored != len(symbols):
+                gaps.append({'date': market_date.isoformat(), 'reason': 'stored_bars_do_not_cover_eod_membership'})
+    return gaps
+
+
 def build_service(official: OfficialReference) -> KISFinalBarRepairService:
     planner = make_planner(official)
 
     def repairer(**kwargs: Any) -> dict[str, Any]:
-        return repair_existing_final_bars(planner=planner, **kwargs)
+        return repair_existing_final_bars(planner=planner, repair_evidence_builder=build_rebuild_evidence, **kwargs)
 
     return KISFinalBarRepairService(repairer=repairer)
 
@@ -274,6 +327,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
     try:
+        # A change on any date from ``start`` on requires every later date rebuilt.
+        rebuild_dates = load_required_rebuild_trade_dates(from_date=start)
+        proof_gaps = rebuild_proof_gaps(rebuild_dates)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({'status': 'failed', 'applied': False, 'error_type': type(exc).__name__,
+                          'error_message': str(exc)}, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return 1
+    if args.apply and proof_gaps:
+        print(json.dumps({
+            'status': 'blocked',
+            'applied': False,
+            'reason': 'rebuild_membership_proof_missing',
+            'rebuild_membership_proof_gaps': proof_gaps,
+            'hint': 'start after the last gap date; a batch the rebuild chain cannot finish is never opened',
+        }, ensure_ascii=False, sort_keys=True))
+        return 2
+    try:
         official = OfficialReference.load(_dates_between(start, end), cache_dir=args.official_cache_dir)
         result = asyncio.run(
             build_service(official).repair_page(
@@ -295,6 +365,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    result['rebuild_membership_proof_gaps'] = proof_gaps
     result['official_reference_uncovered_dates'] = sorted(
         d.isoformat() for d in _dates_between(start, end) if not official.covers(d)
     )

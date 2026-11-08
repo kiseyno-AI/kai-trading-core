@@ -22,10 +22,17 @@ from app.eod.kis_final_bar_repair import (
     StoredFinalBar,
     repair_existing_final_bars,
 )
+from app.eod import official_bar_restatement as restatement
+from app.eod.market_membership import market_membership_sha256
 from app.eod.official_bar_restatement import (
     OfficialReference,
     make_planner,
     plan_official_restatement,
+)
+from app.eod.price_bar_repair_state import (
+    _factor_evidence_symbols_for_batch,
+    _frozen_signal_feature_symbols_for_batch,
+    resolve_pending_frozen_price_dependent_membership,
 )
 
 DAY = date(2099, 9, 14)
@@ -428,6 +435,108 @@ class AppliedRestatementTests(unittest.TestCase):
                 session.close()
                 transaction.rollback()
 
+
+
+class _ProofRun:
+    id = 4242
+    source = 'pykrx'
+
+
+class RebuildScopeEvidenceTests(unittest.TestCase):
+    """Review case: the exact rebuild chain needs a frozen per-date scope."""
+
+    def _apply(self, *, proof):
+        symbol_code = uuid4().hex[:6].upper()
+        connection = engine.connect()
+        transaction = connection.begin()
+        session = Session(bind=connection)
+        self.addCleanup(connection.close)
+        self.addCleanup(transaction.rollback)
+        self.addCleanup(session.close)
+        symbol = Symbol(symbol=symbol_code, name_ko='restatement scope', market='KOSPI',
+                        instrument_type='equity', source='protected_symbol_source', is_active=True)
+        session.add(symbol)
+        session.flush()
+        bar = DailyPriceBar(symbol_id=symbol.id, trade_date=DAY, open_price=100, high_price=110, low_price=90,
+                            close_price=105, volume=1000, turnover=100_000, source='pykrx')
+        session.add(bar)
+        session.flush()
+        session.refresh(bar)
+        initial = StoredFinalBar(bar_id=bar.id, symbol=symbol_code, trade_date=DAY, open_price=100, high_price=110,
+                                 low_price=90, close_price=105, volume=1000, turnover=100_000, source=bar.source,
+                                 captured_at=bar.captured_at, eod_run_id=bar.eod_run_id)
+        official = (100, 108, 92, 104, 900, 90_000)
+        planner = make_planner(OfficialReference({(symbol_code, DAY): official}, covered_dates={DAY}))
+
+        @contextmanager
+        def rollback_only_session_scope(**_kwargs):
+            yield session
+            session.flush()
+
+        strict = (_ProofRun(), [symbol_code]) if proof else (None, None)
+        with patch('app.eod.kis_final_bar_repair.session_scope', rollback_only_session_scope), \
+                patch('app.eod.missing_bar_repair._select_strict_stored_membership', return_value=strict):
+            result = repair_existing_final_bars(
+                start_date=DAY, end_date=DAY, selected_symbols=[symbol_code], initial_rows=[initial],
+                provider_bars={(symbol_code, DAY): provider(symbol_code, official)}, apply=True,
+                required_rebuild_trade_dates=[DAY], planner=planner,
+                repair_evidence_builder=restatement.build_rebuild_evidence,
+            )
+        session.expire_all()
+        batch = session.execute(
+            select(DailyPriceBarRepairBatch).where(DailyPriceBarRepairBatch.repair_batch_id == result['repair_batch_id'])
+        ).scalar_one()
+        return symbol_code, result, batch
+
+    def test_the_batch_records_the_frozen_scope_the_exact_rebuilds_require(self) -> None:
+        symbol_code, result, batch = self._apply(proof=True)
+        self.assertEqual(result['repair_evidence_kind'], 'official_bar_restatement')
+        evidence = batch.verification_metadata['repair_evidence']
+        self.assertEqual(evidence['schema_version'], 'official_bar_restatement_v1')
+        scope = evidence['price_dependent_membership_by_date'][DAY.isoformat()]
+        self.assertEqual(scope['symbols'], [symbol_code])
+        self.assertEqual(scope['membership_sha256'], market_membership_sha256([symbol_code]))
+        self.assertEqual(scope['eod_run_id'], 4242)
+        pending = [{'repair_batch_id': batch.repair_batch_id, 'required_rebuild_trade_dates': [DAY.isoformat()],
+                    'verification_metadata': dict(batch.verification_metadata)}]
+        # Before this change the resolver returned None ("pending frozen price-dependent
+        # membership is unavailable") for every restatement batch.
+        self.assertEqual(resolve_pending_frozen_price_dependent_membership(market_date=DAY, pending=pending), (symbol_code,))
+        self.assertEqual(
+            _factor_evidence_symbols_for_batch(batch=batch, market_date=DAY, rebuilt_symbols=[symbol_code]),
+            (symbol_code,),
+        )
+
+    def test_a_date_without_strict_eod_proof_refuses_the_write(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, 'no strict same-date PyKRX membership proof'):
+            self._apply(proof=False)
+
+    def test_tampered_scope_evidence_fails_closed(self) -> None:
+        batch = {
+            'repair_batch_id': 'x',
+            'verification_metadata': {'repair_evidence': {
+                'schema_version': 'official_bar_restatement_v1', 'repair_kind': 'official_bar_restatement',
+                'price_dependent_membership_by_date': {DAY.isoformat(): {
+                    'symbols': ['000660', '005930'], 'symbol_count': 2,
+                    'membership_sha256': market_membership_sha256(['000660']),
+                }},
+            }},
+        }
+        with self.assertRaises(RuntimeError):
+            _frozen_signal_feature_symbols_for_batch(batch=batch, market_date=DAY)
+
+
+class ApplyPreflightTests(unittest.TestCase):
+    def test_apply_with_a_proof_gap_stops_before_any_fetch_or_write(self) -> None:
+        gap = [{'date': '2026-09-14', 'reason': 'no_strict_same_date_eod_membership'}]
+        with patch.object(restatement, 'load_required_rebuild_trade_dates', return_value=(date(2026, 9, 14),)), \
+                patch.object(restatement, 'rebuild_proof_gaps', return_value=gap), \
+                patch.object(restatement.OfficialReference, 'load') as load, \
+                patch.object(restatement, 'build_service') as service:
+            code = restatement.main(['--start-date', '2026-09-14', '--end-date', '2026-09-14', '--apply'])
+        self.assertEqual(code, 2)
+        load.assert_not_called()
+        service.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()

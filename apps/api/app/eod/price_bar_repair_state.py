@@ -704,6 +704,14 @@ def _signal_feature_dependency_watermark(
     return max(present) if present else None
 
 
+# Repair kinds whose evidence freezes the exact per-date ranking population
+# the downstream exact rebuilds must use, with the evidence schema each needs.
+FROZEN_SCOPE_REPAIR_SCHEMAS = {
+    'missing_bar_insert': 'missing_bar_insert_v3',
+    'official_bar_restatement': 'official_bar_restatement_v1',
+}
+
+
 def _factor_evidence_symbols_for_batch(
     *,
     batch: DailyPriceBarRepairBatch,
@@ -721,11 +729,11 @@ def _factor_evidence_symbols_for_batch(
     rebuilt = tuple(sorted(set(rebuilt_symbols)))
     metadata = dict(getattr(batch, 'verification_metadata', None) or {})
     recorded = dict(metadata.get('repair_evidence') or {})
-    if recorded.get('repair_kind') != 'missing_bar_insert':
+    if recorded.get('repair_kind') not in FROZEN_SCOPE_REPAIR_SCHEMAS:
         return rebuilt
     try:
-        if str(recorded['schema_version']) != 'missing_bar_insert_v3':
-            raise ValueError('unsupported missing-bar evidence version')
+        if str(recorded['schema_version']) != FROZEN_SCOPE_REPAIR_SCHEMAS[recorded['repair_kind']]:
+            raise ValueError('unsupported frozen-scope evidence version')
         raw_scope = dict(
             dict(recorded['price_dependent_membership_by_date'])[
                 market_date.isoformat()
@@ -785,11 +793,11 @@ def _frozen_signal_feature_symbols_for_batch(
             getattr(batch, 'repair_batch_id', '') or ''
         )
     recorded = dict(metadata.get('repair_evidence') or {})
-    if recorded.get('repair_kind') != 'missing_bar_insert':
+    if recorded.get('repair_kind') not in FROZEN_SCOPE_REPAIR_SCHEMAS:
         return None
     try:
-        if str(recorded['schema_version']) != 'missing_bar_insert_v3':
-            raise ValueError('unsupported missing-bar evidence version')
+        if str(recorded['schema_version']) != FROZEN_SCOPE_REPAIR_SCHEMAS[recorded['repair_kind']]:
+            raise ValueError('unsupported frozen-scope evidence version')
         raw_scope = dict(
             dict(recorded['price_dependent_membership_by_date'])[
                 market_date.isoformat()
@@ -3766,6 +3774,25 @@ def _collect_batch_verification(
             for required_date in required_dates
         ):
             issues.append('missing_bar_insert_frozen_membership_invalid')
+    elif repair_evidence_payload.get('repair_kind') == 'official_bar_restatement':
+        # A restatement rewrites values, never membership: the frozen scope is
+        # the strict EOD membership recorded when the bars were rewritten.
+        repair_evidence['repair_kind'] = 'official_bar_restatement'
+        try:
+            for required_date in required_dates:
+                frozen_symbols_by_date[required_date] = (
+                    _frozen_signal_feature_symbols_for_batch(
+                        batch=batch,
+                        market_date=required_date,
+                    )
+                    or ()
+                )
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            frozen_symbols_by_date = {}
+            issues.append('official_bar_restatement_frozen_membership_invalid')
+        else:
+            if any(not symbols for symbols in frozen_symbols_by_date.values()):
+                issues.append('official_bar_restatement_frozen_membership_invalid')
     frozen_scope_key = tuple(
         (
             market_date,
@@ -4003,6 +4030,9 @@ def _collect_batch_verification(
     }
     if repair_evidence_payload.get('repair_kind') == 'missing_bar_insert':
         result['repair_evidence'] = repair_evidence
+    elif repair_evidence_payload.get('repair_kind') == 'official_bar_restatement':
+        # Completion overwrites verification_metadata; keep the frozen scope.
+        result['repair_evidence'] = repair_evidence_payload
     return result
 
 
