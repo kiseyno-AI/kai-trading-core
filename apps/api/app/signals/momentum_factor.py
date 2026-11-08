@@ -888,7 +888,8 @@ class DailyMomentumFactorService:
         }
         history_computation_failed_set = set(computation_failed_symbols)
         ranking_missing_history_symbols = [
-            symbol for symbol in ranking_population
+            symbol
+            for symbol in dict.fromkeys([*ranking_population, *target_symbols])
             if symbol not in valid_histories
             and symbol not in history_computation_failed_set
         ]
