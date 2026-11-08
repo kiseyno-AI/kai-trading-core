@@ -29,6 +29,7 @@ from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 from app.agent_context.signal_decider_loop_service import (
+    SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     signal_decider_loop_service,
 )
@@ -8889,6 +8890,7 @@ class DailyPipelineStageService:
                 market_date=market_date,
                 fs_div=fs_div,
                 symbols=symbols,
+                required_stage_ids=SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
             )
             if not bypass_prerequisite_gate and not prerequisites['ready']:
                 return self._build_prerequisite_gate_result(
