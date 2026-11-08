@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
@@ -59,8 +60,12 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_krx_symbol_sequence(
-    values: Sequence[Any],
+    values: Sequence[Any] | None,
 ) -> list[str] | None:
+    if values is None or isinstance(values, (str, bytes)):
+        # An absent or non-sequence scope is not a proven invocation; fail
+        # closed instead of raising TypeError inside scope validation.
+        return None
     normalized: list[str] = []
     for value in values:
         stock_code = normalize_krx_short_code(value)
@@ -107,6 +112,17 @@ FACTOR_FOLLOWUP_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         'advanced_value_factors',
     ),
 }
+# Factor stages whose inputs are price bars and same-day PyKRX data only. They do not
+# read DART fundamentals, so they are admitted by the follow-up price/enrichment
+# cohort rather than by the (often much smaller) DART/Piotroski cohort.
+NON_DART_FACTOR_FOLLOWUP_STAGE_IDS: frozenset[str] = frozenset(
+    {
+        'momentum_factors',
+        'value_factors',
+        'low_risk_factors',
+        'beta_factors',
+    }
+)
 SUCCESS_COHORT_MANIFEST_VERSIONS: dict[str, frozenset[str]] = {
     'price_collection': frozenset({'price_contexts_scope_outcomes_v1'}),
     'pykrx_enrichment': frozenset(
@@ -2396,6 +2412,7 @@ def _run_daily_factor_followup(
     market_date: str,
     exact_membership_symbols: Sequence[str] | None,
     admitted_symbols: Sequence[str] | None = None,
+    price_admitted_symbols: Sequence[str] | None = None,
     authoritative_market_scope: Mapping[str, Any] | None = None,
     stage_executor: (
         Callable[
@@ -2447,6 +2464,29 @@ def _run_daily_factor_followup(
         raise RuntimeError(
             'Daily factor admitted scope falls outside exact EOD membership: '
             f'{outside_membership[:20]}'
+        )
+    if price_admitted_symbols is None:
+        price_cohort_symbols = list(initial_admitted_symbols)
+    else:
+        normalized_price_admitted = _normalize_krx_symbol_sequence(
+            price_admitted_symbols
+        )
+        if normalized_price_admitted is None:
+            raise RuntimeError(
+                'Daily factor price-admitted scope contains a malformed KRX '
+                'short code.'
+            )
+        outside_price_membership = sorted(
+            set(normalized_price_admitted) - set(normalized_symbols)
+        )
+        if outside_price_membership:
+            raise RuntimeError(
+                'Daily factor price-admitted scope falls outside exact EOD '
+                f'membership: {outside_price_membership[:20]}'
+            )
+        # The price cohort never excludes a symbol the DART cohort admitted.
+        price_cohort_symbols = sorted(
+            set(normalized_price_admitted) | set(initial_admitted_symbols)
         )
 
     def build_stage_call(
@@ -2527,7 +2567,14 @@ def _run_daily_factor_followup(
         else:
             # Component factors are siblings. A per-symbol failure in one
             # component must not suppress an independent component attempt.
-            stage_invocation_symbols = list(initial_admitted_symbols)
+            # Stages that do not read DART fundamentals are admitted by the
+            # price cohort so a small DART/Piotroski cohort cannot shrink
+            # price-only factors to a fraction of the universe.
+            stage_invocation_symbols = list(
+                price_cohort_symbols
+                if stage_id in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS
+                else initial_admitted_symbols
+            )
         if not stage_invocation_symbols:
             overall_status = 'partial'
             successful_symbols_by_stage[stage_id] = []
@@ -2900,6 +2947,66 @@ def _bar_from_exact_market_frame(
         'volume': volume,
         'turnover': turnover,
     }
+
+
+def _official_daily_bar(
+    *,
+    symbol: str,
+    market: str,
+    market_date: str,
+    dependencies: Any,
+    market_frame_cache: dict[tuple[str, str], Any],
+    counters: dict[str, int],
+    run_id: int | None,
+) -> dict[str, Any] | None:
+    """Return the symbol's bar from PyKRX's market-wide frame, or None.
+
+    The market-wide ticker frame is the official KRX daily table and carries
+    OHLC, volume and trading value together.  The per-symbol range endpoint is
+    a different feed: measured on 2026-11-05 its close/high/low differed from
+    the official table (and from KIS history) for about 80% of symbols, and it
+    has no trading value.  None means "not available here" (no getter, fetch
+    failed, symbol absent or incomplete, or inconsistent values) and the caller
+    falls back to the per-symbol path exactly as before.
+    """
+
+    getter = dependencies.get_market_ohlcv_by_ticker
+    if getter is None:
+        return None
+    cache_key = (market_date.replace('-', ''), market)
+    if cache_key not in market_frame_cache:
+        counters['market_fetch_attempts'] = int(counters.get('market_fetch_attempts') or 0) + 1
+        try:
+            market_frame_cache[cache_key] = getter(*cache_key)
+        except Exception as exc:  # noqa: BLE001
+            market_frame_cache[cache_key] = None
+            counters['market_fetch_failures'] = int(counters.get('market_fetch_failures') or 0) + 1
+            dependencies.log_fetch(
+                'fetch_official_market_ohlcv',
+                'failed',
+                run_id=run_id,
+                market=market,
+                trade_date=market_date,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+    bar = _bar_from_exact_market_frame(
+        market_frame_cache.get(cache_key),
+        symbol=symbol,
+        market_date=market_date,
+    )
+    if bar is None:
+        return None
+    if bar['volume'] > 0:
+        # A traded symbol must have a positive value traded and a coherent
+        # candle; otherwise prefer the existing path (which reports it).
+        if bar['turnover'] <= 0:
+            return None
+        if bar['low_price'] > min(bar['open_price'], bar['close_price'], bar['high_price']):
+            return None
+        if bar['high_price'] < max(bar['open_price'], bar['close_price'], bar['low_price']):
+            return None
+    return bar
 
 
 def _summarize_turnover_coverage(counters: Mapping[str, Any]) -> dict[str, Any]:
@@ -3824,6 +3931,20 @@ def run_market_data_pipeline(
             current_period=current_period,
             extra=metadata_extra,
         )
+        daily_pipeline_live_progress.publish_collection_progress(
+            eod_run_id=run_id,
+            market_date=latest_trade_date,
+            stage=stage,
+            status=status,
+            current_step=current_step,
+            current_activity=current_activity,
+            processed=processed,
+            total=total,
+            succeeded=succeeded,
+            failed=failed,
+            current_symbol=current_symbol,
+            current_period=current_period,
+        )
         try:
             daily_pipeline_tracker.update_stage(
                 stage=stage,
@@ -3885,6 +4006,10 @@ def run_market_data_pipeline(
         extra={'bars_upserted': 0},
     )
 
+    price_source_counters: dict[str, int] = {
+        'official_market_frame_bars': 0,
+        'per_symbol_bars': 0,
+    }
     try:
         market_turnover_cache: dict[tuple[str, str], Any] = {}
         turnover_coverage_counters: dict[str, int] = {}
@@ -3896,35 +4021,53 @@ def run_market_data_pipeline(
                     'daily_auto',
                     'daily_stage_run',
                 }
+                official_bar = (
+                    _official_daily_bar(
+                        symbol=item.symbol,
+                        market=item.market,
+                        market_date=latest_trade_date,
+                        dependencies=dependencies,
+                        market_frame_cache=market_turnover_cache,
+                        counters=turnover_coverage_counters,
+                        run_id=run_id,
+                    )
+                    if daily_exact_collection
+                    else None
+                )
                 direct_failure: Exception | None = None
                 try:
-                    frame = dependencies.get_market_ohlcv_by_date(
-                        normalized_start,
-                        normalized_end,
-                        item.symbol,
-                    )
-                    if frame.empty:
-                        raise RuntimeError('No OHLCV rows returned.')
-                    fundamentals_frame = None
-                    if not daily_exact_collection:
-                        fundamentals_frame = service._load_symbol_fundamentals(
-                            symbol=item.symbol,
-                            start_date=normalized_start,
-                            end_date=normalized_end,
+                    if official_bar is not None:
+                        bars = [official_bar]
+                        price_source_counters['official_market_frame_bars'] += 1
+                    else:
+                        frame = dependencies.get_market_ohlcv_by_date(
+                            normalized_start,
+                            normalized_end,
+                            item.symbol,
                         )
-                    bars = service._map_symbol_bars(
-                        frame,
-                        fundamentals_frame=fundamentals_frame,
-                    )
-                    if daily_exact_collection:
-                        bars = _exact_daily_bars(
-                            bars,
-                            market_date=latest_trade_date,
-                        )
-                        if not bars:
-                            raise RuntimeError(
-                                'No exact-date usable OHLCV row returned.'
+                        if frame.empty:
+                            raise RuntimeError('No OHLCV rows returned.')
+                        fundamentals_frame = None
+                        if not daily_exact_collection:
+                            fundamentals_frame = service._load_symbol_fundamentals(
+                                symbol=item.symbol,
+                                start_date=normalized_start,
+                                end_date=normalized_end,
                             )
+                        bars = service._map_symbol_bars(
+                            frame,
+                            fundamentals_frame=fundamentals_frame,
+                        )
+                        if daily_exact_collection:
+                            bars = _exact_daily_bars(
+                                bars,
+                                market_date=latest_trade_date,
+                            )
+                            if not bars:
+                                raise RuntimeError(
+                                    'No exact-date usable OHLCV row returned.'
+                                )
+                        price_source_counters['per_symbol_bars'] += len(bars)
                 except (DailyPipelineTrackingWriteError, SQLAlchemyError):
                     raise
                 except Exception as exc:
@@ -4161,6 +4304,7 @@ def run_market_data_pipeline(
                         'bars_upserted': bars_upserted,
                         'price_recovery': price_recovery,
                         'turnover_coverage': turnover_coverage,
+                        'price_source': dict(price_source_counters),
                         **_gap_policy_details(failed=symbols_failed, total=len(symbols)),
                     },
                 )
@@ -4351,6 +4495,7 @@ def run_market_data_pipeline(
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
             'price_recovery': price_recovery,
+            'price_source': dict(price_source_counters),
             'turnover_coverage': turnover_coverage,
             'turnover_invalid_symbols': turnover_invalid_symbols[:50],
             'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
@@ -4452,6 +4597,7 @@ def run_market_data_pipeline(
             'unattempted_symbols_count': len(unattempted_symbols),
             'bars_upserted': bars_upserted,
             'price_recovery': price_recovery,
+            'price_source': dict(price_source_counters),
             'turnover_coverage': turnover_coverage,
             'turnover_invalid_symbols': turnover_invalid_symbols[:50],
             'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
@@ -5745,6 +5891,7 @@ def run_market_data_pipeline(
         'downstream_retry_symbols_count': len(downstream_retry_symbol_codes),
         'bars_upserted': bars_upserted,
         'price_recovery': price_recovery,
+        'price_source': dict(price_source_counters),
         'turnover_coverage': turnover_coverage,
         'turnover_invalid_symbols': turnover_invalid_symbols[:50],
         'turnover_invalid_symbols_count': len(turnover_invalid_symbols),
@@ -6031,6 +6178,15 @@ def run_market_data_pipeline(
                 )
             if admitted_symbols is not None:
                 factor_kwargs['admitted_symbols'] = list(admitted_symbols)
+                # The admitted cohort is the DART/Piotroski success set. When it
+                # is narrower than the follow-up price cohort, hand the price
+                # cohort over too so price-only factors keep covering it.
+                if daily_followup_admitted_symbols and set(
+                    daily_followup_admitted_symbols
+                ) != set(admitted_symbols):
+                    factor_kwargs['price_admitted_symbols'] = list(
+                        daily_followup_admitted_symbols
+                    )
             factor_result = _run_daily_factor_followup(
                 **factor_kwargs,
             )

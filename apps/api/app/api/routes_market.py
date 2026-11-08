@@ -3,6 +3,7 @@ import logging
 from datetime import date, datetime
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 
 from app.brokers.kis.client import KISClientError, KISConfigurationError
 from app.fx.service import KoreaEximRateNotFoundError
@@ -21,6 +22,8 @@ from app.market.snapshot import (
     market_snapshot_service,
 )
 from app.schemas.market import LiveSectorProjectionResponse, MarketSnapshotResponse
+from app.market.business_line_profiles import business_line_summary
+from app.market.symbol_codes import normalize_krx_short_code
 
 router = APIRouter(prefix='/market', tags=['market'])
 logger = logging.getLogger(__name__)
@@ -37,7 +40,7 @@ async def market_status() -> dict:
         return state.__dict__
 
     try:
-        persist_market_status_snapshot(state, source='api')
+        await run_in_threadpool(persist_market_status_snapshot, state, source='api')
     except Exception as exc:
         logger.warning('Market status persistence failed: %s', exc)
     return state.__dict__
@@ -132,3 +135,11 @@ async def live_sector_projection(
             status_code=503,
             detail='Live sector projection is temporarily unavailable.',
         ) from exc
+
+
+@router.get('/business-lines')
+async def get_business_lines(symbols: str | None = None) -> dict:
+    """Business-line taxonomy with member counts; ``symbols`` adds their profiles."""
+
+    requested = [code for code in (normalize_krx_short_code(item) for item in (symbols or '').split(',')) if code] or None
+    return await asyncio.to_thread(business_line_summary, requested)

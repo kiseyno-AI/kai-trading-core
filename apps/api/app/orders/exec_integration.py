@@ -6462,7 +6462,10 @@ class SignalDeciderExecIntegrationService:
                     expected_observation_revision=observation_revision,
                 )
             except Exception:
-                pass
+                logger.warning(
+                    'Realtime monitored-symbol observation failed; keeping the built payload',
+                    exc_info=True,
+                )
         return payload
 
     async def load_realtime_monitored_symbol_source(
@@ -6693,8 +6696,11 @@ class SignalDeciderExecIntegrationService:
             return self._degraded_cached_portfolio_holding_membership(
                 market_date
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                'Realtime portfolio membership refresh failed; using the completed-task result: %s',
+                exc,
+            )
         return self._take_completed_realtime_portfolio_membership(
             market_date=market_date,
             task=task,

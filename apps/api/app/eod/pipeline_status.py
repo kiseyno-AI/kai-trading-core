@@ -343,9 +343,128 @@ def _load_pykrx_enrichment_coverage(
     ).get('coverage') or {}
 
 
+def _is_point_in_time_safe_skip_stage_row(
+    stage_row: Any,
+    *,
+    market_date: str,
+) -> bool:
+    """True for the orchestrator's admission-neutral past-date safe-skip.
+
+    A later run for a past market date (operator subset or point-in-time
+    recovery) records current-only stages as a canonical safe-skip. That
+    record proves nothing about the date's data, so it must not supersede an
+    earlier record that does.
+    """
+    from app.eod.pykrx_pipeline_runner import (
+        _is_canonical_point_in_time_current_only_skip,
+    )
+
+    if isinstance(stage_row, dict):
+        details = stage_row.get('details')
+        stage_id = stage_row.get('stage_id') or stage_row.get('id') or stage_row.get('stage')
+    else:
+        details = getattr(stage_row, 'details', None)
+        stage_id = getattr(stage_row, 'stage_id', None)
+    details = details if isinstance(details, dict) else {}
+    result_summary = details.get('result_summary')
+    if not isinstance(result_summary, dict) or not stage_id:
+        return False
+    return _is_canonical_point_in_time_current_only_skip(
+        result_summary,
+        stage_id=str(stage_id),
+        market_date=market_date,
+    )
+
+
+PYKRX_ENRICHMENT_MARKET_SCOPE_CATEGORIES = frozenset(
+    {'market_breadth', 'investor_flow_market'}
+)
+
+
+def _pykrx_enrichment_rows_cover_requested_scope(
+    *,
+    coverage: dict[str, Any],
+    category_rows: dict[str, Any],
+    requested_scope_count: int,
+) -> bool:
+    """Stored enrichment rows prove the requested symbol scope on their own.
+
+    True only when the coverage loader counted exactly the requested symbols
+    and every applicable per-symbol category has a row for each of them.
+    """
+
+    try:
+        loaded_scope_count = int(coverage.get('requested_symbol_count') or 0)
+    except (TypeError, ValueError):
+        return False
+    if requested_scope_count <= 0 or loaded_scope_count != requested_scope_count:
+        return False
+    symbol_categories = 0
+    for category, item in category_rows.items():
+        if not isinstance(item, dict):
+            return False
+        scope_type = str(item.get('scope_type') or '').strip().lower()
+        if scope_type == 'market' or (
+            not scope_type and category in PYKRX_ENRICHMENT_MARKET_SCOPE_CATEGORIES
+        ):
+            continue
+        if str(item.get('coverage_status') or '').strip().lower() == 'not_applicable':
+            continue
+        symbol_categories += 1
+        try:
+            present = int(item.get('present_rows') or 0)
+            expected = int(item.get('expected_rows') or 0)
+        except (TypeError, ValueError):
+            return False
+        if expected != requested_scope_count or present < requested_scope_count:
+            return False
+    return symbol_categories > 0
+
+
+AUTOMATIC_PIPELINE_TRIGGER_PREFIX = 'auto_'
+AUTOMATIC_PIPELINE_TRIGGERS = frozenset({'monitor_stale_continuation'})
+NON_EVIDENCE_STAGE_STATUSES = frozenset({'blocked', 'skipped'})
+
+
+def _is_operator_pipeline_trigger(trigger: Any) -> bool:
+    normalized = str(trigger or '').strip()
+    if not normalized:
+        return False
+    return not (
+        normalized.startswith(AUTOMATIC_PIPELINE_TRIGGER_PREFIX)
+        or normalized in AUTOMATIC_PIPELINE_TRIGGERS
+    )
+
+
+def _stage_record_cannot_supersede(
+    stage_row: Any,
+    *,
+    run_trigger: Any,
+    market_date: str,
+) -> bool:
+    """A newer stage record that proves nothing about the date's data.
+
+    Two shapes qualify: the canonical past-date safe-skip, and a stage an
+    operator run (``eod-pipeline-run``, manual API, debug CLI) left blocked
+    or skipped without doing the work. Neither may hide an earlier record
+    for the same stage and date; an operator stage that actually completed
+    still supersedes as before.
+    """
+
+    if _is_point_in_time_safe_skip_stage_row(stage_row, market_date=market_date):
+        return True
+    if not _is_operator_pipeline_trigger(run_trigger):
+        return False
+    status = (
+        stage_row.get('status') if isinstance(stage_row, dict) else getattr(stage_row, 'status', None)
+    )
+    return str(status or '').strip().lower() in NON_EVIDENCE_STAGE_STATUSES
+
+
 def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[str, Any]]:
     normalized_market_date = date.fromisoformat(market_date)
     latest_by_stage: dict[str, dict[str, Any]] = {}
+    non_evidence_fallback_by_stage: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
         rows = session.execute(
             select(DailyPipelineRun, DailyPipelineStageRun)
@@ -362,10 +481,22 @@ def _load_daily_pipeline_stage_history(*, market_date: str) -> dict[str, dict[st
         for run_row, stage_row in rows:
             if stage_row.stage_id in latest_by_stage:
                 continue
-            latest_by_stage[stage_row.stage_id] = {
+            entry = {
                 'run': daily_pipeline_run_state_service._serialize_run(run_row),
                 'stage': daily_pipeline_run_state_service._serialize_stage(stage_row),
             }
+            if _stage_record_cannot_supersede(
+                stage_row,
+                run_trigger=getattr(run_row, 'trigger', None),
+                market_date=market_date,
+            ):
+                # Keep looking for an older record with real evidence; use
+                # this one only when the stage has nothing else.
+                non_evidence_fallback_by_stage.setdefault(stage_row.stage_id, entry)
+                continue
+            latest_by_stage[stage_row.stage_id] = entry
+    for stage_id, entry in non_evidence_fallback_by_stage.items():
+        latest_by_stage.setdefault(stage_id, entry)
     return latest_by_stage
 
 
@@ -2581,6 +2712,15 @@ class EODPipelineStatusService:
         for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             official_stage = official_stages.get(stage_id)
             if not isinstance(official_stage, dict):
+                continue
+            if _stage_record_cannot_supersede(
+                {'stage_id': stage_id, **official_stage},
+                run_trigger=official_run.get('trigger'),
+                market_date=market_date,
+            ):
+                # The latest run did not do this stage's work (past-date
+                # safe-skip, or an operator run that blocked/skipped it);
+                # keep the earlier evidence-bearing state.
                 continue
             fallback_stage = stages.get(stage_id) or {}
             if self._recovery_state_is_newer(
@@ -5261,6 +5401,34 @@ class EODPipelineStatusService:
             for stock_code in normalized_scope_symbols
             if stock_code not in successful_scope_set
         ]
+        # Only when the run carries no per-symbol outcome manifest at all
+        # (past-date operator reruns and point-in-time recovery write none)
+        # are the stored rows the evidence. A manifest that exists but does
+        # not cover the requested symbols, or marks one as retry debt, keeps
+        # deciding: stored rows must never override it.
+        run_has_scope_manifest = any(
+            key in progress_extras
+            for key in (
+                'scope_outcome_manifest_version',
+                'scope_outcome_manifest',
+                'selected_stock_codes',
+                'successful_stock_codes',
+                'retry_debt_stock_codes',
+                'terminal_not_applicable_stock_codes',
+            )
+        )
+        stored_row_scope_complete = (
+            requested_scope_count > 0
+            and not run_has_scope_manifest
+            and _pykrx_enrichment_rows_cover_requested_scope(
+                coverage=coverage,
+                category_rows=category_rows,
+                requested_scope_count=requested_scope_count,
+            )
+        )
+        if stored_row_scope_complete:
+            missing_scope_symbols = []
+        scope_evidence_loaded = exact_scope_loaded or stored_row_scope_complete
         requested_scope_coverage = None
         if requested_scope_count:
             nonready_category_gates = [
@@ -5289,28 +5457,39 @@ class EODPipelineStatusService:
             )
             scope_ready = (
                 status in {'completed', 'partial'}
-                and exact_scope_loaded
+                and scope_evidence_loaded
                 and not missing_scope_symbols
-                and scope_category_gate_ready
+                and (
+                    scope_category_gate_ready
+                    if exact_scope_loaded
+                    else gate_status == 'ready'
+                )
             )
             scope_waiting = status in {'pending', 'running', 'waiting'}
             requested_scope_coverage = {
                 'evidence_version': 'pykrx_enrichment_scope_coverage_v1',
-                'authoritative': exact_scope_loaded,
+                'authoritative': scope_evidence_loaded,
+                'evidence_source': (
+                    'run_scope_outcome_manifest'
+                    if exact_scope_loaded
+                    else 'stored_rows'
+                    if stored_row_scope_complete
+                    else None
+                ),
                 'requested_count': requested_scope_count,
                 'present_count': (
                     requested_scope_count - len(missing_scope_symbols)
-                    if exact_scope_loaded
+                    if scope_evidence_loaded
                     else 0
                 ),
                 'missing_count': (
                     len(missing_scope_symbols)
-                    if exact_scope_loaded
+                    if scope_evidence_loaded
                     else requested_scope_count
                 ),
                 'missing_symbols_sample': (
                     missing_scope_symbols
-                    if exact_scope_loaded
+                    if scope_evidence_loaded
                     else normalized_scope_symbols
                 )[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT],
             }
@@ -6544,9 +6723,7 @@ class EODPipelineStatusService:
                     validated_scope_gap.get('decision_ready_count')
                 )
             )
-            failed_blocking_stages = details.get(
-                'failed_blocking_stages'
-            )
+            blocking_stages = details.get('blocking_stages')
             scope_isolated_pending = bool(
                 stage_id in FACTOR_STAGE_SCORE_FIELDS
                 and existing_status == 'pending'
@@ -6556,8 +6733,8 @@ class EODPipelineStatusService:
                 and validated_exact_universe_has_residual_debt
                 and requested_scope_decision_ready_count is not None
                 and requested_scope_decision_ready_count > 0
-                and isinstance(failed_blocking_stages, list)
-                and not failed_blocking_stages
+                and isinstance(blocking_stages, list)
+                and not blocking_stages
             )
             scope_can_isolate_aggregate_gap = (
                 scope_isolated_pending

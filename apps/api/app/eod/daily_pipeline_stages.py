@@ -29,6 +29,7 @@ from app.agent_context.run_modes import (
     FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
 )
 from app.agent_context.signal_decider_loop_service import (
+    SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
     signal_decider_loop_service,
 )
@@ -57,6 +58,7 @@ from app.eod.pykrx_backfill import (
     FEEDBACK_RETRY_PARENT_CONTRACT_VERSION,
     PYKRX_BACKFILL_SERVICE,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.pykrx_enrichment import pykrx_enrichment_service
 from app.eod.pykrx_enrichment_gate import (
     REQUIRED_EXEC_DECIDER_PYKRX_ENRICHMENT_CATEGORIES,
@@ -7474,9 +7476,25 @@ class DailyPipelineStageService:
         call: Callable[[], dict[str, Any]],
         atomic_finalization: bool = False,
     ) -> dict[str, Any]:
+        daily_pipeline_live_progress.publish_substep(
+            step=stage_id,
+            status='running',
+            detail={
+                'scope_symbols': (
+                    len(exact_scope_symbols)
+                    if exact_scope_symbols is not None
+                    else None
+                )
+            },
+        )
         try:
             result = call()
-        except Exception:
+        except Exception as exc:
+            daily_pipeline_live_progress.publish_substep(
+                step=stage_id,
+                status='failed',
+                detail={'error': f'{type(exc).__name__}: {exc}'[:300]},
+            )
             if exact_scope_symbols is not None and not atomic_finalization:
                 DailyPipelineStageService._finalize_exact_scope_or_raise(
                     market_date=market_date,
@@ -7485,6 +7503,16 @@ class DailyPipelineStageService:
                     result=None,
                 )
             raise
+        daily_pipeline_live_progress.publish_substep(
+            step=stage_id,
+            status='completed',
+            result_status=(
+                str(result.get('status') or '')
+                if isinstance(result, dict)
+                else None
+            )
+            or None,
+        )
         if atomic_finalization:
             if exact_scope_symbols is not None:
                 expected_manifest_versions = (
@@ -8139,9 +8167,24 @@ class DailyPipelineStageService:
                 ),
                 atomic_finalization=True,
             )
+            price_scope_invocation = exact_scope_symbols or symbols
+            if price_scope_invocation is None:
+                # Unscoped operator run (e.g. eod-pipeline-run without
+                # --symbols and without price_collection in the same run):
+                # validate against the universe the context rebuild itself
+                # selected, the same rule _combine_technical_scope_outcomes
+                # applies below. A missing manifest still fails closed.
+                selected_context_codes = price_context_result.get(
+                    'selected_stock_codes'
+                )
+                price_scope_invocation = (
+                    selected_context_codes
+                    if isinstance(selected_context_codes, list)
+                    else []
+                )
             price_scope = _validated_exact_scope_outcome(
                 result=price_context_result,
-                invocation_symbols=exact_scope_symbols or symbols,
+                invocation_symbols=price_scope_invocation,
                 status=self._resolve_result_status(price_context_result),
             )
             price_context_successes = (
@@ -8161,6 +8204,9 @@ class DailyPipelineStageService:
                     exact_scope_symbols=exact_scope_symbols,
                     source='stage_orchestrator',
                     run_id=run_id,
+                    progress_callback=(
+                        daily_pipeline_live_progress.thread_stage_progress
+                    ),
                 ),
                 atomic_finalization=True,
             )
@@ -8196,6 +8242,9 @@ class DailyPipelineStageService:
                     exact_scope_symbols=exact_scope_symbols,
                     source='stage_orchestrator',
                     run_id=run_id,
+                    progress_callback=(
+                        daily_pipeline_live_progress.thread_stage_progress
+                    ),
                 ),
                 atomic_finalization=True,
             )
@@ -8555,6 +8604,9 @@ class DailyPipelineStageService:
                         symbols=symbols,
                         display=settings.external_news_default_display,
                         symbol_limit=symbol_limit,
+                        progress_callback=(
+                            daily_pipeline_live_progress.thread_stage_progress
+                        ),
                     )
                 ),
             )
@@ -8889,6 +8941,7 @@ class DailyPipelineStageService:
                 market_date=market_date,
                 fs_div=fs_div,
                 symbols=symbols,
+                required_stage_ids=SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
             )
             if not bypass_prerequisite_gate and not prerequisites['ready']:
                 return self._build_prerequisite_gate_result(

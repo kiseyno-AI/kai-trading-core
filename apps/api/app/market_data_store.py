@@ -103,6 +103,7 @@ from app.scanner.state import scanner_state
 from app.signals.signal_feature_readiness import (
     direct_signal_source_is_decision_usable,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 
 
 EXACT_SCOPE_ROW_LOCAL_ERRORS = (
@@ -3377,7 +3378,15 @@ def compute_and_persist_daily_trending_ranks(
                 },
             }
         )
-    for period in deduped_periods:
+    for period_index, period in enumerate(deduped_periods):
+        daily_pipeline_live_progress.thread_stage_progress(
+            {
+                'processed': period_index,
+                'total': len(deduped_periods),
+                'current_period': period,
+                'current_step': 'compute_trending_period',
+            }
+        )
         if period == '1d':
             items = _load_trending_stocks_from_daily_price_bars(
                 normalized_market_date=normalized_market_date,
