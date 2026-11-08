@@ -7,6 +7,7 @@ from unittest.mock import patch
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 from app.agent_context.feedback_failure_service import AgentContextFeedbackFailureService
+from app.agent_context.feedback_failure_taxonomy import FeedbackFailureKind, classify_feedback_failure
 
 
 class DetachingRow(dict):
@@ -59,6 +60,47 @@ class FakeRowsSession:
 
 
 class AgentContextFeedbackFailureServiceTests(unittest.TestCase):
+    def test_classification_preserves_stored_failure_kinds(self):
+        for failure_kind in FeedbackFailureKind:
+            with self.subTest(failure_kind=failure_kind.value):
+                result = classify_feedback_failure(failure_kind=failure_kind.value)
+
+                self.assertEqual(result.failure_kind, failure_kind.value)
+
+    def test_grouped_summary_preserves_timeout_and_response_contract_statuses(self):
+        expected_statuses = {
+            'openclaw_transport_timeout': 'transport/timeout',
+            'openclaw_response_contract': 'response/contract',
+        }
+        rows = [
+            SimpleNamespace(
+                market_date=date(2026, 4, 14),
+                run_id='run-1',
+                agent_name='signal-decider',
+                failure_kind=failure_kind,
+                retryable=True,
+                symbol='005930',
+                received_at=datetime(2026, 4, 14, 1, 0, tzinfo=timezone.utc),
+                id=index,
+            )
+            for index, failure_kind in enumerate(expected_statuses, start=1)
+        ]
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeRowsSession(rows)
+
+        with patch('app.agent_context.feedback_failure_service.session_scope', fake_session_scope):
+            result = AgentContextFeedbackFailureService().get_grouped_summary(
+                market_date='2026-04-14',
+            )
+
+        self.assertEqual(result['summary']['failure_count'], 2)
+        self.assertEqual(
+            {group['failure_kind']: group['failure_status'] for group in result['groups']},
+            expected_statuses,
+        )
+
     def test_normalize_failure_kind_truncates_long_values(self):
         service = AgentContextFeedbackFailureService()
 
