@@ -551,11 +551,13 @@ class MissingBarProviderValidationTests(unittest.TestCase):
             _extract_symbol_fundamental(
                 _FakeFrame({}, columns=[]),
                 symbol='005930',
+                market_date=date(2026, 9, 9),
             )
         )
         values = _extract_symbol_fundamental(
             _FakeFrame({'2026-09-09': _fundamental_row()}),
             symbol='005930',
+            market_date=date(2026, 9, 9),
         )
         self.assertEqual(values['per'], Decimal('10.5'))
         with self.assertRaisesRegex(ValueError, 'missing columns'):
@@ -565,6 +567,7 @@ class MissingBarProviderValidationTests(unittest.TestCase):
                     columns=['PER'],
                 ),
                 symbol='005930',
+                market_date=date(2026, 9, 9),
             )
 
 
@@ -1241,6 +1244,54 @@ class MissingDailyBarRepairServiceTests(unittest.TestCase):
             bar.symbol: bar for bar in database_calls[0]['bars']
         }
         self.assertIsNone(bars_by_symbol['005930'].per)
+
+    def test_exact_symbol_fundamental_fallback_requires_requested_date(self):
+        codes = {'KOSPI': '005930', 'KOSDAQ': '035720', 'KONEX': '900001'}
+        for returned_date in (
+            '2026-09-09',
+            date(2026, 9, 9),
+            '2026-09-08',
+            '2026-09-10',
+        ):
+            with self.subTest(returned_date=returned_date):
+                database_repairer = MagicMock(
+                    return_value={'status': 'ready', 'applied': False}
+                )
+                symbol_fundamental_loader = MagicMock(
+                    return_value=_FakeFrame({returned_date: _fundamental_row()})
+                )
+                service = MissingDailyBarRepairService(
+                    trade_date_resolver=lambda **_kwargs: '2026-09-09',
+                    market_ohlcv_loader=lambda _date, market: _FakeFrame(
+                        {codes[market]: _ohlcv_row()}
+                    ),
+                    market_fundamental_loader=lambda _date, market: _FakeFrame(
+                        {
+                            '123456' if market == 'KOSPI' else codes[market]:
+                            _fundamental_row()
+                        }
+                    ),
+                    symbol_fundamental_loader=symbol_fundamental_loader,
+                    database_repairer=database_repairer,
+                    security_group_loader=lambda: {
+                        symbol: 'ST' for symbol in codes.values()
+                    },
+                    lock_factory=_available_lock,
+                    minimum_market_membership={market: 1 for market in codes},
+                )
+
+                result = service.repair_for_market_date(market_date='2026-09-09')
+
+                symbol_fundamental_loader.assert_called_once_with('20260909', '005930')
+                if str(returned_date) == '2026-09-09':
+                    self.assertEqual(result['status'], 'ready')
+                    database_repairer.assert_called_once()
+                    bars = {bar.symbol: bar for bar in database_repairer.call_args.kwargs['bars']}
+                    self.assertEqual(bars['005930'].per, Decimal('10.5'))
+                else:
+                    self.assertEqual(result['status'], 'blocked')
+                    self.assertEqual(result['reason'], 'symbol_fundamental_fallback_failed')
+                    database_repairer.assert_not_called()
 
     def test_exact_symbol_fundamental_fallback_error_blocks_repair(self):
         codes = {
