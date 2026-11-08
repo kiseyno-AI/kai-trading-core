@@ -453,6 +453,62 @@ class TradingOrderServiceTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_cancel_rejects_zero_broker_quantity_despite_local_remaining_quantity(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.cancelable_result['output'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'psbl_qty': '0',
+        }]
+
+        with self.assertRaises(TradingOrderValidationError):
+            await self.service.cancel_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                all_remaining=True,
+            )
+
+        self.assertEqual(self.fake_client.cancel_replace_calls, 0)
+        order = load_broker_order(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        self.assertEqual(order['current_status'], 'submitted')
+
+    async def test_amend_rejects_zero_broker_quantity_despite_local_remaining_quantity(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.cancelable_result['output'] = [{
+            'odno': '0000123456', 'pdno': self.symbol, 'psbl_qty': '0',
+        }]
+
+        with self.assertRaises(TradingOrderValidationError):
+            await self.service.amend_order(
+                account_reference=self.account_reference,
+                client_order_id=self.client_order_id,
+                quantity=Decimal('5'),
+                price=Decimal('71000'),
+            )
+
+        self.assertEqual(self.fake_client.cancel_replace_calls, 0)
+        order = load_broker_order(
+            account_reference=self.account_reference, client_order_id=self.client_order_id,
+        )
+        self.assertEqual(order['current_status'], 'submitted')
+
+    async def test_amend_retains_local_quantity_fallback_when_broker_quantity_is_absent(self) -> None:
+        await self._submit_buy_order()
+        self.fake_client.cancelable_result['output'] = [{
+            'odno': '0000123456', 'pdno': self.symbol,
+        }]
+
+        result = await self.service.amend_order(
+            account_reference=self.account_reference,
+            client_order_id=self.client_order_id,
+            quantity=Decimal('5'),
+            price=Decimal('71000'),
+        )
+
+        self.assertEqual(self.fake_client.cancel_replace_calls, 1)
+        self.assertEqual(result['order']['current_status'], 'replace_pending')
+        self.assertEqual(result['order']['requested_quantity'], Decimal('5'))
+
     async def test_cancel_order_sets_cancel_pending_and_persists_request_events(self) -> None:
         await self._submit_buy_order()
         self.fake_client.cancelable_result = {

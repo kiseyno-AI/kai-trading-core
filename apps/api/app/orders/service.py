@@ -265,7 +265,9 @@ class TradingOrderService:
                 ),
             )
 
-        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty')) or _safe_decimal(order_row.get('remaining_quantity'))
+        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty'))
+        if possible_quantity is None:
+            possible_quantity = _safe_decimal(order_row.get('remaining_quantity'))
         if possible_quantity is None or possible_quantity <= Decimal('0'):
             raise TradingOrderValidationError('order has no cancelable quantity remaining')
 
@@ -571,7 +573,9 @@ class TradingOrderService:
         if amended_quantity == _safe_decimal(order_row.get('requested_quantity')) and broker_order_price == (_safe_decimal(order_row.get('requested_price')) or Decimal('0')) and amended_order_type == str(order_row['order_type']):
             raise TradingOrderValidationError('amend request does not change the order quantity, price, or type')
 
-        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty')) or base_quantity
+        possible_quantity = _safe_decimal(cancelable_row.get('psbl_qty'))
+        if possible_quantity is None:
+            possible_quantity = base_quantity
         if possible_quantity is not None and amended_quantity > possible_quantity:
             raise TradingOrderValidationError('amended quantity exceeds KIS amendable quantity')
 
