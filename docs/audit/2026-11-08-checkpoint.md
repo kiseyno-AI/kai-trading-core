@@ -12,7 +12,7 @@ This checkpoint records the interrupted audit and accompanies the README/archite
 - Audited base: [`2322295cdda099367e812b09d4187858434e49fc`](https://github.com/kiseyno-AI/kai-trading-core/commit/2322295cdda099367e812b09d4187858434e49fc).
 - Task branch: `codex/core-deep-audit-20261108`.
 - The baseline was the latest observed `main`, including the 2026-11-08 merged changes and the preceding English architecture documentation merge.
-- The user authorized promotion of the README and connected documentation to `main`. No application/source-code or test change from this audit is included in that promotion. No deployment or live trading action was performed.
+- The user authorized direct promotion of the root `README.md` to `main`. The detailed architecture and audit documents remain on the separate task branch. No application/source-code or test change from this audit is included in the README promotion. No deployment or live trading action was performed.
 
 The tracked-code inventory selected `.py`, `.sh`, `.js`, `.ts`, `.tsx`, `.sql`, `.yml`, `.yaml`, and `.toml` files and counted their lines. Core contained **629 selected files / 555,047 lines**, including **287,778 non-test source/configuration lines**. The test remainder is **267,269 = 555,047 − 287,778**. Generated graph nodes and passing tests do not count as manually inspected source lines.
 
