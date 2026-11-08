@@ -4,7 +4,7 @@ import threading
 import unittest
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from sqlalchemy.exc import IntegrityError
 
@@ -1713,9 +1713,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'run_id': 7,
         }
         rebuild_contexts.assert_called_once_with(**expected_symbol_scope)
-        rebuild_snapshots.assert_called_once_with(**expected_symbol_scope)
+        rebuild_snapshots.assert_called_once_with(
+            **expected_symbol_scope, progress_callback=ANY
+        )
         rebuild_action_summaries.assert_called_once_with(
-            **expected_symbol_scope
+            **expected_symbol_scope,
+            progress_callback=ANY,
         )
         rebuild_trending_ranks.assert_not_called()
 
@@ -2060,6 +2063,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             exact_scope_symbols=None,
             source='stage_orchestrator',
             run_id=None,
+            progress_callback=ANY,
         )
 
     def test_prior_date_recovery_runs_as_of_piotroski_before_factor_chain(
@@ -9652,11 +9656,91 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'run_id': None,
         }
         rebuild_contexts.assert_called_once_with(**expected_scope)
-        rebuild_snapshots.assert_called_once_with(**expected_scope)
+        rebuild_snapshots.assert_called_once_with(
+            **expected_scope, progress_callback=ANY
+        )
         self.assertEqual(result['contexts_persisted'], 2)
         self.assertEqual(result['contexts_failed'], 0)
         self.assertNotIn('items', result['price_contexts'])
         finalize_scope.assert_not_called()
+
+    def test_unscoped_technical_stage_uses_the_context_selected_universe(
+        self,
+    ) -> None:
+        # Regression: `eod-pipeline-run --stages technical_snapshots,...`
+        # without --symbols and without price_collection in the same run
+        # crashed with "'NoneType' object is not iterable".
+        service = DailyPipelineStageService()
+        universe = ['005930', '000660', '035420']
+        with (
+            patch(
+                'app.eod.daily_pipeline_stages.daily_price_context_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'contexts_persisted': 2,
+                    'contexts_failed': 1,
+                    **_build_exact_scope_outcome(
+                        manifest_version='price_contexts_scope_outcomes_v1',
+                        selected_symbols=universe,
+                        successful_symbols=['005930', '035420'],
+                        retry_debt_symbols=['000660'],
+                    ),
+                },
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.daily_technical_snapshot_service.'
+                'rebuild_for_market_date',
+                return_value={
+                    'snapshots_persisted': 2,
+                    'snapshots_failed': 0,
+                    **_build_exact_scope_outcome(
+                        manifest_version='technical_snapshots_scope_outcomes_v1',
+                        selected_symbols=['005930', '035420'],
+                        successful_symbols=['005930', '035420'],
+                        retry_debt_symbols=[],
+                    ),
+                },
+            ) as rebuild_snapshots,
+            patch(
+                'app.eod.daily_pipeline_stages._finalize_daily_stage_scope',
+                return_value={'ready': True, 'deleted_stale_row_count': 0},
+            ),
+        ):
+            result = service._execute_stage(
+                stage_id='technical_snapshots',
+                market_date='2026-04-24',
+                symbols=None,
+                markets=['KOSPI'],
+                force=False,
+                bypass_prerequisite_gate=False,
+                fs_div='CFS',
+                symbol_limit=None,
+                symbol_offset=0,
+                capture_limit=500,
+                retry_cycles=None,
+                feedback_max_cycles=3,
+                feedback_outer_batch_size=20,
+                reuse_existing_feedback=True,
+            )
+
+        # Only the proven context successes reach the snapshot rebuild.
+        self.assertEqual(
+            rebuild_snapshots.call_args.kwargs['symbols'],
+            ['005930', '035420'],
+        )
+        self.assertEqual(result['contexts_persisted'], 2)
+
+    def test_scope_normalizer_fails_closed_on_missing_scope(self) -> None:
+        from app.eod.pykrx_pipeline_runner import (
+            _normalize_krx_symbol_sequence,
+        )
+
+        self.assertIsNone(_normalize_krx_symbol_sequence(None))
+        self.assertIsNone(_normalize_krx_symbol_sequence('005930'))
+        self.assertEqual(
+            _normalize_krx_symbol_sequence(['005930']),
+            ['005930'],
+        )
 
     def test_resumed_technical_stage_advances_only_combined_exact_successes(
         self,
@@ -9834,6 +9918,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             exact_scope_symbols=['005930', '000660'],
             source='stage_orchestrator',
             run_id=None,
+            progress_callback=ANY,
         )
         finalize_scope.assert_not_called()
         self.assertEqual(

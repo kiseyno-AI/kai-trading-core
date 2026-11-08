@@ -67,6 +67,7 @@ from app.market_data_store import (
     load_symbols,
 )
 from app.signals.momentum_factor import enrich_momentum_audit_fields
+from app.core.numbers import finite_float as _to_float
 
 PersistedFactorReadResultT = TypeVar('PersistedFactorReadResultT')
 
@@ -1400,22 +1401,6 @@ def _to_int(value: Any) -> int | None:
             return None
         try:
             return int(float(text))
-        except ValueError:
-            return None
-    return None
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip().replace(',', '')
-        if not text:
-            return None
-        try:
-            return float(text)
         except ValueError:
             return None
     return None

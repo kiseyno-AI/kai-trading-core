@@ -118,6 +118,7 @@ from app.agent_context.run_state_service import agent_context_feedback_run_state
 from app.agent_context.response_contract import (
     build_agent_contract_provenance,
     build_contract_prompt_suffix,
+    decode_agent_json_object_with_structure_repair,
     decode_strict_agent_json_object,
     normalize_agent_response,
 )
@@ -491,6 +492,10 @@ class AgentDispatchSpec:
 
 UPSTREAM_SUMMARY_ROLES: tuple[str, ...] = SUMMARIZER_AGENT_NAMES
 OPENCLAW_BATCH_RESPONSE_TOOL_NAME = 'submit_agent_feedback_batch'
+# Summarizer batches may be served by a runtime that returns the envelope as
+# plain text (e.g. the Claude Code CLI fallback). Only these roles get the
+# narrow structure repair; decider output stays strictly fail-closed.
+JSON_STRUCTURE_REPAIR_ROLES: frozenset[str] = frozenset(SUMMARIZER_AGENT_NAMES)
 
 
 DISPATCH_SPECS: tuple[AgentDispatchSpec, ...] = (
@@ -3119,6 +3124,32 @@ class OpenClawAgentClient:
                         f"OpenClaw batch ended with status={parsed.get('status')}"
                     )
                 decoded, json_failure_class = self._decode_candidate_json(output_text)
+                if (
+                    decoded is None
+                    and json_failure_class == 'json_decode_error'
+                    and spec.role in JSON_STRUCTURE_REPAIR_ROLES
+                ):
+                    (
+                        decoded,
+                        json_failure_class,
+                        json_structure_repair,
+                    ) = decode_agent_json_object_with_structure_repair(output_text)
+                    if json_structure_repair is not None:
+                        request_provenance['json_structure_repair'] = json_structure_repair
+                        log_agent_feedback_event(
+                            'dispatch_batch_json_structure_repaired',
+                            status='repaired',
+                            request_run_id=request_run_id,
+                            dispatch_id=dispatch_id,
+                            attempt_id=attempt_id,
+                            agent_name=spec.agent_name,
+                            role=spec.role,
+                            market_date=market_date.isoformat(),
+                            session_key=request_session_key,
+                            batch_symbols=batch_symbols,
+                            slot=slot,
+                            json_structure_repair=json_structure_repair,
+                        )
                 decoded_source = (
                     'function_call_arguments'
                     if function_call_seen
