@@ -18,7 +18,7 @@ def load(path: Path) -> dict:
 
 
 class LocalLoopSafetyTests(unittest.TestCase):
-    """The loop runs on the owner's Mac through launchd, never on GitHub Actions."""
+    """The loop runs on the owner's Mac from Core's background runner, never on GitHub Actions."""
 
     def test_the_lab_is_not_a_github_workflow_anymore(self) -> None:
         self.assertFalse(LAB.exists())
@@ -43,10 +43,9 @@ class LocalLoopSafetyTests(unittest.TestCase):
         self.assertIn('.done-$WEEK', text)
         self.assertIn('--force', text)
 
-    def test_launchd_template_points_at_the_local_script(self) -> None:
-        plist = (ROOT / 'scripts' / 'launchd' / 'com.kai.agent-improvement.plist.template').read_text()
-        self.assertIn('__ROOT__/scripts/run_agent_improvement_local.sh', plist)
-        self.assertIn('<key>StartInterval</key><integer>3600</integer>', plist)
+    def test_no_separate_launchd_job_any_more(self) -> None:
+        self.assertFalse((ROOT / 'scripts' / 'install_agent_improvement_launchd.sh').exists())
+        self.assertFalse((ROOT / 'scripts' / 'launchd' / 'com.kai.agent-improvement.plist.template').exists())
 
 
 class GuardWorkflowTests(unittest.TestCase):

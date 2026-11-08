@@ -1,7 +1,8 @@
 #!/bin/bash
 # Weekly signal lab + agent calibration, run on this Mac (not on GitHub Actions).
-# launchd calls this every hour; it does real work once per ISO week, on Saturday
-# from 09:00 KST, using the live main checkout. Numbers stay under var/alpha-lab.
+# Core's background runner starts it (app/analytics/improvement_loop_schedule.py);
+# it does real work once per ISO week, on Saturday from 09:00 KST, using the live
+# main checkout. Numbers stay under var/alpha-lab.
 # Applying (branch + PR + issues) is opt-in: set AGENT_RULES_AUTO_PR=true in
 # var/alpha-lab/loop.env, or pass --apply. Pass --force to ignore the schedule.
 set -u
