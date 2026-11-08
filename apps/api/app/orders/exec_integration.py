@@ -4965,20 +4965,22 @@ class SignalDeciderExecIntegrationService:
                 await synchronize_buy_authority_if_needed()
                 reconciliation_buy_authority_sync = buy_authority_sync
 
-        try:
-            await self._reconcile_pending_dispatch_write_ahead(
-                target_trade_date=resolved_target_date,
-                account_reference=resolved_account_reference,
-                integration=integration,
-                buy_authority_sync=reconciliation_buy_authority_sync,
-                trigger=trigger,
-            )
-        except Exception:
-            # Before this ordering fix, authority had already been synchronized
-            # here. Preserve that fail-closed operational guarantee on an
-            # unexpected pre-refresh reconciliation failure.
-            await synchronize_buy_authority_if_needed()
-            raise
+        if not resolved_dry_run:
+            # Recovery can resend or activate a plan, so it shares the dry-run fence.
+            try:
+                await self._reconcile_pending_dispatch_write_ahead(
+                    target_trade_date=resolved_target_date,
+                    account_reference=resolved_account_reference,
+                    integration=integration,
+                    buy_authority_sync=reconciliation_buy_authority_sync,
+                    trigger=trigger,
+                )
+            except Exception:
+                # Before this ordering fix, authority had already been synchronized
+                # here. Preserve that fail-closed operational guarantee on an
+                # unexpected pre-refresh reconciliation failure.
+                await synchronize_buy_authority_if_needed()
+                raise
         managed_delegated_authority = bool(
             execution_control_disabled
             and self.should_manage_delegated_authority(
@@ -5207,13 +5209,14 @@ class SignalDeciderExecIntegrationService:
             # minutes of source validation. Bind Exec to that final evidence,
             # not to the cache generation that existed before planning began.
             await synchronize_buy_authority_if_needed()
-            await self._reconcile_pending_dispatch_write_ahead(
-                target_trade_date=resolved_target_date,
-                account_reference=resolved_account_reference,
-                integration=integration,
-                buy_authority_sync=buy_authority_sync,
-                trigger=f'{trigger}_post_refresh_authority',
-            )
+            if not resolved_dry_run:
+                await self._reconcile_pending_dispatch_write_ahead(
+                    target_trade_date=resolved_target_date,
+                    account_reference=resolved_account_reference,
+                    integration=integration,
+                    buy_authority_sync=buy_authority_sync,
+                    trigger=f'{trigger}_post_refresh_authority',
+                )
 
         if enrichment_preflight is not None and not force and not enrichment_preflight.get('allowed'):
             existing_rows = self._load_next_open_rows(
