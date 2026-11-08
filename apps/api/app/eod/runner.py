@@ -47,6 +47,8 @@ DAILY_BAR_RECONCILIATION_STEP = 'daily_bar_reconciliation'
 # The job is a cheap no-op once a session is settled; this only spaces out retries
 # when the KIS reference could not be read.
 DAILY_BAR_RECONCILIATION_MIN_INTERVAL = timedelta(minutes=30)
+AGENT_IMPROVEMENT_LOOP_STEP = 'agent_improvement_loop'
+AGENT_IMPROVEMENT_LOOP_CHECK_INTERVAL = timedelta(hours=1)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
@@ -85,6 +87,7 @@ class EODBackgroundRunner:
         self._last_daily_coverage_alert_key: tuple | None = None
         self._last_daily_bar_reconciliation_at: datetime | None = None
         self._daily_bar_reconciliation: dict | None = None
+        self._last_agent_improvement_check_at: datetime | None = None
 
     def snapshot(self, *, now: datetime | None = None) -> dict:
         current = now or datetime.now(timezone.utc)
@@ -380,6 +383,26 @@ class EODBackgroundRunner:
             DAILY_BAR_RECONCILIATION_STEP,
             self._reconcile_daily_bars_sync,
         )
+
+    def _agent_improvement_loop_due(self, *, now: datetime | None = None) -> bool:
+        if not settings.agent_improvement_loop_enabled:
+            return False
+        current = now or datetime.now(timezone.utc)
+        if (
+            self._last_agent_improvement_check_at is not None
+            and current - self._last_agent_improvement_check_at < AGENT_IMPROVEMENT_LOOP_CHECK_INTERVAL
+        ):
+            return False
+        self._last_agent_improvement_check_at = current
+        from app.analytics.improvement_loop_schedule import is_due
+
+        return is_due(current)
+
+    def _start_agent_improvement_loop(self) -> None:
+        # Signal lab plus a Codex edit runs for many minutes: never hold the tick.
+        from app.analytics.improvement_loop_schedule import run
+
+        self._start_background_thread_step(AGENT_IMPROVEMENT_LOOP_STEP, run)
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -939,6 +962,8 @@ class EODBackgroundRunner:
                         await self._run_daily_coverage_audit()
                     if self._daily_bar_reconciliation_due(market):
                         self._start_daily_bar_reconciliation()
+                    if self._agent_improvement_loop_due():
+                        self._start_agent_improvement_loop()
             except Exception as exc:
                 tick_failed = True
                 self._last_tick_error = {

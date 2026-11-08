@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # with Naver's regular-session daily chart (one spaced request per sampled symbol)
     # and warn on a price difference (see app/eod/daily_bar_reconciliation.py). Read-only.
     daily_bar_reconciliation_enabled: bool = True
+    # Weekly agent improvement loop (docs/AGENT_IMPROVEMENT_LOOP.md), started by the
+    # background runner on Saturday from 09:00 KST, once per ISO week.
+    agent_improvement_loop_enabled: bool = True
     daily_bar_reconciliation_sample_size: int = Field(default=200, ge=1, le=3000)
 
     db_auto_upgrade: bool = True
