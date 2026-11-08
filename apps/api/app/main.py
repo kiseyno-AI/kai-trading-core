@@ -74,6 +74,12 @@ def _resolve_request_id(raw_value: str | None) -> str:
     return str(uuid.uuid4())
 
 
+def _cors_allowed_origins(raw_value: str | None) -> list[str]:
+    """Parse CORS_ALLOWED_ORIGINS; an empty value keeps the permissive default."""
+    origins = [item.strip() for item in (raw_value or '').split(',') if item.strip()]
+    return origins or ['*']
+
+
 async def _run_startup_maintenance_step(name: str, factory: Callable[[], Awaitable[object]]) -> None:
     try:
         await asyncio.wait_for(factory(), timeout=STARTUP_MAINTENANCE_TIMEOUT_SECONDS)
@@ -166,7 +172,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title=settings.app_name, debug=settings.app_debug, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=_cors_allowed_origins(settings.cors_allowed_origins),
     allow_credentials=False,
     allow_methods=['*'],
     allow_headers=['*'],
