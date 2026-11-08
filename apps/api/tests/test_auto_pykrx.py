@@ -19777,6 +19777,14 @@ class PykrxBackfillServiceTests(TestCase):
                 return_value=_point_in_time_universe_snapshot(symbols),
             ),
             patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+            patch(
+                'app.eod.pykrx_backfill._get_market_fundamental_by_date',
+                return_value=pd.DataFrame(),
+            ) as fundamentals,
+            patch(
+                'app.eod.pykrx_backfill._get_market_ohlcv_by_ticker',
+                return_value=pd.DataFrame({'거래대금': [4]}, index=['005930']),
+            ) as market_ohlcv,
             patch.object(service, '_map_symbol_bars', return_value=[{
                 'trade_date': '2026-04-03',
                 'open_price': 1,
@@ -19863,6 +19871,8 @@ class PykrxBackfillServiceTests(TestCase):
             )
 
         self.assertEqual(result['status'], 'completed_with_errors')
+        fundamentals.assert_called_once_with('20260403', '20260403', '005930')
+        market_ohlcv.assert_called_once_with('20260403', 'KOSPI')
         rebuild_action_summaries.assert_not_called()
         self.assertEqual(result['action_summaries']['status'], 'skipped')
         self.assertEqual(
