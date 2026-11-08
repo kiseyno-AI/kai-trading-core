@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import functools
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +26,7 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_prefix_outcome_is_satisfied,
@@ -606,6 +608,58 @@ def _log_run_finish(run: Mapping[str, Any]) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+def _publish_live_run(method):
+    """Mirror a run row into the DB-free live progress feed after commit."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        daily_pipeline_live_progress.publish_run(result)
+        return result
+
+    return wrapper
+
+
+def _publish_live_stage(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        daily_pipeline_live_progress.publish_stage(result)
+        return result
+
+    return wrapper
+
+
+def _publish_live_heartbeat(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        daily_pipeline_live_progress.publish_heartbeat(
+            pipeline_run_id=kwargs.get('pipeline_run_id'),
+            stage_id=str(kwargs.get('stage_id') or ''),
+            alive=bool(result),
+        )
+        return result
+
+    return wrapper
+
+
+def _publish_live_interruptions(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        if isinstance(result, Mapping):
+            for run_id in result.get('run_ids') or []:
+                daily_pipeline_live_progress.publish_run(
+                    {
+                        'id': run_id,
+                        'status': 'interrupted',
+                        'error_message': kwargs.get('reason'),
+                    }
+                )
+        return result
+
+    return wrapper
 
 
 class DailyPipelineRunStateService:
@@ -705,6 +759,7 @@ class DailyPipelineRunStateService:
             repaired_count += 1
         return repaired_count
 
+    @_publish_live_run
     def start_run(
         self,
         *,
@@ -980,6 +1035,7 @@ class DailyPipelineRunStateService:
         _log_stage_transition('start', stage)
         return stage
 
+    @_publish_live_stage
     def update_stage(
         self,
         *,
@@ -1143,6 +1199,7 @@ class DailyPipelineRunStateService:
             session.flush()
             return self._serialize_stage(row)
 
+    @_publish_live_heartbeat
     def heartbeat_stage(
         self,
         *,
@@ -1231,6 +1288,7 @@ class DailyPipelineRunStateService:
         _log_stage_transition('finish', stage)
         return stage
 
+    @_publish_live_run
     def finish_run(
         self,
         *,
@@ -4853,6 +4911,7 @@ class DailyPipelineRunStateService:
             'eod_run_id': int(eod_run_id),
         }
 
+    @_publish_live_interruptions
     def mark_active_runs_interrupted(
         self,
         *,
