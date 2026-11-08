@@ -272,7 +272,7 @@ def main(
         sys.stdout.write(json.dumps(reports, ensure_ascii=False, indent=2) + '\n')
     else:
         sys.stdout.write(render_text(reports))
-    return EXIT_OK if all(report['status'] == 'ok' for report in reports) else EXIT_DEGRADED
+    return EXIT_OK if reports and all(report['status'] == 'ok' for report in reports) else EXIT_DEGRADED
 
 
 if __name__ == '__main__':
