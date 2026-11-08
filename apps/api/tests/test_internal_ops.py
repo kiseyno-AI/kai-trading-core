@@ -2262,6 +2262,27 @@ class InternalOpsTests(unittest.TestCase):
         self.assertEqual(run_stages.call_args.kwargs['feedback_max_cycles'], 4)
         self.assertFalse(run_stages.call_args.kwargs['reuse_existing_feedback'])
 
+    def test_blank_explicit_pipeline_scope_is_rejected_before_admission(self) -> None:
+        with (
+            patch('app.internal.ops.bootstrap_runtime'),
+            patch.object(
+                ops.daily_pipeline_stage_service.run_state_service,
+                'start_run',
+                side_effect=AssertionError('invalid scope reached run admission'),
+            ) as start_run,
+        ):
+            for symbols in ('', ' ', ','):
+                with self.subTest(symbols=symbols), self.assertRaisesRegex(
+                    ValueError, 'invalid KRX symbol'
+                ):
+                    ops.run_daily_pipeline_stages(
+                        market_date='2026-04-14',
+                        stages='value_factors',
+                        symbols=symbols,
+                    )
+
+            start_run.assert_not_called()
+
     def test_compute_signal_decider_evaluations_uses_direct_service_call(self) -> None:
         with (
             patch('app.internal.ops.bootstrap_runtime') as bootstrap_runtime,
