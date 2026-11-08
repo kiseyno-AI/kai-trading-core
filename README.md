@@ -4,6 +4,8 @@ Strategy, market-data, decision-support, and read-API service for the KAI tradin
 
 Core collects and normalizes market/fundamental data, builds deterministic factors and agent context, evaluates decision policies, and produces execution plans. The separate `kai-trading-exec` service owns the always-on broker execution loop and execution truth.
 
+**Start here:** [Quickstart](#quickstart) · [System architecture](#architecture-and-data-flow) · [Feature diagrams](#feature-diagrams) · [Graphify source graph](#graphify-source-graph) · [HTTP API](#http-api) · [Operations](#operations)
+
 ## Quickstart
 
 The application root is `apps/api`; the Python import root is `app`. Python 3.11 is the primary local runtime, and CI also verifies Python 3.12. The launcher prefers `PYTHON_BIN`, then the active virtual environment, then `apps/api/.venv/bin/python`, and finally `python3.11` on `PATH`.
@@ -60,7 +62,8 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ## Safety
 
 - KIS uses mock trading by default (`KIS_USE_MOCK=true`). Do not set it to `false` until the production account, credentials, account references, and operational runbook have been verified.
-- US-equity collection, screening, and agent planning are available, but the Core-to-Exec USD handoff is preview-only. `US_EQUITY_EXECUTION_ENABLED` cannot override that safety boundary until Exec advertises and enforces currency-aware USD sizing; non-preview requests fail before any Exec client call.
+- US-equity collection, screening, and agent planning are available, but the Core-to-Exec USD handoff is preview-only. `US_EQUITY_EXECUTION_ENABLED` cannot override that boundary: the current plan builder returns `execution_supported=false` and no dispatch payload. Enabling USD handoff requires a Core implementation/contract change as well as compatible Exec sizing; non-empty live dispatch requests fail before any Exec client call. See the [US execution boundary](docs/architecture/README.md#us-equities).
+- Direct domestic buy, sell, and amend APIs are disabled by default (`TRADING_DIRECT_ORDER_API_ENABLED=false`). Cancel remains available, and internal compatibility callers have separate controls. See the [direct order boundary](docs/architecture/README.md#orders).
 - Core-to-Exec dispatch currently supports one explicit account target per Exec base URL. Dispatch mode fails closed with `multi_account_exec_endpoint_unsupported` when multiple targets are configured. Live runtime additionally requires exactly one explicit valid KIS target and exact row-to-target binding; an empty, invalid, mismatched, or synthetic `KIS:00000000-00` route fails before any Exec POST with `live_exec_account_target_required`. The synthetic route remains available only for mock/paper dispatch and monitor-only planning, while disabled/planning-only mode may still materialize multi-account plans.
 - Live next-open buys do not trust an agent-reported return by itself. Core accepts `quote_spread_bps` only from a current executable snapshot whose timezone-aware timestamp is no older than `KIS_REALTIME_PRICE_STALE_AFTER_SECONDS` (default `30`, startup-validated range `>0` to `300`) and is not future-dated. When both quote-cache and intraday bundles are coherent, Core selects the freshest canonical, same-market-date provider bundle and never mixes their fields. The provider/source-table set must exactly match the selected quote or intraday context, and current price, bid, ask, spread points, and spread bps must all come from that one context and form a positive coherent book. Completed-EOD prices remain valid references but their spreads are never execution-cost evidence. Slippage cost reduces reward and increases loss. Missing, negative, non-finite, out-of-range, stale, future-dated, date-mismatched, mixed-source, or unrecognized evidence fails closed. A canonical completed-EOD snapshot may enter `pending_live_cost_confirmation` only in Exec dispatch mode, where Core uses gross economics solely for pre-screening and Exec must re-price and pass its final full-cost check. Core-local signal-decider next-open buys remain disabled in every integration mode because that path has no execution-time quote recheck; the server-owned `SIGNAL_DECIDER_NEXT_OPEN_NON_SPREAD_ROUND_TRIP_COST_BPS` allowance cannot substitute for spread evidence.
 - The KRX next-open planner accepts only snapshots whose canonical symbol context explicitly identifies `KRX`, `KOSPI`, `KOSDAQ`, or `KONEX`; missing, US, unknown, or conflicting market claims are excluded. Every non-terminal pre-open row is re-evaluated against current bars, enrichment, policy state, account targets, and startup-validated finite thresholds before dispatch. Terminal rows remain immutable audit history.
@@ -84,23 +87,266 @@ Core is designed to stay available continuously, but an Exec process must remain
 
 ## Architecture and data flow
 
-The backend is a FastAPI modular monolith backed by SQLAlchemy and Alembic. Its main flow is:
+The backend is a **FastAPI modular monolith** with PostgreSQL, SQLAlchemy, and Alembic. HTTP routers, local operator commands, and background jobs share domain services in `apps/api/app`. Core persists market facts and decision evidence, builds plans, and reconciles execution readbacks. OpenClaw provides agent inference; Exec owns the delegated broker lifecycle. The Web UI is maintained in a separate repository.
 
-```text
-KIS / pykrx / DART / SEC / macro / news
-                  |
-                  v
-       normalized persisted facts
-                  |
-                  v
- technical + fundamental + risk factors
-                  |
-                  v
- agent context -> summarizers/deciders -> evaluations/policies
-                  |
-                  v
-        execution plan / Exec handoff
-```
+The diagrams below were verified against source snapshot [`5a0ce6b4260d`](https://github.com/kiseyno-AI/kai-trading-core/tree/5a0ce6b4260d47c7cc8177f67be5b29f1811f2c7). They describe implementation boundaries, not a measurement of deployed services. The [architecture catalog](docs/architecture/README.md) contains every diagram's notes and pinned code references.
+
+### System boundary
+
+![KAI Trading Core system boundaries](docs/architecture/diagrams/system.svg)
+
+Solid connectors show data or calls; dashed connectors identify conditional/compatibility paths. Two-ended connectors combine requests with responses or readback. The dashed Exec-to-KIS edge is the contract Core expects; Exec's internal implementation is outside this source review. [Implementation evidence](docs/architecture/README.md#system).
+
+### Responsibilities and durable outputs
+
+| Layer | What it does | Durable output or read model | Implementation |
+| --- | --- | --- | --- |
+| Collection | Normalizes KIS, PyKRX/KRX, DART, SEC, news, macro, FX, and public crypto data | Symbol membership, quotes, daily bars, disclosures, fundamentals, external evidence | [Market data](docs/architecture/README.md#market-discovery), [EOD](docs/architecture/README.md#eod-price), [DART](docs/architecture/README.md#dart) |
+| Deterministic analysis | Computes technical/action summaries, factors, market-risk filters, and screening | Date-bound factor and risk snapshots with source/freshness metadata | [Derived data](docs/architecture/README.md#eod-derived) |
+| Decision support | Assembles symbol-day evidence, requests summaries and decisions, validates responses | Request/response payloads, latest feedback, immutable decision snapshots, durable run lineage | [Context](docs/architecture/README.md#context), [Feedback](docs/architecture/README.md#feedback) |
+| Planning and handoff | Applies current evidence and account gates, registers plans, activates accepted contracts, reads back state | Next-open plans, dispatch write-ahead records, ACK identities, execution projections | [Exec integration](docs/architecture/README.md#execution) |
+| Evaluation and improvement | Scores stored decisions, publishes advisory learning, replays candidate policies, proposes bounded contract changes | Evaluations, hash-verified weekly artifacts, replay evidence, research reports and reviewable PRs | [Learning](docs/architecture/README.md#learning), [Policy](docs/architecture/README.md#policy), [Improvement](docs/architecture/README.md#agent-improvement) |
+
+Persistence is part of the control flow. Startup checks database readiness and pending price-bar repair batches before starting background/realtime services, then reconciles interrupted work and restores tracked symbols. Optional startup maintenance and schedulers are controlled by settings. Redis, Parquet/DuckDB, and vectorbt remain roadmap items. [Runtime evidence](docs/architecture/README.md#runtime).
+
+### Agent decision flow
+
+![Three summarizer roles feeding two independent decision lanes](docs/architecture/diagrams/agents.svg)
+
+The `eod-summarizer`, `technical-summarizer`, and `fundamental-summarizer` supply the evidence required by both `short-term-decider` and `signal-decider`. The two deciders remain independent decision lanes. Dispatch currently advances through roles in order; symbol chunks within a role may run concurrently. OpenClaw returns structured tool responses through `/v1/responses`; this is not an HTTP feedback callback. Core validates and persists those results before they become planning evidence. [Agent flow](docs/architecture/README.md#agents) · [Validation and retry lineage](docs/architecture/README.md#feedback).
+
+### Execution authority and readback
+
+![KR execution plan registration, activation and reconciliation](docs/architecture/diagrams/execution.svg)
+
+Plan registration and execution activation are separate boundaries. Core validates the destination, persists dispatch intent, sends the plan, stores the accepted ACK identity, and only then follows the activation contract. Later plans, orders, executions, and positions must match the original destination and accepted identifiers. **Core-local next-open BUY candidates are empty in every mode**; disabling Exec handoff does not enable a local buy fallback. The retained direct-order and auto-sell compatibility paths have their own controls. [Handoff evidence](docs/architecture/README.md#execution) · [Direct orders](docs/architecture/README.md#orders) · [Auto-sell](docs/architecture/README.md#auto-sell).
+
+### Feature diagrams
+
+The complete catalog covers the 18 registered router modules and their 175 route decorators, plus background jobs, research CLIs, and repair tooling. The count excludes `/health` and FastAPI-generated documentation routes. [Router coverage and counting scope](docs/architecture/README.md#http-surface-coverage).
+
+<!-- FEATURE_DIAGRAMS_START -->
+
+<details>
+<summary>Runtime and API layers</summary>
+
+#### Core layers and startup
+
+HTTP requests and background jobs use domain services in one Python application. SQLAlchemy manages persistence; startup checks database and repair readiness before starting realtime and scheduled work.
+
+![Core layers and startup](docs/architecture/diagrams/runtime.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#runtime).
+
+</details>
+
+<details>
+<summary>Korean market data and discovery</summary>
+
+#### Korean symbols, favorites and scanners
+
+Symbol search, stored daily rankings and realtime rankings use separate inputs. Realtime ranking results use an in-process TTL cache.
+
+![Korean symbols, favorites and scanners](docs/architecture/diagrams/market-discovery.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#market-discovery).
+
+#### Korean quotes and fallbacks
+
+Market state and data availability select the response. If a live quote is unavailable, QuoteService checks a usable daily bar and then same-day quote caches.
+
+![Korean quotes and fallbacks](docs/architecture/diagrams/quotes.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#quotes).
+
+#### Market snapshots and FX
+
+KRX session state drives snapshot refreshes. KIS index and investor-flow observations are combined with optional USD/KRW data; FX also has a standalone read API.
+
+![Market snapshots and FX](docs/architecture/diagrams/market-fx.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#market-fx).
+
+</details>
+
+<details>
+<summary>EOD, disclosures and data repair</summary>
+
+#### Korean EOD execution and recovery
+
+The automatic scheduler enters PykrxBackfillService. The stage API enters DailyPipelineStageService directly; grouped price stages reuse the same PyKRX collection runner.
+
+![Korean EOD execution and recovery](docs/architecture/diagrams/eod-orchestration.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#eod-orchestration).
+
+#### Daily price collection priority
+
+For daily_auto and daily_stage_run, collection first tries the official market-wide frame cached by market and date. An unusable symbol row falls back to the per-symbol history endpoint.
+
+![Daily price collection priority](docs/architecture/diagrams/eod-price.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#eod-price).
+
+#### EOD derived data and factor inputs
+
+Stored prices, PyKRX enrichment and DART fundamentals feed deterministic analysis. Signal features incorporate market-risk, Piotroski and factor results.
+
+![EOD derived data and factor inputs](docs/architecture/diagrams/eod-derived.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#eod-derived).
+
+#### DART incremental fundamentals
+
+Daily refresh scopes corporations and receipt dates, synchronizes disclosures, and captures eligible events. Snapshot rows and successful event status are published in one transaction.
+
+![DART incremental fundamentals](docs/architecture/diagrams/dart.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#dart).
+
+#### Gap filling and audited price repair
+
+Gap filling is opt-in and report-only unless apply is enabled. Manual price restatement has separate evidence gates; applied rewrites create pending batches that block startup until required rebuilds are verified and completed.
+
+![Gap filling and audited price repair](docs/architecture/diagrams/data-repair.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#data-repair).
+
+</details>
+
+<details>
+<summary>Decision evidence and feedback</summary>
+
+#### External news and macro evidence
+
+Symbol news, topic news and macro observations use separate collection and storage paths. Their actual consumers are shown independently from the generic external-context foundation.
+
+![External news and macro evidence](docs/architecture/diagrams/external-evidence.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#external-evidence).
+
+#### Per-symbol decision context
+
+Stored price, technical, factor, financial, news and macro evidence is read for the requested symbol and market date. Coverage, provenance and signal envelopes accompany the agent payload.
+
+![Per-symbol decision context](docs/architecture/diagrams/context.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#context).
+
+#### Response validation, retries and history
+
+Retries preserve parent/child run identity and exact role/symbol scopes. Mutable latest feedback and immutable decision snapshots serve different persistence and audit purposes.
+
+![Response validation, retries and history](docs/architecture/diagrams/feedback.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#feedback).
+
+</details>
+
+<details>
+<summary>Order compatibility and observability</summary>
+
+#### Direct domestic orders and reconciliation
+
+Direct buy, sell and amend routes are disabled by default. When explicitly enabled, they use the durable domestic KIS order service. Matched order notices and broker inquiries reconcile persisted order state.
+
+![Direct domestic orders and reconciliation](docs/architecture/diagrams/orders.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#orders).
+
+#### Compatibility auto-sell from linked positions
+
+Sellable account quantities and linked entry tranches produce watch rows. Observed prices are checked against target and stop thresholds before a dry-run record or an internal compatibility sell submission.
+
+![Compatibility auto-sell from linked positions](docs/architecture/diagrams/auto-sell.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#auto-sell).
+
+#### Execution, price and portfolio read models
+
+Core provides JSON and SSE for external operator clients. Account summaries, persisted Exec readback and WebSocket prices remain distinct read models with their own caches and refresh behavior.
+
+![Execution, price and portfolio read models](docs/architecture/diagrams/monitoring.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#monitoring).
+
+#### Account inquiries and broker operations
+
+Account queries expose summaries, positions and buying power. Broker operations provide local health metadata, authorized token operations, quote queries and intraday snapshot collection and inspection.
+
+![Account inquiries and broker operations](docs/architecture/diagrams/operations.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#operations).
+
+</details>
+
+<details>
+<summary>Evaluation, policy and controlled improvement</summary>
+
+#### Evaluation and weekly advisory feedback
+
+Stored decisions are evaluated against subsequent prices. Mature evaluation cohorts and eligible actual execution evidence feed an immutable weekly artifact whose criteria can inform later decisions.
+
+![Evaluation and weekly advisory feedback](docs/architecture/diagrams/learning.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#learning).
+
+#### Candidate policy replay and activation
+
+Calibration candidates pass through explicit replay and activation. Before promoting a new candidate, the server reruns the replay and validates the submitted evidence.
+
+![Candidate policy replay and activation](docs/architecture/diagrams/policy.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#policy).
+
+#### Read-only signal evaluation lab
+
+Stored KRX bars, factor scores and timestamped agent observations form a shared evaluation panel. Pure scoring functions test rank evidence and non-overlapping top-k returns, then the CLI writes local research reports.
+
+![Read-only signal evaluation lab](docs/architecture/diagrams/signal-lab.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#signal-lab).
+
+#### Guarded weekly agent improvement
+
+An optional local schedule runs the signal lab and deterministic findings. Dry-run is the default; opt-in application can propose bounded decider calibration notes by pull request or open deduplicated code issues.
+
+![Guarded weekly agent improvement](docs/architecture/diagrams/agent-improvement.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#agent-improvement).
+
+</details>
+
+<details>
+<summary>US equities and crypto</summary>
+
+#### US equity pipeline and execution boundary
+
+The US scheduler runs universe refresh, price screening, SEC screening, agent analysis and execution planning in order. This plan-service path currently produces previews only.
+
+![US equity pipeline and execution boundary](docs/architecture/diagrams/us-equities.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#us-equities).
+
+#### Crypto quotes and analysis context
+
+Crypto reads public Upbit quotations and derives deterministic analysis context. This module provides research and decision support without private-account access or order submission.
+
+![Crypto quotes and analysis context](docs/architecture/diagrams/crypto.svg)
+
+[Boundaries and implementation evidence](docs/architecture/README.md#crypto).
+
+</details>
+
+<!-- FEATURE_DIAGRAMS_END -->
+
+### Graphify source graph
+
+![Graphify static relationships between application module groups](docs/architecture/diagrams/graphify-modules.svg)
+
+Graphify's local code-only extraction contains **17,846 nodes, 59,648 links, and 475 communities** at the source snapshot above, including tests and migrations. The matrix groups **7,149 application nodes** and counts **2,961 extracted cross-group links** once per unordered pair; mirrored cells repeat the same value. It excludes inferred, within-group, test, migration, and script links. These are static source relationships, not runtime call counts or production component counts. [Definitions, module membership, and reproducible counts](docs/architecture/README.md#graphify-source-graph).
+
+The editable [diagram model](docs/architecture/model.json), [Graphify summary](docs/architecture/graphify-summary.json), and [standard-library renderer](scripts/render_architecture.py) are checked in with the SVGs. Regenerate the figures and catalog with `python3 scripts/render_architecture.py`; no running Core service or provider access is required.
 
 ### Decision integrity at a glance
 
@@ -141,8 +387,10 @@ Bearer tokens and embedded URL credentials are never persisted as destination
 identity. Rotating a bearer token for the same destination therefore does not
 prevent reconciliation or revocation. A durable `pending_remote_ack` remains a
 managed delegated authority even if dispatch or next-open execution is later
-disabled: Core reconciles and revokes it at the original destination before any
-Core-local execution path can be selected.
+disabled: the background runner reconciles and revokes it at the original
+destination before selecting its Core-local compatibility branch. Direct HTTP
+order admission is governed separately by `TRADING_DIRECT_ORDER_API_ENABLED`.
+See the [runner control flow](https://github.com/kiseyno-AI/kai-trading-core/blob/5a0ce6b4260d47c7cc8177f67be5b29f1811f2c7/apps/api/app/eod/runner.py#L830-L854).
 
 At OPEN, Core separately derives one route-wide buy-authority observation from
 the deterministic `current_live_market_buy_authority_v1` read model. It does
@@ -158,8 +406,8 @@ or mismatched ACK never synthesizes allow.
 
 Core may dispatch a new OPEN v4 buy only after the latest exact-scope
 observation is durably acknowledged and the ACK reports both
-`fence_active=false` and `projection_pending=false`. Exec applies block and
-recovery through a durable two-phase projection so an interrupted item update
+`fence_active=false` and `projection_pending=false`. The external Exec contract
+requires block and recovery through a durable two-phase projection so an interrupted item update
 leaves the fence closed and is retryable by the same observation ID. A healthy
 observation duplicate cannot advance the recovery streak. Recovery releases
 only its scoped market-authority fence. Account-drawdown latches use the
@@ -167,7 +415,8 @@ separate account-recovery observer contract. Neither recovery resumes a paused
 or kill-switched runtime, bypasses the independent hourly risk-off fence, or
 revives a rejected order. Every fresh candidate is evaluated again through
 current runtime, account, session, quote, sizing, exposure, and broker-boundary
-gates.
+gates. These Exec-side requirements are outside the Core implementation review
+for these diagrams.
 
 Accepted v4 authority also binds every Core item key to the exact Exec plan and
 plan-item IDs returned by the validated ACK. Later plan readback may update
@@ -182,7 +431,7 @@ ACK-bound authority. Compact readback keeps authoritative total counts separate
 from retained items. A truncated source is excluded from outcome calculation;
 P/L stays unavailable unless another complete source proves it.
 
-Exec's KIS US-equity gate also requires complete valuation and economic proof
+The documented external Exec US-equity contract requires complete valuation and economic proof
 before a new buy. Every non-zero holding needs either a finite, non-negative
 broker market value or a deterministic value derived from average price,
 quantity, and unrealized P/L. Every open buy needs a known positive-price
@@ -193,6 +442,8 @@ Duplicate broker fill identities collapse only when quantity, base/quote
 notional, price, settlement currency, transaction cost, coverage, source, and
 currency-conflict evidence agree; any economic conflict excludes the whole
 group from realized P/L and keeps the US new-buy gate closed for review.
+These are cross-repository contract requirements; Exec's implementation was not
+inspected for these diagrams. Core's US plan-service path remains preview-only.
 
 Open-drive snapshot refreshes use both process-local single-flight and a durable
 database bucket claim. Transaction advisory locking makes the first cache-row
@@ -242,11 +493,12 @@ Stored facts and versioned read models should be preferred over ad hoc recomputa
 
 Architecture references:
 
-- `docs/REPOSITORY_ARCHITECTURE.md` — repository walkthrough and diagrams
-- `docs/ARCHITECTURE.md` — documentation index
-- `docs/API_BUILD_ORDER.md` — detailed API inventory and implementation notes
-- `ARCHITECTURE.md` — top-level summary
-- `RUNBOOK.md` — production and operator procedures
+- [System and feature architecture](docs/architecture/README.md) — current source-backed diagrams, boundaries, and Graphify methodology
+- [Repository walkthrough](docs/REPOSITORY_ARCHITECTURE.md) — earlier layer-by-layer walkthrough
+- [Architecture index](docs/ARCHITECTURE.md) — documentation navigation
+- [API inventory](docs/API_BUILD_ORDER.md) — detailed implementation notes
+- [Top-level summary](ARCHITECTURE.md) — module responsibilities
+- [Runbook](RUNBOOK.md) — production and operator procedures
 
 ## Configuration
 
@@ -296,11 +548,13 @@ All JSON records use `schema_version: 1` and the same canonical identity.
 
 The stable `.lock` serializes state decisions and OAuth requests across processes. Cache reads, writes, and `fsync` calls run outside the async event-loop thread while the process continues to hold that lock. `force_refresh` ignores the caller's old generation, adopts a generation just written by a peer, and never bypasses the minimum issue interval.
 
-Exec treats the issuance lease as a hard monotonic deadline for both async and
-sync lock waiters and bounds the synchronous coroutine bridge as well. A lock
+The shared token contract requires Exec to treat the issuance lease as a hard
+monotonic deadline for both async and sync lock waiters and to bound the
+synchronous coroutine bridge as well. A lock
 or cache-operation timeout closes its descriptor and returns a retryable `503`
 classified as `TRANSIENT` / `RETRY_PENDING`; it never falls through to an
-uncoordinated token issue or replays a broker request.
+uncoordinated token issue or replays a broker request. This is an external Exec
+implementation requirement, outside the Core source review for these diagrams.
 
 The crash-safe order under the lock is:
 

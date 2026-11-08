@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" id="fig-agents" viewBox="0 0 1280 720" role="img" aria-labelledby="fig-agents-title fig-agents-desc">
+<title id="fig-agents-title">Three summaries, two decision lanes</title>
+<desc id="fig-agents-desc">Each symbol needs all three specialist summaries before either decider can proceed. Short-term and signal decisions have independent objectives and consume the same required summary bundle.</desc>
+<style>#fig-agents text{font-family:Arial, Helvetica, sans-serif} #fig-agents .node-sub,#fig-agents .edge-label,#fig-agents .node-tag{font-family:'DejaVu Sans Mono', Consolas, monospace}</style>
+<rect width="1280" height="720" fill="#f5f5f5"/>
+<defs>
+<marker id="fig-agents-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+<marker id="fig-agents-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+<marker id="fig-agents-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+</defs>
+<path d="M 264 304 L 296 304 A 8 8 0 0 0 304 296 L 304 132 A 8 8 0 0 1 312 124 L 360 124" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<line x1="264" y1="332" x2="360" y2="332" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<path d="M 264 360 L 296 360 A 8 8 0 0 1 304 368 L 304 532 A 8 8 0 0 0 312 540 L 360 540" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<path d="M 584 124 L 616 124 A 8 8 0 0 1 624 132 L 624 296 A 8 8 0 0 0 632 304 L 680 304" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<line x1="584" y1="332" x2="680" y2="332" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<path d="M 584 540 L 616 540 A 8 8 0 0 0 624 532 L 624 368 A 8 8 0 0 1 632 360 L 680 360" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<path d="M 904 312 L 944 312 A 8 8 0 0 0 952 304 L 952 236 A 8 8 0 0 1 960 228 L 1000 228" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<path d="M 904 352 L 944 352 A 8 8 0 0 1 952 360 L 952 428 A 8 8 0 0 0 960 436 L 1000 436" fill="none" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<g id="fig-agents-node-orchestrator">
+<rect x="40" y="280" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="40" y="280" width="224" height="104" rx="6" fill="#f2e7e3" stroke="#bf4520" stroke-width="1.3"/>
+<rect x="52" y="288" width="48" height="14" rx="2" fill="#f2e7e3" stroke="#bf4520" stroke-width=".8"/>
+<text class="node-tag" x="76" y="298" text-anchor="middle" fill="#bf4520" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="152" y="335" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">Core orchestrator</text>
+<text class="node-sub" x="152" y="353" text-anchor="middle" fill="#4f5d75" font-size="12">scope / prerequisite gate</text>
+<text class="node-sub" x="152" y="370" text-anchor="middle" fill="#4f5d75" font-size="12">OpenClaw dispatch</text>
+</g>
+<g id="fig-agents-node-eod">
+<rect x="360" y="72" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="360" y="72" width="224" height="104" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.3"/>
+<rect x="372" y="80" width="48" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width=".8"/>
+<text class="node-tag" x="396" y="90" text-anchor="middle" fill="#2d3142" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="472" y="127" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">EOD summary</text>
+<text class="node-sub" x="472" y="145" text-anchor="middle" fill="#4f5d75" font-size="12">per-symbol readiness</text>
+<text class="node-sub" x="472" y="162" text-anchor="middle" fill="#4f5d75" font-size="12">eod-summarizer</text>
+</g>
+<g id="fig-agents-node-technical">
+<rect x="360" y="280" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="360" y="280" width="224" height="104" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.3"/>
+<rect x="372" y="288" width="48" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width=".8"/>
+<text class="node-tag" x="396" y="298" text-anchor="middle" fill="#2d3142" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="472" y="335" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">Technical summary</text>
+<text class="node-sub" x="472" y="353" text-anchor="middle" fill="#4f5d75" font-size="12">trend / momentum / levels</text>
+<text class="node-sub" x="472" y="370" text-anchor="middle" fill="#4f5d75" font-size="12">technical-summarizer</text>
+</g>
+<g id="fig-agents-node-fundamental">
+<rect x="360" y="488" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="360" y="488" width="224" height="104" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.3"/>
+<rect x="372" y="496" width="48" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width=".8"/>
+<text class="node-tag" x="396" y="506" text-anchor="middle" fill="#2d3142" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="472" y="543" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">Fundamental summary</text>
+<text class="node-sub" x="472" y="561" text-anchor="middle" fill="#4f5d75" font-size="12">financials / disclosures</text>
+<text class="node-sub" x="472" y="578" text-anchor="middle" fill="#4f5d75" font-size="12">fundamental-summarizer</text>
+</g>
+<g id="fig-agents-node-bundle">
+<rect x="680" y="280" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="680" y="280" width="224" height="104" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.3"/>
+<rect x="692" y="288" width="48" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width=".8"/>
+<text class="node-tag" x="716" y="298" text-anchor="middle" fill="#2d3142" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="792" y="335" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">Required summaries</text>
+<text class="node-sub" x="792" y="353" text-anchor="middle" fill="#4f5d75" font-size="12">3 summaries required</text>
+<text class="node-sub" x="792" y="370" text-anchor="middle" fill="#4f5d75" font-size="12">per-symbol completeness</text>
+</g>
+<g id="fig-agents-node-short">
+<rect x="1000" y="176" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="1000" y="176" width="224" height="104" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.3"/>
+<rect x="1012" y="184" width="48" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width=".8"/>
+<text class="node-tag" x="1036" y="194" text-anchor="middle" fill="#2d3142" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="1112" y="231" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">Short-term decider</text>
+<text class="node-sub" x="1112" y="249" text-anchor="middle" fill="#4f5d75" font-size="12">tactical / short horizon</text>
+<text class="node-sub" x="1112" y="266" text-anchor="middle" fill="#4f5d75" font-size="12">short-term-decider</text>
+</g>
+<g id="fig-agents-node-signal">
+<rect x="1000" y="384" width="224" height="104" rx="6" fill="#f5f5f5"/>
+<rect x="1000" y="384" width="224" height="104" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1.3"/>
+<rect x="1012" y="392" width="48" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width=".8"/>
+<text class="node-tag" x="1036" y="402" text-anchor="middle" fill="#2d3142" font-size="8" letter-spacing=".5">MODULE</text>
+<text class="node-title" x="1112" y="439" text-anchor="middle" fill="#2d3142" font-size="16" font-weight="600">Signal decider</text>
+<text class="node-sub" x="1112" y="457" text-anchor="middle" fill="#4f5d75" font-size="12">swing / position horizon</text>
+<text class="node-sub" x="1112" y="474" text-anchor="middle" fill="#4f5d75" font-size="12">signal-decider</text>
+</g>
+<g aria-hidden="true"><line x1="32" y1="668" x2="1248" y2="668" stroke="#bfc0c0" stroke-width=".8"/>
+<line x1="40" y1="694" x2="88" y2="694" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#fig-agents-arrow)"/>
+<text x="104" y="698" fill="#4f5d75" font-size="12">Data / call</text>
+</g>
+</svg>

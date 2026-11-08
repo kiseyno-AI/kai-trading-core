@@ -1,0 +1,192 @@
+<svg xmlns="http://www.w3.org/2000/svg" id="fig-graphify-modules" viewBox="0 0 1280 720" role="img" aria-labelledby="fig-graphify-modules-title fig-graphify-modules-desc">
+<title id="fig-graphify-modules-title">Graphify: static module relationships</title>
+<desc id="fig-graphify-modules-desc">Counts of extracted source relationships between seven application module groups; the symmetric matrix is not runtime call frequency.</desc>
+<style>#fig-graphify-modules text{font-family:Arial, Helvetica, sans-serif} #fig-graphify-modules .node-sub,#fig-graphify-modules .edge-label,#fig-graphify-modules .node-tag{font-family:'DejaVu Sans Mono', Consolas, monospace}</style>
+<rect width="1280" height="720" fill="#f5f5f5"/>
+<text x="40" y="44" font-size="24" font-weight="600" fill="#2d3142">Static module relationships</text>
+<text x="40" y="72" font-size="14" fill="#4f5d75">Graphify source graph · extracted links only · undirected</text>
+<text x="260" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">Entry</text>
+<text x="352" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">Store</text>
+<text x="444" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">EOD</text>
+<text x="536" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">Agents</text>
+<text x="628" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">Orders</text>
+<text x="720" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">Markets</text>
+<text x="812" y="118" text-anchor="middle" font-size="13" fill="#4f5d75">Evidence</text>
+<text x="200" y="169" text-anchor="end" font-size="14" fill="#2d3142">Entry &amp; shared</text>
+<rect x="216" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="entry" data-value="0" x="216" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="260" y="170" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<rect x="308" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="storage" data-value="40" x="308" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.16166"/>
+<text x="352" y="170" text-anchor="middle" font-size="15" fill="#2d3142">40</text>
+<rect x="400" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="eod" data-value="285" x="400" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.43151"/>
+<text x="444" y="170" text-anchor="middle" font-size="15" fill="#2d3142">285</text>
+<rect x="492" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="agents" data-value="137" x="492" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.29918"/>
+<text x="536" y="170" text-anchor="middle" font-size="15" fill="#2d3142">137</text>
+<rect x="584" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="orders" data-value="68" x="584" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.21078"/>
+<text x="628" y="170" text-anchor="middle" font-size="15" fill="#2d3142">68</text>
+<rect x="676" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="markets" data-value="121" x="676" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.28116"/>
+<text x="720" y="170" text-anchor="middle" font-size="15" fill="#2d3142">121</text>
+<rect x="768" y="136" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="entry" data-col="evidence" data-value="166" x="768" y="136" width="88" height="56" fill="#2d3142" fill-opacity="0.32932"/>
+<text x="812" y="170" text-anchor="middle" font-size="15" fill="#2d3142">166</text>
+<text x="200" y="229" text-anchor="end" font-size="14" fill="#2d3142">Persistence</text>
+<rect x="216" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="entry" data-value="40" x="216" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.16166"/>
+<text x="260" y="230" text-anchor="middle" font-size="15" fill="#2d3142">40</text>
+<rect x="308" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="storage" data-value="0" x="308" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="352" y="230" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<rect x="400" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="eod" data-value="750" x="400" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.70000"/>
+<text x="444" y="230" text-anchor="middle" font-size="15" fill="#f5f5f5">750</text>
+<rect x="492" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="agents" data-value="306" x="492" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.44712"/>
+<text x="536" y="230" text-anchor="middle" font-size="15" fill="#2d3142">306</text>
+<rect x="584" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="orders" data-value="229" x="584" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.38680"/>
+<text x="628" y="230" text-anchor="middle" font-size="15" fill="#2d3142">229</text>
+<rect x="676" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="markets" data-value="90" x="676" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.24249"/>
+<text x="720" y="230" text-anchor="middle" font-size="15" fill="#2d3142">90</text>
+<rect x="768" y="196" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="storage" data-col="evidence" data-value="153" x="768" y="196" width="88" height="56" fill="#2d3142" fill-opacity="0.31616"/>
+<text x="812" y="230" text-anchor="middle" font-size="15" fill="#2d3142">153</text>
+<text x="200" y="289" text-anchor="end" font-size="14" fill="#2d3142">EOD &amp; factors</text>
+<rect x="216" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="entry" data-value="285" x="216" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.43151"/>
+<text x="260" y="290" text-anchor="middle" font-size="15" fill="#2d3142">285</text>
+<rect x="308" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="storage" data-value="750" x="308" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.70000"/>
+<text x="352" y="290" text-anchor="middle" font-size="15" fill="#f5f5f5">750</text>
+<rect x="400" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="eod" data-value="0" x="400" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="444" y="290" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<rect x="492" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="agents" data-value="79" x="492" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.22719"/>
+<text x="536" y="290" text-anchor="middle" font-size="15" fill="#2d3142">79</text>
+<rect x="584" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="orders" data-value="16" x="584" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.10224"/>
+<text x="628" y="290" text-anchor="middle" font-size="15" fill="#2d3142">16</text>
+<rect x="676" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="markets" data-value="170" x="676" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.33327"/>
+<text x="720" y="290" text-anchor="middle" font-size="15" fill="#2d3142">170</text>
+<rect x="768" y="256" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="eod" data-col="evidence" data-value="35" x="768" y="256" width="88" height="56" fill="#2d3142" fill-opacity="0.15122"/>
+<text x="812" y="290" text-anchor="middle" font-size="15" fill="#2d3142">35</text>
+<text x="200" y="349" text-anchor="end" font-size="14" fill="#2d3142">Agents &amp; analytics</text>
+<rect x="216" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="entry" data-value="137" x="216" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.29918"/>
+<text x="260" y="350" text-anchor="middle" font-size="15" fill="#2d3142">137</text>
+<rect x="308" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="storage" data-value="306" x="308" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.44712"/>
+<text x="352" y="350" text-anchor="middle" font-size="15" fill="#2d3142">306</text>
+<rect x="400" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="eod" data-value="79" x="400" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.22719"/>
+<text x="444" y="350" text-anchor="middle" font-size="15" fill="#2d3142">79</text>
+<rect x="492" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="agents" data-value="0" x="492" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="536" y="350" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<rect x="584" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="orders" data-value="51" x="584" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.18254"/>
+<text x="628" y="350" text-anchor="middle" font-size="15" fill="#2d3142">51</text>
+<rect x="676" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="markets" data-value="77" x="676" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.22429"/>
+<text x="720" y="350" text-anchor="middle" font-size="15" fill="#2d3142">77</text>
+<rect x="768" y="316" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="agents" data-col="evidence" data-value="37" x="768" y="316" width="88" height="56" fill="#2d3142" fill-opacity="0.15548"/>
+<text x="812" y="350" text-anchor="middle" font-size="15" fill="#2d3142">37</text>
+<text x="200" y="409" text-anchor="end" font-size="14" fill="#2d3142">Orders &amp; Exec</text>
+<rect x="216" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="entry" data-value="68" x="216" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.21078"/>
+<text x="260" y="410" text-anchor="middle" font-size="15" fill="#2d3142">68</text>
+<rect x="308" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="storage" data-value="229" x="308" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.38680"/>
+<text x="352" y="410" text-anchor="middle" font-size="15" fill="#2d3142">229</text>
+<rect x="400" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="eod" data-value="16" x="400" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.10224"/>
+<text x="444" y="410" text-anchor="middle" font-size="15" fill="#2d3142">16</text>
+<rect x="492" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="agents" data-value="51" x="492" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.18254"/>
+<text x="536" y="410" text-anchor="middle" font-size="15" fill="#2d3142">51</text>
+<rect x="584" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="orders" data-value="0" x="584" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="628" y="410" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<rect x="676" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="markets" data-value="71" x="676" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.21538"/>
+<text x="720" y="410" text-anchor="middle" font-size="15" fill="#2d3142">71</text>
+<rect x="768" y="376" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="orders" data-col="evidence" data-value="0" x="768" y="376" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="812" y="410" text-anchor="middle" font-size="15" fill="#2d3142">0</text>
+<text x="200" y="469" text-anchor="end" font-size="14" fill="#2d3142">Market services</text>
+<rect x="216" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="entry" data-value="121" x="216" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.28116"/>
+<text x="260" y="470" text-anchor="middle" font-size="15" fill="#2d3142">121</text>
+<rect x="308" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="storage" data-value="90" x="308" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.24249"/>
+<text x="352" y="470" text-anchor="middle" font-size="15" fill="#2d3142">90</text>
+<rect x="400" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="eod" data-value="170" x="400" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.33327"/>
+<text x="444" y="470" text-anchor="middle" font-size="15" fill="#2d3142">170</text>
+<rect x="492" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="agents" data-value="77" x="492" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.22429"/>
+<text x="536" y="470" text-anchor="middle" font-size="15" fill="#2d3142">77</text>
+<rect x="584" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="orders" data-value="71" x="584" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.21538"/>
+<text x="628" y="470" text-anchor="middle" font-size="15" fill="#2d3142">71</text>
+<rect x="676" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="markets" data-value="0" x="676" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="720" y="470" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<rect x="768" y="436" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="markets" data-col="evidence" data-value="80" x="768" y="436" width="88" height="56" fill="#2d3142" fill-opacity="0.22862"/>
+<text x="812" y="470" text-anchor="middle" font-size="15" fill="#2d3142">80</text>
+<text x="200" y="529" text-anchor="end" font-size="14" fill="#2d3142">External evidence</text>
+<rect x="216" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="entry" data-value="166" x="216" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.32932"/>
+<text x="260" y="530" text-anchor="middle" font-size="15" fill="#2d3142">166</text>
+<rect x="308" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="storage" data-value="153" x="308" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.31616"/>
+<text x="352" y="530" text-anchor="middle" font-size="15" fill="#2d3142">153</text>
+<rect x="400" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="eod" data-value="35" x="400" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.15122"/>
+<text x="444" y="530" text-anchor="middle" font-size="15" fill="#2d3142">35</text>
+<rect x="492" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="agents" data-value="37" x="492" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.15548"/>
+<text x="536" y="530" text-anchor="middle" font-size="15" fill="#2d3142">37</text>
+<rect x="584" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="orders" data-value="0" x="584" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="628" y="530" text-anchor="middle" font-size="15" fill="#2d3142">0</text>
+<rect x="676" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="markets" data-value="80" x="676" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.22862"/>
+<text x="720" y="530" text-anchor="middle" font-size="15" fill="#2d3142">80</text>
+<rect x="768" y="496" width="88" height="56" fill="#f5f5f5"/>
+<rect data-row="evidence" data-col="evidence" data-value="0" x="768" y="496" width="88" height="56" fill="#2d3142" fill-opacity="0.05000"/>
+<text x="812" y="530" text-anchor="middle" font-size="15" fill="#2d3142">—</text>
+<text x="916" y="154" font-size="14" font-weight="600" fill="#2d3142">Full source graph</text>
+<text x="916" y="184" font-size="14" fill="#4f5d75">17,846 nodes</text>
+<text x="916" y="210" font-size="14" fill="#4f5d75">59,648 links</text>
+<text x="916" y="236" font-size="14" fill="#4f5d75">475 communities</text>
+<text x="916" y="288" font-size="14" font-weight="600" fill="#2d3142">This matrix</text>
+<text x="916" y="318" font-size="14" fill="#4f5d75">7,149 application nodes</text>
+<text x="916" y="344" font-size="14" fill="#4f5d75">2,961 cross-group links</text>
+<text x="916" y="386" font-size="13" fill="#4f5d75">Each pair is counted once.</text>
+<text x="916" y="408" font-size="13" fill="#4f5d75">Mirrored cells repeat that count.</text>
+<text x="916" y="450" font-size="13" fill="#4f5d75">Tests, migrations, scripts,</text>
+<text x="916" y="472" font-size="13" fill="#4f5d75">inferred and within-group links</text>
+<text x="916" y="494" font-size="13" fill="#4f5d75">are excluded from the matrix.</text>
+<text x="216" y="600" font-size="12" fill="#4f5d75">LOW</text>
+<rect x="260" y="584" width="32" height="20" fill="#2d3142" fill-opacity="0.05"/>
+<rect x="296" y="584" width="32" height="20" fill="#2d3142" fill-opacity="0.18"/>
+<rect x="332" y="584" width="32" height="20" fill="#2d3142" fill-opacity="0.31"/>
+<rect x="368" y="584" width="32" height="20" fill="#2d3142" fill-opacity="0.44"/>
+<rect x="404" y="584" width="32" height="20" fill="#2d3142" fill-opacity="0.57"/>
+<rect x="440" y="584" width="32" height="20" fill="#2d3142" fill-opacity="0.70"/>
+<text x="488" y="600" font-size="12" fill="#4f5d75">HIGH</text>
+<text x="216" y="634" font-size="12" fill="#4f5d75">0–750 links · square-root shading · numbers are exact counts · — = within-group omitted</text>
+<line x1="40" y1="668" x2="1240" y2="668" stroke="#bfc0c0" stroke-width=".8"/>
+<text x="40" y="698" font-size="12" fill="#4f5d75">Source snapshot: 5a0ce6b4260d · Graphify 0.9.103 · see graphify-summary.json for module membership and counts</text>
+</svg>

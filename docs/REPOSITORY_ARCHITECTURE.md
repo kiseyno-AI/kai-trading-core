@@ -16,7 +16,7 @@ Non-goals:
 - The always-on broker execution loop and execution truth (owned by `kai-trading-exec`; see the top-level `README.md`)
 - Future roadmap architecture that is not yet implemented in this repo
 
-Note: this document predates the `app/orders/`, `app/us_equities/`, portfolio, and Exec-handoff layers. The top-level `README.md` and `docs/API_BUILD_ORDER.md` are the current references for those areas.
+Note: this document predates the `app/orders/`, `app/us_equities/`, portfolio, and Exec-handoff layers. Start with the [current system and feature diagrams](./architecture/README.md), the top-level [README](../README.md), and [API inventory](./API_BUILD_ORDER.md) for those areas and the newer analytics/improvement flows.
 
 ## Top-Level Repository Shape
 
