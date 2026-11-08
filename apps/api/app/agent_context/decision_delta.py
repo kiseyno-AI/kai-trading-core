@@ -465,8 +465,8 @@ def _auto_persistence_trend(
                 return 'worsening'
         return 'persistent' if not changed_fields else 'changed'
 
-    previous_wait_code = _normalize_wait_reason(previous_reference.get('wait_reason') or {}).get('code')
-    current_wait_code = _normalize_wait_reason(current_reference.get('wait_reason') or {}).get('code')
+    previous_wait_code = (_normalize_wait_reason(previous_reference.get('wait_reason')) or {}).get('code')
+    current_wait_code = (_normalize_wait_reason(current_reference.get('wait_reason')) or {}).get('code')
     if previous_wait_code != current_wait_code:
         return 'changed'
     if confidence_delta is not None:
