@@ -173,13 +173,13 @@ def _propose_change(
     added = False
     try:
         in_repo(['git', 'fetch', 'origin', 'main'])
-        # Taken from origin/main and stored outside the worktree before the model runs:
-        # nothing on the candidate branch can change the code that judges it.
-        base_guard = getattr(in_repo(['git', 'show', 'origin/main:scripts/agent_rules_guard.py']), 'stdout', '') or ''
+        base_sha = in_repo(['git', 'rev-parse', '--verify', 'origin/main^{commit}']).stdout.strip()
+        # Pin the fetched commit before the model can change shared Git refs.
+        base_guard = getattr(in_repo(['git', 'show', f'{base_sha}:scripts/agent_rules_guard.py']), 'stdout', '') or ''
         if 'def main' not in base_guard:
             return 'guard_unavailable'
         guard_copy.write_text(base_guard, encoding='utf-8')
-        in_repo(['git', 'worktree', 'add', '--detach', str(worktree), 'origin/main'])
+        in_repo(['git', 'worktree', 'add', '--detach', str(worktree), base_sha])
         added = True
         in_tree(['git', 'checkout', '-B', branch])
         prompt = build_prompt(policy_text, chosen, contract_blocks, run_id=run_id)
@@ -189,7 +189,7 @@ def _propose_change(
         if getattr(staged, 'returncode', 1) == 0:
             return 'no_change'
         in_tree(['git', 'commit', '-m', f"{COMMIT_PREFIX} Calibrate decider notes ({run_id})"])
-        guard = in_tree([sys.executable, '-I', str(guard_copy), '--base', 'origin/main'], check=False)
+        guard = in_tree([sys.executable, '-I', str(guard_copy), '--base', base_sha], check=False)
         if getattr(guard, 'returncode', 1) != 0:
             result['guard_output'] = (getattr(guard, 'stdout', '') or '')[-1500:]
             return 'blocked_by_guard'
