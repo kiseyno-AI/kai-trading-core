@@ -10100,7 +10100,7 @@ class DailyPipelineStageService:
             return None
         items = _normalize_krx_symbol_codes(symbols)
         if items is None:
-            return None
+            raise ValueError('symbol scope contains an invalid KRX symbol')
         return items or None
 
     def _normalize_markets(self, markets: Sequence[str] | None) -> list[str]:
