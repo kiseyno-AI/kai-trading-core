@@ -301,3 +301,63 @@ repair, this step does not rebuild them again; it refreshes participation,
 evaluations, and calendars from the proven exact signal scope. Only after that
 rebuild succeeds should operators run verify and `--complete` so the closeout
 fingerprints are refreshed from the repaired signal scope.
+
+## Official-value restatement of stored daily bars
+
+`app.eod.kis_final_bar_repair` finalizes bars that are partial days and refuses any
+row where the provider value is not a monotonic extension. Bars collected from the
+per-symbol range endpoint are different: their close/high/low disagree with the
+official market-wide table in both directions, so about a quarter of them are
+refused. `app.eod.official_bar_restatement` keeps that tool's KIS fetch, row lock,
+drift check, immutable audit rows and pending rebuild batch, and replaces only
+the safety predicate.
+
+A row is rewritten only when all of these hold:
+
+1. the official KRX market-wide table covers the date completely (both markets
+   above their size floors; a failed fetch leaves the date uncovered);
+2. the stored bar differs from the official row (a stored bar that already equals
+   it is left alone whatever KIS says, which keeps adjusted history out);
+3. KIS history returns exactly the official six values;
+4. the close moves by no more than the 31% a KRX day can produce.
+
+```bash
+cd apps/api
+.venv/bin/python -m app.eod.official_bar_restatement \
+  --start-date 2026-11-06 --end-date 2026-11-06 --symbol-limit 500 \
+  --official-cache-dir /durable/official-frames            # dry run
+
+.venv/bin/python -m app.eod.official_bar_restatement \
+  --start-date 2026-11-06 --end-date 2026-11-06 --symbol-limit 500 \
+  --official-cache-dir /durable/official-frames --apply    # one page per call
+```
+
+Page with `--after-symbol` exactly as for the KIS tool. Every applied page opens a
+pending rebuild batch and the documented downstream rebuild (price contexts,
+technical snapshots, action summaries, trending ranks, factors, signal features,
+evaluations, verify and complete) is mandatory before Core can start.
+
+**Rebuild scope.** A change on date D requires every stored date from D on to be
+rebuilt. The exact factor and signal-feature rebuilds only accept a pending batch
+that froze each of those dates' ranking population, so every restatement batch
+records `official_bar_restatement_v1` evidence: for each rebuild date, the strict
+same-date PyKRX EOD membership (complete KOSPI/KOSDAQ universe snapshot, size
+floors) and the stored-input fingerprint taken after the write. Restatement changes
+values, never membership, so that EOD membership is the population the original
+factors ranked. `price_bar_repair_state` reads it exactly like a missing-bar
+batch's frozen scope and keeps it in the completion record.
+
+**Preflight.** Before fetching anything, the CLI lists every rebuild date without
+that proof (`rebuild_membership_proof_gaps` in the dry-run output). `--apply`
+refuses with `rebuild_membership_proof_missing` while any gap exists, and the
+evidence is rebuilt under row locks inside the write transaction, so a proof that
+disappears in between rolls the page back. A batch the rebuild chain cannot finish
+is therefore never opened. On 2026-11-08 production had no strict proof for
+2026-09-14..09-18 and 2026-10-13, so a start date of 2026-10-14 or later is
+applicable today; earlier dates need a reviewed exact-date membership first.
+
+**One-date trial first.** Restate a single recent date (for example the latest
+session, whose rebuild scope is that one date), run the downstream chain and
+`python -m app.eod.price_bar_repair_state` verification with `--apply`, and confirm
+the batch completes and Core restarts before opening batches for a longer range.
+

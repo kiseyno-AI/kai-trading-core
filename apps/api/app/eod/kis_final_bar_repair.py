@@ -581,6 +581,10 @@ def repair_existing_final_bars(
     apply: bool,
     repair_batch_id: str | None = None,
     required_rebuild_trade_dates: Sequence[str | date] | None = None,
+    planner: Callable[..., dict[str, Any]] | None = None,
+    repair_evidence_builder: (
+        Callable[[Any, Sequence[date]], Mapping[str, Any]] | None
+    ) = None,
 ) -> dict[str, Any]:
     normalized_symbols = tuple(_normalize_symbol(item) for item in selected_symbols)
     if not normalized_symbols:
@@ -625,7 +629,7 @@ def repair_existing_final_bars(
                 'repair_batch_id': None,
             }
 
-        plan = plan_final_bar_repairs(
+        plan = (planner or plan_final_bar_repairs)(
             stored_rows=current_rows,
             provider_bars=provider_bars,
         )
@@ -865,6 +869,22 @@ def repair_existing_final_bars(
         }
         if observed != expected:
             raise RuntimeError('KIS final-bar post-write verification failed')
+
+        if repair_evidence_builder is not None:
+            # Recorded after the write so input fingerprints describe the
+            # repaired bars; a failure rolls the whole page back.
+            evidence = dict(
+                repair_evidence_builder(session, required_rebuild_dates)
+            )
+            session.execute(
+                update(DailyPriceBarRepairBatch.__table__)
+                .where(
+                    DailyPriceBarRepairBatch.__table__.c.repair_batch_id
+                    == normalized_batch_id
+                )
+                .values(verification_metadata={'repair_evidence': evidence})
+            )
+            result['repair_evidence_kind'] = evidence.get('repair_kind')
 
         result.update(
             {
