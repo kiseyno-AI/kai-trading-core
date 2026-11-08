@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     upstream_bearer_token: Optional[str] = None
     api_request_logging_enabled: bool = True
     upstream_http_logging_enabled: bool = True
+    app_log_level: str = 'INFO'
     api_log_directory: str = 'var/log'
     api_request_log_file_name: str = 'api-requests.log'
     upstream_http_log_file_name: str = 'upstream-http.log'
@@ -82,6 +83,10 @@ class Settings(BaseSettings):
     kis_token_issuance_lease_seconds: int = Field(default=90, ge=75, le=3600)
     kis_token_min_issue_interval_seconds: int = Field(default=60, ge=60, le=3600)
     kis_token_cache_directory: str = '~/.cache/kai-trading/kis-oauth-tokens'
+    # Minimum spacing between Core's KIS REST requests (seconds). 0 disables the
+    # limiter (historical behavior). KIS enforces a per-app-key rate limit that
+    # Core shares with kai-trading-exec, which spaces its own calls by 0.12s.
+    kis_min_request_interval_seconds: float = Field(default=0.0, ge=0, le=10, allow_inf_nan=False)
     kis_realtime_trending_cache_ttl_seconds: int = 20
     kis_realtime_order_notice_enabled: bool = True
     kis_realtime_price_enabled: bool = True
@@ -122,6 +127,11 @@ class Settings(BaseSettings):
     kis_intraday_snapshot_news_limit: int = 5
     portfolio_account_references: str = ''
     portfolio_summary_cache_ttl_seconds: int = 60
+    # Core-side direct broker order routes (POST /trading/orders/buy, /sell and
+    # /{id}/amend). Normal trading is delegated to kai-trading-exec, so these
+    # stay closed unless an operator deliberately opens them. Cancel is a
+    # risk-reducing action and is not gated.
+    trading_direct_order_api_enabled: bool = False
     signal_decider_next_open_enabled: bool = False
     signal_decider_next_open_dry_run: bool = True
     signal_decider_next_open_account_targets: str = ''
@@ -225,6 +235,10 @@ class Settings(BaseSettings):
     dart_fundamentals_default_fs_div: str = 'CFS'
     dart_fundamentals_daily_retry_cycles: int = 3
     dart_fundamentals_event_timeout_seconds: int = 60
+    # Annual-report capture downloads and parses the audit document first. Large
+    # filings (financial holdings' amended reports) measured 73-120s, so the
+    # generic 60s limit made them time out on every retry, forever.
+    dart_fundamentals_annual_event_timeout_seconds: int = Field(default=240, ge=1, le=900)
     dart_fundamentals_stale_run_minutes: int = 60
     dart_fundamentals_daily_initial_backfill_enabled: bool = False
     dart_global_share_issuance_enabled: bool = False
@@ -232,7 +246,13 @@ class Settings(BaseSettings):
     # limit below that count left a rotating handful as retry debt each day,
     # so the DART stage was partial every day.
     dart_fundamentals_daily_missing_symbol_probe_limit: int = Field(default=500, ge=0, le=500)
+    # A symbol with no positive-volume bar over this many consecutive market
+    # sessions is treated as not tradable (trading halt, long suspension,
+    # wind-down) and is kept out of candidate screening. Data collection keeps
+    # running so a resumption clears the exclusion by itself.
+    market_risk_dormant_lookback_trading_days: int = Field(default=10, ge=3, le=60)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
+    dart_fundamentals_daily_stale_drain_limit: int = Field(default=100, ge=0, le=500)
 
     sec_edgar_user_agent: str = ''
     sec_edgar_data_base_url: str = 'https://data.sec.gov'

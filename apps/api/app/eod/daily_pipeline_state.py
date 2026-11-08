@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import functools
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
@@ -107,6 +108,9 @@ LEGACY_TERMINAL_CONTINUATION_STAGE_ORDER = (
     *TERMINAL_CONTINUATION_STAGE_ORDER,
     'signal_decider_evaluations',
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -557,6 +561,53 @@ def _build_stage_duration_details(
     }
 
 
+def _log_stage_transition(event: str, stage: Mapping[str, Any]) -> None:
+    """One INFO line per stage start/finish so the daily flow can be followed in the process log.
+
+    The same facts live in ``daily_pipeline_stage_runs``; this makes them greppable next to the
+    provider and runner warnings. Never raises: logging must not change pipeline behavior.
+    """
+
+    try:
+        details = stage.get('details') or {}
+        logger.log(
+            logging.WARNING if stage.get('status') in {'failed', 'blocked'} else logging.INFO,
+            'daily_pipeline stage %s run=%s market_date=%s stage=%s status=%s processed=%s/%s '
+            'succeeded=%s failed=%s duration_s=%s error=%s',
+            event,
+            stage.get('pipeline_run_id'),
+            stage.get('market_date'),
+            stage.get('stage_id'),
+            stage.get('status'),
+            stage.get('processed'),
+            stage.get('total'),
+            stage.get('succeeded'),
+            stage.get('failed'),
+            details.get('duration_seconds'),
+            (stage.get('error_message') or '')[:300] or None,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _log_run_finish(run: Mapping[str, Any]) -> None:
+    try:
+        stages = run.get('stages') or {}
+        counts: dict[str, int] = {}
+        for stage in stages.values():
+            counts[str(stage.get('status'))] = counts.get(str(stage.get('status')), 0) + 1
+        logger.log(
+            logging.WARNING if run.get('status') in {'failed', 'interrupted'} else logging.INFO,
+            'daily_pipeline run finished run=%s market_date=%s trigger=%s status=%s stages=%s error=%s',
+            run.get('id'),
+            run.get('market_date'),
+            run.get('trigger'),
+            run.get('status'),
+            counts,
+            (run.get('error_message') or '')[:300] or None,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 def _publish_live_run(method):
     """Mirror a run row into the DB-free live progress feed after commit."""
 
@@ -964,7 +1015,7 @@ class DailyPipelineRunStateService:
         source_run_ids: Mapping[str, Any] | None = None,
         details: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.update_stage(
+        stage = self.update_stage(
             pipeline_run_id=pipeline_run_id,
             stage_id=stage_id,
             market_date=market_date,
@@ -981,6 +1032,8 @@ class DailyPipelineRunStateService:
             details=details,
             mark_started=True,
         )
+        _log_stage_transition('start', stage)
+        return stage
 
     @_publish_live_stage
     def update_stage(
@@ -1214,7 +1267,7 @@ class DailyPipelineRunStateService:
         source_run_ids: Mapping[str, Any] | None = None,
         details: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.update_stage(
+        stage = self.update_stage(
             pipeline_run_id=pipeline_run_id,
             stage_id=stage_id,
             market_date=market_date,
@@ -1232,6 +1285,8 @@ class DailyPipelineRunStateService:
             completed_at=_utcnow(),
             recompute_remaining=True,
         )
+        _log_stage_transition('finish', stage)
+        return stage
 
     @_publish_live_run
     def finish_run(
@@ -1305,7 +1360,9 @@ class DailyPipelineRunStateService:
                     preserve_updated_at=False,
                 )
             session.flush()
-            return self._serialize_run(row, stage_rows)
+            run_payload = self._serialize_run(row, stage_rows)
+        _log_run_finish(run_payload)
+        return run_payload
 
     def reconcile_terminal_parent_running_stages(
         self,
