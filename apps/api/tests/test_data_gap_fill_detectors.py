@@ -265,3 +265,28 @@ def test_empty_provider_frames_are_not_cached(monkeypatch):
     assert module._load_provider_frame('2026-11-05') == {}
     module._load_provider_frame('2026-11-05')
     assert len(calls) == 4 and module._PROVIDER_FRAME_CACHE == {}
+
+
+def test_partial_market_frame_is_retried_until_both_markets_are_available(monkeypatch):
+    import pandas as pd
+
+    from app.eod import data_gap_fill as module
+
+    def frame(symbol):
+        return pd.DataFrame({'시가': [1], '고가': [2], '저가': [1], '종가': [2]}, index=[symbol])
+
+    kosdaq_responses = iter([pd.DataFrame(), frame('000660')])
+    calls = []
+
+    def provider(_date, market):
+        calls.append(market)
+        return frame('005930') if market == 'KOSPI' else next(kosdaq_responses)
+
+    monkeypatch.setattr(module, '_PROVIDER_FRAME_CACHE', {})
+    monkeypatch.setattr('app.eod.pykrx_backfill._get_market_ohlcv_by_ticker', provider)
+
+    assert module._load_provider_frame('2026-11-05') == {'005930': (1, 2, 1, 2)}
+    complete = {'005930': (1, 2, 1, 2), '000660': (1, 2, 1, 2)}
+    assert module._load_provider_frame('2026-11-05') == complete
+    assert module._load_provider_frame('2026-11-05') == complete
+    assert calls == ['KOSPI', 'KOSDAQ', 'KOSPI', 'KOSDAQ']

@@ -354,11 +354,14 @@ def _load_provider_frame(market_date: str) -> dict[str, tuple[int, int, int, int
 
     compact = market_date.replace('-', '')
     provider: dict[str, tuple[int, int, int, int]] = {}
+    complete = True
     for market in ('KOSPI', 'KOSDAQ'):
         frame = _get_market_ohlcv_by_ticker(compact, market)
+        if frame.empty:
+            complete = False
         for code, row in frame.iterrows():
             provider[str(code)] = tuple(int(row[key]) for key in ('시가', '고가', '저가', '종가'))
-    if provider:  # never cache an empty (failed or blocked) read
+    if provider and complete:  # retry an empty or incomplete market read
         while len(_PROVIDER_FRAME_CACHE) >= _PROVIDER_FRAME_CACHE_MAX:
             _PROVIDER_FRAME_CACHE.pop(next(iter(_PROVIDER_FRAME_CACHE)))
         _PROVIDER_FRAME_CACHE[market_date] = provider
