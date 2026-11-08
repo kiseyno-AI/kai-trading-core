@@ -9,6 +9,7 @@ import time
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -87,10 +88,14 @@ def _build_isolated_engine_kwargs() -> dict[str, object]:
 def _build_database_url() -> str:
     if settings.database_url:
         return settings.database_url
-    return (
-        f"postgresql+psycopg://{settings.postgres_user}:{settings.postgres_password}"
-        f"@{settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}"
-    )
+    return URL.create(
+        'postgresql+psycopg',
+        username=settings.postgres_user,
+        password=settings.postgres_password,
+        host=settings.postgres_host,
+        port=settings.postgres_port,
+        database=settings.postgres_db,
+    ).render_as_string(hide_password=False)
 
 
 DATABASE_URL = _build_database_url()
