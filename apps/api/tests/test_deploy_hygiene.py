@@ -141,6 +141,26 @@ def _ready_schema_inspector(
 
 
 class DeployHygieneTests(unittest.TestCase):
+    def test_schema_preflight_rejects_partial_unique_index_for_full_upsert_key(self) -> None:
+        inspector = _ready_schema_inspector()
+        original_indexes = inspector.get_indexes.side_effect
+
+        def indexes(table: str) -> list[dict]:
+            entries = original_indexes(table)
+            if table == 'daily_price_bars':
+                return [
+                    {**entry, 'dialect_options': {'postgresql_where': "trade_date >= '2026-01-01'"}}
+                    for entry in entries
+                ]
+            return entries
+
+        inspector.get_indexes.side_effect = indexes
+        report = deploy_hygiene._inspect_runtime_schema_drift(inspector)
+
+        self.assertFalse(report['ready'])
+        check = next(item for item in report['checks'] if item['name'] == 'daily_price_bars_symbol_trade_date_unique')
+        self.assertFalse(check['ready'])
+
     def test_parse_create_table_metadata_distinguishes_guarded_and_unguarded_revisions(self) -> None:
         versions_dir = Path(__file__).resolve().parent.parent / 'db_migrations' / 'versions'
         guarded_tables, guarded = deploy_hygiene._parse_create_table_metadata(

@@ -823,6 +823,7 @@ def _inspect_runtime_schema_drift(
             matches = [candidate for candidate in column_matches if candidate.get('name') == required_name]
         else:
             matches = column_matches
+        matches = [candidate for candidate in matches if candidate.get('where') is None]
 
         ready = bool(matches)
         check = {
