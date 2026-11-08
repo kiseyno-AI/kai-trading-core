@@ -229,6 +229,67 @@ class PykrxEnrichmentServiceTests(unittest.TestCase):
                             0,
                         )
 
+    def test_prior_enrichment_fallback_ignores_newer_other_market_rows(self):
+        service = PykrxEnrichmentService()
+        service._retry_count = 0
+        service._request_pause_seconds = 0
+        market_date = date(1990, 1, 9)
+        prior_date = date(1990, 1, 5)
+        with Session(engine) as session:
+            symbols = [
+                Symbol(symbol=uuid4().hex[:6].upper(), name_ko='Audit', market=market)
+                for market in ('KOSPI', 'KOSDAQ')
+            ]
+            session.add_all(symbols)
+            session.flush()
+
+            def add_prior_row(symbol, source_date):
+                session.add(DailyPykrxEnrichmentRow(
+                    symbol_id=symbol.id, market_date=source_date,
+                    market=symbol.market, category='foreign_ownership',
+                    scope_type='symbol', scope_key=symbol.symbol, source='pykrx',
+                    payload={'foreign_ownership_ratio_pct': 12.5},
+                ))
+                session.flush()
+
+            @contextmanager
+            def test_session_scope(**_kwargs):
+                yield session
+
+            add_prior_row(symbols[0], prior_date)
+            with (
+                patch('app.eod.pykrx_enrichment.session_scope', new=test_session_scope),
+                patch('app.market_data_store.session_scope', new=test_session_scope),
+                patch(
+                    'app.eod.pykrx_enrichment.stock.get_exhaustion_rates_of_foreign_investment_by_ticker',
+                    side_effect=RuntimeError('provider unavailable'),
+                ),
+            ):
+                for other_market_row in (False, True):
+                    with self.subTest(other_market_row=other_market_row):
+                        if other_market_row:
+                            add_prior_row(symbols[1], date(1990, 1, 8))
+                        result = service.collect_for_market_date(
+                            market_date=market_date,
+                            markets=[' kospi '],
+                            symbols=[symbols[0].symbol],
+                            categories=['foreign_ownership'],
+                        )
+                        self.assertEqual(result['status'], 'recovered')
+                        fallback = result['categories']['foreign_ownership']['fallback']
+                        self.assertEqual(fallback['source_market_date'], prior_date.isoformat())
+                        self.assertEqual(fallback['rows_persisted'], 1)
+                        stored = session.scalar(select(DailyPykrxEnrichmentRow).where(
+                            DailyPykrxEnrichmentRow.market_date == market_date,
+                            DailyPykrxEnrichmentRow.symbol_id == symbols[0].id,
+                        ))
+                        self.assertEqual(stored.payload['foreign_ownership_ratio_pct'], 12.5)
+                        self.assertEqual(stored.source, 'pykrx_carry_forward')
+                        self.assertEqual(
+                            stored.payload['carried_forward_from_market_date'],
+                            prior_date.isoformat(),
+                        )
+
     @patch('app.eod.pykrx_enrichment.load_symbols')
     def test_valuation_collection_rejects_unfinalized_date_before_provider_work(
         self,

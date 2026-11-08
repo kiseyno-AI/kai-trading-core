@@ -1763,6 +1763,9 @@ class PykrxEnrichmentService:
                     .where(
                         DailyPykrxEnrichmentRow.market_date < date.fromisoformat(market_date_iso),
                         DailyPykrxEnrichmentRow.category == category,
+                        DailyPykrxEnrichmentRow.market.in_(sorted(normalized_markets))
+                        if normalized_markets
+                        else True,
                     )
                     .group_by(DailyPykrxEnrichmentRow.market_date)
                     .order_by(DailyPykrxEnrichmentRow.market_date.desc())
