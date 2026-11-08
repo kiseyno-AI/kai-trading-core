@@ -3,7 +3,7 @@ from __future__ import annotations
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import URL, engine_from_config, pool
 
 from app.core.settings import settings
 from app.db_models import Base
@@ -19,10 +19,14 @@ target_metadata = Base.metadata
 def _database_url() -> str:
     if settings.database_url:
         return settings.database_url
-    return (
-        f"postgresql+psycopg://{settings.postgres_user}:{settings.postgres_password}"
-        f"@{settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}"
-    )
+    return URL.create(
+        'postgresql+psycopg',
+        username=settings.postgres_user,
+        password=settings.postgres_password,
+        host=settings.postgres_host,
+        port=settings.postgres_port,
+        database=settings.postgres_db,
+    ).render_as_string(hide_password=False)
 
 
 def run_migrations_offline() -> None:
