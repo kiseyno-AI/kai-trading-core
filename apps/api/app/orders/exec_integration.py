@@ -14571,7 +14571,7 @@ class SignalDeciderExecIntegrationService:
                 count = int(counts[field_name])
                 if count > 0:
                     return True
-            except (TypeError, ValueError):
+            except (OverflowError, TypeError, ValueError):
                 invalid_activity_summary_detected = True
                 continue
             explicit_inactivity_detected = True
@@ -14606,7 +14606,7 @@ class SignalDeciderExecIntegrationService:
                     count = float(value[field_name])
                     if count > 0:
                         return True
-                except (TypeError, ValueError):
+                except (OverflowError, TypeError, ValueError):
                     invalid_activity_summary_detected = True
                     continue
                 explicit_inactivity_detected = True

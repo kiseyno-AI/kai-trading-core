@@ -3661,6 +3661,37 @@ class ExecRuntimeReadbackNormalizationTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_daily_board_preserves_unknown_activity_for_overflowing_counts(self) -> None:
+        summaries = [
+            json.loads('{"counts": {"open_orders": 1e309}}'),
+            json.loads('{"counts": {"active_execution_jobs": -1e309}}'),
+            {'symbols': {'filled_today_counts': {'buy': {'quantity': 10**400}}}},
+        ]
+        for summary in summaries:
+            with self.subTest(summary=summary), patch(
+                'app.orders.exec_integration._utcnow',
+                return_value=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc),
+            ):
+                board = self.service._build_runtime_daily_board_payload(
+                    market_date=date(2026, 8, 29),
+                    refresh=False,
+                    overview={
+                        'integration': self.integration,
+                        'runtime': {
+                            'status': 'ok',
+                            'payload': {**self._current_exec_payload(), **summary},
+                            'error': None,
+                        },
+                        'items': [],
+                    },
+                    refresh_state={'requested': False, 'status': 'not_requested'},
+                    served_from_cache=False,
+                )
+
+                self.assertEqual(board['activity_coverage']['status'], 'unavailable')
+                self.assertIsNone(board['activity_coverage']['exec_activity_detected'])
+                self.assertEqual(board['freshness']['status'], 'unavailable')
+
     def test_execution_identity_accepts_exact_broker_id_when_order_has_internal_id(self) -> None:
         executions, mismatches = self.service._match_remote_executions(
             row=SimpleNamespace(symbol='005930'),
