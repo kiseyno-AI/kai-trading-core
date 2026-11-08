@@ -53,6 +53,8 @@ SIGNAL_FEATURE_SCOPE_OUTCOME_MANIFEST_VERSION = (
     'signal_features_scope_outcomes_v1'
 )
 
+STORED_FALLBACK_BACKFILL_MODE = 'stored_owned_fallback_missing_row_backfill'
+
 ROW_KIND_DIRECT_ONLY = 'direct_only'
 ROW_KIND_DIRECT_PLUS_FALLBACK = 'direct_plus_fallback'
 ROW_KIND_FALLBACK_ONLY = 'fallback_only'
@@ -2394,6 +2396,86 @@ class DailySignalFeatureService:
                 target_symbols
             ),
             'exact_scope': normalized_exact_symbols is not None,
+        }
+
+    def build_stored_owned_fallback_rows(
+        self,
+        *,
+        market_date: str | date,
+        symbols: Sequence[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build fallback-only rows from stored data alone, persisting nothing.
+
+        Used to backfill a trading day whose signal-feature rows were never
+        written.  Nothing is fetched: the rows carry no KIS ranking evidence
+        (``signal_count`` 0, ``row_kind`` ``fallback_only``) and no quote
+        snapshot, because today's quote cache is not historical evidence.
+        Every row is tagged ``collection.repair_mode`` so it can always be told
+        apart from rows produced by the live collection.  Symbols with no
+        stored bar or factor input are reported, not written.
+        """
+
+        normalized_market_date = _normalize_market_date(market_date)
+        requested: list[str] = []
+        for value in symbols:
+            normalized_symbol = _normalize_symbol(value)
+            if normalized_symbol is None:
+                raise ValueError(
+                    f'stored fallback backfill got an invalid symbol: {value!r}'
+                )
+            requested.append(normalized_symbol)
+        requested = sorted(set(requested))
+        universe = _resolve_generation_universe(
+            market_date=normalized_market_date,
+            direct_symbols=[],
+        )
+        not_active = sorted(set(requested) - set(universe['target_symbols']))
+        if not_active:
+            raise ValueError(
+                'stored fallback backfill symbols have no daily bar on '
+                f'{normalized_market_date}: {not_active[:5]}'
+            )
+        support_maps = _load_support_maps(
+            market_date=normalized_market_date,
+            target_symbols=requested,
+        )
+        support_maps['quote_map'] = {}
+        collection_payload = {
+            'collected_at': _utcnow_iso(),
+            'source_errors': {},
+            'source_counts': {source: 0 for source in SUPPORTED_SIGNAL_SOURCES},
+            'repair_mode': STORED_FALLBACK_BACKFILL_MODE,
+            'provider_symbols': [],
+        }
+        rows: list[dict[str, Any]] = []
+        without_inputs: list[str] = []
+        for symbol in requested:
+            entry = _empty_feature_row(
+                symbol=symbol,
+                market_date=normalized_market_date,
+                source_counts=dict(collection_payload['source_counts']),
+                collection=dict(collection_payload),
+            )
+            merged = _merge_owned_fallback_features(
+                entry=entry,
+                market_date=normalized_market_date,
+                universe=universe,
+                support_maps=support_maps,
+                collection_payload=collection_payload,
+                source_errors={},
+            )
+            provenance = ((merged or {}).get('feature_payload') or {}).get(
+                'row_provenance'
+            ) or {}
+            if merged is None or not provenance.get('fallback_groups_present'):
+                without_inputs.append(symbol)
+                continue
+            rows.append(merged)
+        return rows, {
+            'market_date': normalized_market_date,
+            'requested_symbol_count': len(requested),
+            'built_row_count': len(rows),
+            'without_stored_inputs': without_inputs,
         }
 
     def inspect(
