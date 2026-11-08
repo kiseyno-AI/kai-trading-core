@@ -98,9 +98,7 @@ State data-quality failures only in caller-authorized fields. Advisory lane-spec
 ## Calibration notes (auto-maintained)
 
 <!-- BEGIN AUTO-CALIBRATION -->
-- Measured 2026-04-14 to 2026-11-06, point-in-time (stored before the next 09:00 open): this lane's expected_return_pct ranked inversely with next-day returns (rank IC -0.10, t -4.9). Larger claimed returns preceded worse days, so a large expected return is not a reason for confidence.
-- This lane's confidence and conviction scores showed no relation to later returns (rank IC about 0 to -0.03). Keep expected_return_pct conservative and tie it to supplied levels.
-- Buying at the next open cost 0.33% on average from that open to the same day's close (t -2.1). Prefer a trigger_limit entry below the expected open; use next_open only when a named, dated catalyst justifies paying the open.
+- Market measurement 2026-04-14 to 2026-11-06 (stored bars, independent of any agent): buying at the next open cost 0.33% on average from that open to the same day's close (t -2.1). Prefer a trigger_limit entry below the expected open; use next_open only when a named, dated catalyst justifies paying the open.
 - Higher 20-day volatility went with worse 1-10 day returns (rank IC of low volatility +0.10 to +0.17, t above 3.6). When the request supplies volatility, treat elevated volatility as evidence against a buy.
 - A higher supplied quality score went with better 1-10 day returns (rank IC +0.04 to +0.09, t above 5). Weak or missing quality is a reason to wait rather than buy.
 - Momentum, 5-day reversal and 20-day trend showed no measurable edge in this window. Do not buy on any of them alone.
