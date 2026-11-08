@@ -1959,6 +1959,32 @@ class AgentJsonStructureRepairTests(unittest.TestCase):
                 self.assertIsNone(repair)
                 self.assertIn(failure, {'json_decode_error', 'json_object_not_found'})
 
+    def test_replaces_a_closer_of_the_wrong_kind(self):
+        # Shape seen in production summarizer output (2026-11-05, eod-summarizer):
+        # the risk_flags array was closed with a brace, then the object went on.
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        broken = text.replace('"risk_flags": ["a"]', '"risk_flags": ["a"}', 1)
+        self.assertNotEqual(broken, text)
+        self.assertIsNone(repair_agent_json_structure(broken))  # the insert repair cannot express it
+
+        decoded, failure, repair = decode_agent_json_object_with_structure_repair(broken)
+
+        self.assertIsNone(failure)
+        self.assertEqual(decoded, self._batch())
+        self.assertEqual(repair['substituted_closers'], 1)
+        self.assertEqual(repair['inserted_closers'], 0)
+
+    def test_substitution_still_refuses_extra_closers_and_too_many_edits(self):
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        self.assertIsNone(repair_agent_json_structure(text + '}', mismatched_closer='substitute'))
+        many = text.replace(']', '}')
+        self.assertIsNone(repair_agent_json_structure(many, mismatched_closer='substitute'))
+        decoded, failure, repair = decode_agent_json_object_with_structure_repair(many)
+        self.assertIsNone(decoded)
+        self.assertIsNone(repair)
+        with self.assertRaises(ValueError):
+            repair_agent_json_structure(text, mismatched_closer='guess')
+
     def test_valid_and_duplicate_key_inputs_are_left_to_the_strict_decoder(self):
         text = json.dumps(self._batch(), ensure_ascii=False)
         self.assertEqual(decode_agent_json_object_with_structure_repair(text), (self._batch(), None, None))
