@@ -335,6 +335,7 @@ class DailyTurnoverRepairService:
         market_date: str | date,
         markets: Sequence[str] = DEFAULT_TURNOVER_REPAIR_MARKETS,
         apply: bool = False,
+        allow_partial_verified: bool = False,
     ) -> dict[str, Any]:
         normalized_date = _normalize_market_date(market_date)
         normalized_markets = _normalize_markets(markets)
@@ -508,6 +509,11 @@ class DailyTurnoverRepairService:
                         counts_by_market=skipped_provider_code_counts_by_market,
                     ),
                 )
+            patcher_options: dict[str, Any] = (
+                {'allow_partial_verified': True}
+                if allow_partial_verified
+                else {}
+            )
             try:
                 repair_result = self.turnover_patcher(
                     market_date=iso_date,
@@ -516,6 +522,7 @@ class DailyTurnoverRepairService:
                     provider_volume_by_symbol=volume_by_symbol,
                     provider_ohlc_by_symbol=ohlc_by_symbol,
                     apply=apply,
+                    **patcher_options,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -596,6 +603,16 @@ def _build_parser() -> argparse.ArgumentParser:
         dest='apply',
         help='Validate and report without writing (default).',
     )
+    parser.add_argument(
+        '--partial-verified',
+        action='store_true',
+        help=(
+            'Also write the rows that individually pass every check when other '
+            'rows cannot be verified (missing stored bar, OHLC mismatch, ...). '
+            'Unverified rows are left untouched and reported. Structural '
+            'membership problems still block the date.'
+        ),
+    )
     parser.set_defaults(apply=False)
     return parser
 
@@ -608,6 +625,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             market_date=args.market_date,
             markets=_parse_markets(args.markets),
             apply=args.apply,
+            allow_partial_verified=args.partial_verified,
         )
     except Exception as exc:  # noqa: BLE001
         result = {
@@ -620,7 +638,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 1
 
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    if result.get('status') in {'ready', 'completed'}:
+    if result.get('status') in {
+        'ready',
+        'completed',
+        'ready_partial',
+        'completed_partial',
+    }:
         return 0
     if result.get('status') == 'blocked':
         return 2

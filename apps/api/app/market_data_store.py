@@ -987,6 +987,22 @@ def _turnover_repair_symbol_preview(symbols: Sequence[str]) -> list[str]:
     return list(symbols[:20])
 
 
+# Reasons that describe individual rows.  With ``allow_partial_verified`` they
+# only exclude those rows; every other reason is a whole-date structural block.
+_TURNOVER_REPAIR_ROW_LEVEL_REASONS = frozenset(
+    {
+        'missing_price_bars',
+        'provider_stored_ohlc_mismatch',
+        'invalid_provider_liquidity',
+        'provider_volume_decreased',
+        'provider_turnover_decreased',
+        # Rows outside the provider membership (typically trading-halted
+        # symbols the provider omits) are never part of the update set.
+        'active_stored_rows_outside_provider_membership',
+    }
+)
+
+
 def repair_daily_price_bar_turnovers(
     *,
     market_date: str | date,
@@ -995,6 +1011,7 @@ def repair_daily_price_bar_turnovers(
     provider_volume_by_symbol: Mapping[str, int],
     provider_ohlc_by_symbol: Mapping[str, Sequence[int]],
     apply: bool = False,
+    allow_partial_verified: bool = False,
 ) -> dict[str, Any]:
     """Repair final volume and turnover without rewriting price/fundamental data.
 
@@ -1004,6 +1021,13 @@ def repair_daily_price_bar_turnovers(
     every expected bar; this prevents current adjusted history from being
     mixed into the point-in-time price series.  Provider liquidity must be
     complete and monotonic relative to the stored partial-close values.
+
+    By default any gap blocks the whole date.  ``allow_partial_verified`` is an
+    explicit operator choice for dates that can never be complete (for example
+    symbols with no stored bar): rows that individually pass every check are
+    still written, rows that fail any check are left untouched and reported.
+    A provider membership mismatch (the provider payload is missing or has
+    unexpected symbols) still blocks the date.
     """
 
     normalized_market_date = _normalize_trade_date(market_date)
@@ -1212,11 +1236,43 @@ def repair_daily_price_bar_turnovers(
         if provider_turnover_decrease_symbols:
             blocked_reasons.append('provider_turnover_decreased')
 
+        structural_blocked_reasons = [
+            reason
+            for reason in blocked_reasons
+            if reason not in _TURNOVER_REPAIR_ROW_LEVEL_REASONS
+        ]
+        partial_verified = (
+            allow_partial_verified
+            and bool(blocked_reasons)
+            and not structural_blocked_reasons
+        )
+        effective_blocked_reasons = [] if partial_verified else blocked_reasons
+
         result: dict[str, Any] = {
             'market_date': normalized_market_date.isoformat(),
-            'status': 'blocked' if blocked_reasons else 'ready',
-            'reason': 'incomplete_repair_coverage' if blocked_reasons else None,
-            'blocked_reasons': blocked_reasons,
+            'status': (
+                'blocked'
+                if effective_blocked_reasons
+                else 'ready_partial'
+                if partial_verified
+                else 'ready'
+            ),
+            'reason': (
+                'incomplete_repair_coverage'
+                if effective_blocked_reasons
+                else 'partial_verified_rows_only'
+                if partial_verified
+                else None
+            ),
+            'blocked_reasons': effective_blocked_reasons,
+            'partial_skipped_reasons': blocked_reasons if partial_verified else [],
+            'unverified_symbol_count': len(
+                set(missing_price_bar_symbols)
+                | set(provider_stored_ohlc_mismatch_symbols)
+                | set(invalid_provider_liquidity_symbols)
+                | set(provider_volume_decrease_symbols)
+                | set(provider_turnover_decrease_symbols)
+            ),
             'applied': False,
             'membership_sha256': market_membership_sha256(normalized_expected),
             'expected_symbol_count': len(normalized_expected),
@@ -1293,7 +1349,7 @@ def repair_daily_price_bar_turnovers(
                 unexpected_provider_symbols
             ),
         }
-        if blocked_reasons or not apply:
+        if effective_blocked_reasons or not apply:
             return result
 
         if update_parameters:
@@ -1321,7 +1377,7 @@ def repair_daily_price_bar_turnovers(
 
         result.update(
             {
-                'status': 'completed',
+                'status': 'completed_partial' if partial_verified else 'completed',
                 'applied': True,
                 'updated_count': len(update_parameters),
             }
