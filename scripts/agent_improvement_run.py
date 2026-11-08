@@ -6,8 +6,12 @@ default: it only prints what it would do. With ``--apply`` it
 
 * asks the Codex CLI to edit ONLY the calibration block of the affected decider contract
   and append a changelog line,
-* commits on ``bot/agent-rules-<run>``, runs ``scripts/agent_rules_guard.py`` against
-  origin/main and aborts without pushing if it reports anything,
+* works in a throwaway git worktree of origin/main, so the live checkout (which Core and
+  the OpenClaw contract sync read) never changes branch and needs no restore,
+* commits on ``bot/agent-rules-<run>`` there and runs **origin/main's copy** of
+  ``scripts/agent_rules_guard.py``, saved outside the worktree before the model runs, so the
+  candidate branch cannot weaken the check that judges it; it aborts without pushing if the
+  guard reports anything,
 * opens a pull request (the repository's existing workflow then asks Codex to review it)
   and opens/dedupes one issue per code-level finding.
 
@@ -23,8 +27,10 @@ from datetime import date
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +151,60 @@ def _default_runner(cmd: Sequence[str], *, input: str | None = None, check: bool
     return subprocess.run(list(cmd), input=input, text=True, capture_output=True, check=check, cwd=cwd)
 
 
+def _propose_change(
+    chosen: Sequence[Mapping[str, Any]],
+    *,
+    run_id: str,
+    runner: Runner,
+    policy_text: str,
+    contract_blocks: Mapping[str, str],
+    repo_dir: str | None,
+    work_root: str | None,
+    result: dict[str, Any],
+) -> str:
+    """Branch, let Codex edit, guard with main's guard, push and open a PR, all in a temp worktree."""
+
+    branch = f'bot/agent-rules-{run_id}'
+    scratch = Path(tempfile.mkdtemp(prefix='agent-rules-', dir=work_root))
+    worktree = scratch / 'repo'
+    guard_copy = scratch / 'agent_rules_guard.base.py'
+    in_repo = lambda cmd, **kw: runner(cmd, cwd=repo_dir, **kw)  # noqa: E731
+    in_tree = lambda cmd, **kw: runner(cmd, cwd=str(worktree), **kw)  # noqa: E731
+    added = False
+    try:
+        in_repo(['git', 'fetch', 'origin', 'main'])
+        # Taken from origin/main and stored outside the worktree before the model runs:
+        # nothing on the candidate branch can change the code that judges it.
+        base_guard = getattr(in_repo(['git', 'show', 'origin/main:scripts/agent_rules_guard.py']), 'stdout', '') or ''
+        if 'def main' not in base_guard:
+            return 'guard_unavailable'
+        guard_copy.write_text(base_guard, encoding='utf-8')
+        in_repo(['git', 'worktree', 'add', '--detach', str(worktree), 'origin/main'])
+        added = True
+        in_tree(['git', 'checkout', '-B', branch])
+        prompt = build_prompt(policy_text, chosen, contract_blocks, run_id=run_id)
+        in_tree(['codex', 'exec', '--sandbox', 'workspace-write', '--cd', str(worktree), '-'], input=prompt)
+        in_tree(['git', 'add', '-A'])
+        staged = in_tree(['git', 'diff', '--cached', '--quiet'], check=False)
+        if getattr(staged, 'returncode', 1) == 0:
+            return 'no_change'
+        in_tree(['git', 'commit', '-m', f"{COMMIT_PREFIX} Calibrate decider notes ({run_id})"])
+        guard = in_tree([sys.executable, '-I', str(guard_copy), '--base', 'origin/main'], check=False)
+        if getattr(guard, 'returncode', 1) != 0:
+            result['guard_output'] = (getattr(guard, 'stdout', '') or '')[-1500:]
+            return 'blocked_by_guard'
+        in_tree(['git', 'push', '-u', 'origin', branch])
+        created = in_tree(['gh', 'pr', 'create', '--base', 'main', '--head', branch,
+                           '--title', f'Calibrate decider notes ({run_id})', '--body', pr_body(chosen, run_id=run_id)])
+        return (getattr(created, 'stdout', '') or '').strip() or 'created'
+    finally:
+        if added:
+            in_repo(['git', 'worktree', 'remove', '--force', str(worktree)], check=False)
+            # The pushed branch lives on origin; the local one is not needed.
+            in_repo(['git', 'branch', '-D', branch], check=False)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def execute(
     *,
     findings: Sequence[Mapping[str, Any]],
@@ -154,6 +214,7 @@ def execute(
     policy_text: str,
     contract_blocks: Mapping[str, str],
     repo_dir: str | None = None,
+    work_root: str | None = None,
 ) -> dict[str, Any]:
     text_findings, issue_findings = split_findings(findings)
     chosen = cap_text_changes(text_findings)
@@ -168,29 +229,10 @@ def execute(
 
     result['pull_request'] = None
     if chosen:
-        branch = f'bot/agent-rules-{run_id}'
-        run = lambda cmd, **kw: runner(cmd, cwd=repo_dir, **kw)  # noqa: E731
-        run(['git', 'fetch', 'origin', 'main'])
-        run(['git', 'checkout', '-B', branch, 'origin/main'])
-        prompt = build_prompt(policy_text, chosen, contract_blocks, run_id=run_id)
-        run(['codex', 'exec', '--sandbox', 'workspace-write', '--cd', repo_dir or '.', '-'], input=prompt)
-        run(['git', 'add', '-A'])
-        staged = run(['git', 'diff', '--cached', '--quiet'], check=False)
-        if getattr(staged, 'returncode', 1) == 0:
-            result['pull_request'] = 'no_change'
-        else:
-            run(['git', 'commit', '-m', f"{COMMIT_PREFIX} Calibrate decider notes ({run_id})"])
-            guard = run([sys.executable, 'scripts/agent_rules_guard.py', '--base', 'origin/main'], check=False)
-            if getattr(guard, 'returncode', 1) != 0:
-                result['pull_request'] = 'blocked_by_guard'
-                result['guard_output'] = (getattr(guard, 'stdout', '') or '')[-1500:]
-                run(['git', 'checkout', 'main'], check=False)
-                run(['git', 'branch', '-D', branch], check=False)
-            else:
-                run(['git', 'push', '-u', 'origin', branch])
-                created = run(['gh', 'pr', 'create', '--base', 'main', '--head', branch,
-                               '--title', f'Calibrate decider notes ({run_id})', '--body', pr_body(chosen, run_id=run_id)])
-                result['pull_request'] = (getattr(created, 'stdout', '') or '').strip() or 'created'
+        result['pull_request'] = _propose_change(
+            chosen, run_id=run_id, runner=runner, policy_text=policy_text,
+            contract_blocks=contract_blocks, repo_dir=repo_dir, work_root=work_root, result=result,
+        )
     result['issues'] = []
     for finding in issue_findings:
         title, body = issue_for(finding)
@@ -228,7 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_dir=str(ROOT),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result.get('pull_request') != 'blocked_by_guard' else 2
+    return 2 if result.get('pull_request') in ('blocked_by_guard', 'guard_unavailable') else 0
 
 
 if __name__ == '__main__':

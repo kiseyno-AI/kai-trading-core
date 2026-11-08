@@ -20,6 +20,10 @@ capital. Today most signals have none, so the loop also reports honestly when th
 3. **Act** (`scripts/agent_improvement_run.py`):
    * `text_change` (decider agents only): Codex edits only the calibration block of that agent's contract, in a
      `bot/agent-rules-*` branch, and the guard must pass before anything is pushed. One change per agent per run.
+     The work happens in a temporary `git worktree` of `origin/main`, never in the live checkout, so the checkout Core
+     and the OpenClaw contract sync read never changes branch; the worktree and local branch are removed afterwards,
+     also on failure. The guard that runs is `origin/main`'s copy, saved outside the worktree before Codex starts and
+     run with `python -I`, so nothing on the candidate branch (including an edited guard) can change the verdict.
    * `code_issue` (summarizers, and deterministic signals worth exposing to the deciders): opens one deduplicated issue
      for the normal Codex/PR flow. The loop never edits code.
    * `observation`: logged only.
@@ -32,7 +36,7 @@ capital. Today most signals have none, so the loop also reports honestly when th
   `agent_rules/CHANGELOG.md`.
 * Everything else in a contract (fail-closed rules, gate semantics, output schema) must stay byte-identical.
 * At most 12 lines / 1,500 characters, plain bullets only, wording that could widen authority or leak is refused.
-* The guard is not an allowed path, and the guard workflow (GitHub-hosted, PR-triggered) runs the base branch's copy so a PR cannot weaken it.
+* The guard is not an allowed path. Both the local run and the guard workflow (GitHub-hosted, PR-triggered) run the base branch's copy, so a candidate cannot weaken the check that judges it.
 * Execution, risk, order and gate code is never in scope.
 
 ## Rollback and deployment
