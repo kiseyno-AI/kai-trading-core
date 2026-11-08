@@ -3809,9 +3809,6 @@ class DartFundamentalsCaptureService:
 
             if event_ids_to_capture:
                 pending_event_ids = list(event_ids_to_capture)
-                candidate_receipt_date_from = (
-                    min(check_start_by_symbol.values()) if check_start_by_symbol else None
-                )
                 max_retry_cycles = max(1, resolved_retry_cycles)
                 pending_batches: list[list[int]] = []
                 if pending_event_ids:
@@ -3842,7 +3839,7 @@ class DartFundamentalsCaptureService:
                                 trigger='daily_incremental_refresh',
                                 fs_div=resolved_fs_div,
                                 stock_codes=sorted(candidate_symbols),
-                                receipt_date_from=candidate_receipt_date_from,
+                                # Exact IDs include due rechecks older than the incremental window.
                                 receipt_date_to=resolved_market_date,
                                 event_ids=list(pending_event_ids),
                             )
