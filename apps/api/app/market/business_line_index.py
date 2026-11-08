@@ -124,9 +124,22 @@ def main() -> None:
     args = parser.parse_args()
     end = date.fromisoformat(args.end)
     mapping = profiles_as_of(end)
-    with engine.connect() as connection:
-        rows = compute_daily_metrics(connection, start=date.fromisoformat(args.start), end=end, mapping=mapping)
-    print(json.dumps({'symbols': len(mapping), 'rows': store_daily_metrics(rows) if rows else 0}))
+    stored = 0
+    # One query per calendar year: a single multi-year window pass exceeds
+    # the production connection's statement timeout.
+    for chunk_start, chunk_end in year_chunks(date.fromisoformat(args.start), end):
+        with engine.connect() as connection:
+            rows = compute_daily_metrics(connection, start=chunk_start, end=chunk_end, mapping=mapping)
+        stored += store_daily_metrics(rows) if rows else 0
+        print(json.dumps({'year': chunk_start.year, 'rows': len(rows)}), flush=True)
+    print(json.dumps({'symbols': len(mapping), 'rows': stored}))
+
+
+def year_chunks(start: date, end: date) -> list[tuple[date, date]]:
+    return [
+        (max(start, date(year, 1, 1)), min(end, date(year, 12, 31)))
+        for year in range(start.year, end.year + 1)
+    ]
 
 
 if __name__ == '__main__':
