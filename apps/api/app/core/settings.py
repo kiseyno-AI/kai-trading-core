@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     api_log_rotation_backup_count: int = 10
     startup_maintenance_enabled: bool = True
     background_runner_enabled: bool = True
+    # Hourly read-only check that the latest trading day's derived tables cover the
+    # price-bar universe (see app/internal/daily_coverage_audit.py). It only logs and
+    # reports through the runner snapshot; it never changes pipeline behavior.
+    daily_coverage_audit_enabled: bool = True
 
     db_auto_upgrade: bool = True
     database_url: Optional[str] = None

@@ -35,6 +35,13 @@ MARKET_SNAPSHOT_OPEN_DRIVE_END_EXCLUSIVE_KST = time(15, 31)
 NEXT_OPEN_PLAN_REFRESH_SINGLE_FLIGHT_KEY = 'signal_decider_next_open_execution_refresh_plan_if_due'
 OPEN_EXEC_DISPATCH_SINGLE_FLIGHT_KEY = 'signal_decider_exec_dispatch_open_plan'
 BUY_AUTHORITY_REVOCATION_CONSECUTIVE_FAILURE_THRESHOLD = 3
+DAILY_COVERAGE_AUDIT_STEP = 'daily_coverage_audit'
+DAILY_COVERAGE_AUDIT_MIN_INTERVAL = timedelta(hours=1)
+# CLOSED is excluded: the daily pipeline normally runs then, and a table that is
+# still being written would be reported as incomplete.
+DAILY_COVERAGE_AUDIT_MARKET_STATES = frozenset(
+    {'PREOPEN', 'OPEN', 'WEEKEND', 'HOLIDAY'}
+)
 SEOUL_TZ = ZoneInfo('Asia/Seoul')
 
 
@@ -68,6 +75,9 @@ class EODBackgroundRunner:
         self._last_tick_succeeded_at: datetime | None = None
         self._last_tick_error: dict[str, str] | None = None
         self._tick_count = 0
+        self._last_daily_coverage_audit_at: datetime | None = None
+        self._daily_coverage: dict | None = None
+        self._last_daily_coverage_alert_key: tuple | None = None
 
     def snapshot(self, *, now: datetime | None = None) -> dict:
         current = now or datetime.now(timezone.utc)
@@ -107,6 +117,11 @@ class EODBackgroundRunner:
             'daily_pipeline_enabled': settings.eod_auto_pykrx_enabled,
             'status': status,
             'running': self._running,
+            'daily_coverage': (
+                dict(self._daily_coverage)
+                if self._daily_coverage is not None
+                else None
+            ),
             'task_alive': bool(self._task is not None and not self._task.done()),
             'interval_seconds': self.interval_seconds,
             'started_at': self._started_at.isoformat() if self._started_at else None,
@@ -231,6 +246,86 @@ class EODBackgroundRunner:
         self._step_timeout_cooldowns[name] = datetime.now(timezone.utc) + timedelta(
             seconds=BACKGROUND_RUNNER_TIMEOUT_COOLDOWN_SECONDS
         )
+
+    def _daily_coverage_audit_due(
+        self,
+        market: object | None,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        if not settings.daily_coverage_audit_enabled or market is None:
+            return False
+        if getattr(market, 'state', None) not in DAILY_COVERAGE_AUDIT_MARKET_STATES:
+            return False
+        if auto_pykrx_eod_scheduler.state.active_task:
+            return False
+        current = now or datetime.now(timezone.utc)
+        if (
+            self._last_daily_coverage_audit_at is not None
+            and current - self._last_daily_coverage_audit_at
+            < DAILY_COVERAGE_AUDIT_MIN_INTERVAL
+        ):
+            return False
+        return True
+
+    def _audit_daily_coverage_sync(self, *, now: datetime | None = None) -> dict | None:
+        """Audit the latest trading day (read-only) and remember/log the outcome."""
+
+        from app.internal.daily_coverage_audit import (
+            load_recent_trade_dates,
+            run_audit,
+        )
+
+        dates = load_recent_trade_dates(1)
+        if not dates:
+            return None
+        report = run_audit(dates)[0]
+        checked_at = now or datetime.now(timezone.utc)
+        problems = [
+            {'table': row['key'], 'rows': row['count'], 'status': row['status']}
+            for row in report['tables']
+            if row['status'] != 'ok'
+        ]
+        self._daily_coverage = {
+            'checked_at': checked_at.isoformat(),
+            'market_date': report['market_date'],
+            'status': report['status'],
+            'price_bar_count': report['baseline_count'],
+            'min_ratio': report['min_ratio'],
+            'problem_tables': problems,
+        }
+        alert_key = (
+            report['market_date'],
+            tuple(sorted(item['table'] for item in problems)),
+        )
+        if report['status'] != 'ok' and alert_key != self._last_daily_coverage_alert_key:
+            logger.warning(
+                'Daily coverage audit: %s has incomplete derived tables '
+                '(price_bars=%s): %s',
+                report['market_date'],
+                report['baseline_count'],
+                ', '.join(
+                    f"{item['table']}={item['rows']}({item['status']})"
+                    for item in problems
+                )
+                or 'no price bars',
+            )
+        self._last_daily_coverage_alert_key = (
+            alert_key if report['status'] != 'ok' else None
+        )
+        return self._daily_coverage
+
+    async def _run_daily_coverage_audit(self) -> None:
+        """Run the audit as a best-effort step that can never abort a tick."""
+
+        self._last_daily_coverage_audit_at = datetime.now(timezone.utc)
+        try:
+            await self._run_blocking_step(
+                DAILY_COVERAGE_AUDIT_STEP,
+                self._audit_daily_coverage_sync,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('Daily coverage audit failed: %s', exc)
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -766,6 +861,8 @@ class EODBackgroundRunner:
                                 trigger=f'background_runner:{market.state.lower()}'
                             ),
                         )
+                    if self._daily_coverage_audit_due(market):
+                        await self._run_daily_coverage_audit()
             except Exception as exc:
                 tick_failed = True
                 self._last_tick_error = {

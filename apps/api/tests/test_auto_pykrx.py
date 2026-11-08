@@ -4471,6 +4471,9 @@ class PykrxBackfillServiceTests(TestCase):
                 'market_date': '2026-09-11',
                 'exact_membership_symbols': symbol_codes,
                 'admitted_symbols': symbol_codes[:2],
+                # Price-only factors are admitted by the full follow-up price
+                # cohort, not by the narrower DART/Piotroski cohort.
+                'price_admitted_symbols': symbol_codes,
                 'stage_executor': ANY,
                 'stage_result_callback': ANY,
             },
@@ -17701,6 +17704,9 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-04-03',
             exact_membership_symbols=symbol_codes,
             admitted_symbols=symbol_codes[2:3],
+            # Price-only factors are admitted by the follow-up price cohort
+            # (symbols 3-5; symbols 1-2 never passed price admission).
+            price_admitted_symbols=symbol_codes[2:5],
             authoritative_market_scope=ANY,
             stage_executor=ANY,
             stage_result_callback=ANY,
