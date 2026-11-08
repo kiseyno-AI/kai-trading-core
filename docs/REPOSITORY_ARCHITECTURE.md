@@ -13,8 +13,10 @@ Scope:
 Non-goals:
 
 - Frontend/web UI design
-- Live order execution
+- The always-on broker execution loop and execution truth (owned by `kai-trading-exec`; see the top-level `README.md`)
 - Future roadmap architecture that is not yet implemented in this repo
+
+Note: this document predates the `app/orders/`, `app/us_equities/`, portfolio, and Exec-handoff layers. The top-level `README.md` and `docs/API_BUILD_ORDER.md` are the current references for those areas.
 
 ## Top-Level Repository Shape
 
@@ -588,11 +590,10 @@ What the core does today:
 - expose inspection and aggregate read APIs
 - support operator-triggered ingestion and backfill jobs
 
-What it does not do yet:
+What this document does not cover (see `README.md` and `docs/API_BUILD_ORDER.md`):
 
-- portfolio state management
-- order execution
-- final ranking, prioritization, or discretionary agent reasoning
-- separate worker/service decomposition
+- portfolio read models and Core-side order/reconciliation services (`app/orders/`)
+- delegation of execution plans to `kai-trading-exec` and the buy-authority handshake
+- US-equity collection, screening, and preview-only planning (`app/us_equities/`)
 
-That boundary is intentional. The repo currently behaves as a durable data-and-context core for higher-level decision systems.
+The always-on broker execution loop is intentionally not part of this repo; it belongs to `kai-trading-exec`.

@@ -669,6 +669,11 @@ class DartFundamentalsRepositoryTests(unittest.TestCase):
         )
 
         self.assertEqual([candidate['id'] for candidate in candidates], [due])
+        # The daily path reaches the same event with no receipt-date window,
+        # because a [014] event counts as resolved and the window starts after it.
+        rechecks = self.repository.list_file_not_found_rechecks(stock_codes=[stock_code])
+        self.assertEqual([event['id'] for event in rechecks], [due])
+        self.assertEqual(self.repository.list_file_not_found_rechecks(stock_codes=[stock_code], limit=0), [])
 
     def test_list_stored_fundamentals_summary_excludes_snapshots_at_or_after_cutoff(self):
         stock_code = f'T{uuid4().hex[:10]}'

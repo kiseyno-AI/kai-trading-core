@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -18,7 +18,9 @@ class ScannerState:
 
     def update(self, symbols: list[str]) -> dict:
         self.tracked_symbols = symbols
-        self.last_updated_at = datetime.utcnow().isoformat() + 'Z'
+        # Same wire format as before (naive UTC ISO + 'Z') without the
+        # deprecated datetime.utcnow().
+        self.last_updated_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + 'Z'
         return self.snapshot()
 
     def hydrate(self, symbols: list[str], *, last_updated_at: str | None = None) -> dict:

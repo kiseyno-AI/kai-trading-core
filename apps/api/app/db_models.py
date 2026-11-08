@@ -3113,3 +3113,103 @@ class DartDilutionSignal(Base, TimestampMixin):
     security_type: Mapped[str | None] = mapped_column(String(64))
     reason: Mapped[str | None] = mapped_column(String(255))
     payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MarketNewsItem(Base, TimestampMixin):
+    """One article returned for one market/business-line news topic.
+
+    ``first_seen_at`` is when Core first observed it (the point-in-time
+    cutoff); ``published_at`` is the publisher's time when known.
+    """
+
+    __tablename__ = 'market_news_items'
+    __table_args__ = (
+        UniqueConstraint('topic_key', 'url_hash', name='uq_market_news_items_topic_url'),
+        Index('ix_market_news_items_topic_published', 'topic_key', 'published_at'),
+        Index('ix_market_news_items_published_at', 'published_at'),
+        Index('ix_market_news_items_first_seen_at', 'first_seen_at'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class SymbolIndustryProfile(Base, TimestampMixin):
+    """Industry and business line of one symbol from ``effective_from`` on.
+
+    A new row is written only when the KSIC code or business line changes,
+    so past dates can be classified with what was known then.
+    """
+
+    __tablename__ = 'symbol_industry_profiles'
+    __table_args__ = (
+        UniqueConstraint('symbol', 'effective_from', name='uq_symbol_industry_profiles_symbol_from'),
+        Index('ix_symbol_industry_profiles_business_line', 'business_line'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    corp_code: Mapped[str | None] = mapped_column(String(16))
+    corp_name: Mapped[str | None] = mapped_column(String(255))
+    ksic_code: Mapped[str | None] = mapped_column(String(16))
+    krx_sector: Mapped[str | None] = mapped_column(String(64))
+    business_line: Mapped[str] = mapped_column(String(64), nullable=False)
+    line_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MacroSeriesHistory(Base, TimestampMixin):
+    """Research history of macro series with the date each value became public.
+
+    ``released_on`` comes from ALFRED first releases where FRED serves them
+    (``release_basis='alfred_initial_release'``); dense daily market series
+    are public the same US day after the close (``'same_day_close'``).
+    """
+
+    __tablename__ = 'macro_series_history'
+    __table_args__ = (
+        UniqueConstraint('source', 'series_id', 'observation_date', name='uq_macro_series_history_obs'),
+        Index('ix_macro_series_history_series_released', 'series_id', 'released_on'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    series_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    observation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    value: Mapped[float] = mapped_column(Numeric(24, 8), nullable=False)
+    released_on: Mapped[date] = mapped_column(Date, nullable=False)
+    release_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BusinessLineDailyMetric(Base, TimestampMixin):
+    """Equal-weight daily return of one business line against the market."""
+
+    __tablename__ = 'business_line_daily_metrics'
+    __table_args__ = (
+        UniqueConstraint('trade_date', 'business_line', name='uq_business_line_daily_metrics_day_line'),
+        Index('ix_business_line_daily_metrics_line_day', 'business_line', 'trade_date'),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    business_line: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbols: Mapped[int] = mapped_column(Integer, nullable=False)
+    ew_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    market_ew_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    excess_return: Mapped[float] = mapped_column(Numeric(18, 10), nullable=False)
+    advancers_ratio: Mapped[float] = mapped_column(Numeric(10, 6), nullable=False)
+    turnover: Mapped[float | None] = mapped_column(Numeric(24, 2))
+    turnover_share: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    classification_basis: Mapped[str] = mapped_column(String(32), nullable=False)

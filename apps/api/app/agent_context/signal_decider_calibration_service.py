@@ -28,6 +28,8 @@ from app.agent_context.signal_decider_snapshot_validity import (
     is_decision_snapshot_valid_for_source_date,
 )
 from app.core.settings import settings
+from app.core.numbers import finite_float as _to_float
+from app.market.symbol_codes import split_symbol_list as _normalize_symbols
 
 
 POSITIVE_GRADE_LABELS: tuple[str, ...] = (
@@ -104,21 +106,6 @@ def _normalize_optional_text(value: Any) -> str | None:
     return normalized or None
 
 
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:
-    if not symbols:
-        return []
-    normalized_symbols: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols:
-        for piece in str(raw_symbol or '').split(','):
-            normalized = str(piece).strip().upper()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            normalized_symbols.append(normalized)
-    return normalized_symbols
-
-
 def _normalize_horizon_days(value: int | None) -> int:
     resolved = DEFAULT_SIGNAL_DECIDER_REVIEW_PRIMARY_HORIZON if value is None else int(value)
     if resolved not in SIGNAL_DECIDER_EVALUATION_HORIZONS:
@@ -131,17 +118,6 @@ def _normalize_horizon_days(value: int | None) -> int:
 def _normalize_limit(value: int | None, *, default: int, maximum: int) -> int:
     resolved = default if value is None else int(value)
     return max(1, min(resolved, maximum))
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _maybe_dict(value: Any) -> dict[str, Any]:

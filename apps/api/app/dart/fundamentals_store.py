@@ -43,6 +43,16 @@ FILE_NOT_FOUND_RECHECK_AFTER = timedelta(days=3)
 FILE_NOT_FOUND_MAX_ATTEMPTS = 3
 
 
+def _file_not_found_recheck_due():
+    return and_(
+        DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_NO_DATA,
+        func.coalesce(DartDisclosureEvent.fundamentals_last_error, '').like('%[014]%'),
+        DartDisclosureEvent.fundamentals_capture_attempts < FILE_NOT_FOUND_MAX_ATTEMPTS,
+        DartDisclosureEvent.fundamentals_last_attempt_at.is_not(None),
+        DartDisclosureEvent.fundamentals_last_attempt_at < _utcnow() - FILE_NOT_FOUND_RECHECK_AFTER,
+    )
+
+
 class FundamentalsCaptureCandidateDriftError(RuntimeError):
     """Raised when a capture result targets a stale event version."""
 
@@ -578,6 +588,34 @@ class DartFundamentalsRepository:
             ).scalars()
             return [_serialize_refresh_run(row) for row in rows]
 
+    def list_file_not_found_rechecks(
+        self,
+        *,
+        stock_codes: list[str],
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """[014] events due for a recheck, regardless of any receipt-date window.
+
+        Such an event is terminal (no_data) and counts as resolved, so the
+        daily refresh's date window starts after it and never lists it again;
+        the daily path pulls these separately.
+        """
+
+        if not stock_codes or limit <= 0:
+            return []
+        with session_scope() as session:
+            rows = session.execute(
+                select(DartDisclosureEvent)
+                .where(
+                    DartDisclosureEvent.is_financial_report.is_(True),
+                    DartDisclosureEvent.stock_code.in_(stock_codes),
+                    _file_not_found_recheck_due(),
+                )
+                .order_by(DartDisclosureEvent.fundamentals_last_attempt_at.asc(), DartDisclosureEvent.id.asc())
+                .limit(limit)
+            ).scalars()
+            return [self._serialize_event(row) for row in rows]
+
     def list_capture_candidates(
         self,
         *,
@@ -595,17 +633,10 @@ class DartFundamentalsRepository:
         with session_scope() as session:
             stmt = select(DartDisclosureEvent).where(DartDisclosureEvent.is_financial_report.is_(True))
             if not force:
-                file_not_found_recheck = and_(
-                    DartDisclosureEvent.fundamentals_capture_status == CAPTURE_STATUS_NO_DATA,
-                    func.coalesce(DartDisclosureEvent.fundamentals_last_error, '').like('%[014]%'),
-                    DartDisclosureEvent.fundamentals_capture_attempts < FILE_NOT_FOUND_MAX_ATTEMPTS,
-                    DartDisclosureEvent.fundamentals_last_attempt_at.is_not(None),
-                    DartDisclosureEvent.fundamentals_last_attempt_at < _utcnow() - FILE_NOT_FOUND_RECHECK_AFTER,
-                )
                 stmt = stmt.where(
                     or_(
                         DartDisclosureEvent.fundamentals_capture_status.in_(RETRYABLE_CAPTURE_STATUSES),
-                        file_not_found_recheck,
+                        _file_not_found_recheck_due(),
                     )
                 )
             if stock_codes:

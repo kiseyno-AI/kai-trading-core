@@ -64,6 +64,7 @@ DART_FUNDAMENTALS_MIN_START_DATE = date(settings.dart_fundamentals_min_business_
 DART_FUNDAMENTALS_REFRESH_HEARTBEAT_SECONDS = 30.0
 DART_NO_DATA_STATUS = '013'
 DART_FILE_NOT_FOUND_STATUS = '014'
+FILE_NOT_FOUND_DAILY_RECHECK_LIMIT = 20
 UNSUPPORTED_CODE_REASON = 'code_unsupported:dart_lookup'
 UPDATED_ENTRIES_PREVIEW_LIMIT = 3
 UPDATED_ENTRY_CATEGORY_INITIAL_CAPTURE = 'initial_fundamentals_capture'
@@ -2695,7 +2696,17 @@ class DartFundamentalsCaptureService:
             else ('partial' if successful_stock_codes or terminal_not_applicable else 'failed')
         )
         partial_reasons = list(fundamentals_result.get('partial_reasons') or [])
-        if retry_debt_stock_codes and 'share_issuance_scope_incomplete' not in partial_reasons:
+        # Label share-issuance incompleteness only when share issuance is the
+        # cause: fundamentals succeeded but issuance evidence is not ready, or
+        # the corp-code mapping left debt. Fundamentals-only retry debt
+        # already reports its own reason.
+        issuance_retry_debt = {
+            stock_code
+            for stock_code in retry_debt_stock_codes
+            if stock_code in fundamentals_success
+            and stock_code not in issuance_ready
+        } | (set(mapping_retry_debt_stock_codes or []) & selected_stock_code_set)
+        if issuance_retry_debt and 'share_issuance_scope_incomplete' not in partial_reasons:
             partial_reasons.append('share_issuance_scope_incomplete')
         for partial_reason in followup_partial_reasons:
             if partial_reason not in partial_reasons:
@@ -3668,6 +3679,22 @@ class DartFundamentalsCaptureService:
                 )
             else:
                 has_more_candidate_events = False
+
+            # [014] file-not-found events count as resolved, so the date
+            # window above never reaches them again; pull due rechecks for
+            # the selected symbols directly, inside the same capture limit.
+            list_rechecks = getattr(self.repository, 'list_file_not_found_rechecks', None)
+            recheck_room = (
+                FILE_NOT_FOUND_DAILY_RECHECK_LIMIT
+                if capture_limit is None
+                else min(FILE_NOT_FOUND_DAILY_RECHECK_LIMIT, capture_limit - len(candidate_events))
+            )
+            if list_rechecks is not None and recheck_room > 0:
+                known_ids = {int(event['id']) for event in candidate_events}
+                for event in list_rechecks(stock_codes=selected_stock_codes, limit=recheck_room):
+                    if int(event['id']) not in known_ids:
+                        candidate_events.append(event)
+                        known_ids.add(int(event['id']))
 
             events_detected = len(candidate_events)
             candidate_event_ids = [int(event['id']) for event in candidate_events]
