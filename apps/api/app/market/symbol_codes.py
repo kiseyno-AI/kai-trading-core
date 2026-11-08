@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Sequence
 
 
 KRX_SHORT_CODE_PATTERN = re.compile(r'[0-9]{4}[0-9A-Z]{2}\Z')
@@ -30,3 +30,50 @@ def is_canonical_krx_short_code(value: Any) -> bool:
         raw == raw.upper()
         and KRX_SHORT_CODE_PATTERN.fullmatch(raw) is not None
     )
+
+
+def normalize_symbol_text(value: Any) -> str:
+    """Trimmed, upper-cased symbol; all-digit KRX codes zero-padded to six.
+
+    Lenient counterpart of ``normalize_krx_short_code`` for scopes that may
+    also carry non-KRX symbols: any other shape passes through unchanged and a
+    blank value becomes ``''``.
+    """
+
+    text = str(value or '').strip().upper()
+    return text.zfill(6) if text.isascii() and text.isdigit() else text
+
+
+def require_symbol_text(value: Any) -> str:
+    symbol = normalize_symbol_text(value)
+    if not symbol:
+        raise ValueError('symbol must not be blank')
+    return symbol
+
+
+def normalize_symbol_scope(symbols: Sequence[Any] | None) -> list[str] | None:
+    """Order-preserving unique symbols; ``None`` (no scope) stays ``None``.
+
+    A blank member is an error: an explicit scope must name real symbols.
+    """
+
+    if symbols is None:
+        return None
+    return list(dict.fromkeys(require_symbol_text(symbol) for symbol in symbols))
+
+
+def split_symbol_list(symbols: Sequence[Any] | str | None) -> list[str]:
+    """Symbols from a string or sequence of comma-separated values.
+
+    Blank pieces are skipped, duplicates removed in first-seen order.
+    """
+
+    if symbols is None:
+        return []
+    values = [symbols] if isinstance(symbols, str) else symbols
+    pieces = (
+        normalize_symbol_text(piece)
+        for value in values
+        for piece in str(value or '').split(',')
+    )
+    return list(dict.fromkeys(piece for piece in pieces if piece))

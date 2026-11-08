@@ -47,6 +47,7 @@ from app.signals.factor_coverage import (
 from app.signals.preferred_share_fundamentals import (
     resolve_preferred_fundamentals_issuer_symbols,
 )
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols
 
 FILTER_SOURCE = 'strategy_piotroski_v1'
 LOW_PBR_PERCENTILE = 0.30
@@ -200,24 +201,6 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
     if size <= 0:
         return [items]
     return [items[index:index + size] for index in range(0, len(items), size)]
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in symbols:
-        symbol = str(raw_symbol or '').strip().upper()
-        if not symbol:
-            raise ValueError('symbol must not be blank')
-        if symbol.isdigit():
-            symbol = symbol.zfill(6)
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        normalized.append(symbol)
-    return normalized
 
 
 def _current_highlight_value(highlight: dict[str, Any] | None) -> Any:

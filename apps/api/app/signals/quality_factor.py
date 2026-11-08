@@ -30,6 +30,7 @@ from app.signals.factor_coverage import (
     run_symbol_computation,
 )
 from app.signals.piotroski_filter import INDEX_ASSET_TURNOVER, INDEX_DEBT_RATIO, INDEX_GROSS_MARGIN
+from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
 QUALITY_FACTOR_VERSION = 'quality_v1'
 QUALITY_FACTOR_SOURCE = QUALITY_FACTOR_VERSION
@@ -107,21 +108,6 @@ def _normalize_market_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
-
-
-def _normalize_symbol(symbol: str) -> str:
-    normalized = str(symbol or '').strip().upper()
-    if not normalized:
-        raise ValueError('symbol must not be blank')
-    if normalized.isdigit():
-        normalized = normalized.zfill(6)
-    return normalized
-
-
-def _normalize_symbols(symbols: Sequence[str] | None) -> list[str] | None:
-    if symbols is None:
-        return None
-    return list(dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols))
 
 
 def _percentile_from_rank(rank: int, total: int) -> float:

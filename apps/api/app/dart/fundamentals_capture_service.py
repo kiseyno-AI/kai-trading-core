@@ -2680,7 +2680,17 @@ class DartFundamentalsCaptureService:
             else ('partial' if successful_stock_codes or terminal_not_applicable else 'failed')
         )
         partial_reasons = list(fundamentals_result.get('partial_reasons') or [])
-        if retry_debt_stock_codes and 'share_issuance_scope_incomplete' not in partial_reasons:
+        # Label share-issuance incompleteness only when share issuance is the
+        # cause: fundamentals succeeded but issuance evidence is not ready, or
+        # the corp-code mapping left debt. Fundamentals-only retry debt
+        # already reports its own reason.
+        issuance_retry_debt = {
+            stock_code
+            for stock_code in retry_debt_stock_codes
+            if stock_code in fundamentals_success
+            and stock_code not in issuance_ready
+        } | (set(mapping_retry_debt_stock_codes or []) & selected_stock_code_set)
+        if issuance_retry_debt and 'share_issuance_scope_incomplete' not in partial_reasons:
             partial_reasons.append('share_issuance_scope_incomplete')
         for partial_reason in followup_partial_reasons:
             if partial_reason not in partial_reasons:

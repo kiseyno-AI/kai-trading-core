@@ -26,6 +26,7 @@ from app.agent_context.signal_decider_calendar_review_service import signal_deci
 from app.agent_context.decider_replay_service import decider_replay_service
 from app.agent_context.signal_decider_loop_service import (
     DEFAULT_SIGNAL_DECIDER_EVALUATION_LOOKBACK_DAYS,
+    SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
     signal_decider_loop_service,
 )
 from app.core.settings import settings
@@ -1572,6 +1573,7 @@ def compute_signal_decider_evaluations(
     prerequisites = agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
         market_date=market_date,
         symbols=parsed_symbols,
+        required_stage_ids=SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS,
     )
     if not force_recompute and not prerequisites['ready']:
         return {

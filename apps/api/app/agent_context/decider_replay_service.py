@@ -44,6 +44,8 @@ from app.orders.signal_decider_alignment_gate import (
     build_signal_decider_alignment_gate,
     normalize_alignment_gate_mode,
 )
+from app.core.numbers import finite_float as _to_float
+from app.market.symbol_codes import split_symbol_list as _normalize_symbols
 
 
 DECIDER_REPLAY_SCHEMA_VERSION = 'decider_replay_v1'
@@ -273,22 +275,6 @@ def _normalize_agent_name(value: str) -> str:
     return normalized
 
 
-def _normalize_symbols(symbols: Sequence[str] | str | None) -> list[str]:
-    if symbols is None:
-        return []
-    raw_values = [symbols] if isinstance(symbols, str) else list(symbols)
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw_value in raw_values:
-        for piece in str(raw_value or '').split(','):
-            symbol = piece.strip().upper()
-            if not symbol or symbol in seen:
-                continue
-            seen.add(symbol)
-            normalized.append(symbol)
-    return normalized
-
-
 def _normalize_policy_versions(
     policy_versions: Sequence[str] | str | None,
 ) -> list[str]:
@@ -343,21 +329,6 @@ def _normalize_probe_quantity(value: Any) -> int:
     ):
         raise ValueError('probe_quantity must be an integer from 1 through 100')
     return int(resolved)
-
-
-def _to_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, Decimal):
-        return float(value) if value.is_finite() else None
-    if isinstance(value, (int, float)):
-        resolved = float(value)
-        return resolved if math.isfinite(resolved) else None
-    try:
-        resolved = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    return resolved if math.isfinite(resolved) else None
 
 
 def _to_json_number(value: Decimal | float | int | None, *, places: str = '0.01') -> int | float | None:

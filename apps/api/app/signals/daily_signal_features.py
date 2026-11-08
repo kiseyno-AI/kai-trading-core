@@ -37,12 +37,14 @@ from app.market_data_store import (
     upsert_daily_signal_features,
 )
 from app.repositories.eod_run_repository import daily_price_bar_writer_admission
+from app.signals.overtime_ranking_capture import OvertimeRankingCaptureStore
 from app.signals.signal_feature_readiness import (
     SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
     classify_signal_feature_readiness,
     decision_usable_direct_signal_sources,
     quote_snapshot_is_decision_usable,
 )
+from app.eod.live_progress import daily_pipeline_live_progress
 
 SIGNAL_FEATURE_VERSION = 'daily_signal_features_v2'
 SIGNAL_FEATURE_SOURCE = 'kis_ranking'
@@ -69,6 +71,17 @@ SIGNAL_SOURCE_MAX_ATTEMPTS = 2
 SIGNAL_SOURCE_RETRY_BASE_SECONDS = 0.25
 SIGNAL_SOURCE_DIAGNOSTIC_PREVIEW_LIMIT = 100
 VOLUME_POWER_PLACEHOLDER = 999.99
+# The unfiltered volume-power ranking (all instruments, no volume floor) is
+# topped by ETN/ETF/bond codes with the 999.99 placeholder, so every row was
+# rejected (raw 30 / valid 0 every day). Query common stock per market with a
+# volume floor instead; a 2026-11-07 probe returned 30/30 (KOSPI) and 29/30
+# (KOSDAQ) valid rows.
+VOLUME_POWER_MARKET_SEGMENTS: tuple[tuple[str, str], ...] = (
+    ('KOSPI', '0001'),
+    ('KOSDAQ', '1001'),
+)
+VOLUME_POWER_COMMON_STOCK_DIV_CLS_CODE = '1'
+VOLUME_POWER_MIN_VOLUME = '100000'
 
 FACTOR_SCORE_FIELD_SPECS: dict[str, dict[str, str | None]] = {
     'value': {
@@ -1250,7 +1263,16 @@ def _expand_rows_with_owned_fallback(
 
     direct_map = {item['symbol']: item for item in direct_rows}
     items: list[dict[str, Any]] = []
-    for symbol in universe['target_symbols']:
+    target_total = len(universe['target_symbols'])
+    for index, symbol in enumerate(universe['target_symbols']):
+        daily_pipeline_live_progress.thread_stage_progress(
+            {
+                'processed': index,
+                'total': target_total,
+                'current_symbol': symbol,
+                'current_step': 'build_signal_feature_row',
+            }
+        )
         entry = direct_map.get(symbol)
         if entry is None:
             entry = _empty_feature_row(
@@ -1291,6 +1313,30 @@ def _normalize_symbol(value: Any) -> str | None:
     if re.fullmatch(r'[0-9]{4}[0-9A-Z]{2}', symbol) is None:
         return None
     return symbol
+
+
+overtime_capture_store = OvertimeRankingCaptureStore()
+
+
+def _merge_volume_power_segments(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge per-market volume-power rows into one strength-ordered ranking.
+
+    Each segment's ``data_rank`` restarts at 1, so the merged list is
+    re-ranked by volume power (placeholders and unparseable values last) and
+    the per-market rank is kept as ``market_data_rank``.
+    """
+
+    def strength(row: Mapping[str, Any]) -> float:
+        value = _to_float(row.get('tday_rltv'))
+        if value is None or abs(value - VOLUME_POWER_PLACEHOLDER) < 1e-9:
+            return float('-inf')
+        return value
+
+    ordered = sorted(rows, key=strength, reverse=True)
+    merged: list[dict[str, Any]] = []
+    for index, row in enumerate(ordered, start=1):
+        merged.append({**row, 'market_data_rank': row.get('data_rank'), 'data_rank': str(index)})
+    return merged
 
 
 def _source_symbol(source: str, row: dict[str, Any]) -> str | None:
@@ -1607,42 +1653,84 @@ class DailySignalFeatureService:
         }
 
         if VOLUME_POWER in selected_sources:
-            try:
-                response = await self._fetch_ranking_source(
-                    self.client.fetch_domestic_ranking_volume_power,
-                    max_pages=max_pages,
-                )
-                source_rows[VOLUME_POWER] = list(response.get('output') or [])
-                collection[VOLUME_POWER] = {
+            segment_rows: list[dict[str, Any]] = []
+            segment_meta: dict[str, Any] = {}
+            segment_errors: dict[str, str] = {}
+            for segment, input_iscd in VOLUME_POWER_MARKET_SEGMENTS:
+                try:
+                    response = await self._fetch_ranking_source(
+                        self.client.fetch_domestic_ranking_volume_power,
+                        input_iscd=input_iscd,
+                        div_cls_code=VOLUME_POWER_COMMON_STOCK_DIV_CLS_CODE,
+                        min_volume=VOLUME_POWER_MIN_VOLUME,
+                        max_pages=max_pages,
+                    )
+                except Exception as exc:
+                    segment_errors[segment] = str(exc).strip() or type(exc).__name__
+                    continue
+                rows = [row for row in response.get('output') or [] if isinstance(row, dict)]
+                segment_rows.extend({**row, 'market_segment': segment} for row in rows)
+                segment_meta[segment] = {
                     'page_count': response.get('page_count'),
                     'max_pages_reached': response.get('max_pages_reached'),
+                    'raw_count': len(rows),
                 }
-            except Exception as exc:
-                error_message = str(exc).strip() or type(exc).__name__
-                source_rows[VOLUME_POWER] = []
-                source_errors[VOLUME_POWER] = error_message
-                collection[VOLUME_POWER] = {'error': error_message}
+            source_rows[VOLUME_POWER] = _merge_volume_power_segments(segment_rows)
+            collection[VOLUME_POWER] = {
+                'query': {
+                    'segments': [segment for segment, _ in VOLUME_POWER_MARKET_SEGMENTS],
+                    'div_cls_code': VOLUME_POWER_COMMON_STOCK_DIV_CLS_CODE,
+                    'min_volume': VOLUME_POWER_MIN_VOLUME,
+                },
+                'segments': segment_meta,
+                'max_pages_reached': any(
+                    meta.get('max_pages_reached') is True for meta in segment_meta.values()
+                ),
+            }
+            if segment_errors:
+                collection[VOLUME_POWER]['segment_errors'] = segment_errors
+            if len(segment_errors) == len(VOLUME_POWER_MARKET_SEGMENTS):
+                distinct_messages = list(dict.fromkeys(segment_errors.values()))
+                source_errors[VOLUME_POWER] = (
+                    distinct_messages[0]
+                    if len(distinct_messages) == 1
+                    else '; '.join(
+                        f'{segment}: {message}'
+                        for segment, message in segment_errors.items()
+                    )
+                )
 
         if OVERTIME_VOLUME in selected_sources:
-            try:
-                response = await self._fetch_ranking_source(
-                    self.client.fetch_domestic_ranking_overtime_volume,
-                    rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
-                    max_pages=max_pages,
-                )
-                source_rows[OVERTIME_VOLUME] = list(response.get('output2') or [])
-                collection[OVERTIME_VOLUME] = {
-                    'page_count': response.get('page_count'),
-                    'max_pages_reached': response.get('max_pages_reached'),
-                    'summary_rows': response.get('output1') or [],
-                }
-            except Exception as exc:
-                error_message = str(exc).strip() or type(exc).__name__
-                source_rows[OVERTIME_VOLUME] = []
-                source_errors[OVERTIME_VOLUME] = error_message
-                collection[OVERTIME_VOLUME] = {'error': error_message}
+            captured = overtime_capture_store.usable_rows(normalized_market_date, OVERTIME_VOLUME)
+            if captured is not None:
+                source_rows[OVERTIME_VOLUME], collection[OVERTIME_VOLUME] = captured
+            else:
+                try:
+                    response = await self._fetch_ranking_source(
+                        self.client.fetch_domestic_ranking_overtime_volume,
+                        rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
+                        max_pages=max_pages,
+                    )
+                    source_rows[OVERTIME_VOLUME] = list(response.get('output2') or [])
+                    collection[OVERTIME_VOLUME] = {
+                        'origin': 'live',
+                        'page_count': response.get('page_count'),
+                        'max_pages_reached': response.get('max_pages_reached'),
+                        'summary_rows': response.get('output1') or [],
+                    }
+                except Exception as exc:
+                    error_message = str(exc).strip() or type(exc).__name__
+                    source_rows[OVERTIME_VOLUME] = []
+                    source_errors[OVERTIME_VOLUME] = error_message
+                    collection[OVERTIME_VOLUME] = {'error': error_message}
 
-        if OVERTIME_FLUCTUATION in selected_sources:
+        if OVERTIME_FLUCTUATION in selected_sources and (
+            captured := overtime_capture_store.usable_rows(
+                normalized_market_date, OVERTIME_FLUCTUATION
+            )
+        ) is not None:
+            source_rows[OVERTIME_FLUCTUATION], collection[OVERTIME_FLUCTUATION] = captured
+        elif OVERTIME_FLUCTUATION in selected_sources:
             try:
                 response = await self._fetch_ranking_source(
                     self.client.fetch_domestic_ranking_overtime_fluctuation,
@@ -1651,6 +1739,7 @@ class DailySignalFeatureService:
                 )
                 source_rows[OVERTIME_FLUCTUATION] = list(response.get('output2') or [])
                 collection[OVERTIME_FLUCTUATION] = {
+                    'origin': 'live',
                     'page_count': response.get('page_count'),
                     'max_pages_reached': response.get('max_pages_reached'),
                     'summary_rows': response.get('output1') or [],
@@ -1776,6 +1865,9 @@ class DailySignalFeatureService:
                     'authoritative signal-feature replacement cannot use '
                     'a narrowed admitted scope'
                 )
+        daily_pipeline_live_progress.publish_substep(
+            step='collect_kis_rankings_and_build_rows', status='running'
+        )
         collection = await self.collect_features(
             market_date=market_date,
             sources=sources,
@@ -1783,6 +1875,17 @@ class DailySignalFeatureService:
             overtime_volume_rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
             overtime_fluctuation_div_cls_code=overtime_fluctuation_div_cls_code,
             exact_symbols=generation_symbols,
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='collect_kis_rankings_and_build_rows',
+            status='completed',
+            detail={
+                'rows': len(collection.items),
+                'source_errors': len(collection.source_errors or {}),
+            },
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='validate_and_persist_signal_features', status='running'
         )
 
         # Source health is an authority gate, not merely response metadata.
