@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -123,6 +123,22 @@ def _raise_order_http_error(exc: Exception) -> None:
         raise HTTPException(status_code=status_code, detail=jsonable_encoder(exc.payload or {'detail': str(exc)})) from exc
 
 
+def require_direct_order_api_enabled() -> None:
+    """Keep Core's direct broker-order routes closed unless explicitly enabled."""
+    if not settings.trading_direct_order_api_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                'error': 'direct_order_api_disabled',
+                'message': (
+                    'Direct broker order routes are disabled on Core. Orders are '
+                    'delegated to kai-trading-exec; set TRADING_DIRECT_ORDER_API_ENABLED=true '
+                    'only for deliberate operator use.'
+                ),
+            },
+        )
+
+
 def _bounded_run_request(
     *,
     route: str,
@@ -162,7 +178,7 @@ def _bounded_run_request(
     return dry_run, force
 
 
-@router.post('/buy')
+@router.post('/buy', dependencies=[Depends(require_direct_order_api_enabled)])
 async def submit_buy_order(payload: TradingOrderSubmitRequest, response: Response) -> dict[str, Any]:
     try:
         result = await trading_order_service.submit_buy_order(**payload.model_dump())
@@ -173,7 +189,7 @@ async def submit_buy_order(payload: TradingOrderSubmitRequest, response: Respons
         raise HTTPException(status_code=500, detail=f'Trading order submit failed: {exc}') from exc
 
 
-@router.post('/sell')
+@router.post('/sell', dependencies=[Depends(require_direct_order_api_enabled)])
 async def submit_sell_order(payload: TradingOrderSubmitRequest, response: Response) -> dict[str, Any]:
     try:
         result = await trading_order_service.submit_sell_order(**payload.model_dump())
@@ -452,7 +468,7 @@ async def cancel_order(client_order_id: str, payload: TradingOrderCancelRequest)
         raise HTTPException(status_code=500, detail=f'Trading order cancel failed: {exc}') from exc
 
 
-@router.post('/{client_order_id}/amend')
+@router.post('/{client_order_id}/amend', dependencies=[Depends(require_direct_order_api_enabled)])
 async def amend_order(client_order_id: str, payload: TradingOrderAmendRequest) -> dict[str, Any]:
     try:
         return await trading_order_service.amend_order(

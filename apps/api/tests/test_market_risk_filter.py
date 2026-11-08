@@ -73,6 +73,27 @@ class MarketRiskEvaluatorTests(unittest.TestCase):
         self.assertFalse(result['watchlist_flagged'])
         self.assertEqual(result['filter_payload']['vi_evidence_status'], 'inactive')
 
+    def test_no_recent_trading_blocks_even_without_a_kis_halt_flag(self) -> None:
+        snapshot = {
+            'symbol': '000300',
+            'market_date': '2026-11-06',
+            'market_warning_code': '00',
+            'is_trade_halted': False,
+            'no_recent_trading': True,
+        }
+
+        evaluation = evaluate_market_risk_snapshot(snapshot)
+
+        self.assertFalse(evaluation['passed_filter'])
+        self.assertEqual(evaluation['risk_state'], 'fail')
+        self.assertEqual(evaluation['blocking_reasons'], ['no_recent_trading'])
+        self.assertTrue(evaluate_market_risk_snapshot({**snapshot, 'no_recent_trading': False})['passed_filter'])
+        self.assertTrue(
+            evaluate_market_risk_snapshot(
+                {k: v for k, v in snapshot.items() if k != 'no_recent_trading'}
+            )['passed_filter']
+        )
+
     def test_evaluate_market_warning_reasons_distinguishes_blocking_and_watchlist_codes(self) -> None:
         blocking, watchlist = evaluate_market_warning_reasons({'market_warning_code': '03'})
         self.assertEqual(blocking, ['market_warning_03'])
@@ -246,6 +267,88 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
             result['items'][0]['filter_payload']['watchlist_reasons'],
             ['market_warning_01', 'investment_caution'],
         )
+
+    @staticmethod
+    def _quiet_snapshot(symbol: str) -> dict:
+        return build_market_risk_snapshot(
+            symbol=symbol,
+            market_date='2026-11-06',
+            market='KOSPI',
+            name_ko=symbol,
+            quote_response={
+                'output': {
+                    'mrkt_warn_cls_code': '00',
+                    'mrkt_warn_cls_name': '해당없음',
+                    'mang_issu_yn': 'N',
+                    'invt_caful_yn': 'N',
+                    'short_over_yn': 'N',
+                    'ssts_hot_yn': 'N',
+                    'vi_cls_code': '00',
+                    'insn_pbnt_yn': 'N',
+                    'trht_yn': 'N',
+                }
+            },
+        )
+
+    def _service_with(self, symbols: list[str]):
+        snapshot_service = DailyMarketRiskSnapshotService()
+        service = DailyMarketRiskFilterService(snapshot_service=snapshot_service)
+        collection = {
+            'market_date': '2026-11-06',
+            'source': 'kis_quote2_snapshot_v1',
+            'feature_version': 'kis_quote2_snapshot_v1',
+            'requested_symbols': symbols,
+            'matched_symbols': symbols,
+            'missing_symbols': [],
+            'summary': {'matched_symbol_count': len(symbols)},
+            'snapshots_persisted': len(symbols),
+            'snapshots_failed': 0,
+            'failed_symbols': [],
+            'failed_symbol_errors': [],
+            'items': [self._quiet_snapshot(symbol) for symbol in symbols],
+        }
+        return service, snapshot_service, collection
+
+    async def test_dormant_symbol_is_screened_out_and_traded_symbol_still_passes(self) -> None:
+        service, snapshot_service, collection = self._service_with(['000300', '005930'])
+
+        with (
+            patch.object(snapshot_service, 'collect_for_market_date', new=AsyncMock(return_value=collection)),
+            patch(
+                'app.signals.market_risk_filter.load_symbols_without_recent_trading',
+                return_value=['000300'],
+            ) as loader,
+            patch('app.signals.market_risk_filter.upsert_daily_market_risk_filter_results'),
+        ):
+            result = await service.rebuild_for_market_date(market_date='2026-11-06')
+
+        by_symbol = {item['symbol']: item for item in result['items']}
+        self.assertFalse(by_symbol['000300']['passed_filter'])
+        self.assertEqual(by_symbol['000300']['risk_state'], 'fail')
+        self.assertEqual(
+            by_symbol['000300']['filter_payload']['blocking_reasons'],
+            ['no_recent_trading'],
+        )
+        self.assertTrue(by_symbol['005930']['passed_filter'])
+        self.assertEqual(result['summary']['screening_rejected_count'], 1)
+        self.assertEqual(loader.call_args.kwargs['symbols'], ['000300', '005930'])
+
+    async def test_dormancy_lookup_failure_does_not_fail_the_stage(self) -> None:
+        service, snapshot_service, collection = self._service_with(['000300', '005930'])
+
+        with (
+            patch.object(snapshot_service, 'collect_for_market_date', new=AsyncMock(return_value=collection)),
+            patch(
+                'app.signals.market_risk_filter.load_symbols_without_recent_trading',
+                side_effect=RuntimeError('db hiccup'),
+            ),
+            patch('app.signals.market_risk_filter.upsert_daily_market_risk_filter_results'),
+            self.assertLogs('app.signals.market_risk_filter', level='ERROR'),
+        ):
+            result = await service.rebuild_for_market_date(market_date='2026-11-06')
+
+        self.assertEqual(result['results_failed'], 0)
+        self.assertTrue(all(item['passed_filter'] for item in result['items']))
 
     async def test_exact_scope_preserves_causally_skipped_symbols_as_retry_debt(
         self,

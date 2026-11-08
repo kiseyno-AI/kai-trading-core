@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     kis_intraday_snapshot_news_limit: int = 5
     portfolio_account_references: str = ''
     portfolio_summary_cache_ttl_seconds: int = 60
+    # Core-side direct broker order routes (POST /trading/orders/buy, /sell and
+    # /{id}/amend). Normal trading is delegated to kai-trading-exec, so these
+    # stay closed unless an operator deliberately opens them. Cancel is a
+    # risk-reducing action and is not gated.
+    trading_direct_order_api_enabled: bool = False
     signal_decider_next_open_enabled: bool = False
     signal_decider_next_open_dry_run: bool = True
     signal_decider_next_open_account_targets: str = ''
@@ -243,7 +248,13 @@ class Settings(BaseSettings):
     data_gap_fill_budget_seconds: int = Field(default=900, ge=30, le=3600)
     data_gap_fill_failure_cooldown_seconds: int = Field(default=6 * 3600, ge=60)
     data_gap_fill_provider_check_sessions: int = Field(default=2, ge=0, le=10)
+    # A symbol with no positive-volume bar over this many consecutive market
+    # sessions is treated as not tradable (trading halt, long suspension,
+    # wind-down) and is kept out of candidate screening. Data collection keeps
+    # running so a resumption clears the exclusion by itself.
+    market_risk_dormant_lookback_trading_days: int = Field(default=10, ge=3, le=60)
     dart_fundamentals_daily_incremental_lookback_days: int = 45
+    dart_fundamentals_daily_stale_drain_limit: int = Field(default=100, ge=0, le=500)
 
     sec_edgar_user_agent: str = ''
     sec_edgar_data_base_url: str = 'https://data.sec.gov'
