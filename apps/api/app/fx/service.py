@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import math
 from typing import Any
 
 from app.core.settings import settings
@@ -11,7 +12,10 @@ def _normalize_numeric(value: str | None) -> float | None:
     if value in (None, ''):
         return None
     try:
-        return float(value.replace(',', ''))
+        normalized = float(value.replace(',', ''))
+        if not math.isfinite(normalized):
+            raise ValueError('nonfinite FX value')
+        return normalized
     except ValueError as exc:
         raise KoreaEximAPIError(f'Korea Exim returned invalid numeric value: {value}') from exc
 
