@@ -1673,33 +1673,13 @@ class TradingOrderService:
         refreshed_row = upsert_broker_order(
             {
                 'id': refreshed_row['id'],
-                'order_request_id': refreshed_row['order_request_id'],
                 'broker_name': refreshed_row['broker_name'],
                 'client_order_id': refreshed_row['client_order_id'],
-                'broker_order_id': refreshed_row['broker_order_id'],
                 'account_reference': refreshed_row['account_reference'],
-                'symbol': refreshed_row['symbol'],
-                'side': refreshed_row['side'],
-                'order_type': refreshed_row['order_type'],
-                'requested_quantity': refreshed_row['requested_quantity'],
-                'requested_price': refreshed_row['requested_price'],
-                'accepted_quantity': refreshed_row['accepted_quantity'],
-                'accepted_price': refreshed_row['accepted_price'],
-                'filled_quantity': refreshed_row['filled_quantity'],
-                'remaining_quantity': refreshed_row['remaining_quantity'],
-                'average_fill_price': refreshed_row['average_fill_price'],
-                'time_in_force': refreshed_row.get('time_in_force'),
-                'current_status': refreshed_row['current_status'],
-                'status_reason': refreshed_row.get('status_reason'),
-                'first_submitted_at': refreshed_row.get('first_submitted_at'),
-                'last_broker_update_at': refreshed_row.get('last_broker_update_at'),
-                'last_fill_at': refreshed_row.get('last_fill_at'),
                 'last_reconciled_at': now,
                 'last_reconcile_status': reconcile_status,
                 'last_reconcile_trigger': trigger,
                 'last_reconcile_payload': reconcile_summary,
-                'raw_latest_payload': refreshed_row.get('raw_latest_payload'),
-                'snapshot_payload': refreshed_row.get('snapshot_payload'),
             }
         )
         broker_inquiry['reconcile'] = reconcile_summary
