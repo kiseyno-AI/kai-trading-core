@@ -399,7 +399,7 @@ class TradingOrderReconciliationService:
 
         if last_reconcile_status in {'', 'repaired', 'stale_pending', 'not_found', 'missing_fill_detail', 'error'}:
             return True
-        if status in _ACTIVE_STATUSES:
+        if status in _ACTIVE_STATUSES or status == BrokerOrderStatus.PARTIAL_FILL.value:
             return True
         if status in _TERMINAL_STATUSES:
             if last_reconciled_at is None:

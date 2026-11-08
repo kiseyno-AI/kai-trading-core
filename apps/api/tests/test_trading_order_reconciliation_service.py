@@ -1,4 +1,7 @@
+import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 from sqlalchemy import delete
@@ -135,6 +138,30 @@ class TradingOrderReconciliationInspectTests(unittest.TestCase):
         self.assertEqual(result['stale_pending_orders']['items'][0]['client_order_id'], 'STALE-1')
         self.assertEqual(result['missing_fill_detail_orders']['count'], 1)
         self.assertEqual(result['missing_fill_detail_orders']['items'][0]['client_order_id'], 'MISSING-FILL-1')
+
+    def test_previously_matched_partial_fill_remains_eligible_for_reconciliation(self) -> None:
+        self._seed_order(
+            client_order_id='PARTIAL-MATCHED',
+            current_status='partial_fill',
+            filled_quantity='4',
+            remaining_quantity='6',
+            average_fill_price='70010',
+            last_broker_update_at='2026-04-28T00:25:00+00:00',
+            last_reconcile_status='matched',
+        )
+        reconcile = AsyncMock(return_value={'reconcile': {'repair_applied': False}})
+        self.service.order_service = SimpleNamespace(reconcile_persisted_order=reconcile)
+
+        result = asyncio.run(self.service.reconcile_recent_orders(
+            account_reference=self.account_reference,
+            trigger='periodic',
+            include_orders=False,
+        ))
+
+        self.assertEqual(result['selected_count'], 1)
+        self.assertEqual(result['reconciled_count'], 1)
+        reconcile.assert_awaited_once()
+        self.assertEqual(reconcile.call_args.kwargs['order_row']['client_order_id'], 'PARTIAL-MATCHED')
 
 
 if __name__ == '__main__':
