@@ -477,7 +477,8 @@ def build_default_service(config: GapFillConfig | None = None) -> DataGapFillSer
             'signal_features_missing': detect_signal_features_missing,
             'participation_context_missing': detect_participation_context_missing,
             'turnover_incomplete': detect_turnover_incomplete,
-            'provisional_bars': provider_gap('provisional_bars'),
+            # No 'provisional_bars' detector: the market-wide frame is not the regular
+            # session (RUNBOOK "Daily bar reconciliation"), so a difference is not a defect.
             'missing_bars': provider_gap('missing_bars'),
         },
         fixers={

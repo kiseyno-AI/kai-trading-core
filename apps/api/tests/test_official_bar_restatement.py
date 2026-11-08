@@ -538,5 +538,18 @@ class ApplyPreflightTests(unittest.TestCase):
         load.assert_not_called()
         service.assert_not_called()
 
+    def test_apply_is_refused_because_the_reference_is_not_the_regular_session(self) -> None:
+        with patch.object(restatement, 'load_required_rebuild_trade_dates') as dates, \
+                patch.object(restatement.OfficialReference, 'load') as load, \
+                patch.object(restatement, 'build_service') as service, \
+                patch('builtins.print') as printed:
+            code = restatement.main(['--start-date', '2026-11-06', '--end-date', '2026-11-06', '--apply'])
+        self.assertEqual(code, 2)
+        self.assertIn('restatement_reference_not_regular_session', printed.call_args.args[0])
+        dates.assert_not_called()
+        load.assert_not_called()
+        service.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

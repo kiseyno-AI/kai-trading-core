@@ -43,7 +43,7 @@ Out of scope, by design:
 | `signal_features_missing` | symbols with a bar on a session but no signal-feature row | A | `stored_signal_feature_backfill.apply_backfill` |
 | `participation_context_missing` | session has signal-feature rows but no participation-context row, or its recorded `captured_symbol_count` differs from the row count | A | rebuild from the stored signal-feature rows (after the fixer above) |
 | `turnover_incomplete` | active KOSPI/KOSDAQ bars with `volume > 0` and `turnover = 0` | A | `turnover_repair` with `allow_partial_verified` (provider OHLC must equal stored OHLC; volume and turnover may only increase) |
-| `provisional_bars` | official market frame differs from the stored bar in OHLC (latest `provider_check_sessions` only) | B | report only |
+| `provisional_bars` | not wired since 2026-11-08: the market-wide frame is not the KRX regular session, so its differences from stored bars are not defects (see RUNBOOK "Daily bar reconciliation") | B | — |
 | `missing_bars` | official frame lists a symbol with no stored bar (same sessions) | B | report only |
 
 Tier B findings are written to the log and the result so an operator can run the

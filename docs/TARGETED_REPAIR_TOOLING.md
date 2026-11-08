@@ -304,6 +304,13 @@ fingerprints are refreshed from the repaired signal scope.
 
 ## Official-value restatement of stored daily bars
 
+> **Do not apply (2026-11-08).** The premise of this section was wrong: the PyKRX
+> market-wide frame is not the KRX regular session, and the stored per-symbol bars
+> are (they matched Naver on 36/36 sampled symbol-dates; the 2026-11-06 dry run
+> refused all 391 differing rows because KIS sided with the stored bars).
+> `--apply` is refused with `restatement_reference_not_regular_session`. The text
+> below is kept for the record. See "Daily bar reconciliation" in `RUNBOOK.md`.
+
 `app.eod.kis_final_bar_repair` finalizes bars that are partial days and refuses any
 row where the provider value is not a monotonic extension. Bars collected from the
 per-symbol range endpoint are different: their close/high/low disagree with the
