@@ -27,9 +27,10 @@ def _decimal(value: Any) -> Decimal | None:
     if not normalized:
         return None
     try:
-        return Decimal(normalized)
+        parsed = Decimal(normalized)
     except InvalidOperation:
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _integer(value: Any) -> int | None:
