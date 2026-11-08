@@ -43,6 +43,7 @@ from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_zero_scope_gate_status,
     pykrx_enrichment_preflight_is_ready,
 )
+from app.eod.agent_chain_gates import summary_partial_dependency_is_proven
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.summary_cutoff_contract import (
     CUTOFF_REPAIR_STAGE_IDS,
@@ -2423,7 +2424,7 @@ class DailyPipelineStageService:
             grouped_pykrx_requested
             and (
                 'master_refresh' not in resolved_stages
-                or self._dependency_outcome_is_satisfied(
+                or daily_pipeline_outcome_is_satisfied(
                     stage_outcomes.get('master_refresh')
                 )
             )
@@ -2718,7 +2719,7 @@ class DailyPipelineStageService:
                 elif (
                     bound_invocation_symbols is not None
                     and not has_scope_outcome_claim
-                    and self._dependency_outcome_is_satisfied(
+                    and daily_pipeline_outcome_is_satisfied(
                         stage_outcomes[stage_id]
                     )
                 ):
@@ -2893,14 +2894,14 @@ class DailyPipelineStageService:
                 dependency
                 for dependency in STAGE_DEFINITIONS[stage_id].depends_on
                 if dependency in resolved_stages
-                and not self._dependency_outcome_is_satisfied(
+                and not daily_pipeline_outcome_is_satisfied(
                     stage_outcomes.get(dependency)
                 )
             ]
             if (
                 stage_id == 'signal_decider'
                 and 'agent_feedback_summaries' in incomplete_dependencies
-                and self._partial_summary_dependency_is_proven(
+                and summary_partial_dependency_is_proven(
                     outcome=stage_outcomes.get(
                         'agent_feedback_summaries'
                     ),
@@ -3151,7 +3152,7 @@ class DailyPipelineStageService:
                     and (
                         decider_outcome is None
                         or decider_status == 'completed'
-                        or not self._dependency_outcome_is_satisfied(
+                        or not daily_pipeline_outcome_is_satisfied(
                             decider_outcome
                         )
                     )
@@ -9191,10 +9192,6 @@ class DailyPipelineStageService:
                 )
         return restored_outcome, restored_invocation
 
-    @staticmethod
-    def _dependency_outcome_is_satisfied(outcome: dict[str, Any] | None) -> bool:
-        return daily_pipeline_outcome_is_satisfied(outcome)
-
     @classmethod
     def _complete_price_scope_is_proven(
         cls,
@@ -9665,48 +9662,6 @@ class DailyPipelineStageService:
         ):
             return None
         return normalized
-
-    @staticmethod
-    def _partial_summary_dependency_is_proven(
-        *,
-        outcome: dict[str, Any] | None,
-        cutoff_resolution: dict[str, Any] | None,
-        parent_symbols: Sequence[str] | None,
-    ) -> bool:
-        """Accept only an exact finalized success intersection as input."""
-
-        if not (
-            isinstance(outcome, dict)
-            and str(outcome.get('status') or '').strip().lower()
-            == 'partial'
-            and isinstance(cutoff_resolution, dict)
-            and cutoff_resolution.get('ready') is True
-            and cutoff_resolution.get('knowledge_cutoff_at') is not None
-        ):
-            return False
-        result = outcome.get('result')
-        if not isinstance(result, dict):
-            return False
-        source_run_id = str(
-            cutoff_resolution.get('source_run_id') or ''
-        ).strip()
-        completed_symbols = cutoff_resolution.get('requested_symbols')
-        return bool(
-            source_run_id
-            and source_run_id == str(result.get('run_id') or '').strip()
-            and isinstance(completed_symbols, list)
-            and completed_symbols
-            and completed_summary_scope_matches_parent(
-                feedback_scope_mode=cutoff_resolution.get(
-                    'feedback_scope_mode'
-                ),
-                completed_symbols=completed_symbols,
-                completed_scope_proof=cutoff_resolution.get(
-                    'completed_scope_proof'
-                ),
-                parent_symbols=parent_symbols,
-            )
-        )
 
     @staticmethod
     def _terminal_decider_progression_proof(
