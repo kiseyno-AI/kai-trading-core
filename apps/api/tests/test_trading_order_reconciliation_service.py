@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -9,7 +10,7 @@ from sqlalchemy import delete
 from app.db import engine, session_scope
 from app.db_models import BrokerOrder, BrokerOrderEvent, OrderRequest
 from app.orders.reconciliation import TradingOrderReconciliationService
-from app.orders.store import upsert_broker_order, upsert_order_request
+from app.orders.store import append_broker_order_event, load_broker_order, upsert_broker_order, upsert_order_request
 
 
 class TradingOrderReconciliationInspectTests(unittest.TestCase):
@@ -162,6 +163,43 @@ class TradingOrderReconciliationInspectTests(unittest.TestCase):
         self.assertEqual(result['reconciled_count'], 1)
         reconcile.assert_awaited_once()
         self.assertEqual(reconcile.call_args.kwargs['order_row']['client_order_id'], 'PARTIAL-MATCHED')
+
+    def test_failed_reconciliation_preserves_a_fill_recorded_during_the_inquiry(self) -> None:
+        self._seed_order(
+            client_order_id='FILL-DURING-INQUIRY',
+            current_status='submitted',
+            last_broker_update_at='2026-04-28T00:25:00+00:00',
+        )
+
+        async def fail_after_fill(*, order_row, **_kwargs):
+            append_broker_order_event({
+                'account_reference': self.account_reference,
+                'client_order_id': order_row['client_order_id'],
+                'broker_order_id': order_row['broker_order_id'],
+                'event_type': 'fill', 'resulting_status': 'filled',
+                'event_occurred_at': '2026-04-28T00:26:00+00:00',
+                'cumulative_filled_quantity': '10', 'remaining_quantity': '0',
+                'fill_price': '70100', 'average_fill_price': '70100',
+                'source': 'ws_notice', 'event_dedup_key': 'fill-during-inquiry',
+            })
+            raise RuntimeError('mock inquiry timeout')
+
+        self.service.order_service = SimpleNamespace(reconcile_persisted_order=fail_after_fill)
+        result = asyncio.run(self.service.reconcile_recent_orders(
+            account_reference=self.account_reference,
+        ))
+        order = load_broker_order(
+            account_reference=self.account_reference,
+            client_order_id='FILL-DURING-INQUIRY',
+        )
+
+        self.assertEqual(result['error_count'], 1)
+        self.assertEqual(order['last_reconcile_status'], 'error')
+        self.assertEqual(order['current_status'], 'filled')
+        self.assertEqual(order['filled_quantity'], Decimal('10'))
+        self.assertEqual(order['remaining_quantity'], Decimal('0'))
+        self.assertEqual(order['average_fill_price'], Decimal('70100'))
+        self.assertEqual(result['orders'][0]['order']['current_status'], 'filled')
 
 
 if __name__ == '__main__':
