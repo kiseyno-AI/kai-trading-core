@@ -4010,3 +4010,65 @@ def test_runner_required_provider_preflight_clears_after_configuration() -> None
         )
 
     assert result is None
+
+
+def test_price_only_factor_on_price_cohort_is_not_a_stage_debt_scope_mismatch() -> None:
+    # 2026-11-09: DART/Piotroski partial, momentum ran on the whole price cohort
+    # (e8b19f29). Recovery must not read that as a scope mismatch and stop.
+    dart_result = _exact_result(
+        selected=SYMBOLS,
+        successful=SYMBOLS[:2],
+        retry_debt=[SYMBOLS[2]],
+        version='dart_fundamentals_scope_outcomes_v1',
+    )
+    piotroski_result = _exact_result(
+        selected=SYMBOLS[:2],
+        successful=SYMBOLS[:2],
+        retry_debt=[],
+        version='piotroski_scope_outcomes_v1',
+        status='completed',
+        publication_symbols=SYMBOLS,
+    )
+    momentum_result = _exact_result(
+        selected=SYMBOLS,
+        successful=SYMBOLS,
+        retry_debt=[],
+        version='factor_scope_outcomes_v1',
+        status='completed',
+        stage_id='momentum_factors',
+        publication_symbols=SYMBOLS,
+    )
+    eod_metadata = {
+        'followup_admission_scope_outcome': _parent_admission_outcome(),
+        'stage_progress': {
+            'fundamentals_daily_refresh': {
+                'status': 'partial',
+                'details': {'result_summary': dart_result},
+            },
+            'piotroski_filter': {
+                'status': 'completed',
+                'details': {'result_summary': piotroski_result},
+            },
+            'momentum_factors': {
+                'status': 'completed',
+                'details': {'result_summary': momentum_result},
+            },
+        },
+    }
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=eod_metadata,
+        stage_rows=eod_metadata['stage_progress'],
+        incomplete_stages=['fundamentals_daily_refresh'],
+    )
+
+    assert resolution.get('reason') != 'momentum_factors_stage_debt_scope_mismatch'
+    assert resolution['ready'] is True
+    state = resolution['state']
+    assert 'momentum_factors' not in state['pending_by_stage']
+    # Recovery resumes the real debt (the DART symbol), not the price-only factor.
+    assert _next_followup_stage_debt_request(state) == (
+        'fundamentals_daily_refresh',
+        [SYMBOLS[2]],
+    )

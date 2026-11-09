@@ -102,6 +102,7 @@ from app.eod.pykrx_pipeline_runner import (
     FACTOR_FOLLOWUP_STAGE_DEPENDENCIES,
     FACTOR_FOLLOWUP_STAGE_ORDER,
     HISTORICAL_BACKFILL_STAGE_ORDER,
+    NON_DART_FACTOR_FOLLOWUP_STAGE_IDS,
     POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
     PykrxPipelineDependencies,
     _validated_exact_scope_outcome,
@@ -226,6 +227,25 @@ FOLLOWUP_EXACT_STAGE_DEPENDENCIES = {
     **FACTOR_FOLLOWUP_STAGE_DEPENDENCIES,
     'signal_features': FACTOR_FOLLOWUP_STAGE_ORDER,
 }
+
+
+def _is_price_cohort_factor_stage(
+    stage_id: str,
+    accounted: set[str],
+    dependency_scope: set[str],
+) -> bool:
+    """True when a price-only factor ran on the price cohort (e8b19f29).
+
+    Since 2026-11-06 momentum/value/low_risk/beta run on the follow-up price
+    cohort instead of the Piotroski success set. Their exact Piotroski dependency
+    still describes older runs, so a stage that accounts for symbols outside the
+    Piotroski-derived scope is judged against the parent admission cohort and
+    inherits no DART closure. Older runs keep the dependency rules unchanged.
+    """
+
+    return stage_id in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS and bool(
+        accounted - dependency_scope
+    )
 RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS = (
     'pykrx_enrichment',
     'technical_snapshots',
@@ -3265,6 +3285,13 @@ def _validated_followup_stage_debt_state(
         inherited_terminal = set().union(
             *(terminal_sets.get(dependency, set()) for dependency in dependencies)
         )
+        if _is_price_cohort_factor_stage(
+            stage_id,
+            stage_pending | stage_successful | stage_terminal,
+            eligible | inherited_terminal,
+        ):
+            eligible = set(parent_set)
+            inherited_terminal = set()
         proof_classification = proof_classifications.get(
             stage_id,
             {'successful': set(), 'pending': set(), 'terminal': set()},
@@ -3344,6 +3371,16 @@ def _canonicalize_followup_stage_debt_graph(
                 or terminal.get(stage_id)
             )
             if not stage_present and not admit_newly_eligible:
+                continue
+            if _is_price_cohort_factor_stage(
+                stage_id,
+                set().union(
+                    pending.get(stage_id) or [],
+                    successful.get(stage_id) or [],
+                    terminal.get(stage_id) or [],
+                ),
+                eligible | inherited_terminal,
+            ):
                 continue
 
             stage_pending = set(pending.get(stage_id) or [])
@@ -4405,6 +4442,14 @@ def _resolve_followup_stage_debt_state(
                                 ]
                             )
                 else:
+                    expected_selected = set(parent_symbols)
+                if (
+                    set(partition['selected_stock_codes']) != expected_selected
+                    and stage_id in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS
+                    and set(partition['selected_stock_codes'])
+                    == set(parent_symbols)
+                ):
+                    # Price-cohort shape: see _is_price_cohort_factor_stage.
                     expected_selected = set(parent_symbols)
                 if set(partition['selected_stock_codes']) != expected_selected:
                     return {
