@@ -276,6 +276,9 @@ RUNTIME_SCHEMA_UNIQUE_CHECKS: tuple[dict[str, Any], ...] = (
         'table': 'signal_decider_decision_snapshots',
         'columns': ('content_fingerprint',),
         'required_name': 'uq_signal_decider_snapshots_content_fingerprint',
+        # The model declares this index partial and the writer passes the same predicate as
+        # ON CONFLICT ... WHERE, so a matching partial index is the correct conflict target here.
+        'partial_where': 'content_fingerprint IS NOT NULL',
         'description': 'Append-only signal-decider persistence deduplicates exact retries by content fingerprint.',
     },
     {
@@ -603,6 +606,17 @@ def _normalize_unique_constraint(raw_constraint: dict[str, Any]) -> dict[str, An
     }
 
 
+def _normalize_where_clause(value: str) -> str:
+    return ''.join(character for character in value.lower() if character not in '() \t\n')
+
+
+def _unique_where_allowed(where: str | None, partial_where: str | None) -> bool:
+    # A full upsert key needs a non-partial index; a key the writer targets with the same predicate may be partial.
+    if where is None:
+        return True
+    return partial_where is not None and _normalize_where_clause(where) == _normalize_where_clause(partial_where)
+
+
 def _normalize_unique_index(raw_index: dict[str, Any]) -> dict[str, Any] | None:
     if not raw_index.get('unique'):
         return None
@@ -823,7 +837,7 @@ def _inspect_runtime_schema_drift(
             matches = [candidate for candidate in column_matches if candidate.get('name') == required_name]
         else:
             matches = column_matches
-        matches = [candidate for candidate in matches if candidate.get('where') is None]
+        matches = [candidate for candidate in matches if _unique_where_allowed(candidate.get('where'), spec.get('partial_where'))]
 
         ready = bool(matches)
         check = {
