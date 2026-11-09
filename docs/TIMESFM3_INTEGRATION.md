@@ -160,6 +160,47 @@ requires the last input date to equal the requested completed market date. It
 reuses the existing Core finality guard (default 20:10 KST) with the supplied
 cutoff. Every consumed row's `captured_at` must be strictly before that cutoff.
 
+### KRX calendar corrections
+
+Core's shared `KRX_EXCHANGE_CALENDAR` supplements the upstream XKRX calendar with
+two confirmed 2026 closures missing from `exchange_calendars==4.13.2`:
+
+- `2026-06-03`: local election day.
+- `2026-07-17`: Constitution Day.
+
+The [KRX market-operation notices](https://strn.krx.co.kr/corebbs5/BHPSTRN0401/list)
+(posted June 1 and July 10, 2026) and
+[Samsung Futures' May 14 market closure notice](https://www.ssfutures.com/ssf/customer/notice/CUS_01102.cmd?ND_PATH=%2Fbiz%2Fcustomer%2Fnotice%2FAd202_4589.shtm&categoryID=M158746897264671332)
+confirm the dates. As checked on November 9, 2026, the latest upstream release is
+still [4.13.2](https://github.com/gerrymanoim/exchange_calendars/releases/tag/4.13.2).
+June 3 is fixed by the unreleased
+[upstream PR #574](https://github.com/gerrymanoim/exchange_calendars/pull/574);
+July 17 remains reported in
+[upstream issue #611](https://github.com/gerrymanoim/exchange_calendars/issues/611).
+Upgrading to 4.13.2 alone does not correct either date.
+
+The local calendar adds these dates before constructing its sessions, using a
+union so future upstream inclusion does not duplicate a holiday. This same object
+serves TimesFM, history-repair session checks, and the existing exchange-calendar
+fallback. KIS remains the authoritative first choice for normal market-calendar
+lookups; strict lookups still reject fallback. No additional network call is added
+to TimesFM. These exact-date corrections do not implement later-year holiday rules;
+remove them only after testing an upstream release that covers both dates.
+Forecast `calendar_source` identifies this correction as
+`exchange_calendars:XKRX+core_2026_closures_v1`.
+
+For the reported `2025-08-01` through `2026-11-06` window, the corrected calendar
+expects 308 sessions (`310 - 2`), matching the stored row count. The recent window
+from `2026-04-29` expects 128 (`130 - 2`). A missing bar on an actual session or
+an extra bar on either closure is still rejected. Do not backfill prices or lower
+the history requirement to address this mismatch. Pull the fix, restart any
+running Core process, then rerun the read-only preview. Diagnostic scripts must
+import `app.market.session.KRX_EXCHANGE_CALENDAR`; a separate
+`exchange_calendars.get_calendar('XKRX')` still uses the uncorrected upstream
+registry.
+
+### Source availability
+
 The loader reads current mutable price rows. A repaired/backfilled row observed
 after the cutoff makes the forecast unavailable; it is not silently filtered out.
 The input hash detects subsequent source changes, but does not reconstruct old

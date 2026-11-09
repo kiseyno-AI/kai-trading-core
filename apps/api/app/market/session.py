@@ -7,7 +7,7 @@ import inspect
 from threading import Lock
 from typing import Any, Protocol
 
-import exchange_calendars as xcals
+from exchange_calendars.exchange_calendar_xkrx import XKRXExchangeCalendar
 import pandas as pd
 
 from app.brokers.kis.client import KISClient
@@ -28,7 +28,18 @@ CALENDAR_SOURCE_STATUS_FALLBACK = 'fallback'
 CALENDAR_SOURCE_STATUS_UNAVAILABLE = 'unavailable'
 CALENDAR_SOURCE_STATUS_MISSING_DATE = 'missing_date'
 
-KRX_EXCHANGE_CALENDAR = xcals.get_calendar('XKRX')
+
+class _CoreXKRXExchangeCalendar(XKRXExchangeCalendar):
+    @property
+    def adhoc_holidays(self) -> list[pd.Timestamp]:
+        # shortcut: confirmed 2026 closures only; remove after a tested upstream release includes both.
+        return pd.DatetimeIndex(super().adhoc_holidays).union(
+            pd.DatetimeIndex(['2026-06-03', '2026-07-17'])
+        ).tolist()
+
+
+KRX_EXCHANGE_CALENDAR = _CoreXKRXExchangeCalendar()
+KRX_EXCHANGE_CALENDAR_SOURCE = 'exchange_calendars:XKRX+core_2026_closures_v1'
 DEFAULT_KRX_CALENDAR_CACHE_TTL = timedelta(hours=6)
 DEFAULT_KRX_CALENDAR_FALLBACK_CACHE_TTL = timedelta(seconds=60)
 DEFAULT_KRX_CALENDAR_SCAN_DAYS = 370

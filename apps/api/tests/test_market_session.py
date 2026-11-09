@@ -14,6 +14,7 @@ from app.market.session import (
     CALENDAR_SOURCE_KIS_CHK_HOLIDAY,
     get_krx_exchange_calendar_day,
     InMemoryKrxCalendarCache,
+    KRX_EXCHANGE_CALENDAR,
     RECOMMENDATION_BASIS_LATEST_COMPLETED_EOD,
     RECOMMENDATION_BASIS_LIVE_INTRADAY,
     build_market_session_metadata,
@@ -100,6 +101,30 @@ class FakePagedKISClient(KISClient):
 class MarketSessionTests(unittest.TestCase):
     def tearDown(self) -> None:
         reset_krx_calendar_provider()
+
+    def test_exchange_calendar_excludes_confirmed_2026_closures(self):
+        for first, last, expected in [
+            ('2026-06-02', '2026-06-04', ['2026-06-02', '2026-06-04']),
+            ('2026-07-16', '2026-07-20', ['2026-07-16', '2026-07-20']),
+        ]:
+            with self.subTest(first=first):
+                sessions = KRX_EXCHANGE_CALENDAR.sessions_in_range(first, last)
+                self.assertEqual([item.date().isoformat() for item in sessions], expected)
+
+    def test_kis_failure_fallback_excludes_confirmed_2026_closures(self):
+        for target_date in [date(2026, 6, 3), date(2026, 7, 17)]:
+            with self.subTest(target_date=target_date):
+                client = FakeCalendarClient(error=RuntimeError('kis down'))
+                provider = KisKrxTradingCalendarProvider(client=client)
+
+                result = provider.lookup_day(target_date, allow_fallback=True)
+
+                self.assertFalse(result.is_open)
+                self.assertEqual(result.calendar_source, CALENDAR_SOURCE_EXCHANGE_CALENDARS)
+                self.assertEqual(result.calendar_source_status, 'fallback')
+                with self.assertRaises(KrxCalendarUnavailableError):
+                    provider.lookup_day(target_date, allow_fallback=False)
+                self.assertEqual(len(client.calls), 1)
 
     def test_kis_client_fetches_chk_holiday_pages_with_context_keys(self):
         client = FakePagedKISClient()

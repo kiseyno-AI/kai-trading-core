@@ -23,7 +23,7 @@ from app.core.numbers import finite_float
 from app.core.settings import settings
 from app.eod.finality import validate_finalized_krx_write_date
 from app.forecast_context.mlx_runner import MAX_INPUT_POINTS, MODEL_ID, MODEL_REVISION, PACKAGE_VERSION
-from app.market.session import KRX_EXCHANGE_CALENDAR
+from app.market.session import KRX_EXCHANGE_CALENDAR, KRX_EXCHANGE_CALENDAR_SOURCE
 from app.market_data_store import load_recent_price_bars_by_symbol
 
 logger = logging.getLogger(__name__)
@@ -282,7 +282,7 @@ class TimesFMForecastService:
                     'package_version': PACKAGE_VERSION, 'backend': 'mlx',
                     'price_basis': 'stored_daily_close', 'adjustment_status': 'not_verified',
                     'target_transform': 'none', 'horizon_unit': 'trading_bars',
-                    'calendar_source': 'exchange_calendars:XKRX',
+                    'calendar_source': KRX_EXCHANGE_CALENDAR_SOURCE,
                     'calibration_status': 'not_evaluated', 'decision_use': 'optional_auxiliary_evidence',
                     **{k: v for k, v in window.items() if k != 'values'},
                     'generated_at': cached['generated_at'], 'horizons': horizons,
