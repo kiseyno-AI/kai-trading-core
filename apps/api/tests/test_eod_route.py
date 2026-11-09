@@ -1,4 +1,6 @@
 
+import contextlib
+import time
 import unittest
 from datetime import date
 from types import SimpleNamespace
@@ -1303,6 +1305,52 @@ class EODRouteTests(unittest.TestCase):
             payload['stages']['technical_snapshots']['current_activity'],
             'Computing daily technical snapshots for 000660',
         )
+
+    def test_get_latest_eod_pipeline_status_route_serves_cached_then_refreshes(self):
+        calls = []
+
+        class CountingService:
+            def read(self, **kwargs):
+                calls.append(kwargs)
+                return {'status': 'running', 'call': len(calls)}
+
+        original_service = routes_eod.eod_pipeline_status_service
+        routes_eod.eod_pipeline_status_service = CountingService()
+        routes_eod._pipeline_status_cache.clear()
+        routes_eod._pipeline_status_inflight.clear()
+        params = {'include_feedback_context': 'true'}
+        stack = contextlib.ExitStack()
+        try:
+            client = stack.enter_context(TestClient(self.app))
+            first = client.get('/eod/pipeline/status', params=params).json()
+            second = client.get('/eod/pipeline/status', params=params).json()
+            self.assertEqual((first['call'], second['call'], len(calls)), (1, 1, 1))
+
+            # Past the fresh window: stale payload is served, a refresh runs.
+            key = next(iter(routes_eod._pipeline_status_cache))
+            stored_at, payload = routes_eod._pipeline_status_cache[key]
+            routes_eod._pipeline_status_cache[key] = (
+                stored_at - routes_eod.PIPELINE_STATUS_FRESH_SECONDS,
+                payload,
+            )
+            stale = client.get('/eod/pipeline/status', params=params).json()
+            self.assertEqual(stale['call'], 1)
+            for _ in range(100):
+                if routes_eod._pipeline_status_cache[key][1]['call'] == 2:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(client.get('/eod/pipeline/status', params=params).json()['call'], 2)
+            self.assertEqual(len(calls), 2)
+
+            # An explicit market_date is never cached.
+            client.get('/eod/pipeline/status', params={'market_date': '2026-04-21'})
+            client.get('/eod/pipeline/status', params={'market_date': '2026-04-21'})
+            self.assertEqual(len(calls), 4)
+        finally:
+            stack.close()
+            routes_eod.eod_pipeline_status_service = original_service
+            routes_eod._pipeline_status_cache.clear()
+            routes_eod._pipeline_status_inflight.clear()
 
     def test_get_eod_pipeline_stages_route_returns_stage_catalog(self):
         fake_service = FakeDailyPipelineStageService()

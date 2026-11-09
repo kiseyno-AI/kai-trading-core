@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -221,6 +222,39 @@ async def get_eod_pipeline_live_events(
     return daily_pipeline_live_progress.events_since(since, limit=limit)
 
 
+# The latest-date status view takes 3-6 s to build and dashboards poll it every
+# ~15 s, so serve a recent result and rebuild it in the background
+# (stale-while-revalidate). Explicit market_date reads are always computed fresh.
+PIPELINE_STATUS_FRESH_SECONDS = 10.0
+PIPELINE_STATUS_MAX_STALE_SECONDS = 60.0
+_pipeline_status_cache: dict[tuple, tuple[float, dict]] = {}
+_pipeline_status_inflight: dict[tuple, asyncio.Task] = {}
+
+
+async def _refresh_pipeline_status(key: tuple, read_kwargs: dict) -> dict:
+    try:
+        result = await asyncio.to_thread(eod_pipeline_status_service.read, **read_kwargs)
+        _pipeline_status_cache[key] = (time.monotonic(), result)
+        return result
+    finally:
+        _pipeline_status_inflight.pop(key, None)
+
+
+async def _read_latest_pipeline_status(read_kwargs: dict) -> dict:
+    key = tuple(sorted(read_kwargs.items()))
+    cached = _pipeline_status_cache.get(key)
+    age = time.monotonic() - cached[0] if cached is not None else None
+    task = _pipeline_status_inflight.get(key)
+    if task is None and (age is None or age >= PIPELINE_STATUS_FRESH_SECONDS):
+        task = asyncio.create_task(_refresh_pipeline_status(key, read_kwargs))
+        # Background refresh errors surface to the next caller that has to wait.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _pipeline_status_inflight[key] = task
+    if age is not None and age < PIPELINE_STATUS_MAX_STALE_SECONDS:
+        return cached[1]
+    return await asyncio.shield(task)
+
+
 @router.get('/pipeline/status')
 async def get_eod_pipeline_status(
     market_date: str | None = None,
@@ -228,16 +262,18 @@ async def get_eod_pipeline_status(
     include_diagnostics: bool = Query(default=False),
     include_feedback_context: bool = Query(default=False),
 ) -> dict:
+    read_kwargs = {
+        'market_date': market_date,
+        'fs_div': fs_div,
+        'include_feedback_context': include_feedback_context,
+        'include_feedback_stage': include_feedback_context,
+        'include_row_count_diagnostics': include_diagnostics,
+        'include_pykrx_enrichment_coverage': include_diagnostics,
+    }
     try:
-        return await asyncio.to_thread(
-            eod_pipeline_status_service.read,
-            market_date=market_date,
-            fs_div=fs_div,
-            include_feedback_context=include_feedback_context,
-            include_feedback_stage=include_feedback_context,
-            include_row_count_diagnostics=include_diagnostics,
-            include_pykrx_enrichment_coverage=include_diagnostics,
-        )
+        if market_date is None:
+            return await _read_latest_pipeline_status(read_kwargs)
+        return await asyncio.to_thread(eod_pipeline_status_service.read, **read_kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
