@@ -8969,6 +8969,21 @@ class PykrxBackfillService:
                 for market in persisted_markets
                 if str(market or '').strip()
             )
+        elif (
+            retryable_feedback_rearm_candidate
+            and not proven_partial_summary_downstream_continuation
+            and feedback_retry_stage_id == TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            and resume_from_stage != TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            and TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0] in recovery_stages
+        ):
+            # The parent feedback run already passed its prerequisite gate on
+            # these inputs, and the rearm inherits that run's cutoff and scope.
+            # A still-partial upstream stage (signal_features is partial most
+            # days) must not widen the rearm: the stage executor accepts an
+            # inherited feedback config only on the exact feedback suffix, and
+            # anything wider raised on every tick (2026-11-09).
+            resume_from_stage = TERMINAL_FOLLOWUP_CONTINUATION_STAGES[0]
+            recovery_stages = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
 
         market_risk_recovery_scope_outcome: dict[str, Any] | None = None
         recovery_price_scope_outcome: dict[str, Any] | None = None

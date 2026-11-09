@@ -11206,6 +11206,337 @@ class PykrxBackfillServiceTests(TestCase):
         capped_resume_followups.assert_not_called()
         capped_run_collection.assert_not_called()
 
+    def test_feedback_rearm_narrows_partial_upstream_to_exact_suffix(
+        self,
+    ) -> None:
+        service = PykrxBackfillService()
+        now = datetime.now(timezone.utc)
+        latest_pipeline_run = {
+            'id': 96,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'status': 'blocked',
+            'updated_at': now.isoformat(),
+            'completed_at': now.isoformat(),
+            'run_metadata': {
+                'resolved_stages': [
+                    'signal_features',
+                    'agent_feedback_summaries',
+                    'signal_decider',
+                    'next_open_execution_plan',
+                    'signal_decider_evaluations',
+                ],
+                'reused_eod_collection_run_id': 7,
+            },
+            'stages': {
+                'signal_features': {
+                    'status': 'partial',
+                    'details': {
+                        'result_summary': {
+                            'status': 'partial',
+                            'reason': 'signal_feature_sources_incomplete',
+                        }
+                    },
+                },
+                'agent_feedback_summaries': {
+                    'status': 'partial',
+                    'details': {
+                        'result_summary': {
+                            'run_id': 'feedback-cycle-test',
+                            'prerequisites': {'ready': True},
+                            'progress': {
+                                'summary': {
+                                    'run_status': 'partial',
+                                    'failed_items': 1,
+                                    'completed_cycles': 2,
+                                    'cycle_number': 2,
+                                    'role_progress': {
+                                        'eod-summarizer': {
+                                            'retry_pending_symbols': 1,
+                                            'in_progress_symbols': 0,
+                                            'pending_symbols': 0,
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    },
+                },
+                'signal_decider': {'status': 'blocked'},
+                'next_open_execution_plan': {'status': 'blocked'},
+                'signal_decider_evaluations': {'status': 'blocked'},
+            },
+        }
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
+        )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(latest_pipeline_run),
+            3,
+        )
+        persisted_shape_pipeline_run = deepcopy(latest_pipeline_run)
+        persisted_result = persisted_shape_pipeline_run['stages'][
+            'agent_feedback_summaries'
+        ]['details']['result_summary']
+        persisted_result['progress']['prerequisites'] = (
+            persisted_result.pop('prerequisites')
+        )
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(
+                persisted_shape_pipeline_run
+            )
+        )
+        parent_cutoff = datetime(
+            2026,
+            4,
+            3,
+            8,
+            0,
+            tzinfo=timezone.utc,
+        )
+        parent_symbols = ['005930', '000660']
+        parent_role_symbol_scopes = {
+            role: list(parent_symbols)
+            for role in SUMMARIZER_AGENT_NAMES
+        }
+        parent_feedback_run = {
+            'run_id': 'feedback-cycle-test',
+            'market_date': '2026-04-03',
+            'status': 'partial',
+            'request_payload': {
+                'mode': 'daily_retry_cycle_role_sequenced',
+                'roles': list(SUMMARIZER_AGENT_NAMES),
+                'requested_symbols': list(parent_symbols),
+                'symbols': list(parent_symbols),
+                'role_symbol_scopes': parent_role_symbol_scopes,
+                'feedback_scope_mode': 'decider_scope_fast_path',
+                'knowledge_cutoff_at': parent_cutoff.isoformat(),
+                'admission_knowledge_cutoff_at': (
+                    parent_cutoff.isoformat()
+                ),
+                'fs_div': 'OFS',
+                'policy_context_as_of_date': '2026-04-06',
+                'outer_batch_size': 17,
+            },
+        }
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=parent_feedback_run,
+        ) as get_feedback_run:
+            rearm_config = _retryable_feedback_rearm_config(
+                latest_pipeline_run,
+                market_date='2026-04-03',
+            )
+            self.assertIsNotNone(rearm_config)
+            self.assertEqual(
+                rearm_config['feedback_scope_mode'],
+                'decider_scope_fast_path',
+            )
+            self.assertEqual(
+                rearm_config['requested_symbols'],
+                parent_symbols,
+            )
+            self.assertEqual(
+                rearm_config['role_symbol_scopes'],
+                parent_role_symbol_scopes,
+            )
+            self.assertEqual(rearm_config['fs_div'], 'OFS')
+            self.assertEqual(
+                rearm_config['policy_context_as_of_date'],
+                date(2026, 4, 6),
+            )
+            self.assertEqual(
+                _retryable_feedback_rearm_knowledge_cutoff(
+                    latest_pipeline_run,
+                    market_date='2026-04-03',
+                ),
+                datetime(2026, 4, 3, 8, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual(get_feedback_run.call_count, 2)
+        get_feedback_run.assert_called_with(run_id='feedback-cycle-test')
+        failed_pipeline_run = deepcopy(latest_pipeline_run)
+        failed_pipeline_run['stages']['agent_feedback_summaries'][
+            'status'
+        ] = 'failed'
+        failed_pipeline_run['stages']['agent_feedback_summaries'][
+            'details'
+        ]['result_summary']['progress']['summary'][
+            'run_status'
+        ] = 'failed'
+        failed_summary = failed_pipeline_run['stages'][
+            'agent_feedback_summaries'
+        ]['details']['result_summary']['progress']['summary']
+        failed_summary['completed_cycles'] = 0
+        failed_summary['cycle_number'] = 1
+        failed_parent_run = deepcopy(parent_feedback_run)
+        failed_parent_run['status'] = 'failed'
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(failed_pipeline_run)
+        )
+        self.assertEqual(
+            _retryable_feedback_rearm_max_cycles(failed_pipeline_run),
+            1,
+        )
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=failed_parent_run,
+        ):
+            self.assertIsNotNone(
+                _retryable_feedback_rearm_config(
+                    failed_pipeline_run,
+                    market_date='2026-04-03',
+                )
+            )
+        latest_pipeline_run = failed_pipeline_run
+        parent_feedback_run = failed_parent_run
+        latest_pipeline_run['stages']['agent_feedback_summaries'][
+            'details'
+        ]['result_summary']['prerequisites']['ready'] = False
+        latest_pipeline_run['run_metadata'][
+            'inherited_feedback_prerequisite_admission'
+        ] = True
+        latest_pipeline_run['run_metadata'][
+            'inherited_feedback_knowledge_cutoff_at'
+        ] = '2026-04-03T08:00:00+00:00'
+        latest_pipeline_run['run_metadata'][
+            'inherited_feedback_source_run_id'
+        ] = 'feedback-cycle-test'
+        self.assertTrue(
+            _is_retryable_feedback_rearm_candidate(latest_pipeline_run)
+        )
+
+        with (
+            patch.object(
+                service,
+                'resolve_latest_trade_date',
+                return_value='2026-04-03',
+            ),
+            patch(
+                'app.eod.pykrx_backfill.advisory_eod_collection_lock',
+                return_value=_lock(),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                return_value={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=1,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=parent_feedback_run,
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run'
+            ) as resume_followups,
+            patch.object(service, '_run_market_data_pipeline') as run_collection,
+        ):
+            result = service.run_daily_pipeline_if_due(
+                market_date='2026-04-03',
+                trigger='auto_close_scheduler',
+            )
+
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'followup_recovery_backoff')
+        self.assertTrue(
+            result['followup_recovery']['retryable_feedback_rearm']
+        )
+        self.assertTrue(result['followup_recovery']['retry_scheduled'])
+        self.assertEqual(result['followup_recovery']['max_attempts'], 8)
+        resume_followups.assert_not_called()
+        run_collection.assert_not_called()
+
+        latest_pipeline_run['updated_at'] = (
+            now - timedelta(minutes=10)
+        ).isoformat()
+        latest_pipeline_run['completed_at'] = (
+            now - timedelta(minutes=10)
+        ).isoformat()
+        with (
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'get_latest_run_for_context',
+                return_value=latest_pipeline_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'count_runs',
+                return_value=1,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'agent_context_feedback_run_state_service.get_run',
+                return_value=parent_feedback_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.'
+                'load_latest_pykrx_enrichment_repair_checkpoint',
+                return_value=None,
+            ),
+            patch.object(
+                service,
+                '_preflight_untracked_followup_price_scope',
+                return_value={
+                    'result': None,
+                    'symbols': [],
+                    'downstream_symbols': [],
+                },
+            ),
+            patch.object(
+                service,
+                '_resolve_point_in_time_followup_membership',
+                return_value=({'005930'}, ('KOSPI',)),
+            ),
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'daily_pipeline_stage_service.run',
+                return_value={
+                    'status': 'partial',
+                    'pipeline_run_id': 97,
+                },
+            ) as rearmed_followups,
+        ):
+            rearmed = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03',
+                latest_available_trade_date='2026-04-03',
+                latest_eod_run={
+                    'id': 7,
+                    'status': 'completed',
+                    'symbols_failed': 0,
+                },
+                markets=('KOSPI', 'KOSDAQ'),
+                point_in_time_recovery=False,
+            )
+
+        self.assertTrue(rearmed['triggered'])
+        kwargs = rearmed_followups.call_args.kwargs
+        self.assertEqual(
+            list(kwargs['stages']),
+            [
+                'agent_feedback_summaries',
+                'signal_decider',
+                'next_open_execution_plan',
+            ],
+        )
+        self.assertEqual(kwargs['resume_from_stage'], 'agent_feedback_summaries')
+        self.assertFalse(kwargs['force'])
+        self.assertTrue(kwargs['reuse_existing_feedback'])
+        self.assertIn('inherited_feedback_retry_config', kwargs)
+
     def test_shared_openclaw_outage_rearms_only_with_versioned_exact_marker(
         self,
     ) -> None:
