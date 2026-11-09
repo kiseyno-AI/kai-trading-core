@@ -85,6 +85,7 @@
 - `POST /trading/orders/intraday-auto-sell/run-if-due`
 - `GET /trading/orders/{client_order_id}/timeline?account_reference=KIS:12345678-01&refresh=false`
 - `GET /portfolio/summary?refresh=false`
+- `GET /portfolio/equity-history`
 - `GET /trading/accounts/{account_reference}/summary`
 - `GET /trading/accounts/{account_reference}/positions?symbol=005930&include_zero=false`
 - `GET /trading/accounts/{account_reference}/buying-power?symbol=005930&price=57000&order_type=market`
@@ -366,6 +367,7 @@
 - The default `/portfolio/summary` read path is now a short-lived in-memory cache with stale-while-revalidate semantics. Fresh cache hits return immediately, stale cache hits return the last known summary plus honest freshness metadata, and `refresh=true` forces a live rebuild for manual sync paths.
 - `PORTFOLIO_ACCOUNT_REFERENCES` accepts a comma-separated list of `KIS:<account_number>-<product_code>` entries, with optional labels in `Label=KIS:...` form. When the setting is missing or invalid, `GET /portfolio/summary` returns `200` with `sync.status=not_configured` and explanatory notices instead of an ambiguous empty success.
 - Production portfolio aggregation also requires `KIS_APP_KEY`, `KIS_APP_SECRET`, and `KIS_USE_MOCK=false`. In `APP_ENV=production`, the route and deploy preflight now treat mock-KIS portfolio wiring as a configuration error instead of waiting for a later upstream failure.
+- `GET /portfolio/equity-history` reads Core-owned daily valuations by currency and calculates the percentage change from the first record. The existing Core background runner stores the first complete, fresh post-close valuation per KRX session in `portfolio_asset_snapshots`. The route contains private amounts and is for server-side consumers.
 - The portfolio summary route keeps sync state explicit: fully successful account reads report `sync.status=synced`, mixed-success reads report `sync.status=stale`, total upstream failure reports `sync.status=unavailable`, and deployment/account configuration problems report `sync.status=not_configured`.
 - `/portfolio/summary` now also returns a `freshness` object with cache hit state, TTL, cache age, last refresh attempt/success timestamps, `lastRefreshStatus`, `lastRefreshError`, and whether a background refresh is currently in flight.
 - Startup primes the portfolio summary cache when runtime configuration is ready, and the shared background runner keeps refreshing it on the normal poll loop so dashboard reads do not sit on the live broker critical path.

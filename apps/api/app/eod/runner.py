@@ -21,6 +21,7 @@ from app.market.snapshot import market_snapshot_service
 from app.orders.exec_integration import signal_decider_exec_integration_service
 from app.orders.intraday_auto_sell import signal_decider_intraday_auto_sell_service
 from app.orders.next_open_execution import signal_decider_next_open_execution_service
+from app.orders.portfolio_equity_history import capture_daily_equity
 from app.orders.portfolio_summary_service import portfolio_summary_service
 from app.orders.reconciliation import trading_order_reconciliation_service
 from app.market_news.service import market_news_service
@@ -88,6 +89,7 @@ class EODBackgroundRunner:
         self._last_daily_bar_reconciliation_at: datetime | None = None
         self._daily_bar_reconciliation: dict | None = None
         self._last_agent_improvement_check_at: datetime | None = None
+        self._last_portfolio_equity_date: str | None = None
 
     def snapshot(self, *, now: datetime | None = None) -> dict:
         current = now or datetime.now(timezone.utc)
@@ -473,6 +475,11 @@ class EODBackgroundRunner:
             if fail_closed:
                 raise
             self._record_step_failure(name, exc)
+
+    def _capture_portfolio_equity(self, snapshot: dict, close_at: str) -> None:
+        session_close = datetime.fromisoformat(close_at)
+        if capture_daily_equity(snapshot, session_close):
+            self._last_portfolio_equity_date = session_close.astimezone(SEOUL_TZ).date().isoformat()
 
     def _start_background_thread_step(self, name: str, func) -> None:
         """Run a blocking job in a thread without awaiting it; one in flight per name."""
@@ -942,12 +949,22 @@ class EODBackgroundRunner:
                                     force_index=False,
                                 ),
                             )
-                        await self._run_async_step(
+                        portfolio = await self._run_async_step(
                             'portfolio_summary_refresh_if_due',
                             portfolio_summary_service.refresh_portfolio_summary_if_due(
                                 trigger=f'background_runner:{market.state.lower()}'
                             ),
+                            return_task_result=True,
                         )
+                        if (
+                            market.state == 'CLOSED' and market.session_close_at
+                            and market.current_calendar_date != self._last_portfolio_equity_date
+                            and isinstance(portfolio, dict)
+                        ):
+                            self._start_background_thread_step(
+                                'portfolio_equity_capture',
+                                lambda snapshot=portfolio, close=market.session_close_at: self._capture_portfolio_equity(snapshot, close),
+                            )
                         if settings.data_gap_fill_enabled and market.state == 'OPEN':
                             # Weekday market hours are idle for Core. The job owns its
                             # schedule, budget and writer fences (docs/DATA_GAP_FILL.md)
