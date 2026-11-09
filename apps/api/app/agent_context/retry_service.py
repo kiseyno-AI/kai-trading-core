@@ -3633,7 +3633,7 @@ class AgentFeedbackRetryService:
         if not feedback_run_id or not feedback_received_at:
             return None
         feedback_id = getattr(decision, 'latest_feedback_id', None)
-        return {
+        evidence = {
             'schema_version': REUSE_FEEDBACK_EVIDENCE_SCHEMA_VERSION,
             'feedback_id': int(feedback_id) if feedback_id is not None else None,
             'feedback_run_id': feedback_run_id,
@@ -3654,6 +3654,45 @@ class AgentFeedbackRetryService:
                 None,
             ),
         }
+        summary_payload = latest_feedback.get('summary_payload')
+        context_payload = latest_feedback.get('context_payload')
+        if (
+            isinstance(summary_payload, dict)
+            and isinstance(context_payload, dict)
+        ):
+            recovery_provenance = summary_payload.get('recovery_provenance')
+            context_recovery_provenance = context_payload.get(
+                'recovery_provenance'
+            )
+            normalized_feedback = summary_payload.get('normalized_feedback')
+            if (
+                summary_payload.get('collector_mode')
+                == 'persisted_failure_recovery'
+                and isinstance(recovery_provenance, dict)
+                and recovery_provenance == context_recovery_provenance
+                and recovery_provenance.get('mode')
+                == 'persisted_failure_response_recovery'
+                and recovery_provenance.get('reason')
+                == 'optional_improvement_notes_omitted'
+                and isinstance(normalized_feedback, dict)
+                and normalized_feedback.get('response_contract_valid') is True
+            ):
+                recovery_source_run_id = str(
+                    recovery_provenance.get('source_run_id') or ''
+                ).strip()
+                recovery_source_failure_id = recovery_provenance.get(
+                    'source_failure_id'
+                )
+                if (
+                    recovery_source_run_id
+                    and isinstance(recovery_source_failure_id, int)
+                    and recovery_source_failure_id > 0
+                ):
+                    evidence['recovery_source_run_id'] = recovery_source_run_id
+                    evidence['recovery_source_failure_id'] = (
+                        recovery_source_failure_id
+                    )
+        return evidence
 
     @staticmethod
     def _exact_retry_parent_failed_scope(
@@ -4382,7 +4421,15 @@ class AgentFeedbackRetryService:
                 and parent_run_id
                 and normalized_parent_started_at is not None
             )
-            if bool(decision.should_dispatch) and not failure_shadowed_by_latest_lineage:
+            exact_recovery_is_proven = bool(
+                reuse_parent_run_id
+                and (reuse_evidence or {}).get('recovery_source_run_id')
+            )
+            if (
+                bool(decision.should_dispatch)
+                and not failure_shadowed_by_latest_lineage
+                and not exact_recovery_is_proven
+            ):
                 return False
             if parent_run_id and reuse_evidence is None:
                 return False
@@ -4420,7 +4467,11 @@ class AgentFeedbackRetryService:
             feedback_run_id = str(
                 (reuse_evidence or {}).get('feedback_run_id') or ''
             ).strip()
-            if feedback_run_id not in parent_by_child_run_id:
+            lineage_run_id = str(
+                (reuse_evidence or {}).get('recovery_source_run_id')
+                or feedback_run_id
+            ).strip()
+            if lineage_run_id not in parent_by_child_run_id:
                 # Reuse authority must come from a run in the requested
                 # point-in-time mode. Legacy rows without the flag are normal
                 # mode only; malformed or opposite-mode rows are rejected.
@@ -4437,16 +4488,22 @@ class AgentFeedbackRetryService:
             if reuse_parent_run_id is not None:
                 direct_child_matches = (
                     prior_parent_run_id == reuse_parent_run_id
-                    and parent_by_child_run_id.get(feedback_run_id)
+                    and parent_by_child_run_id.get(lineage_run_id)
                     == reuse_parent_run_id
                     and prior_child is not None
-                    and prior_child[0] == feedback_run_id
-                    and prior_child[1]
-                    in {
-                        'completed',
-                        'completed_with_failures',
-                        'partial',
-                    }
+                    and prior_child[0] == lineage_run_id
+                    and (
+                        prior_child[1]
+                        in {
+                            'completed',
+                            'completed_with_failures',
+                            'partial',
+                        }
+                        or (
+                            prior_child[1] == 'failed'
+                            and exact_recovery_is_proven
+                        )
+                    )
                 )
                 if direct_child_matches:
                     return True

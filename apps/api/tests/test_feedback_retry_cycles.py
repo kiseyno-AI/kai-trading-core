@@ -766,6 +766,79 @@ class RecordingRunStateService:
 
 
 class FeedbackRetryCycleTests(unittest.TestCase):
+    def test_reuse_evidence_binds_valid_optional_note_recovery_to_source_child(self):
+        source_child = 'source-child'
+        decision = _decision(
+            should_dispatch=False,
+            latest_feedback_id=17,
+            latest_feedback={
+                'id': 17,
+                'run_id': 'recovery-run',
+                'received_at': '2026-04-16T05:01:00+00:00',
+                'summary_payload': {
+                    'collector_mode': 'persisted_failure_recovery',
+                    'normalized_feedback': {
+                        'response_contract_valid': True,
+                    },
+                    'recovery_provenance': {
+                        'mode': 'persisted_failure_response_recovery',
+                        'source_failure_id': 41,
+                        'source_run_id': source_child,
+                        'reason': 'optional_improvement_notes_omitted',
+                    },
+                },
+                'context_payload': {
+                    'recovery_provenance': {
+                        'mode': 'persisted_failure_response_recovery',
+                        'source_failure_id': 41,
+                        'source_run_id': source_child,
+                        'reason': 'optional_improvement_notes_omitted',
+                    },
+                },
+            },
+            latest_feedback_received_at='2026-04-16T05:01:00+00:00',
+        )
+
+        evidence = AgentFeedbackRetryService._reuse_feedback_evidence(decision)
+
+        self.assertEqual(evidence['recovery_source_run_id'], source_child)
+
+    def test_reuse_evidence_rejects_unproven_recovery_source_child(self):
+        decision = _decision(
+            should_dispatch=False,
+            latest_feedback_id=17,
+            latest_feedback={
+                'id': 17,
+                'run_id': 'recovery-run',
+                'received_at': '2026-04-16T05:01:00+00:00',
+                'summary_payload': {
+                    'collector_mode': 'persisted_failure_recovery',
+                    'normalized_feedback': {
+                        'response_contract_valid': False,
+                    },
+                    'recovery_provenance': {
+                        'mode': 'persisted_failure_response_recovery',
+                        'source_failure_id': 41,
+                        'source_run_id': 'source-child',
+                        'reason': 'optional_improvement_notes_omitted',
+                    },
+                },
+                'context_payload': {
+                    'recovery_provenance': {
+                        'mode': 'persisted_failure_response_recovery',
+                        'source_failure_id': 41,
+                        'source_run_id': 'source-child',
+                        'reason': 'optional_improvement_notes_omitted',
+                    },
+                },
+            },
+            latest_feedback_received_at='2026-04-16T05:01:00+00:00',
+        )
+
+        evidence = AgentFeedbackRetryService._reuse_feedback_evidence(decision)
+
+        self.assertNotIn('recovery_source_run_id', evidence)
+
     def test_progress_callback_includes_current_lifecycle_stage(self):
         observed: dict[str, object] = {}
 
@@ -4615,7 +4688,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             reason='reuse_latest_feedback',
         )
 
-        def build_exact_snapshot(decision):
+        def build_exact_snapshot(decision, *, exact_reuse_parent=reuse_parent):
             with (
                 patch.object(
                     service,
@@ -4638,12 +4711,63 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                     parent_started_at=datetime(
                         2026, 4, 16, 6, 0, tzinfo=timezone.utc
                     ),
-                    reuse_parent_run_id=reuse_parent,
+                    reuse_parent_run_id=exact_reuse_parent,
                 )
 
         exact_snapshot = build_exact_snapshot(reusable_decision)
         self.assertEqual(
             exact_snapshot.role_states[role].reused_symbols,
+            (symbol,),
+        )
+
+        recovered_decision = _decision(
+            **{
+                **reusable_decision.__dict__,
+                'should_dispatch': True,
+                'reason': 'knowledge_cutoff_mismatch',
+                'latest_feedback': {
+                    'id': 18,
+                    'run_id': 'recovery-run',
+                    'received_at': reuse_evidence['feedback_received_at'],
+                    'summary_payload': {
+                        'collector_mode': 'persisted_failure_recovery',
+                        'normalized_feedback': {
+                            'response_contract_valid': True,
+                        },
+                        'recovery_provenance': {
+                            'mode': 'persisted_failure_response_recovery',
+                            'source_failure_id': 41,
+                            'source_run_id': source_child,
+                            'reason': 'optional_improvement_notes_omitted',
+                        },
+                    },
+                    'context_payload': {
+                        'recovery_provenance': {
+                            'mode': 'persisted_failure_response_recovery',
+                            'source_failure_id': 41,
+                            'source_run_id': source_child,
+                            'reason': 'optional_improvement_notes_omitted',
+                        },
+                    },
+                },
+                'latest_feedback_id': 18,
+            }
+        )
+        with session_scope() as session:
+            source_child_row = session.execute(
+                select(AgentContextFeedbackRun).where(
+                    AgentContextFeedbackRun.run_id == source_child
+                )
+            ).scalar_one()
+            source_child_row.status = 'failed'
+            source_child_row.completed_count = 0
+            source_child_row.failed_count = 1
+        recovered_snapshot = build_exact_snapshot(
+            recovered_decision,
+            exact_reuse_parent=source_parent,
+        )
+        self.assertEqual(
+            recovered_snapshot.role_states[role].reused_symbols,
             (symbol,),
         )
 
