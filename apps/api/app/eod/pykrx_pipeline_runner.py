@@ -3109,6 +3109,9 @@ def _terminalize_optional_intraday_snapshot_result(
     """Make optional intraday degradation terminal without hiding evidence."""
 
     raw_result = dict(result)
+    requested_symbols = raw_result.get('requested_symbols')
+    if isinstance(requested_symbols, list):
+        raw_result['requested_count'] = len(requested_symbols)
     raw_status = str(raw_result.get('status') or '').strip().lower()
     raw_reason = str(raw_result.get('reason') or '').strip()
     normal_nonexecution = bool(
@@ -3156,6 +3159,7 @@ def _terminalize_optional_intraday_snapshot_result(
             'market_date': market_date,
             'collection_status': resolved_status,
             'collection_reason': raw_result.get('reason'),
+            'requested_count': raw_result.get('requested_count'),
             'snapshots_persisted': raw_result.get('snapshots_persisted'),
             'snapshots_failed': raw_result.get('snapshots_failed'),
             'failed_symbols': raw_result.get('failed_symbols'),
