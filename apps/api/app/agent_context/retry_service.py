@@ -45,6 +45,7 @@ from app.agent_context.reuse_service import (
     FUNDAMENTAL_SUMMARIZER_AGENT_NAME,
     FeedbackReuseStaticInputs,
     agent_context_reuse_service,
+    is_stale_dispatch_reason,
 )
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
@@ -4517,16 +4518,9 @@ class AgentFeedbackRetryService:
                 for symbol in role_symbols
                 if (reuse_decisions.get(symbol, {}).get(role) is not None)
                 and reuse_decisions[symbol][role].should_dispatch
-                and str(getattr(reuse_decisions[symbol][role], 'reason', '') or '')
-                in {
-                    'forced_recompute',
-                    'fundamental_input_fingerprint_changed',
-                    'fundamental_input_fingerprint_missing',
-                    'knowledge_cutoff_mismatch',
-                    'stored_fundamental_input_fingerprint_missing',
-                    'source_updated',
-                    'stale_market_feedback',
-                }
+                and is_stale_dispatch_reason(
+                    getattr(reuse_decisions[symbol][role], 'reason', None)
+                )
             )
             terminal_symbol_set = set(completed_symbols) | set(failed_symbols)
             boundary_pending_symbols = tuple(symbol for symbol in role_symbols if symbol not in terminal_symbol_set)

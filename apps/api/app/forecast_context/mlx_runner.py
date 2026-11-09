@@ -183,6 +183,45 @@ class TimesFM3MLXRunner:
             'items': items,
         }
 
+    def benchmark(
+        self, payload: dict[str, Any], *, repeats: int = 30, warmups: int = 5,
+        data_source: str = 'synthetic',
+    ) -> dict[str, Any]:
+        """Measure synchronized calls, keeping load and first-shape compilation separate."""
+        repeats = _bounded_int(repeats, 'repeats', 1, 200)
+        warmups = _bounded_int(warmups, 'warmups', 0, 20)
+        request = validate_request(payload)
+        first = self.forecast(request)
+        for _ in range(warmups):
+            self.forecast(request)
+        self._mx.synchronize()
+        self._mx.reset_peak_memory()
+        timings = [self.forecast(request)['inference_ms'] for _ in range(repeats)]
+        self._mx.synchronize()
+        count = len(request['series'])
+        return {
+            'model_id': MODEL_ID,
+            'model_revision': MODEL_REVISION,
+            'package_version': PACKAGE_VERSION,
+            'backend': 'mlx',
+            'data_source': data_source,
+            'synthetic': data_source == 'synthetic',
+            'context_length': request['context_length'],
+            'actual_context_lengths': sorted({len(item['values']) for item in request['series']}),
+            'horizon': request['horizon'],
+            'batch_size': request['batch_size'],
+            'series_count': count,
+            'repeats': repeats,
+            'warmups': warmups,
+            'load_ms': first['load_ms'],
+            'first_call_ms': first['inference_ms'],
+            'p50_batch_ms': _percentile(timings, 0.5),
+            'p95_batch_ms': _percentile(timings, 0.95),
+            'mean_per_symbol_ms': statistics.mean(timings) / count,
+            'mlx_peak_memory_bytes': int(self._mx.get_peak_memory()),
+            'timing_scope': 'array conversion, synchronized inference and output validation; excludes data access and model load',
+        }
+
 
 def _percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
@@ -190,47 +229,6 @@ def _percentile(values: list[float], fraction: float) -> float:
     lower = math.floor(index)
     upper = math.ceil(index)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
-
-
-def benchmark(
-    payload: dict[str, Any], *, repeats: int = 30, warmups: int = 5,
-    data_source: str = 'synthetic', runner: TimesFM3MLXRunner | None = None,
-) -> dict[str, Any]:
-    """Measure synchronized calls, keeping load and first-shape compilation separate."""
-    repeats = _bounded_int(repeats, 'repeats', 1, 200)
-    warmups = _bounded_int(warmups, 'warmups', 0, 20)
-    request = validate_request(payload)
-    runner = runner or TimesFM3MLXRunner()
-    first = runner.forecast(request)
-    for _ in range(warmups):
-        runner.forecast(request)
-    runner._mx.synchronize()
-    runner._mx.reset_peak_memory()
-    timings = [runner.forecast(request)['inference_ms'] for _ in range(repeats)]
-    runner._mx.synchronize()
-    count = len(request['series'])
-    return {
-        'model_id': MODEL_ID,
-        'model_revision': MODEL_REVISION,
-        'package_version': PACKAGE_VERSION,
-        'backend': 'mlx',
-        'data_source': data_source,
-        'synthetic': data_source == 'synthetic',
-        'context_length': request['context_length'],
-        'actual_context_lengths': sorted({len(item['values']) for item in request['series']}),
-        'horizon': request['horizon'],
-        'batch_size': request['batch_size'],
-        'series_count': count,
-        'repeats': repeats,
-        'warmups': warmups,
-        'load_ms': first['load_ms'],
-        'first_call_ms': first['inference_ms'],
-        'p50_batch_ms': _percentile(timings, 0.5),
-        'p95_batch_ms': _percentile(timings, 0.95),
-        'mean_per_symbol_ms': statistics.mean(timings) / count,
-        'mlx_peak_memory_bytes': int(runner._mx.get_peak_memory()),
-        'timing_scope': 'array conversion, synchronized inference and output validation; excludes data access and model load',
-    }
 
 
 def _read_payload(path: str | None) -> Any:
@@ -281,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
                         ],
                     }
                     source = 'synthetic'
-                result = benchmark(request, repeats=args.repeats, warmups=args.warmups, data_source=source)
+                result = TimesFM3MLXRunner().benchmark(request, repeats=args.repeats, warmups=args.warmups, data_source=source)
             else:
                 result = TimesFM3MLXRunner().forecast(_read_payload(args.input))
         encoded = json.dumps(result, allow_nan=False, separators=(',', ':'))

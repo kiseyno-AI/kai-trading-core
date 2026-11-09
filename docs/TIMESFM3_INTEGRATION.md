@@ -16,7 +16,9 @@ intraday bars, covariates, fine-tuning, and forecast-based position sizing are n
 part of this implementation.
 
 `AgentFeedbackOrchestrator._prepare_role_dispatch_items` prepares one eligible
-symbol batch. The shared payload adds `forecast_evidence.timesfm3` after the
+symbol batch after reuse, upstream-summary, and canonical-price checks. Blocked
+symbols do not invoke the forecast worker. The shared payload adds
+`forecast_evidence.timesfm3` after the
 existing source-generation hashes are created. Prompt trimming retains the
 forecast and its interpretation guidance. Both existing decider request snapshots
 keep the complete evidence. No database schema migration or new HTTP route is
@@ -28,6 +30,11 @@ the anchor close, quantiles, calibration status, and timing scope. Existing
 pre/post-dispatch and durable-snapshot revalidation also validate this evidence
 using price reads and hashes; they never rerun the model. A changed source window
 invalidates previously available evidence through the existing input-change fence.
+Feedback reuse validates the saved forecast with the same checks before keeping
+an earlier decision, including after forecasting is disabled. It redispatches
+deciders whose forecast evidence or input window is no longer valid. Read-only
+status calls without a requested cutoff use the feedback run's saved admission
+cutoff; they do not derive an authoritative cutoff from the forecast itself.
 
 ## Model and output contract
 
@@ -167,7 +174,9 @@ leakage-free historical trading performance.
 
 Missing optional dependencies/checkpoint, a timeout, malformed outputs, or bad
 input produce `status=unavailable` with a reason. The remaining decision evidence
-continues. Model failures have a short retry cooldown. Existing cached successes
+continues. Worker failures have a 60-second retry cooldown. Invalid per-symbol
+outputs use a 60-second cooldown keyed by the exact input, so a bad output does
+not delay other symbols or revised inputs. Existing cached successes
 are reused only for exactly matching inputs, never as a stale last-good fallback.
 Unavailable evidence is neutral; it is not converted into a zero return or a
 negative signal. Previously available evidence that fails integrity/source checks

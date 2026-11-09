@@ -13,7 +13,7 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
 from app.agent_context.status_service import EXPECTED_AGENT_NAMES
-from app.agent_context.reuse_service import FUNDAMENTAL_REUSE_STALE_REASONS, agent_context_reuse_service
+from app.agent_context.reuse_service import agent_context_reuse_service, is_stale_dispatch_reason
 from app.agent_context.runtime_state import _build_top_level_progress_fields, runtime_feedback_state_store
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure, DailyPriceBar, Symbol
@@ -844,7 +844,7 @@ class AgentContextProgressService:
                     if not decision.should_dispatch:
                         completed_by_role[agent_name].add(symbol)
                         reused_by_role[agent_name].add(symbol)
-                    elif str(decision.reason or '') in FUNDAMENTAL_REUSE_STALE_REASONS:
+                    elif is_stale_dispatch_reason(decision.reason):
                         stale_by_role[agent_name].add(symbol)
         else:
             unresolved_failures = []

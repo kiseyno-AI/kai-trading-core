@@ -8,6 +8,7 @@ from app.agent_context import orchestrator as orchestrator_module
 from app.agent_context.orchestrator import AgentFeedbackOrchestrator
 from app.agent_context.orchestrator_helpers import (
     attach_timesfm_forecast_evidence,
+    validate_timesfm_forecast_evidence,
     compressed_batch_item_for_prompt,
     trim_batch_item_for_prompt,
 )
@@ -60,13 +61,13 @@ def forecast(symbol='005930'):
 
 
 class TimesFMDeciderEvidenceTests(unittest.TestCase):
-    def prepare(self, role, *, items=None, evidence=None, reuse=None, error=None):
+    def prepare(self, role, *, items=None, evidence=None, reuse=None, error=None, missing_roles=None):
         service = AgentFeedbackOrchestrator()
         items = items or [source_item()]
         failures = []
         with (
             patch.object(service, '_build_decider_policy_context', return_value={}),
-            patch.object(service, '_build_upstream_feedback_bundle', return_value=({}, {}, [])),
+            patch.object(service, '_build_upstream_feedback_bundle', return_value=({}, {}, missing_roles or [])),
             patch.object(orchestrator_module.runtime_feedback_state_store, 'get_run', return_value=None),
             patch.object(orchestrator_module.signal_decider_market_context_builder, 'build', return_value={}),
             patch.object(
@@ -151,6 +152,16 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
         self.assertFalse(failures)
         self.assertNotIn('forecast_evidence', payloads[0])
 
+    def test_missing_upstream_summaries_do_not_run_forecasting(self):
+        for role in DECIDERS:
+            with self.subTest(role=role):
+                payloads, build, failures = self.prepare(
+                    role, missing_roles=['technical-summarizer'],
+                )
+                self.assertEqual(payloads, [])
+                self.assertEqual([item['symbol'] for item in failures], ['005930'])
+                build.assert_not_called()
+
     def test_forecast_anchor_mismatch_is_unavailable_without_affecting_other_symbols(self):
         for mismatch in ({'anchor_close': 99}, {'input_end_date': '2026-11-06'}):
             with self.subTest(mismatch=mismatch):
@@ -189,7 +200,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
             'validate_evidence',
             side_effect=[{'005930': 'input_changed'}, {}],
         ) as validate:
-            failures = AgentFeedbackOrchestrator._validate_forecast_evidence(
+            failures = validate_timesfm_forecast_evidence(
                 market_date=MARKET_DATE, source_items=source_items, knowledge_cutoff_at=CUTOFF
             )
         self.assertEqual(validate.call_count, 2)
@@ -209,7 +220,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
         with patch.object(
             orchestrator_module.timesfm_forecast_service, 'validate_evidence', return_value={}
         ) as validate:
-            failures = AgentFeedbackOrchestrator._validate_forecast_evidence(
+            failures = validate_timesfm_forecast_evidence(
                 market_date=MARKET_DATE, source_items=source_items, knowledge_cutoff_at=CUTOFF
             )
         validate.assert_called_once_with(
@@ -232,7 +243,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
             {'role': DECIDERS[1], 'symbol': '005930'},
         ]
         with patch.object(orchestrator_module.timesfm_forecast_service, 'validate_evidence') as validate:
-            failures = AgentFeedbackOrchestrator._validate_forecast_evidence(
+            failures = validate_timesfm_forecast_evidence(
                 market_date=MARKET_DATE, source_items=source_items, knowledge_cutoff_at=CUTOFF
             )
         validate.assert_not_called()
@@ -244,7 +255,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
         with patch.object(
             orchestrator_module.timesfm_forecast_service, 'validate_evidence', side_effect=RuntimeError('DB unavailable')
         ):
-            failures = AgentFeedbackOrchestrator._validate_forecast_evidence(
+            failures = validate_timesfm_forecast_evidence(
                 market_date=MARKET_DATE, source_items=[malformed, available], knowledge_cutoff_at=CUTOFF
             )
         self.assertEqual(failures[('signal-decider', '005930')], 'malformed_forecast_evidence')
@@ -256,7 +267,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
         )
         payload['forecast_evidence']['timesfm3']['evidence_fingerprint'] = 'replacement'
         with patch.object(orchestrator_module.timesfm_forecast_service, 'validate_evidence') as validate:
-            failures = AgentFeedbackOrchestrator._validate_forecast_evidence(
+            failures = validate_timesfm_forecast_evidence(
                 market_date=MARKET_DATE, source_items=[payload], knowledge_cutoff_at=CUTOFF
             )
         validate.assert_not_called()

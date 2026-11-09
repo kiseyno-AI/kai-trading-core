@@ -22,7 +22,7 @@ from typing import Any
 from app.core.numbers import finite_float
 from app.core.settings import settings
 from app.eod.finality import validate_finalized_krx_write_date
-from app.forecast_context.mlx_runner import MODEL_ID, MODEL_REVISION, PACKAGE_VERSION
+from app.forecast_context.mlx_runner import MAX_INPUT_POINTS, MODEL_ID, MODEL_REVISION, PACKAGE_VERSION
 from app.market.session import KRX_EXCHANGE_CALENDAR
 from app.market_data_store import load_recent_price_bars_by_symbol
 
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 HORIZONS = (1, 5, 20)
 SCHEMA_VERSION = 'timesfm3_decision_evidence_v1'
 MAX_CACHE_ITEMS = 4096
-MAX_INPUT_POINTS = 4_194_304
 FAILURE_COOLDOWN_SECONDS = 60.0
 API_ROOT = Path(__file__).resolve().parents[2]
 
@@ -211,9 +210,15 @@ class TimesFMForecastService:
             result.update({s: unavailable_evidence(s, market_date, 'forecast_worker_busy') for s in windows})
             return result
         try:
+            now = monotonic()
+            for window in windows.values():
+                key = window['input_fingerprint']
+                cached = self._cache.get(key)
+                if cached is not None and 'retry_after' in cached and now >= cached['retry_after']:
+                    del self._cache[key]
             missing = [s for s, window in windows.items() if window['input_fingerprint'] not in self._cache]
             failure_reason = 'forecast_worker_cooldown'
-            if missing and monotonic() >= self._retry_after:
+            if missing and now >= self._retry_after:
                 try:
                     started = perf_counter()
                     response = _run_worker({
@@ -238,7 +243,10 @@ class TimesFMForecastService:
                                 'batch_symbols': len(missing),
                             }
                         except ForecastUnavailable as exc:
-                            result[symbol] = unavailable_evidence(symbol, market_date, str(exc))
+                            self._cache[windows[symbol]['input_fingerprint']] = {
+                                'reason': str(exc),
+                                'retry_after': monotonic() + FAILURE_COOLDOWN_SECONDS,
+                            }
                 except Exception as exc:
                     self._retry_after = monotonic() + FAILURE_COOLDOWN_SECONDS
                     failure_reason = ('forecast_worker_timeout' if isinstance(exc, subprocess.TimeoutExpired)
@@ -253,6 +261,9 @@ class TimesFMForecastService:
                     result[symbol] = unavailable_evidence(symbol, market_date, failure_reason)
                     continue
                 self._cache.move_to_end(window['input_fingerprint'])
+                if 'reason' in cached:
+                    result[symbol] = unavailable_evidence(symbol, market_date, cached['reason'])
+                    continue
                 anchor = window['anchor_close']
                 horizons = []
                 for step in HORIZONS:

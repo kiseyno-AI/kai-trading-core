@@ -127,7 +127,7 @@ def test_package_mismatch_rejected_before_importing_mlx(monkeypatch):
 
 
 def test_benchmark_separates_load_and_first_call_and_marks_synthetic(fake_runtime):
-    report = module.benchmark(_request(count=2), repeats=3, warmups=2)
+    report = module.TimesFM3MLXRunner().benchmark(_request(count=2), repeats=3, warmups=2)
     assert len(fake_runtime.loads) == 1
     assert len(fake_runtime.calls) == 6
     assert report['synthetic'] is True

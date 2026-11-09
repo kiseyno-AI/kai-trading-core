@@ -136,6 +136,49 @@ def test_malformed_or_crossed_quantiles_never_become_evidence(configured, invali
     evidence = build(instance)['005930']
     assert evidence['status'] == 'unavailable'
     assert 'horizons' not in evidence
+    assert build(instance)['005930'] == evidence
+    worker.assert_called_once()
+
+
+def test_invalid_forecast_retries_after_input_cooldown(configured, monkeypatch):
+    instance, _, _, worker = configured
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(service, 'monotonic', clock)
+    invalid = worker_response({'series': [{'symbol': '005930'}]})
+    invalid['items'][0]['quantiles'][0] = [-1] * 9
+    worker.side_effect = None
+    worker.return_value = invalid
+    assert build(instance)['005930']['reason'] == 'invalid_forecast_values'
+    worker.side_effect = worker_response
+    clock.return_value = 100.0 + service.FAILURE_COOLDOWN_SECONDS - 1
+    assert build(instance)['005930']['status'] == 'unavailable'
+    worker.assert_called_once()
+    clock.return_value += 1
+    assert build(instance)['005930']['status'] == 'available'
+    assert worker.call_count == 2
+
+
+def test_invalid_forecast_cooldown_is_isolated_by_input(configured):
+    instance, histories, _, worker = configured
+    histories['000660'] = price_bars()
+
+    def mixed_response(request):
+        response = worker_response(request)
+        for item in response['items']:
+            if item['symbol'] == '005930':
+                item['quantiles'][0] = [-1] * 9
+        return response
+
+    worker.side_effect = mixed_response
+    assert build(instance)['005930']['reason'] == 'invalid_forecast_values'
+    result = build(instance, ['005930', '000660'])
+    assert result['005930']['status'] == 'unavailable'
+    assert result['000660']['status'] == 'available'
+    assert [item['symbol'] for item in worker.call_args.args[0]['series']] == ['000660']
+    worker.side_effect = worker_response
+    histories['005930'][70]['close_price'] = 99
+    assert build(instance)['005930']['status'] == 'available'
+    assert worker.call_count == 3
 
 
 def test_batch_failure_does_not_hide_valid_other_symbol(configured):

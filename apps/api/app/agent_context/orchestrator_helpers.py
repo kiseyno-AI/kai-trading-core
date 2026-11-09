@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import math
 import re
 import uuid
@@ -17,6 +18,10 @@ from app.agent_context.signal_envelope import (
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 from app.agent_context.response_contract import build_agent_contract_provenance
 from app.agent_context.model_identity import build_runtime_contract_provenance
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
+from app.forecast_context.service import timesfm_forecast_service
+
+logger = logging.getLogger(__name__)
 
 ABORTLIKE_ERROR_MARKERS = (
     'this operation was aborted',
@@ -2555,6 +2560,64 @@ def slim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     """Backward-compatible alias for older tests/imports."""
     return compressed_batch_item_for_prompt(item)
 
+
+def validate_timesfm_forecast_evidence(
+    *,
+    market_date: date,
+    source_items: Sequence[dict[str, Any]],
+    knowledge_cutoff_at: str | None,
+) -> dict[tuple[str, str], str]:
+    """Revalidate saved forecast inputs without running model inference."""
+    failures: dict[tuple[str, str], str] = {}
+    evidence_by_role: dict[str, dict[str, dict[str, Any]]] = {}
+    for item in source_items:
+        role = str(item.get('role') or item.get('agent_name') or '').strip()
+        symbol = str(item.get('symbol') or '').strip().upper()
+        if role not in DECISION_SUPPORT_AGENT_NAMES:
+            continue
+        if 'forecast_evidence' not in item:
+            if 'forecast_evidence_generation' in item:
+                failures[(role, symbol)] = 'missing_forecast_evidence'
+            continue
+        forecast = item['forecast_evidence']
+        if not isinstance(forecast, dict) or not isinstance(forecast.get('timesfm3'), dict):
+            failures[(role, symbol)] = 'malformed_forecast_evidence'
+            continue
+        evidence = forecast['timesfm3']
+        if 'forecast_evidence_generation' in item:
+            generation = item['forecast_evidence_generation']
+            if (
+                not isinstance(generation, dict)
+                or generation.get('schema_version') != 'forecast_evidence_generation_v1'
+                or not generation.get('evidence_fingerprint')
+                or generation['evidence_fingerprint'] != evidence.get('evidence_fingerprint')
+            ):
+                failures[(role, symbol)] = 'forecast_evidence_generation_mismatch'
+                continue
+        evidence_by_role.setdefault(role, {})[symbol] = evidence
+
+    # The two decision lanes remain independent, including when the same
+    # symbol has different saved evidence in each request.
+    for role, evidence_by_symbol in evidence_by_role.items():
+        try:
+            invalid = timesfm_forecast_service.validate_evidence(
+                market_date=market_date,
+                evidence_by_symbol=evidence_by_symbol,
+                knowledge_cutoff_at=knowledge_cutoff_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'TimesFM forecast evidence validation unavailable',
+                extra={'error_type': type(exc).__name__},
+            )
+            invalid = {
+                symbol: 'forecast_validation_unavailable'
+                for symbol in evidence_by_symbol
+            }
+        failures.update(
+            {(role, symbol): reason for symbol, reason in invalid.items()}
+        )
+    return failures
 
 def attach_timesfm_forecast_evidence(
     payload: dict[str, Any],

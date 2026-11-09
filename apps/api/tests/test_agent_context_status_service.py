@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.agent_context.reuse_service import FeedbackReuseDecision
 from app.agent_context.status_service import AgentContextStatusService
 
 
@@ -56,6 +57,57 @@ class FakeStatusSession:
 
 
 class AgentContextStatusServiceTests(unittest.TestCase):
+    def test_feedback_status_counts_invalid_forecast_as_stale(self):
+        fake_session = FakeStatusSession()
+        fake_session.feedback_rows = []
+        fake_session.failure_rows = []
+        reason = 'forecast_evidence_invalid:forecast_source_changed'
+        decisions = {
+            role: FeedbackReuseDecision(
+                symbol='005930',
+                agent_name=role,
+                should_dispatch=True,
+                reason=dispatch_reason,
+                latest_feedback_id=77,
+                latest_feedback_received_at='2026-04-13T01:00:00+00:00',
+                latest_source_updated_at=None,
+                latest_feedback=None,
+            )
+            for role, dispatch_reason in (
+                ('signal-decider', reason),
+                ('short-term-decider', 'no_feedback'),
+            )
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with (
+            patch('app.agent_context.status_service.session_scope', fake_session_scope),
+            patch(
+                'app.agent_context.status_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value={'ready': True, 'status': 'ready', 'missing_prerequisites': []},
+            ),
+            patch(
+                'app.agent_context.status_service.agent_context_feedback_run_state_service.find_latest_run',
+                return_value=None,
+            ),
+            patch(
+                'app.agent_context.status_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={'005930': decisions},
+            ),
+        ):
+            result = AgentContextStatusService().get_feedback_status(
+                market_date='2026-04-14', symbols=['005930'],
+            )
+
+        self.assertEqual(result['summary']['stale_feedback_count'], 1)
+        item = result['items'][0]
+        self.assertEqual(item['stale_agents'], ['signal-decider'])
+        self.assertEqual(item['stale_feedback']['signal-decider']['reason'], reason)
+        self.assertEqual(item['reused_count'], 0)
+
     def test_feedback_status_groups_missing_upstream_without_marking_symbol_in_progress(self):
         fake_session = FakeStatusSession()
 
