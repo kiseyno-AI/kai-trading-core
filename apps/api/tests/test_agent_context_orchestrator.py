@@ -8136,7 +8136,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         service.client = client
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
-        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=2,
+            timesfm_enabled=False,
+        )
         reuse_calls = []
         def build_latest_decisions(**kwargs):
             reuse_calls.append(kwargs)
@@ -8417,7 +8421,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
         symbols = ['005930', '000660', '035420', '051910']
-        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=10, openclaw_agent_parallel_subtasks=1)
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=10,
+            openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
+        )
         reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -8516,6 +8524,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=2,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -8642,6 +8651,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -8709,7 +8719,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         service.client = client
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
-        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=2)
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=2,
+            timesfm_enabled=False,
+        )
         reuse_service = SimpleNamespace(build_latest_decisions=lambda **kwargs: {})
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -8770,6 +8784,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -9038,6 +9053,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                 fake_settings = SimpleNamespace(
                     openclaw_agent_symbol_chunk_size=1,
                     openclaw_agent_parallel_subtasks=1,
+                    timesfm_enabled=False,
                 )
                 market_context_builder = FakeMarketContextBuilder(
                     {
@@ -9156,6 +9172,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -9232,6 +9249,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -9355,6 +9373,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -9422,6 +9441,7 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             openclaw_agent_symbol_chunk_size=1,
             openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
         )
         market_context_builder = FakeMarketContextBuilder(
             {
@@ -9506,7 +9526,11 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         feedback_service = FakeFeedbackService()
         cleanup_service = FakeSessionCleanupService()
         failure_service = RecordingFailureService()
-        fake_settings = SimpleNamespace(openclaw_agent_symbol_chunk_size=1, openclaw_agent_parallel_subtasks=1)
+        fake_settings = SimpleNamespace(
+            openclaw_agent_symbol_chunk_size=1,
+            openclaw_agent_parallel_subtasks=1,
+            timesfm_enabled=False,
+        )
 
         def build_latest_decisions(**kwargs):
             roles = tuple(kwargs['roles'])
