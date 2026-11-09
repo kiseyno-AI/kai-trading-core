@@ -1,0 +1,3 @@
+# Optional native Apple Silicon research worker; keep out of the API environment.
+# Install with: python -m pip install -r requirements-timesfm.txt
+timesfm[mlx]==3.0.2

@@ -209,6 +209,15 @@ class Settings(BaseSettings):
     koreaexim_base_url: str = 'https://oapi.koreaexim.go.kr/site/program/financial/exchangeJSON'
     koreaexim_fallback_days: int = 2
 
+    # Optional TimesFM 3.0 research evidence for the two final deciders.
+    # Model dependencies live in the optional worker environment, not base API requirements.
+    timesfm_enabled: bool = False
+    timesfm_python_executable: str = ''
+    timesfm_context_length: int = Field(default=512, ge=128, le=2048)
+    timesfm_min_context_length: int = Field(default=128, ge=32, le=2048)
+    timesfm_batch_size: int = Field(default=32, ge=1, le=32)
+    timesfm_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+
     macro_context_enabled: bool = True
     macro_context_refresh_min_interval_hours: int = 24
     macro_context_stale_after_hours: int = 72

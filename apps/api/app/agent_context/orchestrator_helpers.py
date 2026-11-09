@@ -2122,6 +2122,7 @@ def _sanitize_noncanonical_execution_narratives(
 
 def trim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     trimmed = json.loads(json.dumps(item, ensure_ascii=False))
+    trimmed.pop('forecast_evidence_generation', None)
     source_revalidation_request = trimmed.pop('source_revalidation_request', None)
     decision_input_generation_fence = trimmed.pop(
         'decision_input_generation_fence',
@@ -2354,6 +2355,7 @@ _PROMPT_SLIM_PRIORITY_KEYS = (
     'symbol_day_context',
     'liquidity_context',
     'macro_context',
+    'forecast_evidence',
     'market_regime_context',
     'decision_input_quality_context',
     'decider_data_quality_context',
@@ -2531,12 +2533,61 @@ def compressed_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     dispatched_policy = trimmed.get('signal_decider_policy')
     if isinstance(dispatched_policy, dict):
         compressed['signal_decider_policy'] = dispatched_policy
+    forecast_evidence = trimmed.get('forecast_evidence')
+    if isinstance(forecast_evidence, dict):
+        # This is already a bounded horizon summary. Generic nested compression
+        # must not separate the quantiles from their target and interpretation.
+        compressed['forecast_evidence'] = forecast_evidence
+        constraints = trimmed.get('decision_support_constraints')
+        guidance = (
+            constraints.get('forecast_evidence_guidance')
+            if isinstance(constraints, dict)
+            else None
+        )
+        if isinstance(guidance, dict):
+            compressed.setdefault('decision_support_constraints', {})[
+                'forecast_evidence_guidance'
+            ] = guidance
     return compressed
 
 
 def slim_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     """Backward-compatible alias for older tests/imports."""
     return compressed_batch_item_for_prompt(item)
+
+
+def attach_timesfm_forecast_evidence(
+    payload: dict[str, Any],
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach optional model evidence without changing source-data generations."""
+    constraints = payload.get('decision_support_constraints')
+    return {
+        **payload,
+        'forecast_evidence': {'timesfm3': jsonable_encoder(evidence)},
+        'forecast_evidence_generation': {
+            'schema_version': 'forecast_evidence_generation_v1',
+            'evidence_fingerprint': evidence.get('evidence_fingerprint'),
+        },
+        'decision_support_constraints': {
+            **(constraints if isinstance(constraints, dict) else {}),
+            'forecast_evidence_guidance': {
+                'authority': 'auxiliary_numerical_evidence_only',
+                'interpretation': [
+                    'TimesFM is not an independent specialist vote or execution authority.',
+                    'The median forecast is not an expected return or calibrated probability of profit.',
+                    'Close-to-close forecast returns are not executable next-open returns.',
+                    'Marginal quantiles are not calibrated confidence scores and must not be summed across horizons.',
+                    'Daily forecasts do not establish intraday trigger timing, portfolio risk, or tradeable alpha.',
+                ],
+                'missing_evidence_policy': (
+                    'Unavailable forecasts are neutral. Use the remaining evidence; '
+                    'do not invent a forecast or block a decision solely because it is absent.'
+                ),
+                'hard_gate_policy': 'Forecasts never override existing quality, risk, or execution gates.',
+            },
+        },
+    }
 
 
 def build_upstream_feedback_bundle(
