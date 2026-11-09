@@ -4,8 +4,10 @@
 
 This optional personal-study integration supplies a numerical forecast to both
 `short-term-decider` and `signal-decider` immediately before their normal dispatch.
-It is disabled until `TIMESFM_ENABLED=true`. It does not add a specialist vote,
-change an order rule, activate a policy, or replace the existing summaries.
+The standard API launcher automatically enables a provisioned native Apple
+Silicon worker when `TIMESFM_ENABLED` is unset. Explicit `false` keeps it disabled;
+direct Python/CLI invocation retains the disabled setting default. It does not add
+a specialist vote, change an order rule, activate a policy, or replace summaries.
 
 The first version uses KRX `daily_price_bars.close_price`: up to 512 observations,
 at least 128 by default, with 1-, 5-, and 20-trading-bar forecasts. These values are
@@ -35,6 +37,33 @@ an earlier decision, including after forecasting is disabled. It redispatches
 deciders whose forecast evidence or input window is no longer valid. Read-only
 status calls without a requested cutoff use the feedback run's saved admission
 cutoff; they do not derive an authoritative cutoff from the forecast itself.
+
+## Automatic daily process
+
+The automatic after-close PyKRX chain and the manual/recovery daily orchestrator
+both run TimesFM inside the existing `signal_decider` stage. After the summarizer
+prerequisites, decision reuse, and canonical-price checks, the eligible symbols
+receive forecasts before either final decider is dispatched. Both roles share the
+existing process cache. The forecast uses the same admitted
+`source_knowledge_cutoff_at` as the decider; it does not create a later cutoff.
+
+`GET /eod/pipeline/live` exposes `substeps.timesfm_forecast` on the running
+`signal_decider` stage, with start/completion status, role and request-run identity,
+symbol count, final evidence availability counts and reasons, cutoff, and elapsed
+milliseconds for the current invocation. Counts describe the latest role/batch,
+not the whole daily universe; the second role may reuse cached forecasts.
+Availability is measured after the forecast's anchor is checked against the
+decider's canonical price. A completed forecast operation can still report
+unavailable evidence; that remains optional and does not change the parent
+stage's decision success/failure counters. An explicitly disabled forecast is
+reported as skipped. Generic dispatches without an active daily stage do not
+create a synthetic daily run.
+
+The complete evidence remains in each decider request snapshot at
+`forecast_evidence.timesfm3`. There is no separate persisted forecast-completion
+stage: after restart, the process cache is empty and eligible decider dispatches
+prepare forecasts again. Existing daily scheduling, scope, recovery, and
+next-open execution gates remain in force.
 
 ## Model and output contract
 
@@ -77,7 +106,15 @@ decision path. The model source code is Apache-2.0; the selected 3.0 weights hav
 a separate non-commercial/non-production license. This integration is scoped to
 the owner's stated personal study purpose; see the official license below.
 
-Add these optional settings to the Core `.env`, using the real absolute path:
+When started through `start-api.sh` (including the existing Mac launchd service),
+Darwin/arm64 plus an executable `apps/api/var/timesfm-venv/bin/python` enables the
+feature and supplies that absolute interpreter path if the corresponding settings
+are unset. Explicit process-environment values take precedence over `.env`, and
+explicit settings are preserved. Other platforms and installations without that
+worker retain the disabled default. Startup does not install or download a model.
+
+For direct Python/CLI runs, a worker installed elsewhere, or explicit overrides,
+use these settings in the Core environment, using the real absolute path:
 
 ```dotenv
 TIMESFM_ENABLED=true

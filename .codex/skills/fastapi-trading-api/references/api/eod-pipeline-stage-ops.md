@@ -5,6 +5,13 @@ Lists the canonical daily stage catalog and runs an explicit subset of those sta
 
 `GET /eod/pipeline/stages` returns the stable stage order, default operator sequence, dependency metadata, inspect routes, and output-table hints so operators can decide which stages to run.
 
+The existing `signal_decider` stage prepares optional TimesFM evidence for each
+eligible final-decider batch after summary/reuse/price checks. The named
+`timesfm_forecast` sub-step and latest batch results are visible through
+`GET /eod/pipeline/live`; it is not a separately selectable stage. Both decider
+roles receive `forecast_evidence.timesfm3` in their stored request snapshots when
+forecasting is enabled. Forecast unavailability remains nonblocking.
+
 The default operator sequence now includes `pykrx_enrichment` immediately after `price_collection`, then the factor/scoring stages after `fundamentals_daily_refresh` and `piotroski_filter`: `momentum_factors`, `value_factors`, `low_risk_factors`, `beta_factors`, `advanced_value_factors`, `unified_value_factors`, `quality_factors`, and `composite_factors`. It then runs `external_news_collect`, `external_news_enrich`, and `macro_context_refresh` before agent feedback dispatch.
 
 `POST /eod/pipeline/run` accepts a stage subset, preserves canonical ordering, creates a durable `daily_pipeline_runs` row plus per-stage `daily_pipeline_stage_runs`, and delegates execution to the reusable stage operations. Callers should include any prerequisites they need; declared dependencies included in the same run are enforced and block downstream stages when an upstream stage does not complete. `resume_from_stage` narrows the run to that stage and later canonical stages so operators can restart at `market_risk_filter` without rerunning upstream price or technical outputs. Set `background=true` for long-running recovery work; stage names and `market_date` are validated before the route returns `202 Accepted`, and invalid requests return the same `400` response as synchronous runs. The durable pipeline status endpoints expose subsequent progress. Admission is serialized per market date and overlapping active stage sets are deduplicated across API, manual, and monitor triggers. Before deduplication, `running` rows older than `EOD_AUTO_PYKRX_STALE_RUN_MINUTES` by their last persisted activity are marked `abandoned` with resumable audit metadata so crashed workers cannot block recovery indefinitely. `force` controls stage recomputation, while the separate recovery-only `bypass_prerequisite_gate` flag bypasses prerequisite inspection without forcing completed feedback artifacts to be recomputed.

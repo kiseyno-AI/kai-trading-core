@@ -164,6 +164,55 @@ class LiveProgressTests(unittest.TestCase):
         self.assertEqual(stage['substeps']['price_contexts']['result_status'], 'completed')
         self.assertNotIn('ignored', stage['substeps'])
 
+    def test_repeated_substep_resets_finished_invocation_but_not_running_updates(self):
+        self.live.publish_run(_run())
+        self.live.publish_stage(_stage('signal_decider', total=2))
+        first_start = datetime(2026, 11, 6, 11, 20, tzinfo=timezone.utc)
+        second_start = first_start + timedelta(seconds=20)
+        with patch('app.eod.live_progress._now', return_value=first_start) as clock:
+            self.live.publish_substep(step='timesfm_forecast', status='running')
+            clock.return_value = first_start + timedelta(seconds=1)
+            self.live.publish_substep(step='timesfm_forecast', status='running')
+            step = self.live.snapshot()['active_run']['stages'][0]['substeps']['timesfm_forecast']
+            self.assertEqual(step['started_at'], first_start.isoformat())
+            self.live.publish_substep(
+                step='timesfm_forecast', status='completed', result_status='available',
+                detail={'role': 'signal-decider', 'available_count': 1},
+            )
+
+            clock.return_value = second_start
+            self.live.publish_substep(
+                step='timesfm_forecast', status='running', detail={'role': 'short-term-decider'},
+            )
+
+            step = self.live.snapshot()['active_run']['stages'][0]['substeps']['timesfm_forecast']
+            self.assertEqual(step['started_at'], second_start.isoformat())
+            self.assertIsNone(step['completed_at'])
+            self.assertNotIn('result_status', step)
+            self.assertEqual(step['detail'], {'role': 'short-term-decider'})
+
+    def test_repeated_skipped_substeps_start_at_current_invocation(self):
+        self.live.publish_run(_run())
+        self.live.publish_stage(_stage('signal_decider', total=2))
+        first_start = datetime(2026, 11, 6, 11, 20, tzinfo=timezone.utc)
+        second_start = first_start + timedelta(seconds=20)
+        with patch('app.eod.live_progress._now', return_value=first_start) as clock:
+            self.live.publish_substep(
+                step='timesfm_forecast', status='skipped', result_status='disabled',
+                detail={'role': 'signal-decider'},
+            )
+            clock.return_value = second_start
+            self.live.publish_substep(
+                step='timesfm_forecast', status='skipped', result_status='disabled',
+                detail={'role': 'short-term-decider'},
+            )
+
+        step = self.live.snapshot()['active_run']['stages'][0]['substeps']['timesfm_forecast']
+        self.assertEqual(step['started_at'], second_start.isoformat())
+        self.assertEqual(step['completed_at'], second_start.isoformat())
+        self.assertEqual(step['result_status'], 'disabled')
+        self.assertEqual(step['detail'], {'role': 'short-term-decider'})
+
     def test_per_symbol_callback_updates_counts_without_a_db_write(self):
         self.live.publish_run(_run())
         self.live.publish_stage(_stage('technical_snapshots', total=2769))

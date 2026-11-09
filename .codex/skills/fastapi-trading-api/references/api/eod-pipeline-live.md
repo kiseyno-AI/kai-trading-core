@@ -11,6 +11,19 @@ Every write the daily pipeline makes to its run state (run start/finish, stage s
 
 Nothing here queries the database, so it is safe to poll every second.
 
+During daily `signal_decider` execution, `substeps.timesfm_forecast` shows forecast
+preparation before each final decider role. Its `detail.scope=current_role_batch`
+means the counts belong to the latest role/batch, not the entire pipeline. The
+detail carries `role`, `request_run_id`, `symbol_count`, `knowledge_cutoff_at`,
+`optional_context`, `available_count`, `unavailable_count`, `unavailable_reasons`,
+and current-call `elapsed_ms`. Terminal availability counts reflect the evidence
+actually attached after canonical-price/anchor validation. `status=completed`
+means the optional operation finished; `result_status` separately reports
+`available`, `partial`, or `unavailable`. Disabled forecasting reports
+`status=skipped`, `result_status=disabled`. Parent-stage counts remain unchanged.
+The complete forecast is retained in the existing decider request snapshot at
+`forecast_evidence.timesfm3`.
+
 Sources, newest wins:
 - Core API process memory;
 - `apps/api/var/pipeline-live/current.json` (override with `DAILY_PIPELINE_LIVE_DIR`), written atomically at most once per second and on every status change by whichever process runs the pipeline (including `python -m app.internal.ops eod-pipeline-run`). `origin` says which one was returned.

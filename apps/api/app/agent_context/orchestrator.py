@@ -152,6 +152,7 @@ from app.agent_context.signal_decider_weekly_learning_service import (
 from app.core.settings import settings
 from app.db import session_scope, session_timeout_budget
 from app.db_models import AgentContextFeedback, EODCollectionRun
+from app.eod.live_progress import daily_pipeline_live_progress
 from app.external_news.store import list_external_news_items
 from app.forecast_context.service import timesfm_forecast_service, unavailable_evidence
 
@@ -5220,6 +5221,21 @@ class AgentFeedbackOrchestrator:
         forecast_symbols = [symbol for symbol in forecast_symbols if symbol]
         if not forecast_symbols:
             return dispatch_items
+        forecast_enabled = settings.timesfm_enabled
+        forecast_started = time.perf_counter()
+        forecast_progress = {
+            'scope': 'current_role_batch',
+            'role': role,
+            'request_run_id': request_run_id,
+            'symbol_count': len(forecast_symbols),
+            'knowledge_cutoff_at': source_knowledge_cutoff_at,
+            'optional_context': True,
+        }
+        if forecast_enabled:
+            daily_pipeline_live_progress.publish_substep(
+                step='timesfm_forecast', status='running', result_status='running',
+                detail=forecast_progress,
+            )
         try:
             forecast_by_symbol = timesfm_forecast_service.build_for_symbols(
                 market_date=market_date,
@@ -5239,6 +5255,8 @@ class AgentFeedbackOrchestrator:
                 )
                 for symbol in forecast_symbols
             }
+        forecast_available_count = 0
+        forecast_unavailable_reasons: dict[str, int] = {}
         for index, payload in enumerate(dispatch_items):
             symbol = str(payload.get('symbol') or '').strip().upper()
             forecast_evidence = forecast_by_symbol.get(symbol)
@@ -5262,6 +5280,29 @@ class AgentFeedbackOrchestrator:
                         reason='forecast_anchor_mismatch',
                     )
             dispatch_items[index] = attach_timesfm_forecast_evidence(payload, forecast_evidence)
+            if forecast_evidence.get('status') == 'available':
+                forecast_available_count += 1
+            else:
+                reason = str(forecast_evidence.get('reason') or 'forecast_unavailable')
+                forecast_unavailable_reasons[reason] = forecast_unavailable_reasons.get(reason, 0) + 1
+        forecast_result_status = (
+            'disabled' if not forecast_enabled
+            else 'available' if forecast_available_count == len(forecast_symbols)
+            else 'partial' if forecast_available_count
+            else 'unavailable'
+        )
+        daily_pipeline_live_progress.publish_substep(
+            step='timesfm_forecast',
+            status='completed' if forecast_enabled else 'skipped',
+            result_status=forecast_result_status,
+            detail={
+                **forecast_progress,
+                'available_count': forecast_available_count,
+                'unavailable_count': sum(forecast_unavailable_reasons.values()),
+                'unavailable_reasons': forecast_unavailable_reasons,
+                'elapsed_ms': round((time.perf_counter() - forecast_started) * 1000, 3),
+            },
+        )
         return dispatch_items
 
     def _attach_signal_decider_performance_criteria(
