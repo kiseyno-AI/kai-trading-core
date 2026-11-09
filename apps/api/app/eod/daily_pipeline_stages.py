@@ -1638,11 +1638,21 @@ class DailyPipelineStageService:
                 required_stage_ids=feedback_prerequisite_stage_ids,
             )
         ):
+            prerequisite_scope_symbols = resolved_symbols
+            if (
+                prerequisite_scope_symbols is None
+                and 'signal_decider' in resolved_stages
+                and 'agent_feedback_summaries' not in resolved_stages
+                and canonical_intraday_summary_cutoff_proof
+            ):
+                prerequisite_scope_symbols = list(
+                    expected_completed_symbols or []
+                )
             prerequisites = (
                 agent_feedback_prerequisite_service.inspect_feedback_prerequisites(
                     market_date=resolved_market_date,
                     fs_div=resolved_fs_div,
-                    symbols=resolved_symbols,
+                    symbols=prerequisite_scope_symbols,
                     required_stage_ids=(
                         persisted_feedback_prerequisite_stage_ids
                     ),
