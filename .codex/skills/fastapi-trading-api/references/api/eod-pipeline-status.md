@@ -19,6 +19,8 @@ The `pykrx_enrichment` stage is also the operator status source for the decider 
 
 By default, dashboard/status reads omit expensive row-count missing-symbol samples, PyKRX coverage scans, and feedback-run context so polling cannot consume the same database capacity as the daily pipeline. Pass `include_diagnostics=true` to include PyKRX enrichment coverage and row-count missing diagnostics. Pass `include_feedback_context=true` to include the live/durable `agent_feedback_summaries` stage.
 
+When `market_date` is omitted, the route answers from a short in-process cache per query-flag combination: a result younger than 10 s is returned as is; an older one (up to 60 s) is returned immediately while a background rebuild runs, so polling dashboards get millisecond responses with data at most about 30 s old (`generated_at` shows when it was built). Only the first read after a restart, or after 60 s with no reads, waits for a full rebuild. Reads with an explicit `market_date` are always computed fresh.
+
 When diagnostics are enabled, row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
 
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
