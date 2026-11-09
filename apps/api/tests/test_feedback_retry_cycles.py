@@ -1869,6 +1869,123 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             },
         )
 
+    def test_exact_partial_summary_cutoff_uses_completed_intersection_when_finalized_with_pending_work(
+        self,
+    ):
+        cutoff = datetime(2026, 4, 16, 6, 45, tzinfo=timezone.utc)
+        source_run_id = 'feedback-cycle-finalized-with-pending-work'
+        roles = list(SUMMARIZER_AGENT_NAMES)
+        admitted_symbols = ['000660', '005930', '035420']
+        role_scopes = {role: list(admitted_symbols) for role in roles}
+        completed_symbols_by_role = {
+            roles[0]: ['000660', '005930'],
+            roles[1]: list(admitted_symbols),
+            roles[2]: ['000660', '035420'],
+        }
+        failed_symbols_by_role = {roles[0]: ['035420']}
+        request_payload = {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': roles,
+            'requested_symbols': list(admitted_symbols),
+            'symbols': list(admitted_symbols),
+            'role_symbol_scopes': role_scopes,
+            'role_symbol_counts': {role: 3 for role in roles},
+            'feedback_scope_mode': 'broad_feedback_universe',
+            'request_run_id': source_run_id,
+            'admission_knowledge_cutoff_at': cutoff.isoformat(),
+        }
+        role_progress = {
+            roles[0]: {
+                'role': roles[0],
+                'status': 'completed_with_failures',
+                'boundary_status': 'completed_with_failures',
+                'total_symbols': 3,
+                'processed_symbols': 3,
+                'completed_symbols': 2,
+                'terminal_symbols': 3,
+                'failed_items': 1,
+                'in_progress_symbols': 0,
+                'pending_symbols': 0,
+                'retry_pending_symbols': 1,
+            },
+            roles[1]: {
+                'role': roles[1],
+                'status': 'completed',
+                'boundary_status': 'completed',
+                'total_symbols': 3,
+                'processed_symbols': 3,
+                'completed_symbols': 3,
+                'terminal_symbols': 3,
+                'failed_items': 0,
+                'in_progress_symbols': 0,
+                'pending_symbols': 0,
+                'retry_pending_symbols': 0,
+            },
+            roles[2]: {
+                'role': roles[2],
+                'status': 'incomplete',
+                'boundary_status': 'incomplete',
+                'total_symbols': 3,
+                'processed_symbols': 2,
+                'completed_symbols': 2,
+                'terminal_symbols': 2,
+                'failed_items': 0,
+                'in_progress_symbols': 0,
+                'pending_symbols': 1,
+                'retry_pending_symbols': 1,
+            },
+        }
+        progress_summary = {
+            'run_id': source_run_id,
+            'run_status': 'partial',
+            'run_table_status': 'partial',
+            'is_live': False,
+            'run_completed_at': (cutoff + timedelta(minutes=1)).isoformat(),
+            'expected_feedback_count': 9,
+            'completed_feedback_count': 7,
+            'failed_items': 1,
+            'role_symbol_scopes': role_scopes,
+            'role_symbol_counts': {role: 3 for role in roles},
+            'completed_symbols_by_role': completed_symbols_by_role,
+            'failed_symbols_by_role': failed_symbols_by_role,
+            'role_progress': role_progress,
+        }
+        exact_run = {
+            'run_id': source_run_id,
+            'market_date': date(2026, 4, 16),
+            'status': 'partial',
+            'symbols_total': 9,
+            'completed_count': 7,
+            'failed_count': 1,
+            'completed_at': cutoff + timedelta(minutes=1),
+            'request_payload': request_payload,
+            'summary_payload': {
+                'lifecycle_stage': 'finished',
+                'request': dict(request_payload),
+                'progress_summary': progress_summary,
+            },
+        }
+
+        with patch(
+            'app.agent_context.retry_service.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=exact_run,
+        ):
+            result = resolve_latest_completed_summary_knowledge_cutoff(
+                market_date=date(2026, 4, 16),
+                feedback_scope_mode='broad_feedback_universe',
+                source_run_id=source_run_id,
+                requested_symbols=admitted_symbols,
+                now=cutoff + timedelta(minutes=5),
+            )
+
+        self.assertTrue(result['ready'])
+        self.assertEqual(result['requested_symbols'], ['000660'])
+        self.assertEqual(
+            result['completed_scope_proof']['completed_symbols'],
+            ['000660'],
+        )
+
     def test_exact_partial_summary_cutoff_rejects_inconsistent_failure_partition(
         self,
     ):
@@ -5429,6 +5546,9 @@ class FeedbackRetryCycleTests(unittest.TestCase):
             parallel_per_role=1,
             batch_size=20,
             started_at=datetime.now(timezone.utc),
+            completed_symbols_by_role={
+                'eod-summarizer': {'000660', '005930'}
+            },
             reused_symbols_by_role={'eod-summarizer': {'000660', '005930'}},
             reused_feedback_evidence_by_role={
                 'eod-summarizer': {
@@ -5457,6 +5577,10 @@ class FeedbackRetryCycleTests(unittest.TestCase):
 
         self.assertEqual(
             summary['reused_symbols_by_role'],
+            {'eod-summarizer': ['000660', '005930']},
+        )
+        self.assertEqual(
+            summary['progress_summary']['completed_symbols_by_role'],
             {'eod-summarizer': ['000660', '005930']},
         )
         self.assertEqual(
