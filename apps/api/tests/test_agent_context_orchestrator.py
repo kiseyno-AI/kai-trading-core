@@ -1736,6 +1736,27 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
 
 
 class ResponseIntegrityGuardTests(unittest.TestCase):
+    def test_summarizer_omitted_improvement_notes_defaults_to_empty(self):
+        payload = {
+            'role': 'eod-summarizer',
+            'summary': '요약',
+            'confidence': 0.8,
+            'risk_flags': [],
+            'details': {},
+        }
+
+        normalized = orchestrator_module.normalize_agent_response(
+            role='eod-summarizer',
+            output_text=json.dumps(payload, ensure_ascii=False),
+            raw_response=payload,
+            market_date='2026-11-09',
+            symbol='005930',
+            agent_name='eod-summarizer',
+        )
+
+        self.assertTrue(normalized['response_contract_valid'])
+        self.assertEqual(normalized['improvement_notes'], [])
+
     def test_missing_batch_response_correlation_fails_closed(self):
         self.assertEqual(
             batch_response_contract_failure({'decoded': {'items': []}}),

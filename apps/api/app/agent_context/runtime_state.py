@@ -370,6 +370,13 @@ class RuntimeFeedbackRunState:
             'progress_ratio': progress_fields['progress_ratio'],
             'progress_percent': progress_fields['progress_percent'],
             'failed_items': failed_items,
+            'completed_symbols_by_role': {
+                role: sorted(
+                    self.completed_symbols_by_role.get(role, set())
+                    & role_scope_sets.get(role, set())
+                )
+                for role in self.requested_roles
+            },
             'failed_symbols_by_role': {
                 role: sorted(symbols)
                 for role, symbols in self.failed_symbols_by_role.items()

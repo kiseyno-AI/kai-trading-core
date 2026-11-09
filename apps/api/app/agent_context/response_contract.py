@@ -7,7 +7,11 @@ from datetime import date
 from typing import Any
 
 from app.agent_context.decision_delta import build_decision_delta
-from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.roles import (
+    SHORT_TERM_DECIDER_AGENT_NAME,
+    SIGNAL_DECIDER_AGENT_NAME,
+    SUMMARIZER_AGENT_NAMES,
+)
 from app.agent_context.wait_reason_taxonomy import (
     WAIT_REASON_ISSUE_GENERIC,
     WAIT_REASON_ISSUE_MISSING,
@@ -1681,6 +1685,8 @@ def normalize_agent_response(
             },
             'improvement_notes': ['Return structured JSON with explicit missing-data and improvement notes.'],
         }
+    elif role in SUMMARIZER_AGENT_NAMES and 'improvement_notes' not in parsed:
+        parsed['improvement_notes'] = []
 
     raw_reported_role = parsed.get('role')
     reported_role = (

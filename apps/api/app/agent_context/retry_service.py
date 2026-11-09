@@ -185,6 +185,9 @@ def _resolve_terminal_role_success_scopes(
     role_scopes = progress_summary.get('role_symbol_scopes')
     role_counts = progress_summary.get('role_symbol_counts')
     role_progress = progress_summary.get('role_progress')
+    completed_by_role = progress_summary.get(
+        'completed_symbols_by_role'
+    )
     failed_by_role = progress_summary.get('failed_symbols_by_role')
     if not (
         isinstance(role_scopes, Mapping)
@@ -233,6 +236,7 @@ def _resolve_terminal_role_success_scopes(
     total_items = 0
     completed_items = 0
     failed_items = 0
+    pending_items = 0
     normalized_failed_by_role: dict[str, list[str]] = {}
 
     for role in normalized_roles:
@@ -299,12 +303,35 @@ def _resolve_terminal_role_success_scopes(
         ):
             return base_result
         expected_role_status = (
-            'completed'
+            'incomplete'
+            if pending > 0 or in_progress > 0
+            else 'completed'
             if failed == 0
             else 'completed_with_failures'
             if completed > 0
             else 'failed'
         )
+        exact_completed_symbols = sorted(set(scope) - set(failed_symbols))
+        if pending > 0 or in_progress > 0:
+            raw_completed = (
+                completed_by_role.get(role)
+                if isinstance(completed_by_role, Mapping)
+                else None
+            )
+            if not isinstance(raw_completed, list):
+                return base_result
+            exact_completed_symbols = _normalize_optional_symbol_scope(
+                raw_completed
+            )
+            if not (
+                raw_completed == exact_completed_symbols
+                and len(exact_completed_symbols) == completed
+                and set(exact_completed_symbols).issubset(scope)
+                and not set(exact_completed_symbols).intersection(
+                    failed_symbols
+                )
+            ):
+                return base_result
         if not (
             str(role_state.get('role') or '').strip().lower() == role
             and str(role_state.get('status') or '').strip().lower()
@@ -315,24 +342,22 @@ def _resolve_terminal_role_success_scopes(
             == expected_role_status
             and total == len(scope)
             and persisted_role_count == total
-            and processed == total
-            and terminal == total
-            and completed + failed == total
+            and processed == completed + failed + in_progress
+            and terminal == completed + failed
+            and completed + failed + in_progress + pending == total
             and failed == len(failed_symbols)
             and in_progress == 0
-            and pending == 0
-            and retry_pending <= failed
+            and retry_pending <= failed + pending
         ):
             return base_result
 
         admitted_scopes.append(scope)
-        completed_symbols_by_role[role] = sorted(
-            set(scope) - set(failed_symbols)
-        )
+        completed_symbols_by_role[role] = exact_completed_symbols
         normalized_failed_by_role[role] = failed_symbols
         total_items += total
         completed_items += completed
         failed_items += failed
+        pending_items += pending
 
     expected_total = strict_nonnegative_int(
         progress_summary.get('expected_feedback_count')
@@ -347,7 +372,7 @@ def _resolve_terminal_role_success_scopes(
         expected_total == total_items
         and reported_completed == completed_items
         and reported_failed == failed_items
-        and completed_items + failed_items == total_items
+        and completed_items + failed_items + pending_items == total_items
     ):
         return base_result
 
@@ -371,6 +396,7 @@ def _resolve_terminal_role_success_scopes(
         'total_items': total_items,
         'completed_items': completed_items,
         'failed_items': failed_items,
+        'pending_items': pending_items,
     }
 
 
@@ -1604,8 +1630,14 @@ def resolve_latest_completed_summary_knowledge_cutoff(
             and terminal_scope.get('completed_items') == completed_count
             and terminal_scope.get('failed_items') == failed_count
             and completed_count > 0
-            and failed_count > 0
-            and completed_count + failed_count == symbols_total
+            and (
+                failed_count > 0
+                or terminal_scope.get('pending_items', 0) > 0
+            )
+            and completed_count
+            + failed_count
+            + terminal_scope.get('pending_items', 0)
+            == symbols_total
         ):
             return {**base_result, 'reason': 'summary_run_incomplete'}
         completed_scope = terminal_scope['completed_symbols']
