@@ -25,6 +25,10 @@ INHERITED_UPSTREAM_BEARER_TOKEN_SET="${UPSTREAM_BEARER_TOKEN+x}"
 INHERITED_UPSTREAM_BEARER_TOKEN="${UPSTREAM_BEARER_TOKEN-}"
 INHERITED_APP_DEBUG_SET="${APP_DEBUG+x}"
 INHERITED_APP_DEBUG="${APP_DEBUG-}"
+INHERITED_TIMESFM_ENABLED_SET="${TIMESFM_ENABLED+x}"
+INHERITED_TIMESFM_ENABLED="${TIMESFM_ENABLED-}"
+INHERITED_TIMESFM_PYTHON_SET="${TIMESFM_PYTHON_EXECUTABLE+x}"
+INHERITED_TIMESFM_PYTHON="${TIMESFM_PYTHON_EXECUTABLE-}"
 
 set -a
 source .env
@@ -41,8 +45,19 @@ if [ "$INHERITED_UPSTREAM_BEARER_TOKEN_SET" = "x" ]; then
   UPSTREAM_BEARER_TOKEN="$INHERITED_UPSTREAM_BEARER_TOKEN"
 fi
 if [ "$INHERITED_APP_DEBUG_SET" = "x" ]; then APP_DEBUG="$INHERITED_APP_DEBUG"; fi
+if [ "$INHERITED_TIMESFM_ENABLED_SET" = "x" ]; then TIMESFM_ENABLED="$INHERITED_TIMESFM_ENABLED"; fi
+if [ "$INHERITED_TIMESFM_PYTHON_SET" = "x" ]; then
+  TIMESFM_PYTHON_EXECUTABLE="$INHERITED_TIMESFM_PYTHON"
+fi
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+# Provisioned Apple Silicon workers join the daily process without duplicating their path in .env.
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && \
+   [ -x "$SCRIPT_DIR/var/timesfm-venv/bin/python" ]; then
+  export TIMESFM_ENABLED="${TIMESFM_ENABLED-true}"
+  export TIMESFM_PYTHON_EXECUTABLE="${TIMESFM_PYTHON_EXECUTABLE-$SCRIPT_DIR/var/timesfm-venv/bin/python}"
+fi
 
 if [ -n "${PYTHON_BIN:-}" ]; then
   : # Explicit operator override wins.

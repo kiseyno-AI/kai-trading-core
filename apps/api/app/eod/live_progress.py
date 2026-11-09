@@ -350,6 +350,8 @@ class DailyPipelineLiveProgress:
                 substeps = stage.setdefault('substeps', {})
                 now = _now().isoformat()
                 current = dict(substeps.get(step) or {})
+                if _status(status) in {'running', 'skipped'} and current.get('status') in TERMINAL_STATUSES:
+                    current = {}
                 current.setdefault('started_at', now)
                 current.update(
                     {

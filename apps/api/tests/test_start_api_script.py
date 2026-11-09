@@ -47,6 +47,8 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "app.internal.deploy_hygiene" ]; then
 fi
 
 if [ "${1:-}" = "-m" ] && [ "${2:-}" = "uvicorn" ]; then
+  printf 'UVICORN_TIMESFM_ENABLED=%s\\n' "${TIMESFM_ENABLED-<unset>}" >> "${FAKE_PYTHON_LOG:?}"
+  printf 'UVICORN_TIMESFM_PYTHON=%s\\n' "${TIMESFM_PYTHON_EXECUTABLE-<unset>}" >> "${FAKE_PYTHON_LOG:?}"
   printf 'UVICORN_DB_AUTO_UPGRADE=%s\\n' "${DB_AUTO_UPGRADE:-<unset>}" >> "${FAKE_PYTHON_LOG:?}"
   printf 'UVICORN_APP_DEBUG=%s\\n' "${APP_DEBUG:-<unset>}" >> "${FAKE_PYTHON_LOG:?}"
   exit 0
@@ -100,6 +102,11 @@ exit 1
         env_python_bin: Path | None = None,
         env_install_requirements: str | None = None,
         inherited_install_requirements: str | None = 'false',
+        env_timesfm_enabled: str | None = None,
+        env_timesfm_python: Path | None = None,
+        inherited_timesfm_enabled: str | None = None,
+        inherited_timesfm_python: Path | None = None,
+        uname: tuple[str, str] | None = None,
         expected_returncode: int = 0,
     ) -> list[str]:
         env_path = self.workdir / '.env'
@@ -112,6 +119,17 @@ exit 1
             env_lines.append(f'PYTHON_BIN={shlex.quote(str(env_python_bin))}')
         if env_install_requirements is not None:
             env_lines.append(f'INSTALL_REQUIREMENTS_ON_START={shlex.quote(env_install_requirements)}')
+        if env_timesfm_enabled is not None:
+            env_lines.append(f'TIMESFM_ENABLED={shlex.quote(env_timesfm_enabled)}')
+        if env_timesfm_python is not None:
+            env_lines.append(f'TIMESFM_PYTHON_EXECUTABLE={shlex.quote(str(env_timesfm_python))}')
+        if uname is not None:
+            env_lines.append(
+                'uname() { case "$1" in '
+                f'-s) printf "%s\\n" {shlex.quote(uname[0])} ;; '
+                f'-m) printf "%s\\n" {shlex.quote(uname[1])} ;; '
+                '*) return 1 ;; esac; }'
+            )
         env_path.write_text('\n'.join(env_lines) + '\n', encoding='utf-8')
 
         env = os.environ.copy()
@@ -124,6 +142,8 @@ exit 1
             'HOST',
             'UPSTREAM_BEARER_TOKEN',
             'VIRTUAL_ENV',
+            'TIMESFM_ENABLED',
+            'TIMESFM_PYTHON_EXECUTABLE',
         ):
             env.pop(key, None)
         if use_explicit_python:
@@ -139,6 +159,10 @@ exit 1
             env['INSTALL_REQUIREMENTS_ON_START'] = inherited_install_requirements
         if host is not None:
             env['HOST'] = host
+        if inherited_timesfm_enabled is not None:
+            env['TIMESFM_ENABLED'] = inherited_timesfm_enabled
+        if inherited_timesfm_python is not None:
+            env['TIMESFM_PYTHON_EXECUTABLE'] = str(inherited_timesfm_python)
         if preflight_json is not None:
             env['FAKE_PREFLIGHT_JSON'] = preflight_json
         env['FAKE_PREFLIGHT_JSON_EXIT_CODE'] = str(preflight_json_exit_code)
@@ -157,7 +181,96 @@ exit 1
         self.assertEqual(result.returncode, expected_returncode, msg=f'stdout={result.stdout}\nstderr={result.stderr}')
         if not self.log_path.exists():
             return []
-        return self.log_path.read_text(encoding='utf-8').splitlines()
+        log_lines = self.log_path.read_text(encoding='utf-8').splitlines()
+        self.assertNotIn('TIMESFM_WORKER_CALLED', log_lines)
+        return log_lines
+
+    def _provision_timesfm_worker(self) -> Path:
+        worker = self.workdir / 'var' / 'timesfm-venv' / 'bin' / 'python'
+        worker.parent.mkdir(parents=True)
+        worker.write_text(
+            '#!/bin/sh\nprintf "TIMESFM_WORKER_CALLED\\n" >> "$FAKE_PYTHON_LOG"\nexit 1\n',
+            encoding='utf-8',
+        )
+        worker.chmod(0o755)
+        return worker
+
+    def test_provisioned_native_timesfm_worker_is_enabled_automatically(self) -> None:
+        worker = self._provision_timesfm_worker()
+
+        log_lines = self._run_script(db_auto_upgrade='false', uname=('Darwin', 'arm64'))
+
+        self.assertIn('UVICORN_TIMESFM_ENABLED=true', log_lines)
+        self.assertIn(f'UVICORN_TIMESFM_PYTHON={worker}', log_lines)
+
+    def test_timesfm_explicit_false_disables_provisioned_worker(self) -> None:
+        self._provision_timesfm_worker()
+
+        log_lines = self._run_script(
+            db_auto_upgrade='false', uname=('Darwin', 'arm64'), env_timesfm_enabled='false',
+        )
+
+        self.assertIn('UVICORN_TIMESFM_ENABLED=false', log_lines)
+
+    def test_inherited_timesfm_settings_override_env_file(self) -> None:
+        self._provision_timesfm_worker()
+        custom_worker = self.workdir / 'custom-worker'
+
+        log_lines = self._run_script(
+            db_auto_upgrade='false', uname=('Darwin', 'arm64'),
+            env_timesfm_enabled='false', env_timesfm_python=self.workdir / 'env-worker',
+            inherited_timesfm_enabled='true', inherited_timesfm_python=custom_worker,
+        )
+
+        self.assertIn('UVICORN_TIMESFM_ENABLED=true', log_lines)
+        self.assertIn(f'UVICORN_TIMESFM_PYTHON={custom_worker}', log_lines)
+
+    def test_inherited_timesfm_false_overrides_enabled_env_file(self) -> None:
+        self._provision_timesfm_worker()
+
+        log_lines = self._run_script(
+            db_auto_upgrade='false', uname=('Darwin', 'arm64'),
+            env_timesfm_enabled='true', inherited_timesfm_enabled='false',
+        )
+
+        self.assertIn('UVICORN_TIMESFM_ENABLED=false', log_lines)
+
+    def test_enabled_timesfm_uses_provisioned_worker_when_path_is_unset(self) -> None:
+        worker = self._provision_timesfm_worker()
+
+        log_lines = self._run_script(
+            db_auto_upgrade='false', uname=('Darwin', 'arm64'), env_timesfm_enabled='true',
+        )
+
+        self.assertIn('UVICORN_TIMESFM_ENABLED=true', log_lines)
+        self.assertIn(f'UVICORN_TIMESFM_PYTHON={worker}', log_lines)
+
+    def test_env_timesfm_worker_path_is_preserved(self) -> None:
+        self._provision_timesfm_worker()
+        custom_worker = self.workdir / 'custom-worker'
+
+        log_lines = self._run_script(
+            db_auto_upgrade='false', uname=('Darwin', 'arm64'),
+            env_timesfm_enabled='true', env_timesfm_python=custom_worker,
+        )
+
+        self.assertIn(f'UVICORN_TIMESFM_PYTHON={custom_worker}', log_lines)
+
+    def test_timesfm_stays_unset_without_provisioned_worker(self) -> None:
+        log_lines = self._run_script(db_auto_upgrade='false', uname=('Darwin', 'arm64'))
+
+        self.assertIn('UVICORN_TIMESFM_ENABLED=<unset>', log_lines)
+        self.assertIn('UVICORN_TIMESFM_PYTHON=<unset>', log_lines)
+
+    def test_timesfm_stays_unset_on_unsupported_platforms(self) -> None:
+        self._provision_timesfm_worker()
+        for uname in [('Linux', 'arm64'), ('Linux', 'x86_64'), ('Darwin', 'x86_64')]:
+            with self.subTest(uname=uname):
+                log_lines = self._run_script(db_auto_upgrade='false', uname=uname)
+
+                self.assertIn('UVICORN_TIMESFM_ENABLED=<unset>', log_lines)
+                self.assertIn('UVICORN_TIMESFM_PYTHON=<unset>', log_lines)
+                self.log_path.unlink()
 
     def test_active_virtualenv_python_is_used_without_an_explicit_override(self) -> None:
         virtual_env = self.workdir / 'active-venv'

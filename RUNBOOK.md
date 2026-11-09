@@ -280,13 +280,23 @@ If schema parity is not clean, write a corrective migration instead of dropping 
 ## Optional TimesFM 3.0 decision evidence
 
 See [TimesFM 3.0 setup, preview, and latency measurement](docs/TIMESFM3_INTEGRATION.md).
-The feature defaults off. Provision the native Apple Silicon worker and pinned
-checkpoint, preview a finalized KRX symbol from stored prices, then enable
-`TIMESFM_ENABLED` for the two final deciders. No database migration is required.
+Provision the native Apple Silicon worker and pinned checkpoint, then preview a
+finalized KRX symbol from stored prices. On Darwin/arm64, `start-api.sh`
+automatically enables an executable `var/timesfm-venv/bin/python` and supplies its
+absolute path when the corresponding TimesFM settings are unset. Explicit
+`TIMESFM_ENABLED=false` disables it; explicit process-environment values override
+`.env`. Direct Python/CLI runs retain the disabled setting default and need the
+explicit environment settings documented in the setup guide. No database
+migration is required.
 Model loading happens once per uncached batch; the official inference benchmark
 does not describe the full Core request time. The existing request snapshots keep
 `forecast_evidence.timesfm3` and its source/evidence hashes. Missing forecasts are
 optional, and generic context GETs never invoke MLX.
+Both automatic and manual/recovery daily runs perform this work inside the
+`signal_decider` stage after summary/reuse/price checks and before final decider
+dispatch. Inspect `substeps.timesfm_forecast` through `GET /eod/pipeline/live` for
+the latest role/batch's availability counts, reasons, original cutoff, and current
+elapsed time. These are forecast diagnostics, not parent-stage success counts.
 
 ## External-news point-in-time integrity
 

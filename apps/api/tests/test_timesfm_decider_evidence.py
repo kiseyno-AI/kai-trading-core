@@ -12,6 +12,7 @@ from app.agent_context.orchestrator_helpers import (
     compressed_batch_item_for_prompt,
     trim_batch_item_for_prompt,
 )
+from app.eod.live_progress import DailyPipelineLiveProgress
 from app.forecast_context.service import unavailable_evidence
 
 
@@ -61,11 +62,33 @@ def forecast(symbol='005930'):
 
 
 class TimesFMDeciderEvidenceTests(unittest.TestCase):
-    def prepare(self, role, *, items=None, evidence=None, reuse=None, error=None, missing_roles=None):
+    def setUp(self):
+        self.live = DailyPipelineLiveProgress(write_files=False)
+        live_patch = patch.object(orchestrator_module, 'daily_pipeline_live_progress', self.live)
+        live_patch.start()
+        self.addCleanup(live_patch.stop)
+
+    def start_daily_stage(self):
+        self.live.publish_stage({
+            'pipeline_run_id': 1,
+            'market_date': MARKET_DATE.isoformat(),
+            'stage_id': 'signal_decider',
+            'status': 'running',
+            'processed': 1,
+            'total': 4,
+            'succeeded': 1,
+            'failed': 0,
+        })
+
+    def prepare(
+        self, role, *, items=None, evidence=None, reuse=None, build_effect=None,
+        missing_roles=None, enabled=True,
+    ):
         service = AgentFeedbackOrchestrator()
         items = items or [source_item()]
         failures = []
         with (
+            patch.object(orchestrator_module.settings, 'timesfm_enabled', enabled),
             patch.object(service, '_build_decider_policy_context', return_value={}),
             patch.object(service, '_build_upstream_feedback_bundle', return_value=({}, {}, missing_roles or [])),
             patch.object(orchestrator_module.runtime_feedback_state_store, 'get_run', return_value=None),
@@ -74,7 +97,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
                 orchestrator_module.timesfm_forecast_service,
                 'build_for_symbols',
                 return_value=evidence or {},
-                side_effect=error,
+                side_effect=build_effect,
             ) as build,
         ):
             result = service._prepare_role_dispatch_items(
@@ -107,6 +130,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
                     role, items=[original], evidence={'005930': forecast()}
                 )
                 self.assertFalse(failures)
+                self.assertFalse(self.live.snapshot()['active'])
                 build.assert_called_once_with(
                     market_date=MARKET_DATE,
                     symbols=['005930'],
@@ -132,6 +156,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
                     self.assertIn('Unavailable forecasts are neutral', guidance['missing_evidence_policy'])
 
     def test_forecast_batch_excludes_reused_and_stale_price_symbols(self):
+        self.start_daily_stage()
         stale = source_item('051910')
         stale['price_context']['trade_date'] = '2026-11-06'
         items = [source_item(), source_item('000660'), source_item('035420'), stale]
@@ -145,6 +170,8 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
         self.assertEqual(build.call_count, 1)
         self.assertEqual([item['symbol'] for item in payloads], ['005930', '000660'])
         self.assertEqual([item['symbol'] for item in failures], ['051910'])
+        stage = self.live.snapshot()['active_run']['stages'][0]
+        self.assertEqual(stage['substeps']['timesfm_forecast']['detail']['symbol_count'], 2)
 
     def test_summarizer_does_not_call_forecasting(self):
         payloads, build, failures = self.prepare('technical-summarizer')
@@ -153,6 +180,7 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
         self.assertNotIn('forecast_evidence', payloads[0])
 
     def test_missing_upstream_summaries_do_not_run_forecasting(self):
+        self.start_daily_stage()
         for role in DECIDERS:
             with self.subTest(role=role):
                 payloads, build, failures = self.prepare(
@@ -161,6 +189,8 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
                 self.assertEqual(payloads, [])
                 self.assertEqual([item['symbol'] for item in failures], ['005930'])
                 build.assert_not_called()
+                stage = self.live.snapshot()['active_run']['stages'][0]
+                self.assertNotIn('timesfm_forecast', stage.get('substeps', {}))
 
     def test_forecast_anchor_mismatch_is_unavailable_without_affecting_other_symbols(self):
         for mismatch in ({'anchor_close': 99}, {'input_end_date': '2026-11-06'}):
@@ -182,13 +212,98 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
     def test_disabled_and_failed_forecasting_preserve_decider_dispatch(self):
         for role in DECIDERS:
             with self.subTest(role=role):
-                payloads, _, failures = self.prepare(role)
+                payloads, _, failures = self.prepare(role, enabled=False)
                 self.assertFalse(failures)
                 self.assertNotIn('forecast_evidence', payloads[0])
                 self.assertNotIn('forecast_evidence_guidance', payloads[0]['decision_support_constraints'])
-                payloads, _, failures = self.prepare(role, error=RuntimeError('unavailable model'))
+                payloads, _, failures = self.prepare(role, build_effect=RuntimeError('unavailable model'))
                 self.assertFalse(failures)
                 self.assertEqual(payloads[0]['forecast_evidence']['timesfm3']['status'], 'unavailable')
+
+    def test_forecast_progress_reports_each_role_batch_before_dispatch(self):
+        self.start_daily_stage()
+        cached_forecast = {**forecast(), 'timing': {'worker_batch_ms': 99999.0}}
+        for role in DECIDERS:
+            with self.subTest(role=role):
+                def build_forecast(**kwargs):
+                    stage = self.live.snapshot()['active_run']['stages'][0]
+                    substep = stage['substeps']['timesfm_forecast']
+                    self.assertEqual(substep['status'], 'running')
+                    self.assertEqual(substep['result_status'], 'running')
+                    self.assertEqual(substep['detail']['role'], role)
+                    self.assertNotIn('available_count', substep['detail'])
+                    self.assertEqual(kwargs['knowledge_cutoff_at'], CUTOFF)
+                    return {'005930': cached_forecast}
+
+                with patch.object(orchestrator_module.time, 'perf_counter', side_effect=[10, 10.125]):
+                    payloads, build, failures = self.prepare(role, build_effect=build_forecast)
+
+                self.assertFalse(failures)
+                build.assert_called_once()
+                self.assertEqual(payloads[0]['forecast_evidence']['timesfm3'], cached_forecast)
+                stage = self.live.snapshot()['active_run']['stages'][0]
+                substep = stage['substeps']['timesfm_forecast']
+                self.assertEqual(substep['status'], 'completed')
+                self.assertEqual(substep['result_status'], 'available')
+                self.assertEqual(substep['detail'], {
+                    'scope': 'current_role_batch',
+                    'role': role,
+                    'request_run_id': 'timesfm-integration-test',
+                    'symbol_count': 1,
+                    'knowledge_cutoff_at': CUTOFF,
+                    'optional_context': True,
+                    'available_count': 1,
+                    'unavailable_count': 0,
+                    'unavailable_reasons': {},
+                    'elapsed_ms': 125.0,
+                })
+                self.assertEqual(
+                    {key: stage[key] for key in ('status', 'processed', 'total', 'succeeded', 'failed')},
+                    {'status': 'running', 'processed': 1, 'total': 4, 'succeeded': 1, 'failed': 0},
+                )
+
+    def test_disabled_forecast_substep_is_skipped(self):
+        self.start_daily_stage()
+
+        payloads, _, failures = self.prepare('signal-decider', enabled=False)
+
+        self.assertFalse(failures)
+        self.assertNotIn('forecast_evidence', payloads[0])
+        stage = self.live.snapshot()['active_run']['stages'][0]
+        substep = stage['substeps']['timesfm_forecast']
+        self.assertEqual(substep['status'], 'skipped')
+        self.assertEqual(substep['result_status'], 'disabled')
+        self.assertEqual(substep['detail']['available_count'], 0)
+        self.assertEqual(substep['detail']['unavailable_count'], 0)
+        self.assertEqual(stage['status'], 'running')
+        events = [event for event in self.live.events_since(0)['events'] if event['kind'] == 'substep']
+        self.assertEqual([event['status'] for event in events], ['skipped'])
+
+    def test_forecast_progress_uses_final_anchor_validation_and_optional_failure(self):
+        self.start_daily_stage()
+        for evidence, build_effect, expected_status, available, reasons in [
+            ({'005930': {**forecast(), 'anchor_close': 99}, '000660': forecast('000660')},
+             None, 'partial', 1, {'forecast_anchor_mismatch': 1}),
+            ({}, RuntimeError('unavailable model'), 'unavailable', 0, {'forecast_service_failed': 2}),
+        ]:
+            with self.subTest(expected_status=expected_status):
+                payloads, _, failures = self.prepare(
+                    'signal-decider', items=[source_item(), source_item('000660')],
+                    evidence=evidence, build_effect=build_effect,
+                )
+
+                self.assertFalse(failures)
+                self.assertEqual(len(payloads), 2)
+                stage = self.live.snapshot()['active_run']['stages'][0]
+                substep = stage['substeps']['timesfm_forecast']
+                self.assertEqual(substep['status'], 'completed')
+                self.assertEqual(substep['result_status'], expected_status)
+                self.assertEqual(substep['detail']['symbol_count'], 2)
+                self.assertEqual(substep['detail']['available_count'], available)
+                self.assertEqual(substep['detail']['unavailable_count'], 2 - available)
+                self.assertEqual(substep['detail']['unavailable_reasons'], reasons)
+                self.assertEqual(stage['status'], 'running')
+                self.assertEqual(stage['failed'], 0)
 
     def test_validation_is_independent_for_each_decider_lane(self):
         source_items = [
