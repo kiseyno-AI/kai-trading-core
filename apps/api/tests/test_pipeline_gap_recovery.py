@@ -47,6 +47,7 @@ from app.eod.pykrx_pipeline_runner import (
     AUTO_DAILY_TRACKED_STAGE_ORDER,
     FACTOR_FOLLOWUP_STAGE_ORDER,
     _build_daily_fundamentals_refresh_kwargs,
+    _extract_result_counts,
     _resolve_auto_daily_tracked_stages,
     _required_provider_blocked_result,
     _run_daily_factor_followup,
@@ -2774,6 +2775,7 @@ def test_optional_intraday_partial_is_terminal_degraded_without_hiding_evidence(
             'triggered': True,
             'status': 'partial',
             'reason': 'per_symbol_failures',
+            'requested_symbols': ['000001', '000002'],
             'snapshots_persisted': 1,
             'snapshots_failed': 1,
             'failed_symbols': ['000002'],
@@ -2789,6 +2791,9 @@ def test_optional_intraday_partial_is_terminal_degraded_without_hiding_evidence(
     assert result['market_date'] == '2026-10-30'
     assert result['collection_status'] == 'partial'
     assert result['collection']['failed_symbols'] == ['000002']
+    assert _extract_result_counts(
+        result, default_total=2769, stage_id='intraday_snapshots',
+    ) == {'processed': 2, 'total': 2, 'succeeded': 1, 'failed': 1}
     outcome = DailyPipelineStageService()._build_stage_outcome(
         'intraday_snapshots',
         result,

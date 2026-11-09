@@ -2016,6 +2016,19 @@ class AgentJsonStructureRepairTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             repair_agent_json_structure(text, mismatched_closer='guess')
 
+    def test_removes_one_redundant_closer_before_the_expected_closer(self):
+        text = json.dumps(self._batch(), ensure_ascii=False)
+        for broken in (
+            text.replace('"risk_flags": ["a"]', '"risk_flags": ["a"}]', 1),
+            text[:-4] + '}}}]}',
+        ):
+            with self.subTest(broken=broken):
+                with self.assertRaises(json.JSONDecodeError):
+                    json.loads(broken)
+                decoded, failure, repair = decode_agent_json_object_with_structure_repair(broken)
+                self.assertEqual((decoded, failure), (self._batch(), None))
+                self.assertEqual(repair['removed_redundant_closers'], 1)
+
     def test_valid_and_duplicate_key_inputs_are_left_to_the_strict_decoder(self):
         text = json.dumps(self._batch(), ensure_ascii=False)
         self.assertEqual(decode_agent_json_object_with_structure_repair(text), (self._batch(), None, None))

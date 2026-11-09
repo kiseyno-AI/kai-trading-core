@@ -265,6 +265,17 @@ def decode_agent_json_object_with_structure_repair(
         repaired_decoded, repaired_failure = decode_strict_agent_json_object(repaired_text)
         if repaired_decoded is not None:
             return repaired_decoded, repaired_failure, repair_info
+    # A stray closer before the real one can make both nesting repairs fail.
+    # Try deleting only the exact delimiter rejected by the JSON parser.
+    text = str(candidate_text or '').strip()
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        if text[exc.pos:exc.pos + 1] in ('}', ']') and text[exc.pos + 1:].lstrip().startswith(('}', ']')):
+            repaired = text[:exc.pos] + text[exc.pos + 1:]
+            repaired_decoded, _ = decode_strict_agent_json_object(repaired)
+            if repaired_decoded is not None:
+                return repaired_decoded, None, {'applied': True, 'removed_redundant_closers': 1}
     return None, failure_class, None
 
 
