@@ -22,6 +22,15 @@ def price_bars(count=128):
     ]
 
 
+def reported_price_bars():
+    # Explicit closures keep this regression independent of the calendar's holiday omissions.
+    return [
+        row for row in price_bars(512)
+        if row['trade_date'] >= '2025-08-01'
+        and row['trade_date'] not in {'2026-06-03', '2026-07-17'}
+    ]
+
+
 def worker_response(request):
     return {
         'model_id': service.MODEL_ID, 'model_revision': service.MODEL_REVISION,
@@ -78,6 +87,63 @@ def test_sorted_price_window_quantiles_percent_units_and_cache(configured):
     assert build(instance)['005930'] == evidence
     worker.assert_called_once()
     assert len(worker.call_args.args[0]['series'][0]['values']) == 128
+
+
+@pytest.mark.parametrize('context_length,points,start_date', [
+    (512, 308, '2025-08-01'),
+    (128, 128, '2026-04-29'),
+])
+def test_confirmed_holidays_do_not_create_price_gaps(
+    configured, monkeypatch, context_length, points, start_date,
+):
+    instance, histories, _, worker = configured
+    monkeypatch.setattr(settings, 'timesfm_context_length', context_length)
+    histories['005930'] = reported_price_bars()
+    assert len(histories['005930']) == 308
+
+    evidence = build(instance)
+
+    assert evidence['005930']['status'] == 'available'
+    assert evidence['005930']['context_points'] == points
+    assert evidence['005930']['input_start_date'] == start_date
+    assert evidence['005930']['calendar_source'] == 'exchange_calendars:XKRX+core_2026_closures_v1'
+    assert build(instance) == evidence
+    assert instance.validate_evidence(
+        market_date=MARKET_DATE, evidence_by_symbol=evidence, knowledge_cutoff_at=CUTOFF,
+    ) == {}
+    worker.assert_called_once()
+
+
+@pytest.mark.parametrize('missing_date', ['2026-06-04', '2026-07-20'])
+def test_genuine_price_gap_beside_confirmed_holiday_is_rejected(configured, missing_date):
+    instance, histories, _, worker = configured
+    histories['005930'] = [row for row in reported_price_bars() if row['trade_date'] != missing_date]
+
+    assert build(instance)['005930']['reason'] == 'missing_or_non_session_price_bars'
+    worker.assert_not_called()
+
+
+@pytest.mark.parametrize('holiday', ['2026-06-03', '2026-07-17'])
+def test_price_bar_on_confirmed_holiday_is_rejected(configured, holiday):
+    instance, histories, _, worker = configured
+    histories['005930'] = reported_price_bars()
+    histories['005930'].append({**histories['005930'][0], 'trade_date': holiday})
+
+    assert build(instance)['005930']['reason'] == 'missing_or_non_session_price_bars'
+    worker.assert_not_called()
+
+
+@pytest.mark.parametrize('holiday', [date(2026, 6, 3), date(2026, 7, 17)])
+def test_confirmed_holiday_cannot_be_forecast_market_date(configured, holiday):
+    instance, _, loader, worker = configured
+
+    evidence = instance.build_for_symbols(
+        market_date=holiday, symbols=['005930'], knowledge_cutoff_at=CUTOFF,
+    )
+
+    assert evidence['005930']['reason'] == 'not_a_krx_session'
+    loader.assert_not_called()
+    worker.assert_not_called()
 
 
 @pytest.mark.parametrize('mutation,reason', [
