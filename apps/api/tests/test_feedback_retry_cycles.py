@@ -5867,45 +5867,53 @@ class FeedbackRetryCycleTests(unittest.TestCase):
                 return ({}, {})
             return ({role: {'005930'}}, {})
 
-        with (
-            patch.object(
-                service,
-                '_load_same_day_terminal_symbols',
-                side_effect=load_terminal_symbols,
-            ),
-            patch(
-                'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
-                return_value={
-                    '005930': {
-                        role: _decision(
-                            should_dispatch=True,
-                            latest_feedback_received_at='2026-04-16T05:00:00+00:00',
-                            reason='source_updated',
-                        )
-                    }
-                },
-            ),
-        ):
-            snapshot = service._build_role_sequence_snapshot(
-                market_date=date.fromisoformat('2026-04-16'),
-                roles=(role,),
-                eligible_symbols=('005930',),
-                reuse_existing=True,
-                parent_run_id='feedback-parent-stale',
-                parent_started_at=datetime(
-                    2026,
-                    4,
-                    16,
-                    6,
-                    0,
-                    tzinfo=timezone.utc,
+        for reason in ('source_updated', 'forecast_evidence_invalid:forecast_source_changed'):
+            with (
+                self.subTest(reason=reason),
+                patch.object(
+                    service,
+                    '_load_same_day_terminal_symbols',
+                    side_effect=load_terminal_symbols,
                 ),
-            )
+                patch.object(
+                    service,
+                    '_load_reuse_lineage_context',
+                    return_value=({}, {}, {}, {}),
+                ),
+                patch(
+                    'app.agent_context.retry_service.agent_context_reuse_service.build_latest_decisions',
+                    return_value={
+                        '005930': {
+                            role: _decision(
+                                should_dispatch=True,
+                                latest_feedback_received_at='2026-04-16T05:00:00+00:00',
+                                reason=reason,
+                            )
+                        }
+                    },
+                ),
+            ):
+                snapshot = service._build_role_sequence_snapshot(
+                    market_date=date.fromisoformat('2026-04-16'),
+                    roles=(role,),
+                    eligible_symbols=('005930',),
+                    reuse_existing=True,
+                    parent_run_id='feedback-parent-stale',
+                    parent_started_at=datetime(
+                        2026,
+                        4,
+                        16,
+                        6,
+                        0,
+                        tzinfo=timezone.utc,
+                    ),
+                )
 
-        role_state = snapshot.role_states[role]
-        self.assertEqual(role_state.completed_symbols, ())
-        self.assertEqual(role_state.reused_symbols, ())
-        self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+                role_state = snapshot.role_states[role]
+                self.assertEqual(role_state.completed_symbols, ())
+                self.assertEqual(role_state.reused_symbols, ())
+                self.assertEqual(role_state.boundary_pending_symbols, ('005930',))
+                self.assertEqual(role_state.stale_symbols, ('005930',))
 
     def test_role_snapshot_rejects_reuse_from_parent_older_than_latest_authority(self):
         service = AgentFeedbackRetryService()

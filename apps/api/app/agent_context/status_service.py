@@ -11,7 +11,7 @@ from app.agent_context.prerequisite_service import agent_feedback_prerequisite_s
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.run_state_service import agent_context_feedback_run_state_service
-from app.agent_context.reuse_service import FUNDAMENTAL_REUSE_STALE_REASONS, agent_context_reuse_service
+from app.agent_context.reuse_service import agent_context_reuse_service, is_stale_dispatch_reason
 from app.db import session_scope
 from app.db_models import AgentContextFeedback, AgentContextFeedbackFailure
 
@@ -206,7 +206,7 @@ class AgentContextStatusService:
                 for agent_name, decision in reuse_decisions.get(symbol, {}).items()
                 if agent_name not in agent_map
                 and decision.should_dispatch
-                and str(decision.reason or '') in FUNDAMENTAL_REUSE_STALE_REASONS
+                and is_stale_dispatch_reason(decision.reason)
             }
             stale_agents = sorted(stale_agent_map.keys())
             completed_agents = sorted(set(computed_agents) | set(reused_agents))

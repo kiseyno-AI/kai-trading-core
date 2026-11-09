@@ -42,6 +42,8 @@ from app.agent_context.eligibility import (
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
 from app.agent_context.feedback_failure_taxonomy import FeedbackFailureKind, classify_feedback_failure
 from app.agent_context.orchestrator_helpers import (
+    attach_timesfm_forecast_evidence,
+    validate_timesfm_forecast_evidence,
     build_completed_dispatch_item as _build_completed_dispatch_item,
     build_failed_dispatch_item as _build_failed_dispatch_item,
     build_response_storage_payload as _build_response_storage_payload,
@@ -151,6 +153,7 @@ from app.core.settings import settings
 from app.db import session_scope, session_timeout_budget
 from app.db_models import AgentContextFeedback, EODCollectionRun
 from app.external_news.store import list_external_news_items
+from app.forecast_context.service import timesfm_forecast_service, unavailable_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -3852,12 +3855,26 @@ class AgentFeedbackOrchestrator:
             except Exception as exc:  # noqa: BLE001
                 current_decision_lookup_error = type(exc).__name__
 
+        forecast_validation_failures = validate_timesfm_forecast_evidence(
+            market_date=market_date,
+            source_items=source_items,
+            knowledge_cutoff_at=source_knowledge_cutoff_at,
+        )
         for source_item in source_items:
             symbol = str(source_item.get('symbol') or '').strip().upper()
             decision_role = str(
                 source_item.get('role') or source_item.get('agent_name') or ''
             ).strip()
             reasons: list[dict[str, Any]] = []
+            forecast_failure = forecast_validation_failures.get((decision_role, symbol))
+            if forecast_failure is not None:
+                reasons.append(
+                    {
+                        'code': 'forecast_evidence_invalid',
+                        'model': 'timesfm3',
+                        'reason': forecast_failure,
+                    }
+                )
             if symbol not in refreshed_eligible_set:
                 record = (
                     refreshed_eligibility.get('records_by_symbol', {}).get(
@@ -4957,7 +4974,6 @@ class AgentFeedbackOrchestrator:
                     expected_weekly_policy_binding
                 ),
             )
-
         dispatch_items: list[dict[str, Any]] = []
         for item in symbol_context_items:
             symbol = str(item.get('symbol') or '')
@@ -5196,6 +5212,56 @@ class AgentFeedbackOrchestrator:
                 'market_context_authority': 'next_open_live_market_gate',
             }
             dispatch_items.append(payload)
+        if role not in DECISION_SUPPORT_AGENT_NAMES or not dispatch_items:
+            return dispatch_items
+        forecast_symbols = list(dict.fromkeys(
+            str(item.get('symbol') or '').strip().upper() for item in dispatch_items
+        ))
+        forecast_symbols = [symbol for symbol in forecast_symbols if symbol]
+        if not forecast_symbols:
+            return dispatch_items
+        try:
+            forecast_by_symbol = timesfm_forecast_service.build_for_symbols(
+                market_date=market_date,
+                symbols=forecast_symbols,
+                knowledge_cutoff_at=source_knowledge_cutoff_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                'TimesFM forecast evidence unavailable',
+                extra={'error_type': type(exc).__name__},
+            )
+            forecast_by_symbol = {
+                symbol: unavailable_evidence(
+                    symbol=symbol,
+                    market_date=market_date,
+                    reason='forecast_service_failed',
+                )
+                for symbol in forecast_symbols
+            }
+        for index, payload in enumerate(dispatch_items):
+            symbol = str(payload.get('symbol') or '').strip().upper()
+            forecast_evidence = forecast_by_symbol.get(symbol)
+            if not isinstance(forecast_evidence, dict):
+                continue
+            if forecast_evidence.get('status') == 'available':
+                price_context = payload['symbol_day_context'].get('price_context') or {}
+                price_date = price_context.get('trade_date')
+                if isinstance(price_date, date):
+                    price_date = price_date.isoformat()
+                try:
+                    anchor_matches = float(forecast_evidence.get('anchor_close')) == float(
+                        price_context.get('close_price')
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    anchor_matches = False
+                if not anchor_matches or forecast_evidence.get('input_end_date') != price_date:
+                    forecast_evidence = unavailable_evidence(
+                        symbol=symbol,
+                        market_date=market_date,
+                        reason='forecast_anchor_mismatch',
+                    )
+            dispatch_items[index] = attach_timesfm_forecast_evidence(payload, forecast_evidence)
         return dispatch_items
 
     def _attach_signal_decider_performance_criteria(

@@ -157,6 +157,44 @@ class AgentContextProgressServiceTests(unittest.TestCase):
         prerequisite_patcher.start()
         self.addCleanup(prerequisite_patcher.stop)
 
+    def test_persisted_progress_counts_invalid_forecast_as_stale(self):
+        fake_session = FakeProgressSession()
+        fake_session.feedback_rows = []
+        fake_session.failure_rows = []
+        roles = ('signal-decider', 'short-term-decider')
+        decisions = {
+            role: _reuse_decision(
+                symbol='005930', agent_name=role, should_dispatch=True,
+                reason=reason,
+            )
+            for role, reason in (
+                ('signal-decider', 'forecast_evidence_invalid:forecast_source_changed'),
+                ('short-term-decider', 'no_feedback'),
+            )
+        }
+
+        @contextmanager
+        def fake_session_scope():
+            yield fake_session
+
+        with (
+            patch('app.agent_context.progress_service.session_scope', fake_session_scope),
+            patch(
+                'app.agent_context.progress_service.agent_context_reuse_service.build_latest_decisions',
+                return_value={'005930': decisions},
+            ),
+        ):
+            result = AgentContextProgressService()._build_persisted_progress(
+                market_date=date(2026, 4, 14), symbols=['005930'], expected_agents=roles,
+            )
+
+        summary = result['summary']
+        self.assertEqual(summary['stale_feedback_count'], 1)
+        self.assertEqual(summary['role_progress']['signal-decider']['stale_symbols'], 1)
+        self.assertEqual(summary['role_progress']['short-term-decider']['stale_symbols'], 0)
+        self.assertEqual(summary['completed_feedback_count'], 0)
+        self.assertEqual(summary['reused_feedback_count'], 0)
+
     def test_feedback_progress_uses_durable_run_snapshot_when_runtime_state_missing(self):
         fake_session = FakeProgressSession()
         run_snapshot = {

@@ -277,6 +277,17 @@ If the preflight flags likely drift, or `alembic upgrade head` fails with `Dupli
 
 If schema parity is not clean, write a corrective migration instead of dropping tables in place.
 
+## Optional TimesFM 3.0 decision evidence
+
+See [TimesFM 3.0 setup, preview, and latency measurement](docs/TIMESFM3_INTEGRATION.md).
+The feature defaults off. Provision the native Apple Silicon worker and pinned
+checkpoint, preview a finalized KRX symbol from stored prices, then enable
+`TIMESFM_ENABLED` for the two final deciders. No database migration is required.
+Model loading happens once per uncached batch; the official inference benchmark
+does not describe the full Core request time. The existing request snapshots keep
+`forecast_evidence.timesfm3` and its source/evidence hashes. Missing forecasts are
+optional, and generic context GETs never invoke MLX.
+
 ## External-news point-in-time integrity
 
 - Apply migrations through `20260906_0079` with `python3.11 -m alembic upgrade head` before collecting or reading external news. Revision `0078` adds article-to-symbol associations; `0079` adds append-only classifier versions.

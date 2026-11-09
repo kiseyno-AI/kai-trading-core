@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
@@ -10,7 +10,10 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import String, column, func, lateral, or_, select, true, values
 
 from app.agent_context.feedback_service import _normalize_market_date, _normalize_symbols
-from app.agent_context.orchestrator_helpers import trim_batch_item_for_prompt
+from app.agent_context.orchestrator_helpers import (
+    trim_batch_item_for_prompt,
+    validate_timesfm_forecast_evidence,
+)
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     DEFAULT_AGENT_NAMES,
@@ -313,8 +316,12 @@ def _fingerprint_value(payload: dict[str, Any] | None) -> str | None:
     return value or None
 
 
-def _is_stale_dispatch_reason(reason: str | None) -> bool:
-    return str(reason or '') in FUNDAMENTAL_REUSE_STALE_REASONS
+def is_stale_dispatch_reason(reason: str | None) -> bool:
+    normalized = str(reason or '')
+    return (
+        normalized in FUNDAMENTAL_REUSE_STALE_REASONS
+        or normalized.startswith('forecast_evidence_invalid:')
+    )
 
 
 def _normalized_evidence_datetime(value: Any) -> datetime:
@@ -1227,6 +1234,44 @@ class AgentContextReuseService:
                             else None
                         ),
                     )
+
+        # Forecast histories can change without a new upstream summary receipt.
+        # Validate their saved inputs after releasing the feedback read session.
+        forecast_items_by_cutoff: dict[str | None, list[dict[str, Any]]] = {}
+        for symbol, role_decisions in decisions.items():
+            for role, decision in role_decisions.items():
+                if role not in DECISION_SUPPORT_AGENT_NAMES or decision.should_dispatch:
+                    continue
+                feedback = decision.latest_feedback or {}
+                context = feedback.get('context_payload')
+                if not isinstance(context, dict) or not (
+                    'forecast_evidence' in context
+                    or 'forecast_evidence_generation' in context
+                ):
+                    continue
+                cutoff = normalized_knowledge_cutoff_at
+                if cutoff is None:
+                    # Inspection may omit an expected cutoff; preserve the
+                    # approved boundary of the feedback's originating run.
+                    cutoff = run_knowledge_cutoff_by_id.get(
+                        str(feedback.get('run_id') or '').strip()
+                    )
+                cutoff_key = cutoff.isoformat() if cutoff is not None else None
+                forecast_items_by_cutoff.setdefault(cutoff_key, []).append(
+                    {**context, 'role': role, 'symbol': symbol}
+                )
+        for cutoff, source_items in forecast_items_by_cutoff.items():
+            failures = validate_timesfm_forecast_evidence(
+                market_date=normalized_market_date,
+                source_items=source_items,
+                knowledge_cutoff_at=cutoff,
+            )
+            for (role, symbol), reason in failures.items():
+                decisions[symbol][role] = replace(
+                    decisions[symbol][role],
+                    should_dispatch=True,
+                    reason=f'forecast_evidence_invalid:{reason}',
+                )
         return decisions
 
     def _load_latest_feedback_state(
@@ -1812,7 +1857,7 @@ class AgentContextReuseService:
                         'stored_input_fingerprint': decision.stored_input_fingerprint,
                         'reuse_policy_version': decision.reuse_policy_version,
                         'reuse_source': decision.reuse_source,
-                        'stale': _is_stale_dispatch_reason(decision.reason),
+                        'stale': is_stale_dispatch_reason(decision.reason),
                         'latest_feedback': decision.latest_feedback,
                     }
                 )

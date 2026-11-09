@@ -3,6 +3,17 @@
 ## Summary
 Dispatches symbol-level summarizer feedback collection with optional freshness-aware reuse.
 
+When `TIMESFM_ENABLED=true`, final `short-term-decider` and `signal-decider`
+requests include `forecast_evidence.timesfm3` prepared from finalized KRX stored
+closes. It is auxiliary evidence with explicit availability, median/quantile
+semantics, and input/evidence hashes; it is saved in the existing request snapshot.
+Missing forecasts do not block dispatch. Existing available evidence that fails
+source or integrity revalidation follows the existing changed-input fence. This
+adds no request parameter or new endpoint. Setup and measurement are documented
+in `docs/TIMESFM3_INTEGRATION.md`; the flag does not retroactively recompute reused
+decisions. Historical cutoffs must be respected, even when they make final EOD
+forecasts unavailable.
+
 Core dispatches requested symbols through the strategy-aware prefilter scoring rule. `daily_market_risk_filter_results.passed_filter=false` remains a hard block and those symbols are returned in `request.skipped_symbols`. Piotroski/value failures are soft penalties for the short-term/momentum/breakout feedback path, so those symbols remain in `request.symbols` and are listed in `request.soft_penalized_symbols` with details under `request.eligibility_diagnostics`.
 Explicit requested-symbol dispatch bypasses the automatic broad and role caps used by daily retry cycles. The response records `auto_scope=false`, per-role scopes equal to the requested eligible symbols, and `requested_symbol_scope_cap_bypass` under `request.funnel_diagnostics`.
 Each normal dispatch also creates a durable `agent_context_feedback_runs` row, checkpoints role progress as the run advances, and finalizes that run row even when the cycle exits partially. When `wait_for_completion=false`, Core now creates the durable queued run row before returning and reuses the same `request_run_id` when the background work starts.
