@@ -307,7 +307,7 @@ class AgentContextResponseContractTests(unittest.TestCase):
                 elif role == 'short-term-decider':
                     self.assertEqual(result['tactical_action'], 'reject')
 
-    def test_structured_specialist_response_requires_every_contract_field(self):
+    def test_structured_summarizer_response_defaults_optional_improvement_notes(self):
         result = normalize_agent_response(
             role='technical-summarizer',
             output_text=json.dumps({'role': 'technical-summarizer'}),
@@ -325,9 +325,9 @@ class AgentContextResponseContractTests(unittest.TestCase):
                 'required_field_missing:confidence',
                 'required_field_missing:risk_flags',
                 'required_field_missing:details',
-                'required_field_missing:improvement_notes',
             ],
         )
+        self.assertEqual(result['improvement_notes'], [])
 
     def test_structured_specialist_response_rejects_invalid_field_types_and_values(self):
         output_text = json.dumps(
