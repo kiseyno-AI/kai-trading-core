@@ -173,6 +173,50 @@ class DeployHygieneTests(unittest.TestCase):
         self.assertFalse(report['checks']['health']['ok'])
         self.assertEqual(len(report['checks']), 4)
 
+    def test_schema_preflight_accepts_the_declared_partial_index_for_decider_fingerprints(self) -> None:
+        # The live index is partial by design and the writer uses the same index_where.
+        inspector = _ready_schema_inspector(missing_unique_names={'uq_signal_decider_snapshots_content_fingerprint'})
+        original_indexes = inspector.get_indexes.side_effect
+
+        def indexes(table: str) -> list[dict]:
+            entries = list(original_indexes(table))
+            if table == 'signal_decider_decision_snapshots':
+                entries.append({
+                    'name': 'uq_signal_decider_snapshots_content_fingerprint',
+                    'column_names': ['content_fingerprint'],
+                    'unique': True,
+                    'dialect_options': {'postgresql_where': '(content_fingerprint IS NOT NULL)'},
+                })
+            return entries
+
+        inspector.get_indexes.side_effect = indexes
+        report = deploy_hygiene._inspect_runtime_schema_drift(inspector)
+
+        check = next(item for item in report['checks'] if item['name'] == 'signal_decider_decision_snapshots_content_fingerprint_unique')
+        self.assertTrue(check['ready'])
+        self.assertTrue(report['ready'])
+
+    def test_schema_preflight_rejects_a_different_predicate_on_the_decider_fingerprint_index(self) -> None:
+        inspector = _ready_schema_inspector(missing_unique_names={'uq_signal_decider_snapshots_content_fingerprint'})
+        original_indexes = inspector.get_indexes.side_effect
+
+        def indexes(table: str) -> list[dict]:
+            entries = list(original_indexes(table))
+            if table == 'signal_decider_decision_snapshots':
+                entries.append({
+                    'name': 'uq_signal_decider_snapshots_content_fingerprint',
+                    'column_names': ['content_fingerprint'],
+                    'unique': True,
+                    'dialect_options': {'postgresql_where': "(market_date >= '2026-01-01')"},
+                })
+            return entries
+
+        inspector.get_indexes.side_effect = indexes
+        report = deploy_hygiene._inspect_runtime_schema_drift(inspector)
+
+        check = next(item for item in report['checks'] if item['name'] == 'signal_decider_decision_snapshots_content_fingerprint_unique')
+        self.assertFalse(check['ready'])
+
     def test_schema_preflight_rejects_partial_unique_index_for_full_upsert_key(self) -> None:
         inspector = _ready_schema_inspector()
         original_indexes = inspector.get_indexes.side_effect
