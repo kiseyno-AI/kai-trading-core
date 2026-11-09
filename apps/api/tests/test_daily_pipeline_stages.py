@@ -3130,6 +3130,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 'resolve_latest_completed_summary_knowledge_cutoff',
                 return_value=resolution,
             ) as resolve_cutoff,
+            patch(
+                'app.eod.daily_pipeline_stages.'
+                'agent_feedback_prerequisite_service.'
+                'inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ) as inspect_prerequisites,
         ):
             result = service.run(
                 market_date='2026-04-14',
@@ -3149,6 +3155,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             fs_div='CFS',
             source_run_id='feedback-cycle-summary',
             requested_symbols=None,
+        )
+        self.assertEqual(
+            inspect_prerequisites.call_args.kwargs['symbols'],
+            completed_symbols,
         )
 
         for mismatch, reason in (
