@@ -1885,3 +1885,69 @@ class KISRealtimePriceRouteTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_orderbooks_share_capacity_and_only_expose_current_kis_quotes(monkeypatch):
+    now = datetime(2026, 11, 10, 5, 25, tzinfo=timezone.utc)
+    monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+    monkeypatch.setattr(settings, 'kis_realtime_price_max_subscriptions', 2)
+    monkeypatch.setattr(settings, 'kis_realtime_price_subscribe_pause_seconds', 0)
+    service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+    socket = FakeWebSocket()
+
+    async def check():
+        service._record_market_session(SimpleNamespace(
+            state='OPEN', session_open_at=(now - timedelta(hours=1)).isoformat(),
+            session_close_at=(now + timedelta(hours=1)).isoformat(),
+        ), active=True)
+        service._mark_connected()
+        service._apply_runtime_monitored_source(KISRealtimeMonitoredSymbolSource(
+            symbols=('005930', '000660'), market_date='2026-11-10', source_version=now,
+            membership_complete=True, protected_symbols=('005930',),
+        ), trigger='test', expected_observation_revision=None)
+        await service._sync_subscriptions(socket, approval_key='test')
+        assert [frame['body']['input'] for frame in socket.sent] == [
+            {'tr_id': 'H0STASP0', 'tr_key': '005930'},
+            {'tr_id': 'H0STCNT0', 'tr_key': '005930'},
+        ]
+
+        def row(symbol='005930', hour='142500', ask='71100', session='0'):
+            fields = [''] * 63
+            for index, value in {0: symbol, 1: hour, 2: session, 3: ask,
+                                 13: '71000', 23: '150', 33: '200'}.items():
+                fields[index] = value
+            return '^'.join(fields)
+
+        message = '0|H0STASP0|002|' + '^'.join([row(), row(symbol='000660')])
+        await service._handle_message(socket, message)
+        with patch.object(routes_quotes, 'kis_realtime_price_service', service):
+            app = FastAPI()
+            app.include_router(routes_quotes.router)
+            with TestClient(app) as client:
+                assert client.get('/quotes/realtime/orderbooks').json() == {'connected': True, 'passive_quote_symbols': [], 'items': [{
+                    'symbol': '005930', 'bid_price': 71000, 'ask_price': 71100,
+                    'bid_size': 200, 'ask_size': 150, 'price_as_of': now.isoformat(),
+                    'price_received_at': now.isoformat(), 'source': 'kis_orderbook_ws',
+                }]}
+        assert service.orderbooks_snapshot(now=now + timedelta(seconds=3))['items'] == []
+        await service._handle_message(socket, '0|H0STASP0|001|' + row(ask='0'))
+        assert service.orderbooks_snapshot()['items'] == []
+        await service._handle_message(socket, '0|H0STASP0|001|' + row(hour='246000'))
+        await service._handle_message(socket, '0|H0STASP0|001|' + row(session='1'))
+        assert service.orderbooks_snapshot()['items'] == []
+        await service._handle_message(socket, '0|H0STASP0|001|' + row())
+        service._mark_disconnected()
+        assert service.orderbooks_snapshot()['items'] == []
+
+        socket.sent.clear()
+        service._mark_connected()
+        await service._sync_subscriptions(socket, approval_key='test')
+        await service._handle_system_message(socket, json.dumps({
+            'header': {'tr_id': 'H0STASP0', 'tr_key': '005930'},
+            'body': {'rt_cd': '1', 'msg1': 'book not available'},
+        }), received_at=now)
+        await service._sync_subscriptions(socket, approval_key='test')
+        assert service.health_snapshot()['orderbook_subscribed_symbols'] == []
+        assert service.health_snapshot()['subscribed_symbols'] == ['000660', '005930']
+
+    asyncio.run(check())
