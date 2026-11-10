@@ -20,6 +20,14 @@ def install_analyst_contract(tmp_path, monkeypatch):
     )
 
 
+def watch_outcomes():
+    return {
+        'observation_count': 12, 'watch_event_count': 6, 'trade_touch_count': 4, 'ask_touch_count': 5,
+        'ask_entry_count': 3, 'actual_entry_fill_count': 1, 'actual_closed_trade_count': 0,
+        'source_status': {'watch': 'available'}, 'examples': [{'private': 'evidence'}],
+    }
+
+
 def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, monkeypatch):
     day = date(2026, 11, 10)
     now = datetime(2026, 11, 10, 22, tzinfo=ZoneInfo('Asia/Seoul'))
@@ -33,13 +41,9 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
     def collect(market_date, *, observed_at, store):
         assert market_date == day
         assert observed_at == now
-        stats = {
-            'observation_count': 12, 'watch_event_count': 6, 'trade_touch_count': 4, 'ask_touch_count': 5, 'ask_entry_count': 3,
-            'actual_entry_fill_count': 1, 'actual_closed_trade_count': 0, 'source_status': {'watch': 'available'},
-            'examples': [{'private': 'evidence'}],
-        }
-        no_events = {**dict.fromkeys(stats, 0), 'observation_count': 12, 'source_status': {'watch': 'unavailable'}}
-        return {'roles': {'signal-decider': stats, 'short-term-decider': no_events}}
+        stats = watch_outcomes()
+        trade_only = {**stats, 'watch_event_count': 1, 'trade_touch_count': 1, 'ask_touch_count': 0, 'ask_entry_count': 0}
+        return {'roles': {'signal-decider': stats, 'short-term-decider': trade_only}}
 
     class Analyst:
         calls = 0
@@ -72,7 +76,7 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
     assert 'contract_markdown' not in run['candidates']['signal-decider']
     assert 'evidence' not in run
     assert run['watch_outcomes']['signal-decider']['ask_entry_count'] == 3
-    assert run['watch_outcomes']['short-term-decider']['watch_event_count'] == 0
+    assert run['watch_outcomes']['short-term-decider']['watch_event_count'] == 1
     artifact = store.load_result('daily-review', day.isoformat())
     assert 'displayed offer depth' in artifact['candidate_contracts']['signal-decider']
     assert 'displayed offer depth' not in artifact['candidate_contracts']['short-term-decider']
@@ -140,4 +144,23 @@ def test_storage_admission_blocks_a_review_before_dispatch(tmp_path, monkeypatch
         raise AssertionError('blocked reviews must not collect evidence or dispatch')
 
     result = daily_review.run_due_daily_review(now=now, store=store, evidence_loader=collect, is_trading_day=lambda _: True)
+    assert result.detail == 'openclaw_storage_admission_blocked'
+
+
+def test_review_rechecks_storage_admission_after_evidence_collection(tmp_path, monkeypatch):
+    install_analyst_contract(tmp_path, monkeypatch)
+    store = SideAgentStore(tmp_path)
+    now = datetime(2026, 11, 10, 22, tzinfo=ZoneInfo('Asia/Seoul'))
+
+    def collect(*args, **kwargs):
+        monkeypatch.setattr(daily_review.settings, 'openclaw_dispatch_min_free_bytes', 2**63)
+        return {'roles': {role: watch_outcomes() for role in daily_review.DECIDER_ROLES}}
+
+    class NoDispatch:
+        def call(self, **kwargs):
+            pytest.fail('storage is no longer admitted')
+
+    result = daily_review.run_due_daily_review(
+        now=now, store=store, client=NoDispatch(), evidence_loader=collect, is_trading_day=lambda _: True,
+    )
     assert result.detail == 'openclaw_storage_admission_blocked'

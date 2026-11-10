@@ -43,6 +43,10 @@ FOCUS_SOURCES: dict[Focus, str] = {
     'entry_liquidity': 'watch', 'price_confirmation': 'watch', 'market_regime': 'market',
     'business_quality': 'business', 'dated_news': 'news', 'volatility': 'market',
 }
+FOCUS_REQUIRED_COUNTS: dict[Focus, tuple[str, ...]] = {
+    'entry_liquidity': ('ask_touch_count',),
+    'price_confirmation': ('trade_touch_count', 'ask_entry_count'),
+}
 WATCH_RESULT_FIELDS = (
     'observation_count', 'watch_event_count', 'trade_touch_count', 'ask_touch_count', 'ask_entry_count',
     'actual_entry_fill_count', 'actual_closed_trade_count', 'source_status',
@@ -113,6 +117,7 @@ def _candidate(role: str, day: str, feedback: RoleReview, evidence: dict[str, An
         if (
             observation_count < MIN_WATCH_OBSERVATIONS
             or evidence['source_status'].get(source) != 'available'
+            or not all(evidence[field] for field in FOCUS_REQUIRED_COUNTS.get(feedback.focus, ()))
             or not any(finding.source == source for finding in feedback.findings)
         ):
             status = 'insufficient_evidence'
@@ -165,6 +170,14 @@ def _verified_analyst_contract() -> str:
     return hashlib.sha256(expected).hexdigest()
 
 
+def _require_storage_admission() -> None:
+    admission = inspect_openclaw_storage_admission(
+        state_dir=settings.openclaw_state_dir, min_free_bytes=settings.openclaw_dispatch_min_free_bytes,
+    )
+    if admission['admitted'] is not True:
+        raise SideAgentValidationError('OpenClaw storage admission denied')
+
+
 def _is_krx_session(day: date) -> bool:
     return get_krx_exchange_calendar_day(day).is_open
 
@@ -215,11 +228,7 @@ def _run_review(
     store.write_result(REVIEW, day, record)
     error = 'openclaw_storage_admission_blocked'
     try:
-        admission = inspect_openclaw_storage_admission(
-            state_dir=settings.openclaw_state_dir, min_free_bytes=settings.openclaw_dispatch_min_free_bytes,
-        )
-        if admission['admitted'] is not True:
-            raise SideAgentValidationError('OpenClaw storage admission denied')
+        _require_storage_admission()
         error = 'postmortem_contract_mismatch'
         contract_sha = _verified_analyst_contract()
         error = 'evidence_unavailable'
@@ -242,6 +251,11 @@ def _run_review(
             analyst_contract_sha256=contract_sha, updated_at=datetime.now(KST).isoformat(),
         )
         store.write_result(REVIEW, day, record)
+        error = 'postmortem_contract_mismatch'
+        if _verified_analyst_contract() != contract_sha:
+            raise SideAgentValidationError('postmortem contract changed during evidence collection')
+        error = 'openclaw_storage_admission_blocked'
+        _require_storage_admission()
         error = 'gateway_failed'
         raw = (client or SideAgentClient()).call(
             agent=POSTMORTEM_AGENT, task='daily_review', payload=payload, run_id=f'daily-review-{day}-{attempts + 1}',
