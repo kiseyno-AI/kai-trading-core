@@ -526,7 +526,7 @@ class KISRealtimePriceService:
             and session_open_at <= now <= session_close_at
         )
 
-    def _recorded_market_session_is_active(self) -> bool:
+    def _recorded_market_session_is_active(self, *, at: datetime | None = None) -> bool:
         with self._state_lock:
             active = bool(self._health.get('market_session_active'))
             session_open_at = _parse_iso_datetime(
@@ -535,12 +535,12 @@ class KISRealtimePriceService:
             session_close_at = _parse_iso_datetime(
                 self._health.get('market_session_close_at')
             )
-        now = _utc_now()
+        observed_at = at if at is not None else _utc_now()
         return bool(
             active
             and session_open_at is not None
             and session_close_at is not None
-            and session_open_at <= now <= session_close_at
+            and session_open_at <= observed_at <= session_close_at
         )
 
     def _record_market_session(self, market: Any, *, active: bool) -> str:
@@ -1729,14 +1729,11 @@ class KISRealtimePriceService:
                     break
                 if (tr_id, symbol) in self._pending_unsubscriptions:
                     continue
-            market_date = _utc_now().astimezone(KST).date()
             await self._send_subscription(
                 websocket, approval_key=approval_key, symbol=symbol, tr_id=tr_id, tr_type='1',
             )
             with self._state_lock:
                 channel_symbols[tr_id].add(symbol)
-                if self._session_history is not None and tr_id == price_tr_id:
-                    self._pending_session_history.setdefault(market_date, {}).setdefault(symbol, None)
                 self._health['metrics']['subscribe_requests'] += 1
 
         with self._state_lock:
@@ -1817,6 +1814,14 @@ class KISRealtimePriceService:
         if result_code == '0' and message_code == 'OPSP0001' and symbol:
             with self._state_lock:
                 self._pending_unsubscriptions.pop((tr_id, symbol), None)
+                if (
+                    self._session_history is not None
+                    and tr_id == self._price_tr_id()
+                    and symbol in self._subscribed_symbols
+                    and self._recorded_market_session_is_active(at=received_at)
+                ):
+                    market_date = received_at.astimezone(KST).date()
+                    self._pending_session_history.setdefault(market_date, {}).setdefault(symbol, None)
                 self._sync_health_symbols_locked()
             return
         message_text = _normalize_text(body.get('msg1')) or 'system_message'
