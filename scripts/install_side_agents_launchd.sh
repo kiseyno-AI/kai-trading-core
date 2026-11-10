@@ -1,8 +1,12 @@
 #!/bin/bash
-# Install (or --uninstall) the per-user launchd job that runs the side agents.
+# Install the side agents or their separate --daily-review job. Add --uninstall to remove the selected job.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.kai.side-agents"
+if [ "${1:-}" = "--daily-review" ]; then
+  LABEL="com.kai.daily-review"
+  shift
+fi
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 if [ "${1:-}" = "--uninstall" ]; then

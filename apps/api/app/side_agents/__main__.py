@@ -17,6 +17,7 @@ from app.side_agents.runner import (
     run_postmortem,
 )
 from app.side_agents.client import SideAgentClient
+from app.side_agents.daily_review import run_due_daily_review
 from app.side_agents.schemas import MARKET_AGENT, NEWS_AGENT, POSTMORTEM_AGENT, SIDE_AGENT_NAMES
 from app.side_agents.store import SideAgentStore
 
@@ -27,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     due = sub.add_parser('run-due', help='run whatever is due now (idempotent; safe to call every 30 minutes)')
     due.add_argument('--dry-run', action='store_true')
     due.add_argument('--only', action='append', choices=SIDE_AGENT_NAMES)
+    review = sub.add_parser('run-daily-review', help='run the separate KRX post-close review if due')
+    review.add_argument('--dry-run', action='store_true')
     one = sub.add_parser('run', help='run one agent now')
     one.add_argument('--agent', required=True, choices=SIDE_AGENT_NAMES)
     one.add_argument('--date', help='market date YYYY-MM-DD (default: today KST)')
@@ -47,6 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         report = run_due(store=store, dry_run=args.dry_run, only=args.only)
         print(json.dumps(report.as_dict(), ensure_ascii=False))
         return 0
+
+    if args.command == 'run-daily-review':
+        outcome = run_due_daily_review(store=store, dry_run=args.dry_run)
+        print(json.dumps(vars(outcome) if outcome else None, ensure_ascii=False))
+        return int(outcome is not None and outcome.status == 'failed')
 
     now = datetime.now(timezone.utc).astimezone(KST)
     market_date = date.fromisoformat(args.date) if args.date else now.date()
