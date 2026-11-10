@@ -9,6 +9,8 @@ deciders, never touch orders, and their outputs are advisory files until a human
 | `news-event-analyst` | same gate as the market agent | up to 30 symbols (news-driven and filing-driven interleaved): Naver headlines and snippets, official DART filing titles with an importance rule, 1d/5d price move and 20d volume ratio | per-symbol materiality, event type, direction, evidence grade, reaction check |
 | `postmortem-analyst` | trading day, from 16:30 | KRX WAIT observations, confirmed outcomes, stored market, business and news context | role-specific [Daily Review](DAILY_REVIEW.md) and candidate contracts |
 
+The weekly learning runner separately uses `weekly-learning-analyst` for its Korean evidence report. Core validates and publishes the learning artifact before the narrative phase. Both review agents use the same model and reasoning configuration as the two deciders. The weekly report's [runtime contract](../runtime_contracts/openclaw/v1/weekly-learning-analyst/AGENTS.md) is installed by the same contract sync command.
+
 The evening gate checks that at least 500 daily bars and 500 risk snapshots exist for the date; until then the run reports `waiting` without using the attempt budget. KIS requests are sent one at a time, 0.25 s apart (the KIS client has no rate limiter and Core may be calling it too). Each live leg is isolated and carries a status. A failing KIS or BOK call is reported to the agent as an error, never hidden
 and never filled in. For a past market date the live legs (index, flows, US proxies) are skipped by design.
 
