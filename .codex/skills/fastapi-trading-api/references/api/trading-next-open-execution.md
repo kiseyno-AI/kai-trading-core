@@ -5,6 +5,8 @@ Inspect or dispatch the persisted next-open plan derived from the latest previou
 
 `watch_for_trigger` rows are monitor-only, not immediate buy candidates. They return `generic_action="monitor_candidate"`, `eligibility_status="monitor_candidate"`, and `execution_status="awaiting_trigger"` while Exec watches their trigger/chase conditions. The summary separates these rows from buy eligibility: `buy_eligible_count` aliases `eligible_count`, `monitor_candidate_count` counts monitor-only rows, `awaiting_trigger_count` counts rows still waiting for their trigger, and `ready_count` is `eligible_count + monitor_candidate_count`. Consumers must not interpret `monitor_candidate_count` or `ready_count` as an immediately executable buy count.
 
+Each decider owns its decision and prices. A `REJECT` or `AVOID_CHASE` creates no buy handoff for its lane. If both lanes qualify on the same account and symbol, Exec can submit two separately identified buys, each at its own price conditions and within the shared account and symbol exposure limits. Specialist disagreement remains in `validation.warnings`. The compatibility field `safety_rails.block_on_specialist_disagreement` always reports `false`.
+
 The daily EOD pipeline refreshes this persisted plan immediately after the decision-support decider stage completes. PREOPEN refresh remains as an idempotent safety net, but operators no longer need to wait until the next morning for buy snapshots to become inspectable execution-plan rows.
 
 When PREOPEN validation finds that a candidate was generated against an older

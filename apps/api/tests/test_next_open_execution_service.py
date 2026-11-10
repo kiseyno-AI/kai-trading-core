@@ -1006,9 +1006,6 @@ def test_preopen_policy_fingerprint_binds_mode_cost_thresholds_and_account_budge
         'signal_decider_next_open_block_on_data_warnings': (
             not settings.signal_decider_next_open_block_on_data_warnings
         ),
-        'signal_decider_next_open_block_on_specialist_disagreement': (
-            not settings.signal_decider_next_open_block_on_specialist_disagreement
-        ),
         'signal_decider_next_open_require_target_and_stop': (
             not settings.signal_decider_next_open_require_target_and_stop
         ),
@@ -1959,7 +1956,6 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_next_open_non_spread_round_trip_cost_bps': settings.signal_decider_next_open_non_spread_round_trip_cost_bps,
             'signal_decider_next_open_require_active_policy': settings.signal_decider_next_open_require_active_policy,
             'signal_decider_next_open_block_on_data_warnings': settings.signal_decider_next_open_block_on_data_warnings,
-            'signal_decider_next_open_block_on_specialist_disagreement': settings.signal_decider_next_open_block_on_specialist_disagreement,
             'signal_decider_next_open_require_target_and_stop': settings.signal_decider_next_open_require_target_and_stop,
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
             'signal_decider_exec_runtime_mode': settings.signal_decider_exec_runtime_mode,
@@ -1980,7 +1976,6 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.signal_decider_next_open_non_spread_round_trip_cost_bps = 0.0
         settings.signal_decider_next_open_require_active_policy = True
         settings.signal_decider_next_open_block_on_data_warnings = True
-        settings.signal_decider_next_open_block_on_specialist_disagreement = True
         settings.signal_decider_next_open_require_target_and_stop = True
         settings.signal_decider_exec_integration_mode = 'disabled'
         settings.signal_decider_exec_runtime_mode = 'mock'
@@ -2824,6 +2819,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         market: str | None = 'KOSPI',
         next_day_open_action: str = 'buy',
         data_warnings: list[str] | None = None,
+        specialist_disagreement: list[str] | None = None,
         target_price: int = 54000,
         expected_return_pct: float | None = 4.5,
         stop_loss_price: int = 47000,
@@ -2873,7 +2869,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
                 decision_risks_payload=['Leadership remained narrow.'],
                 invalidation_conditions_payload=['Close below support.'],
                 data_quality_warnings_payload=data_warnings or [],
-                specialist_disagreement_payload=[],
+                specialist_disagreement_payload=specialist_disagreement or [],
                 traceability_payload={
                     'schema_version': 'signal_decider_trace_v2',
                     'gate_checks': {
@@ -5911,6 +5907,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         snapshot_id = self._seed_snapshot(
             symbol='005930',
             next_day_open_action='wait',
+            specialist_disagreement=['Technical and fundamental evidence diverged.'],
             entry_price_basis='trigger_limit',
             trigger_price=50_500,
             chase_limit_price=51_500,
@@ -5941,6 +5938,10 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['generic_action'], 'buy')
         self.assertEqual(item['handoff_intent'], 'intraday_watch_buy')
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+        self.assertIn(
+            'specialist_disagreement_present',
+            {reason['code'] for reason in item['validation']['warnings']},
+        )
         self.assertEqual(item['execution_status'], 'awaiting_trigger')
         self.assertTrue(item['exec_monitoring_active'])
         self.assertEqual(item['trigger_price'], 50_500)
@@ -6405,6 +6406,15 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             by_snapshot[signal_snapshot_id]['client_order_id'],
             by_snapshot[short_snapshot_id]['client_order_id'],
         )
+        for snapshot_id, prices in (
+            (signal_snapshot_id, (10_000, 10_200, 10_800, 9_700)),
+            (short_snapshot_id, (9_900, 10_100, 10_600, 9_600)),
+        ):
+            item = by_snapshot[snapshot_id]
+            self.assertEqual(
+                (item['trigger_price'], item['chase_limit_price'], item['target_price'], item['stop_loss_price']),
+                prices,
+            )
 
     def test_signal_wait_missing_trigger_is_visible_but_not_execution_authority(self) -> None:
         snapshot_id = self._seed_snapshot(
@@ -7273,8 +7283,17 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    def test_refresh_plan_items_skips_rejected_short_term_decisions(self) -> None:
-        self._seed_short_term_snapshot(symbol='035420', tactical_action='reject')
+    def test_nonbuy_short_term_decisions_do_not_change_signal_wait_plans(self) -> None:
+        expected_snapshots = set()
+        for symbol, action in (('035420', 'reject'), ('005930', 'avoid_chase')):
+            self._seed_short_term_snapshot(symbol=symbol, tactical_action=action)
+            expected_snapshots.add(self._seed_snapshot(
+                symbol=symbol,
+                next_day_open_action='wait',
+                entry_price_basis='trigger_limit',
+                trigger_price=50_500,
+                chase_limit_price=51_500,
+            ))
         service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
 
         with patch(
@@ -7283,7 +7302,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
 
-        self.assertNotIn('035420', {item['symbol'] for item in result['items']})
+        self.assertEqual({item['decision_snapshot_id'] for item in result['items']}, expected_snapshots)
+        self.assertTrue(all(item['eligibility_status'] == ELIGIBILITY_MONITOR_CANDIDATE for item in result['items']))
 
     def test_latest_snapshot_selection_ranks_before_short_term_actionability_filter(self) -> None:
         actionable_id = self._seed_short_term_snapshot(
