@@ -1641,6 +1641,10 @@ class KISRealtimePriceService:
             self._health['last_price_received_at'] = _isoformat(received_at)
             for tick in ticks:
                 self._prices[tick.symbol] = tick
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        for tick in ticks:
+            wait_price_observations.observe(tick)
         return [tick.to_public_dict() for tick in ticks]
 
     def ingest_price_fields(

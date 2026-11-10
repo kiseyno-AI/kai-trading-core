@@ -13651,7 +13651,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
 
-    def test_passive_signal_wait_observations_use_latest_validated_krx_snapshot(self) -> None:
+    def test_passive_wait_observations_keep_both_deciders_for_the_same_symbol(self) -> None:
         def snapshot(
             *,
             snapshot_id: int,
@@ -13683,6 +13683,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     snapshot_id % 60,
                     tzinfo=timezone.utc,
                 ),
+                response_payload={'trigger_price': str(snapshot_id * 100), 'tactical_action': action},
                 request_payload={
                     'symbol_day_context': {
                         'company': {'market': market},
@@ -13698,7 +13699,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 snapshot(snapshot_id=14, symbol='USWAIT', market='NASDAQ'),
                 snapshot(
                     snapshot_id=15,
-                    symbol='070590',
+                    symbol='032080',
                     agent_name='short-term-decider',
                 ),
                 snapshot(snapshot_id=16, symbol='089890', action='reject'),
@@ -13728,13 +13729,20 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'decision_agent_name': 'signal-decider',
                     'source_market_date': self.market_date.isoformat(),
                     'observed_at': '2026-04-29T07:13:00+00:00',
+                    'trigger_price': '1300',
+                },
+                {
+                    'symbol': '032080',
+                    'decision_snapshot_id': 15,
+                    'decision_agent_name': 'short-term-decider',
+                    'source_market_date': self.market_date.isoformat(),
+                    'observed_at': '2026-04-29T07:15:00+00:00',
+                    'trigger_price': '1500',
                 }
             ],
         )
         generation_loader.assert_called_once_with(
             source_market_date=self.market_date,
-            target_trade_date=self.target_trade_date,
-            allow_post_open_intraday_watch=False,
         )
 
     def test_runtime_monitored_symbols_adds_signal_wait_as_observation_only(self) -> None:

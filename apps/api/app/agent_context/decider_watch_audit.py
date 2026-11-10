@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, load_only
 
 from app.agent_context.decider_evaluation_service import SUPPORTED_DECIDER_AGENT_NAMES
+from app.agent_context.wait_price_observations import wait_price_observations
 from app.db_models import (
     AgentContextFeedbackFailure,
     DailyPriceBar,
@@ -282,4 +283,5 @@ def build_decider_watch_audit(
             'by_simulation_status': dict(Counter(item['simulation']['status'] for item in items)),
         },
         'items': items,
+        'live_wait_price_observations': wait_price_observations.history(as_of_market_date),
     }
