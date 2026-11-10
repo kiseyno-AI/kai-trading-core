@@ -3536,6 +3536,17 @@ class DailyPipelineStageService:
                                 stage_id == 'signal_decider'
                                 and resolved_proof_source
                             )
+                            summary_parent_symbols = resolved_symbols
+                            if (
+                                canonical_intraday_summary_cutoff_proof
+                                and 'agent_feedback_summaries' not in resolved_stages
+                                and set(resolved_symbols or ())
+                                == set(expected_completed_symbols or ())
+                            ):
+                                # The request is already narrowed to the pinned
+                                # completed cohort. Validate the source proof
+                                # without treating that cohort as its parent.
+                                summary_parent_symbols = None
                             proof_scope_is_valid = bool(
                                 isinstance(resolved_proof_symbols, list)
                                 and resolved_proof_symbols
@@ -3551,7 +3562,7 @@ class DailyPipelineStageService:
                                             'completed_scope_proof'
                                         )
                                     ),
-                                    parent_symbols=resolved_symbols,
+                                    parent_symbols=summary_parent_symbols,
                                 )
                             )
                             if exact_decider_scope and not proof_scope_is_valid:
