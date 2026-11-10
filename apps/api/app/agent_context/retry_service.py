@@ -46,6 +46,7 @@ from app.agent_context.reuse_service import (
     FeedbackReuseStaticInputs,
     agent_context_reuse_service,
     is_stale_dispatch_reason,
+    recovered_feedback_source,
 )
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
@@ -3654,44 +3655,15 @@ class AgentFeedbackRetryService:
                 None,
             ),
         }
-        summary_payload = latest_feedback.get('summary_payload')
-        context_payload = latest_feedback.get('context_payload')
-        if (
-            isinstance(summary_payload, dict)
-            and isinstance(context_payload, dict)
-        ):
-            recovery_provenance = summary_payload.get('recovery_provenance')
-            context_recovery_provenance = context_payload.get(
-                'recovery_provenance'
-            )
-            normalized_feedback = summary_payload.get('normalized_feedback')
-            if (
-                summary_payload.get('collector_mode')
-                == 'persisted_failure_recovery'
-                and isinstance(recovery_provenance, dict)
-                and recovery_provenance == context_recovery_provenance
-                and recovery_provenance.get('mode')
-                == 'persisted_failure_response_recovery'
-                and recovery_provenance.get('reason')
-                == 'optional_improvement_notes_omitted'
-                and isinstance(normalized_feedback, dict)
-                and normalized_feedback.get('response_contract_valid') is True
-            ):
-                recovery_source_run_id = str(
-                    recovery_provenance.get('source_run_id') or ''
-                ).strip()
-                recovery_source_failure_id = recovery_provenance.get(
-                    'source_failure_id'
-                )
-                if (
-                    recovery_source_run_id
-                    and isinstance(recovery_source_failure_id, int)
-                    and recovery_source_failure_id > 0
-                ):
-                    evidence['recovery_source_run_id'] = recovery_source_run_id
-                    evidence['recovery_source_failure_id'] = (
-                        recovery_source_failure_id
-                    )
+        recovered_source = recovered_feedback_source(
+            latest_feedback.get('summary_payload'),
+            latest_feedback.get('context_payload'),
+        )
+        if recovered_source is not None:
+            (
+                evidence['recovery_source_run_id'],
+                evidence['recovery_source_failure_id'],
+            ) = recovered_source
         return evidence
 
     @staticmethod

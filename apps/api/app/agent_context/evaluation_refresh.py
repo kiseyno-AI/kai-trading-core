@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -33,7 +33,7 @@ TRADING_DAY_EARLIEST = time(22, 30)
 MIN_ATTEMPT_INTERVAL = timedelta(minutes=30)
 MARKER_SCHEMA_VERSION = 'signal_decider_evaluation_refresh_v1'
 
-_last_attempt_at: dict[str, datetime] = {}
+_last_attempt_at: dict[tuple[Path, str], datetime] = {}
 
 
 def default_marker_dir() -> Path:
@@ -95,6 +95,47 @@ def refresh_signal_decider_evaluations_if_due(
     compute: Callable[[str], dict[str, Any]] | None = None,
     marker_dir: Path | None = None,
 ) -> dict[str, Any]:
+    return _refresh_if_due(
+        market=market, now=now, compute=compute or _default_compute,
+        root=marker_dir or default_marker_dir(),
+    )
+
+
+def refresh_decider_watch_audit_if_due(
+    *,
+    market: Any,
+    now: datetime | None = None,
+    compute: Callable[[str], dict[str, Any]] | None = None,
+    marker_dir: Path | None = None,
+) -> dict[str, Any]:
+    observed_at = now or datetime.now(timezone.utc)
+
+    def compute_watch_report(market_date: str) -> dict[str, Any]:
+        from sqlalchemy import text
+
+        from app.agent_context.decider_watch_audit import build_decider_watch_audit
+        from app.db import SessionLocal
+
+        with SessionLocal() as session:
+            session.execute(text('SET TRANSACTION READ ONLY'))
+            return build_decider_watch_audit(
+                session, as_of_market_date=date.fromisoformat(market_date), observed_at=observed_at,
+            )
+
+    return _refresh_if_due(
+        market=market, now=observed_at, compute=compute or compute_watch_report,
+        root=(marker_dir or default_marker_dir()) / 'watch-audit', save_report=True,
+    )
+
+
+def _refresh_if_due(
+    *,
+    market: Any,
+    now: datetime | None,
+    compute: Callable[[str], dict[str, Any]],
+    root: Path,
+    save_report: bool = False,
+) -> dict[str, Any]:
     now_kst = (now or datetime.now(timezone.utc)).astimezone(KST)
     state = getattr(market, 'state', None)
     if state not in {'CLOSED', 'WEEKEND', 'HOLIDAY'}:
@@ -104,7 +145,6 @@ def refresh_signal_decider_evaluations_if_due(
     market_date = str(getattr(market, 'latest_valid_trading_date', '') or '').strip()
     if not market_date:
         return {'status': 'skipped', 'reason': 'no_latest_trading_date'}
-    root = marker_dir or default_marker_dir()
     marker = _load_marker(root, market_date)
     marker_summary = marker.get('summary') if marker is not None else None
     if (
@@ -115,12 +155,13 @@ def refresh_signal_decider_evaluations_if_due(
         and not marker_summary.get('gated')
     ):
         return {'status': 'skipped', 'reason': 'already_refreshed', 'market_date': market_date}
-    last = _last_attempt_at.get(market_date)
+    attempt_key = (root, market_date)
+    last = _last_attempt_at.get(attempt_key)
     if last is not None and now_kst - last < MIN_ATTEMPT_INTERVAL:
         return {'status': 'skipped', 'reason': 'attempt_interval', 'market_date': market_date}
-    _last_attempt_at[market_date] = now_kst
+    _last_attempt_at[attempt_key] = now_kst
 
-    result = (compute or _default_compute)(market_date)
+    result = compute(market_date)
     summary = result.get('summary') if isinstance(result.get('summary'), dict) else {}
     gated = bool(summary.get('gated'))
     status = 'gated' if gated else str(summary.get('status') or 'failed')
@@ -135,10 +176,11 @@ def refresh_signal_decider_evaluations_if_due(
             'summary': summary,
             'blocked_stage_ids': result.get('blocked_stage_ids'),
             'waiting_stage_ids': result.get('waiting_stage_ids'),
+            **({'report': result} if save_report else {}),
         },
     )
     outcome = {'status': status, 'market_date': market_date, 'summary': summary}
-    logger.info('signal_decider_evaluation_refresh %s', outcome)
+    logger.info('%s %s', 'decider_watch_audit' if save_report else 'signal_decider_evaluation_refresh', outcome)
     return outcome
 
 
@@ -148,13 +190,18 @@ def main() -> int:
     import asyncio
 
     market = asyncio.run(async_get_market_state())
-    try:
-        outcome = refresh_signal_decider_evaluations_if_due(market=market)
-    except Exception as exc:  # noqa: BLE001 - report and exit non-zero for launchd
-        print(json.dumps({'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'[:500]}, ensure_ascii=False))
-        return 1
-    print(json.dumps(outcome, ensure_ascii=False, default=str))
-    return 0
+    exit_code = 0
+    for name, refresh in (
+        ('evaluations', refresh_signal_decider_evaluations_if_due),
+        ('watch_audit', refresh_decider_watch_audit_if_due),
+    ):
+        try:
+            outcome = refresh(market=market)
+        except Exception as exc:  # noqa: BLE001 - let independent jobs finish
+            outcome = {'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'[:500]}
+            exit_code = 1
+        print(json.dumps({'job': name, **outcome}, ensure_ascii=False, default=str))
+    return exit_code
 
 
 if __name__ == '__main__':

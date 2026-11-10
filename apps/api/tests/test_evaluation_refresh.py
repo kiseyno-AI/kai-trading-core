@@ -99,6 +99,27 @@ class EvaluationRefreshTests(unittest.TestCase):
         # Evaluations read decision snapshots and later price bars only.
         self.assertEqual(SIGNAL_DECIDER_EVALUATION_PREREQUISITE_STAGE_IDS, ('technical_snapshots',))
 
+    def test_watch_history_is_saved_independently_of_a_gated_evaluation(self):
+        now = datetime(2026, 11, 9, 22, 40, tzinfo=KST)
+        market = _market('CLOSED', '2026-11-09')
+        gated = MagicMock(return_value={'summary': {'status': 'blocked', 'gated': True}})
+        report = {'summary': {'status': 'completed', 'items': 1}, 'items': [
+            {'symbol': '005930', 'simulation': {'gross_pnl_krw_per_share': -100}},
+        ]}
+        self.assertEqual(self._run(market, now, gated)['status'], 'gated')
+
+        audit = MagicMock(return_value=report)
+        result = refresh.refresh_decider_watch_audit_if_due(
+            market=market, now=now, compute=audit, marker_dir=self.root,
+        )
+        saved = refresh._load_marker(self.root / 'watch-audit', '2026-11-09')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(saved['report'], report)
+        self.assertEqual(refresh.refresh_decider_watch_audit_if_due(
+            market=market, now=now, compute=audit, marker_dir=self.root,
+        )['reason'], 'already_refreshed')
+        audit.assert_called_once_with('2026-11-09')
+
 
 if __name__ == '__main__':
     unittest.main()

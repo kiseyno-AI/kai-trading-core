@@ -2531,7 +2531,7 @@ class OpenClawAgentClient:
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
             f"{contract_prompt_suffix}\n"
             f"Market date: {market_date.isoformat()}\n"
-            f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False)}"
+            f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False, separators=(',', ':'))}"
         )
         if max_chars <= 0 or len(compact_message) <= max_chars:
             return compact_message
