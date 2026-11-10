@@ -436,6 +436,55 @@ class TimesFMDeciderEvidenceTests(unittest.TestCase):
                 else:
                     self.assertEqual(failures, {})
 
+    def test_revalidation_reads_each_role_policy_once_and_rechecks_on_next_pass(self):
+        service = AgentFeedbackOrchestrator()
+        originals = [source_item(symbol) for symbol in ('005930', '000660')]
+        cases = [(DECIDERS[0], item) for item in originals] + [(DECIDERS[1], originals[0])]
+        original_policy = {'current_version': 'original'}
+        payloads = [
+            service._build_signal_decider_payload(
+                item=item, market_date=MARKET_DATE, request_run_id='policy-revalidation-test',
+                market_context={}, upstream_summaries={}, upstream_traceability={},
+                signal_decider_policy=original_policy, agent_name=role,
+                source_knowledge_cutoff_at=CUTOFF,
+            )
+            for role, item in cases
+        ]
+        policy_by_role = dict.fromkeys(DECIDERS, original_policy)
+
+        def load_policy(*, role, **kwargs):
+            return policy_by_role[role]
+
+        with (
+            patch.object(orchestrator_module.agent_context_read_service, 'get_symbol_day_context', return_value={'items': originals}),
+            patch.object(orchestrator_module, '_split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics', return_value=(['005930', '000660'], [], {'records_by_symbol': {}})),
+            patch.object(orchestrator_module.runtime_feedback_state_store, 'get_run', return_value=None),
+            patch.object(orchestrator_module.agent_context_reuse_service, 'build_latest_decisions', return_value={}),
+            patch.object(orchestrator_module, 'UPSTREAM_SUMMARY_ROLES', ()),
+            patch.object(service, '_build_decider_policy_context', side_effect=load_policy) as policy_loader,
+        ):
+            args = dict(
+                market_date=MARKET_DATE, request_run_id='policy-revalidation-test',
+                source_items=payloads, source_context_scope_symbols=['005930', '000660'],
+                eligibility_scope_symbols=['005930', '000660'], fs_div='CFS', disclosures_limit=5,
+                revalidate_market_context=False, durable_source_generation=True,
+                source_knowledge_cutoff_at=CUTOFF,
+            )
+            self.assertEqual(service._revalidate_decider_dispatch_inputs(**args), {})
+            self.assertCountEqual([call.kwargs['role'] for call in policy_loader.call_args_list], DECIDERS)
+
+            policy_loader.reset_mock()
+            policy_by_role[DECIDERS[0]] = {'current_version': 'updated'}
+            failures = service._revalidate_decider_dispatch_inputs(**args)
+            self.assertCountEqual([call.kwargs['role'] for call in policy_loader.call_args_list], DECIDERS)
+            self.assertEqual(
+                {key: value['reasons'] for key, value in failures.items()},
+                {
+                    (DECIDERS[0], symbol): [{'code': 'policy_context_changed'}]
+                    for symbol in ('005930', '000660')
+                },
+            )
+
 
 if __name__ == '__main__':
     unittest.main()
