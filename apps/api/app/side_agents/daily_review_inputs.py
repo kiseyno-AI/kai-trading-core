@@ -418,7 +418,8 @@ def _market_headlines(day: date, cutoff: datetime) -> list[dict]:
         rows = market_news_service.list_items(
             topic_keys=['kr_kospi', 'kr_kosdaq', 'kr_foreign_flows'], start=start.astimezone(timezone.utc),
             end=min(cutoff, start + timedelta(days=1)).astimezone(timezone.utc),
-            as_of=cutoff.astimezone(timezone.utc), limit=2 * MAX_MARKET_HEADLINES,
+            as_of=cutoff.astimezone(timezone.utc), persisted_before=cutoff.astimezone(timezone.utc),
+            limit=2 * MAX_MARKET_HEADLINES,
         )
     headlines = {}
     for row in rows:
@@ -498,9 +499,7 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
     analyst_is_current = bool(analyst_context and datetime.fromisoformat(analyst_context['completed_at']) >= session_open)
     has_market = bool(breadth or analyst_is_current or dashboard_status == 'available')
     index_legs = [_object(market.get('index')) for market in dashboard_markets.values()]
-    market_volatility = any(leg.get('status') == 'ready' and _has_price_range(leg) for leg in index_legs) or bool(
-        analyst_is_current and _object(analyst_context).get('volatility')
-    )
+    market_volatility = any(leg.get('status') == 'ready' and _has_price_range(leg) for leg in index_legs)
     market_headlines = _market_headlines(market_date, observed_at)
     recent_sessions = _recent_sessions(market_date, observed_at)
     for name, role in roles.items():

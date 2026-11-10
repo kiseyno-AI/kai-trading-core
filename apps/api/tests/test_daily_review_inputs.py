@@ -356,6 +356,14 @@ def test_review_keeps_cached_market_observations_separate_by_trust_and_cutoff(tm
     assert review['roles']['signal-decider']['source_status']['market'] == 'available'
     assert review['roles']['signal-decider']['source_status']['market_volatility'] == 'unavailable'
 
+    analyst_store = SideAgentStore(tmp_path / 'with-analyst')
+    analyst_store.write_result(MARKET_AGENT, day.isoformat(), {
+        'completed_at': (cutoff - timedelta(minutes=1)).isoformat(),
+        'output': {'market_date': day.isoformat(), 'regime': 'neutral', 'volatility': 'unknown'},
+    })
+    analyst_review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=analyst_store)
+    assert analyst_review['roles']['signal-decider']['source_status']['market_volatility'] == 'unavailable'
+
     row['flow_leg']['provider_observed_at'] = '2026-11-09T15:25:00+09:00'
     stale_flow = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=store)
     assert 'flow' not in stale_flow['market']['dashboard']['markets']['kospi']
@@ -372,14 +380,16 @@ def test_review_includes_only_market_headlines_known_before_the_cutoff(tmp_path,
     before = cutoff - timedelta(minutes=1)
     after = cutoff + timedelta(minutes=1)
     with Session(review_db) as db:
-        for i, (topic, published_at, first_seen_at) in enumerate([
-            ('kr_kospi', before, before), ('kr_kosdaq', before, before),
-            ('kr_kospi', before, after), ('kr_kospi', after, before),
-            ('line_entertainment', before, before),
+        for i, (topic, published_at, first_seen_at, created_at, updated_at) in enumerate([
+            ('kr_kospi', before, before, before, before), ('kr_kosdaq', before, before, before, before),
+            ('kr_kospi', before, after, after, after), ('kr_kospi', after, before, before, before),
+            ('line_entertainment', before, before, before, before),
+            ('kr_kospi', before, before, after, after), ('kr_kospi', before, before, before, after),
         ]):
             db.add(MarketNewsItem(
                 topic_key=topic, region='KR', provider='test', url=f'https://example.test/{i}',
                 url_hash=str(i), title=f'뉴스 {i}', published_at=published_at, first_seen_at=first_seen_at,
+                created_at=created_at, updated_at=updated_at,
             ))
         db.commit()
 
