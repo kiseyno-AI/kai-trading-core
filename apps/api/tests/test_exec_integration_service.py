@@ -13749,6 +13749,32 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             source_market_date=self.market_date,
         )
 
+        target_day = self.target_trade_date.isoformat()
+        closed = {
+            'lifecycle_status': 'closed', 'target_trade_date': target_day,
+            'entry_filled_quantity': '10', 'exit_filled_quantity': '10', 'open_quantity': '0',
+        }
+        outcomes = [
+            {**closed, 'decision_snapshot_id': 13},
+            {**closed, 'decision_snapshot_id': 15},
+            {
+                **closed, 'decision_snapshot_id': 15, 'lifecycle_status': 'partially_closed',
+                'exit_filled_quantity': '5', 'open_quantity': '5',
+            },
+        ]
+        with (
+            patch.object(signal_decider_next_open_execution_service, '_load_latest_snapshot_generation_state',
+                         return_value=generation_state),
+            patch('app.orders.exec_integration.signal_decider_execution_outcome_service.list_snapshot_outcomes',
+                  return_value=outcomes) as outcome_loader,
+        ):
+            remaining = SignalDeciderExecIntegrationService._load_passive_signal_wait_observations(
+                source_market_date=self.market_date, target_trade_date=self.target_trade_date,
+            )
+
+        self.assertEqual([item['decision_snapshot_id'] for item in remaining], [15])
+        outcome_loader.assert_called_once_with(decision_snapshot_ids=[13, 15], refresh=False)
+
     def test_runtime_monitored_symbols_adds_signal_wait_as_observation_only(self) -> None:
         wait_symbol = '032080'
         self._seed_symbol(symbol=wait_symbol, name_ko='Passive wait')
@@ -13798,6 +13824,15 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'decision_agent_name': 'signal-decider',
                         'source_market_date': self.market_date.isoformat(),
                         'observed_at': '2026-04-29T07:13:00+00:00',
+                        'trigger_price': '38550.0',
+                    },
+                    {
+                        'symbol': wait_symbol,
+                        'decision_snapshot_id': 14,
+                        'decision_agent_name': 'short-term-decider',
+                        'source_market_date': self.market_date.isoformat(),
+                        'observed_at': '2026-04-29T07:14:00+00:00',
+                        'trigger_price': '39100',
                     }
                 ],
             )
@@ -13845,7 +13880,14 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(item['stop_loss_price'])
         self.assertIsNone(item['trigger_price'])
         self.assertIsNone(item['chase_limit_price'])
-        self.assertEqual(item['decision_agent_names'], ['signal-decider'])
+        self.assertEqual(
+            item['wait_observations'],
+            [
+                {'decision_agent_name': 'signal-decider', 'trigger_price': 38550},
+                {'decision_agent_name': 'short-term-decider', 'trigger_price': 39100},
+            ],
+        )
+        self.assertEqual(item['decision_agent_names'], ['short-term-decider', 'signal-decider'])
         self.assertEqual(item['account_references'], [])
         self.assertEqual(item['status_counts'], {})
         self.assertEqual(self.client.post_calls, [])
@@ -13899,6 +13941,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'decision_agent_name': 'signal-decider',
                         'source_market_date': self.market_date.isoformat(),
                         'observed_at': '2026-04-29T07:13:00+00:00',
+                        'trigger_price': '40000',
                     }
                 ],
             )
@@ -13920,6 +13963,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['handoff_intents'], [])
         self.assertIsNone(item['trigger_price'])
         self.assertIsNone(item['chase_limit_price'])
+        self.assertEqual(
+            item['wait_observations'],
+            [{'decision_agent_name': 'signal-decider', 'trigger_price': 40000}],
+        )
 
     async def test_passive_wait_loader_failure_preserves_base_monitored_symbols(self) -> None:
         held_symbol = '070590'

@@ -279,6 +279,11 @@ class ExecutionDailyBoardPayload(_ContractModel):
     items: list[ExecutionDailyBoardRowPayload]
 
 
+class ExecutionWaitObservationPayload(_ContractModel):
+    decision_agent_name: Literal['signal-decider', 'short-term-decider']
+    trigger_price: int | float | None
+
+
 class ExecutionMonitoredSymbolItemPayload(ExecutionRuntimeExecCardPayload):
     symbol: str
     name: str
@@ -301,6 +306,7 @@ class ExecutionMonitoredSymbolItemPayload(ExecutionRuntimeExecCardPayload):
     stop_loss_price: int | float | str | None = None
     trigger_price: int | float | str | None = None
     chase_limit_price: int | float | str | None = None
+    wait_observations: list[ExecutionWaitObservationPayload] = Field(default_factory=list)
     expected_holding_period: str | None = None
     decision_agent_names: list[str]
     last_event_at: str | None = None

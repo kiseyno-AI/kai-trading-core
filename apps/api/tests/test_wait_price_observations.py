@@ -2,6 +2,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from app.agent_context import wait_price_observations
 from app.agent_context.wait_price_observations import WaitPriceObservations, watch_from_snapshot
 from app.quotes.kis_realtime_prices import KIS_REALTIME_PRICE_COLUMNS, KISRealtimePriceService
@@ -77,7 +79,8 @@ def test_ask_touch_and_entry_band_are_independent_of_trade_history(tmp_path):
     assert 'ask_entry' not in earlier
 
 
-def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch):
+@pytest.mark.parametrize(('symbol_count', 'batch_sizes'), [(35, [30, 5]), (100, [30, 30, 30, 10])])
+def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch, symbol_count, batch_sizes):
     import asyncio
 
     from app.quotes import kis_realtime_prices
@@ -85,7 +88,7 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
     async def check():
         now = datetime(2026, 11, 10, 4, 0, tzinfo=timezone.utc)
         observer = WaitPriceObservations(tmp_path)
-        symbols = [f'{index:06d}' for index in range(1, 36)]
+        symbols = [f'{index:06d}' for index in range(1, symbol_count + 1)]
         observer.configure(now.date(), [
             wait_price_observations.WaitPriceWatch(
                 index, 'signal-decider', symbol, '2026-11-09',
@@ -133,10 +136,11 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
         await prices.start()
         try:
             await asyncio.wait_for(wait_for_round(), 2)
-            assert batches == [symbols[:30], symbols[30:]]
-            assert prices.health_snapshot()['wait_orderbook_observation']['sampled_count'] == 35
+            assert [len(batch) for batch in batches] == batch_sizes
+            assert [symbol for batch in batches for symbol in batch] == symbols
+            assert prices.health_snapshot()['wait_orderbook_observation']['sampled_count'] == symbol_count
             records = observer.history(now.date())
-            assert len(records) == 35
+            assert len(records) == symbol_count
             assert all(row['ask_touch']['ask_size'] == 3 and row['status'] == 'not_observed' for row in records)
             assert all(row['ask_touch']['price_as_of'] is None for row in records)
             assert records[0]['ask_entry']['source'] == 'kis_orderbook_rest_confirmed'
