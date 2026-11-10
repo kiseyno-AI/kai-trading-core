@@ -650,28 +650,6 @@ async def resolve_supported_dart_corp_record(
     if normalized_stock_code is None:
         raise ValueError('DART corporation mapping contains an invalid stock code')
     try:
-        is_supported = await client.has_supported_stock_code(normalized_stock_code)
-    except Exception:
-        is_supported = True
-    if not is_supported:
-        mapping_authority = _dart_mapping_authority(client)
-        if (
-            mapping_authority is not None
-            and mapping_authority.get('authoritative') is not True
-        ):
-            return None, _non_authoritative_mapping_error(
-                stock_code=normalized_stock_code,
-                authority=mapping_authority,
-            )
-        return None, {
-            'stock_code': normalized_stock_code,
-            'error_type': 'DartLookupUnsupported',
-            'error': f'unsupported stock code for DART lookup: {normalized_stock_code}',
-            'terminal': True,
-            'status': CAPTURE_STATUS_MAPPING_FAILED,
-            'reason': UNSUPPORTED_CODE_REASON,
-        }
-    try:
         corp = await client.lookup_corp_code(stock_code=normalized_stock_code)
     except Exception as exc:
         error_type = type(exc).__name__
