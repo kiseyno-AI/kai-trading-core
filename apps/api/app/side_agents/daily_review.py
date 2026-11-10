@@ -24,6 +24,7 @@ from app.side_agents.store import SideAgentStore
 
 logger = logging.getLogger(__name__)
 REVIEW = 'daily-review'
+REVIEW_DUE_HHMM = (16, 30)
 CONTRACTS = Path(__file__).resolve().parents[4] / 'runtime_contracts' / 'openclaw' / 'v1'
 MIN_WATCH_OBSERVATIONS = 5
 MAX_EVIDENCE_BYTES = 120_000
@@ -188,7 +189,7 @@ def run_due_daily_review(
     is_trading_day: Callable[[date], bool] = _is_krx_session, dry_run: bool = False,
 ) -> UnitOutcome | None:
     current = (now or datetime.now(timezone.utc)).astimezone(KST)
-    market_date = target_market_date(current, is_trading_day)
+    market_date = target_market_date(current, is_trading_day, due_hhmm=REVIEW_DUE_HHMM)
     if market_date is None or current >= _window_close(market_date):
         return None
     day = market_date.isoformat()

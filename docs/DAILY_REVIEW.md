@@ -16,9 +16,11 @@ The review supplies measured coverage and bounded examples, prioritizing example
 
 ## Schedule and recovery
 
-The independent `com.kai.daily-review` launchd job invokes `python -m app.side_agents run-daily-review` from 21:30 KST on exchange sessions, with catch-up until 06:00 KST the next calendar day. The window allows stored evening inputs to become available. Review does not wait for the other side agents. A date lock prevents overlap. A completed date is immutable to the scheduler. Failures retry at least 25 minutes apart up to `SIDE_AGENTS_MAX_DAILY_ATTEMPTS` (three by default). Older weekly postmortems remain available via the legacy manual command.
+The independent `com.kai.daily-review` launchd job checks on the hour and half-hour. The first eligible KRX slot is 16:30 KST, with catch-up until 06:00 KST the next calendar day. The review uses stored evidence at its cutoff and reports gaps in later-arriving inputs. A date lock prevents overlap. A completed date is immutable to the scheduler. Failures retry at least 25 minutes apart up to `SIDE_AGENTS_MAX_DAILY_ATTEMPTS` (three by default). Older weekly postmortems remain available via the legacy manual command.
 
 Install the reviewed `postmortem-analyst` runtime contract using `scripts/sync_openclaw_runtime_contract.py --agent postmortem-analyst --install` and confirm it with `--check`. Run `scripts/install_side_agents_launchd.sh --daily-review` to install the dedicated job. Daily Review verifies OpenClaw storage capacity and that the canonical and live analyst files match. Its log is `var/side-agents/logs/daily-review.log`; the atomic records are `var/side-agents/daily-review/YYYY-MM-DD.json` or under `SIDE_AGENTS_OUTPUT_DIR` when set. The Core API and scheduler must share that directory.
+
+Keep the analyst's OpenClaw model and reasoning setting aligned with both deciders. The current setting is `openai/gpt-6.1-sol` with `medium` reasoning.
 
 ## Web handoff
 

@@ -16,7 +16,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/var/side-agents/logs"
-sed -e "s#__ROOT__#$ROOT#g" -e "s#__LABEL__#$LABEL#g" "$ROOT/scripts/launchd/com.kai.side-agents.plist.template" > "$PLIST"
+sed -e "s#__ROOT__#$ROOT#g" -e "s#__LABEL__#$LABEL#g" "$ROOT/scripts/launchd/$LABEL.plist.template" > "$PLIST"
 plutil -lint "$PLIST" >/dev/null
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST"

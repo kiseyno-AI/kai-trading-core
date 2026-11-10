@@ -28,6 +28,14 @@ def watch_outcomes():
     }
 
 
+def test_krx_daily_review_opens_at_1630():
+    kst = ZoneInfo('Asia/Seoul')
+    now = datetime(2026, 11, 10, 16, 30, tzinfo=kst)
+    assert daily_review.run_due_daily_review(now=now - timedelta(minutes=1), dry_run=True) is None
+    assert daily_review.run_due_daily_review(now=now, dry_run=True).unit == '2026-11-10'
+    assert daily_review.run_due_daily_review(now=now.replace(day=14), dry_run=True) is None
+
+
 def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, monkeypatch):
     day = date(2026, 11, 10)
     now = datetime(2026, 11, 10, 22, tzinfo=ZoneInfo('Asia/Seoul'))
