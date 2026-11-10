@@ -9,6 +9,8 @@ If a short-term watch is active or pending in Exec while the original core row s
 
 Price fields are display-oriented: realtime websocket prices are preferred, then local current-quote/cache fallback, then recent daily close. Fallback prices are labeled with `price_source`, `price_status`, `display_price_available`, and realtime subscription metadata so capacity-limited symbols do not look like true data gaps.
 
+For after-hours changes and hypothetical performance for a recorded session, use [monitoring session results](execution-runtime-monitoring-session-results.md).
+
 Validated prior-session WAIT decisions from either decider may appear as passive price observations. Each `wait_observations` entry contains the `decision_agent_name` and its numeric `trigger_price` when assigned. The Exec trigger and order authority remain separate. Observation-only symbols are listed in `realtime_subscription.observation_only_symbols` and carry `monitoring_statuses=["signal_wait_observation_only"]`. Existing holdings and live Exec membership keep their runtime classification. Core stops observing a decision after the linked actual execution confirms the buy was fully sold. The existing observation history is retained.
 
 Either lane's WAIT can supply the subscription, including when its `wait_observations.trigger_price` is null. A price-less WAIT receives quotes without trigger-touch tracking. When displaying decider prices for these symbols, request `/agent-context/feedback/payloads` with `watch_only=true` to get each WAIT lane independently. A sibling lane's `REJECT` or `AVOID_CHASE` does not appear in that response.

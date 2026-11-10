@@ -116,6 +116,7 @@ from app.quotes.kis_realtime_prices import (
     KISRealtimeMonitoredSymbolSource,
     kis_realtime_price_service,
 )
+from app.quotes.monitoring_session_history import MonitoringSessionHistory, monitoring_session_history
 from app.repositories.symbol_repository import load_symbols
 
 
@@ -2776,8 +2777,10 @@ class SignalDeciderExecIntegrationService:
         self,
         *,
         client: SignalDeciderExecClient | None = None,
+        session_history: MonitoringSessionHistory | None = None,
     ) -> None:
         self.client = client or SignalDeciderExecClient()
+        self._session_history = session_history
         self.dashboard_cache_ttl_seconds = max(int(settings.signal_decider_exec_dashboard_cache_ttl_seconds), 0)
         self.dashboard_refresh_debounce_seconds = max(
             float(settings.signal_decider_exec_dashboard_refresh_debounce_seconds),
@@ -6933,6 +6936,18 @@ class SignalDeciderExecIntegrationService:
                     source_version=membership.source_version,
                 )
         self._latest_exec_monitoring_membership = (market_date, membership)
+        if (
+            self._session_history is not None
+            and membership.membership_complete
+            and membership.symbols
+            and generated_at <= _utcnow()
+        ):
+            try:
+                await asyncio.to_thread(
+                    self._session_history.record_exec_membership, membership.symbols, generated_at,
+                )
+            except Exception:
+                logger.exception('Could not save Exec monitoring history for %s', market_date)
         return membership
 
     def _degraded_cached_exec_monitoring_membership(
@@ -16371,4 +16386,6 @@ class SignalDeciderExecIntegrationService:
         return REMOTE_FETCH_STATUS_UNAVAILABLE
 
 
-signal_decider_exec_integration_service = SignalDeciderExecIntegrationService()
+signal_decider_exec_integration_service = SignalDeciderExecIntegrationService(
+    session_history=monitoring_session_history,
+)

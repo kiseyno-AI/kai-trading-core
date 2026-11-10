@@ -30,6 +30,11 @@ from app.market.session import (
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
 )
 from app.market.symbol_codes import is_canonical_krx_short_code
+from app.quotes.monitoring_session_history import (
+    MonitoringLastQuote,
+    MonitoringSessionHistory,
+    monitoring_session_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,7 @@ KIS_REALTIME_PRICE_TR_ID = 'H0STCNT0'
 KIS_REALTIME_ORDERBOOK_TR_ID = 'H0STASP0'
 KIS_REALTIME_ORDERBOOK_MAX_AGE = timedelta(seconds=2)
 KIS_WAIT_ORDERBOOK_COVERAGE_MAX_AGE = timedelta(seconds=10)
+MONITORING_SESSION_CHECKPOINT_SECONDS = 2.0
 KIS_REALTIME_MAX_CHANNELS = 41
 KIS_UNSUBSCRIBE_ACK_TIMEOUT_SECONDS = 10.0
 KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
@@ -313,10 +319,15 @@ class KISRealtimeOrderbook:
 
 
 class KISRealtimePriceService:
-    def __init__(self, *, client: KISClient | None = None) -> None:
+    def __init__(
+        self, *, client: KISClient | None = None, session_history: MonitoringSessionHistory | None = None,
+    ) -> None:
         self.client = client or kis_client
         self._task: asyncio.Task[None] | None = None
         self._wait_orderbook_task: asyncio.Task[None] | None = None
+        self._session_history = session_history
+        self._session_history_task: asyncio.Task[None] | None = None
+        self._pending_session_history: dict[date, dict[str, MonitoringLastQuote | None]] = {}
         self._websocket: Any = None
         self._stop_requested = False
         self._subscription_changed_event: asyncio.Event | None = None
@@ -515,7 +526,7 @@ class KISRealtimePriceService:
             and session_open_at <= now <= session_close_at
         )
 
-    def _recorded_market_session_is_active(self) -> bool:
+    def _recorded_market_session_is_active(self, *, at: datetime | None = None) -> bool:
         with self._state_lock:
             active = bool(self._health.get('market_session_active'))
             session_open_at = _parse_iso_datetime(
@@ -524,12 +535,12 @@ class KISRealtimePriceService:
             session_close_at = _parse_iso_datetime(
                 self._health.get('market_session_close_at')
             )
-        now = _utc_now()
+        observed_at = at if at is not None else _utc_now()
         return bool(
             active
             and session_open_at is not None
             and session_close_at is not None
-            and session_open_at <= now <= session_close_at
+            and session_open_at <= observed_at <= session_close_at
         )
 
     def _record_market_session(self, market: Any, *, active: bool) -> str:
@@ -616,6 +627,10 @@ class KISRealtimePriceService:
             self._run_wait_orderbooks(),
             name='kis-wait-orderbooks',
         )
+        if self._session_history is not None:
+            self._session_history_task = asyncio.create_task(
+                self._run_session_checkpoints(), name='kis-monitoring-session-history',
+            )
 
     async def stop(self) -> None:
         self._stop_requested = True
@@ -659,7 +674,33 @@ class KISRealtimePriceService:
 
         if orderbook_task is not None:
             await asyncio.gather(orderbook_task, return_exceptions=True)
+        history_task = self._session_history_task
+        self._session_history_task = None
+        if history_task is not None:
+            # The checkpoint's file write must finish before the final flush.
+            await asyncio.gather(history_task, return_exceptions=True)
+        await self._flush_session_history()
         self._set_status('stopped')
+
+    async def _run_session_checkpoints(self) -> None:
+        while not self._stop_requested:
+            await self._flush_session_history()
+            await asyncio.sleep(MONITORING_SESSION_CHECKPOINT_SECONDS)
+
+    async def _flush_session_history(self) -> None:
+        if self._session_history is None:
+            return
+        with self._state_lock:
+            pending = {day: rows.copy() for day, rows in self._pending_session_history.items()}
+        for day, rows in pending.items():
+            try:
+                await asyncio.to_thread(self._session_history.record, day, rows)
+            except Exception:
+                logger.exception('Could not save KRX monitoring history for %s', day)
+                continue
+            with self._state_lock:
+                if self._pending_session_history.get(day) == rows:
+                    self._pending_session_history.pop(day, None)
 
     @staticmethod
     def _normalize_monitored_symbols(
@@ -1773,6 +1814,14 @@ class KISRealtimePriceService:
         if result_code == '0' and message_code == 'OPSP0001' and symbol:
             with self._state_lock:
                 self._pending_unsubscriptions.pop((tr_id, symbol), None)
+                if (
+                    self._session_history is not None
+                    and tr_id == self._price_tr_id()
+                    and symbol in self._subscribed_symbols
+                    and self._recorded_market_session_is_active(at=received_at)
+                ):
+                    market_date = received_at.astimezone(KST).date()
+                    self._pending_session_history.setdefault(market_date, {}).setdefault(symbol, None)
                 self._sync_health_symbols_locked()
             return
         message_text = _normalize_text(body.get('msg1')) or 'system_message'
@@ -1935,6 +1984,7 @@ class KISRealtimePriceService:
             self._health['last_price_received_at'] = _isoformat(received_at)
             for tick in ticks:
                 self._prices[tick.symbol] = tick
+                self._collect_session_trade_locked(tick)
         from app.agent_context.wait_price_observations import wait_price_observations
 
         for tick in ticks:
@@ -1951,6 +2001,33 @@ class KISRealtimePriceService:
                     received_at=tick.received_at, source='kis_trade_packet_ask',
                 )
         return [tick.to_public_dict() for tick in ticks]
+
+    def _collect_session_trade_locked(self, tick: KISRealtimePriceTick) -> None:
+        if (
+            self._session_history is None
+            or not self._health.get('market_session_active')
+            or tick.symbol not in self._subscribed_symbols
+            or tick.trade_halt
+            or tick.current_price is None
+            or not tick.current_price.is_finite()
+            or tick.current_price <= 0
+        ):
+            return
+        opened_at = _parse_iso_datetime(self._health.get('market_session_open_at'))
+        closed_at = _parse_iso_datetime(self._health.get('market_session_close_at'))
+        local = tick.price_as_of.astimezone(KST)
+        if (
+            opened_at is None or closed_at is None
+            or not opened_at <= tick.price_as_of <= min(closed_at, tick.received_at)
+            or local.date() != tick.received_at.astimezone(KST).date()
+            or tick.raw_fields.get('BSOP_DATE') != local.strftime('%Y%m%d')
+            or tick.raw_fields.get('STCK_CNTG_HOUR') != local.strftime('%H%M%S')
+        ):
+            return
+        session = self._pending_session_history.setdefault(local.date(), {})
+        previous = session.get(tick.symbol)
+        if previous is None or tick.price_as_of >= previous.as_of:
+            session[tick.symbol] = MonitoringLastQuote(tick.current_price, tick.price_as_of)
 
     def ingest_price_fields(
         self,
@@ -2147,4 +2224,4 @@ class KISRealtimePriceService:
         return payload
 
 
-kis_realtime_price_service = KISRealtimePriceService()
+kis_realtime_price_service = KISRealtimePriceService(session_history=monitoring_session_history)

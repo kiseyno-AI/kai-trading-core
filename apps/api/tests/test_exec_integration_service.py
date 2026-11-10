@@ -3,6 +3,8 @@ import copy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -101,6 +103,7 @@ from app.quotes.kis_realtime_prices import (
     KISRealtimeMonitoredSymbolSource,
     KISRealtimePriceService,
 )
+from app.quotes.monitoring_session_history import MonitoringSessionHistory
 
 
 def _runtime_monitored_membership_payload(
@@ -15110,6 +15113,37 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.client.runtime_membership_calls,
             calls_before_historical_read,
         )
+
+    async def test_session_history_retains_confirmed_exec_monitoring_without_a_quote(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            history = MonitoringSessionHistory(Path(temp_dir))
+            client = FakeExecClient()
+            service = SignalDeciderExecIntegrationService(client=client, session_history=history)
+            preopen = datetime(2026, 4, 29, 23, 50, tzinfo=timezone.utc)
+            client.runtime_membership_response = _runtime_monitored_membership_payload(
+                ['000660'], generated_at=preopen.isoformat(),
+            )
+            with patch('app.orders.exec_integration._utcnow', return_value=preopen):
+                await service._load_live_exec_monitoring_symbols(
+                    market_date=self.target_trade_date, trigger='test-preopen',
+                )
+            self.assertEqual(history.dates(), set())
+
+            now = datetime(2026, 4, 30, 0, 0, tzinfo=timezone.utc)
+
+            async def fetch_membership():
+                nonlocal now
+                now += timedelta(seconds=1)
+                return _runtime_monitored_membership_payload(['005930'], generated_at=now.isoformat())
+
+            with (
+                patch('app.orders.exec_integration._utcnow', side_effect=lambda: now),
+                patch.object(client, 'get_runtime_monitored_symbol_membership', side_effect=fetch_membership),
+            ):
+                await service._load_live_exec_monitoring_symbols(
+                    market_date=self.target_trade_date, trigger='test-open',
+                )
+            self.assertEqual(history.read(self.target_trade_date), {'005930': None})
 
     async def test_delayed_older_exec_membership_cannot_replace_newer_snapshot(
         self,
