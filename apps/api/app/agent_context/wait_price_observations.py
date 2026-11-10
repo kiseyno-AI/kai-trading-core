@@ -1,4 +1,4 @@
-"""Record WAIT trigger observations from KIS trades, without execution authority."""
+"""Record WAIT trigger observations from KIS trades and orderbook snapshots."""
 
 from __future__ import annotations
 
@@ -36,12 +36,15 @@ class WaitPriceWatch:
     source_market_date: str
     observed_at: str
     trigger_price: str
+    buy_direction: str | None = None
+    chase_limit_price: str | None = None
 
 
 def watch_from_snapshot(
     snapshot: SignalDeciderDecisionSnapshot, *, market_date: date,
 ) -> WaitPriceWatch | None:
     from app.orders.next_open_execution import (
+        _effective_short_term_tactical_action,
         _is_krx_next_open_snapshot,
         _short_term_tactical_action,
         _trigger_entry_price_values,
@@ -60,7 +63,9 @@ def watch_from_snapshot(
         or snapshot.market_date >= market_date
     ):
         return None
-    trigger = _trigger_entry_price_values(snapshot)['trigger_price']
+    levels = _trigger_entry_price_values(snapshot)
+    trigger = levels['trigger_price']
+    chase = levels['chase_limit_price']
     known_at = max(
         value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
         for value in (snapshot.created_at, snapshot.feedback_received_at)
@@ -77,6 +82,12 @@ def watch_from_snapshot(
         source_market_date=snapshot.market_date.isoformat(),
         observed_at=known_at.isoformat(),
         trigger_price=str(trigger),
+        buy_direction=(
+            'at_or_above'
+            if role == 'short-term-decider' and _effective_short_term_tactical_action(snapshot) == 'watch_for_trigger'
+            else 'at_or_below'
+        ),
+        chase_limit_price=str(chase) if chase is not None and chase.is_finite() and chase >= trigger else None,
     )
 
 
@@ -109,6 +120,8 @@ class WaitPriceObservations:
         self._started: dict[int, datetime] = {}
         self._previous: dict[int, tuple[datetime, Decimal]] = {}
         self._touched: set[int] = set()
+        self._ask_touched: set[int] = set()
+        self._ask_entries: set[int] = set()
 
     def recovery_watches(self, day: date) -> list[WaitPriceWatch]:
         return [
@@ -132,6 +145,8 @@ class WaitPriceObservations:
             same_day = self._day == day
             started_by_id = dict(self._started) if same_day else {}
             touched = set(self._touched) if same_day else set()
+            ask_touched = set(self._ask_touched) if same_day else set()
+            ask_entries = set(self._ask_entries) if same_day else set()
             grouped: dict[str, list[WaitPriceWatch]] = defaultdict(list)
             active_ids: set[int] = set()
             for watch in watches:
@@ -151,11 +166,17 @@ class WaitPriceObservations:
                 started_by_id[snapshot_id] = started
                 if path.with_name(f'{snapshot_id}.touch.json').is_file():
                     touched.add(snapshot_id)
+                if path.with_name(f'{snapshot_id}.ask-touch.json').is_file():
+                    ask_touched.add(snapshot_id)
+                if path.with_name(f'{snapshot_id}.ask-entry.json').is_file():
+                    ask_entries.add(snapshot_id)
             self._previous = {
                 key: value for key, value in self._previous.items() if same_day and key in active_ids
             }
             self._started = {key: started_by_id[key] for key in active_ids}
             self._touched = touched
+            self._ask_touched = ask_touched
+            self._ask_entries = ask_entries
             self._day = day
             self._watches = grouped
 
@@ -203,6 +224,63 @@ class WaitPriceObservations:
                     self._touched.add(snapshot_id)
                 self._previous[snapshot_id] = (tick.price_as_of, price)
 
+    def observe_ask(
+        self,
+        symbol: str,
+        ask: Decimal | None,
+        size: int | None,
+        *,
+        price_as_of: datetime | None,
+        received_at: datetime,
+        source: str,
+    ) -> bool:
+        if ask is None or not ask.is_finite() or ask <= 0 or size is None or size <= 0:
+            return False
+        observed_at = price_as_of or received_at
+        local = observed_at.astimezone(KST)
+        if not (
+            time(9) <= local.time() <= time(15, 30)
+            and timedelta(0) <= received_at - observed_at <= MAX_TRADE_DELAY
+        ):
+            return False
+        confirm = False
+        with self._lock:
+            if local.date() != self._day:
+                return False
+            for watch in self._watches.get(symbol, []):
+                key = watch.decision_snapshot_id
+                if key in self._ask_entries or observed_at < self._started[key]:
+                    continue
+                direction = watch.buy_direction
+                if direction is None:
+                    continue
+                trigger = Decimal(watch.trigger_price)
+                if not (ask >= trigger if direction == 'at_or_above' else ask <= trigger):
+                    continue
+                chase = Decimal(watch.chase_limit_price) if watch.chase_limit_price is not None else None
+                within_chase = ask <= chase if chase is not None else None
+                evidence = {
+                    'ask_price': str(ask), 'ask_size': size, 'direction': direction,
+                    'trigger_price': str(trigger), 'chase_limit_price': watch.chase_limit_price,
+                    'within_chase_limit': within_chase, 'source': source,
+                    'price_as_of': price_as_of.isoformat() if price_as_of is not None else None,
+                    'price_received_at': received_at.isoformat(),
+                }
+                folder = self.root / local.date().isoformat()
+                try:
+                    if key not in self._ask_touched:
+                        _write_once(folder / f'{key}.ask-touch.json', evidence)
+                        self._ask_touched.add(key)
+                    if within_chase:
+                        if price_as_of is None:
+                            confirm = True
+                        else:
+                            _write_once(folder / f'{key}.ask-entry.json', evidence)
+                            self._ask_entries.add(key)
+                except OSError:
+                    logger.exception('Could not save WAIT ask observation for snapshot %s', key)
+        return confirm
+
     def history(self, day: date, *, as_of: datetime | None = None) -> list[dict]:
         folder = self.root / day.isoformat()
         results = {}
@@ -220,6 +298,11 @@ class WaitPriceObservations:
             touch = _read(touch_path) if touch_path.is_file() else {}
             if touch and (as_of is None or datetime.fromisoformat(touch['price_received_at']) <= as_of):
                 row.update(touch)
+            for field, suffix in (('ask_touch', 'ask-touch'), ('ask_entry', 'ask-entry')):
+                path = folder / f'{key}.{suffix}.json'
+                evidence = _read(path) if path.is_file() else None
+                if evidence and (as_of is None or datetime.fromisoformat(evidence['price_received_at']) <= as_of):
+                    row[field] = evidence
             results[key] = row
         return [results[key] for key in sorted(results)]
 

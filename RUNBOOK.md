@@ -686,3 +686,10 @@ watch audit includes these records separately from simulated results. An
 qualifying touch was captured, which can include gaps in the quote stream.
 An operator can enroll validated recovery snapshots for a specific session
 with `--enroll-recovery SNAPSHOT_ID ...`. These records carry no order authority.
+
+WAIT history also records the first best ask that meets the order trigger
+and its displayed size. It separately records the first ask within the
+chase limit when confirmed with a timestamped quote. Core checks KIS
+multi-quote snapshots in batches during the regular session and also uses
+the best ask carried on trade messages. Multi-quote evidence uses receipt
+time, so the history can miss quotes between samples.

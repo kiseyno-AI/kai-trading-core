@@ -51,3 +51,97 @@ def test_same_symbol_keeps_independent_first_touch_history(tmp_path, monkeypatch
     history = stored.history(day)
     assert [(x['decision_snapshot_id'], x['status'], x['observed_price'], x['evidence'])
             for x in history] == [(1, 'touched', '98', 'crossed'), (2, 'touched', '105', 'exact')]
+
+
+def test_ask_touch_and_entry_band_are_independent_of_trade_history(tmp_path):
+    opened = datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
+    observer = WaitPriceObservations(tmp_path)
+    watch = wait_price_observations.WaitPriceWatch(
+        1, 'short-term-decider', '130580', '2026-11-09',
+        (opened - timedelta(hours=1)).isoformat(), '100',
+        buy_direction='at_or_above', chase_limit_price='103',
+    )
+    observer.configure(opened.date(), [watch], now=opened)
+    for second, price, size in [(1, '100', 0), (2, '104', 9), (3, '102', 7)]:
+        now = opened + timedelta(seconds=second)
+        observer.observe_ask('130580', Decimal(price), size, price_as_of=now, received_at=now, source='test')
+    result = observer.history(opened.date())[0]
+    assert result['status'] == 'not_observed'
+    assert result['ask_touch']['ask_price'] == '104'
+    assert result['ask_touch']['ask_size'] == 9
+    assert result['ask_touch']['within_chase_limit'] is False
+    assert result['ask_entry']['ask_price'] == '102'
+    assert result['ask_entry']['ask_size'] == 7
+    earlier = observer.history(opened.date(), as_of=opened + timedelta(seconds=2))[0]
+    assert earlier['ask_touch']['ask_price'] == '104'
+    assert 'ask_entry' not in earlier
+
+
+def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch):
+    import asyncio
+
+    from app.quotes import kis_realtime_prices
+
+    async def check():
+        now = datetime(2026, 11, 10, 4, 0, tzinfo=timezone.utc)
+        observer = WaitPriceObservations(tmp_path)
+        symbols = [f'{index:06d}' for index in range(1, 36)]
+        observer.configure(now.date(), [
+            wait_price_observations.WaitPriceWatch(
+                index, 'signal-decider', symbol, '2026-11-09',
+                (now - timedelta(hours=5)).isoformat(), '100',
+                buy_direction='at_or_below', chase_limit_price='100',
+            )
+            for index, symbol in enumerate(symbols, 1)
+        ], now=now)
+        batches = []
+
+        class Client:
+            def _environment(self):
+                return 'real'
+
+            def websocket_url(self):
+                return 'ws://example.test'
+
+            async def fetch_domestic_multi_quotes(self, batch):
+                batches.append(batch)
+                return [
+                    {'inter_shrn_iscd': symbol, 'inter2_askp': '99', 'inter2_bidp': '98', 'seln_rsqn': '3'}
+                    for symbol in batch
+                ]
+
+            async def fetch_domestic_orderbook(self, symbol):
+                assert symbol == symbols[0]
+                return {'output1': {
+                    'askp1': '99', 'bidp1': '98', 'askp_rsqn1': '3', 'aspr_acpt_hour': '130000',
+                }}
+
+        async def skip_trade_socket():
+            pass
+
+        monkeypatch.setattr(wait_price_observations, 'wait_price_observations', observer)
+        monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+        monkeypatch.setattr(kis_realtime_prices.settings, 'kis_realtime_price_enabled', True)
+        prices = KISRealtimePriceService(client=Client())
+        monkeypatch.setattr(prices, '_is_configured', lambda: (True, None))
+        monkeypatch.setattr(prices, '_recorded_market_session_is_active', lambda: True)
+        monkeypatch.setattr(prices, '_run', skip_trade_socket)
+        async def wait_for_round():
+            while 'wait_orderbook_observation' not in prices.health_snapshot():
+                await asyncio.sleep(0.001)
+
+        await prices.start()
+        try:
+            await asyncio.wait_for(wait_for_round(), 2)
+            assert batches == [symbols[:30], symbols[30:]]
+            assert prices.health_snapshot()['wait_orderbook_observation']['sampled_count'] == 35
+            records = observer.history(now.date())
+            assert len(records) == 35
+            assert all(row['ask_touch']['ask_size'] == 3 and row['status'] == 'not_observed' for row in records)
+            assert all(row['ask_touch']['price_as_of'] is None for row in records)
+            assert records[0]['ask_entry']['source'] == 'kis_orderbook_rest_confirmed'
+            assert 'ask_entry' not in records[1]
+        finally:
+            await prices.stop()
+
+    asyncio.run(check())
