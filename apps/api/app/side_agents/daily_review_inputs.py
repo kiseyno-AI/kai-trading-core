@@ -19,12 +19,15 @@ from app.db_models import (
 from app.external_news.store import list_external_news_items
 from app.market.clock import KST
 from app.market.session import get_krx_exchange_calendar_day
+from app.market_data_store import load_current_market_snapshot_context
+from app.market_news.service import market_news_service
 from app.side_agents.market_inputs import _num, aggregate_breadth
 from app.side_agents.schemas import MARKET_AGENT
 from app.side_agents.store import SideAgentStore
 
 
 MAX_EXAMPLES_PER_ROLE = 6
+MAX_MARKET_HEADLINES = 6
 RECENT_SESSION_COUNT = 5
 
 
@@ -54,20 +57,50 @@ def _number(value: Any) -> float | None:
     return number if number is not None and isfinite(number) else None
 
 
+def _has_price_range(value: Any) -> bool:
+    prices = _object(value)
+    high, low = _number(prices.get('high_price', prices.get('high'))), _number(prices.get('low_price', prices.get('low')))
+    return high is not None and low is not None and high >= low > 0
+
+
 def _role_watches(watches: list[dict], role: str) -> list[dict]:
     return [watch for watch in watches if watch['decision_agent_name'] == role]
+
+
+def _has_watch_event(watch: dict) -> bool:
+    return watch['status'] == 'touched' or bool(watch.get('ask_touch') or watch.get('ask_entry'))
 
 
 def _watch_counts(watches: list[dict]) -> dict:
     return {
         'observation_count': len(watches),
-        'watch_event_count': sum(
-            watch['status'] == 'touched' or bool(watch.get('ask_touch') or watch.get('ask_entry')) for watch in watches
-        ),
+        'watch_event_count': sum(_has_watch_event(watch) for watch in watches),
         'trade_touch_count': sum(watch['status'] == 'touched' for watch in watches),
         'ask_touch_count': sum(bool(watch.get('ask_touch')) for watch in watches),
         'ask_entry_count': sum(bool(watch.get('ask_entry')) for watch in watches),
     }
+
+
+def _watch_registration(watches: list[dict], session_open: datetime) -> dict:
+    starts = [datetime.fromisoformat(watch['tracking_started_at']).astimezone(KST) for watch in watches]
+    return {
+        'session_open_at': session_open.isoformat(),
+        'first_registered_at': min(starts).isoformat() if starts else None,
+        'last_registered_at': max(starts).isoformat() if starts else None,
+        'registered_after_open': sum(start > session_open for start in starts),
+    }
+
+
+def _source_status(current: bool, earlier_context: bool) -> str:
+    if current:
+        return 'available'
+    return 'context_only' if earlier_context else 'unavailable'
+
+
+def _execution_status(entry_fills: int, records: int) -> str:
+    if entry_fills:
+        return 'available'
+    return 'records_only' if records else 'unavailable'
 
 
 def _recent_sessions(day: date, cutoff: datetime) -> list[dict]:
@@ -176,6 +209,65 @@ def _market_analyst_context(store: SideAgentStore, day: date, cutoff: datetime) 
         **_fields(output, 'market_date', 'regime', 'posture_hint', 'volatility', 'confidence', 'summary_ko'),
         'trend': _fields(output.get('trend'), 'kospi', 'kosdaq'),
         'drivers': _items(output.get('drivers'), 'factor', 'direction', 'evidence'),
+    }
+
+
+def _timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed.astimezone(KST) if parsed.tzinfo is not None else None
+
+
+def _dashboard_leg_known(leg: dict, day: date, cached_at: datetime) -> bool:
+    observed = _timestamp(leg.get('provider_observed_at'))
+    collected = _timestamp(leg.get('collected_at'))
+    return bool(observed and collected and observed.date() == day and observed <= collected <= cached_at)
+
+
+def _dashboard_market_context(day: date, cutoff: datetime) -> dict | None:
+    snapshot = _object(load_current_market_snapshot_context())
+    cached_at = _timestamp(snapshot.get('cached_at'))
+    if cached_at is None or cached_at > cutoff:
+        return None
+
+    markets = {}
+    available = False
+    stored_markets = _object(_object(snapshot.get('payload')).get('markets'))
+    provenance_fields = ('status', 'observation_source', 'provider_observed_at', 'collected_at', 'error')
+    for key in ('kospi', 'kosdaq'):
+        row = _object(stored_markets.get(key))
+        index = _object(row.get('index_leg'))
+        flow = _object(row.get('flow_leg'))
+        legs = {}
+        if (
+            index.get('status') in ('ready', 'unverified') and index.get('observation_payload_match') is True
+            and _dashboard_leg_known(index, day, cached_at) and (_number(row.get('value')) or 0) > 0
+        ):
+            legs['index'] = {
+                **_fields(index, *provenance_fields),
+                **_fields(row, 'value', 'change_percent', 'open', 'high', 'low'),
+            }
+            available |= index['status'] == 'ready'
+        flows = _fields(row, 'foreign_net_value', 'institution_net_value')
+        if (
+            flows and flow.get('status') in ('ready', 'cached') and flow.get('current_session') is True
+            and _dashboard_leg_known(flow, day, cached_at)
+        ):
+            legs['flow'] = {
+                **_fields(flow, *provenance_fields, 'source'), **flows,
+                **_fields(row, 'investor_flow_value_unit'),
+            }
+            available = True
+        if legs:
+            markets[key] = legs
+    if not markets:
+        return None
+    return {
+        **_fields(snapshot, 'source', 'snapshot_status', 'cached_at'),
+        'status': _source_status(available, True),
+        'markets': markets,
     }
 
 
@@ -320,32 +412,63 @@ def _session_news(day: date, cutoff: datetime, symbols: list[str]) -> dict[str, 
     }
 
 
+def _market_headlines(day: date, cutoff: datetime) -> list[dict]:
+    start = datetime.combine(day, time.min, KST)
+    with session_timeout_budget(statement_timeout_ms=10_000):
+        rows = market_news_service.list_items(
+            topic_keys=['kr_kospi', 'kr_kosdaq', 'kr_foreign_flows'], start=start.astimezone(timezone.utc),
+            end=min(cutoff, start + timedelta(days=1)).astimezone(timezone.utc),
+            as_of=cutoff.astimezone(timezone.utc), persisted_before=cutoff.astimezone(timezone.utc),
+            limit=2 * MAX_MARKET_HEADLINES,
+        )
+    headlines = {}
+    for row in rows:
+        headlines.setdefault(row['url'], _fields(row, 'topic_key', 'title', 'url', 'published_at', 'first_seen_at'))
+        if len(headlines) == MAX_MARKET_HEADLINES:
+            break
+    return list(headlines.values())
+
+
 def load_daily_review_evidence(market_date: date, *, observed_at: datetime, store: SideAgentStore) -> dict[str, Any]:
     """Read stored KRX session evidence. An absent observation does not prove a price was missed."""
     if observed_at.tzinfo is None:
         raise ValueError('Daily Review observed_at must be timezone-aware')
+    session_open = datetime.combine(market_date, time(9), KST)
     watches = wait_price_observations.history(market_date, as_of=observed_at)
     watches = [watch for watch in watches if watch['decision_agent_name'] in DECISION_SUPPORT_AGENT_NAMES]
     roles = {}
     with session_scope(statement_timeout_ms=10_000) as db:
         executions = _stored_execution(db, market_date, observed_at, watches)
+        filled_ids = {key for key, rows in executions.items() if any(row['entry_fill_observed'] for row in rows)}
         breadth = _market_breadth(db, market_date, observed_at)
         for role in DECISION_SUPPORT_AGENT_NAMES:
             role_watches = _role_watches(watches, role)
             ordered = sorted(role_watches, key=lambda watch: (
-                not any(row['entry_fill_observed'] for row in executions.get(watch['decision_snapshot_id'], [])),
+                watch['decision_snapshot_id'] not in filled_ids,
                 not bool(watch.get('ask_entry')), not bool(watch.get('ask_touch')),
                 watch['status'] != 'touched', watch['decision_snapshot_id'],
             ))
+            priority = []
+            contrasts = []
+            for watch in ordered:
+                if watch['decision_snapshot_id'] in filled_ids or _has_watch_event(watch):
+                    priority.append(watch)
+                else:
+                    contrasts.append(watch)
+            fill_count = sum(watch['decision_snapshot_id'] in filled_ids for watch in role_watches)
+            priority_limit = max(min(fill_count, MAX_EXAMPLES_PER_ROLE), MAX_EXAMPLES_PER_ROLE - min(2, len(contrasts)))
+            selected = priority[:priority_limit]
+            selected.extend(contrasts[:MAX_EXAMPLES_PER_ROLE - len(selected)])
             role_execution = [outcome for watch in role_watches for outcome in executions.get(watch['decision_snapshot_id'], [])]
             roles[role] = {
                 **_watch_counts(role_watches),
+                'registration': _watch_registration(role_watches, session_open),
                 'actual_entry_fill_count': sum(row['entry_fill_observed'] for row in role_execution),
                 'actual_closed_trade_count': sum(row['closed_trade_observed'] for row in role_execution),
                 'execution_lifecycle_counts': dict(Counter(row['lifecycle_status'] for row in role_execution)),
                 'examples': [
                     {**watch, 'recorded_execution': executions.get(watch['decision_snapshot_id'], [])[:3]}
-                    for watch in ordered[:MAX_EXAMPLES_PER_ROLE]
+                    for watch in selected
                 ],
             }
         examples = [example for role in roles.values() for example in role['examples']]
@@ -370,40 +493,64 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
                 'confirmed_ask_mark_to_close_pct': round((price['close_price'] / ask - 1) * 100, 3) if ask and ask > 0 else None,
             }
     analyst_context = _market_analyst_context(store, market_date, observed_at)
-    has_market = bool(breadth or analyst_context)
+    dashboard = _dashboard_market_context(market_date, observed_at)
+    dashboard_status = dashboard['status'] if dashboard else 'unavailable'
+    dashboard_markets = dashboard['markets'] if dashboard else {}
+    analyst_is_current = bool(analyst_context and datetime.fromisoformat(analyst_context['completed_at']) >= session_open)
+    has_market = bool(breadth or analyst_is_current or dashboard_status == 'available')
+    index_legs = [_object(market.get('index')) for market in dashboard_markets.values()]
+    market_volatility = any(leg.get('status') == 'ready' and _has_price_range(leg) for leg in index_legs)
+    market_headlines = _market_headlines(market_date, observed_at)
     recent_sessions = _recent_sessions(market_date, observed_at)
     for name, role in roles.items():
-        role_contexts = [_object(example['decision_context']) for example in role['examples']]
+        role_examples = role['examples']
+        role_contexts = [_object(example['decision_context']) for example in role_examples]
+        current_technicals = [
+            snapshot for example in role_examples for snapshot in example['technical_snapshots']
+            if snapshot['market_date'] == market_date.isoformat()
+        ]
         role['source_status'] = {
             'watch': 'available' if role['watch_event_count'] else 'unavailable',
-            'actual_execution': 'available' if role['execution_lifecycle_counts'] else 'unavailable',
-            'market': 'available' if has_market or any(
-                example['session_price'] or example['technical_snapshots'] for example in role['examples']
-            ) or any(
-                _object(context.get('market_regime')).get('posture') in {'normal', 'caution', 'risk_off'}
-                for context in role_contexts
-            ) else 'unavailable',
-            'business': 'available' if any(example['session_filings'] for example in role['examples']) or any(
-                company.get('filings') or company.get('financial_highlights')
-                for company in (_object(context.get('company')) for context in role_contexts)
-            ) else 'unavailable',
-            'news': 'available' if any(example['session_news'] for example in role['examples']) or any(
-                _object(context.get('news_at_decision')).get('items') for context in role_contexts
-            ) else 'unavailable',
+            'actual_execution': _execution_status(
+                role['actual_entry_fill_count'], sum(role['execution_lifecycle_counts'].values()),
+            ),
+            'market': _source_status(
+                has_market or bool(current_technicals) or any(example['session_price'] for example in role_examples),
+                bool(dashboard or analyst_context) or any(example['technical_snapshots'] for example in role_examples) or any(
+                    _object(context.get('market_regime')).get('posture') in {'normal', 'caution', 'risk_off'}
+                    for context in role_contexts
+                ),
+            ),
+            'market_volatility': 'available' if market_volatility or any(
+                _has_price_range(example['session_price']) for example in role_examples
+            ) or any(snapshot['atr_pct_14'] is not None and snapshot['atr_pct_14'] >= 0
+                     for snapshot in current_technicals) else 'unavailable',
+            'business': _source_status(
+                any(example['session_filings'] for example in role_examples),
+                any(company.get('filings') or company.get('financial_highlights')
+                    for company in (_object(context.get('company')) for context in role_contexts)),
+            ),
+            'news': _source_status(
+                any(example['session_news'] for example in role_examples),
+                any(_object(context.get('news_at_decision')).get('items') for context in role_contexts),
+            ),
             'recent_sessions': 'available' if any(
                 session['roles'][name]['watch_event_count'] for session in recent_sessions
             ) else 'unavailable',
         }
     watch_event_count = sum(role['watch_event_count'] for role in roles.values())
+    execution_records = sum(map(len, executions.values()))
     return {
         'market_date': market_date.isoformat(),
         'observed_at': observed_at.isoformat(),
         'roles': roles,
         'market': {
-            'status': 'available' if has_market else 'unavailable',
+            'status': _source_status(has_market, bool(dashboard or analyst_context)),
             'breadth': aggregate_breadth(breadth) if breadth else None,
             'analyst_context': analyst_context,
+            'dashboard': dashboard,
         },
+        'market_headlines': market_headlines,
         'recent_sessions': recent_sessions,
         'coverage': {
             'watch': {
@@ -411,17 +558,28 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
                 'tracked_decisions': len(watches),
                 'event_bearing_decisions': watch_event_count,
                 'unique_symbols': len({watch['symbol'] for watch in watches}),
-                'scope': 'observation_count counts tracked decisions; watch_event_count counts decisions with recorded touch or ask evidence. Missing events do not establish coverage or a hit rate.',
+                'registration': _watch_registration(watches, session_open),
+                'registration_by_role': {name: role['registration'] for name, role in roles.items()},
+                'scope': 'Registration records the earliest possible monitoring time. The log does not measure feed coverage or a hit rate.',
                 'trade_touch': 'first exact trade or crossing between two accepted trades',
                 'ask_entry': 'first timestamped ask in the entry band with positive displayed size; not a fill',
             },
             'actual_execution': {
-                'status': 'available' if executions else 'unavailable',
-                'scope': 'stored linked execution outcomes for observed WATCH snapshots and this target session; gross results; account mode not inferred',
-                'records': sum(map(len, executions.values())),
+                'status': _execution_status(sum(role['actual_entry_fill_count'] for role in roles.values()), execution_records),
+                'scope': 'Stored records linked to the watched decisions for this session. Records without fills describe lifecycle only.',
+                'records': execution_records,
             },
             'decision_context': {'covered_examples': len(contexts), 'examples': len(examples)},
             'market_risk': {'records': len(breadth), 'source': 'daily_market_risk_snapshots'},
+            'market_dashboard': {
+                'status': dashboard_status,
+                'markets': {name: {leg: item['status'] for leg, item in legs.items()}
+                            for name, legs in dashboard_markets.items()},
+            },
+            'market_headlines': {
+                'items': len(market_headlines), 'source': 'market_news_items',
+                'scope': 'Market-wide topic headlines. They provide context without linking a catalyst to a watched symbol.',
+            },
             'session_price': {'covered_symbols': len(session_prices), 'scope': 'EOD bar marks, no fill or exit inference'},
             'technical_snapshots': {'covered_symbols': len(technicals), 'scope': 'up to three dated snapshots available at cutoff per sampled symbol'},
             'session_filings': {'covered_symbols': len(filings), 'scope': 'same-session DART receipts available at cutoff for sampled symbols'},
