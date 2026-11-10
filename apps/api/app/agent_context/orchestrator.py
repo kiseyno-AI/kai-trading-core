@@ -2510,7 +2510,7 @@ class OpenClawAgentClient:
         if max_chars <= 0 or len(base_message) <= max_chars:
             return base_message
         compressed_items = [_compressed_batch_item_for_prompt(item) for item in batch_items]
-        compact_message = (
+        compact_header = (
             f"Request marker: {request_marker}\n"
             f"Role: {spec.role}\n"
             f"Instruction: {spec.instruction}\n"
@@ -2531,10 +2531,18 @@ class OpenClawAgentClient:
             "Missing detailed quarterly/cash-flow context should usually reduce confidence only, not make the symbol untradeable on its own.\n"
             f"{contract_prompt_suffix}\n"
             f"Market date: {market_date.isoformat()}\n"
-            f"Assigned batch payload:\n{json.dumps(compressed_items, ensure_ascii=False, separators=(',', ':'))}"
+            "Assigned batch payload:\n"
         )
-        if max_chars <= 0 or len(compact_message) <= max_chars:
+        compact_message = compact_header + json.dumps(compressed_items, ensure_ascii=False, separators=(',', ':'))
+        if len(compact_message) <= max_chars:
             return compact_message
+        if any('material_news_provenance' in item for item in compressed_items):
+            # Optional news provenance must not consume space needed by the existing batch.
+            for item in compressed_items:
+                item.pop('material_news_provenance', None)
+            compact_message = compact_header + json.dumps(compressed_items, ensure_ascii=False, separators=(',', ':'))
+            if len(compact_message) <= max_chars:
+                return compact_message
         raise AgentDispatchTerminalError(
             'OpenClaw prompt budget is too small to encode the requested batch without dropping assigned symbols',
             details={

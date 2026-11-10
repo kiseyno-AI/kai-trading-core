@@ -6376,6 +6376,85 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('context_provenance', message)
         self.assertIn('raw_payload', message)
 
+    def test_decider_compact_prompt_retains_material_news_provenance(self):
+        material_item = {
+            'title': 'Company releases guidance',
+            'url': 'https://news.example/guidance',
+            'provider': 'example',
+            'published_at': '2026-04-14T05:00:00+00:00',
+            'materiality_bucket': 'material',
+            'access_status': 'snippet_only',
+        }
+        source_item = {
+            'symbol': '005930',
+            'agent_name': 'signal-decider',
+            'symbol_day_context': {
+                'symbol': '005930',
+                'market': 'KOSPI',
+                'market_date': '2026-04-14',
+                'currency': 'KRW',
+                'exchange': 'KRX',
+                'company': {'name': 'Company'},
+                'market_session': {'status': 'closed'},
+                'market_data_phase_contract': {'status': 'finalized'},
+                'quote_context': {'price': 100},
+                'price_context': {'close_price': 100},
+                'technical_snapshot': {'trend_state': 'up'},
+                'action_summary': {'action_label': 'wait'},
+                'intraday_execution_context': {'status': 'not_applicable'},
+                'valuation_context': {'status': 'unavailable'},
+                'investor_flow_context': {'status': 'available'},
+                'short_selling_context': {'status': 'available'},
+                'sector_peer_context': {'status': 'available'},
+                'market_relative_context': {'status': 'available'},
+                'market_breadth_context': {'status': 'available'},
+                'recent_external_news': {
+                    'status': 'available',
+                    'material_items': [
+                        {**material_item, 'snippet': 'MATERIAL_NEWS_BODY' * 5000},
+                        {**material_item, 'title': 'Another material article'},
+                        {**material_item, 'title': 'X' * 2000, 'url': 'https://news.example/' + 'x' * 2000},
+                        {**material_item, 'title': 'Fourth material article'},
+                    ],
+                    'unknown_items': [{'title': 'Unclassified article'}],
+                },
+            },
+        }
+        with patch.object(orchestrator_module.settings, 'openclaw_agent_max_prompt_chars', 60_000):
+            message = OpenClawAgentClient()._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                batch_items=[source_item],
+                request_marker='batch-request::material-news',
+            )
+
+        self.assertLessEqual(len(message), 60_000)
+        [sent_item] = json.loads(message.rsplit('Assigned batch payload:\n', 1)[1])
+        provenance = sent_item['material_news_provenance']
+        self.assertEqual(provenance['status'], 'available')
+        news = provenance['material_items']
+        self.assertEqual(len(news), 3)
+        self.assertEqual(news[0], material_item)
+        self.assertEqual(news[1]['title'], 'Another material article')
+        self.assertLess(len(news[2]['title']), 2000)
+        self.assertNotIn('url', news[2])
+        self.assertNotIn('MATERIAL_NEWS_BODY', json.dumps(provenance))
+        self.assertNotIn('Unclassified article', json.dumps(news))
+        tight_cap = len(message) - 1
+        with patch.object(orchestrator_module.settings, 'openclaw_agent_max_prompt_chars', tight_cap):
+            bounded_message = OpenClawAgentClient()._build_batch_message(
+                spec=orchestrator_module.DISPATCH_SPECS[-1],
+                market_date=orchestrator_module.date.fromisoformat('2026-04-14'),
+                batch_items=[source_item],
+                request_marker='batch-request::material-news',
+            )
+
+        self.assertLessEqual(len(bounded_message), tight_cap)
+        [bounded_item] = json.loads(bounded_message.rsplit('Assigned batch payload:\n', 1)[1])
+        self.assertEqual(bounded_item['symbol'], '005930')
+        self.assertEqual(bounded_item['symbol_day_context']['price_context']['close_price'], 100)
+        self.assertNotIn('material_news_provenance', bounded_item)
+
     def test_compressed_batch_item_for_prompt_keeps_bulky_raw_fields_as_summaries(self):
         compressed = compressed_batch_item_for_prompt(
             {
