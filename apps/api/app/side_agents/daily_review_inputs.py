@@ -13,7 +13,8 @@ from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
 from app.agent_context.wait_price_observations import wait_price_observations
 from app.db import session_scope, session_timeout_budget
 from app.db_models import (
-    DailyMarketRiskSnapshot, DailyPriceBar, SignalDeciderActualExecutionOutcome, SignalDeciderDecisionSnapshot, Symbol,
+    DailyMarketRiskSnapshot, DailyPriceBar, DailyTechnicalSnapshot, DartDisclosureEvent,
+    SignalDeciderActualExecutionOutcome, SignalDeciderDecisionSnapshot, Symbol,
 )
 from app.external_news.store import list_external_news_items
 from app.market.clock import KST
@@ -45,7 +46,7 @@ def _fields(value: Any, *keys: str) -> dict:
 
 
 def _items(value: Any, *keys: str) -> list[dict]:
-    return [_fields(item, *keys) for item in value[:2] if isinstance(item, dict)] if isinstance(value, list) else []
+    return [fields for item in value[:2] if (fields := _fields(item, *keys))] if isinstance(value, list) else []
 
 
 def _number(value: Any) -> float | None:
@@ -60,6 +61,9 @@ def _role_watches(watches: list[dict], role: str) -> list[dict]:
 def _watch_counts(watches: list[dict]) -> dict:
     return {
         'observation_count': len(watches),
+        'watch_event_count': sum(
+            watch['status'] == 'touched' or bool(watch.get('ask_touch') or watch.get('ask_entry')) for watch in watches
+        ),
         'trade_touch_count': sum(watch['status'] == 'touched' for watch in watches),
         'ask_touch_count': sum(bool(watch.get('ask_touch')) for watch in watches),
         'ask_entry_count': sum(bool(watch.get('ask_entry')) for watch in watches),
@@ -73,38 +77,52 @@ def _recent_sessions(day: date, cutoff: datetime) -> list[dict]:
         if not get_krx_exchange_calendar_day(prior_day).is_open:
             continue
         watches = wait_price_observations.history(prior_day, as_of=cutoff)
+        roles = {role: _watch_counts(_role_watches(watches, role)) for role in DECISION_SUPPORT_AGENT_NAMES}
         history.append({
             'market_date': prior_day.isoformat(),
-            'roles': {role: _watch_counts(_role_watches(watches, role)) for role in DECISION_SUPPORT_AGENT_NAMES},
-            'status': 'available' if watches else 'unavailable',
+            'roles': roles,
+            'status': 'available' if any(role['watch_event_count'] for role in roles.values()) else 'unavailable',
         })
         if len(history) == RECENT_SESSION_COUNT:
             break
     return history
 
 
-def _stored_execution(
-    db: Session, market_date: date, cutoff: datetime, snapshot_ids: list[int],
-) -> dict[int, list[dict]]:
-    if not snapshot_ids:
+def _matches_watch(watch: dict, *, role: str, symbol: str, source_day: date) -> bool:
+    return (role, symbol, source_day.isoformat()) == (
+        watch['decision_agent_name'], watch['symbol'], watch['source_market_date'],
+    )
+
+
+def _stored_execution(db: Session, market_date: date, cutoff: datetime, watches: list[dict]) -> dict[int, list[dict]]:
+    by_id = {watch['decision_snapshot_id']: watch for watch in watches}
+    if not by_id:
         return {}
     outcome = SignalDeciderActualExecutionOutcome
-    rows = db.scalars(select(outcome).options(load_only(
+    snapshot = SignalDeciderDecisionSnapshot
+    rows = db.execute(select(outcome, snapshot.agent_name, snapshot.symbol, snapshot.market_date).join(
+        snapshot, (snapshot.id == outcome.decision_snapshot_id) & (snapshot.symbol == outcome.symbol)
+        & (snapshot.market_date == outcome.source_market_date),
+    ).options(load_only(
         outcome.id, outcome.decision_snapshot_id, outcome.lifecycle_status,
         outcome.entry_filled_at, outcome.exit_filled_at, outcome.entry_filled_quantity,
         outcome.exit_filled_quantity, outcome.closed_quantity, outcome.open_quantity,
         outcome.entry_average_fill_price, outcome.exit_average_fill_price,
         outcome.entry_notional_krw, outcome.exit_notional_krw, outcome.realized_pnl_krw,
-        outcome.realized_return_pct, outcome.computed_at, outcome.exit_reason,
+        outcome.realized_return_pct,
     )).where(
-        outcome.decision_snapshot_id.in_(snapshot_ids),
+        outcome.decision_snapshot_id.in_(by_id),
         outcome.target_trade_date == market_date,
         outcome.created_at <= cutoff,
         outcome.updated_at <= cutoff,
         outcome.computed_at <= cutoff,
-    ).order_by(outcome.id)).all()
+        snapshot.created_at <= cutoff,
+        func.coalesce(snapshot.feedback_received_at, snapshot.created_at) <= cutoff,
+    ).order_by(outcome.id))
     results: dict[int, list[dict]] = {}
-    for row in rows:
+    for row, role, symbol, source_day in rows:
+        if not _matches_watch(by_id[row.decision_snapshot_id], role=role, symbol=symbol, source_day=source_day):
+            continue
         entry_at = _aware(row.entry_filled_at) if row.entry_filled_at else None
         exit_at = _aware(row.exit_filled_at) if row.exit_filled_at else None
         # The row aggregates fills across the lifecycle, so later fills invalidate its historical state.
@@ -116,19 +134,15 @@ def _stored_execution(
             and quantity is not None and quantity > 0
         )
         has_closed_trade = bool(
-            has_entry and exit_at and exit_at >= entry_at and actual_execution_outcome_exclusion_reason(row) is None
+            has_entry and entry_at and exit_at and exit_at >= entry_at and actual_execution_outcome_exclusion_reason(row) is None
         )
+        realized_return = _number(row.realized_return_pct) if has_closed_trade else None
         results.setdefault(row.decision_snapshot_id, []).append({
-            'outcome_id': row.id,
             'lifecycle_status': row.lifecycle_status,
             'entry_fill_observed': has_entry,
             'closed_trade_observed': has_closed_trade,
-            'entry_filled_at': entry_at.isoformat() if has_entry else None,
-            'exit_filled_at': exit_at.isoformat() if has_closed_trade else None,
-            'entry_average_fill_price': _number(row.entry_average_fill_price) if has_entry else None,
-            'exit_reason': row.exit_reason if has_closed_trade else None,
-            'gross_realized_pnl_krw': _number(row.realized_pnl_krw) if has_closed_trade else None,
-            'gross_realized_return_pct': _number(row.realized_return_pct) if has_closed_trade else None,
+            # The execution ledger stores a fractional return despite its column name.
+            'gross_realized_return_pct': round(realized_return * 100, 4) if realized_return is not None else None,
         })
     return results
 
@@ -172,17 +186,16 @@ def _decision_contexts(db: Session, watches: list[dict], cutoff: datetime) -> di
     snapshot = SignalDeciderDecisionSnapshot
     rows = db.execute(select(
         snapshot.id, snapshot.agent_name, snapshot.symbol, snapshot.market_date,
-        snapshot.policy_version, snapshot.confidence_score_10, snapshot.request_payload,
+        snapshot.policy_version, snapshot.confidence_score_10, snapshot.thesis_summary,
+        snapshot.suggested_holding_period, snapshot.target_price, snapshot.stop_loss_price,
+        snapshot.invalidation_conditions_payload, snapshot.request_payload,
     ).where(
         snapshot.id.in_(by_id), snapshot.created_at <= cutoff,
         func.coalesce(snapshot.feedback_received_at, snapshot.created_at) <= cutoff,
     ))
     results = {}
     for row in rows:
-        watch = by_id[row.id]
-        if (row.agent_name, row.symbol, row.market_date.isoformat()) != (
-            watch['decision_agent_name'], watch['symbol'], watch['source_market_date'],
-        ):
+        if not _matches_watch(by_id[row.id], role=row.agent_name, symbol=row.symbol, source_day=row.market_date):
             continue
         request = _object(row.request_payload)
         context = _object(request.get('symbol_day_context'))
@@ -192,9 +205,18 @@ def _decision_contexts(db: Session, watches: list[dict], cutoff: datetime) -> di
         dart = _object(context.get('recent_dart_events'))
         factors = _object(_object(request.get('factor_summary')).get('factor_scores'))
         company = _fields(context.get('company'), 'name_ko', 'market', 'instrument_type', 'is_preferred_share')
+        highlights = _object(latest.get('highlights'))
+        invalidations = row.invalidation_conditions_payload
         results[row.id] = {
             'policy_version': row.policy_version,
             'confidence_score_10': _number(row.confidence_score_10),
+            'thesis_summary': row.thesis_summary[:360],
+            'suggested_holding_period': row.suggested_holding_period,
+            'target_price': row.target_price,
+            'stop_loss_price': row.stop_loss_price,
+            'invalidation_conditions': [
+                condition[:240] for condition in invalidations[:5] if isinstance(condition, str)
+            ] if isinstance(invalidations, list) else [],
             'market_regime': _fields(request.get('market_regime_context'), 'market_date', 'status', 'posture', 'market_regime', 'reason_summary'),
             'factor_scores': {
                 key: _fields(value, 'score', 'status', 'market_date') for key, value in list(factors.items())[:10]
@@ -205,7 +227,11 @@ def _decision_contexts(db: Session, watches: list[dict], cutoff: datetime) -> di
                 'sector': _fields(context.get('sector_peer_context'), 'sector_name').get('sector_name'),
                 **_fields(fundamentals.get('history_summary'), 'latest_receipt_date', 'latest_period_end_date'),
                 'fundamentals_freshness': _fields(fundamentals.get('freshness_provenance'), 'freshness_status', 'as_of_market_date'),
-                'financial_highlights': _fields(latest.get('highlights'), 'revenue', 'operating_profit', 'net_income', 'operating_cash_flow', 'free_cash_flow', 'summary'),
+                'financial_highlights': {
+                    key: amounts for key in ('revenue', 'operating_profit', 'net_income', 'operating_cash_flow', 'free_cash_flow')
+                    if (amounts := _fields(highlights.get(key), 'current_amount', 'current_cumulative_amount', 'prior_amount', 'currency'))
+                    and (amounts.get('current_amount') is not None or amounts.get('current_cumulative_amount') is not None)
+                },
                 'filings': _items(dart.get('items'), 'report_name', 'report_nm', 'receipt_date', 'filing_category'),
             },
             'news_at_decision': {
@@ -228,6 +254,51 @@ def _session_prices(db: Session, day: date, cutoff: datetime, symbols: list[str]
         bar.close_price > 0,
     )).mappings()
     return {row['symbol']: {**row, 'captured_at': _aware(row['captured_at']).isoformat()} for row in rows}
+
+
+def _recent_technicals(db: Session, day: date, cutoff: datetime, symbols: list[str]) -> dict[str, list[dict]]:
+    if not symbols:
+        return {}
+    technical = DailyTechnicalSnapshot
+    rows = db.execute(select(
+        Symbol.symbol, technical.market_date, technical.captured_at, technical.source,
+        technical.trend_state, technical.ma_alignment, technical.breakout_20d, technical.breakdown_20d,
+        technical.return_5d, technical.return_20d, technical.volume_ratio_20d, technical.atr_pct_14,
+    ).join(Symbol, Symbol.id == technical.symbol_id).where(
+        Symbol.symbol.in_(symbols), technical.market_date.between(day - timedelta(days=14), day),
+        technical.created_at <= cutoff, technical.captured_at <= cutoff, technical.updated_at <= cutoff,
+    ).order_by(Symbol.symbol, technical.market_date.desc())).mappings()
+    by_symbol: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        if len(by_symbol[row['symbol']]) < 3:
+            by_symbol[row['symbol']].append({
+                **_fields(dict(row), 'source', 'trend_state', 'ma_alignment', 'breakout_20d', 'breakdown_20d'),
+                'market_date': row['market_date'].isoformat(),
+                'captured_at': _aware(row['captured_at']).isoformat(),
+                **{key: _number(row[key]) for key in ('return_5d', 'return_20d', 'volume_ratio_20d', 'atr_pct_14')},
+            })
+    return dict(by_symbol)
+
+
+def _session_filings(db: Session, day: date, cutoff: datetime, symbols: list[str]) -> dict[str, list[dict]]:
+    if not symbols:
+        return {}
+    filing = DartDisclosureEvent
+    rows = db.execute(select(
+        filing.stock_code, filing.rcept_no, filing.report_nm, filing.filing_category, filing.created_at,
+    ).where(
+        filing.stock_code.in_(symbols), filing.receipt_date == day,
+        filing.created_at <= cutoff, filing.updated_at <= cutoff,
+    ).order_by(filing.stock_code, filing.rcept_no.desc()))
+    by_symbol: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        if len(by_symbol[row.stock_code]) < 2:
+            by_symbol[row.stock_code].append({
+                'receipt_date': day.isoformat(), 'receipt_number': row.rcept_no,
+                'report_name': row.report_nm[:240], 'filing_category': row.filing_category,
+                'first_seen_at': _aware(row.created_at).isoformat(),
+            })
+    return dict(by_symbol)
 
 
 def _session_news(day: date, cutoff: datetime, symbols: list[str]) -> dict[str, list[dict]]:
@@ -257,7 +328,7 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
     watches = [watch for watch in watches if watch['decision_agent_name'] in DECISION_SUPPORT_AGENT_NAMES]
     roles = {}
     with session_scope(statement_timeout_ms=10_000) as db:
-        executions = _stored_execution(db, market_date, observed_at, [watch['decision_snapshot_id'] for watch in watches])
+        executions = _stored_execution(db, market_date, observed_at, watches)
         breadth = _market_breadth(db, market_date, observed_at)
         for role in DECISION_SUPPORT_AGENT_NAMES:
             role_watches = _role_watches(watches, role)
@@ -281,12 +352,16 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
         contexts = _decision_contexts(db, examples, observed_at)
         example_symbols = sorted({example['symbol'] for example in examples})
         session_prices = _session_prices(db, market_date, observed_at, example_symbols)
+        technicals = _recent_technicals(db, market_date, observed_at, example_symbols)
+        filings = _session_filings(db, market_date, observed_at, example_symbols)
     session_news = _session_news(market_date, observed_at, example_symbols)
     for example in examples:
         example.update(
             decision_context=contexts.get(example['decision_snapshot_id']),
             session_news=session_news.get(example['symbol'], []),
             session_price=None,
+            technical_snapshots=technicals.get(example['symbol'], []),
+            session_filings=filings.get(example['symbol'], []),
         )
         if price := session_prices.get(example['symbol']):
             ask = _number(_object(example.get('ask_entry')).get('ask_price'))
@@ -300,23 +375,26 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
     for name, role in roles.items():
         role_contexts = [_object(example['decision_context']) for example in role['examples']]
         role['source_status'] = {
-            'watch': 'available' if role['observation_count'] else 'unavailable',
+            'watch': 'available' if role['watch_event_count'] else 'unavailable',
             'actual_execution': 'available' if role['execution_lifecycle_counts'] else 'unavailable',
-            'market': 'available' if has_market or any(example['session_price'] for example in role['examples']) or any(
+            'market': 'available' if has_market or any(
+                example['session_price'] or example['technical_snapshots'] for example in role['examples']
+            ) or any(
                 _object(context.get('market_regime')).get('posture') in {'normal', 'caution', 'risk_off'}
                 for context in role_contexts
             ) else 'unavailable',
-            'business': 'available' if any(
-                company.get('sector') or company.get('latest_receipt_date') or company.get('financial_highlights')
+            'business': 'available' if any(example['session_filings'] for example in role['examples']) or any(
+                company.get('filings') or company.get('financial_highlights')
                 for company in (_object(context.get('company')) for context in role_contexts)
             ) else 'unavailable',
             'news': 'available' if any(example['session_news'] for example in role['examples']) or any(
                 _object(context.get('news_at_decision')).get('items') for context in role_contexts
             ) else 'unavailable',
             'recent_sessions': 'available' if any(
-                session['roles'][name]['observation_count'] for session in recent_sessions
+                session['roles'][name]['watch_event_count'] for session in recent_sessions
             ) else 'unavailable',
         }
+    watch_event_count = sum(role['watch_event_count'] for role in roles.values())
     return {
         'market_date': market_date.isoformat(),
         'observed_at': observed_at.isoformat(),
@@ -329,9 +407,11 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
         'recent_sessions': recent_sessions,
         'coverage': {
             'watch': {
-                'status': 'available' if watches else 'unavailable',
+                'status': 'available' if watch_event_count else 'unavailable',
+                'tracked_decisions': len(watches),
+                'event_bearing_decisions': watch_event_count,
                 'unique_symbols': len({watch['symbol'] for watch in watches}),
-                'scope': 'persisted tracking records only; not continuous quote coverage or every WAIT decision',
+                'scope': 'observation_count counts tracked decisions; watch_event_count counts decisions with recorded touch or ask evidence. Missing events do not establish coverage or a hit rate.',
                 'trade_touch': 'first exact trade or crossing between two accepted trades',
                 'ask_entry': 'first timestamped ask in the entry band with positive displayed size; not a fill',
             },
@@ -343,6 +423,8 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
             'decision_context': {'covered_examples': len(contexts), 'examples': len(examples)},
             'market_risk': {'records': len(breadth), 'source': 'daily_market_risk_snapshots'},
             'session_price': {'covered_symbols': len(session_prices), 'scope': 'EOD bar marks, no fill or exit inference'},
+            'technical_snapshots': {'covered_symbols': len(technicals), 'scope': 'up to three dated snapshots available at cutoff per sampled symbol'},
+            'session_filings': {'covered_symbols': len(filings), 'scope': 'same-session DART receipts available at cutoff for sampled symbols'},
             'session_news': {'covered_symbols': len(session_news), 'scope': 'stored news linked before cutoff for sampled symbols'},
         },
     }

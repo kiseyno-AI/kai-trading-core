@@ -17,7 +17,7 @@ and never filled in. For a past market date the live legs (index, flows, US prox
 `python -m app.side_agents run-due` (from `apps/api`) decides what is due, dispatches through the OpenClaw
 gateway (`POST /v1/responses`, model `openclaw/<agent>`), validates the reply fail-closed and writes it to
 `var/side-agents/<agent>/<unit>.json`. `scripts/install_side_agents_launchd.sh` installs a per-user launchd job
-that calls the evening analysts and the separate `run-daily-review` command every 30 minutes. The schedule logic uses KRX time. The legacy weekly postmortem remains available as a manual command.
+that calls the evening analysts every 30 minutes. `scripts/install_side_agents_launchd.sh --daily-review` installs the independent Daily Review job with the same interval. The schedule logic uses KRX time. The legacy weekly postmortem remains available as a manual command.
 
 - **Idempotent:** a finished unit is never re-run. Interrupted news batches resume.
 - **Quota-safe:** only failed or rejected attempts count; at most `SIDE_AGENTS_MAX_DAILY_ATTEMPTS` (3) per

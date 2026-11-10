@@ -18,12 +18,12 @@ GET /agent-context/daily-review?market_date=2026-11-10
     "updated_at": "2026-11-10T21:35:07+09:00",
     "error": null,
     "watch_outcomes": {
-      "signal-decider": {"observation_count": 35, "trade_touch_count": 2, "ask_touch_count": 6,
+      "signal-decider": {"observation_count": 35, "watch_event_count": 6, "trade_touch_count": 2, "ask_touch_count": 6,
         "ask_entry_count": 5, "actual_entry_fill_count": 0, "actual_closed_trade_count": 0,
         "source_status": {"watch": "available", "actual_execution": "unavailable"}},
-      "short-term-decider": {"observation_count": 2, "trade_touch_count": 0, "ask_touch_count": 0,
+      "short-term-decider": {"observation_count": 2, "watch_event_count": 0, "trade_touch_count": 0, "ask_touch_count": 0,
         "ask_entry_count": 0, "actual_entry_fill_count": 0, "actual_closed_trade_count": 0,
-        "source_status": {"watch": "available", "actual_execution": "unavailable"}}
+        "source_status": {"watch": "unavailable", "actual_execution": "unavailable"}}
     }
   }]
 }
@@ -36,7 +36,7 @@ GET /agent-context/daily-review?market_date=2026-11-10
 | `error` | A short machine-readable failure reason when available |
 | `observed_at` | Evidence cutoff for this attempt |
 | `evidence_coverage` | Source availability and counts once evidence is assembled |
-| `watch_outcomes` | Per-role counts for tracked WAIT decisions, trade touches, best-ask touches, asks in the entry band, recorded fills and closed trades, with source availability |
+| `watch_outcomes` | Per-role counts for tracked WAIT decisions (`observation_count`), decisions with a persisted touch or ask event (`watch_event_count`), trade touches, best-ask touches, asks in the entry band, recorded fills and closed trades, with source availability |
 | `evidence_sha256`, `analyst_contract_sha256` | Evidence payload and verified analyst contract digests |
 | `feedback` | On completion, the Korean summary and `roles` keyed by `signal-decider` and `short-term-decider`. Each has `assessment_ko`, `findings` (`source`, `observation_ko`, `implication_ko`), and a nullable `focus`. |
 | `candidates` | On completion, per-role `status`, `focus`, `base_sha256`, and `contract_sha256`. Status is `ready_for_review`, `unchanged`, `insufficient_evidence`, or `calibration_block_full`. |

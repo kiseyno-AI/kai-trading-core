@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -11,6 +12,7 @@ from app.side_agents.store import SideAgentStore
 
 def install_analyst_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(daily_review.settings, 'openclaw_state_dir', str(tmp_path))
+    monkeypatch.setattr(daily_review.settings, 'openclaw_dispatch_min_free_bytes', 0)
     workspace = tmp_path / 'workspace-postmortem-analyst'
     workspace.mkdir()
     (workspace / 'AGENTS.md').write_bytes(
@@ -32,11 +34,12 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
         assert market_date == day
         assert observed_at == now
         stats = {
-            'observation_count': 12, 'trade_touch_count': 4, 'ask_touch_count': 5, 'ask_entry_count': 3,
+            'observation_count': 12, 'watch_event_count': 6, 'trade_touch_count': 4, 'ask_touch_count': 5, 'ask_entry_count': 3,
             'actual_entry_fill_count': 1, 'actual_closed_trade_count': 0, 'source_status': {'watch': 'available'},
             'examples': [{'private': 'evidence'}],
         }
-        return {'roles': {role: stats for role in daily_review.DECIDER_ROLES}}
+        no_events = {**dict.fromkeys(stats, 0), 'observation_count': 12, 'source_status': {'watch': 'unavailable'}}
+        return {'roles': {'signal-decider': stats, 'short-term-decider': no_events}}
 
     class Analyst:
         calls = 0
@@ -51,7 +54,7 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
                 "summary_ko": "호가와 체결을 구분했습니다.",
                 "roles": {
                     "signal-decider": {"assessment_ko": "호가 관찰", "findings": [{"source": "watch", "observation_ko": "호가 잔량 차이", "implication_ko": "진입 가정 점검"}], "focus": "entry_liquidity"},
-                    "short-term-decider": {"assessment_ko": "기존 기준 유지", "findings": [], "focus": null}
+                    "short-term-decider": {"assessment_ko": "가용성 확인", "findings": [{"source": "watch", "observation_ko": "호가 확인 필요", "implication_ko": "진입 가정 점검"}], "focus": "entry_liquidity"}
                 }
             }'''
 
@@ -65,10 +68,11 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
     run = api.get(f'/agent-context/daily-review?market_date={day}').json()['runs'][0]
     assert run['status'] == 'completed'
     assert run['candidates']['signal-decider']['status'] == 'ready_for_review'
-    assert run['candidates']['short-term-decider']['status'] == 'unchanged'
+    assert run['candidates']['short-term-decider']['status'] == 'insufficient_evidence'
     assert 'contract_markdown' not in run['candidates']['signal-decider']
     assert 'evidence' not in run
     assert run['watch_outcomes']['signal-decider']['ask_entry_count'] == 3
+    assert run['watch_outcomes']['short-term-decider']['watch_event_count'] == 0
     artifact = store.load_result('daily-review', day.isoformat())
     assert 'displayed offer depth' in artifact['candidate_contracts']['signal-decider']
     assert 'displayed offer depth' not in artifact['candidate_contracts']['short-term-decider']
@@ -109,3 +113,31 @@ def test_failed_attempt_near_window_end_is_terminal(tmp_path, monkeypatch):
     assert daily_review.run_due_daily_review(now=now, **options).status == 'failed'
     assert store.load_result('daily-review', '2026-11-10')['status'] == 'failed'
     assert daily_review.run_due_daily_review(now=now + timedelta(minutes=10), **options) is None
+
+
+def test_interrupted_last_attempt_does_not_stay_running(tmp_path, monkeypatch):
+    install_analyst_contract(tmp_path, monkeypatch)
+    monkeypatch.setattr(daily_review.settings, 'side_agents_output_dir', str(tmp_path))
+    monkeypatch.setattr(daily_review.settings, 'side_agents_max_daily_attempts', 1)
+    now = datetime(2026, 11, 10, 22, tzinfo=ZoneInfo('Asia/Seoul'))
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        daily_review.run_due_daily_review(now=now, evidence_loader=interrupted, is_trading_day=lambda _: True)
+    run = TestClient(app).get('/agent-context/daily-review?market_date=2026-11-10').json()['runs'][0]
+    assert (run['status'], run['error']) == ('failed', 'interrupted')
+
+
+def test_storage_admission_blocks_a_review_before_dispatch(tmp_path, monkeypatch):
+    install_analyst_contract(tmp_path, monkeypatch)
+    monkeypatch.setattr(daily_review.settings, 'openclaw_dispatch_min_free_bytes', 2**63)
+    store = SideAgentStore(tmp_path)
+    now = datetime(2026, 11, 10, 22, tzinfo=ZoneInfo('Asia/Seoul'))
+
+    def collect(*args, **kwargs):
+        raise AssertionError('blocked reviews must not collect evidence or dispatch')
+
+    result = daily_review.run_due_daily_review(now=now, store=store, evidence_loader=collect, is_trading_day=lambda _: True)
+    assert result.detail == 'openclaw_storage_admission_blocked'

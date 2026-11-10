@@ -9,9 +9,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from app.agent_context.model_identity import DECIDER_ROLES
+from app.agent_context.openclaw_storage_admission import inspect_openclaw_storage_admission
 from app.agent_context.response_contract import decode_strict_agent_json_object
 from app.agent_context.safe_file import SafeFileReadError, read_bounded_regular_file
 from app.core.settings import settings
@@ -43,7 +44,7 @@ FOCUS_SOURCES: dict[Focus, str] = {
     'business_quality': 'business', 'dated_news': 'news', 'volatility': 'market',
 }
 WATCH_RESULT_FIELDS = (
-    'observation_count', 'trade_touch_count', 'ask_touch_count', 'ask_entry_count',
+    'observation_count', 'watch_event_count', 'trade_touch_count', 'ask_touch_count', 'ask_entry_count',
     'actual_entry_fill_count', 'actual_closed_trade_count', 'source_status',
 )
 ReviewText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=600)]
@@ -80,6 +81,24 @@ def _digest(text: str) -> str:
 
 def _window_close(day: date) -> datetime:
     return datetime.combine(day + timedelta(days=1), time(6), KST)
+
+
+def _visible_status(record: dict[str, Any], *, store: SideAgentStore, key: str) -> dict[str, Any]:
+    if record.get('status') == 'running':
+        try:
+            with (store.root / REVIEW / '.locks' / key).open() as lock:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                record = store.load_result(REVIEW, key) or record
+        except BlockingIOError:
+            return record
+        except FileNotFoundError:
+            pass
+        if record.get('status') == 'running':
+            can_retry = record['attempt'] < max(1, settings.side_agents_max_daily_attempts)
+            record = {**record, 'status': 'retry_wait' if can_retry else 'failed', 'error': 'interrupted'}
+    if record.get('status') == 'retry_wait' and datetime.now(KST) >= _window_close(date.fromisoformat(record['market_date'])):
+        return {**record, 'status': 'failed'}
+    return record
 
 
 def _candidate(role: str, day: str, feedback: RoleReview, evidence: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -126,8 +145,7 @@ def list_daily_reviews(*, market_date: date | None, limit: int) -> dict[str, Any
     for key in keys:
         record = store.load_result(REVIEW, key)
         if record is not None:
-            if record['status'] == 'retry_wait' and datetime.now(KST) >= _window_close(date.fromisoformat(key)):
-                record = {**record, 'status': 'failed'}
+            record = _visible_status(record, store=store, key=key)
             runs.append({
                 field: record[field] for field in (
                     'market_date', 'status', 'stage', 'attempt', 'observed_at', 'updated_at', 'error',
@@ -195,8 +213,14 @@ def _run_review(
         'observed_at': now.isoformat(), 'updated_at': now.isoformat(), 'error': None,
     }
     store.write_result(REVIEW, day, record)
-    error = 'postmortem_contract_mismatch'
+    error = 'openclaw_storage_admission_blocked'
     try:
+        admission = inspect_openclaw_storage_admission(
+            state_dir=settings.openclaw_state_dir, min_free_bytes=settings.openclaw_dispatch_min_free_bytes,
+        )
+        if admission['admitted'] is not True:
+            raise SideAgentValidationError('OpenClaw storage admission denied')
+        error = 'postmortem_contract_mismatch'
         contract_sha = _verified_analyst_contract()
         error = 'evidence_unavailable'
         if evidence_loader is None:
@@ -239,7 +263,7 @@ def _run_review(
         contracts = {}
         for role, feedback in review.roles.items():
             candidates[role], contracts[role] = _candidate(role, day, feedback, record['watch_outcomes'][role])
-    except (OSError, SafeFileReadError, SideAgentDispatchError, ValidationError, ValueError) as exc:
+    except (OSError, SafeFileReadError, SideAgentDispatchError, ValueError) as exc:
         logger.warning('daily review %s %s (%s)', day, error, type(exc).__name__)
     except Exception:
         logger.exception('daily review %s %s', day, error)
