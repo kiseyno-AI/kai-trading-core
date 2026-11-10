@@ -18,7 +18,9 @@ from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     DEFAULT_AGENT_NAMES,
     SIGNAL_DECIDER_AGENT_NAME,
+    SUMMARIZER_AGENT_NAMES,
 )
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.core.settings import settings
 from app.db import session_scope
 from app.db_models import (
@@ -382,6 +384,31 @@ def _request_payload_knowledge_cutoff_at(payload: Any) -> datetime | None:
     return None
 
 
+def recovered_feedback_source(
+    summary: Any,
+    context: Any,
+) -> tuple[str, int] | None:
+    if not isinstance(summary, dict) or not isinstance(context, dict):
+        return None
+    recovery = summary.get('recovery_provenance')
+    normalized_feedback = summary.get('normalized_feedback')
+    if (
+        summary.get('collector_mode') != 'persisted_failure_recovery'
+        or not isinstance(recovery, dict)
+        or recovery != context.get('recovery_provenance')
+        or recovery.get('mode') != 'persisted_failure_response_recovery'
+        or recovery.get('reason') != 'optional_improvement_notes_omitted'
+        or not isinstance(normalized_feedback, dict)
+        or normalized_feedback.get('response_contract_valid') is not True
+    ):
+        return None
+    run_id = str(recovery.get('source_run_id') or '').strip()
+    failure_id = recovery.get('source_failure_id')
+    if not run_id or type(failure_id) is not int or failure_id <= 0:
+        return None
+    return run_id, failure_id
+
+
 def _authoritative_summary_reuse_evidence(
     *,
     run: Any,
@@ -391,16 +418,16 @@ def _authoritative_summary_reuse_evidence(
     knowledge_cutoff_at: datetime | None,
     fs_div: str,
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Return only reuse evidence proven by one completed summary parent."""
+    """Return reuse evidence proven by the summary parent's completed scope."""
 
-    if (
-        run is None
-        or str(getattr(run, 'status', '') or '').strip().lower()
-        != 'completed'
-        or getattr(run, 'market_date', None) != market_date
-        or int(getattr(run, 'failed_count', 0) or 0) != 0
-        or int(getattr(run, 'completed_count', 0) or 0)
-        != int(getattr(run, 'symbols_total', 0) or 0)
+    if run is None or getattr(run, 'market_date', None) != market_date:
+        return {}
+    status = str(getattr(run, 'status', '') or '').strip().lower()
+    total = getattr(run, 'symbols_total', 0)
+    completed = getattr(run, 'completed_count', 0)
+    failed = getattr(run, 'failed_count', 0)
+    if status not in {'completed', 'partial'} or (
+        status == 'completed' and (failed != 0 or completed != total)
     ):
         return {}
 
@@ -436,6 +463,41 @@ def _authoritative_summary_reuse_evidence(
     if not requested_roles.issubset(parent_roles):
         return {}
 
+    requested_symbols = set(symbols)
+    if status == 'partial':
+        # The retry service also depends on reuse. Share its terminal proof
+        # without importing the retry orchestrator during module initialization.
+        from app.agent_context.retry_service import resolve_terminal_role_success_intersection
+
+        progress = summary_payload.get('progress_summary')
+        role_scopes = request_payload.get('role_symbol_scopes')
+        run_id = getattr(run, 'run_id', None)
+        if (
+            knowledge_cutoff_at is None
+            or not run_id
+            or getattr(run, 'completed_at', None) is None
+            or request_payload.get('mode') != DAILY_RETRY_CYCLE_MODE
+            or parent_roles != set(SUMMARIZER_AGENT_NAMES)
+            or not isinstance(progress, Mapping)
+            or progress.get('run_id') != run_id
+            or progress.get('run_status') != status
+            or not isinstance(role_scopes, Mapping)
+        ):
+            return {}
+        scope = resolve_terminal_role_success_intersection(
+            progress_summary=progress,
+            roles=SUMMARIZER_AGENT_NAMES,
+            expected_role_symbol_scopes=role_scopes,
+        )
+        if (
+            scope.get('ready') is not True
+            or scope.get('total_items') != total
+            or scope.get('completed_items') != completed
+            or scope.get('failed_items') != failed
+        ):
+            return {}
+        requested_symbols.intersection_update(scope['completed_symbols'])
+
     evidence_by_role = summary_payload.get(
         'reused_feedback_evidence_by_role'
     )
@@ -446,7 +508,6 @@ def _authoritative_summary_reuse_evidence(
     ):
         return {}
 
-    requested_symbols = set(symbols)
     resolved: dict[tuple[str, str], dict[str, Any]] = {}
     for role in roles:
         role_evidence = evidence_by_role.get(role)
@@ -733,6 +794,7 @@ class AgentContextReuseService:
                             latest_failure_map[(failure_row.symbol, agent_name)] = failure_row
 
             authoritative_feedback_map: dict[tuple[str, str], Any] = {}
+            authoritative_recovery_run_ids: dict[tuple[str, str], str] = {}
             normalized_summary_run_id = str(
                 authoritative_summary_run_id or ''
             ).strip()
@@ -793,6 +855,15 @@ class AgentContextReuseService:
                     ):
                         continue
                     authoritative_feedback_map[key] = row
+                    source = recovered_feedback_source(
+                        row.summary_payload,
+                        row.context_payload,
+                    )
+                    if source is not None and source == (
+                        evidence.get('recovery_source_run_id'),
+                        evidence.get('recovery_source_failure_id'),
+                    ):
+                        authoritative_recovery_run_ids[key] = source[0]
 
             decision_support_source_by_symbol = (
                 self._load_decision_support_source_updated_at(
@@ -816,6 +887,7 @@ class AgentContextReuseService:
                 )
                 if str(getattr(row, 'run_id', None) or '').strip()
             }
+            evidence_run_ids.update(authoritative_recovery_run_ids.values())
             run_order_by_id: dict[
                 str,
                 tuple[datetime, int, datetime, int],
@@ -1098,11 +1170,13 @@ class AgentContextReuseService:
                         isinstance(flag, str) and flag in {'missing_batch_feedback', 'unstructured_response'}
                         for flag in latest_risk_flags
                     ) or has_newer_failure
+                    cutoff_run_id = authoritative_recovery_run_ids.get(
+                        (symbol, agent_name),
+                        str(latest_feedback.run_id or '').strip(),
+                    )
                     has_knowledge_cutoff_mismatch = (
                         normalized_knowledge_cutoff_at is not None
-                        and run_knowledge_cutoff_by_id.get(
-                            str(latest_feedback.run_id or '').strip()
-                        )
+                        and run_knowledge_cutoff_by_id.get(cutoff_run_id)
                         != normalized_knowledge_cutoff_at
                     )
                     feedback_market_date = latest_feedback.market_date if latest_feedback is not None else None

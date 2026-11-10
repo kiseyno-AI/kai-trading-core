@@ -16,6 +16,8 @@ from app.agent_context.reuse_service import (
     _failure_supersedes_feedback,
 )
 from app.agent_context.retry_service import AgentFeedbackRetryService
+from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 
 
 def _decision(*, should_dispatch: bool, reason: str, fingerprint: str = 'sha256:abc'):
@@ -114,7 +116,7 @@ class _FlexibleRowsResult:
 
 
 class _AuthoritativeSummarySession:
-    def __init__(self):
+    def __init__(self, *, partial=False, recovery_cutoff=None):
         market_date = date(2026, 4, 16)
         cutoff = '2026-04-16T06:30:00+00:00'
         feedback = SimpleNamespace(
@@ -181,6 +183,76 @@ class _AuthoritativeSummarySession:
                 },
             },
         )
+        if partial:
+            recovery = {
+                'mode': 'persisted_failure_response_recovery',
+                'reason': 'optional_improvement_notes_omitted',
+                'source_run_id': 'original-summary-run',
+                'source_failure_id': 9,
+            }
+            feedback.summary_payload = {
+                'collector_mode': 'persisted_failure_recovery',
+                'recovery_provenance': recovery,
+                'normalized_feedback': {'response_contract_valid': True},
+            }
+            feedback.context_payload = {'recovery_provenance': dict(recovery)}
+            summary_parent.summary_payload['reused_feedback_evidence_by_role'][
+                'eod-summarizer'
+            ]['005930'].update({
+                'recovery_source_run_id': 'original-summary-run',
+                'recovery_source_failure_id': 9,
+            })
+            roles = SUMMARIZER_AGENT_NAMES
+            scopes = {role: ['000660', '005930'] for role in roles}
+            completed_at = '2026-04-16T07:00:00+00:00'
+            summary_parent.run_id = 'summary-parent-run'
+            summary_parent.status = 'partial'
+            summary_parent.completed_at = datetime.fromisoformat(completed_at)
+            summary_parent.symbols_total = 6
+            summary_parent.completed_count = 4
+            summary_parent.failed_count = 1
+            summary_parent.request_payload.update({
+                'mode': DAILY_RETRY_CYCLE_MODE,
+                'roles': list(roles),
+                'role_symbol_scopes': scopes,
+            })
+            progress = {
+                'run_id': summary_parent.run_id,
+                'run_status': 'partial',
+                'run_table_status': 'partial',
+                'is_live': False,
+                'run_completed_at': completed_at,
+                'expected_feedback_count': 6,
+                'completed_feedback_count': 4,
+                'failed_items': 1,
+                'role_symbol_scopes': scopes,
+                'role_symbol_counts': dict.fromkeys(roles, 2),
+                'completed_symbols_by_role': {'technical-summarizer': ['005930']},
+                'failed_symbols_by_role': {'fundamental-summarizer': ['000660']},
+                'role_progress': {},
+            }
+            for role in roles:
+                pending = int(role == 'technical-summarizer')
+                failed = int(role == 'fundamental-summarizer')
+                status = (
+                    'incomplete' if pending
+                    else 'completed_with_failures' if failed
+                    else 'completed'
+                )
+                progress['role_progress'][role] = {
+                    'role': role,
+                    'status': status,
+                    'boundary_status': status,
+                    'total_symbols': 2,
+                    'processed_symbols': 2 - pending,
+                    'completed_symbols': 2 - failed - pending,
+                    'terminal_symbols': 2 - pending,
+                    'failed_items': failed,
+                    'in_progress_symbols': 0,
+                    'pending_symbols': pending,
+                    'retry_pending_symbols': failed + pending,
+                }
+            summary_parent.summary_payload['progress_summary'] = progress
         feedback_run = SimpleNamespace(
             id=11,
             run_id='valid-feedback-run',
@@ -192,7 +264,7 @@ class _AuthoritativeSummarySession:
                 31,
                 tzinfo=timezone.utc,
             ),
-            request_payload={'knowledge_cutoff_at': cutoff},
+            request_payload={} if partial else {'knowledge_cutoff_at': cutoff},
         )
         failure_run = SimpleNamespace(
             id=12,
@@ -207,6 +279,18 @@ class _AuthoritativeSummarySession:
             ),
             request_payload={'knowledge_cutoff_at': cutoff},
         )
+        run_rows = [feedback_run, failure_run]
+        if partial:
+            run_rows.append(
+                SimpleNamespace(
+                    id=10,
+                    run_id='original-summary-run',
+                    started_at=datetime(2026, 4, 16, 6, 31, tzinfo=timezone.utc),
+                    request_payload={
+                        'knowledge_cutoff_at': recovery_cutoff or cutoff,
+                    },
+                )
+            )
         self._results = iter(
             (
                 _FlexibleRowsResult(
@@ -215,12 +299,16 @@ class _AuthoritativeSummarySession:
                 _FlexibleRowsResult([feedback]),
                 _FlexibleRowsResult([failure]),
                 _FlexibleRowsResult([summary_parent]),
-                _FlexibleRowsResult([feedback]),
-                _FlexibleRowsResult([feedback_run, failure_run]),
+                _FlexibleRowsResult(run_rows),
             )
         )
+        self._authoritative_feedback = feedback
 
-    def execute(self, _statement):
+    def execute(self, statement):
+        if [column['name'] for column in statement.column_descriptions] == [
+            'AgentContextFeedback'
+        ]:
+            return _FlexibleRowsResult([self._authoritative_feedback])
         return next(self._results)
 
 
@@ -405,11 +493,34 @@ class FundamentalReuseServiceTests(unittest.TestCase):
     def test_completed_summary_parent_evidence_overrides_later_failure_tombstone(
         self,
     ):
+        self._assert_summary_parent_evidence_is_reused(
+            self._summary_parent_reuse_decision(partial=False)
+        )
+
+    def test_partial_summary_parent_reuses_evidence_for_a_fully_completed_symbol(
+        self,
+    ):
+        self._assert_summary_parent_evidence_is_reused(
+            self._summary_parent_reuse_decision(partial=True)
+        )
+
+    def test_recovered_summary_parent_evidence_requires_original_source_cutoff(self):
+        decision = self._summary_parent_reuse_decision(
+            partial=True,
+            recovery_cutoff='2026-04-16T06:20:00+00:00',
+        )
+        self.assertTrue(decision.should_dispatch)
+        self.assertEqual(decision.reason, 'knowledge_cutoff_mismatch')
+
+    def _summary_parent_reuse_decision(self, *, partial, recovery_cutoff=None):
         service = AgentContextReuseService()
 
         @contextmanager
         def authoritative_session_scope():
-            yield _AuthoritativeSummarySession()
+            yield _AuthoritativeSummarySession(
+                partial=partial,
+                recovery_cutoff=recovery_cutoff,
+            )
 
         with (
             patch(
@@ -422,7 +533,7 @@ class FundamentalReuseServiceTests(unittest.TestCase):
                 return_value=None,
             ),
         ):
-            decision = service.build_latest_decisions(
+            return service.build_latest_decisions(
                 market_date='2026-04-16',
                 symbols=['005930'],
                 roles=['eod-summarizer'],
@@ -431,6 +542,7 @@ class FundamentalReuseServiceTests(unittest.TestCase):
                 authoritative_summary_run_id='summary-parent-run',
             )['005930']['eod-summarizer']
 
+    def _assert_summary_parent_evidence_is_reused(self, decision):
         self.assertFalse(decision.should_dispatch)
         self.assertEqual(
             decision.reason,

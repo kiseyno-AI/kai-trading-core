@@ -6136,6 +6136,51 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
                     request_marker='batch-request::trim-fallback',
                 )
 
+    def test_signal_decider_dispatch_fits_compressed_payload_without_json_padding(self):
+        market_date = date(2026, 4, 14)
+        spec = next(spec for spec in orchestrator_module.DISPATCH_SPECS if spec.role == 'signal-decider')
+        item = {
+            'symbol': '005930',
+            'market_date': market_date.isoformat(),
+            'dispatch_id': 'prompt-budget-test:signal-decider:slot-1:batch-1',
+            'context_provenance': {'raw': 'x' * 80000},
+            'upstream_summaries': {
+                'technical-summarizer': {'summary': '거래량을 확인했습니다.', 'raw_payload': 'y' * 80000},
+            },
+        }
+        client = OpenClawAgentClient()
+        with patch.object(orchestrator_module.settings, 'openclaw_agent_max_prompt_chars', 60000):
+            reference = client._build_batch_message(
+                spec=spec,
+                market_date=market_date,
+                batch_items=[item],
+                request_marker=f"batch-request::{item['dispatch_id']}:attempt-1",
+            )
+        payload_marker = 'Assigned batch payload:\n'
+        header, encoded = reference.rsplit(payload_marker, 1)
+        expected_payload = json.loads(encoded)
+        padded_size = len(header + payload_marker + json.dumps(expected_payload, ensure_ascii=False))
+        budget = padded_size - 10
+        output = {'items': [{'symbol': '005930', 'feedback': _complete_actionable_signal_feedback()}]}
+        response = httpx.Response(200, json={
+            'status': 'completed',
+            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(output)}]}],
+        })
+        with (
+            patch.object(orchestrator_module.settings, 'openclaw_agent_max_prompt_chars', budget),
+            patch.object(client, '_raise_if_circuit_broken', return_value=False),
+            patch.object(client, '_post_model_request', return_value=(response, {}, None, None, False)) as post,
+            patch.object(client, '_observe_post_dispatch_model_identity', return_value=None),
+            patch.object(orchestrator_module, 'log_agent_feedback_event'),
+        ):
+            result = client.dispatch_batch(spec=spec, market_date=market_date, batch_items=[item])
+
+        post.assert_called_once()
+        sent_prompt = post.call_args.kwargs['body']['input']
+        self.assertLessEqual(len(sent_prompt), budget)
+        self.assertEqual(json.loads(sent_prompt.rsplit(payload_marker, 1)[1]), expected_payload)
+        self.assertEqual(result['response_correlation']['response_symbols'], ['005930'])
+
     def test_signal_decider_prompt_compression_preserves_every_assigned_symbol_and_count(self):
         fake_settings = SimpleNamespace(
             openclaw_base_url='https://openclaw.example',
@@ -6168,8 +6213,8 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         self.assertIn('Request marker: batch-request::compress-all', message)
         self.assertIn('Assigned symbols (exact authoritative strings): ["005930", "000660"]', message)
         self.assertIn('output exactly 2 item(s)', message)
-        self.assertIn('"symbol": "005930"', message)
-        self.assertIn('"symbol": "000660"', message)
+        sent_items = json.loads(message.rsplit('Assigned batch payload:\n', 1)[1])
+        self.assertEqual([item['symbol'] for item in sent_items], ['005930', '000660'])
         self.assertGreaterEqual(message.count('compressed_payload'), 2)
         self.assertIn('usage_policy.model_guidance_eligible=true', message)
         self.assertIn('must never relax wait/reject into buy or authorize a buy', message)
@@ -6324,7 +6369,8 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
 
         self.assertLess(len(message), fake_settings.openclaw_agent_max_prompt_chars)
         self.assertIn('Assigned symbols (exact authoritative strings): ["005930"]', message)
-        self.assertIn('"symbol": "005930"', message)
+        sent_items = json.loads(message.rsplit('Assigned batch payload:\n', 1)[1])
+        self.assertEqual([item['symbol'] for item in sent_items], ['005930'])
         self.assertIn('compressed_payload', message)
         self.assertIn('hash', message)
         self.assertIn('context_provenance', message)

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Install a launchd job that runs the decider-evaluation refresh at 23:00 and
-# 23:45 local time daily (the command itself decides whether it is due and
-# refreshes once per KRX session). Remove with:
+# Check every 30 minutes so the KRX evening window works in any host timezone.
+# The command refreshes each report once per KRX session. Remove with:
 #   launchctl bootout gui/$(id -u)/com.kiseyno.kai-decider-evaluation-refresh
 set -euo pipefail
 label=com.kiseyno.kai-decider-evaluation-refresh
@@ -15,10 +14,7 @@ cat > "$plist" <<PLIST
 <plist version="1.0"><dict>
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key><array><string>/bin/bash</string><string>$repo/scripts/run_decider_evaluation_refresh.sh</string></array>
-  <key>StartCalendarInterval</key><array>
-    <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>45</integer></dict>
-  </array>
+  <key>StartInterval</key><integer>1800</integer>
   <key>StandardOutPath</key><string>$log_dir/decider-evaluation-refresh.log</string>
   <key>StandardErrorPath</key><string>$log_dir/decider-evaluation-refresh.log</string>
 </dict></plist>
