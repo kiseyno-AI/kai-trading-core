@@ -1,6 +1,6 @@
 # GET /quotes/realtime/orderbooks
 
-Returns the latest in-memory KRX best bid and ask for protected monitoring symbols with an active KIS book subscription. Books need a valid exchange time no older than two seconds. A disconnect, invalid book, or stale exchange time removes the corresponding live hint. The route does not request data from KIS.
+Returns the latest in-memory KRX best bid and ask for protected monitoring symbols with an active KIS book subscription. Books need a valid exchange time no older than two seconds. A disconnect, invalid book, or stale exchange time removes the corresponding live hint. The route does not request data from KIS. Removed websocket channels retain their slot until KIS acknowledges the unsubscribe. When a book rejection or missing acknowledgment leaves that slot uncertain, Core reconnects into trade-only mode for that KRX market date.
 
 The `passive_quote_symbols` list identifies WAIT symbols covered by the latest successful samples within ten seconds. Coverage expires at `passive_quote_expires_at` (UTC), ten seconds after the first usable batch in that round or at regular-session close, whichever comes first. An empty coverage list has a null expiration. A connected socket and the passive sampling coverage are independent. An empty result supports the caller's existing REST fallback. A book is a scheduling hint for Exec, with order eligibility and pre-submit validation still owned by Exec.
 

@@ -87,6 +87,7 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
 
     async def check():
         now = datetime(2026, 11, 10, 4, 0, tzinfo=timezone.utc)
+        sample_clock = now
         observer = WaitPriceObservations(tmp_path)
         symbols = [f'{index:06d}' for index in range(1, symbol_count + 1)]
         observer.configure(now.date(), [
@@ -107,6 +108,8 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
                 return 'ws://example.test'
 
             async def fetch_domestic_multi_quotes(self, batch):
+                nonlocal sample_clock
+                sample_clock = now + timedelta(seconds=len(batches))
                 batches.append(batch)
                 return [
                     {'inter_shrn_iscd': symbol, 'inter2_askp': '99', 'inter2_bidp': '98', 'seln_rsqn': '3'}
@@ -123,7 +126,7 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
             pass
 
         monkeypatch.setattr(wait_price_observations, 'wait_price_observations', observer)
-        monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+        monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: sample_clock)
         monkeypatch.setattr(kis_realtime_prices.settings, 'kis_realtime_price_enabled', True)
         prices = KISRealtimePriceService(client=Client())
         monkeypatch.setattr(prices, '_is_configured', lambda: (True, None))
@@ -142,7 +145,13 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
             snapshot = prices.orderbooks_snapshot()
             assert snapshot['passive_quote_symbols'] == symbols
             assert snapshot['passive_quote_expires_at'] == (now + timedelta(seconds=10)).isoformat()
-            expired = prices.orderbooks_snapshot(now=now + timedelta(seconds=11))
+            # The end of the sampling round is later than its first usable batch.
+            assert prices.health_snapshot()['wait_orderbook_observation']['last_sample_at'] != now.isoformat()
+            prices._record_market_session(SimpleNamespace(
+                state='OPEN', session_close_at=(now + timedelta(seconds=6)).isoformat(),
+            ), active=True)
+            assert prices.orderbooks_snapshot()['passive_quote_expires_at'] == (now + timedelta(seconds=6)).isoformat()
+            expired = prices.orderbooks_snapshot(now=now + timedelta(seconds=6))
             assert expired['passive_quote_symbols'] == []
             assert expired['passive_quote_expires_at'] is None
             records = observer.history(now.date())
