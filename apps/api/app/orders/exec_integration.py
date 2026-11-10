@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter, defaultdict
 import copy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -21,6 +21,11 @@ from sqlalchemy.orm import defer
 
 from app.agent_context.decision_input_quality import build_decision_input_quality_envelope
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
+from app.agent_context.wait_price_observations import (
+    WaitPriceWatch,
+    wait_price_observations,
+    watch_from_snapshot,
+)
 from app.core.audit_logging import request_with_audit
 from app.core.settings import settings
 from app.db import session_scope
@@ -32,6 +37,7 @@ from app.market.session import (
     CALENDAR_SOURCE_STATUS_MISSING_DATE,
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
     async_get_krx_calendar_day,
+    get_krx_exchange_calendar_day,
 )
 from app.market.symbol_codes import is_canonical_krx_short_code
 from app.orders.execution_handoff_contract import (
@@ -93,7 +99,6 @@ from app.orders.next_open_execution import (
     _PlanRefreshRevisionConflict,
     _execution_plan_row_authority_fingerprint,
     _current_route_live_market_buy_authority,
-    _is_krx_next_open_snapshot,
     _is_canonical_closed_market_cost_absence,
     _load_live_market_snapshot_context,
     _row_is_monitor_only_intraday_watch,
@@ -2785,6 +2790,7 @@ class SignalDeciderExecIntegrationService:
         self._dashboard_cache: dict[tuple[str, str, str | None], DashboardReadModelCacheRecord] = {}
         self._dashboard_build_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
         self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
+        self._wait_price_observation_task: asyncio.Task[None] | None = None
         self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
         self._latest_exec_monitoring_membership: tuple[
             date,
@@ -6503,6 +6509,17 @@ class SignalDeciderExecIntegrationService:
                 )
             )
         now = _utcnow().astimezone(timezone.utc)
+        local_now = now.astimezone(MARKET_TIME_ZONE)
+        task = self._wait_price_observation_task
+        if (
+            resolved_market_date == local_now.date()
+            and local_now.time() <= time(15, 30)
+            and (task is None or task.done())
+        ):
+            self._wait_price_observation_task = asyncio.create_task(
+                self._refresh_wait_price_observations(resolved_market_date),
+                name='krx-wait-price-observations',
+            )
         if cached_source is not None and (
             cached_source.market_date != resolved_market_date.isoformat()
             or cached_source.source_version is None
@@ -6597,6 +6614,7 @@ class SignalDeciderExecIntegrationService:
                         and symbol not in critical_symbols
                     ),
                     *cached_symbols,
+                    *wait_price_observations.symbols(resolved_market_date),
                 ]
             )
         )
@@ -7446,79 +7464,60 @@ class SignalDeciderExecIntegrationService:
         )
         return payload
 
+    async def _refresh_wait_price_observations(self, target_trade_date: date) -> None:
+        try:
+            if not get_krx_exchange_calendar_day(target_trade_date).is_open:
+                return
+            source_market_date = await _async_previous_trading_day(target_trade_date)
+            observations = await asyncio.to_thread(
+                self._load_passive_signal_wait_observations,
+                source_market_date=source_market_date,
+                target_trade_date=target_trade_date,
+            )
+            await asyncio.to_thread(
+                wait_price_observations.configure,
+                target_trade_date,
+                [
+                    WaitPriceWatch(**observation)
+                    for observation in observations
+                    if observation.get('trigger_price') is not None
+                ],
+                now=_utcnow(),
+            )
+        except Exception:
+            logger.exception('Could not refresh WAIT price observations for %s', target_trade_date)
+
     @staticmethod
     def _load_passive_signal_wait_observations(
         *,
         source_market_date: date,
         target_trade_date: date,
     ) -> list[dict[str, Any]]:
-        generation_state = (
-            signal_decider_next_open_execution_service
-            ._load_latest_snapshot_generation_state(
-                source_market_date=source_market_date,
-                target_trade_date=target_trade_date,
-                allow_post_open_intraday_watch=False,
-            )
-        )
-        snapshots_by_symbol: dict[
-            str,
-            list[SignalDeciderDecisionSnapshot],
-        ] = defaultdict(list)
-        for snapshot in generation_state.get('snapshots') or []:
-            if not isinstance(snapshot, SignalDeciderDecisionSnapshot) and not hasattr(
-                snapshot,
-                'id',
-            ):
-                continue
-            if getattr(snapshot, 'market_date', None) != source_market_date:
-                continue
-            if (
-                _normalize_optional_text(
-                    getattr(snapshot, 'agent_name', None),
-                    lowercase=True,
+        recovery = wait_price_observations.recovery_watches(target_trade_date)
+        try:
+            generation_state = (
+                signal_decider_next_open_execution_service
+                ._load_latest_snapshot_generation_state(
+                    source_market_date=source_market_date,
                 )
-                != SIGNAL_DECIDER_AGENT_NAME
-            ):
-                continue
-            symbol = _normalize_optional_text(getattr(snapshot, 'symbol', None))
-            if not symbol:
-                continue
-            symbol = symbol.upper()
-            snapshots_by_symbol[symbol].append(snapshot)
+            )
+        except Exception:
+            logger.warning('Could not load current WAIT decisions', exc_info=True)
+            return [asdict(watch) for watch in recovery]
 
-        observations: list[dict[str, Any]] = []
-        for symbol, snapshots in sorted(snapshots_by_symbol.items()):
-            # The validated generation loader already owns latest-per-symbol
-            # selection. More than one signal snapshot for one symbol means
-            # the source scope is conflicting, so observation also fails shut.
-            if len(snapshots) != 1:
+        snapshots = [
+            snapshot for snapshot in generation_state.get('snapshots') or []
+            if snapshot.market_date == source_market_date
+        ]
+        scope_counts = Counter((snapshot.symbol, snapshot.agent_name) for snapshot in snapshots)
+        observations = {watch.decision_snapshot_id: asdict(watch) for watch in recovery}
+        for snapshot in snapshots:
+            if scope_counts[(snapshot.symbol, snapshot.agent_name)] != 1:
                 continue
-            snapshot = snapshots[0]
-            action = _normalize_optional_text(
-                getattr(snapshot, 'next_day_open_action', None)
-                or getattr(snapshot, 'decision_action', None),
-                lowercase=True,
-            )
-            if action != 'wait' or not _is_krx_next_open_snapshot(snapshot):
-                continue
-            observed_at = (
-                getattr(snapshot, 'feedback_received_at', None)
-                or getattr(snapshot, 'created_at', None)
-            )
-            observations.append(
-                {
-                    'symbol': symbol,
-                    'decision_snapshot_id': int(snapshot.id),
-                    'decision_agent_name': SIGNAL_DECIDER_AGENT_NAME,
-                    'source_market_date': source_market_date.isoformat(),
-                    'observed_at': (
-                        observed_at.isoformat()
-                        if hasattr(observed_at, 'isoformat')
-                        else None
-                    ),
-                }
-            )
-        return observations
+            watch = watch_from_snapshot(snapshot, market_date=target_trade_date)
+            if watch is not None:
+                observations.setdefault(watch.decision_snapshot_id, asdict(watch))
+        return list(observations.values())
 
     async def _build_and_cache_runtime_symbol_detail(
         self,
@@ -7693,16 +7692,12 @@ class SignalDeciderExecIntegrationService:
             *(live_holding_symbols or set()),
             *live_exec_monitoring_symbols,
         }
-        passive_signal_wait_by_symbol = {
-            symbol: observation
-            for observation in passive_signal_wait_observations
-            if isinstance(observation, dict)
-            and (
-                symbol := _normalize_optional_text(
-                    observation.get('symbol')
-                )
-            )
-        }
+        passive_signal_wait_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for observation in passive_signal_wait_observations:
+            if isinstance(observation, dict) and (
+                symbol := _normalize_optional_text(observation.get('symbol'))
+            ):
+                passive_signal_wait_by_symbol[symbol].append(observation)
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in board_items:
             symbol = _normalize_optional_text(item.get('symbol'))
@@ -7736,8 +7731,8 @@ class SignalDeciderExecIntegrationService:
             candidate_missing_symbols
         )
         passive_signal_wait_by_symbol = {
-            symbol: observation
-            for symbol, observation in passive_signal_wait_by_symbol.items()
+            symbol: observations
+            for symbol, observations in passive_signal_wait_by_symbol.items()
             if symbol in symbol_metadata_map
             and _normalize_optional_text(
                 symbol_metadata_map[symbol].get('market'),
@@ -7756,7 +7751,7 @@ class SignalDeciderExecIntegrationService:
             items.extend(
                 (
                     self._build_passive_signal_wait_observation_item(
-                        observation=passive_signal_wait_by_symbol[symbol],
+                        observations=passive_signal_wait_by_symbol[symbol],
                         market_date=resolved_market_date,
                         metadata=symbol_metadata_map[symbol],
                     )
@@ -7791,6 +7786,10 @@ class SignalDeciderExecIntegrationService:
                 for symbol in missing_symbols
             }
         )
+        for symbol in passive_signal_wait_by_symbol.keys() & ranking_groups.keys():
+            ranking_groups[symbol] = [
+                *ranking_groups[symbol], {'passive_wait_observation': True},
+            ]
         realtime_symbols = self._prioritized_runtime_symbols_for_realtime(
             ranking_groups
         )
@@ -8137,11 +8136,11 @@ class SignalDeciderExecIntegrationService:
     def _build_passive_signal_wait_observation_item(
         self,
         *,
-        observation: dict[str, Any],
+        observations: Sequence[dict[str, Any]],
         market_date: date,
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
-        symbol = str(observation['symbol'])
+        symbol = str(observations[0]['symbol'])
         exclusion_reason = 'observation_only_no_order_authority'
         return {
             'symbol': symbol,
@@ -8177,8 +8176,14 @@ class SignalDeciderExecIntegrationService:
             'trigger_price': None,
             'chase_limit_price': None,
             'expected_holding_period': None,
-            'decision_agent_names': [SIGNAL_DECIDER_AGENT_NAME],
-            'last_event_at': observation.get('observed_at'),
+            'decision_agent_names': sorted({
+                observation.get('decision_agent_name') or SIGNAL_DECIDER_AGENT_NAME
+                for observation in observations
+            }),
+            'last_event_at': max(
+                (observation['observed_at'] for observation in observations if observation.get('observed_at')),
+                default=None,
+            ),
             'account_references': [],
             'status_counts': {},
         }
@@ -15490,6 +15495,8 @@ class SignalDeciderExecIntegrationService:
             } or _normalize_optional_text(item.get('broker_order_id')):
                 priority = max(priority, 200)
                 continue
+            if item.get('passive_wait_observation'):
+                priority = max(priority, 150)
             if item.get('planned_intents') or cls._has_target_stop_watch_facts(item):
                 priority = max(priority, 100)
         return priority

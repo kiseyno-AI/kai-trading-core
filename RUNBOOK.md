@@ -676,3 +676,13 @@ Set this up under a long-running process manager (LaunchAgent, systemd, pm2, or 
 
 - Set `BOK_ECOS_API_KEY` in `apps/api/.env` before calling ECOS-backed endpoints.
 - `BOK_API_KEY` and `BOK_BASE_URL` are still accepted as legacy fallback names, but `BOK_ECOS_API_KEY` and `BOK_ECOS_BASE_URL` are the canonical settings.
+
+WAIT price observations use the Core KIS trade stream for both deciders and
+save the first exact trade or crossing for each decision and KRX session.
+Check the records from `apps/api` with
+`python -m app.agent_context.wait_price_observations YYYY-MM-DD`. The daily
+watch audit includes these records separately from simulated results. An
+`enrolled` record is queued for observation and `not_observed` means no
+qualifying touch was captured, which can include gaps in the quote stream.
+An operator can enroll validated recovery snapshots for a specific session
+with `--enroll-recovery SNAPSHOT_ID ...`. These records carry no order authority.
