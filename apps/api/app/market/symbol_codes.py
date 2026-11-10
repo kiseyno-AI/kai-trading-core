@@ -5,6 +5,21 @@ from typing import Any, Sequence
 
 
 KRX_SHORT_CODE_PATTERN = re.compile(r'[0-9]{4}[0-9A-Z]{2}\Z')
+KRX_EQUITY_MARKETS = frozenset({'KRX', 'KOSPI', 'KOSDAQ', 'KONEX'})
+_PREFERRED_NAME_SUFFIX = re.compile(
+    r'(?<![0-9])(?:[1-9][0-9]*\s*)?우(?:\s*[BC]|선주|\s*\(전환\))?\s*\Z',
+    re.IGNORECASE,
+)
+
+
+def is_krx_preferred_share(symbol: Any, name_ko: Any, market: Any) -> bool:
+    code = normalize_krx_short_code(symbol)
+    return bool(
+        code
+        and str(market or '').upper() in KRX_EQUITY_MARKETS
+        and (not code.isdecimal() or code[-1] in '579')
+        and _PREFERRED_NAME_SUFFIX.search(str(name_ko or ''))
+    )
 
 
 def normalize_krx_short_code(value: Any) -> str | None:

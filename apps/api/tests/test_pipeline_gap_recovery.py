@@ -1398,16 +1398,21 @@ def test_piotroski_exact_partial_advances_only_proven_success_subset() -> None:
     ) == ['000001']
 
 
-def test_piotroski_quality_only_partial_advances_on_initial_execution() -> None:
+@pytest.mark.parametrize('terminal_not_applicable', [[], ['005935']])
+def test_piotroski_quality_only_partial_advances_on_initial_execution(
+    terminal_not_applicable: list[str],
+) -> None:
     symbols = [f'{index:06d}' for index in range(1, 118)]
+    selected = symbols + terminal_not_applicable
     quality_only = _exact_result(
-        selected=symbols,
+        selected=selected,
         successful=symbols,
         retry_debt=[],
         version='piotroski_scope_outcomes_v1',
         status='partial',
         stage_id='piotroski_filter',
-        publication_symbols=symbols,
+        publication_symbols=selected,
+        terminal_not_applicable=terminal_not_applicable,
     )
     quality_only.update(
         {
@@ -1427,30 +1432,34 @@ def test_piotroski_quality_only_partial_advances_on_initial_execution() -> None:
 
     assert _validated_successful_cohort(
         stage_result=quality_only,
-        invocation_symbols=symbols,
+        invocation_symbols=selected,
         stage_id='piotroski_filter',
     ) == symbols
     assert _validated_atomic_successful_cohort(
         stage_result=quality_only,
-        invocation_symbols=symbols,
+        invocation_symbols=selected,
         stage_id='piotroski_filter',
         finalization_stage_id='piotroski_filter',
         market_date='2026-10-30',
-        exact_publication_symbols=symbols,
+        exact_publication_symbols=selected,
     ) == symbols
     stage_scope = DailyPipelineStageService._exact_partial_success_scope(
         outcome={'status': 'partial', 'result': quality_only},
-        invocation_symbols=symbols,
+        invocation_symbols=selected,
         expected_stage_id='piotroski_filter',
         expected_market_date='2026-10-30',
-        publication_symbols=symbols,
+        publication_symbols=selected,
     )
     assert stage_scope is not None
     assert stage_scope['manifest_version'] == 'piotroski_scope_outcomes_v1'
-    assert stage_scope['selected_stock_codes'] == symbols
+    assert stage_scope['selected_stock_codes'] == selected
     assert stage_scope['successful_stock_codes'] == symbols
     assert stage_scope['retry_debt_stock_codes'] == []
-    assert stage_scope['terminal_not_applicable_stock_codes'] == []
+    assert stage_scope['terminal_not_applicable_stock_codes'] == terminal_not_applicable
+    assert _extract_result_counts(quality_only, stage_id='piotroski_filter') == {
+        'processed': len(selected), 'total': len(selected),
+        'succeeded': len(symbols), 'failed': 0,
+    }
 
 
 def test_partial_piotroski_followup_keeps_full_membership_authority() -> None:

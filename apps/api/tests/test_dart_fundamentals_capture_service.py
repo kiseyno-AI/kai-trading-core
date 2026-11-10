@@ -3838,6 +3838,26 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
 
         repository.create_refresh_run.assert_called_once()
 
+    async def test_preferred_only_refresh_records_not_applicable_without_a_provider(self):
+        service = _DartFundamentalsCaptureService(
+            client=object(),
+            repository=object(),
+            active_symbol_loader=lambda: [
+                {'symbol': '00104K', 'name_ko': 'CJ4우(전환)', 'market': 'KOSPI'},
+            ],
+            global_share_issuance_enabled=True,
+            global_share_issuance_activation_loader=lambda: {'enabled': True},
+        )
+
+        result = await service.run_daily_incremental_refresh(
+            market_date=date(2026, 11, 9), symbols=['00104K'],
+        )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['terminal_not_applicable_stock_codes'], ['00104K'])
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+
     async def test_compound_refresh_preserves_core_failure_evidence(self):
         class BulkMappingClient(FakeCaptureClient):
             async def lookup_corp_codes_for_stocks(self, *, stock_codes):

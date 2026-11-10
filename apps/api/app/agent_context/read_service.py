@@ -45,6 +45,7 @@ from app.external_news.store import list_recent_external_news_for_symbols
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
+from app.market.symbol_codes import is_krx_preferred_share
 from app.market_data_store import (
     load_current_market_snapshot_context,
     load_current_kis_intraday_snapshots,
@@ -4522,6 +4523,8 @@ def _build_intraday_execution_context(
         else block_statuses[block_name] not in {DECIDER_QUALITY_STATUS_UNAVAILABLE, DECIDER_QUALITY_STATUS_PROVIDER_ERROR}
         for block_name in block_names
     }
+    if block_statuses['investor_program_activity'] == DECIDER_QUALITY_STATUS_EMPTY:
+        availability_map['investor_program_activity'] = False
     return {
         'status': str(row.get('availability_status') or coverage.get('status') or DECIDER_QUALITY_STATUS_AVAILABLE),
         'reason': 'intraday_snapshot_partial' if str(row.get('availability_status') or '') == 'partial' else None,
@@ -5028,6 +5031,8 @@ def _resolve_factor_summary_status(
 
     freshness_status = str(freshness_provenance.get('freshness_status') or '').strip()
     if row is None:
+        if freshness_status == FRESHNESS_STATUS_NOT_APPLICABLE:
+            return DECIDER_QUALITY_STATUS_NOT_APPLICABLE
         if freshness_status in {FRESHNESS_STATUS_STALE, FRESHNESS_STATUS_AVAILABLE_BUT_OLD}:
             return FACTOR_SUMMARY_STATUS_NOT_COMPUTED_FOR_MARKET_DATE
         return FACTOR_SUMMARY_STATUS_MISSING_SOURCE_ROW
@@ -5493,7 +5498,10 @@ def _build_decider_factor_score_quality_context(
         signal_features_summary.get('status'),
         freshness_provenance=_maybe_dict(signal_features_summary.get('provenance')),
     )
-    all_states = [*score_states, signal_features_state]
+    all_states = [
+        state for state in (*score_states, signal_features_state)
+        if state != DECIDER_QUALITY_STATUS_NOT_APPLICABLE
+    ]
     status = (
         DECIDER_QUALITY_STATUS_AVAILABLE
         if all(state == DECIDER_QUALITY_STATUS_AVAILABLE for state in all_states)
@@ -5744,6 +5752,14 @@ def _build_decider_financials_quality_context(
     unified_value_row: dict[str, Any] | None,
     advanced_value_row: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    if fundamentals.get('status') == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        return {
+            'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+            'reason': fundamentals.get('reason'),
+            'missing_core_fields': [],
+            'missing_cash_flow_fields': [],
+            'freshness': _compact_provenance_summary(fundamentals_provenance),
+        }
     latest_snapshot = _maybe_dict(fundamentals.get('latest_snapshot'))
     period = _maybe_dict(latest_snapshot.get('period'))
     report_code = str(period.get('report_code') or '').strip() or None
@@ -5837,7 +5853,9 @@ def _build_decider_disclosures_news_quality_context(
         recent_external_news.get('status'),
         freshness_provenance=recent_external_news_provenance,
     )
-    if dart_state == DECIDER_QUALITY_STATUS_AVAILABLE and external_news_state in {
+    if dart_state == DECIDER_QUALITY_STATUS_NOT_APPLICABLE:
+        status = external_news_state
+    elif dart_state == DECIDER_QUALITY_STATUS_AVAILABLE and external_news_state in {
         DECIDER_QUALITY_STATUS_AVAILABLE,
         DECIDER_QUALITY_STATUS_EMPTY,
     }:
@@ -6732,6 +6750,11 @@ class AgentContextReadService:
         normalized_symbols = _normalize_symbols(symbols)
         normalized_market_date = market_date if isinstance(market_date, date) else date.fromisoformat(market_date)
         symbol_rows = load_symbols(symbols=normalized_symbols, limit=max(len(normalized_symbols), 1000))
+        preferred_shares = {
+            row['symbol'] for row in symbol_rows
+            if is_krx_preferred_share(row.get('symbol'), row.get('name_ko'), row.get('market'))
+        }
+        dart_symbols = [symbol for symbol in normalized_symbols if symbol not in preferred_shares]
         symbol_market_by_code = {
             str(row.get('symbol') or '').strip(): str(row.get('market') or '').strip().upper()
             for row in symbol_rows
@@ -6954,11 +6977,11 @@ class AgentContextReadService:
         dart_storage_unavailable = False
         try:
             fundamentals_rows = self.fundamentals_repository.list_stored_fundamentals_summary(
-                stock_codes=normalized_symbols,
+                stock_codes=dart_symbols,
                 fs_div=normalized_fs_div,
                 captured_before=external_news_knowledge_cutoff_at,
                 receipt_date_to=normalized_market_date,
-            )
+            ) if dart_symbols else []
         except SQLAlchemyError:
             dart_storage_unavailable = True
             fundamentals_rows = []
@@ -6968,11 +6991,11 @@ class AgentContextReadService:
         )
         try:
             disclosures_by_symbol = self.disclosure_repository.list_recent_events_by_stock_codes(
-                stock_codes=normalized_symbols,
+                stock_codes=dart_symbols,
                 receipt_date_to=normalized_market_date,
                 observed_before=external_news_knowledge_cutoff_at,
                 limit_per_symbol=disclosures_limit,
-            )
+            ) if dart_symbols else {}
         except SQLAlchemyError:
             dart_storage_unavailable = True
             disclosures_by_symbol = {symbol: [] for symbol in normalized_symbols}
@@ -7085,6 +7108,7 @@ class AgentContextReadService:
         for symbol in normalized_symbols:
             company_row = symbol_map.get(symbol)
             company_market = str(company_row.get('market') or '').strip().upper() if company_row else ''
+            preferred_share = symbol in preferred_shares
             if company_market in US_EQUITY_MARKETS:
                 if us_request_market_session is None:
                     us_request_market_session = _build_us_market_session_metadata(
@@ -7224,17 +7248,29 @@ class AgentContextReadService:
                 if row is not None:
                     factor_row_counts[family] += 1
             fundamentals = _build_fundamentals_summary(
-                fundamentals_map.get(symbol, []),
+                [] if preferred_share else fundamentals_map.get(symbol, []),
                 market_date=normalized_market_date,
             )
             recent_disclosures = [
-                _serialize_disclosure(item) for item in disclosures_by_symbol.get(symbol, [])
+                _serialize_disclosure(item)
+                for item in ([] if preferred_share else disclosures_by_symbol.get(symbol, []))
             ]
             recent_dart_events = _build_recent_dart_events_context(
                 disclosures=recent_disclosures,
                 fundamentals=fundamentals,
                 storage_unavailable=dart_storage_unavailable,
             )
+            if preferred_share:
+                not_applicable = {
+                    'status': DECIDER_QUALITY_STATUS_NOT_APPLICABLE,
+                    'reason': 'preferred_share_not_applicable',
+                    'decision_guidance': (
+                        'DART filings and Piotroski are not applicable to this preferred share. '
+                        'Do not report them as data gaps or lower confidence because of their absence.'
+                    ),
+                }
+                fundamentals.update(not_applicable)
+                recent_dart_events.update(not_applicable)
             recent_external_news = _build_recent_external_news_context(
                 external_news_by_symbol.get(symbol, []),
                 provider_status=external_news_provider_status,
@@ -7281,7 +7317,7 @@ class AgentContextReadService:
                 ),
                 'recent_dart_events': {
                     'status': recent_dart_events.get('status'),
-                    'missing_fields': [] if recent_dart_events.get('status') == 'available' else ['items'],
+                    'missing_fields': [] if recent_dart_events.get('status') in {'available', 'not_applicable'} else ['items'],
                     'unavailable_reason': recent_dart_events.get('reason'),
                 },
                 'recent_external_news': {
@@ -7295,6 +7331,8 @@ class AgentContextReadService:
                 disclosures=recent_disclosures,
                 latest_snapshot=fundamentals.get('latest_snapshot'),
             )
+            if preferred_share:
+                disclosure_context = {**not_applicable, 'items': []}
             quote_context_provenance = _build_quote_freshness_provenance(
                 row=raw_quote_row,
                 requested_market_date=normalized_market_date,
@@ -7333,6 +7371,17 @@ class AgentContextReadService:
                 disclosures_limit=disclosures_limit,
                 storage_unavailable=dart_storage_unavailable,
             )
+            if preferred_share:
+                dart_not_applicable = _build_freshness_provenance(
+                    requested_market_date=normalized_market_date,
+                    freshness_status=FRESHNESS_STATUS_NOT_APPLICABLE,
+                    provenance_status=PROVENANCE_STATUS_NOT_APPLICABLE,
+                    source_tables=(),
+                    source_provider='dart',
+                    reason='preferred_share_not_applicable',
+                )
+                fundamentals_provenance = dart_not_applicable
+                recent_disclosures_provenance = dart_not_applicable
             recent_external_news_provenance = _build_external_news_freshness_provenance(
                 context=recent_external_news,
                 requested_market_date=normalized_market_date,
@@ -7461,6 +7510,17 @@ class AgentContextReadService:
                 )
                 for family, score_payload in scores.items()
             }
+            if preferred_share:
+                for family in ('unified_value', 'quality'):
+                    if _maybe_dict(scores.get(family)).get('score') is None:
+                        scores[family] = {
+                            **not_applicable,
+                            'freshness_provenance': dart_not_applicable,
+                        }
+                for family in ('advanced_value', 'unified_value', 'quality', 'composite'):
+                    if current_factor_rows[family] is None and not factor_storage_unavailable.get(family):
+                        factor_row_provenance[family] = dart_not_applicable
+                        context_completeness['factor_rows'][family]['row_status'] = 'not_applicable'
             factor_summary = _build_factor_summary(
                 requested_market_date=normalized_market_date,
                 factor_rows=current_factor_rows,
@@ -7573,13 +7633,14 @@ class AgentContextReadService:
                 recent_external_news=recent_external_news,
             )
 
-            fundamentals_entries = fundamentals_map.get(symbol) or []
+            fundamentals_entries = [] if preferred_share else fundamentals_map.get(symbol) or []
             latest_disclosure = recent_disclosures[0] if recent_disclosures else None
             company = {
                 'symbol': symbol,
                 'name_ko': company_row.get('name_ko') if company_row else None,
                 'market': company_row.get('market') if company_row else None,
                 'instrument_type': company_row.get('instrument_type') if company_row else None,
+                'is_preferred_share': preferred_share,
                 'standard_code': company_row.get('standard_code') if company_row else None,
                 'source': company_row.get('source') if company_row else None,
                 'is_active': company_row.get('is_active') if company_row else None,
@@ -7667,6 +7728,7 @@ class AgentContextReadService:
                     'persisted_factor_rows': persisted_factor_rows,
                     'fundamentals': fundamentals,
                     'recent_disclosures': {
+                        **(not_applicable if preferred_share else {}),
                         'count': len(recent_disclosures),
                         'items': recent_disclosures,
                         'freshness_provenance': recent_disclosures_provenance,
@@ -7907,15 +7969,18 @@ class AgentContextReadService:
                 'available_rows': recent_dart_events_available_count,
                 'partial_rows': 0,
                 'unavailable_rows': recent_dart_events_unavailable_count,
-                'empty_rows': requested_symbol_count - recent_dart_events_available_count - recent_dart_events_unavailable_count,
-                'coverage_ratio': _ratio(recent_dart_events_available_count, requested_symbol_count),
+                'not_applicable_rows': len(preferred_shares),
+                'empty_rows': len(dart_symbols) - recent_dart_events_available_count - recent_dart_events_unavailable_count,
+                'coverage_ratio': _ratio(recent_dart_events_available_count, len(dart_symbols)),
                 'coverage_status': (
-                    'complete'
-                    if recent_dart_events_available_count == requested_symbol_count and requested_symbol_count > 0
+                    'not_applicable'
+                    if not dart_symbols
+                    else 'complete'
+                    if recent_dart_events_available_count == len(dart_symbols)
                     else 'partial'
                     if recent_dart_events_available_count > 0
                     else 'unavailable'
-                    if recent_dart_events_unavailable_count == requested_symbol_count and requested_symbol_count > 0
+                    if recent_dart_events_unavailable_count == len(dart_symbols)
                     else 'missing'
                 ),
             },

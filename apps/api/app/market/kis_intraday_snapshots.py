@@ -568,6 +568,29 @@ class KISIntradaySnapshotService:
         program_rows = _extract_list(program_response or {}, 'output')
         investor_row = investor_rows[-1] if investor_rows else {}
         program_row = sorted(program_rows, key=lambda item: str(item.get('bsop_hour') or ''))[-1] if program_rows else {}
+
+        def source_status(
+            response: dict[str, Any] | None,
+            row: dict[str, Any],
+            *keys: str,
+        ) -> str:
+            if row:
+                return 'available'
+            for key in keys:
+                output = (response or {}).get(key)
+                if isinstance(output, (dict, list)):
+                    return 'empty' if not output else 'unavailable'
+            return 'unavailable'
+
+        source_statuses = {
+            'investor_trend_estimate': source_status(investor_response, investor_row, 'output2', 'output'),
+            'program_trade': source_status(program_response, program_row, 'output'),
+        }
+        states = source_statuses.values()
+        if 'unavailable' in states:
+            activity_status = 'partial' if 'available' in states or 'empty' in states else 'unavailable'
+        else:
+            activity_status = 'available' if 'available' in states else 'empty'
         as_of_timestamp = _combine_market_date_and_time(
             fallback_market_date,
             str(program_row.get('bsop_hour') or '').strip() or None,
@@ -575,13 +598,8 @@ class KISIntradaySnapshotService:
 
         payload = _clean_mapping(
             {
-                'status': (
-                    'available'
-                    if investor_row and program_row
-                    else 'partial'
-                    if investor_row or program_row
-                    else 'unavailable'
-                ),
+                'status': activity_status,
+                'source_statuses': source_statuses,
                 'as_of_timestamp': as_of_timestamp,
                 'investor_trend_estimate': _clean_mapping(
                     {

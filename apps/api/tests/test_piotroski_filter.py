@@ -995,6 +995,67 @@ class DailyPiotroskiPointInTimeInputsTests(unittest.TestCase):
             )
             session.commit()
 
+    def test_rebuild_excludes_preferred_shares_from_exact_scope_ranking_and_coverage(self) -> None:
+        market_date = date(2026, 4, 14)
+        for symbol, name, pbr in (
+            ('005930', '삼성전자', 1.0),
+            ('005935', '삼성전자우', 0.5),
+            ('33626K', '두산퓨얼셀1우', 0.5),
+        ):
+            symbol_id = self._add_symbol(symbol=symbol, name_ko=name, is_active=True)
+            self._add_price_bar(symbol_id=symbol_id, trade_date=market_date, pbr=pbr)
+        # Applicability follows the master even if an explicitly selected
+        # preferred share has no price row on the requested date.
+        self._add_symbol(symbol='28513K', name_ko='SK케미칼우', is_active=True)
+        selected = ['005930', '005935', '33626K', '28513K']
+        with (
+            patch('app.signals.piotroski_filter.session_scope', self._session_scope),
+            patch('app.signals.piotroski_filter.replace_daily_derived_results_exact_scope') as publish,
+        ):
+            publish.return_value = {
+                'results_persisted': 1,
+                'failed_symbols': [],
+                'failed_symbol_errors': [],
+                'scope_finalization': {'ready': True},
+            }
+            result = self.service.rebuild_for_market_date(
+                market_date=market_date,
+                symbols=selected,
+                ranking_symbols=selected,
+                exact_scope_symbols=selected,
+            )
+
+        published = publish.call_args.kwargs['results']
+        self.assertEqual([row['symbol'] for row in published], ['005930'])
+        self.assertEqual(published[0]['pbr_percentile_rank'], 0.0)
+        self.assertEqual(result['requested_symbol_count'], 1)
+        self.assertEqual(result['full_signal_unusable_count'], 1)
+        self.assertEqual(result['successful_stock_codes'], ['005930'])
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertEqual(result['terminal_not_applicable_stock_codes'], ['005935', '28513K', '33626K'])
+        self.assertEqual(publish.call_args.kwargs['exact_symbols'], selected)
+
+    def test_preferred_only_scope_is_not_applicable_without_financial_inputs(self) -> None:
+        symbol = '005935'
+        self._add_symbol(symbol=symbol, name_ko='삼성전자우', is_active=True)
+        with (
+            patch('app.signals.piotroski_filter.session_scope', self._session_scope),
+            patch.object(self.service, '_load_inputs') as load_inputs,
+        ):
+            result = self.service.rebuild_for_market_date(
+                market_date=date(2026, 4, 14), symbols=[symbol],
+            )
+
+        load_inputs.assert_not_called()
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['gate_status'], 'ready')
+        self.assertEqual(result['reason'], 'preferred_share_not_applicable')
+        self.assertEqual(result['full_signal_coverage_status'], 'not_applicable')
+        self.assertIsNone(result['full_signal_coverage_ratio'])
+        self.assertEqual(result['required_financial_signal_missing_counts'], {})
+        self.assertEqual(result['terminal_not_applicable_stock_codes'], [symbol])
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+
     def _add_valuation_snapshot(
         self,
         *,

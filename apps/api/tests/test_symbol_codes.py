@@ -1,7 +1,17 @@
 from app.market.symbol_codes import (
     is_canonical_krx_short_code,
+    is_krx_preferred_share,
     normalize_krx_short_code,
 )
+
+
+def test_krx_preferred_share_requires_preferred_name_and_market() -> None:
+    assert is_krx_preferred_share('005935', '삼성전자우', 'KOSPI')
+    assert is_krx_preferred_share('00104K', 'CJ4우(전환)', 'KOSPI')
+    assert is_krx_preferred_share('33626L', '두산퓨얼셀2우B', 'KOSPI')
+    assert not is_krx_preferred_share('005935', '삼성전자', 'KOSPI')
+    assert not is_krx_preferred_share('005930', '삼성전자우', 'KOSPI')
+    assert not is_krx_preferred_share('005935', '삼성전자우', 'NASDAQ')
 
 
 def test_normalize_krx_short_code_accepts_numeric_and_alpha_codes() -> None:

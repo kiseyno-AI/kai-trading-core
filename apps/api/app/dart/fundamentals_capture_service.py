@@ -45,7 +45,7 @@ from app.dart.signals_service import (
     dart_signals_service,
 )
 from app.integrations.dart.client import DartClient, dart_client
-from app.market.symbol_codes import normalize_krx_short_code
+from app.market.symbol_codes import is_krx_preferred_share, normalize_krx_short_code
 from app.market_data_store import load_symbols
 from app.signals.piotroski_filter import daily_piotroski_filter_service
 from sqlalchemy import func, select
@@ -2318,12 +2318,72 @@ class DartFundamentalsCaptureService:
         run_feedback_followup: bool | None = None,
         progress_callback: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
+        resolved_market_date = _normalize_refresh_date(market_date, default=date.today())
+        if self.global_share_issuance_enabled:
+            try:
+                activation_audit = self.global_share_issuance_activation_loader()
+            except Exception as exc:
+                activation_audit = {
+                    'enabled': False,
+                    'reasons': ['activation_audit_read_failed'],
+                    'error': str(exc),
+                    'audit_run_id': None,
+                }
+            if activation_audit.get('enabled') is not True:
+                return {
+                    'triggered': False,
+                    'status': 'failed',
+                    'reason': 'global_share_issuance_activation_audit_required',
+                    'market_date': resolved_market_date.isoformat(),
+                    'activation_audit': activation_audit,
+                    'partial_reasons': ['global_share_issuance_activation_not_proven'],
+                    'selected_stock_codes': [],
+                    'successful_stock_codes': [],
+                    'retry_debt_stock_codes': [],
+                    'scope_outcome_manifest': [],
+                    'scope_outcome_manifest_version': 'dart_daily_data_scope_outcomes_v1',
+                }
+        active_symbols = self.active_symbol_loader()
+        preferred_codes = {
+            row['symbol'] for row in active_symbols
+            if is_krx_preferred_share(row.get('symbol'), row.get('name_ko'), row.get('market'))
+        }
+        upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
+        requested_codes = _validated_stock_code_sequence(
+            symbols if symbols is not None else [
+                row.get('symbol') for row in active_symbols[symbol_offset:upper_bound]
+                if str(row.get('symbol') or '').strip()
+            ]
+        )
+        if requested_codes is None:
+            raise ValueError('daily fundamentals refresh contains an invalid stock code')
+        selected_stock_codes = list(dict.fromkeys(requested_codes))
+        preferred_in_scope = preferred_codes.intersection(selected_stock_codes)
+        supported_codes = [code for code in selected_stock_codes if code not in preferred_in_scope]
+        refresh_symbols = supported_codes if preferred_in_scope else symbols
+        if preferred_in_scope and not supported_codes:
+            return {
+                'triggered': False,
+                'status': 'completed',
+                'reason': 'preferred_share_not_applicable',
+                'market_date': resolved_market_date.isoformat(),
+                'scope_outcome_manifest_version': 'dart_daily_data_scope_outcomes_v1',
+                'selected_stock_codes': selected_stock_codes,
+                'successful_stock_codes': [],
+                'retry_debt_stock_codes': [],
+                'terminal_not_applicable_stock_codes': sorted(preferred_in_scope),
+                'preferred_not_applicable_stock_codes': sorted(preferred_in_scope),
+                'scope_outcome_manifest': [
+                    {'stock_code': code, 'outcome': 'terminal_not_applicable'}
+                    for code in selected_stock_codes
+                ],
+            }
         if not self.global_share_issuance_enabled:
-            return await self._run_daily_incremental_refresh(
+            result = await self._run_daily_incremental_refresh(
                 market_date=market_date,
                 symbol_limit=symbol_limit,
                 symbol_offset=symbol_offset,
-                symbols=symbols,
+                symbols=refresh_symbols,
                 capture_limit=capture_limit,
                 force=force,
                 fs_div=fs_div,
@@ -2333,67 +2393,28 @@ class DartFundamentalsCaptureService:
                 run_feedback_followup=run_feedback_followup,
                 progress_callback=progress_callback,
             )
-
-        resolved_market_date = _normalize_refresh_date(
-            market_date,
-            default=date.today(),
-        )
-        try:
-            activation_audit = (
-                self.global_share_issuance_activation_loader()
-            )
-        except Exception as exc:
-            activation_audit = {
-                'enabled': False,
-                'reasons': ['activation_audit_read_failed'],
-                'error': str(exc),
-                'audit_run_id': None,
-            }
-        if activation_audit.get('enabled') is not True:
-            return {
-                'triggered': False,
-                'status': 'failed',
-                'reason': (
-                    'global_share_issuance_activation_audit_required'
-                ),
-                'market_date': resolved_market_date.isoformat(),
-                'activation_audit': activation_audit,
-                'partial_reasons': [
-                    'global_share_issuance_activation_not_proven'
-                ],
-                'selected_stock_codes': [],
-                'successful_stock_codes': [],
-                'retry_debt_stock_codes': [],
-                'scope_outcome_manifest': [],
-                'scope_outcome_manifest_version': (
-                    'dart_daily_data_scope_outcomes_v1'
-                ),
-            }
+            manifest = result.get('scope_outcome_manifest')
+            if preferred_in_scope and isinstance(manifest, list):
+                result = {
+                    **result,
+                    'selected_stock_codes': selected_stock_codes,
+                    'terminal_not_applicable_stock_codes': sorted(preferred_in_scope),
+                    'preferred_not_applicable_stock_codes': sorted(preferred_in_scope),
+                    'scope_outcome_manifest': [
+                        *manifest,
+                        *({'stock_code': code, 'outcome': 'terminal_not_applicable'}
+                          for code in sorted(preferred_in_scope)),
+                    ],
+                }
+            return result
 
         resolved_fs_div = (
             fs_div or settings.dart_fundamentals_default_fs_div
         ).strip().upper()
-        active_symbols = self.active_symbol_loader()
-        global_stock_codes = _normalize_active_universe_stock_codes(
-            active_symbols
-        )
-        upper_bound = None if symbol_limit is None else symbol_offset + symbol_limit
-        selected_stock_codes = _validated_stock_code_sequence(
-            (
-                symbols
-                if symbols is not None
-                else [
-                    item.get('symbol')
-                    for item in active_symbols[symbol_offset:upper_bound]
-                    if str(item.get('symbol') or '').strip()
-                ]
-            )
-        )
-        if selected_stock_codes is None:
-            raise ValueError(
-                'daily fundamentals refresh contains an invalid stock code'
-            )
-        selected_stock_codes = list(dict.fromkeys(selected_stock_codes))
+        global_stock_codes = [
+            code for code in _normalize_active_universe_stock_codes(active_symbols)
+            if code not in preferred_codes
+        ]
         mapping_error: str | None = None
         try:
             mapping_result = await self.client.lookup_corp_codes_for_stocks(
@@ -2419,7 +2440,7 @@ class DartFundamentalsCaptureService:
                 market_date=market_date,
                 symbol_limit=symbol_limit,
                 symbol_offset=symbol_offset,
-                symbols=symbols,
+                symbols=refresh_symbols,
                 capture_limit=capture_limit,
                 force=force,
                 fs_div=fs_div,
@@ -2457,7 +2478,7 @@ class DartFundamentalsCaptureService:
 
         corporations = list(mapping_result.get('resolved') or [])
         terminal_not_applicable_stock_codes = sorted(
-            {
+            preferred_in_scope | {
                 str(stock_code or '').strip().zfill(6)
                 for stock_code in mapping_result.get(
                     'unsupported_stock_codes', []
@@ -2761,6 +2782,7 @@ class DartFundamentalsCaptureService:
             'terminal_not_applicable_stock_codes': sorted(
                 terminal_not_applicable
             ),
+            'preferred_not_applicable_stock_codes': sorted(preferred_in_scope),
             'terminal_policy_version': (
                 'dart_missing_corp_mapping_not_applicable_v1'
             ),
