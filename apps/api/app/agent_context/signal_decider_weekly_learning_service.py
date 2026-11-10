@@ -754,6 +754,8 @@ class SignalDeciderWeeklyLearningRepository:
                     )
                 ).all()
             )
+            # Keep loaded values available after session_scope commits the read.
+            session.expunge_all()
 
         snapshots = [snapshot for _, snapshot in rows]
         verified_snapshots, identity_exclusions, cohort = (
