@@ -2535,6 +2535,51 @@ def compressed_batch_item_for_prompt(item: dict[str, Any]) -> dict[str, Any]:
     compressed = _compress_prompt_value(trimmed)
     if not isinstance(compressed, dict):
         return {'payload': compressed}
+    if trimmed.get('role', trimmed.get('agent_name')) in DECISION_SUPPORT_AGENT_NAMES:
+        symbol_context = trimmed.get('symbol_day_context')
+        external_news = symbol_context.get('recent_external_news') if isinstance(symbol_context, dict) else None
+        material_items = external_news.get('material_items') if isinstance(external_news, dict) else None
+        if isinstance(material_items, list) and material_items:
+            # Nested compression can reduce the news section to its shape alone.
+            limits = {
+                'title': 120,
+                'url': 200,
+                'provider': 40,
+                'published_at': 40,
+                'materiality_bucket': 32,
+                'access_status': 32,
+            }
+            provenance = []
+            for article in material_items:
+                if not isinstance(article, dict):
+                    continue
+                fields = {}
+                for key, limit in limits.items():
+                    value = article.get(key)
+                    if not isinstance(value, str) or not value or (key == 'url' and len(value) > limit):
+                        continue
+                    fields[key] = _truncate_prompt_string(value, limit=limit)
+                if fields:
+                    provenance.append(fields)
+            if provenance:
+                retained_context = compressed.get('symbol_day_context', {})
+                retained_news = retained_context.get('recent_external_news', {})
+                retained_items = retained_news.get('material_items')
+                retains_provenance = (
+                    isinstance(retained_items, list)
+                    and len(retained_items) == len(provenance)
+                    and all(
+                        isinstance(retained, dict)
+                        and all(retained.get(key) == value for key, value in fields.items())
+                        for retained, fields in zip(retained_items, provenance)
+                    )
+                )
+                if not retains_provenance:
+                    news = {'material_items': provenance}
+                    status = external_news.get('status')
+                    if isinstance(status, str):
+                        news['status'] = _truncate_prompt_string(status, limit=40)
+                    compressed['material_news_provenance'] = news
     dispatched_policy = trimmed.get('signal_decider_policy')
     if isinstance(dispatched_policy, dict):
         compressed['signal_decider_policy'] = dispatched_policy

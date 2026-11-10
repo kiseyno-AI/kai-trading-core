@@ -3144,24 +3144,49 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 trigger='auto_eod_followup_resume',
                 summary_cutoff_proof=proof,
             )
+            narrowed_result = service.run(
+                market_date='2026-04-14',
+                stages=['signal_decider'],
+                symbols=completed_symbols,
+                trigger='auto_eod_followup_resume',
+                summary_cutoff_proof=proof,
+            )
+            self.assertTrue(inspect_prerequisites.call_args_list)
+            self.assertTrue(
+                all(
+                    call.kwargs['symbols'] == completed_symbols
+                    for call in inspect_prerequisites.call_args_list
+                )
+            )
+            wrong_scope_result = service.run(
+                market_date='2026-04-14',
+                stages=['signal_decider'],
+                symbols=['000660'],
+                trigger='auto_eod_followup_resume',
+                summary_cutoff_proof=proof,
+            )
 
         self.assertEqual(result['status'], 'completed')
+        self.assertEqual(narrowed_result['status'], 'completed')
+        self.assertEqual(wrong_scope_result['status'], 'blocked')
         self.assertEqual(
-            feedback_retry_service.calls[0]['config'].symbols,
-            tuple(completed_symbols),
+            wrong_scope_result['stages']['signal_decider']['result'][
+                'knowledge_cutoff_resolution'
+            ]['reason'],
+            'summary_run_symbol_scope_mismatch',
         )
-        resolve_cutoff.assert_called_once_with(
+        self.assertEqual(
+            [call['config'].symbols for call in feedback_retry_service.calls],
+            [tuple(completed_symbols), tuple(completed_symbols)],
+        )
+        self.assertEqual(resolve_cutoff.call_count, 3)
+        resolve_cutoff.assert_called_with(
             market_date=date(2026, 4, 14),
             feedback_scope_mode='broad_feedback_universe',
             fs_div='CFS',
             source_run_id='feedback-cycle-summary',
             requested_symbols=None,
         )
-        self.assertEqual(
-            inspect_prerequisites.call_args.kwargs['symbols'],
-            completed_symbols,
-        )
-
         for mismatch, reason in (
             (
                 {
