@@ -3861,6 +3861,20 @@ class AgentFeedbackOrchestrator:
             source_items=source_items,
             knowledge_cutoff_at=source_knowledge_cutoff_at,
         )
+        # Policy is shared by the role and dates. Read it again on each
+        # revalidation pass without rebuilding the same report per symbol.
+        refreshed_policy_by_role: dict[str, dict[str, Any]] = {}
+        policy_error_by_role: dict[str, str] = {}
+        for role in decision_roles:
+            try:
+                refreshed_policy_by_role[role] = self._build_decider_policy_context(
+                    role=role,
+                    market_date=market_date,
+                    policy_context_as_of_date=policy_context_as_of_date,
+                )
+            except Exception as exc:  # noqa: BLE001
+                policy_error_by_role[role] = type(exc).__name__
+
         for source_item in source_items:
             symbol = str(source_item.get('symbol') or '').strip().upper()
             decision_role = str(
@@ -3945,19 +3959,12 @@ class AgentFeedbackOrchestrator:
                     )
                 else:
                     refreshed_item.pop('agent_feedback_eligibility', None)
-            refreshed_policy_context: dict[str, Any] = {}
-            try:
-                if decision_role in DECISION_SUPPORT_AGENT_NAMES:
-                    refreshed_policy_context = self._build_decider_policy_context(
-                        role=decision_role,
-                        market_date=market_date,
-                        policy_context_as_of_date=policy_context_as_of_date,
-                    )
-            except Exception as exc:  # noqa: BLE001
+            refreshed_policy_context = refreshed_policy_by_role.get(decision_role, {})
+            if decision_role in policy_error_by_role:
                 reasons.append(
                     {
                         'code': 'policy_context_revalidation_failed',
-                        'error_type': type(exc).__name__,
+                        'error_type': policy_error_by_role[decision_role],
                     }
                 )
 
