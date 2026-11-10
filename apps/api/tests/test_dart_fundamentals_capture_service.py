@@ -24,6 +24,7 @@ from app.dart.fundamentals_store import (
     LegacyCfsRecoveryCandidateDriftError,
 )
 from app.dart.signals_service import build_authoritative_absence_audit_signal
+from app.integrations.dart.client import DartLookupError
 
 
 def DartFundamentalsCaptureService(**kwargs):
@@ -662,8 +663,8 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_authoritative_corp_cache_cannot_terminalize_absence(self):
         class NonAuthoritativeClient:
-            async def has_supported_stock_code(self, _stock_code):
-                return False
+            async def lookup_corp_code(self, *, stock_code):
+                raise DartLookupError(f'Unknown stock_code: {stock_code}')
 
             def corp_code_mapping_authority(self):
                 return {
@@ -692,10 +693,6 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         class AlphaClient:
-            async def has_supported_stock_code(self, stock_code):
-                calls.append(('supported', stock_code))
-                return True
-
             async def lookup_corp_code(self, *, stock_code):
                 calls.append(('lookup', stock_code))
                 return {
@@ -712,7 +709,7 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(corp['stock_code'], '00088K')
         self.assertEqual(
             calls,
-            [('supported', '00088K'), ('lookup', '00088K')],
+            [('lookup', '00088K')],
         )
 
     async def test_global_activation_failure_stops_before_current_universe_work(self):
@@ -3540,8 +3537,8 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_daily_incremental_refresh_tolerates_terminal_mapping_failure(self):
         class UnsupportedCaptureClient(FakeCaptureClient):
-            async def has_supported_stock_code(self, stock_code):
-                return False
+            async def lookup_corp_code(self, *, stock_code):
+                raise DartLookupError(f'Unknown stock_code: {stock_code}')
 
         client = UnsupportedCaptureClient()
         repository = FakeCaptureRepository()
