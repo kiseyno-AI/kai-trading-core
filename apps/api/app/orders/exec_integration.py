@@ -7520,7 +7520,7 @@ class SignalDeciderExecIntegrationService:
             )
         except Exception:
             logger.warning('Could not load current WAIT decisions', exc_info=True)
-            return [asdict(watch) for watch in recovery]
+            generation_state = {}
 
         snapshots = [
             snapshot for snapshot in generation_state.get('snapshots') or []
@@ -7534,7 +7534,13 @@ class SignalDeciderExecIntegrationService:
             watch = watch_from_snapshot(snapshot, market_date=target_trade_date)
             if watch is not None:
                 observations.setdefault(watch.decision_snapshot_id, asdict(watch))
-        return list(observations.values())
+        closed_ids = signal_decider_execution_outcome_service.closed_snapshot_ids(
+            decision_snapshot_ids=list(observations), target_trade_date=target_trade_date,
+        )
+        return [
+            observation for snapshot_id, observation in observations.items()
+            if snapshot_id not in closed_ids
+        ]
 
     async def _build_and_cache_runtime_symbol_detail(
         self,
@@ -7737,15 +7743,8 @@ class SignalDeciderExecIntegrationService:
             for symbol in realtime_symbols
         ]
         included_symbols = {item['symbol'] for item in items}
-        candidate_missing_symbols = sorted(
-            (
-                direct_membership_symbols
-                | set(passive_signal_wait_by_symbol)
-            )
-            - included_symbols
-        )
         symbol_metadata_map = self._load_symbol_metadata_map(
-            candidate_missing_symbols
+            (direct_membership_symbols - included_symbols) | passive_signal_wait_by_symbol.keys()
         )
         passive_signal_wait_by_symbol = {
             symbol: observations
@@ -7811,6 +7810,21 @@ class SignalDeciderExecIntegrationService:
             ranking_groups
         )
         items = [item_by_symbol[symbol] for symbol in realtime_symbols]
+        for item in items:
+            observations = passive_signal_wait_by_symbol.get(item['symbol'], ())
+            if observations:
+                item['wait_observations'] = [
+                    {
+                        'decision_agent_name': observation['decision_agent_name'],
+                        'trigger_price': _to_json_number(
+                            _positive_decimal(observation.get('trigger_price'))
+                        ),
+                    }
+                    for observation in observations
+                    if observation.get('decision_agent_name') in {
+                        SIGNAL_DECIDER_AGENT_NAME, SHORT_TERM_DECIDER_AGENT_NAME,
+                    }
+                ]
         observation_only_symbols = [
             symbol
             for symbol in realtime_symbols

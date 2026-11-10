@@ -372,6 +372,33 @@ class SignalDeciderExecutionOutcomeService:
             ).scalars().all()
             return [_serialize_outcome_row(row) for row in rows]
 
+    def closed_snapshot_ids(
+        self, *, decision_snapshot_ids: Sequence[int], target_trade_date: date,
+    ) -> set[int]:
+        trade_day = target_trade_date.isoformat()
+        closed: set[int] = set()
+        still_active: set[int] = set()
+        unfilled_terminal = {
+            LIFECYCLE_DRY_RUN, LIFECYCLE_ENTRY_CANCELED, LIFECYCLE_ENTRY_REJECTED,
+        }
+        for row in self.list_snapshot_outcomes(decision_snapshot_ids=decision_snapshot_ids, refresh=False):
+            if row['target_trade_date'] != trade_day:
+                continue
+            snapshot_id = row['decision_snapshot_id']
+            status = row['lifecycle_status']
+            entry_quantity = _safe_decimal(row['entry_filled_quantity'])
+            exit_quantity = _safe_decimal(row['exit_filled_quantity'])
+            if (
+                status == LIFECYCLE_CLOSED
+                and entry_quantity is not None and entry_quantity.is_finite() and entry_quantity > 0
+                and exit_quantity is not None and exit_quantity.is_finite() and exit_quantity >= entry_quantity
+                and _safe_decimal(row['open_quantity']) == 0
+            ):
+                closed.add(snapshot_id)
+            elif status not in unfilled_terminal or entry_quantity not in (None, 0):
+                still_active.add(snapshot_id)
+        return closed - still_active
+
     def list_outcomes(
         self,
         *,
