@@ -73,6 +73,12 @@ def test_audit_separates_observed_watches_from_failed_decisions_and_paper_profit
             summary_payload={'error': 'missing_decider_upstream_summaries:eod-summarizer'},
             received_at=after_open,
         ))
+        db.add(Symbol(symbol='AAPL', name_ko='Apple', market='NASDAQ', currency_code='USD'))
+        db.add(AgentContextFeedbackFailure(
+            market_date=source_date, symbol='AAPL', agent_name='short-term-decider',
+            failure_kind='dependency_missing_upstream', summary_payload={},
+            received_at=after_open,
+        ))
         db.flush()
         report = build_decider_watch_audit(
             db, as_of_market_date=latest_date,
@@ -80,6 +86,7 @@ def test_audit_separates_observed_watches_from_failed_decisions_and_paper_profit
             next_session=lambda day: day + timedelta(days=1),
         )
     items = {item['symbol']: item for item in report['items']}
+    assert 'AAPL' not in items
     watched = items['005930']
     assert watched['plans'][0]['exec_monitoring_observed_at'] == after_open.isoformat()
     assert 'private-account' not in str(report)

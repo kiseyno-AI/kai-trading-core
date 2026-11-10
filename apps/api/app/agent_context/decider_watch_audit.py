@@ -20,6 +20,7 @@ from app.db_models import (
 from app.market.clock import KST
 from app.market.session import DEFAULT_KRX_CALENDAR_SCAN_DAYS, get_krx_exchange_calendar_day
 from app.orders.next_open_execution import (
+    KRX_NEXT_OPEN_MARKETS,
     _is_krx_next_open_snapshot,
     _short_term_tactical_action,
     _trigger_entry_price_values,
@@ -208,10 +209,11 @@ def build_decider_watch_audit(
     failures = db.scalars(select(failure).options(load_only(
         failure.id, failure.market_date, failure.symbol, failure.agent_name,
         failure.run_id, failure.failure_kind, failure.summary_payload, failure.received_at,
-    )).where(
+    )).join(Symbol, Symbol.symbol == failure.symbol).where(
         failure.market_date.between(earliest, as_of_market_date),
         failure.agent_name.in_(SUPPORTED_DECIDER_AGENT_NAMES),
         failure.received_at <= observed_at,
+        func.upper(Symbol.market).in_(KRX_NEXT_OPEN_MARKETS),
     )).all()
     symbols = {row.symbol for row in watches} | {row.symbol for row in failures}
     bar = DailyPriceBar
