@@ -283,5 +283,5 @@ def build_decider_watch_audit(
             'by_simulation_status': dict(Counter(item['simulation']['status'] for item in items)),
         },
         'items': items,
-        'live_wait_price_observations': wait_price_observations.history(as_of_market_date),
+        'live_wait_price_observations': wait_price_observations.history(as_of_market_date, as_of=_aware(observed_at)),
     }

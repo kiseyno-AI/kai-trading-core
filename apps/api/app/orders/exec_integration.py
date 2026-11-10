@@ -2790,6 +2790,7 @@ class SignalDeciderExecIntegrationService:
         self._dashboard_cache: dict[tuple[str, str, str | None], DashboardReadModelCacheRecord] = {}
         self._dashboard_build_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
         self._dashboard_refresh_tasks: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
+        self._wait_price_observation_task: asyncio.Task[None] | None = None
         self._dashboard_refresh_state: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
         self._latest_exec_monitoring_membership: tuple[
             date,
@@ -6508,6 +6509,17 @@ class SignalDeciderExecIntegrationService:
                 )
             )
         now = _utcnow().astimezone(timezone.utc)
+        local_now = now.astimezone(MARKET_TIME_ZONE)
+        task = self._wait_price_observation_task
+        if (
+            resolved_market_date == local_now.date()
+            and local_now.time() <= time(15, 30)
+            and (task is None or task.done())
+        ):
+            self._wait_price_observation_task = asyncio.create_task(
+                self._refresh_wait_price_observations(resolved_market_date),
+                name='krx-wait-price-observations',
+            )
         if cached_source is not None and (
             cached_source.market_date != resolved_market_date.isoformat()
             or cached_source.source_version is None
@@ -7451,6 +7463,29 @@ class SignalDeciderExecIntegrationService:
             payload=payload,
         )
         return payload
+
+    async def _refresh_wait_price_observations(self, target_trade_date: date) -> None:
+        try:
+            if not get_krx_exchange_calendar_day(target_trade_date).is_open:
+                return
+            source_market_date = await _async_previous_trading_day(target_trade_date)
+            observations = await asyncio.to_thread(
+                self._load_passive_signal_wait_observations,
+                source_market_date=source_market_date,
+                target_trade_date=target_trade_date,
+            )
+            await asyncio.to_thread(
+                wait_price_observations.configure,
+                target_trade_date,
+                [
+                    WaitPriceWatch(**observation)
+                    for observation in observations
+                    if observation.get('trigger_price') is not None
+                ],
+                now=_utcnow(),
+            )
+        except Exception:
+            logger.exception('Could not refresh WAIT price observations for %s', target_trade_date)
 
     @staticmethod
     def _load_passive_signal_wait_observations(
@@ -8412,38 +8447,6 @@ class SignalDeciderExecIntegrationService:
             'started_at': started_at.isoformat(),
             'last_error': None,
         }
-        passive_signal_wait_observations: list[dict[str, Any]] = []
-        if symbol is None:
-            try:
-                source_market_date = await _async_previous_trading_day(
-                    target_trade_date
-                )
-                passive_signal_wait_observations = await asyncio.to_thread(
-                    self._load_passive_signal_wait_observations,
-                    source_market_date=source_market_date,
-                    target_trade_date=target_trade_date,
-                )
-                now = _utcnow()
-                if (
-                    target_trade_date == now.astimezone(MARKET_TIME_ZONE).date()
-                    and get_krx_exchange_calendar_day(target_trade_date).is_open
-                ):
-                    await asyncio.to_thread(
-                        wait_price_observations.configure,
-                        target_trade_date,
-                        [
-                            WaitPriceWatch(**observation)
-                            for observation in passive_signal_wait_observations
-                            if observation.get('trigger_price') is not None
-                        ],
-                        now=now,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    'Could not load passive signal WAIT observations for %s: %s',
-                    target_trade_date.isoformat(),
-                    exc,
-                )
         try:
             refresh_coro = self.list_signal_decider_exec_overview(
                 target_trade_date=target_trade_date,
@@ -8505,6 +8508,7 @@ class SignalDeciderExecIntegrationService:
         live_holding_symbols = None
         live_portfolio_holding_membership = None
         live_exec_monitoring_membership = None
+        passive_signal_wait_observations: list[dict[str, Any]] = []
         if symbol is None:
             background_trigger = f'{trigger}:dashboard_background_refresh'
             live_portfolio_holding_membership = (
@@ -8522,6 +8526,21 @@ class SignalDeciderExecIntegrationService:
                 market_date=target_trade_date,
                 trigger=background_trigger,
             )
+            try:
+                source_market_date = await _async_previous_trading_day(
+                    target_trade_date
+                )
+                passive_signal_wait_observations = await asyncio.to_thread(
+                    self._load_passive_signal_wait_observations,
+                    source_market_date=source_market_date,
+                    target_trade_date=target_trade_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'Could not load passive signal WAIT observations for %s: %s',
+                    target_trade_date.isoformat(),
+                    exc,
+                )
         await self._store_dashboard_caches_from_overview(
             market_date=target_trade_date,
             symbol=symbol,

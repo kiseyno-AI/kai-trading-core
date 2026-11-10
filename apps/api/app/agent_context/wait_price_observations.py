@@ -193,6 +193,7 @@ class WaitPriceObservations:
                         _write_once(self.root / local.date().isoformat() / f'{snapshot_id}.touch.json', {
                             'status': 'touched', 'evidence': 'exact' if exact else 'crossed',
                             'price_as_of': tick.price_as_of.isoformat(), 'observed_price': str(price),
+                            'price_received_at': tick.received_at.isoformat(),
                             'previous_price': str(previous[1]) if crossed else None,
                             'previous_price_as_of': previous[0].isoformat() if crossed else None,
                         })
@@ -202,18 +203,24 @@ class WaitPriceObservations:
                     self._touched.add(snapshot_id)
                 self._previous[snapshot_id] = (tick.price_as_of, price)
 
-    def history(self, day: date) -> list[dict]:
+    def history(self, day: date, *, as_of: datetime | None = None) -> list[dict]:
         folder = self.root / day.isoformat()
         results = {}
-        for watch in self.recovery_watches(day):
-            results[watch.decision_snapshot_id] = {
-                **asdict(watch), 'market_date': day.isoformat(), 'status': 'enrolled',
-            }
+        if as_of is None:
+            for watch in self.recovery_watches(day):
+                results[watch.decision_snapshot_id] = {
+                    **asdict(watch), 'market_date': day.isoformat(), 'status': 'enrolled',
+                }
         for path in folder.glob('*.watch.json'):
             row = _read(path)
+            if as_of is not None and datetime.fromisoformat(row['tracking_started_at']) > as_of:
+                continue
             key = row['decision_snapshot_id']
-            touch = folder / f'{key}.touch.json'
-            results[key] = {**row, **(_read(touch) if touch.is_file() else {})}
+            touch_path = folder / f'{key}.touch.json'
+            touch = _read(touch_path) if touch_path.is_file() else {}
+            if touch and (as_of is None or datetime.fromisoformat(touch['price_received_at']) <= as_of):
+                row.update(touch)
+            results[key] = row
         return [results[key] for key in sorted(results)]
 
 

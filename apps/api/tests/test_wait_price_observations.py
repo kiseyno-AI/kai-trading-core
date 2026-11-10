@@ -45,6 +45,9 @@ def test_same_symbol_keeps_independent_first_touch_history(tmp_path, monkeypatch
     ingest(3, 98)
     ingest(4, 100)
 
-    history = WaitPriceObservations(tmp_path).history(day)
+    stored = WaitPriceObservations(tmp_path)
+    earlier = stored.history(day, as_of=opened + timedelta(seconds=2))
+    assert [x['status'] for x in earlier] == ['not_observed', 'touched']
+    history = stored.history(day)
     assert [(x['decision_snapshot_id'], x['status'], x['observed_price'], x['evidence'])
             for x in history] == [(1, 'touched', '98', 'crossed'), (2, 'touched', '105', 'exact')]
