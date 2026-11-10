@@ -1818,6 +1818,7 @@ def _atomic_exact_scope_proof(
     selected_symbols: Sequence[str],
     successful_symbols: Sequence[str] | None = None,
     retry_debt_symbols: Sequence[str] = (),
+    terminal_not_applicable_symbols: Sequence[str] = (),
     stage_id: str | None = None,
     market_date: str = '2026-04-03',
     exact_symbols: Sequence[str] | None = None,
@@ -1853,6 +1854,7 @@ def _atomic_exact_scope_proof(
             selected_symbols=selected,
             successful_symbols=successful,
             retry_debt_symbols=retry_debt_symbols,
+            terminal_not_applicable_symbols=terminal_not_applicable_symbols,
         ),
     }
 
@@ -17441,9 +17443,11 @@ class PykrxBackfillServiceTests(TestCase):
                 market='KOSPI',
                 name_ko=f'Symbol {index}',
             )
-            for index in range(1, 7)
+            for index in range(1, 8)
         ]
         symbol_codes = [item.symbol for item in symbols]
+        preferred_symbols = symbol_codes[5:6]
+        signal_symbols = symbol_codes[2:3] + preferred_symbols
 
         with ExitStack() as stack:
             stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', 'test-dart-key'))
@@ -17582,7 +17586,7 @@ class PykrxBackfillServiceTests(TestCase):
                     side_effect=lambda **_: followup_order.append('signal_features')
                     or {
                         'status': 'completed',
-                        'features_persisted': 1,
+                        'features_persisted': len(signal_symbols),
                         'features_failed': 0,
                         'sources': [],
                         'source_counts': {},
@@ -17591,7 +17595,7 @@ class PykrxBackfillServiceTests(TestCase):
                             manifest_version=(
                                 'signal_features_scope_outcomes_v1'
                             ),
-                            selected_symbols=symbol_codes[2:3],
+                            selected_symbols=signal_symbols,
                         ),
                     },
                 )
@@ -17630,13 +17634,15 @@ class PykrxBackfillServiceTests(TestCase):
                         'gate_status': 'ready',
                         'market_date': '2026-04-03',
                         'scope_finalization': {'ready': True},
+                        'preferred_not_applicable_stock_codes': preferred_symbols,
                         **build_exact_symbol_scope_outcome(
                             manifest_version=(
                                 'dart_fundamentals_scope_outcomes_v1'
                             ),
-                            selected_symbols=symbol_codes[2:5],
+                            selected_symbols=symbol_codes[2:6],
                             successful_symbols=symbol_codes[2:4],
                             retry_debt_symbols=symbol_codes[4:5],
+                            terminal_not_applicable_symbols=preferred_symbols,
                         ),
                     },
                 )
@@ -17657,9 +17663,10 @@ class PykrxBackfillServiceTests(TestCase):
                             manifest_version=(
                                 'piotroski_scope_outcomes_v1'
                             ),
-                            selected_symbols=symbol_codes[2:4],
+                            selected_symbols=symbol_codes[2:4] + preferred_symbols,
                             successful_symbols=symbol_codes[2:3],
                             retry_debt_symbols=symbol_codes[3:4],
+                            terminal_not_applicable_symbols=preferred_symbols,
                             exact_symbols=symbol_codes,
                         ),
                     },
@@ -17676,6 +17683,16 @@ class PykrxBackfillServiceTests(TestCase):
                         'results_failed': 0,
                         'gate_status': 'ready',
                         'blocking_status': 'non_blocking',
+                        'stages': {
+                            stage_id: {
+                                'status': 'completed',
+                                'result': {'successful_stock_codes': signal_symbols},
+                            }
+                            for stage_id in (
+                                'momentum_factors', 'value_factors',
+                                'low_risk_factors', 'beta_factors',
+                            )
+                        },
                         **build_exact_symbol_scope_outcome(
                             manifest_version=(
                                 'factor_followup_scope_outcomes_v1'
@@ -17766,11 +17783,11 @@ class PykrxBackfillServiceTests(TestCase):
             run_piotroski_followup=False,
             run_feedback_followup=False,
             progress_callback=ANY,
-            symbols=symbol_codes[2:5],
+            symbols=symbol_codes[2:6],
         )
         piotroski_followup.assert_called_once_with(
             market_date='2026-04-03',
-            symbols=symbol_codes[2:4],
+            symbols=symbol_codes[2:4] + preferred_symbols,
             ranking_symbols=symbol_codes,
             exact_scope_symbols=symbol_codes,
             authoritative_market_scope=ANY,
@@ -17780,8 +17797,8 @@ class PykrxBackfillServiceTests(TestCase):
             exact_membership_symbols=symbol_codes,
             admitted_symbols=symbol_codes[2:3],
             # Price-only factors are admitted by the follow-up price cohort
-            # (symbols 3-5; symbols 1-2 never passed price admission).
-            price_admitted_symbols=symbol_codes[2:5],
+            # (symbols 3-6; symbols 1-2 never passed price admission).
+            price_admitted_symbols=symbol_codes[2:6],
             authoritative_market_scope=ANY,
             stage_executor=ANY,
             stage_result_callback=ANY,
@@ -17804,21 +17821,21 @@ class PykrxBackfillServiceTests(TestCase):
             market_date='2026-04-03',
             include_retry_metadata=True,
             exact_symbols=symbol_codes,
-            admitted_symbols=symbol_codes[2:3],
+            admitted_symbols=signal_symbols,
         )
         feedback_followup.assert_called_once_with(
             market_date='2026-04-03',
             enabled=False,
             knowledge_cutoff_at=ANY,
             progress_callback=ANY,
-            symbols=symbol_codes[2:3],
+            symbols=signal_symbols,
         )
         signal_decider_followup.assert_called_once_with(
             market_date='2026-04-03',
             enabled=False,
             knowledge_cutoff_at=ANY,
             progress_callback=ANY,
-            symbols=symbol_codes[2:3],
+            symbols=signal_symbols,
         )
         evaluation_followup.assert_not_called()
         self.assertEqual(
@@ -17831,7 +17848,7 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertEqual(
             result['signal_feature_followup']['successful_stock_codes'],
-            symbol_codes[2:3],
+            signal_symbols,
         )
         self.assertEqual(
             result['signal_feature_followup']['retry_debt_stock_codes'],

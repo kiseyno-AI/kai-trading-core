@@ -6929,6 +6929,7 @@ def run_market_data_pipeline(
                         {'factor_followup_scope_outcomes_v1'}
                     ),
                 )
+                signal_feature_invocation_symbols = []
                 if factor_admitted_symbols:
                     preferred_signal_symbols = set(preferred_followup_symbols)
                     for price_factor_stage in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS:
@@ -6939,12 +6940,14 @@ def run_market_data_pipeline(
                         preferred_signal_symbols.intersection_update(
                             price_factor_result.get('successful_stock_codes') or ()
                         )
-                    signal_admitted = sorted(set(factor_admitted_symbols) | preferred_signal_symbols)
+                    signal_feature_invocation_symbols = sorted(
+                        set(factor_admitted_symbols) | preferred_signal_symbols
+                    )
                     signal_feature_admitted_symbols = (
                         None
-                        if set(signal_admitted)
+                        if set(signal_feature_invocation_symbols)
                         == set(exact_followup_symbols)
-                        else signal_admitted
+                        else signal_feature_invocation_symbols
                     )
                     result['signal_feature_followup'] = (
                         run_signal_feature_followup()
@@ -6962,9 +6965,6 @@ def run_market_data_pipeline(
                         result['signal_feature_followup'],
                     )
                 result['signal_features'] = result['signal_feature_followup']
-                signal_feature_invocation_symbols = (
-                    factor_admitted_symbols or []
-                )
                 signal_feature_successful_symbols = (
                     _validated_successful_cohort(
                         stage_result=result['signal_feature_followup'],
