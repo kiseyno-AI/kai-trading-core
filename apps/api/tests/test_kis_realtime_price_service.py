@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -1924,7 +1926,7 @@ def test_orderbooks_share_capacity_and_only_expose_current_kis_quotes(monkeypatc
             app = FastAPI()
             app.include_router(routes_quotes.router)
             with TestClient(app) as client:
-                assert client.get('/quotes/realtime/orderbooks').json() == {'connected': True, 'passive_quote_symbols': [], 'items': [{
+                assert client.get('/quotes/realtime/orderbooks').json() == {'connected': True, 'passive_quote_symbols': [], 'passive_quote_expires_at': None, 'items': [{
                     'symbol': '005930', 'bid_price': 71000, 'ask_price': 71100,
                     'bid_size': 200, 'ask_size': 150, 'price_as_of': now.isoformat(),
                     'price_received_at': now.isoformat(), 'source': 'kis_orderbook_ws',
@@ -1949,5 +1951,73 @@ def test_orderbooks_share_capacity_and_only_expose_current_kis_quotes(monkeypatc
         await service._sync_subscriptions(socket, approval_key='test')
         assert service.health_snapshot()['orderbook_subscribed_symbols'] == []
         assert service.health_snapshot()['subscribed_symbols'] == ['000660', '005930']
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('failed_symbol', [None, '005930'])
+def test_ambiguous_book_rejection_reconnects_once_into_trade_only(monkeypatch, failed_symbol):
+    now = datetime(2026, 11, 10, 5, 25, tzinfo=timezone.utc)
+    monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+    monkeypatch.setattr(settings, 'kis_realtime_price_max_subscriptions', 2)
+    monkeypatch.setattr(settings, 'kis_realtime_price_subscribe_pause_seconds', 0)
+    service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+    socket = FakeWebSocket()
+
+    async def check():
+        _record_open_market_session(service)
+        service._mark_connected()
+        source = KISRealtimeMonitoredSymbolSource(
+            symbols=('005930', '000660'), market_date='2026-11-10', source_version=now,
+            membership_complete=True, protected_symbols=('005930',),
+        )
+        service._apply_runtime_monitored_source(source, trigger='test', expected_observation_revision=None)
+        await service._sync_subscriptions(socket, approval_key='test')
+        if failed_symbol is not None:
+            # A delayed unsubscribe rejection can arrive after the watch rejoins.
+            for index, protected in enumerate([(), ('005930',)], 1):
+                service._apply_runtime_monitored_source(KISRealtimeMonitoredSymbolSource(
+                    symbols=source.symbols, market_date=source.market_date,
+                    source_version=now + timedelta(seconds=index), membership_complete=True,
+                    protected_symbols=protected,
+                ), trigger='test', expected_observation_revision=None)
+                await service._sync_subscriptions(socket, approval_key='test')
+        header = {'tr_id': 'H0STASP0'}
+        if failed_symbol is not None:
+            header['tr_key'] = failed_symbol
+        rejection = json.dumps({'header': header, 'body': {'rt_cd': '1', 'msg1': 'book error'}})
+        with pytest.raises(KISRealtimePriceSubscriptionError):
+            await service._handle_system_message(socket, rejection, received_at=now)
+        service._mark_disconnected()
+        service._mark_connected()
+        socket.sent.clear()
+        await service._sync_subscriptions(socket, approval_key='test')
+        assert {frame['body']['input']['tr_key'] for frame in socket.sent} == {'000660', '005930'}
+        assert {frame['body']['input']['tr_id'] for frame in socket.sent} == {'H0STCNT0'}
+        await service._handle_system_message(socket, rejection, received_at=now)
+        assert service.health_snapshot()['subscribed_symbols'] == ['000660', '005930']
+
+    asyncio.run(check())
+
+
+def test_zero_channel_budget_sends_no_book_or_trade_subscriptions(monkeypatch):
+    now = datetime(2026, 11, 10, 5, 25, tzinfo=timezone.utc)
+    monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+    monkeypatch.setattr(settings, 'kis_realtime_price_max_subscriptions', 0)
+    monkeypatch.setattr(settings, 'kis_realtime_price_subscribe_pause_seconds', 0)
+    service = KISRealtimePriceService(client=FakeKISRealtimePriceClient())
+    socket = FakeWebSocket()
+
+    async def check():
+        _record_open_market_session(service)
+        service._mark_connected()
+        symbols = tuple(f'{i:06d}' for i in range(1, 46))
+        service._apply_runtime_monitored_source(KISRealtimeMonitoredSymbolSource(
+            symbols=symbols, market_date='2026-11-10', source_version=now,
+            membership_complete=True, protected_symbols=symbols,
+        ), trigger='test', expected_observation_revision=None)
+        await service._sync_subscriptions(socket, approval_key='test')
+        assert socket.sent == []
+        assert service.subscription_snapshot()['allowed_symbols'] == []
 
     asyncio.run(check())

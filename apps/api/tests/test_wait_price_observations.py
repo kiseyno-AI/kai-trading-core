@@ -139,6 +139,12 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
             assert [len(batch) for batch in batches] == batch_sizes
             assert [symbol for batch in batches for symbol in batch] == symbols
             assert prices.health_snapshot()['wait_orderbook_observation']['sampled_count'] == symbol_count
+            snapshot = prices.orderbooks_snapshot()
+            assert snapshot['passive_quote_symbols'] == symbols
+            assert snapshot['passive_quote_expires_at'] == (now + timedelta(seconds=10)).isoformat()
+            expired = prices.orderbooks_snapshot(now=now + timedelta(seconds=11))
+            assert expired['passive_quote_symbols'] == []
+            assert expired['passive_quote_expires_at'] is None
             records = observer.history(now.date())
             assert len(records) == symbol_count
             assert all(row['ask_touch']['ask_size'] == 3 and row['status'] == 'not_observed' for row in records)
