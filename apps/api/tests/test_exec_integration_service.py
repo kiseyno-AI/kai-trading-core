@@ -12,6 +12,7 @@ from sqlalchemy import delete, event, select
 
 from app.agent_context.decider_replay_service import DeciderReplayCostAssumptions, DeciderReplayRepository
 from app.agent_context.model_identity import build_observed_model_identity
+from app.agent_context.wait_price_observations import WaitPriceWatch
 from app.core.settings import settings
 from app.db import engine, session_scope
 from app.db_models import (
@@ -13659,14 +13660,16 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             action: str = 'wait',
             agent_name: str = 'signal-decider',
             market: str = 'KOSPI',
+            has_trigger: bool = True,
         ) -> SimpleNamespace:
+            generic_action = 'wait' if action == 'avoid_chase' else action
             return SimpleNamespace(
                 id=snapshot_id,
                 market_date=self.market_date,
                 symbol=symbol,
                 agent_name=agent_name,
-                decision_action=action,
-                next_day_open_action=action,
+                decision_action=generic_action,
+                next_day_open_action=generic_action,
                 feedback_received_at=datetime(
                     2026,
                     4,
@@ -13683,7 +13686,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     snapshot_id % 60,
                     tzinfo=timezone.utc,
                 ),
-                response_payload={'trigger_price': str(snapshot_id * 100), 'tactical_action': action},
+                response_payload={
+                    'trigger_price': str(snapshot_id * 100) if has_trigger else None,
+                    'tactical_action': action,
+                },
                 request_payload={
                     'symbol_day_context': {
                         'company': {'market': market},
@@ -13704,14 +13710,21 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 snapshot(snapshot_id=16, symbol='089890', action='reject'),
                 snapshot(snapshot_id=17, symbol='089890'),
+                snapshot(snapshot_id=18, symbol='005930', has_trigger=False),
+                snapshot(snapshot_id=19, symbol='005930', agent_name='short-term-decider', action='avoid_chase'),
             ],
         }
 
-        with patch.object(
-            signal_decider_next_open_execution_service,
-            '_load_latest_snapshot_generation_state',
-            return_value=generation_state,
-        ) as generation_loader:
+        recovered_wait = WaitPriceWatch(
+            10, 'short-term-decider', '005930', self.market_date.isoformat(),
+            '2026-04-29T07:10:00+00:00', '1000', buy_direction='at_or_above',
+        )
+        with (
+            patch.object(signal_decider_next_open_execution_service, '_load_latest_snapshot_generation_state',
+                         return_value=generation_state) as generation_loader,
+            patch('app.orders.exec_integration.wait_price_observations.recovery_watches',
+                  return_value=[recovered_wait]),
+        ):
             observations = (
                 SignalDeciderExecIntegrationService
                 ._load_passive_signal_wait_observations(
@@ -13742,7 +13755,17 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'trigger_price': '1500',
                     'buy_direction': 'at_or_below',
                     'chase_limit_price': None,
-                }
+                },
+                {
+                    'symbol': '005930',
+                    'decision_snapshot_id': 18,
+                    'decision_agent_name': 'signal-decider',
+                    'source_market_date': self.market_date.isoformat(),
+                    'observed_at': '2026-04-29T07:18:00+00:00',
+                    'trigger_price': None,
+                    'buy_direction': 'at_or_below',
+                    'chase_limit_price': None,
+                },
             ],
         )
         generation_loader.assert_called_once_with(
@@ -13772,10 +13795,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 source_market_date=self.market_date, target_trade_date=self.target_trade_date,
             )
 
-        self.assertEqual([item['decision_snapshot_id'] for item in remaining], [15])
-        outcome_loader.assert_called_once_with(decision_snapshot_ids=[13, 15], refresh=False)
+        self.assertEqual([item['decision_snapshot_id'] for item in remaining], [15, 18])
+        outcome_loader.assert_called_once_with(decision_snapshot_ids=[13, 15, 18], refresh=False)
 
-    def test_runtime_monitored_symbols_adds_signal_wait_as_observation_only(self) -> None:
+    def test_runtime_monitored_symbols_subscribes_signal_wait_without_a_trigger(self) -> None:
         wait_symbol = '032080'
         self._seed_symbol(symbol=wait_symbol, name_ko='Passive wait')
         with session_scope() as session:
@@ -13824,16 +13847,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                         'decision_agent_name': 'signal-decider',
                         'source_market_date': self.market_date.isoformat(),
                         'observed_at': '2026-04-29T07:13:00+00:00',
-                        'trigger_price': '38550.0',
+                        'trigger_price': None,
                     },
-                    {
-                        'symbol': wait_symbol,
-                        'decision_snapshot_id': 14,
-                        'decision_agent_name': 'short-term-decider',
-                        'source_market_date': self.market_date.isoformat(),
-                        'observed_at': '2026-04-29T07:14:00+00:00',
-                        'trigger_price': '39100',
-                    }
                 ],
             )
 
@@ -13882,12 +13897,9 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(item['chase_limit_price'])
         self.assertEqual(
             item['wait_observations'],
-            [
-                {'decision_agent_name': 'signal-decider', 'trigger_price': 38550},
-                {'decision_agent_name': 'short-term-decider', 'trigger_price': 39100},
-            ],
+            [{'decision_agent_name': 'signal-decider', 'trigger_price': None}],
         )
-        self.assertEqual(item['decision_agent_names'], ['short-term-decider', 'signal-decider'])
+        self.assertEqual(item['decision_agent_names'], ['signal-decider'])
         self.assertEqual(item['account_references'], [])
         self.assertEqual(item['status_counts'], {})
         self.assertEqual(self.client.post_calls, [])

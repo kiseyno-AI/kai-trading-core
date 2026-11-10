@@ -35,7 +35,7 @@ class WaitPriceWatch:
     symbol: str
     source_market_date: str
     observed_at: str
-    trigger_price: str
+    trigger_price: str | None
     buy_direction: str | None = None
     chase_limit_price: str | None = None
 
@@ -71,23 +71,29 @@ def watch_from_snapshot(
         for value in (snapshot.created_at, snapshot.feedback_received_at)
         if value is not None
     )
-    if trigger is None or not trigger.is_finite() or trigger <= 0 or known_at >= datetime.combine(
+    if known_at >= datetime.combine(
         market_date, time(15, 30), KST,
     ):
         return None
+    if trigger is not None and (not trigger.is_finite() or trigger <= 0):
+        trigger = None
     return WaitPriceWatch(
         decision_snapshot_id=int(snapshot.id),
         decision_agent_name=role,
         symbol=snapshot.symbol,
         source_market_date=snapshot.market_date.isoformat(),
         observed_at=known_at.isoformat(),
-        trigger_price=str(trigger),
+        trigger_price=str(trigger) if trigger is not None else None,
         buy_direction=(
             'at_or_above'
             if role == 'short-term-decider' and _effective_short_term_tactical_action(snapshot) == 'watch_for_trigger'
             else 'at_or_below'
         ),
-        chase_limit_price=str(chase) if chase is not None and chase.is_finite() and chase >= trigger else None,
+        chase_limit_price=(
+            str(chase)
+            if trigger is not None and chase is not None and chase.is_finite() and chase >= trigger
+            else None
+        ),
     )
 
 
@@ -151,7 +157,7 @@ class WaitPriceObservations:
             active_ids: set[int] = set()
             for watch in watches:
                 snapshot_id = watch.decision_snapshot_id
-                if snapshot_id in active_ids:
+                if watch.trigger_price is None or snapshot_id in active_ids:
                     continue
                 active_ids.add(snapshot_id)
                 grouped[watch.symbol].append(watch)
@@ -332,6 +338,7 @@ def main() -> None:
         watches = [
             watch for snapshot in snapshots
             if (watch := watch_from_snapshot(snapshot, market_date=args.market_date)) is not None
+            and watch.trigger_price is not None
         ]
         if {watch.decision_snapshot_id for watch in watches} != ids:
             parser.error('Every snapshot must have a valid KRX WAIT trigger for this date')

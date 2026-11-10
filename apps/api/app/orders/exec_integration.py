@@ -7477,11 +7477,7 @@ class SignalDeciderExecIntegrationService:
             await asyncio.to_thread(
                 wait_price_observations.configure,
                 target_trade_date,
-                [
-                    WaitPriceWatch(**observation)
-                    for observation in observations
-                    if observation.get('trigger_price') is not None
-                ],
+                [WaitPriceWatch(**observation) for observation in observations],
                 now=_utcnow(),
             )
         except Exception:
@@ -7527,7 +7523,17 @@ class SignalDeciderExecIntegrationService:
             if snapshot.market_date == source_market_date
         ]
         scope_counts = Counter((snapshot.symbol, snapshot.agent_name) for snapshot in snapshots)
-        observations = {watch.decision_snapshot_id: asdict(watch) for watch in recovery}
+        current_ids_by_scope = {
+            (snapshot.symbol, snapshot.agent_name): snapshot.id
+            for snapshot in generation_state.get('raw_snapshots') or snapshots
+            if snapshot.market_date == source_market_date
+        }
+        observations = {
+            watch.decision_snapshot_id: asdict(watch) for watch in recovery
+            if current_ids_by_scope.get(
+                (watch.symbol, watch.decision_agent_name), watch.decision_snapshot_id,
+            ) == watch.decision_snapshot_id
+        }
         for snapshot in snapshots:
             if scope_counts[(snapshot.symbol, snapshot.agent_name)] != 1:
                 continue

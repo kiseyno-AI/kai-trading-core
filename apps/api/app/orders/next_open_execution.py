@@ -3103,9 +3103,6 @@ def _next_open_policy_fingerprint(account_targets: Sequence[NextOpenAccountTarge
         'block_on_data_warnings': bool(
             settings.signal_decider_next_open_block_on_data_warnings
         ),
-        'block_on_specialist_disagreement': bool(
-            settings.signal_decider_next_open_block_on_specialist_disagreement
-        ),
         'require_target_and_stop': bool(
             settings.signal_decider_next_open_require_target_and_stop
         ),
@@ -3322,9 +3319,7 @@ class SignalDeciderNextOpenExecutionService:
                 'min_expected_return_pct': settings.signal_decider_next_open_min_expected_return_pct,
                 'require_active_policy': bool(settings.signal_decider_next_open_require_active_policy),
                 'block_on_data_warnings': bool(settings.signal_decider_next_open_block_on_data_warnings),
-                'block_on_specialist_disagreement': bool(
-                    settings.signal_decider_next_open_block_on_specialist_disagreement
-                ),
+                'block_on_specialist_disagreement': False,
                 'require_target_and_stop': bool(settings.signal_decider_next_open_require_target_and_stop),
             },
         }
@@ -8649,13 +8644,11 @@ class SignalDeciderNextOpenExecutionService:
                 )
             else:
                 blocking_reasons.append(close_price_mismatch_reason)
-        if settings.signal_decider_next_open_block_on_specialist_disagreement and _normalize_text_list(
-            snapshot.specialist_disagreement_payload
-        ):
-            blocking_reasons.append(
+        if _normalize_text_list(snapshot.specialist_disagreement_payload):
+            warnings.append(
                 _reason(
                     'specialist_disagreement_present',
-                    'Snapshot has specialist disagreement warnings.',
+                    'The decider reported disagreement among its specialists.',
                 )
             )
         if candidate_enrichment is not None:
