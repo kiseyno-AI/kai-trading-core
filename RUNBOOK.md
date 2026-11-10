@@ -21,6 +21,16 @@ What it does:
 - when `./start-api.sh` handles the migration path, it exports `DB_AUTO_UPGRADE=false` for the uvicorn process so FastAPI lifespan startup does not immediately run a duplicate migration pass
 - if `API_REQUEST_LOGGING_ENABLED=true` and/or `UPSTREAM_HTTP_LOGGING_ENABLED=true`, the service writes rotating JSONL audit logs under `apps/api/var/log` by default
 
+## Migrating the former Observatory equity history
+
+Core now owns daily equity history. To cut over an installation with an existing Observatory history, use a maintenance window outside live dispatch. Stop the old `com.kiseyno.observatory-equity` collector and leave its private SQLite file in place. From Core's `apps/api`, run:
+
+```sh
+.venv/bin/python -m scripts.import_observatory_equity "$HOME/.local/state/openclaw-observatory/equity.sqlite"
+```
+
+The importer verifies existing amounts and refuses a conflicting date instead of overwriting it. It imports only daily totals and dates. Restart Core, confirm the private history route, then switch Observatory to the Core API and verify its public response omits every amount. Keep the old SQLite file as a private backup until the cutover is confirmed.
+
 ## Health checks
 - `GET /health`
 - `GET /broker/kis/health`
@@ -33,6 +43,7 @@ What it does:
 - `POST /broker/kis/intraday-snapshots/collect?symbols=005930`
 - `GET /broker/kis/intraday-snapshots?symbols=005930&limit=5`
 - `GET /portfolio/summary`
+- `GET /portfolio/equity-history` (private)
 - `GET /trading/orders/exec/runtime?refresh=true`
 - `GET /trading/orders/exec/signal-decider?target_trade_date=2026-04-30&refresh=true`
 - `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=true`
