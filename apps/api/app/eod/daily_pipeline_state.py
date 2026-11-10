@@ -1605,18 +1605,6 @@ class DailyPipelineRunStateService:
                 'repaired_stage_run_ids': sorted(repaired_stage_run_ids),
             }
 
-    def has_active_run(self, *, market_date: str | date) -> bool:
-        with session_scope() as session:
-            active_run_id = session.scalar(
-                select(DailyPipelineRun.id)
-                .where(
-                    DailyPipelineRun.market_date == _normalize_market_date(market_date),
-                    DailyPipelineRun.status.in_((*ACTIVE_DAILY_PIPELINE_STATUSES, 'queued')),
-                )
-                .limit(1)
-            )
-        return active_run_id is not None
-
     def get_latest_run(
         self,
         *,

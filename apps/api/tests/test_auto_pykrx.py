@@ -23011,11 +23011,6 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
         )
         recovery_target_patcher.start()
         self.addCleanup(recovery_target_patcher.stop)
-        latest_collection_patcher = patch(
-            'app.eod.auto_pykrx.load_latest_eod_collection_run', return_value=None
-        )
-        latest_collection_patcher.start()
-        self.addCleanup(latest_collection_patcher.stop)
         calendar_patcher = patch(
             'app.eod.auto_pykrx.async_previous_krx_trading_date',
             new=AsyncMock(side_effect=previous_weekday),
@@ -23616,7 +23611,7 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             await scheduler.schedule_daily_pipeline_if_due()
             self.assertIsNone(scheduler._task)
 
-        load_recovery_target.assert_not_called()
+        load_recovery_target.assert_called_once()
         run_pipeline.assert_not_awaited()
         self.assertEqual(scheduler.snapshot()['last_status'], 'idle')
         self.assertEqual(
@@ -23624,9 +23619,10 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             f'waiting_until:{(close_at + timedelta(minutes=280)).isoformat()}',
         )
 
-    async def test_closed_session_prioritizes_current_daily_work_over_older_recovery(
+    async def test_closed_session_starts_older_recovery_after_same_day_finality_window(
         self,
     ) -> None:
+        scheduler = AutoPykrxEODScheduler()
         now = datetime.now(KST)
         close_at = (now - timedelta(minutes=281)).replace(
             second=0,
@@ -23646,88 +23642,133 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             latest_valid_trading_date=current_market_date,
         )
 
-        older_target = AutoEODRecoveryTarget(
-            trade_date=(now.date() - timedelta(days=1)).isoformat(), eod_run_id=81
+        with (
+            patch(
+                'app.eod.auto_pykrx.async_get_market_state',
+                return_value=market,
+            ),
+            patch(
+                'app.eod.auto_pykrx.'
+                'load_oldest_outstanding_auto_eod_recovery_target',
+                return_value=AutoEODRecoveryTarget(
+                    trade_date='2026-09-11',
+                    eod_run_id=81,
+                ),
+            ),
+            patch.object(
+                scheduler,
+                '_run_scheduled_daily_pipeline',
+                new=AsyncMock(return_value=None),
+            ) as run_pipeline,
+        ):
+            await scheduler.schedule_daily_pipeline_if_due(
+                expected_market_state='CLOSED'
+            )
+            self.assertIsNotNone(scheduler._task)
+            await scheduler._task
+
+        run_pipeline.assert_awaited_once_with(
+            '2026-09-11',
+            markets=('KOSPI', 'KOSDAQ'),
+            point_in_time_recovery=True,
+            recovery_eod_run_id=81,
+            fallback_market_date=current_market_date,
         )
-        current_target = AutoEODRecoveryTarget(
-            trade_date=current_market_date, eod_run_id=82
+
+    async def test_closed_session_advances_after_unsuccessful_historical_recovery(
+        self,
+    ) -> None:
+        now = datetime.now(KST)
+        current_date = now.date().isoformat()
+        close_at = now - timedelta(minutes=281)
+        older = AutoEODRecoveryTarget(
+            trade_date=(now.date() - timedelta(days=1)).isoformat(), eod_run_id=81,
         )
-        completed_collection = {
-            'status': 'completed',
-            'symbols_failed': 0,
-            'run_metadata': {'mode': 'daily_auto'},
-        }
+        market = MarketState(
+            market='KRX',
+            state='CLOSED',
+            is_trading_day=True,
+            is_open=False,
+            server_time=now.isoformat(),
+            session_open_at=(close_at - timedelta(hours=6, minutes=30)).isoformat(),
+            session_close_at=close_at.isoformat(),
+            latest_valid_trading_date=current_date,
+        )
+
+        current = AutoEODRecoveryTarget(trade_date=current_date, eod_run_id=82)
         cases = (
-            ('fresh daily', None, None, False, current_market_date, {}),
-            ('active collection', {'status': 'running'}, None, False, current_market_date, {}),
+            ({'status': 'blocked', 'reason': 'feedback_prerequisites_not_ready'}, True, None),
+            ({'status': 'failed', 'reason': 'price_collection_failed'}, True, current),
             (
-                'completed repair only',
-                {**completed_collection, 'run_metadata': {'mode': 'historical'}},
+                {
+                    'status': 'completed',
+                    'fundamentals_followup': {
+                        'status': 'blocked', 'reason': 'required_provider_not_ready',
+                    },
+                },
+                True,
                 None,
-                False,
-                current_market_date,
-                {},
             ),
             (
-                'current followup debt',
-                completed_collection,
-                current_target,
-                False,
-                current_market_date,
-                {'recovery_eod_run_id': 82},
-            ),
-            ('current daily followups still running', completed_collection, None, True, None, {}),
-            (
-                'older debt after current completion',
-                completed_collection,
+                {
+                    'status': 'completed',
+                    'followup_recovery': {
+                        'state_convergence': {
+                            'updated': False, 'reason': 'recovery_parent_not_finalized',
+                        },
+                    },
+                },
+                True,
                 None,
-                False,
-                older_target.trade_date,
-                {'point_in_time_recovery': True, 'recovery_eod_run_id': 81},
             ),
+            ({'reason': 'followup_recovery_backoff', 'triggered': False}, True, None),
+            (RuntimeError('unexpected historical recovery failure'), True, None),
+            ({'reason': 'followup_recovery_already_running', 'triggered': False}, False, None),
+            ({'status': 'running', 'triggered': True}, False, None),
+            ({'status': 'completed', 'triggered': True}, False, None),
         )
-        for label, current_collection, current_debt, active, expected_date, expected_kwargs in cases:
-            with self.subTest(label=label):
+        for result, should_advance, current_target in cases:
+            with self.subTest(result=result):
                 scheduler = AutoPykrxEODScheduler()
 
                 def load_recovery_target(*, on_or_after, on_or_before):
-                    self.assertEqual(on_or_before, current_market_date)
-                    if on_or_after == current_market_date:
-                        return current_debt
-                    return older_target
+                    self.assertEqual(on_or_before, current_date)
+                    return current_target if on_or_after == current_date else older
 
                 with (
                     patch('app.eod.auto_pykrx.async_get_market_state', return_value=market),
                     patch(
                         'app.eod.auto_pykrx.load_oldest_outstanding_auto_eod_recovery_target',
                         side_effect=load_recovery_target,
-                    ) as load_recovery,
-                    patch(
-                        'app.eod.auto_pykrx.load_latest_eod_collection_run',
-                        return_value=current_collection,
                     ),
                     patch(
-                        'app.eod.daily_pipeline_state.daily_pipeline_run_state_service.has_active_run',
-                        return_value=active,
-                        create=True,
-                    ),
-                    patch.object(
-                        scheduler, '_run_scheduled_daily_pipeline', new=AsyncMock(),
-                    ) as run_pipeline,
+                        'app.eod.auto_pykrx.PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                        side_effect=[result, {'status': 'completed', 'triggered': True}],
+                    ) as run_daily,
                 ):
                     await scheduler.schedule_daily_pipeline_if_due(expected_market_state='CLOSED')
-                    if scheduler._task is not None:
-                        await scheduler._task
+                    first_task = scheduler._task
+                    self.assertIsNotNone(first_task)
+                    await scheduler.schedule_daily_pipeline_if_due(expected_market_state='CLOSED')
+                    self.assertIs(scheduler._task, first_task)
+                    await first_task
+                    await scheduler.schedule_daily_pipeline_if_due(expected_market_state='CLOSED')
+                    await scheduler._task
 
-                if expected_date is None:
-                    run_pipeline.assert_not_awaited()
-                    self.assertEqual(scheduler.snapshot()['last_reason'], 'current_daily_pipeline_running')
-                else:
-                    run_pipeline.assert_awaited_once_with(
-                        expected_date, markets=('KOSPI', 'KOSDAQ'), **expected_kwargs
+                self.assertEqual(run_daily.call_count, 2)
+                first_call, second_call = run_daily.call_args_list
+                self.assertEqual(first_call.kwargs['market_date'], older.trade_date)
+                self.assertEqual(first_call.kwargs['recovery_eod_run_id'], 81)
+                self.assertTrue(first_call.kwargs['point_in_time_recovery'])
+                if should_advance:
+                    self.assertEqual(second_call.kwargs['market_date'], current_date)
+                    self.assertEqual(
+                        second_call.kwargs.get('recovery_eod_run_id'),
+                        current_target.eod_run_id if current_target is not None else None,
                     )
-                expected_lookup_count = 2 if expected_date == older_target.trade_date else 1
-                self.assertEqual(load_recovery.call_count, expected_lookup_count)
+                    self.assertNotIn('point_in_time_recovery', second_call.kwargs)
+                else:
+                    self.assertEqual(second_call, first_call)
 
     async def test_closed_scheduler_rechecks_session_before_starting_recovery(
         self,
