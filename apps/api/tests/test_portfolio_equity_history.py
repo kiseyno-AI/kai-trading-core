@@ -1,5 +1,5 @@
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import sqlite3
 
 import pytest
@@ -32,9 +32,9 @@ def test_daily_equity_route_keeps_legacy_baseline_and_requires_complete_post_clo
     client = equity_client
     assert client.get('/portfolio/equity-history').json() == {'equity': []}
 
-    def capture(day, hour, first, second, **freshness):
+    def capture(day, hour, first, second, *, day_offset=0, **freshness):
         close = datetime(2026, 11, day, 6, 30, tzinfo=timezone.utc)
-        observed = close.replace(hour=hour)
+        observed = close.replace(hour=hour) + timedelta(days=day_offset)
         snapshot = {
             'asOf': observed.isoformat(),
             'freshness': {'isStale': False, **freshness},
@@ -48,6 +48,7 @@ def test_daily_equity_route_keeps_legacy_baseline_and_requires_complete_post_clo
         return capture_daily_equity(snapshot, close, now=observed.replace(hour=8))
 
     assert not capture(10, 5, 100, 100)
+    assert not capture(10, 0, 100, 100, day_offset=1)
     assert not capture(10, 7, 100, 100, isStale=True)
     assert not capture(10, 7, 100, None)
     legacy_path = tmp_path / 'legacy.sqlite'

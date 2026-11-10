@@ -32,9 +32,11 @@ def capture_daily_equity(
     except (KeyError, TypeError, ValueError):
         return False
     current = now or datetime.now(timezone.utc)
+    session_date = session_close.astimezone(SEOUL).date()
     if (
         as_of.tzinfo is None or as_of < session_close or as_of > current
-        or as_of.astimezone(SEOUL).date() != current.astimezone(SEOUL).date()
+        or as_of.astimezone(SEOUL).date() != session_date
+        or current.astimezone(SEOUL).date() != session_date
     ):
         return False
 
