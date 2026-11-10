@@ -9,11 +9,9 @@ import re
 import sqlite3
 
 from app.orders.portfolio_equity_history import (
-    CENT,
     MAX_AMOUNT,
     SEOUL,
-    read_equity_history,
-    store_daily_equity,
+    store_equity_days,
 )
 
 
@@ -27,20 +25,12 @@ def import_history(path: Path) -> int:
             amount = Decimal(str(raw_amount))
             if not re.fullmatch('[A-Z]{3}', currency) or not amount.is_finite() or abs(amount) > MAX_AMOUNT:
                 raise ValueError('Invalid legacy valuation')
-            valuations.setdefault(day, {})[currency] = amount.quantize(CENT)
+            valuations.setdefault(day, {})[currency] = amount
 
-    for day, totals in valuations.items():
-        store_daily_equity(datetime.combine(day, time.min, SEOUL), totals)
-
-    actual = {
-        (point['date'], series['currency']): point['equity']
-        for series in read_equity_history()['equity']
-        for point in series['points']
-    }
-    for day, totals in valuations.items():
-        recorded = {currency: amount for (date_key, currency), amount in actual.items() if date_key == day.isoformat()}
-        if recorded != {currency: float(amount) for currency, amount in totals.items()}:
-            raise ValueError('Legacy valuations do not match the Core history for one or more dates')
+    store_equity_days(
+        {datetime.combine(day, time.min, SEOUL): totals for day, totals in valuations.items()},
+        verify_existing=True,
+    )
     return len(valuations)
 
 

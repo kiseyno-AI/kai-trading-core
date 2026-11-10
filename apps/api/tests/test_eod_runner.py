@@ -2499,6 +2499,41 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         refresh_portfolio.assert_not_awaited()
 
+    async def test_closed_loop_records_equity_while_daily_pipeline_is_active(self) -> None:
+        runner = EODBackgroundRunner(interval_seconds=0)
+        close_at = '2026-04-30T15:30:00+09:00'
+        market = MarketState(
+            market='KRX', state='CLOSED', is_trading_day=True, is_open=False,
+            server_time='2026-04-30T16:00:00+09:00',
+            session_open_at='2026-04-30T09:00:00+09:00',
+            session_close_at=close_at, current_calendar_date='2026-04-30',
+        )
+        portfolio = {'asOf': '2026-04-30T15:31:00+09:00'}
+
+        async def stop_after_tick(_seconds: int) -> None:
+            runner._running = False
+
+        with (
+            patch('app.eod.runner.async_get_market_state', return_value=market),
+            patch('app.eod.runner.settings.background_runner_enabled', True),
+            patch.object(runner_module.auto_pykrx_eod_scheduler.state, 'active_task', True),
+            patch.object(runner, '_run_pending_session_cleanup', new_callable=AsyncMock),
+            patch.object(runner, '_start_overtime_ranking_capture_if_due'),
+            patch.object(runner, '_start_market_news_collect_if_due'),
+            patch.object(
+                runner_module.portfolio_summary_service, 'refresh_portfolio_summary_if_due',
+                new=AsyncMock(return_value=portfolio),
+            ) as refresh,
+            patch('app.eod.runner.capture_daily_equity', return_value=True) as capture,
+            patch('app.eod.runner.asyncio.sleep', side_effect=stop_after_tick),
+        ):
+            runner._running = True
+            await runner._run_loop()
+            await asyncio.gather(*runner._async_step_tasks.values())
+
+        refresh.assert_awaited_once_with(trigger='background_runner:closed')
+        capture.assert_called_once_with(portfolio, datetime.fromisoformat(close_at))
+
     async def test_session_cleanup_continues_while_daily_pipeline_is_active(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
         market_state = MarketState(

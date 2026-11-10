@@ -55,31 +55,44 @@ def capture_daily_equity(
     if any(abs(total) > MAX_AMOUNT for total in totals.values()):
         return False
     try:
-        store_daily_equity(as_of, totals)
+        store_equity_days({as_of: totals})
     except SQLAlchemyError:
         raise RuntimeError('Daily portfolio valuation storage failed') from None
     return True
 
 
-def store_daily_equity(as_of: datetime, totals: dict[str, Decimal]) -> None:
-    day_start = datetime.combine(as_of.astimezone(SEOUL).date(), time.min, SEOUL)
+def store_equity_days(
+    valuations: dict[datetime, dict[str, Decimal]], *, verify_existing: bool = False,
+) -> None:
     with session_scope(statement_timeout_ms=3000, lock_timeout_ms=1000) as session:
         # The existing snapshot table permits intraday rows, so serialize this daily writer.
         session.execute(text('SELECT pg_advisory_xact_lock(hashtext(:source))'), {'source': SOURCE})
-        existing = session.scalar(select(PortfolioAssetSnapshot.id).where(
-            PortfolioAssetSnapshot.account_reference == PORTFOLIO_REFERENCE,
-            PortfolioAssetSnapshot.source == SOURCE,
-            PortfolioAssetSnapshot.captured_at >= day_start,
-            PortfolioAssetSnapshot.captured_at < day_start + timedelta(days=1),
-        ).limit(1))
-        if existing is None:
-            session.add_all([
+        missing = []
+        for as_of, totals in valuations.items():
+            day_start = datetime.combine(as_of.astimezone(SEOUL).date(), time.min, SEOUL)
+            totals = {currency: amount.quantize(CENT) for currency, amount in totals.items()}
+            existing = session.execute(select(
+                PortfolioAssetSnapshot.currency, PortfolioAssetSnapshot.total_assets,
+            ).where(
+                PortfolioAssetSnapshot.account_reference == PORTFOLIO_REFERENCE,
+                PortfolioAssetSnapshot.source == SOURCE,
+                PortfolioAssetSnapshot.captured_at >= day_start,
+                PortfolioAssetSnapshot.captured_at < day_start + timedelta(days=1),
+            )).all()
+            if existing:
+                if verify_existing and (
+                    len(existing) != len(totals) or {currency: amount for currency, amount in existing} != totals
+                ):
+                    raise ValueError('Legacy valuations do not match the Core history for one or more dates')
+                continue
+            missing.extend(
                 PortfolioAssetSnapshot(
-                    account_reference=PORTFOLIO_REFERENCE, total_assets=amount.quantize(CENT),
+                    account_reference=PORTFOLIO_REFERENCE, total_assets=amount,
                     currency=currency, as_of=as_of, captured_at=as_of, source=SOURCE,
                 )
                 for currency, amount in totals.items()
-            ])
+            )
+        session.add_all(missing)
 
 
 def read_equity_history() -> dict:

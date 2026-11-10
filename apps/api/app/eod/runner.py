@@ -476,10 +476,35 @@ class EODBackgroundRunner:
                 raise
             self._record_step_failure(name, exc)
 
-    def _capture_portfolio_equity(self, snapshot: dict, close_at: str) -> None:
+    async def _refresh_and_capture_portfolio_equity(self, close_at: str) -> None:
+        portfolio = await portfolio_summary_service.refresh_portfolio_summary_if_due(
+            trigger='background_runner:closed'
+        )
         session_close = datetime.fromisoformat(close_at)
-        if capture_daily_equity(snapshot, session_close):
+        if await asyncio.to_thread(capture_daily_equity, portfolio, session_close):
             self._last_portfolio_equity_date = session_close.astimezone(SEOUL_TZ).date().isoformat()
+
+    def _start_portfolio_equity_capture_if_due(self, market: object) -> bool:
+        if (
+            not settings.background_runner_enabled
+            or market.state != 'CLOSED'
+            or not market.session_close_at
+            or not market.current_calendar_date
+            or market.current_calendar_date == self._last_portfolio_equity_date
+        ):
+            return False
+
+        # Keep the post-close valuation independent of the daily pipeline.
+        name = 'portfolio_equity_capture'
+        running = self._async_step_tasks.get(name)
+        if running is None or running.done():
+            task = asyncio.create_task(
+                self._refresh_and_capture_portfolio_equity(market.session_close_at),
+                name=f'eod-background-async:{name}',
+            )
+            self._async_step_tasks[name] = task
+            task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
+        return True
 
     def _start_background_thread_step(self, name: str, func) -> None:
         """Run a blocking job in a thread without awaiting it; one in flight per name."""
@@ -706,6 +731,7 @@ class EODBackgroundRunner:
             market: object | None = None
             try:
                 market = await async_get_market_state()
+                portfolio_capture_due = self._start_portfolio_equity_capture_if_due(market)
                 await self._run_pending_session_cleanup()
                 self._start_overtime_ranking_capture_if_due(market)
                 self._start_market_news_collect_if_due()
@@ -949,21 +975,12 @@ class EODBackgroundRunner:
                                     force_index=False,
                                 ),
                             )
-                        portfolio = await self._run_async_step(
-                            'portfolio_summary_refresh_if_due',
-                            portfolio_summary_service.refresh_portfolio_summary_if_due(
-                                trigger=f'background_runner:{market.state.lower()}'
-                            ),
-                            return_task_result=True,
-                        )
-                        if (
-                            market.state == 'CLOSED' and market.session_close_at
-                            and market.current_calendar_date != self._last_portfolio_equity_date
-                            and isinstance(portfolio, dict)
-                        ):
-                            self._start_background_thread_step(
-                                'portfolio_equity_capture',
-                                lambda snapshot=portfolio, close=market.session_close_at: self._capture_portfolio_equity(snapshot, close),
+                        if not portfolio_capture_due:
+                            await self._run_async_step(
+                                'portfolio_summary_refresh_if_due',
+                                portfolio_summary_service.refresh_portfolio_summary_if_due(
+                                    trigger=f'background_runner:{market.state.lower()}'
+                                ),
                             )
                         if settings.data_gap_fill_enabled and market.state == 'OPEN':
                             # Weekday market hours are idle for Core. The job owns its

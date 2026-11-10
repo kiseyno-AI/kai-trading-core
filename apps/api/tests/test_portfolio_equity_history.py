@@ -2,6 +2,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 import sqlite3
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
@@ -13,7 +14,8 @@ from app.orders.portfolio_equity_history import capture_daily_equity
 from scripts.import_observatory_equity import import_history
 
 
-def test_daily_equity_route_keeps_legacy_baseline_and_requires_complete_post_close_data(tmp_path):
+@pytest.fixture
+def equity_client():
     PortfolioAssetSnapshot.__table__.create(engine, checkfirst=True)
     with session_scope() as session:
         session.execute(delete(PortfolioAssetSnapshot).where(
@@ -22,7 +24,12 @@ def test_daily_equity_route_keeps_legacy_baseline_and_requires_complete_post_clo
 
     app = FastAPI()
     app.include_router(router)
-    client = TestClient(app)
+    with TestClient(app) as client:
+        yield client
+
+
+def test_daily_equity_route_keeps_legacy_baseline_and_requires_complete_post_close_data(tmp_path, equity_client):
+    client = equity_client
     assert client.get('/portfolio/equity-history').json() == {'equity': []}
 
     def capture(day, hour, first, second, **freshness):
@@ -59,3 +66,34 @@ def test_daily_equity_route_keeps_legacy_baseline_and_requires_complete_post_clo
         {'date': '2026-11-10', 'equity': 200, 'returnPct': 0},
         {'date': '2026-11-11', 'equity': 250, 'returnPct': 25},
     ]}]}
+
+
+
+def test_legacy_import_leaves_all_dates_unchanged_on_conflict(tmp_path, equity_client):
+    existing_path = tmp_path / 'existing.sqlite'
+    incoming_path = tmp_path / 'incoming.sqlite'
+    for path, rows in (
+        (existing_path, [('2026-11-11', 'KRW', 250)]),
+        (incoming_path, [('2026-11-10', 'KRW', 200), ('2026-11-11', 'KRW', 251)]),
+    ):
+        with closing(sqlite3.connect(path)) as legacy:
+            legacy.execute('CREATE TABLE valuations (date TEXT, currency TEXT, equity REAL)')
+            legacy.executemany('INSERT INTO valuations VALUES (?, ?, ?)', rows)
+            legacy.commit()
+
+    assert import_history(existing_path) == 1
+    before = equity_client.get('/portfolio/equity-history').json()
+    with pytest.raises(ValueError, match='Legacy valuations do not match'):
+        import_history(incoming_path)
+
+    assert equity_client.get('/portfolio/equity-history').json() == before
+
+    with closing(sqlite3.connect(incoming_path)) as legacy:
+        legacy.execute("UPDATE valuations SET equity = 250 WHERE date = '2026-11-11'")
+        legacy.commit()
+    assert import_history(incoming_path) == 2
+    assert import_history(incoming_path) == 2
+    assert equity_client.get('/portfolio/equity-history').json()['equity'][0]['points'] == [
+        {'date': '2026-11-10', 'equity': 200, 'returnPct': 0},
+        {'date': '2026-11-11', 'equity': 250, 'returnPct': 25},
+    ]
