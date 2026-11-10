@@ -3,6 +3,7 @@ import inspect
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1898,6 +1899,39 @@ class KISRealtimePriceRouteTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_session_history_records_subscribed_symbols_and_only_verified_trades(tmp_path, monkeypatch):
+    from app.quotes.monitoring_session_history import MonitoringLastQuote, MonitoringSessionHistory
+
+    now = datetime(2026, 11, 10, 6, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+    monkeypatch.setattr(settings, 'kis_realtime_price_subscribe_pause_seconds', 0)
+    service = KISRealtimePriceService(
+        client=FakeKISRealtimePriceClient(), session_history=MonitoringSessionHistory(tmp_path),
+    )
+
+    async def receive_then_stop():
+        _record_open_market_session(service, now=now)
+        service._apply_runtime_monitored_source(KISRealtimeMonitoredSymbolSource(
+            symbols=('005930', '000660'), market_date='2026-11-10', source_version=now,
+            membership_complete=True,
+        ), trigger='test', expected_observation_revision=None)
+        await service._sync_subscriptions(FakeWebSocket(), approval_key='test')
+        service.ingest_price_message(_message_for_rows([
+            _price_fields(price='10500', hhmmss='152959', business_date='20261110'),
+            _price_fields(price='9000', hhmmss='152940', business_date='20261110'),
+            _price_fields(price='20000', hhmmss='153000', business_date='20261111'),
+            _price_fields(price='30000', hhmmss='', business_date='20261110'),
+            _price_fields(symbol='035420', price='40000', hhmmss='153000', business_date='20261110'),
+        ]), received_at=now)
+        await service.stop()
+
+    asyncio.run(receive_then_stop())
+    assert MonitoringSessionHistory(tmp_path).read(now.date()) == {
+        '005930': MonitoringLastQuote(Decimal('10500'), now - timedelta(seconds=1)),
+        '000660': None,
+    }
 
 
 def test_orderbooks_share_capacity_and_only_expose_current_kis_quotes(monkeypatch):
