@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,7 +37,8 @@ def test_krx_daily_review_opens_at_1630():
     assert daily_review.run_due_daily_review(now=now.replace(day=14), dry_run=True) is None
 
 
-def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize(('focus', 'source'), [('entry_liquidity', 'watch'), ('volatility', 'market')])
+def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, monkeypatch, focus, source):
     day = date(2026, 11, 10)
     now = datetime(2026, 11, 10, 22, tzinfo=ZoneInfo('Asia/Seoul'))
     store = SideAgentStore(tmp_path)
@@ -50,7 +52,10 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
         assert market_date == day
         assert observed_at == now
         stats = watch_outcomes()
-        trade_only = {**stats, 'watch_event_count': 1, 'trade_touch_count': 1, 'ask_touch_count': 0, 'ask_entry_count': 0}
+        trade_only = {
+            **stats, 'watch_event_count': 1, 'trade_touch_count': 1, 'ask_touch_count': 0, 'ask_entry_count': 0,
+            'source_status': {'watch': 'available', 'market': 'available', 'market_volatility': 'unavailable'},
+        }
         return {'roles': {'signal-decider': stats, 'short-term-decider': trade_only}}
 
     class Analyst:
@@ -61,14 +66,20 @@ def test_scheduled_review_exposes_only_public_status_and_runs_once(tmp_path, mon
             assert (agent, task, run_id) == ('postmortem-analyst', 'daily_review', f'daily-review-{day}-1')
             run = api.get(f'/agent-context/daily-review?market_date={day}').json()['runs'][0]
             assert (run['status'], run['stage']) == ('running', 'postmortem')
-            return '''{
-                "schema_version": "daily_review_v1", "market_date": "2026-11-10",
-                "summary_ko": "호가와 체결을 구분했습니다.",
-                "roles": {
-                    "signal-decider": {"assessment_ko": "호가 관찰", "findings": [{"source": "watch", "observation_ko": "호가 잔량 차이", "implication_ko": "진입 가정 점검"}], "focus": "entry_liquidity"},
-                    "short-term-decider": {"assessment_ko": "가용성 확인", "findings": [{"source": "watch", "observation_ko": "호가 확인 필요", "implication_ko": "진입 가정 점검"}], "focus": "entry_liquidity"}
-                }
-            }'''
+            return json.dumps({
+                'schema_version': 'daily_review_v1', 'market_date': '2026-11-10',
+                'summary_ko': '호가와 체결을 구분했습니다.',
+                'roles': {
+                    'signal-decider': {
+                        'assessment_ko': '호가 관찰', 'focus': 'entry_liquidity',
+                        'findings': [{'source': 'watch', 'observation_ko': '호가 잔량 차이', 'implication_ko': '진입 가정 점검'}],
+                    },
+                    'short-term-decider': {
+                        'assessment_ko': '가용성 확인', 'focus': focus,
+                        'findings': [{'source': source, 'observation_ko': '근거 확인 필요', 'implication_ko': '진입 가정 점검'}],
+                    },
+                },
+            })
 
     analyst = Analyst()
     options = dict(store=store, client=analyst, evidence_loader=collect, is_trading_day=lambda _: True)

@@ -9,10 +9,12 @@ from sqlalchemy.orm import Session
 from app.agent_context.wait_price_observations import WaitPriceObservations, WaitPriceWatch
 from app.db_models import (
     Base, DailyMarketRiskSnapshot, DailyPriceBar, DailyTechnicalSnapshot, DartDisclosureEvent, ExternalNewsItem,
-    ExternalNewsItemClassification, ExternalNewsItemSymbol, SignalDeciderActualExecutionOutcome,
+    ExternalNewsItemClassification, ExternalNewsItemSymbol, MarketNewsItem, SignalDeciderActualExecutionOutcome,
     SignalDeciderDecisionSnapshot, Symbol,
 )
 from app.external_news import store as news_store
+from app.market.clock import KST
+from app.market_news import service as market_news_store
 from app.side_agents import daily_review_inputs
 from app.side_agents.schemas import MARKET_AGENT
 from app.side_agents.store import SideAgentStore
@@ -24,7 +26,7 @@ def review_db(monkeypatch):
     Base.metadata.create_all(engine, tables=[model.__table__ for model in (
         SignalDeciderActualExecutionOutcome, SignalDeciderDecisionSnapshot, DailyMarketRiskSnapshot, DailyPriceBar,
         DailyTechnicalSnapshot, DartDisclosureEvent, ExternalNewsItem, ExternalNewsItemClassification,
-        ExternalNewsItemSymbol, Symbol,
+        ExternalNewsItemSymbol, MarketNewsItem, Symbol,
     )])
 
     @contextmanager
@@ -34,6 +36,8 @@ def review_db(monkeypatch):
 
     monkeypatch.setattr(daily_review_inputs, 'session_scope', test_session_scope)
     monkeypatch.setattr(news_store, 'session_scope', test_session_scope)
+    monkeypatch.setattr(market_news_store, 'session_scope', test_session_scope)
+    monkeypatch.setattr(daily_review_inputs, 'load_current_market_snapshot_context', lambda: None)
     return engine
 
 
@@ -75,6 +79,54 @@ def test_review_counts_each_role_and_separates_touches_quotes_and_fills(tmp_path
     assert review['market']['status'] == 'unavailable'
 
 
+def test_review_reports_when_watches_registered_for_each_role(tmp_path, monkeypatch, review_db):
+    day = date(2026, 11, 10)
+    first = datetime(2026, 11, 10, 8, 55, tzinfo=KST)
+    late = datetime(2026, 11, 10, 13, 39, tzinfo=KST)
+    cutoff = datetime(2026, 11, 10, 16, 30, tzinfo=KST)
+    watches = WaitPriceObservations(tmp_path / 'watches')
+    signal = WaitPriceWatch(1, 'signal-decider', '005930', '2026-11-09', first.isoformat(), '100')
+    short_term = WaitPriceWatch(2, 'short-term-decider', '000660', '2026-11-09', first.isoformat(), '100')
+    watches.configure(day, [signal], now=first)
+    watches.configure(day, [signal, short_term], now=late)
+    monkeypatch.setattr(daily_review_inputs, 'wait_price_observations', watches)
+
+    review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
+
+    assert review['coverage']['watch']['registration'] == {
+        'session_open_at': '2026-11-10T09:00:00+09:00',
+        'first_registered_at': '2026-11-10T08:55:00+09:00',
+        'last_registered_at': '2026-11-10T13:39:00+09:00',
+        'registered_after_open': 1,
+    }
+    assert review['roles']['signal-decider']['registration']['registered_after_open'] == 0
+    assert review['roles']['short-term-decider']['registration']['registered_after_open'] == 1
+    assert review['coverage']['watch']['registration_by_role']['short-term-decider']['registered_after_open'] == 1
+    assert review['coverage']['watch']['event_bearing_decisions'] == 0
+
+
+def test_review_reserves_contrast_examples_without_changing_watch_counts(tmp_path, monkeypatch, review_db):
+    day = date(2026, 11, 10)
+    opened = datetime(2026, 11, 10, 9, tzinfo=KST)
+    cutoff = datetime(2026, 11, 10, 16, 30, tzinfo=KST)
+    watches = WaitPriceObservations(tmp_path / 'watches')
+    watches.configure(day, [
+        WaitPriceWatch(i, 'signal-decider', '005930', '2026-11-09', opened.isoformat(),
+                       '100' if i <= 5 else '90', 'at_or_below')
+        for i in range(1, 9)
+    ], now=opened)
+    watches.observe_ask('005930', Decimal('100'), 10, price_as_of=opened, received_at=opened, source='test')
+    monkeypatch.setattr(daily_review_inputs, 'wait_price_observations', watches)
+
+    review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
+
+    role = review['roles']['signal-decider']
+    assert role['observation_count'] == 8
+    assert role['watch_event_count'] == 5
+    assert len(role['examples']) == 6
+    assert sum(not row.get('ask_touch') for row in role['examples']) == 2
+
+
 def test_review_joins_the_exact_decision_and_excludes_facts_after_the_cutoff(tmp_path, monkeypatch, review_db):
     market_date = date(2026, 11, 10)
     prior_day = date(2026, 11, 9)
@@ -87,6 +139,7 @@ def test_review_joins_the_exact_decision_and_excludes_facts_after_the_cutoff(tmp
     watches.configure(market_date, [
         WaitPriceWatch(1, 'signal-decider', '005930', prior_day.isoformat(), opened.isoformat(), '100'),
         WaitPriceWatch(2, 'short-term-decider', '005930', prior_day.isoformat(), opened.isoformat(), '100'),
+        WaitPriceWatch(3, 'short-term-decider', '000660', prior_day.isoformat(), opened.isoformat(), '100'),
     ], now=opened)
     monkeypatch.setattr(daily_review_inputs, 'wait_price_observations', watches)
     with Session(review_db) as db:
@@ -114,6 +167,14 @@ def test_review_joins_the_exact_decision_and_excludes_facts_after_the_cutoff(tmp
             },
         )
         db.add_all([SignalDeciderDecisionSnapshot(id=i, **snapshot_data) for i in (1, 2)])
+        db.add(SignalDeciderDecisionSnapshot(**{
+            **snapshot_data, 'id': 3, 'agent_name': 'short-term-decider', 'symbol': '000660',
+        }))
+        db.add(SignalDeciderActualExecutionOutcome(
+            id=5, decision_snapshot_id=3, entry_plan_item_id=5, market_date=prior_day, source_market_date=prior_day,
+            target_trade_date=market_date, account_reference='private-account', symbol='000660', policy_version='v1',
+            lifecycle_status='planned', created_at=opened, updated_at=opened, computed_at=opened,
+        ))
         for i, snapshot_id, symbol, filled_at in [
             (1, 1, '005930', cutoff - timedelta(minutes=15)),
             (2, 1, '005930', cutoff + timedelta(minutes=15)),
@@ -143,10 +204,15 @@ def test_review_joins_the_exact_decision_and_excludes_facts_after_the_cutoff(tmp
     review = daily_review_inputs.load_daily_review_evidence(market_date, observed_at=cutoff, store=store)
 
     signal = review['roles']['signal-decider']
+    short_term = review['roles']['short-term-decider']
     assert signal['actual_entry_fill_count'] == signal['actual_closed_trade_count'] == 1
-    assert review['roles']['short-term-decider']['actual_entry_fill_count'] == 0
-    assert review['roles']['short-term-decider']['examples'][0]['decision_context'] is None
-    assert review['coverage']['actual_execution']['records'] == 1
+    assert short_term['actual_entry_fill_count'] == 0
+    assert short_term['examples'][0]['decision_context'] is None
+    assert review['coverage']['actual_execution']['records'] == 2
+    assert signal['source_status']['actual_execution'] == 'available'
+    assert short_term['source_status']['actual_execution'] == 'records_only'
+    assert short_term['execution_lifecycle_counts'] == {'planned': 1}
+    assert signal['source_status']['news'] == signal['source_status']['business'] == 'context_only'
     evidence = signal['examples'][0]
     assert evidence['recorded_execution'] == [{
         'lifecycle_status': 'closed', 'entry_fill_observed': True,
@@ -247,3 +313,79 @@ def test_review_includes_current_filings_and_recent_technicals_known_by_cutoff(t
     ]
     assert [(row['receipt_date'], row['report_name']) for row in evidence['session_filings']] == [('2026-11-10', '공시 1')]
     assert signal['source_status']['business'] == signal['source_status']['market'] == 'available'
+    assert signal['source_status']['market_volatility'] == 'available'
+
+    earlier = daily_review_inputs.load_daily_review_evidence(
+        day, observed_at=cutoff - timedelta(minutes=2), store=SideAgentStore(tmp_path / 'results'),
+    )
+    assert earlier['roles']['signal-decider']['source_status']['market'] == 'context_only'
+    assert earlier['roles']['signal-decider']['source_status']['market_volatility'] == 'unavailable'
+
+
+def test_review_keeps_cached_market_observations_separate_by_trust_and_cutoff(tmp_path, monkeypatch, review_db):
+    day = date(2026, 11, 10)
+    cutoff = datetime(2026, 11, 10, 16, 30, tzinfo=KST)
+    index_at = '2026-11-10T15:32:00+09:00'
+    cached_at = '2026-11-10T15:39:00+09:00'
+    row = {
+        'value': 5239.13, 'change_percent': 4.39, 'high': 5300.92, 'low': 5174.55, 'advancers': 716,
+        'foreign_net_value': 370825000000, 'investor_flow_value_unit': 'krw',
+        'index_leg': {
+            'status': 'unverified', 'provider_observed_at': index_at, 'collected_at': cached_at,
+            'observation_payload_match': True, 'error': 'outside regular session',
+        },
+        'flow_leg': {
+            'status': 'cached', 'current_session': True, 'provider_observed_at': '2026-11-10T15:25:00+09:00',
+            'collected_at': '2026-11-10T15:25:22+09:00',
+        },
+    }
+    snapshot = {
+        'cached_at': cached_at, 'as_of': index_at, 'snapshot_status': 'partial',
+        'source': 'kis_market_snapshot_v1', 'payload': {'markets': {'kospi': row}},
+    }
+    monkeypatch.setattr(daily_review_inputs, 'load_current_market_snapshot_context', lambda: snapshot)
+    store = SideAgentStore(tmp_path)
+
+    review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=store)
+
+    dashboard = review['market']['dashboard']
+    assert dashboard['markets']['kospi']['index']['status'] == 'unverified'
+    assert dashboard['markets']['kospi']['index']['value'] == 5239.13
+    assert 'advancers' not in dashboard['markets']['kospi']['index']
+    assert dashboard['markets']['kospi']['flow']['foreign_net_value'] == 370825000000
+    assert review['roles']['signal-decider']['source_status']['market'] == 'available'
+    assert review['roles']['signal-decider']['source_status']['market_volatility'] == 'unavailable'
+
+    row['flow_leg']['provider_observed_at'] = '2026-11-09T15:25:00+09:00'
+    stale_flow = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=store)
+    assert 'flow' not in stale_flow['market']['dashboard']['markets']['kospi']
+    assert stale_flow['roles']['signal-decider']['source_status']['market'] == 'context_only'
+
+    earlier = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff - timedelta(hours=1), store=store)
+    assert earlier['market']['dashboard'] is None
+    assert earlier['roles']['signal-decider']['source_status']['market'] == 'unavailable'
+
+
+def test_review_includes_only_market_headlines_known_before_the_cutoff(tmp_path, review_db):
+    day = date(2026, 11, 10)
+    cutoff = datetime(2026, 11, 10, 7, 30, tzinfo=timezone.utc)
+    before = cutoff - timedelta(minutes=1)
+    after = cutoff + timedelta(minutes=1)
+    with Session(review_db) as db:
+        for i, (topic, published_at, first_seen_at) in enumerate([
+            ('kr_kospi', before, before), ('kr_kosdaq', before, before),
+            ('kr_kospi', before, after), ('kr_kospi', after, before),
+            ('line_entertainment', before, before),
+        ]):
+            db.add(MarketNewsItem(
+                topic_key=topic, region='KR', provider='test', url=f'https://example.test/{i}',
+                url_hash=str(i), title=f'뉴스 {i}', published_at=published_at, first_seen_at=first_seen_at,
+            ))
+        db.commit()
+
+    review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
+
+    assert {item['title'] for item in review['market_headlines']} == {'뉴스 0', '뉴스 1'}
+    assert review['coverage']['market_headlines']['items'] == 2
+    assert review['roles']['signal-decider']['source_status']['news'] == 'unavailable'
+    assert review['roles']['signal-decider']['source_status']['market'] == 'unavailable'

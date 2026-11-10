@@ -114,16 +114,21 @@ def _candidate(role: str, day: str, feedback: RoleReview, evidence: dict[str, An
     draft = base
     if feedback.focus is not None:
         source = FOCUS_SOURCES[feedback.focus]
+        availability_source = 'market_volatility' if feedback.focus == 'volatility' else source
         observation_count = evidence['observation_count']
         if (
             observation_count < MIN_WATCH_OBSERVATIONS
-            or evidence['source_status'].get(source) != 'available'
+            or evidence['source_status'].get(availability_source) != 'available'
             or not all(evidence[field] for field in FOCUS_REQUIRED_COUNTS.get(feedback.focus, ()))
             or not any(finding.source == source for finding in feedback.findings)
         ):
             status = 'insufficient_evidence'
         else:
-            line = f'- Daily review {day} ({observation_count} tracked WAIT decisions): {FOCUS_NOTES[feedback.focus]}'
+            event_count = evidence['watch_event_count']
+            line = (
+                f'- Daily review {day} ({observation_count} WAIT registrations, {event_count} with price events): '
+                f'{FOCUS_NOTES[feedback.focus]}'
+            )
             prefix, after_begin = base.split(BEGIN)
             block, suffix = after_begin.split(END)
             if FOCUS_NOTES[feedback.focus] not in block:

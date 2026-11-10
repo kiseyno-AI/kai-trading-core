@@ -35,7 +35,7 @@ GET /agent-context/daily-review?market_date=2026-11-10
 | `stage` | `evidence`, `postmortem`, `contracts`, or `complete` |
 | `error` | A short machine-readable failure reason when available |
 | `observed_at` | Evidence cutoff for this attempt |
-| `evidence_coverage` | Source availability and counts once evidence is assembled |
+| `evidence_coverage` | Source availability and counts once evidence is assembled. `watch.registration` and `watch.registration_by_role` include registration time bounds and the count registered after the open. |
 | `watch_outcomes` | Per-role counts for tracked WAIT decisions (`observation_count`), decisions with a persisted touch or ask event (`watch_event_count`), trade touches, best-ask touches, asks in the entry band, recorded fills and closed trades, with source availability |
 | `evidence_sha256`, `analyst_contract_sha256` | Evidence payload and verified analyst contract digests |
 | `feedback` | On completion, the Korean summary and `roles` keyed by `signal-decider` and `short-term-decider`. Each has `assessment_ko`, `findings` (`source`, `observation_ko`, `implication_ko`), and a nullable `focus`. |
