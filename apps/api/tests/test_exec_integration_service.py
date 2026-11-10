@@ -13730,6 +13730,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'source_market_date': self.market_date.isoformat(),
                     'observed_at': '2026-04-29T07:13:00+00:00',
                     'trigger_price': '1300',
+                    'buy_direction': 'at_or_below',
+                    'chase_limit_price': None,
                 },
                 {
                     'symbol': '032080',
@@ -13738,6 +13740,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'source_market_date': self.market_date.isoformat(),
                     'observed_at': '2026-04-29T07:15:00+00:00',
                     'trigger_price': '1500',
+                    'buy_direction': 'at_or_below',
+                    'chase_limit_price': None,
                 }
             ],
         )

@@ -998,6 +998,21 @@ class KISClient:
             max_pages=max_pages,
         )
 
+    async def fetch_domestic_multi_quotes(self, symbols: list[str]) -> list[dict[str, Any]]:
+        if not 1 <= len(symbols) <= 30:
+            raise ValueError('KIS multi-quote requests require 1 to 30 symbols')
+        params = {}
+        for index, symbol in enumerate(symbols, 1):
+            params[f'FID_COND_MRKT_DIV_CODE_{index}'] = 'J'
+            params[f'FID_INPUT_ISCD_{index}'] = symbol
+        payload = await self._get(
+            '/uapi/domestic-stock/v1/quotations/intstock-multprice',
+            tr_id='FHKST11300006',
+            params=params,
+        )
+        rows = payload.get('output')
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
     async def fetch_domestic_orderbook(self, symbol: str, market_code: str = 'J') -> dict:
         return await self._get(
             '/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn',

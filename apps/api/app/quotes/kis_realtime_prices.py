@@ -301,6 +301,7 @@ class KISRealtimePriceService:
     def __init__(self, *, client: KISClient | None = None) -> None:
         self.client = client or kis_client
         self._task: asyncio.Task[None] | None = None
+        self._wait_orderbook_task: asyncio.Task[None] | None = None
         self._websocket: Any = None
         self._stop_requested = False
         self._subscription_changed_event: asyncio.Event | None = None
@@ -579,6 +580,10 @@ class KISRealtimePriceService:
             self._run(),
             name='kis-realtime-prices',
         )
+        self._wait_orderbook_task = asyncio.create_task(
+            self._run_wait_orderbooks(),
+            name='kis-wait-orderbooks',
+        )
 
     async def stop(self) -> None:
         self._stop_requested = True
@@ -586,6 +591,10 @@ class KISRealtimePriceService:
         source_refresh_task = self._source_refresh_task
         websocket = self._websocket
         self._task = None
+        orderbook_task = self._wait_orderbook_task
+        self._wait_orderbook_task = None
+        if orderbook_task is not None:
+            orderbook_task.cancel()
         self._source_refresh_task = None
         self._source_refresh_observation_revision = None
         self._websocket = None
@@ -616,6 +625,8 @@ class KISRealtimePriceService:
             except asyncio.CancelledError:
                 pass
 
+        if orderbook_task is not None:
+            await asyncio.gather(orderbook_task, return_exceptions=True)
         self._set_status('stopped')
 
     @staticmethod
@@ -1254,6 +1265,109 @@ class KISRealtimePriceService:
             trigger=f'kis_realtime_price:{trigger}',
         )
 
+    async def _run_wait_orderbooks(self) -> None:
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        previous_confirmation = ''
+        while not self._stop_requested:
+            local_now = _utc_now().astimezone(KST)
+            symbols = sorted(wait_price_observations.symbols(local_now.date()))
+            if (
+                not symbols or not self._recorded_market_session_is_active()
+                or not datetime_time(9) <= local_now.time() < datetime_time(15, 30)
+            ):
+                await asyncio.sleep(2)
+                continue
+            sampled = set()
+            failures = 0
+            confirmation_candidates = set()
+            for offset in range(0, len(symbols), 30):
+                if not self._recorded_market_session_is_active():
+                    break
+                if offset and self.client._environment() == 'demo':
+                    await asyncio.sleep(1.1)
+                batch = symbols[offset:offset + 30]
+                try:
+                    rows = await self.client.fetch_domestic_multi_quotes(batch)
+                except KISClientError:
+                    failures += 1
+                    continue
+                received, candidates = await asyncio.to_thread(
+                    self._record_wait_ask_samples, batch, rows, _utc_now(),
+                )
+                sampled.update(received)
+                confirmation_candidates.update(candidates)
+            if confirmation_candidates and self._recorded_market_session_is_active():
+                symbol = min(
+                    confirmation_candidates,
+                    key=lambda candidate: (candidate <= previous_confirmation, candidate),
+                )
+                previous_confirmation = symbol
+                if self.client._environment() == 'demo':
+                    await asyncio.sleep(1.1)
+                await self._confirm_wait_ask(symbol)
+            with self._state_lock:
+                self._health['wait_orderbook_observation'] = {
+                    'requested_count': len(symbols), 'sampled_count': len(sampled),
+                    'failed_batches': failures, 'last_sample_at': _isoformat(_utc_now()),
+                }
+            await asyncio.sleep(2)
+
+    @staticmethod
+    def _record_wait_ask_samples(
+        batch: list[str], rows: list[dict[str, Any]], received_at: datetime,
+    ) -> tuple[set[str], set[str]]:
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        sampled: set[str] = set()
+        confirmation_candidates: set[str] = set()
+        for row in rows:
+            symbol = _normalize_symbol(row.get('inter_shrn_iscd'))
+            ask = _parse_decimal(row.get('inter2_askp'))
+            bid = _parse_decimal(row.get('inter2_bidp'))
+            size_text = _normalize_text(row.get('seln_rsqn'))
+            if (
+                symbol is None or symbol not in batch
+                or ask is None or bid is None or not 0 < bid <= ask
+                or not size_text.isascii() or not size_text.isdecimal() or int(size_text) <= 0
+            ):
+                continue
+            sampled.add(symbol)
+            if wait_price_observations.observe_ask(
+                symbol, ask, int(size_text), price_as_of=None,
+                received_at=received_at, source='kis_orderbook_rest_sample',
+            ):
+                confirmation_candidates.add(symbol)
+        return sampled, confirmation_candidates
+
+    async def _confirm_wait_ask(self, symbol: str) -> None:
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        try:
+            response = await self.client.fetch_domestic_orderbook(symbol)
+        except KISClientError:
+            return
+        received_at = _utc_now()
+        book = response.get('output1')
+        if not isinstance(book, dict):
+            return
+        hour = _normalize_text(book.get('aspr_acpt_hour'))
+        as_of = _parse_kis_timestamp(business_date=None, hhmmss=hour, received_at=received_at)
+        size_text = _normalize_text(book.get('askp_rsqn1'))
+        ask = _parse_decimal(book.get('askp1'))
+        bid = _parse_decimal(book.get('bidp1'))
+        if (
+            hour != as_of.astimezone(KST).strftime('%H%M%S')
+            or not size_text.isascii() or not size_text.isdecimal()
+            or ask is None or bid is None or not 0 < bid <= ask
+        ):
+            return
+        await asyncio.to_thread(
+            wait_price_observations.observe_ask,
+            symbol, ask, int(size_text), price_as_of=as_of, received_at=received_at,
+            source='kis_orderbook_rest_confirmed',
+        )
+
     async def _run(self) -> None:
         base_reconnect_delay = max(
             0.5,
@@ -1645,6 +1759,17 @@ class KISRealtimePriceService:
 
         for tick in ticks:
             wait_price_observations.observe(tick)
+            size = tick.raw_fields.get('ASKP_RSQN1', '')
+            if (
+                not tick.trade_halt and size.isascii() and size.isdecimal()
+                and tick.ask_price is not None and tick.bid_price is not None
+                and 0 < tick.bid_price <= tick.ask_price
+                and tick.raw_fields.get('STCK_CNTG_HOUR') == tick.price_as_of.astimezone(KST).strftime('%H%M%S')
+            ):
+                wait_price_observations.observe_ask(
+                    tick.symbol, tick.ask_price, int(size), price_as_of=tick.price_as_of,
+                    received_at=tick.received_at, source='kis_trade_packet_ask',
+                )
         return [tick.to_public_dict() for tick in ticks]
 
     def ingest_price_fields(

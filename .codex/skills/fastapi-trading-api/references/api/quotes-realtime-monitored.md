@@ -53,3 +53,8 @@ GET /quotes/realtime/monitored/stream
 event: prices
 data: {"status":"subscribed","summary":{"items_total":1},"items":[{"symbol":"005930","current_price":71500,"price_status":"available"}]}
 ```
+
+When WAIT orderbook sampling is active, `health.wait_orderbook_observation`
+reports `requested_count`, `sampled_count`, `failed_batches`, and
+`last_sample_at` for the latest regular-session sampling round. The
+sampled count measures orderbook coverage separately from trade subscriptions.

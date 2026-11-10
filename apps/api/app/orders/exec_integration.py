@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter, defaultdict
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -7494,6 +7494,23 @@ class SignalDeciderExecIntegrationService:
         target_trade_date: date,
     ) -> list[dict[str, Any]]:
         recovery = wait_price_observations.recovery_watches(target_trade_date)
+        legacy = {watch.decision_snapshot_id for watch in recovery if watch.buy_direction is None}
+        if legacy:
+            try:
+                with session_scope() as session:
+                    snapshots = session.scalars(select(SignalDeciderDecisionSnapshot).where(
+                        SignalDeciderDecisionSnapshot.id.in_(legacy),
+                    )).all()
+                    enriched = {
+                        snapshot.id: watch_from_snapshot(snapshot, market_date=target_trade_date)
+                        for snapshot in snapshots
+                    }
+                for index, watch in enumerate(recovery):
+                    current = enriched.get(watch.decision_snapshot_id)
+                    if current is not None and replace(current, buy_direction=None, chase_limit_price=None) == watch:
+                        recovery[index] = current
+            except Exception:
+                logger.exception('Could not recover the buy conditions for enrolled WAIT decisions')
         try:
             generation_state = (
                 signal_decider_next_open_execution_service
