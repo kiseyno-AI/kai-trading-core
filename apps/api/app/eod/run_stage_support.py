@@ -176,6 +176,7 @@ def is_nonblocking_quality_only_piotroski_partial(
     successful = list(successful_symbols)
     retry_debt = list(retry_debt_symbols)
     terminal = list(terminal_not_applicable_symbols)
+    applicable = set(selected) - set(terminal)
     usable = exact_nonnegative_int(
         stage_result.get('full_signal_usable_count')
     )
@@ -191,8 +192,9 @@ def is_nonblocking_quality_only_piotroski_partial(
         and len(selected) == len(set(selected))
         and len(successful) == len(set(successful))
         and not retry_debt
-        and not terminal
-        and set(successful) == set(selected)
+        and len(terminal) == len(set(terminal))
+        and set(terminal).issubset(selected)
+        and set(successful) == applicable
         and str(stage_result.get('status') or '').strip().lower()
         == 'partial'
         and str(stage_result.get('gate_status') or '').strip().lower()
@@ -206,7 +208,7 @@ def is_nonblocking_quality_only_piotroski_partial(
         ).strip().lower()
         in {'complete', 'completed', 'ready'}
         and exact_nonnegative_int(stage_result.get('results_persisted'))
-        == len(selected)
+        == len(applicable)
         and exact_nonnegative_int(stage_result.get('results_failed')) == 0
         and reason == 'piotroski_evidence_incomplete'
         and str(stage_result.get('quality_warning') or '').strip()
@@ -219,7 +221,7 @@ def is_nonblocking_quality_only_piotroski_partial(
         and incomplete is not None
         and unusable is not None
         and usable > 0
-        and usable + incomplete + unusable == len(selected)
+        and usable + incomplete + unusable == len(applicable)
     )
 
 

@@ -385,6 +385,44 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['coverage']['total_blocks'], 4)
         self.assertEqual(payload['coverage']['excluded_blocks'], ['news_hints'])
 
+    async def test_collect_snapshots_distinguishes_empty_optional_activity_from_errors(self) -> None:
+        for case, program_response, program_error, status, block_status in (
+            ('one empty', None, None, 'ok', 'available'),
+            ('both empty', {'output': []}, None, 'ok', 'empty'),
+            ('provider error', None, RuntimeError('provider timeout'), 'partial', 'partial'),
+            ('malformed payload', {'output': 'invalid'}, None, 'partial', 'partial'),
+        ):
+            with self.subTest(case=case):
+                client = FakeKISIntradayClient()
+                client.fetch_domestic_investor_trend_estimate = AsyncMock(return_value={'output2': []})
+                if program_response is not None or program_error is not None:
+                    client.fetch_domestic_program_trade_by_stock = AsyncMock(
+                        return_value=program_response, side_effect=program_error,
+                    )
+
+                service = KISIntradaySnapshotService(client=client)
+                with (
+                    patch(
+                        'app.market.kis_intraday_snapshots.async_get_market_state',
+                        return_value=SimpleNamespace(
+                            state='CLOSED',
+                            is_trading_day=True,
+                            server_time='2026-05-07T16:15:35+09:00',
+                        ),
+                    ),
+                    patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot'),
+                ):
+                    result = await service.collect_snapshots(symbols=['005930'], include_news=False)
+
+                self.assertEqual(result['status'], status)
+                self.assertEqual(result['snapshots_persisted'], 1)
+                self.assertEqual(result['snapshots_failed'], 0)
+                self.assertEqual(result['retry_required'], status == 'partial')
+                payload = result['items'][0]['investor_program_activity']
+                self.assertEqual(payload['status'], block_status)
+                self.assertEqual(payload['source_statuses']['investor_trend_estimate'], 'empty')
+                self.assertNotIn('investor_trend_estimate', payload)
+
     async def test_collect_snapshots_is_disabled_without_credentials_before_universe_lookup(self) -> None:
         settings.kis_app_key = ''
         settings.kis_app_secret = ''

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
@@ -86,7 +87,7 @@ from app.external_news.classifier import (
 from app.macro_context.service import macro_context_service
 from app.market.clock import get_market_state
 from app.market.session import build_market_session_metadata
-from app.market.symbol_codes import normalize_krx_short_code
+from app.market.symbol_codes import is_krx_preferred_share, normalize_krx_short_code
 from app.market_data_store import (
     DAY_BASED_TRENDING_PERIODS,
     count_daily_action_summaries_for_live_symbols,
@@ -155,6 +156,10 @@ ROW_COUNT_STAGE_MODELS = {
     'piotroski_filter': DailyPiotroskiFilterResult,
     **FACTOR_STAGE_MODELS,
 }
+PREFERRED_SHARE_NOT_APPLICABLE_STAGES = frozenset({
+    'piotroski_filter', 'advanced_value_factors', 'unified_value_factors',
+    'quality_factors', 'composite_factors',
+})
 PREREQUISITE_SCOPE_STAGE_MODELS = {
     'price_collection': DailyPriceBar,
     'technical_snapshots': DailyTechnicalSnapshot,
@@ -792,6 +797,16 @@ def _load_row_count_stage_counts(
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
+        preferred_ids = set()
+        if include_missing_diagnostics:
+            preferred_ids = {
+                row.id for row in session.execute(
+                    select(Symbol.id, Symbol.symbol, Symbol.name_ko, Symbol.market)
+                    .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+                    .where(DailyPriceBar.trade_date == normalized_market_date)
+                )
+                if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
+            }
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
             aggregate_columns = [
                 func.count(model.id),
@@ -838,6 +853,9 @@ def _load_row_count_stage_counts(
                     model=model,
                     market_date=normalized_market_date,
                     limit=ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
+                    not_applicable_ids=(
+                        preferred_ids if stage_id in PREFERRED_SHARE_NOT_APPLICABLE_STAGES else ()
+                    ),
                 )
             counts[stage_id] = {
                 'persisted': persisted_count,
@@ -879,6 +897,7 @@ def _load_row_count_missing_diagnostics_for_model(
     model: Any,
     market_date: date,
     limit: int,
+    not_applicable_ids: Collection[int] = (),
 ) -> dict[str, Any]:
     price_symbol_ids = set(
         session.execute(
@@ -892,6 +911,8 @@ def _load_row_count_missing_diagnostics_for_model(
             .where(model.market_date == market_date)
         ).scalars().all()
     )
+    not_applicable_count = len(price_symbol_ids.intersection(not_applicable_ids))
+    price_symbol_ids.difference_update(not_applicable_ids)
     present_symbol_ids = price_symbol_ids & persisted_symbol_ids
     missing_symbol_ids = sorted(price_symbol_ids - persisted_symbol_ids)
     missing_count = len(missing_symbol_ids)
@@ -912,6 +933,7 @@ def _load_row_count_missing_diagnostics_for_model(
         'membership_evidence_version': 'row_count_scope_gap_v1',
         'membership_authoritative': True,
         'membership_requested_count': len(price_symbol_ids),
+        'not_applicable_count': not_applicable_count,
         'membership_present_count': len(present_symbol_ids),
         'membership_extra_count': len(persisted_symbol_ids - price_symbol_ids),
         'missing_count': int(missing_count),
@@ -962,12 +984,18 @@ def _load_row_count_stage_scope_gap(
     normalized_market_date = date.fromisoformat(market_date)
     with session_scope() as session:
         requested_symbol_rows = session.execute(
-            select(Symbol.id, Symbol.symbol)
+            select(Symbol.id, Symbol.symbol, Symbol.name_ko, Symbol.market)
             .where(Symbol.symbol.in_(normalized_symbols))
         ).all()
+        not_applicable_symbols = {
+            row.symbol for row in requested_symbol_rows
+            if stage_id in PREFERRED_SHARE_NOT_APPLICABLE_STAGES
+            and is_krx_preferred_share(row.symbol, row.name_ko, row.market)
+        }
         symbol_by_id = {
             int(row.id): str(row.symbol).strip().upper()
             for row in requested_symbol_rows
+            if row.symbol not in not_applicable_symbols
         }
         requested_symbol_ids = set(symbol_by_id)
         date_column = (
@@ -1076,7 +1104,7 @@ def _load_row_count_stage_scope_gap(
                     symbol_by_id[symbol_id]
                     for symbol_id in requested_symbol_ids - persisted_symbol_ids
                 ),
-                *(set(normalized_symbols) - set(symbol_by_id.values())),
+                *(set(normalized_symbols) - set(symbol_by_id.values()) - not_applicable_symbols),
             }
         )
         missing_count = len(missing_symbols)
@@ -1103,11 +1131,12 @@ def _load_row_count_stage_scope_gap(
         'evidence_version': 'row_count_scope_gap_v1',
         'authoritative': True,
         'missing_count': int(missing_count or 0),
-        'present_count': max(len(set(normalized_symbols)) - missing_count, 0),
+        'present_count': len(set(normalized_symbols)) - missing_count - len(not_applicable_symbols),
+        'not_applicable_count': len(not_applicable_symbols),
         'requested_count': len(set(normalized_symbols)),
         'coverage_ratio': round(
-            max(len(set(normalized_symbols)) - missing_count, 0)
-            / len(set(normalized_symbols)),
+            (len(set(normalized_symbols)) - missing_count - len(not_applicable_symbols))
+            / max(len(set(normalized_symbols)) - len(not_applicable_symbols), 1),
             6,
         ),
         'missing_symbols_sample': missing_symbols[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT],
@@ -1210,13 +1239,15 @@ def _validated_row_count_scope_gap_evidence(
     )
     present_count = _strict_nonnegative_int(value.get('present_count'))
     missing_count = _strict_nonnegative_int(value.get('missing_count'))
+    not_applicable_count = _strict_nonnegative_int(value.get('not_applicable_count', 0))
     if (
         value.get('authoritative') is not True
         or value.get('evidence_version') != 'row_count_scope_gap_v1'
         or evidence_requested_count != requested_count
         or present_count is None
         or missing_count is None
-        or present_count + missing_count != requested_count
+        or not_applicable_count is None
+        or present_count + missing_count + not_applicable_count != requested_count
     ):
         return None
     return dict(value)
@@ -6382,6 +6413,7 @@ class EODPipelineStatusService:
             'coverage_ratio': coverage_ratio,
             'min_non_blocking_coverage_ratio': PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO,
             'missing_count': missing_count,
+            'not_applicable_count': _coerce_int(aggregate.get('not_applicable_count')),
             'missing_symbols_sample': missing_symbols_sample,
             'missing_symbol_details_sample': missing_symbol_details_sample,
             'missing_sample_limit': aggregate.get('missing_sample_limit') or ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,

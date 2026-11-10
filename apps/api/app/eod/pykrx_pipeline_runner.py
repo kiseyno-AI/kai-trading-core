@@ -1431,7 +1431,7 @@ def _extract_raw_result_counts(
             'failed': min(failed, inspected),
         }
 
-    if stage_id == 'signal_features':
+    if stage_id in {'piotroski_filter', 'signal_features'}:
         selected_scope = result.get('selected_stock_codes')
         if isinstance(selected_scope, list):
             scope_status = str(result.get('status') or '').strip().lower()
@@ -1447,17 +1447,20 @@ def _extract_raw_result_counts(
                 status=scope_status,
             )
             if partition is not None:
-                succeeded = len(partition['successful_stock_codes']) + len(
-                    partition['terminal_not_applicable_stock_codes']
-                )
+                succeeded = len(partition['successful_stock_codes'])
+                not_applicable = len(partition['terminal_not_applicable_stock_codes'])
+                if stage_id == 'signal_features':
+                    succeeded += not_applicable
+                    not_applicable = 0
                 failed = len(partition['retry_debt_stock_codes'])
                 total = len(partition['selected_stock_codes'])
                 return {
-                    'processed': succeeded + failed,
+                    'processed': succeeded + failed + not_applicable,
                     'total': total,
                     'succeeded': succeeded,
                     'failed': failed,
                 }
+    if stage_id == 'signal_features':
         succeeded = _int(result.get('features_persisted'))
         failed = _int(result.get('features_failed'))
         processed = succeeded + failed
@@ -6824,6 +6827,14 @@ def run_market_data_pipeline(
                 stage_id='fundamentals_daily_refresh',
             )
             fundamentals_satisfied = bool(fundamentals_admitted_symbols)
+            preferred_followup_symbols = (
+                set(result['fundamentals_followup'].get('preferred_not_applicable_stock_codes') or ())
+                & set(result['fundamentals_followup'].get('terminal_not_applicable_stock_codes') or ())
+                & set(daily_followup_admitted_symbols)
+            )
+            piotroski_invocation_symbols = sorted(
+                set(fundamentals_admitted_symbols or ()) | preferred_followup_symbols
+            )
             if fundamentals_satisfied:
                 try:
                     piotroski_kwargs: dict[str, Any] = {
@@ -6835,11 +6846,11 @@ def run_market_data_pipeline(
                             daily_derived_market_scope_authority
                         ),
                     }
-                    if set(fundamentals_admitted_symbols or []) != set(
+                    if set(piotroski_invocation_symbols) != set(
                         exact_followup_symbols
                     ):
                         piotroski_kwargs['admitted_symbols'] = list(
-                            fundamentals_admitted_symbols or []
+                            piotroski_invocation_symbols
                         )
                     result['piotroski_filter_followup'] = (
                         run_followup_stage(
@@ -6882,7 +6893,7 @@ def run_market_data_pipeline(
             piotroski_admitted_symbols = (
                 _validated_successful_cohort(
                     stage_result=result['piotroski_filter_followup'],
-                    invocation_symbols=fundamentals_admitted_symbols or [],
+                    invocation_symbols=piotroski_invocation_symbols,
                     stage_id='piotroski_filter',
                 )
                 if fundamentals_satisfied
@@ -6919,11 +6930,21 @@ def run_market_data_pipeline(
                     ),
                 )
                 if factor_admitted_symbols:
+                    preferred_signal_symbols = set(preferred_followup_symbols)
+                    for price_factor_stage in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS:
+                        price_factor_result = (
+                            (result['factor_scoring_followup'].get('stages') or {})
+                            .get(price_factor_stage, {}).get('result') or {}
+                        )
+                        preferred_signal_symbols.intersection_update(
+                            price_factor_result.get('successful_stock_codes') or ()
+                        )
+                    signal_admitted = sorted(set(factor_admitted_symbols) | preferred_signal_symbols)
                     signal_feature_admitted_symbols = (
                         None
-                        if set(factor_admitted_symbols)
+                        if set(signal_admitted)
                         == set(exact_followup_symbols)
-                        else list(factor_admitted_symbols)
+                        else signal_admitted
                     )
                     result['signal_feature_followup'] = (
                         run_signal_feature_followup()

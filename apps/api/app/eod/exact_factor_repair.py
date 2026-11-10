@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timezone
+from functools import partial
 import json
 import logging
 import sys
@@ -498,7 +499,11 @@ def prune_stale_factor_rows(
 
 def _default_stage_runners() -> dict[str, Callable[..., dict[str, Any]]]:
     return {
-        'piotroski_filter': daily_piotroski_filter_service.rebuild_for_market_date,
+        # Historical repair manifests certify one row per frozen market member.
+        'piotroski_filter': partial(
+            daily_piotroski_filter_service.rebuild_for_market_date,
+            _preserve_legacy_preferred_rows=True,
+        ),
         'momentum_factors': daily_momentum_factor_service.rebuild_for_market_date,
         'value_factors': daily_value_factor_service.rebuild_for_market_date,
         'low_risk_factors': daily_low_risk_factor_service.rebuild_for_market_date,

@@ -3681,7 +3681,8 @@ class AgentContextReadServiceTests(unittest.TestCase):
                         'source': 'pykrx',
                         'is_active': True,
                         'last_refreshed_at': None,
-                    }
+                    },
+                    {'symbol': '00104K', 'market': 'KOSPI', 'name_ko': 'CJ4우(전환)'},
                 ],
             ),
             patch('app.agent_context.read_service.load_daily_technical_snapshots', return_value=[]),
@@ -3730,16 +3731,24 @@ class AgentContextReadServiceTests(unittest.TestCase):
         ):
             result = service.get_symbol_day_context(
                 market_date='2026-04-08',
-                symbols=['005930'],
+                symbols=['005930', '00104K'],
                 fs_div='CFS',
                 disclosures_limit=3,
             )
 
-        item = result['items'][0]
+        by_symbol = {item['symbol']: item for item in result['items']}
+        item = by_symbol['005930']
         self.assertEqual(item['liquidity_context']['status'], 'storage_unavailable')
         self.assertEqual(item['liquidity_context']['turnover']['status'], 'storage_unavailable')
         self.assertEqual(item['liquidity_context']['turnover']['reason'], 'daily_price_context_storage_unavailable')
         self.assertEqual(item['context_provenance']['price_context']['reason'], 'daily_price_context_storage_unavailable')
+        preferred = by_symbol['00104K']
+        self.assertTrue(preferred['company']['is_preferred_share'])
+        self.assertEqual(preferred['fundamentals']['status'], 'not_applicable')
+        self.assertEqual(preferred['context_completeness']['recent_dart_events']['missing_fields'], [])
+        quality = preferred['decider_data_quality_context']['blocks']
+        self.assertEqual(quality['financials_cashflow']['status'], 'not_applicable')
+        self.assertEqual(quality['disclosures_news']['providers']['dart_recent_events']['status'], 'not_applicable')
 
     def test_get_symbol_day_context_marks_stale_and_available_but_old_blocks_without_silently_omitting_them(self):
         latest_prior_rows = {

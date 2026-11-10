@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, func, or_, select
 
 from app.dart.service import (
     build_highlights_from_normalized_items,
@@ -28,6 +28,7 @@ from app.db_models import (
     Symbol,
 )
 from app.eod.finality import validate_finalized_krx_write_date
+from app.market.symbol_codes import KRX_EQUITY_MARKETS, is_krx_preferred_share
 from app.market_data_store import (
     load_daily_piotroski_filter_results,
     load_latest_available_daily_piotroski_filter_result_date,
@@ -498,6 +499,7 @@ class DailyPiotroskiFilterService:
         ranking_symbols: Sequence[str] | None = None,
         exact_scope_symbols: Sequence[str] | None = None,
         authoritative_market_scope: Mapping[str, Any] | None = None,
+        _preserve_legacy_preferred_rows: bool = False,
     ) -> dict[str, Any]:
         normalized_market_date = date.fromisoformat(market_date) if isinstance(market_date, str) else market_date
         normalized_symbols = _normalize_symbols(symbols)
@@ -513,20 +515,40 @@ class DailyPiotroskiFilterService:
                     'requested symbols must be contained in ranking_symbols: '
                     + ','.join(outside_ranking_scope[:20])
                 )
+        preferred_symbols = (
+            set() if _preserve_legacy_preferred_rows else self._load_preferred_symbols(
+                normalized_market_date,
+                symbols=normalized_symbols,
+                ranking_symbols=normalized_ranking_symbols,
+            )
+        )
+        applicable_ranking_symbols = (
+            [symbol for symbol in normalized_ranking_symbols if symbol not in preferred_symbols]
+            if normalized_ranking_symbols is not None
+            else None
+        )
+        if normalized_symbols and set(normalized_symbols) <= preferred_symbols:
+            applicable_ranking_symbols = []
         default_annual_year = normalized_market_date.year - 1
         default_prior_annual_year = default_annual_year - 1
-        ranking_inputs = self._load_inputs(
-            normalized_market_date,
-            symbols=(
-                normalized_ranking_symbols
-                if ranking_symbols is not None
-                else None
-            ),
+        load_exclusions = (
+            {'excluded_symbols': preferred_symbols}
+            if applicable_ranking_symbols is None and preferred_symbols
+            else {}
+        )
+        ranking_inputs = (
+            self._load_inputs(
+                normalized_market_date,
+                symbols=applicable_ranking_symbols,
+                **load_exclusions,
+            )
+            if applicable_ranking_symbols != []
+            else []
         )
         ranking_input_symbols = [item.symbol for item in ranking_inputs]
         ranking_scope_symbols = (
-            list(normalized_ranking_symbols or [])
-            if ranking_symbols is not None
+            applicable_ranking_symbols
+            if applicable_ranking_symbols is not None
             else ranking_input_symbols
         )
         ranking_missing_symbols = [
@@ -867,10 +889,12 @@ class DailyPiotroskiFilterService:
         selected_scope_symbols = (
             list(normalized_symbols)
             if normalized_symbols is not None
-            else sorted(set(ranking_input_symbols))
+            else sorted(set(ranking_input_symbols) | preferred_symbols)
         )
+        not_applicable_symbols = sorted(set(selected_scope_symbols) & preferred_symbols)
+        applicable_symbols = set(selected_scope_symbols) - preferred_symbols
         missing_input_symbols = sorted(
-            set(selected_scope_symbols) - evaluated_symbols
+            applicable_symbols - evaluated_symbols
         )
         if missing_input_symbols:
             missing_input_count = len(missing_input_symbols)
@@ -891,21 +915,23 @@ class DailyPiotroskiFilterService:
             evaluated_symbols - set(failed_symbols)
         )
         retry_debt_symbols = sorted(
-            set(selected_scope_symbols) - set(successful_symbols)
+            applicable_symbols - set(successful_symbols)
         )
         scope_status = (
             'completed'
             if not retry_debt_symbols
             else ('partial' if successful_symbols else 'failed')
         )
-        full_signal_total_count = len(selected_scope_symbols)
+        full_signal_total_count = len(applicable_symbols)
         full_signal_coverage_ratio = (
             full_signal_usable_count / full_signal_total_count
             if full_signal_total_count > 0
-            else 0.0
+            else (None if not_applicable_symbols else 0.0)
         )
         full_signal_coverage_status = (
-            'usable'
+            'not_applicable'
+            if not full_signal_total_count and not_applicable_symbols
+            else 'usable'
             if full_signal_total_count > 0
             and full_signal_usable_count == full_signal_total_count
             else (
@@ -984,18 +1010,17 @@ class DailyPiotroskiFilterService:
             'required_financial_input_missing_counts': dict(
                 sorted(required_input_missing_counts.items())
             ),
-            'scope_outcome_manifest_version': (
-                'piotroski_scope_outcomes_v1'
-            ),
+            'scope_outcome_manifest_version': 'piotroski_scope_outcomes_v1',
             'selected_stock_codes': selected_scope_symbols,
             'successful_stock_codes': successful_symbols,
             'retry_debt_stock_codes': retry_debt_symbols,
+            'terminal_not_applicable_stock_codes': not_applicable_symbols,
             'scope_outcome_manifest': [
                 {
                     'stock_code': symbol,
                     'outcome': (
-                        'success'
-                        if symbol in successful_symbols
+                        'terminal_not_applicable' if symbol in preferred_symbols
+                        else 'success' if symbol in successful_symbols
                         else 'retry_debt'
                     ),
                 }
@@ -1015,6 +1040,8 @@ class DailyPiotroskiFilterService:
         if evidence_reason is not None:
             result['reason'] = evidence_reason
             result['quality_warning'] = evidence_reason
+        elif full_signal_coverage_status == 'not_applicable':
+            result['reason'] = 'preferred_share_not_applicable'
         if scope_finalization is not None:
             result['scope_finalization'] = scope_finalization
         return result
@@ -1101,11 +1128,36 @@ class DailyPiotroskiFilterService:
             normalized = normalized.zfill(6)
         return normalized
 
+    @staticmethod
+    def _load_preferred_symbols(
+        market_date: date,
+        *,
+        symbols: Sequence[str] | None,
+        ranking_symbols: Sequence[str] | None,
+    ) -> set[str]:
+        query = select(Symbol.symbol, Symbol.name_ko, Symbol.market).where(
+            Symbol.market.in_(KRX_EQUITY_MARKETS),
+        )
+        if ranking_symbols is not None:
+            query = query.where(Symbol.symbol.in_(ranking_symbols))
+        else:
+            has_price = select(DailyPriceBar.id).where(
+                DailyPriceBar.symbol_id == Symbol.id,
+                DailyPriceBar.trade_date == market_date,
+            ).exists()
+            query = query.where(or_(has_price, Symbol.symbol.in_(symbols or [])))
+        with session_scope() as session:
+            return {
+                symbol for symbol, name, market in session.execute(query)
+                if is_krx_preferred_share(symbol, name, market)
+            }
+
     def _load_inputs(
         self,
         market_date: date,
         *,
         symbols: Sequence[str] | None = None,
+        excluded_symbols: set[str] | None = None,
     ) -> list[PiotroskiInputs]:
         with session_scope() as session:
             base_query = (
@@ -1128,6 +1180,8 @@ class DailyPiotroskiFilterService:
             )
             if symbols is not None:
                 base_query = base_query.where(Symbol.symbol.in_(list(symbols)))
+            if excluded_symbols:
+                base_query = base_query.where(Symbol.symbol.not_in(excluded_symbols))
             base_rows = session.execute(base_query).all()
 
             symbols = [row.symbol for row in base_rows]

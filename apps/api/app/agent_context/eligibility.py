@@ -33,7 +33,9 @@ from app.market_data_store import (
     load_daily_piotroski_filter_results,
 )
 from app.orders.domain import BrokerOrderStatus, OrderRequestSubmissionStatus
+from app.market.symbol_codes import is_krx_preferred_share
 from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
+from app.repositories.symbol_repository import load_symbols
 
 AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
     'market_risk_filter',
@@ -1644,15 +1646,24 @@ def _build_eligibility_record(
     strategy_scope: str,
     market_risk_row: dict | None,
     piotroski_row: dict | None,
+    preferred_share: bool = False,
 ) -> dict[str, Any]:
     hard_block_reasons = _market_risk_hard_blocks(market_risk_row)
     soft_penalties = _market_risk_soft_penalties(market_risk_row)
     if strategy_scope == AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY:
-        hard_block_reasons.extend(_piotroski_hard_blocks_for_value_scope(piotroski_row))
+        if preferred_share:
+            hard_block_reasons.append(_reason(
+                code='preferred_share_not_applicable_to_value_scope',
+                source='piotroski_filter',
+                message='The Piotroski-only value scope is not applicable to preferred shares.',
+            ))
+        else:
+            hard_block_reasons.extend(_piotroski_hard_blocks_for_value_scope(piotroski_row))
         rule_version = AGENT_FEEDBACK_VALUE_LONG_ONLY_ELIGIBILITY_RULE
         candidate_path = AGENT_FEEDBACK_STRATEGY_SCOPE_VALUE_LONG_ONLY
     else:
-        soft_penalties.extend(_piotroski_soft_penalties(piotroski_row))
+        if not preferred_share:
+            soft_penalties.extend(_piotroski_soft_penalties(piotroski_row))
         rule_version = AGENT_FEEDBACK_ELIGIBILITY_RULE
         candidate_path = AGENT_FEEDBACK_STRATEGY_SCOPE_SHORT_TERM_MOMENTUM
 
@@ -1677,7 +1688,10 @@ def _build_eligibility_record(
         'soft_penalties': soft_penalties,
         'filter_signals': {
             'market_risk_filter': _market_risk_filter_signals(market_risk_row),
-            'piotroski_filter': _piotroski_filter_signals(piotroski_row),
+            'piotroski_filter': (
+                {'status': 'not_applicable', 'reason': 'preferred_share_not_applicable'}
+                if preferred_share else _piotroski_filter_signals(piotroski_row)
+            ),
         },
     }
 
@@ -1705,6 +1719,15 @@ def load_agent_feedback_eligibility_records(
     )
     piotroski_by_symbol = _rows_by_symbol(piotroski_rows)
     market_risk_by_symbol = _rows_by_symbol(market_risk_rows)
+    record_symbols = _record_order(
+        requested_symbols=symbol_scope,
+        market_risk_rows=market_risk_rows,
+        piotroski_rows=piotroski_rows,
+    )
+    preferred_shares = {
+        row['symbol'] for row in (load_symbols(symbols=record_symbols) if record_symbols else [])
+        if is_krx_preferred_share(row.get('symbol'), row.get('name_ko'), row.get('market'))
+    }
     records = [
         _build_eligibility_record(
             symbol=symbol,
@@ -1712,12 +1735,9 @@ def load_agent_feedback_eligibility_records(
             strategy_scope=strategy_scope,
             market_risk_row=market_risk_by_symbol.get(symbol),
             piotroski_row=piotroski_by_symbol.get(symbol),
+            preferred_share=symbol in preferred_shares,
         )
-        for symbol in _record_order(
-            requested_symbols=symbol_scope,
-            market_risk_rows=market_risk_rows,
-            piotroski_rows=piotroski_rows,
-        )
+        for symbol in record_symbols
     ]
     return _apply_candidate_cap(
         records=records,
