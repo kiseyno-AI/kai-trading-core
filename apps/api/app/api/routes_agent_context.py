@@ -55,6 +55,7 @@ from app.agent_context.weekly_policy_rebind_service import (
 )
 from app.agent_context.runtime_state import RuntimeFeedbackRunState, runtime_feedback_state_store
 from app.orders.signal_decider_execution_outcomes import signal_decider_execution_outcome_service
+from app.side_agents.daily_review import list_daily_reviews
 
 import threading
 import uuid
@@ -2011,6 +2012,14 @@ async def get_signal_decider_calibration_report(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Signal-decider calibration report failed: {exc}') from exc
+
+
+@router.get('/daily-review')
+def get_daily_reviews(
+    market_date: date | None = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=30),
+) -> dict:
+    return list_daily_reviews(market_date=market_date, limit=limit)
 
 
 @router.post('/signal-decider/weekly-learning/publish')

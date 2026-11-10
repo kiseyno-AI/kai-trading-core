@@ -7,7 +7,7 @@ deciders, never touch orders, and their outputs are advisory files until a human
 | --- | --- | --- | --- |
 | `market-context-analyst` | trading day, from 21:30 once that day's bars and risk snapshots exist (catch-up until 06:00) | KIS KOSPI/KOSDAQ index (level, range, advancers/decliners, limit moves, 52-week position), KIS market-level investor flows (foreign, institution, individual, sub-groups), KIS US ETF proxies (SPY, QQQ, SOXX, EWY, TLT, UUP, USO, GLD), Bank of Korea daily rates and USD/KRW, stored Korea Exim FX, stored breadth by market and sector from `daily_market_risk_snapshots` plus five-session history | regime, trend, volatility, rotation, drivers, event risk, posture hint |
 | `news-event-analyst` | same gate as the market agent | up to 30 symbols (news-driven and filing-driven interleaved): Naver headlines and snippets, official DART filing titles with an importance rule, 1d/5d price move and 20d volume ratio | per-symbol materiality, event type, direction, evidence grade, reaction check |
-| `postmortem-analyst` | Saturday, from 09:00 | six weeks of `signal_decider_decision_snapshots` joined to realized next-open-to-horizon-close returns: per agent and action, classification, confidence buckets, candidate baseline | classification, calibration, patterns, up to 5 advisory proposals |
+| `postmortem-analyst` | trading day, from 21:30 | KRX WAIT observations, confirmed outcomes, stored market, business and news context | role-specific [Daily Review](DAILY_REVIEW.md) and candidate contracts |
 
 The evening gate checks that at least 500 daily bars and 500 risk snapshots exist for the date; until then the run reports `waiting` without using the attempt budget. KIS requests are sent one at a time, 0.25 s apart (the KIS client has no rate limiter and Core may be calling it too). Each live leg is isolated and carries a status. A failing KIS or BOK call is reported to the agent as an error, never hidden
 and never filled in. For a past market date the live legs (index, flows, US proxies) are skipped by design.
@@ -17,7 +17,7 @@ and never filled in. For a past market date the live legs (index, flows, US prox
 `python -m app.side_agents run-due` (from `apps/api`) decides what is due, dispatches through the OpenClaw
 gateway (`POST /v1/responses`, model `openclaw/<agent>`), validates the reply fail-closed and writes it to
 `var/side-agents/<agent>/<unit>.json`. `scripts/install_side_agents_launchd.sh` installs a per-user launchd job
-that calls it every 30 minutes; the schedule logic lives in code, so DST and the Mac's US-Eastern clock do not matter.
+that calls the evening analysts and the separate `run-daily-review` command every 30 minutes. The schedule logic uses KRX time. The legacy weekly postmortem remains available as a manual command.
 
 - **Idempotent:** a finished unit is never re-run. Interrupted news batches resume.
 - **Quota-safe:** only failed or rejected attempts count; at most `SIDE_AGENTS_MAX_DAILY_ATTEMPTS` (3) per
