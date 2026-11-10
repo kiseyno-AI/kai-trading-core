@@ -171,6 +171,66 @@ def _semantic_result_payloads(
     return tuple(payloads)
 
 
+def daily_pipeline_nullable_output_is_completed(
+    outcome: Mapping[str, Any],
+) -> bool:
+    """Recognize an atomic completed attempt whose persisted values may be null."""
+
+    if outcome.get('status') is not None and outcome.get('status') != 'completed':
+        return False
+    payloads = _semantic_result_payloads(outcome)
+    if not any(
+        payload.get('nullable_output_completed') is True
+        and payload.get('status') == 'completed'
+        for payload in payloads
+    ):
+        return False
+    if (
+        _partial_has_blocking_evidence(payloads)
+        or not _partial_retries_are_terminal(payloads)
+        or _has_positive_failure_evidence(payloads)
+    ):
+        return False
+    finalizations = [
+        _mapping(payload.get('scope_finalization'))
+        for payload in payloads
+        if 'scope_finalization' in payload
+    ]
+    if not finalizations or not all(
+        (_optional_int(item.get('successful_symbol_count')) or 0) > 0
+        for item in finalizations
+    ):
+        return False
+    if any(
+        payload.get('retry_debt_stock_codes')
+        or _mapping(payload.get('exact_scope_outcome_proof')).get(
+            'retry_debt_stock_codes'
+        )
+        for payload in payloads
+    ):
+        return False
+    stage_ids = _stage_ids((*payloads, *finalizations))
+    market_dates = {
+        str(payload['market_date']).strip()
+        for payload in (*payloads, *finalizations)
+        if payload.get('market_date')
+    }
+    if len(stage_ids) != 1 or len(market_dates) != 1:
+        return False
+    stage_id = next(iter(stage_ids))
+    if (
+        stage_id != 'piotroski_filter'
+        and 'factor_scope_outcomes_v1'
+        not in STAGE_EXACT_SCOPE_OUTCOME_MANIFEST_VERSIONS.get(stage_id, ())
+    ):
+        return False
+    return _has_exact_scope_outcome_manifest(
+        payloads,
+        expected_stage_id=stage_id,
+        expected_market_date=next(iter(market_dates)),
+    )
+
+
 def daily_pipeline_result_has_no_ready_content(
     result: Mapping[str, Any] | None,
 ) -> bool:
@@ -201,7 +261,7 @@ def daily_pipeline_result_has_no_ready_content(
                 persisted_ready_count == 0
                 and (persisted_unready_count or 0) >= persisted_count
             ):
-                return True
+                return not daily_pipeline_nullable_output_is_completed(result)
     for payload in payloads:
         decision_ready_count = _optional_int(
             payload.get('decision_ready_count')
@@ -213,7 +273,7 @@ def daily_pipeline_result_has_no_ready_content(
             decision_ready_count == 0
             and (decision_degraded_count or 0) > 0
         ):
-            return True
+            return not daily_pipeline_nullable_output_is_completed(result)
     expected_count = next(
         (
             value
@@ -241,10 +301,11 @@ def daily_pipeline_result_has_no_ready_content(
         unready_count = _optional_int(payload.get('unready_count'))
         if ready_count != 0:
             continue
-        if (unready_count or 0) >= expected_count:
-            return True
-        if (insufficient_count or 0) >= expected_count:
-            return True
+        if (
+            (unready_count or 0) >= expected_count
+            or (insufficient_count or 0) >= expected_count
+        ):
+            return not daily_pipeline_nullable_output_is_completed(result)
     return False
 
 

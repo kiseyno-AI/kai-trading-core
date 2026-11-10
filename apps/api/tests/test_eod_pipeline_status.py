@@ -26,9 +26,12 @@ from app.eod.pipeline_status import (
     _load_pipeline_pykrx_run_rows,
     _load_row_count_missing_diagnostics_for_model,
     _load_row_count_stage_counts,
+    _load_row_count_stage_scope_gap,
+    _load_signal_feature_counts,
     _signal_feature_row_is_semantically_ready,
 )
 from app.eod.market_membership import build_market_membership_snapshot
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.signals.signal_feature_readiness import (
     SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
     classify_signal_feature_readiness,
@@ -1875,6 +1878,71 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(stage['failed'], 1)
         self.assertEqual(stage['remaining'], 0)
 
+    def test_signal_feature_clean_empty_row_completes_stage_and_requested_scope(self):
+        market_date = '2026-04-21'
+        row = SimpleNamespace(
+            symbol_id=1,
+            signal_count=0,
+            captured_at=None,
+            feature_payload={
+                'market_date': market_date,
+                'freshness': {'market_date': market_date},
+                'row_provenance': {
+                    'row_kind': 'no_signal',
+                    'direct_signal_source_count': 0,
+                    'fallback_groups_present': [],
+                },
+                'sources': {},
+                'fallback_features': {},
+                'collection': {
+                    'collected_at': '2026-04-21T12:00:00+00:00',
+                    'source_errors': {},
+                    'source_health': {'overtime-volume': {'status': 'empty'}},
+                },
+            },
+        )
+        requested = SimpleNamespace(
+            id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'
+        )
+        session = MagicMock()
+        session.execute.side_effect = [
+            SimpleNamespace(all=lambda: [row]),
+            SimpleNamespace(all=lambda: [requested]),
+            SimpleNamespace(all=lambda: [row]),
+            SimpleNamespace(all=lambda: [requested]),
+        ]
+        with patch('app.eod.pipeline_status.session_scope') as scope:
+            scope.return_value.__enter__.return_value = session
+            aggregate = _load_signal_feature_counts(market_date=market_date)
+            scoped = _load_row_count_stage_scope_gap(
+                stage_id='signal_features',
+                market_date=market_date,
+                symbols=['005930'],
+            )
+
+        stage = EODPipelineStatusService(
+            row_count_scope_gap_loader=lambda **_: scoped,
+        )._build_signal_features_stage(
+            market_date=market_date,
+            aggregate=aggregate,
+            expected_total=1,
+            scope_symbols=['005930'],
+        )
+        self.assertEqual(stage['status'], 'completed')
+        self.assertEqual(stage['gate_status'], 'ready')
+        self.assertEqual(stage['succeeded'], 1)
+        self.assertEqual(stage['failed'], 0)
+        self.assertEqual(stage['details']['semantic_ready_rows'], 0)
+        self.assertEqual(stage['details']['quality_no_signal_rows'], 1)
+        self.assertEqual(scoped['missing_count'], 0)
+        row.feature_payload['collection']['collected_at'] = '2026-04-21T16:00:00+00:00'
+        stale = classify_signal_feature_readiness(
+            signal_count=row.signal_count,
+            feature_payload=row.feature_payload,
+            expected_market_date=market_date,
+        )
+        self.assertFalse(stale['publication_ready'])
+
     def test_requested_scope_gate_preserves_completed_degraded_quality(self):
         service = EODPipelineStatusService(
             row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
@@ -2879,6 +2947,24 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     ['005930', '000660', '035420'],
                 )
                 self.assertEqual(coverage['source_run_ids_by_symbol'], {})
+
+    def test_dart_scope_treats_only_proven_preferred_symbols_as_not_applicable(self):
+        metadata = build_exact_symbol_scope_outcome(
+            manifest_version='dart_daily_data_scope_outcomes_v1',
+            selected_symbols=['005930', '005935', '035420'],
+            successful_symbols=['005930'],
+            retry_debt_symbols=[],
+            terminal_not_applicable_symbols=['005935', '035420'],
+        )
+        metadata['preferred_not_applicable_stock_codes'] = ['005935', '999999']
+        coverage = EODPipelineStatusService._build_fundamentals_requested_scope_coverage(
+            run={'id': 906, 'status': 'completed', 'run_metadata': metadata},
+            scope_symbols=['005930', '005935', '035420', '999999'],
+        )
+
+        self.assertEqual(coverage['present_count'], 1)
+        self.assertEqual(coverage['not_applicable_count'], 1)
+        self.assertEqual(coverage['missing_symbols_sample'], ['035420', '999999'])
 
     def test_pykrx_global_completion_does_not_cover_missing_requested_symbol(self):
         coverage = _full_pykrx_enrichment_coverage(

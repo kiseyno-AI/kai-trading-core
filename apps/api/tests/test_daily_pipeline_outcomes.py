@@ -15,6 +15,8 @@ from app.eod.daily_pipeline_outcomes import (
     terminal_continuation_feedback_lease_loss_run_id,
 )
 from app.eod.market_membership import market_membership_sha256
+from app.eod.daily_pipeline_stages import DailyPipelineStageService
+from app.eod.pipeline_status import EODPipelineStatusService
 from app.eod.pykrx_backfill import PykrxBackfillService
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 
@@ -715,6 +717,96 @@ def test_standard_unready_coverage_blocks_completed_factor_outcome() -> None:
     }
 
     assert daily_pipeline_outcome_is_satisfied(outcome) is False
+
+
+@pytest.mark.parametrize(
+    ('proof_change', 'expected'),
+    [
+        ({}, True),
+        ({'stage': 'momentum_factors'}, False),
+        ({'market_date': '2026-04-02'}, False),
+        ({'ready': False}, False),
+    ],
+)
+def test_completed_nullable_factor_requires_current_atomic_proof(
+    proof_change: dict, expected: bool,
+) -> None:
+    result = {
+        'status': 'completed',
+        'nullable_output_completed': True,
+        'results_persisted': 2,
+        'results_failed': 0,
+        'summary': {'ready_count': 0, 'unready_count': 2},
+        **_exact_scope_outcome(total=2, succeeded=2, stage_id='beta_factors'),
+    }
+    result['scope_finalization'].update(proof_change)
+    outcome = {'stage': 'beta_factors', 'status': 'completed', 'result': result}
+
+    assert daily_pipeline_outcome_is_satisfied(outcome) is expected
+    assert not daily_pipeline_outcome_is_satisfied({
+        **outcome,
+        'result': {**result, 'results_failed': 1},
+    })
+
+
+def test_exact_membership_keeps_published_null_scores_ready() -> None:
+    result = {
+        'status': 'completed',
+        'nullable_output_completed': True,
+        'results_persisted': 2,
+        'results_failed': 0,
+        'summary': {'ready_count': 0, 'unready_count': 2},
+        **_exact_scope_outcome(total=2, succeeded=2, stage_id='beta_factors'),
+    }
+    symbols = result['selected_stock_codes']
+    proof = DailyPipelineStageService._build_exact_scope_outcome_proof(
+        result,
+        stage_id='beta_factors',
+        invocation_symbols=symbols,
+        publication_symbols=symbols,
+        expected_market_date=result['market_date'],
+    )
+    assert proof is not None
+    for key in (
+        'scope_outcome_manifest_version',
+        'scope_outcome_manifest',
+        'selected_stock_codes',
+        'successful_stock_codes',
+        'retry_debt_stock_codes',
+        'terminal_not_applicable_stock_codes',
+    ):
+        result.pop(key)
+    stage = {
+        'task': 'beta_factors',
+        'status': 'completed',
+        'gate_status': 'ready',
+        'details': {
+            'result_summary': result,
+            'exact_scope_outcome_proof': proof,
+        },
+    }
+    coverage = {
+        'evidence_version': 'row_count_scope_gap_v1',
+        'authoritative': True,
+        'requested_count': 2,
+        'present_count': 2,
+        'missing_count': 0,
+        'decision_ready_count': 0,
+        'decision_degraded_count': 2,
+    }
+    projected = EODPipelineStatusService._apply_exact_universe_coverage_evidence(
+        stage=stage, coverage=coverage, expected_count=2, source_run_id=900,
+    )
+
+    assert projected['status'] == 'completed'
+    assert projected['gate_status'] == 'ready'
+    assert projected['details']['exact_scope_decision_ready_count'] == 0
+    assert EODPipelineStatusService._apply_exact_universe_coverage_evidence(
+        stage=stage,
+        coverage={**coverage, 'present_count': 1, 'missing_count': 1},
+        expected_count=2,
+        source_run_id=900,
+    )['gate_status'] == 'blocked'
 
 
 def test_persisted_readiness_prevents_failed_ready_row_from_passing_partial_coverage() -> None:

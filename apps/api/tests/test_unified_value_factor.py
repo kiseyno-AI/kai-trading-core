@@ -447,7 +447,7 @@ class DailyUnifiedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(result['summary']['scored_count'], 3)
         self.assertEqual(result['summary']['ranking_universe_counts']['unified_value_score'], 3)
 
-    def test_rebuild_marks_invalid_per_as_partial_auditable_row(self) -> None:
+    def test_rebuild_completes_with_an_auditable_null_score_for_invalid_per(self) -> None:
         service = DailyUnifiedValueFactorService()
         market_date = date(2026, 4, 24)
         inputs = [
@@ -504,7 +504,7 @@ class DailyUnifiedValueFactorServiceTests(unittest.TestCase):
         self.assertIsNone(invalid['unified_value_score'])
         self.assertIsNone(invalid['unified_value_rank'])
         self.assertEqual(result['summary']['invalid_per_count'], 1)
-        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['reason'], 'partial_usable_coverage')
         self.assertEqual(result['gate_status'], 'ready')
         self.assertEqual(result['blocking_status'], 'non_blocking')

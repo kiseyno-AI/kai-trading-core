@@ -183,6 +183,12 @@ FACTOR_STAGE_ORDER: tuple[str, ...] = (
     'quality_factors',
     'composite_factors',
 )
+DART_DEPENDENT_FACTOR_STAGE_IDS = frozenset(
+    {'advanced_value_factors', 'unified_value_factors', 'quality_factors', 'composite_factors'}
+)
+PREFERRED_SHARE_CONTINUATION_STAGE_IDS = frozenset(
+    {'signal_features', 'external_news_collect', 'agent_feedback_summaries'}
+)
 EXACT_MEMBERSHIP_BOUND_STAGE_IDS = frozenset(
     {
         'pykrx_enrichment',
@@ -2751,6 +2757,7 @@ class DailyPipelineStageService:
                 )
                 handled.add(stage_id)
 
+        dart_preferred_not_applicable: set[str] = set()
         for stage_id in resolved_stages:
             if stage_id in handled:
                 continue
@@ -2958,6 +2965,7 @@ class DailyPipelineStageService:
                 # proofless persisted completion during an open session.
                 incomplete_dependencies.append('signal_decider')
             if STAGE_DEFINITIONS[stage_id].supports_symbols:
+                preferred_continuation: set[str] = set()
                 for dependency in STAGE_DEFINITIONS[stage_id].depends_on:
                     if dependency not in resolved_stages:
                         continue
@@ -2983,9 +2991,36 @@ class DailyPipelineStageService:
                     )
                     if exact_scope is None:
                         continue
-                    admitted_symbols = exact_scope[
-                        'successful_stock_codes'
-                    ]
+                    admitted_symbols = list(exact_scope['successful_stock_codes'])
+                    preferred_exemptions: set[str] = set()
+                    if dependency == 'fundamentals_daily_refresh':
+                        dart_outcome = stage_outcomes[dependency]
+                        dart_proof = (dart_outcome.get('details') or {}).get(
+                            'exact_scope_outcome_proof'
+                        ) or {}
+                        preferred_claim = dart_outcome['result'].get(
+                            'preferred_not_applicable_stock_codes',
+                            dart_proof.get('preferred_not_applicable_stock_codes'),
+                        )
+                        if isinstance(preferred_claim, list):
+                            dart_preferred_not_applicable.update(
+                                set(_normalize_krx_symbol_codes(preferred_claim) or ())
+                                & set(exact_scope['terminal_not_applicable_stock_codes'])
+                            )
+                        if stage_id == 'piotroski_filter':
+                            preferred_exemptions = dart_preferred_not_applicable
+                    elif stage_id in PREFERRED_SHARE_CONTINUATION_STAGE_IDS:
+                        if dependency == 'piotroski_filter':
+                            # Piotroski terminal non-applicability proves the preferred lane.
+                            preferred_continuation.update(
+                                exact_scope['terminal_not_applicable_stock_codes']
+                            )
+                            preferred_exemptions = preferred_continuation
+                        elif dependency in DART_DEPENDENT_FACTOR_STAGE_IDS:
+                            preferred_exemptions = preferred_continuation.difference(
+                                exact_scope['selected_stock_codes']
+                            )
+                    admitted_symbols.extend(sorted(preferred_exemptions))
                     if not admitted_symbols:
                         if dependency not in incomplete_dependencies:
                             incomplete_dependencies.append(dependency)
@@ -3003,6 +3038,10 @@ class DailyPipelineStageService:
                         {
                             'dependency': dependency,
                             **exact_scope,
+                            **(
+                                {'preferred_exempt_stock_codes': sorted(preferred_exemptions)}
+                                if preferred_exemptions else {}
+                            ),
                         }
                     )
             if exact_partial_dependency_candidates:
@@ -3126,6 +3165,20 @@ class DailyPipelineStageService:
                             for symbol in official_membership_symbols
                             if symbol in merged_successful
                         ]
+            stage_ranking_scope = (
+                official_membership_symbols if stage_id == recovery_stage_id else None
+            )
+            if stage_id in DART_DEPENDENT_FACTOR_STAGE_IDS and dart_preferred_not_applicable:
+                if stage_symbols is not None:
+                    stage_symbols = [
+                        symbol for symbol in stage_symbols
+                        if symbol not in dart_preferred_not_applicable
+                    ]
+                if official_membership_symbols is not None:
+                    stage_ranking_scope = [
+                        symbol for symbol in official_membership_symbols
+                        if symbol not in dart_preferred_not_applicable
+                    ]
             self._start_tracked_stage(
                 pipeline_run_id=pipeline_run_id,
                 stage_id=stage_id,
@@ -3584,11 +3637,7 @@ class DailyPipelineStageService:
                             market_date=resolved_market_date,
                             symbols=stage_symbols,
                             exact_scope_symbols=official_membership_symbols,
-                            ranking_scope_symbols=(
-                                official_membership_symbols
-                                if stage_id == recovery_stage_id
-                                else None
-                            ),
+                            ranking_scope_symbols=stage_ranking_scope,
                             publication_scope_symbols=(
                                 list(stage_symbols or [])
                                 if stage_id == recovery_stage_id
@@ -5566,6 +5615,15 @@ class DailyPipelineStageService:
                 ],
             ),
         }
+        if stage_id == 'fundamentals_daily_refresh':
+            preferred_claim = result.get('preferred_not_applicable_stock_codes')
+            if isinstance(preferred_claim, list):
+                preferred = set(_normalize_krx_symbol_codes(preferred_claim) or ())
+                proof['preferred_not_applicable_stock_codes'] = [
+                    symbol
+                    for symbol in partition['terminal_not_applicable_stock_codes']
+                    if symbol in preferred
+                ]
         finalization = partition.get('scope_finalization')
         if isinstance(finalization, Mapping):
             proof.update(

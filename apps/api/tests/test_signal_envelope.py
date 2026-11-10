@@ -112,19 +112,35 @@ class SignalEnvelopeTests(unittest.TestCase):
         )
 
         by_source = {item['source_name']: item for item in envelopes}
-        value = by_source['factor:value']
         kis_ranking = by_source['factor:kis_ranking']
         news = by_source['news:external']
 
-        self.assertEqual(value['value'], 0.0)
-        self.assertEqual(value['confidence'], 0.0)
-        self.assertIn('missing_source_row', value['risk_flags'])
-        self.assertIn('low_quality_or_missing_source', value['risk_flags'])
+        self.assertNotIn('factor:value', by_source)
         self.assertEqual(kis_ranking['confidence'], 0.0)
         self.assertEqual(kis_ranking['evidence_refs'], [])
         self.assertEqual(news['value'], 0.0)
         self.assertEqual(news['confidence'], 0.1)
         self.assertIn('no_recent_external_news_found', news['risk_flags'])
+
+    def test_missing_factor_and_no_signal_row_do_not_synthesize_numeric_evidence(self) -> None:
+        summary = {
+            'factor_scores': {
+                'value': {'status': 'available', 'score': None},
+                'quality': {'status': 'available', 'score': 0.0},
+                'momentum': {'status': 'available', 'percentile': 0.75},
+            },
+            'signal_features': {
+                'status': 'available', 'signal_count': 0, 'row_kind': 'no_signal',
+            },
+        }
+        envelopes = build_symbol_signal_envelopes(
+            symbol='005930', market_date='2026-04-14', factor_summary=summary,
+        )
+        self.assertEqual(
+            {item['source_name']: item['value'] for item in envelopes},
+            {'factor:quality': -1.0, 'factor:momentum': 0.5},
+        )
+        self.assertIsNone(summary['factor_scores']['value']['score'])
 
     def test_multiple_sources_for_one_symbol_date_are_kept_compact_and_distinct(self) -> None:
         envelopes = build_decider_signal_envelopes(
@@ -151,7 +167,7 @@ class SignalEnvelopeTests(unittest.TestCase):
         self.assertIn('technical-summarizer', sources)
         self.assertIn('risk:market', sources)
         self.assertIn('factor:quality', sources)
-        self.assertIn('factor:low_risk', sources)
+        self.assertNotIn('factor:low_risk', sources)
         self.assertIn('factor:kis_ranking', sources)
         self.assertTrue(all(item['symbol'] == '005930' for item in envelopes))
         self.assertTrue(all(item['market_date'] == '2026-04-14' for item in envelopes))

@@ -951,8 +951,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.source_counts, {VOLUME_POWER: 0, OVERTIME_VOLUME: 1})
         self.assertEqual(result.source_health[VOLUME_POWER]['status'], 'unavailable')
         self.assertEqual(result.source_health[VOLUME_POWER]['invalid_count'], 2)
-        self.assertEqual(result.source_health[OVERTIME_VOLUME]['status'], 'partial')
-        self.assertEqual(result.source_health[OVERTIME_VOLUME]['invalid_count'], 1)
+        self.assertEqual(result.source_health[OVERTIME_VOLUME]['status'], 'available')
+        self.assertEqual(result.source_health[OVERTIME_VOLUME]['invalid_count'], 0)
         self.assertEqual([item['symbol'] for item in result.items], ['000660'])
         self.assertEqual(
             {item['reason'] for item in result.source_diagnostics[VOLUME_POWER]},
@@ -960,8 +960,93 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             {item['reason'] for item in result.source_diagnostics[OVERTIME_VOLUME]},
-            {'non_positive_overtime_volume'},
+            {'no_overtime_trades'},
         )
+
+    async def test_refresh_publishes_no_signal_for_clean_empty_rankings(self):
+        client = EmptyKISRankingClient()
+        client.fetch_domestic_ranking_overtime_volume = AsyncMock(
+            return_value={'output2': [
+                {'stck_shrn_iscd': '005930', 'ovtm_untp_vol': '0'},
+            ]},
+        )
+        symbols = ['005930']
+        service = DailySignalFeatureService(client=client)
+
+        with (
+            patch(
+                'app.signals.daily_signal_features._utcnow_iso',
+                return_value='2026-04-14T12:00:00+00:00',
+            ),
+            patch(
+                'app.signals.daily_signal_features.overtime_capture_store.usable_rows',
+                return_value=None,
+            ),
+            patch(
+                'app.signals.daily_signal_features._resolve_exact_repair_generation_universe',
+                return_value={'target_symbols': symbols, 'active_symbols': symbols},
+            ),
+            patch(
+                'app.signals.daily_signal_features._load_support_maps',
+                return_value={},
+            ),
+            patch(
+                'app.signals.daily_signal_features.replace_daily_signal_features_exact_scope',
+                return_value={
+                    'successful_symbols': symbols,
+                    'failed_symbols': [],
+                    'scope_finalization': {'ready': True},
+                },
+            ) as persist,
+            patch(
+                'app.signals.daily_signal_features.daily_market_participation_context_service.'
+                'rebuild_for_market_date',
+            ),
+        ):
+            result = await service.refresh_for_market_date(
+                market_date='2026-04-14',
+                exact_symbols=symbols,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['incomplete_sources'], [])
+        self.assertEqual(result['successful_stock_codes'], symbols)
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertEqual(result['source_health'][OVERTIME_VOLUME]['reason'], 'no_overtime_trades')
+        self.assertEqual(result['source_health'][OVERTIME_FLUCTUATION]['reason'], 'empty_response')
+        row, = persist.call_args.kwargs['features']
+        self.assertEqual(row['signal_count'], 0)
+        self.assertIsNone(row['overtime_volume'])
+        self.assertIsNone(row['overtime_fluctuation_rate'])
+        self.assertEqual(row['feature_payload']['sources'], {})
+        self.assertEqual(row['feature_payload']['row_provenance']['row_kind'], 'no_signal')
+        readiness = row['feature_payload']['readiness']
+        self.assertEqual(readiness['quality_status'], 'no_signal')
+        self.assertTrue(readiness['publication_ready'])
+        self.assertFalse(readiness['semantic_ready'])
+
+    async def test_collect_features_does_not_classify_malformed_response_as_empty(self):
+        client = EmptyKISRankingClient()
+        client.fetch_domestic_ranking_overtime_fluctuation = AsyncMock(
+            return_value={'output2': [], 'raw_pages': [{'output2': 'invalid'}]},
+        )
+        service = DailySignalFeatureService(client=client)
+        with (
+            patch(
+                'app.signals.daily_signal_features.overtime_capture_store.usable_rows',
+                return_value=None,
+            ),
+            patch(
+                'app.signals.daily_signal_features._expand_rows_with_owned_fallback',
+                return_value=([], {}),
+            ),
+        ):
+            result = await service.collect_features(
+                market_date='2026-04-14',
+                sources=[OVERTIME_FLUCTUATION],
+            )
+        self.assertEqual(result.source_health[OVERTIME_FLUCTUATION]['status'], 'unavailable')
+        self.assertEqual(result.source_health[OVERTIME_FLUCTUATION]['reason'], 'source_error')
     async def test_collect_features_retries_each_retryable_kis_ranking_read_once(self):
         client = type(
             'RetryingKISRankingClient',

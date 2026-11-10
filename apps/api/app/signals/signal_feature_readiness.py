@@ -110,6 +110,16 @@ def direct_signal_source_is_decision_usable(
     return False
 
 
+def _seoul_observation_date(raw_timestamp: Any) -> str | None:
+    try:
+        timestamp = datetime.fromisoformat(str(raw_timestamp or '').strip())
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        return None
+    return timestamp.astimezone(_SEOUL_TZ).date().isoformat()
+
+
 def quote_snapshot_is_same_day(
     *,
     payload: Mapping[str, Any],
@@ -140,20 +150,8 @@ def quote_snapshot_is_same_day(
         quote_freshness.get('cached_at'),
         quote_freshness.get('captured_at'),
     ):
-        timestamp_text = str(raw_timestamp or '').strip()
-        if not timestamp_text:
-            continue
-        try:
-            observed_at = datetime.fromisoformat(
-                timestamp_text.replace('Z', '+00:00')
-            )
-        except ValueError:
-            continue
-        if observed_at.tzinfo is None:
-            continue
-        observed_dates.append(
-            observed_at.astimezone(_SEOUL_TZ).date().isoformat()
-        )
+        if observed_date := _seoul_observation_date(raw_timestamp):
+            observed_dates.append(observed_date)
     return bool(observed_dates) and all(
         observed_date == expected_market_date
         for observed_date in observed_dates
@@ -213,6 +211,7 @@ def classify_signal_feature_readiness(
     if not isinstance(feature_payload, Mapping):
         return {
             'contract_version': SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
+            'publication_ready': False,
             'semantic_ready': False,
             'quality_status': 'retry',
             'quality_reasons': ['feature_payload_missing'],
@@ -318,6 +317,33 @@ def classify_signal_feature_readiness(
     semantic_ready = bool(
         date_and_provenance_ready and (direct_ready or fallback_ready)
     )
+    collection = feature_payload.get('collection')
+    if not isinstance(collection, Mapping):
+        collection = {}
+    source_health = collection.get('source_health')
+    source_errors = collection.get('source_errors')
+    sources = feature_payload.get('sources')
+    observed_empty = bool(
+        date_and_provenance_ready
+        and signal_count == 0
+        and provenance.get('direct_signal_source_count') == 0
+        and row_kind in {'fallback_only', 'no_signal'}
+        and isinstance(sources, Mapping)
+        and not sources
+        and not usable_fallback_groups
+        and isinstance(feature_payload.get('fallback_features'), Mapping)
+        and isinstance(source_errors, Mapping)
+        and not source_errors
+        # A live query for a different KRX date cannot prove a clean empty.
+        and _seoul_observation_date(collection.get('collected_at')) == effective_market_date
+        and isinstance(source_health, Mapping)
+        and source_health
+        and all(
+            isinstance(source, Mapping)
+            and source.get('status') in {'available', 'empty'}
+            for source in source_health.values()
+        )
+    )
     if not semantic_ready:
         if normalized_signal_count > 0 and not direct_ready:
             reasons.append('direct_signal_evidence_incomplete')
@@ -325,14 +351,8 @@ def classify_signal_feature_readiness(
             reasons.append('fallback_decision_values_missing')
         if not direct_ready and not fallback_ready:
             reasons.append('no_decision_usable_signal_feature_evidence')
-        quality_status = 'retry'
+        quality_status = 'no_signal' if observed_empty else 'retry'
     else:
-        collection = feature_payload.get('collection')
-        source_errors = (
-            collection.get('source_errors')
-            if isinstance(collection, Mapping)
-            else {}
-        )
         if fallback_ready and not direct_ready:
             reasons.append('fallback_only')
         if isinstance(source_errors, Mapping) and source_errors:
@@ -366,6 +386,7 @@ def classify_signal_feature_readiness(
 
     return {
         'contract_version': SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
+        'publication_ready': quality_status != 'retry',
         'semantic_ready': semantic_ready,
         'quality_status': quality_status,
         'quality_reasons': list(dict.fromkeys(reasons)),

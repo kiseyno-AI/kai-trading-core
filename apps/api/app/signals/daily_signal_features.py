@@ -58,6 +58,7 @@ STORED_FALLBACK_BACKFILL_MODE = 'stored_owned_fallback_missing_row_backfill'
 ROW_KIND_DIRECT_ONLY = 'direct_only'
 ROW_KIND_DIRECT_PLUS_FALLBACK = 'direct_plus_fallback'
 ROW_KIND_FALLBACK_ONLY = 'fallback_only'
+ROW_KIND_NO_SIGNAL = 'no_signal'
 
 ACTIVE_UNIVERSE_LABEL = 'active_daily_bar_universe'
 CANDIDATE_UNIVERSE_LABEL = 'agent_feedback_candidate_universe'
@@ -886,11 +887,10 @@ def _prepare_signal_feature_publication_items(
     dict[str, str],
     dict[str, int],
 ]:
-    """Select rows whose persisted evidence is decision-usable.
+    """Select verified signal rows and successful no-signal observations.
 
-    Every row must satisfy the same readiness contract before publication.
-    A shared source gap downgrades otherwise-usable rows instead of turning
-    the whole scope into retry debt.  Unusable rows never advance.
+    A source error can downgrade otherwise-usable rows, but cannot prove
+    that an empty row is a successful observation.
     """
 
     quality_by_symbol: dict[str, str] = {}
@@ -904,7 +904,9 @@ def _prepare_signal_feature_publication_items(
             expected_market_date=expected_market_date,
         )
         reasons = list(readiness.get('quality_reasons') or [])
-        if not readiness.get('semantic_ready'):
+        if not readiness['publication_ready'] or (
+            incomplete_sources and not readiness['semantic_ready']
+        ):
             if symbol:
                 quality_by_symbol[symbol] = 'retry'
             for reason in reasons:
@@ -930,6 +932,8 @@ def _prepare_signal_feature_publication_items(
         feature_payload = dict(
             publication_item.get('feature_payload') or {}
         )
+        if quality_status == 'no_signal':
+            feature_payload['row_provenance']['row_kind'] = ROW_KIND_NO_SIGNAL
         feature_payload['readiness'] = annotated_readiness
         publication_item['feature_payload'] = feature_payload
         publication_items.append(publication_item)
@@ -1354,11 +1358,15 @@ def _source_row_invalid_reason(source: str, row: dict[str, Any]) -> str | None:
         return 'invalid_source_symbol'
 
     if source == OVERTIME_VOLUME:
-        overtime_volume = _to_int(row.get('ovtm_untp_vol'))
+        overtime_volume = _to_float(row.get('ovtm_untp_vol'))
         if overtime_volume is None:
             return 'missing_overtime_volume'
+        if overtime_volume == 0:
+            return 'no_overtime_trades'
         if overtime_volume <= 0:
             return 'non_positive_overtime_volume'
+        if not overtime_volume.is_integer():
+            return 'invalid_overtime_volume'
     elif source == VOLUME_POWER:
         volume_power = _to_float(row.get('tday_rltv'))
         if volume_power is None:
@@ -1398,11 +1406,14 @@ def _partition_valid_source_rows(
         raw_rows = list(source_rows.get(source, []))
         source_valid_rows: list[dict[str, Any]] = []
         source_diagnostics: list[dict[str, Any]] = []
+        no_signal_count = 0
         for row in raw_rows:
             invalid_reason = _source_row_invalid_reason(source, row)
             if invalid_reason is None:
                 source_valid_rows.append(row)
                 continue
+            if invalid_reason == 'no_overtime_trades':
+                no_signal_count += 1
             if len(source_diagnostics) < SIGNAL_SOURCE_DIAGNOSTIC_PREVIEW_LIMIT:
                 source_diagnostics.append(
                     {
@@ -1414,19 +1425,22 @@ def _partition_valid_source_rows(
 
         raw_count = len(raw_rows)
         valid_count = len(source_valid_rows)
-        invalid_count = raw_count - valid_count
+        invalid_count = raw_count - valid_count - no_signal_count
         if source in errors:
             status = 'unavailable'
             reason = 'source_error'
-        elif valid_count <= 0:
+        elif not valid_count and invalid_count:
             status = 'unavailable'
-            reason = 'all_rows_invalid' if raw_count else 'empty_response'
+            reason = 'all_rows_invalid'
         elif source in truncated_sources:
             status = 'partial'
             reason = 'pagination_truncated'
         elif invalid_count:
             status = 'partial'
             reason = 'some_rows_invalid'
+        elif not valid_count:
+            status = 'empty'
+            reason = 'no_overtime_trades' if no_signal_count else 'empty_response'
         else:
             status = 'available'
             reason = None
@@ -1441,11 +1455,30 @@ def _partition_valid_source_rows(
             'raw_count': raw_count,
             'valid_count': valid_count,
             'invalid_count': invalid_count,
+            'no_signal_count': no_signal_count,
             'pagination_truncated': source in truncated_sources,
-            'diagnostics_truncated': invalid_count > len(source_diagnostics),
+            'diagnostics_truncated': raw_count - valid_count > len(source_diagnostics),
         }
 
     return valid_rows, raw_counts, valid_counts, health, diagnostics
+
+
+def _ranking_response_rows(response: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    rows = response.get(key)
+    raw_pages = response.get('raw_pages', ())
+    # The KIS paginator drops invalid output shapes when merging raw pages.
+    if (
+        not isinstance(rows, list)
+        or any(not isinstance(row, dict) for row in rows)
+        or ('raw_pages' in response and (not isinstance(raw_pages, list) or not raw_pages))
+        or any(
+            not isinstance(page, dict)
+            or not isinstance(page.get(key), (list, dict))
+            for page in raw_pages
+        )
+    ):
+        raise ValueError(f'malformed KIS ranking response for {key}')
+    return rows
 
 
 def _base_feature(row: dict[str, Any], *, rank: int) -> dict[str, Any]:
@@ -1667,10 +1700,10 @@ class DailySignalFeatureService:
                         min_volume=VOLUME_POWER_MIN_VOLUME,
                         max_pages=max_pages,
                     )
+                    rows = _ranking_response_rows(response, 'output')
                 except Exception as exc:
                     segment_errors[segment] = str(exc).strip() or type(exc).__name__
                     continue
-                rows = [row for row in response.get('output') or [] if isinstance(row, dict)]
                 segment_rows.extend({**row, 'market_segment': segment} for row in rows)
                 segment_meta[segment] = {
                     'page_count': response.get('page_count'),
@@ -1713,7 +1746,7 @@ class DailySignalFeatureService:
                         rank_sort_cls_code=overtime_volume_rank_sort_cls_code,
                         max_pages=max_pages,
                     )
-                    source_rows[OVERTIME_VOLUME] = list(response.get('output2') or [])
+                    source_rows[OVERTIME_VOLUME] = _ranking_response_rows(response, 'output2')
                     collection[OVERTIME_VOLUME] = {
                         'origin': 'live',
                         'page_count': response.get('page_count'),
@@ -1739,7 +1772,7 @@ class DailySignalFeatureService:
                     div_cls_code=overtime_fluctuation_div_cls_code,
                     max_pages=max_pages,
                 )
-                source_rows[OVERTIME_FLUCTUATION] = list(response.get('output2') or [])
+                source_rows[OVERTIME_FLUCTUATION] = _ranking_response_rows(response, 'output2')
                 collection[OVERTIME_FLUCTUATION] = {
                     'origin': 'live',
                     'page_count': response.get('page_count'),
@@ -1770,7 +1803,7 @@ class DailySignalFeatureService:
         )
         if (
             (collection.get(VOLUME_POWER) or {}).get('segment_errors')
-            and source_health.get(VOLUME_POWER, {}).get('status') == 'available'
+            and source_health.get(VOLUME_POWER, {}).get('status') in {'available', 'empty'}
         ):
             source_health[VOLUME_POWER].update(
                 {'status': 'partial', 'reason': 'segment_error'}
@@ -1913,7 +1946,7 @@ class DailySignalFeatureService:
                     if str((health or {}).get('status') or '')
                     .strip()
                     .lower()
-                    != 'available'
+                    not in {'available', 'empty'}
                 ),
             }
         )
@@ -2039,11 +2072,17 @@ class DailySignalFeatureService:
             for symbol in successful_scope_symbols
             if quality_by_symbol.get(symbol) == 'degraded'
         ]
+        no_signal_scope_count = sum(
+            quality_by_symbol.get(symbol) == 'no_signal'
+            for symbol in successful_scope_symbols
+        )
         quality_status = (
             'degraded'
             if degraded_scope_symbols
             or (successful_scope_symbols and retry_failed_symbols)
-            else ('healthy' if successful_scope_symbols else 'unavailable')
+            else 'healthy' if complete_scope_symbols
+            else 'no_signal' if no_signal_scope_count
+            else 'unavailable'
         )
 
         if not persisted_items and exact_symbols is None:
@@ -2104,8 +2143,13 @@ class DailySignalFeatureService:
             'degraded_stock_codes': degraded_scope_symbols,
             'complete_stock_code_count': len(complete_scope_symbols),
             'degraded_stock_code_count': len(degraded_scope_symbols),
-            'semantic_ready_count': sum(
+            'no_signal_stock_code_count': no_signal_scope_count,
+            'publication_ready_count': sum(
                 symbol in publication_symbol_set
+                for symbol in selected_scope_symbols
+            ),
+            'semantic_ready_count': sum(
+                quality_by_symbol.get(symbol) in {'complete', 'degraded'}
                 for symbol in selected_scope_symbols
             ),
             'semantic_retry_count': sum(

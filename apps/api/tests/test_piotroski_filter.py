@@ -137,7 +137,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
         item.prior_asset_turnover = None
         return item
 
-    def test_zero_full_signal_usable_rows_block_downstream_progression(self):
+    def test_zero_full_signal_usable_rows_complete_without_retry_debt(self):
         service = DailyPiotroskiFilterService()
         inputs = [
             self._remove_all_required_financial_evidence(
@@ -159,8 +159,10 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 market_date='2026-04-14',
             )
 
-        self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['reason'], 'piotroski_evidence_unusable')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['quality_warning'], 'piotroski_evidence_unusable')
+        self.assertIs(result['nullable_output_completed'], True)
+        self.assertEqual(result['retry_debt_stock_codes'], [])
         self.assertEqual(result['requested_symbol_count'], 2)
         self.assertEqual(result['results_persisted'], 2)
         self.assertEqual(result['full_signal_usable_count'], 0)
@@ -216,7 +218,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             ],
             ['missing_net_income', 'missing_total_assets'],
         )
-        self.assertFalse(
+        self.assertTrue(
             daily_pipeline_outcome_is_satisfied(
                 {'stage': 'piotroski_filter', **result}
             )
@@ -245,8 +247,8 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 market_date='2026-04-14',
             )
 
-        self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['reason'], 'piotroski_evidence_incomplete')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['quality_warning'], 'piotroski_evidence_incomplete')
         self.assertEqual(result['full_signal_usable_count'], 1)
         self.assertEqual(result['full_signal_incomplete_count'], 1)
         self.assertEqual(result['full_signal_unusable_count'], 1)
@@ -264,7 +266,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
                 'improving_asset_turnover': 2,
             },
         )
-        self.assertFalse(
+        self.assertTrue(
             daily_pipeline_outcome_is_satisfied(
                 {'stage': 'piotroski_filter', **result}
             )
@@ -353,7 +355,8 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             payload['symbol']: payload
             for payload in upsert.call_args.args[0]
         }['005930']
-        self.assertEqual(persisted['piotroski_score'], 1)
+        self.assertIsNone(persisted['piotroski_score'])
+        self.assertIsNone(persisted['filter_payload']['score_summary']['score_ratio'])
         self.assertEqual(
             persisted['filter_payload']['score_summary']['available_signal_count'],
             1,
@@ -540,7 +543,7 @@ class DailyPiotroskiFilterServiceTests(unittest.TestCase):
             ['005930', '000660'],
         )
         self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['reason'], 'piotroski_evidence_incomplete')
+        self.assertEqual(result['quality_warning'], 'piotroski_evidence_incomplete')
         self.assertEqual(result['requested_symbol_count'], 3)
         self.assertEqual(result['full_signal_usable_count'], 2)
         self.assertEqual(result['full_signal_incomplete_count'], 0)

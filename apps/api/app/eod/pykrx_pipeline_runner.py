@@ -7052,9 +7052,9 @@ def run_market_data_pipeline(
             factor_status = _resolve_result_status(
                 result.get('factor_scoring_followup') or {}
             )
-            factor_satisfied = _is_satisfied_followup_result(
-                result.get('factor_scoring_followup') or {}
-            )
+            # Progression is bound to the validated signal-feature invocation.
+            # Factor debt for other symbols remains visible on the parent run.
+            factor_satisfied = bool(factor_admitted_symbols)
             signal_feature_status = _resolve_result_status(
                 result.get('signal_feature_followup') or {}
             )

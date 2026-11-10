@@ -51,6 +51,7 @@ from app.eod.daily_pipeline_stages import (
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
+    daily_pipeline_nullable_output_is_completed,
     daily_pipeline_result_has_no_ready_content,
     daily_pipeline_warning_metadata,
     normalize_daily_pipeline_stage_status,
@@ -574,10 +575,12 @@ def _load_signal_feature_counts(*, market_date: str) -> dict[str, Any]:
     )
     return {
         'persisted': len(rows),
+        'publication_ready_count': sum(item['publication_ready'] for item in readiness),
         'semantic_ready_count': semantic_ready_count,
         'semantic_unready_count': len(rows) - semantic_ready_count,
         'quality_complete_count': quality_counts['complete'],
         'quality_degraded_count': quality_counts['degraded'],
+        'quality_no_signal_count': quality_counts['no_signal'],
         'quality_retry_count': quality_counts['retry'],
         'quality_reason_counts': dict(sorted(quality_reason_counts.items())),
         'direct_signal_rows': direct_signal_rows,
@@ -1033,14 +1036,14 @@ def _load_row_count_stage_scope_gap(
                 for symbol_id, readiness in (
                     signal_readiness_by_symbol_id.items()
                 )
-                if readiness['semantic_ready']
+                if readiness['publication_ready']
             }
             signal_quality_by_symbol_id = {
                 symbol_id: str(readiness['quality_status'])
                 for symbol_id, readiness in (
                     signal_readiness_by_symbol_id.items()
                 )
-                if readiness['semantic_ready']
+                if readiness['publication_ready']
             }
         elif stage_id in PREREQUISITE_SCOPE_STAGE_REQUIRED_MODELS:
             required_model_symbol_ids = [
@@ -1141,7 +1144,7 @@ def _load_row_count_stage_scope_gap(
         ),
         'missing_symbols_sample': missing_symbols[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT],
         'missing_symbol_details_sample': details_sample,
-        'semantic_readiness_required': stage_id == 'signal_features',
+        'publication_readiness_required': stage_id == 'signal_features',
         'required_row_components': [
             required_model.__tablename__
             for required_model in required_models
@@ -1172,6 +1175,10 @@ def _load_row_count_stage_scope_gap(
             quality == 'degraded'
             for quality in signal_quality_by_symbol_id.values()
         )
+        quality_no_signal_count = sum(
+            quality == 'no_signal'
+            for quality in signal_quality_by_symbol_id.values()
+        )
         quality_retry_count = max(
             len(set(normalized_symbols)) - len(persisted_symbol_ids),
             0,
@@ -1180,6 +1187,7 @@ def _load_row_count_stage_scope_gap(
             {
                 'quality_complete_count': quality_complete_count,
                 'quality_degraded_count': quality_degraded_count,
+                'quality_no_signal_count': quality_no_signal_count,
                 'quality_retry_count': quality_retry_count,
                 'quality_status': (
                     'retry'
@@ -1187,6 +1195,7 @@ def _load_row_count_stage_scope_gap(
                     else 'degraded'
                     if quality_degraded_count > 0
                     or quality_retry_count > 0
+                    else 'no_signal' if not quality_complete_count
                     else 'complete'
                 ),
             }
@@ -1952,6 +1961,11 @@ class EODPipelineStatusService:
                 )
                 if (
                     current_is_official
+                    and daily_pipeline_nullable_output_is_completed(current_stage)
+                ):
+                    continue
+                if (
+                    current_is_official
                     and self._stage_reports_incomplete_authoritative_state(
                         current_stage
                     )
@@ -1968,7 +1982,7 @@ class EODPipelineStatusService:
                 ):
                     continue
                 if daily_pipeline_result_has_no_ready_content(
-                    current_details.get('result_summary')
+                    current_stage
                 ) and not self._should_preserve_stored_coverage_stage(
                     stage_id=stage_id,
                     fallback_stage=stored_stage,
@@ -4209,12 +4223,16 @@ class EODPipelineStatusService:
             if result_summary
             else status
         )
+        nullable_output_completed = daily_pipeline_nullable_output_is_completed(
+            {**official_stage, 'stage_id': stage_id}
+        )
         status_repaired_from_result_summary = (
             stored_status == 'completed'
+            and not nullable_output_completed
             and result_summary_status in {'partial', 'blocked', 'waiting'}
         )
         no_ready_content = daily_pipeline_result_has_no_ready_content(
-            result_summary
+            {**official_stage, 'stage_id': stage_id}
         )
         if status_repaired_from_result_summary:
             status = result_summary_status
@@ -4680,26 +4698,29 @@ class EODPipelineStatusService:
             if aggregate.get('semantic_ready_count') is not None
             else persisted
         )
+        publication_ready = _coerce_int(
+            aggregate.get('publication_ready_count'), semantic_ready,
+        )
         normalized_total = max(
             int(expected_total or 0),
             persisted,
-            semantic_ready,
+            publication_ready,
         )
         scope_is_unverified = str(expected_total_source).endswith(
             '_unverified'
         )
-        if semantic_ready <= 0 and persisted <= 0:
+        if publication_ready <= 0 and persisted <= 0:
             status = 'pending'
-        elif semantic_ready <= 0:
+        elif publication_ready <= 0:
             status = 'partial'
         elif scope_is_unverified:
             status = 'partial'
-        elif normalized_total > 0 and semantic_ready < normalized_total:
+        elif normalized_total > 0 and publication_ready < normalized_total:
             status = 'partial'
         else:
             status = 'completed'
         coverage_ratio = (
-            semantic_ready / normalized_total if normalized_total > 0 else 0.0
+            publication_ready / normalized_total if normalized_total > 0 else 0.0
         )
         partial_is_progressable = bool(
             status == 'partial'
@@ -4715,10 +4736,13 @@ class EODPipelineStatusService:
         quality_degraded_count = int(
             aggregate.get('quality_degraded_count') or 0
         )
+        quality_no_signal_count = int(
+            aggregate.get('quality_no_signal_count') or 0
+        )
         quality_retry_count = int(
             aggregate.get('quality_retry_count')
             if aggregate.get('quality_retry_count') is not None
-            else max(persisted - semantic_ready, 0)
+            else max(persisted - publication_ready, 0)
         )
         if quality_degraded_count > 0:
             quality_status = 'degraded'
@@ -4726,13 +4750,15 @@ class EODPipelineStatusService:
             quality_status = 'complete'
         elif quality_retry_count > 0:
             quality_status = 'retry'
+        elif quality_no_signal_count > 0:
+            quality_status = 'no_signal'
         else:
             quality_status = 'unavailable'
         processed_rows = min(persisted, normalized_total)
         counts = build_stage_counts(
             total=normalized_total,
-            succeeded=semantic_ready,
-            failed=max(processed_rows - semantic_ready, 0),
+            succeeded=publication_ready,
+            failed=max(processed_rows - publication_ready, 0),
             processed=processed_rows,
         )
         stage = {
@@ -4741,7 +4767,7 @@ class EODPipelineStatusService:
             'status': status,
             'source_status': (
                 'stored_signal_features_present'
-                if semantic_ready > 0
+                if publication_ready > 0
                 else None
             ),
             'market_date': market_date,
@@ -4785,24 +4811,27 @@ class EODPipelineStatusService:
             'details': {
                 'mode': 'derived_from_daily_signal_features',
                 'reason': (
-                    'semantic_signal_features_available'
+                    'signal_feature_collection_completed_without_signals'
+                    if status == 'completed' and semantic_ready == 0
+                    else 'semantic_signal_features_available'
                     if status == 'completed'
                     else 'signal_feature_scope_requires_verification'
-                    if scope_is_unverified and semantic_ready > 0
+                    if scope_is_unverified and publication_ready > 0
                     else 'incomplete_semantic_signal_feature_coverage'
                     if status == 'partial'
                     else 'no_semantic_signal_features_for_market_date'
                 ),
                 'gate_reason': (
                     'expected_scope_unverified'
-                    if scope_is_unverified and semantic_ready > 0
+                    if scope_is_unverified and publication_ready > 0
                     else None
                 ),
                 'scope_verification_required': bool(
-                    scope_is_unverified and semantic_ready > 0
+                    scope_is_unverified and publication_ready > 0
                 ),
                 'expected_rows_source': expected_total_source,
                 'rows_persisted': persisted,
+                'publication_ready_rows': publication_ready,
                 'semantic_ready_rows': semantic_ready,
                 'semantic_unready_rows': int(
                     aggregate.get('semantic_unready_count')
@@ -4823,6 +4852,7 @@ class EODPipelineStatusService:
                 'quality_status': quality_status,
                 'quality_complete_rows': quality_complete_count,
                 'quality_degraded_rows': quality_degraded_count,
+                'quality_no_signal_rows': quality_no_signal_count,
                 'quality_retry_rows': quality_retry_count,
                 'quality_reason_counts': dict(
                     aggregate.get('quality_reason_counts') or {}
@@ -4832,6 +4862,9 @@ class EODPipelineStatusService:
                 ),
                 'semantic_readiness_rule': (
                     'market_date_and_provenance_proven_direct_or_numeric_market_fallback'
+                ),
+                'publication_readiness_rule': (
+                    'semantic_evidence_or_verified_no_signal_observation'
                 ),
             },
         }
@@ -5971,6 +6004,7 @@ class EODPipelineStatusService:
         requested_symbols = cls._normalize_symbol_list(scope_symbols)
         unresolved = set(requested_symbols)
         successful: set[str] = set()
+        not_applicable: set[str] = set()
         source_run_ids_by_symbol: dict[str, Any] = {}
         valid_evidence_run_ids: list[Any] = []
         evidence_runs = run.get('_scope_evidence_runs')
@@ -6088,20 +6122,29 @@ class EODPipelineStatusService:
                 continue
             if run_status == 'completed' and run_retry_debt:
                 continue
+            raw_preferred = evidence_metadata.get(
+                'preferred_not_applicable_stock_codes'
+            )
+            preferred = (
+                set(cls._normalize_symbol_list(raw_preferred))
+                if isinstance(raw_preferred, list)
+                else set()
+            )
+            not_applicable.update(covered & run_terminal & preferred)
             valid_evidence_run_ids.append(evidence_run.get('id'))
             for symbol in covered:
                 source_run_ids_by_symbol[symbol] = evidence_run.get('id')
                 if run_status in {'completed', 'partial'} and symbol in run_successful:
                     successful.add(symbol)
             unresolved -= covered
-        missing = [
-            symbol for symbol in requested_symbols if symbol not in successful
-        ]
+        satisfied = successful | not_applicable
+        missing = [symbol for symbol in requested_symbols if symbol not in satisfied]
         return {
             'evidence_version': 'dart_daily_data_scope_outcomes_v1',
             'authoritative': bool(valid_evidence_run_ids),
             'requested_count': len(requested_symbols),
             'present_count': len(successful),
+            'not_applicable_count': len(not_applicable),
             'missing_count': len(missing),
             'missing_symbols_sample': missing[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT],
             'source_run_ids_by_symbol': source_run_ids_by_symbol,
@@ -6683,6 +6726,7 @@ class EODPipelineStatusService:
             for quality_key in (
                 'quality_complete_count',
                 'quality_degraded_count',
+                'quality_no_signal_count',
                 'quality_retry_count',
                 'quality_status',
             ):
@@ -6702,9 +6746,12 @@ class EODPipelineStatusService:
                     ] = scope_gap[quality_key]
         missing_count = int(validated_scope_gap['missing_count'])
         if missing_count <= 0:
-            if _factor_scope_has_no_decision_ready_rows(
-                stage_id=stage_id,
-                evidence=validated_scope_gap,
+            if (
+                _factor_scope_has_no_decision_ready_rows(
+                    stage_id=stage_id,
+                    evidence=validated_scope_gap,
+                )
+                and not daily_pipeline_nullable_output_is_completed(stage)
             ):
                 details['gate_reason'] = (
                     'no_decision_ready_factor_rows_in_requested_scope'
@@ -6907,6 +6954,7 @@ class EODPipelineStatusService:
             for quality_key in (
                 'quality_complete_count',
                 'quality_degraded_count',
+                'quality_no_signal_count',
                 'quality_retry_count',
                 'quality_status',
             ):
@@ -6926,9 +6974,12 @@ class EODPipelineStatusService:
                         f'exact_scope_{quality_key}'
                     ] = coverage[quality_key]
         if missing_count <= 0:
-            if _factor_scope_has_no_decision_ready_rows(
-                stage_id=stage_task,
-                evidence=validated_coverage,
+            if (
+                _factor_scope_has_no_decision_ready_rows(
+                    stage_id=stage_task,
+                    evidence=validated_coverage,
+                )
+                and not daily_pipeline_nullable_output_is_completed(stage)
             ):
                 details['gate_reason'] = (
                     'no_decision_ready_factor_rows_in_exact_scope'
