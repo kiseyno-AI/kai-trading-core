@@ -29,6 +29,11 @@ async def get_realtime_monitored_prices(
     return kis_realtime_price_service.monitored_snapshot()
 
 
+@router.get('/realtime/orderbooks')
+async def get_realtime_orderbooks() -> dict:
+    return kis_realtime_price_service.orderbooks_snapshot()
+
+
 @router.get('/realtime/monitored/stream')
 async def stream_realtime_monitored_prices(request: Request) -> StreamingResponse:
     async def event_stream():

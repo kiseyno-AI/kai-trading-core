@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo('Asia/Seoul')
 KIS_REALTIME_PRICE_TR_ID = 'H0STCNT0'
+KIS_REALTIME_ORDERBOOK_TR_ID = 'H0STASP0'
+KIS_REALTIME_ORDERBOOK_MAX_AGE = timedelta(seconds=2)
+KIS_REALTIME_MAX_CHANNELS = 41
 KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
 KIS_REALTIME_PRICE_PING_INTERVAL_SECONDS = 30.0
 KIS_REALTIME_PRICE_PING_TIMEOUT_SECONDS = 10.0
@@ -297,6 +300,16 @@ def parse_realtime_price_message(
     return ticks
 
 
+@dataclass(frozen=True)
+class KISRealtimeOrderbook:
+    bid: Decimal
+    ask: Decimal
+    bid_size: int
+    ask_size: int
+    as_of: datetime
+    received_at: datetime
+
+
 class KISRealtimePriceService:
     def __init__(self, *, client: KISClient | None = None) -> None:
         self.client = client or kis_client
@@ -320,6 +333,10 @@ class KISRealtimePriceService:
         self._observation_revision = 0
         self._last_source_version: datetime | None = None
         self._subscribed_symbols: set[str] = set()
+        self._orderbook_symbols: set[str] = set()
+        self._rejected_orderbook_symbols: set[str] = set()
+        self._orderbooks: dict[str, KISRealtimeOrderbook] = {}
+        self._wait_orderbook_sampled_symbols: set[str] = set()
         self._limited_symbols: set[str] = set()
         self._last_observed_symbols_at: datetime | None = None
         self._health: dict[str, Any] = self._build_health_state()
@@ -417,6 +434,7 @@ class KISRealtimePriceService:
             self._critical_protected_symbols
         )
         self._health['subscribed_symbols'] = sorted(self._subscribed_symbols)
+        self._health['orderbook_subscribed_symbols'] = sorted(self._orderbook_symbols)
         self._health['limited_symbols'] = sorted(self._limited_symbols)
         self._health['last_observed_symbols_at'] = _isoformat(self._last_observed_symbols_at)
 
@@ -439,14 +457,20 @@ class KISRealtimePriceService:
             self._health['websocket_connected'] = True
             self._health['last_connected_at'] = _isoformat(_utc_now())
             self._health['consecutive_failures'] = 0
-            self._subscribed_symbols = set()
+            self._subscribed_symbols.clear()
+            self._orderbook_symbols.clear()
+            self._rejected_orderbook_symbols.clear()
+            self._orderbooks.clear()
             self._sync_health_symbols_locked()
 
     def _mark_disconnected(self) -> None:
         with self._state_lock:
             self._health['websocket_connected'] = False
             self._health['last_disconnected_at'] = _isoformat(_utc_now())
-            self._subscribed_symbols = set()
+            self._subscribed_symbols.clear()
+            self._orderbook_symbols.clear()
+            self._rejected_orderbook_symbols.clear()
+            self._orderbooks.clear()
             self._sync_health_symbols_locked()
 
     def _increment_reconnect_attempt(self) -> None:
@@ -1133,6 +1157,8 @@ class KISRealtimePriceService:
             subscription_changed = bool(
                 before_desired != self._desired_symbols
                 or before_order != self._desired_symbol_order
+                or before_protected != self._protected_symbols
+                or before_critical != self._critical_protected_symbols
             )
             partition_state_changed = bool(
                 before_base != self._base_symbols
@@ -1307,11 +1333,12 @@ class KISRealtimePriceService:
                     await asyncio.sleep(1.1)
                 await self._confirm_wait_ask(symbol)
             with self._state_lock:
+                self._wait_orderbook_sampled_symbols = sampled
                 self._health['wait_orderbook_observation'] = {
                     'requested_count': len(symbols), 'sampled_count': len(sampled),
                     'failed_batches': failures, 'last_sample_at': _isoformat(_utc_now()),
                 }
-            await asyncio.sleep(2)
+            await asyncio.sleep(2 if self.client._environment() == 'demo' else 1)
 
     @staticmethod
     def _record_wait_ask_samples(
@@ -1569,78 +1596,81 @@ class KISRealtimePriceService:
             ordered.extend(sorted(self._desired_symbols - set(ordered)))
         return ordered
 
-    def _target_symbols_snapshot_locked(self) -> tuple[list[str], list[str]]:
-        max_subscriptions = _parse_positive_int(
-            settings.kis_realtime_price_max_subscriptions,
-            default=40,
+    def _channel_limit(self) -> int:
+        return min(
+            _parse_positive_int(settings.kis_realtime_price_max_subscriptions, default=40),
+            KIS_REALTIME_MAX_CHANNELS,
         )
+
+    def _orderbook_targets_locked(self, desired: list[str]) -> list[str]:
+        candidates = self._protected_symbols - self._rejected_orderbook_symbols
+        return sorted(
+            (symbol for symbol in desired if symbol in candidates),
+            key=lambda symbol: symbol not in self._critical_protected_symbols,
+        )[:self._channel_limit() - 1]
+
+    def _target_symbols_snapshot_locked(self) -> tuple[list[str], list[str]]:
         desired = self._ordered_desired_symbols_locked()
-        allowed = desired[:max_subscriptions]
-        limited = desired[max_subscriptions:]
+        trade_capacity = self._channel_limit() - len(self._orderbook_targets_locked(desired))
+        allowed = desired[:trade_capacity]
+        limited = desired[trade_capacity:]
         self._limited_symbols = set(limited)
         self._sync_health_symbols_locked()
         return allowed, limited
 
     def _target_symbols_snapshot(self) -> tuple[list[str], list[str]]:
         with self._state_lock:
-            allowed, limited = self._target_symbols_snapshot_locked()
-        return allowed, limited
+            return self._target_symbols_snapshot_locked()
 
     async def _sync_subscriptions(self, websocket: Any, *, approval_key: str) -> None:
         if not self._recorded_market_session_is_active():
             return
-        allowed_symbols, limited_symbols = self._target_symbols_snapshot()
+        price_tr_id = self._price_tr_id()
         with self._state_lock:
-            subscribed = set(self._subscribed_symbols)
+            allowed_symbols, limited_symbols = self._target_symbols_snapshot_locked()
+            book_targets = self._orderbook_targets_locked(self._ordered_desired_symbols_locked())
+            channel_symbols = {
+                price_tr_id: self._subscribed_symbols,
+                KIS_REALTIME_ORDERBOOK_TR_ID: self._orderbook_symbols,
+            }
+            target = {(price_tr_id, symbol) for symbol in allowed_symbols}
+            target.update((KIS_REALTIME_ORDERBOOK_TR_ID, symbol) for symbol in book_targets)
+            subscribed = {(channel, symbol) for channel, symbols in channel_symbols.items() for symbol in symbols}
 
-        unsubscribe_symbols = sorted(subscribed - set(allowed_symbols))
-        subscribe_symbols = sorted(set(allowed_symbols) - subscribed)
-
-        for symbol in unsubscribe_symbols:
+        for tr_id, symbol in sorted(subscribed - target):
             if not self._recorded_market_session_is_active():
                 return
             await self._send_subscription(
-                websocket,
-                approval_key=approval_key,
-                symbol=symbol,
+                websocket, approval_key=approval_key, symbol=symbol, tr_id=tr_id,
                 tr_type=settings.kis_realtime_price_unsubscribe_tr_type,
             )
             with self._state_lock:
-                self._subscribed_symbols.discard(symbol)
+                channel_symbols[tr_id].discard(symbol)
+                if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID:
+                    self._orderbooks.pop(symbol, None)
                 self._health['metrics']['unsubscribe_requests'] += 1
 
-        for symbol in subscribe_symbols:
+        for tr_id, symbol in sorted(target - subscribed):
             if not self._recorded_market_session_is_active():
                 return
             await self._send_subscription(
-                websocket,
-                approval_key=approval_key,
-                symbol=symbol,
-                tr_type='1',
+                websocket, approval_key=approval_key, symbol=symbol, tr_id=tr_id, tr_type='1',
             )
             with self._state_lock:
-                self._subscribed_symbols.add(symbol)
+                channel_symbols[tr_id].add(symbol)
                 self._health['metrics']['subscribe_requests'] += 1
 
         with self._state_lock:
-            if allowed_symbols:
-                self._health['status'] = 'limited' if limited_symbols else 'subscribed'
-                self._health['subscription'] = {
-                    'status': 'limited' if limited_symbols else 'succeeded',
-                    'updated_at': _isoformat(_utc_now()),
-                    'message': (
-                        f'{len(limited_symbols)} symbol(s) limited by configured max'
-                        if limited_symbols
-                        else 'subscriptions_current'
-                    ),
-                }
-            else:
-                self._health['status'] = 'idle_no_symbols'
-                self._health['subscription'] = {
-                    'status': 'idle',
-                    'updated_at': _isoformat(_utc_now()),
-                    'message': 'no_monitored_symbols',
-                }
+            status = ('limited' if limited_symbols else 'subscribed') if target else 'idle_no_symbols'
+            self._health['status'] = status
+            self._health['subscription'] = {
+                'status': 'succeeded' if status == 'subscribed' else 'idle' if not target else status,
+                'updated_at': _isoformat(_utc_now()),
+                'message': (
+                    f'{len(limited_symbols)} symbol(s) limited by configured max'
+                    if limited_symbols else 'subscriptions_current' if target else 'no_monitored_symbols'
+                ),
+            }
             self._sync_health_symbols_locked()
 
     async def _send_subscription(
@@ -1650,6 +1680,7 @@ class KISRealtimePriceService:
         approval_key: str,
         symbol: str,
         tr_type: str,
+        tr_id: str | None = None,
     ) -> None:
         message = {
             'header': {
@@ -1660,7 +1691,7 @@ class KISRealtimePriceService:
             },
             'body': {
                 'input': {
-                    'tr_id': self._price_tr_id(),
+                    'tr_id': tr_id or self._price_tr_id(),
                     'tr_key': symbol,
                 }
             },
@@ -1680,6 +1711,9 @@ class KISRealtimePriceService:
         if text_message.startswith('{'):
             await self._handle_system_message(websocket, text_message, received_at=received_at)
             return
+        if text_message.startswith(f'0|{KIS_REALTIME_ORDERBOOK_TR_ID}|'):
+            self._ingest_orderbook_message(text_message, received_at=received_at)
+            return
         self.ingest_price_message(text_message, received_at=received_at)
 
     async def _handle_system_message(self, websocket: Any, message: str, *, received_at: datetime) -> None:
@@ -1695,7 +1729,7 @@ class KISRealtimePriceService:
             await websocket.pong(message)
             return
 
-        if tr_id != self._price_tr_id():
+        if tr_id not in {self._price_tr_id(), KIS_REALTIME_ORDERBOOK_TR_ID}:
             return
 
         result_code = _normalize_text(body.get('rt_cd'))
@@ -1708,10 +1742,21 @@ class KISRealtimePriceService:
                 else f'{message_text} (rt_cd={result_code})'
             )
             with self._state_lock:
+                if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID and failed_symbol in self._orderbook_symbols:
+                    self._orderbook_symbols.discard(failed_symbol)
+                    self._rejected_orderbook_symbols.add(failed_symbol)
+                    self._orderbooks.pop(failed_symbol, None)
+                    self._health['last_orderbook_subscription_error'] = failure_message
+                    self._sync_health_symbols_locked()
+                    return
+                subscribed = (
+                    self._orderbook_symbols if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID
+                    else self._subscribed_symbols
+                )
                 if failed_symbol:
-                    self._subscribed_symbols.discard(failed_symbol)
+                    subscribed.discard(failed_symbol)
                 else:
-                    self._subscribed_symbols.clear()
+                    subscribed.clear()
                 self._health['status'] = 'reconnecting'
                 self._health['subscription'] = {
                     'status': 'failed',
@@ -1722,6 +1767,83 @@ class KISRealtimePriceService:
                 }
                 self._sync_health_symbols_locked()
             raise KISRealtimePriceSubscriptionError(failure_message)
+
+    def _ingest_orderbook_message(self, message: str, *, received_at: datetime) -> None:
+        chunks = message.split('|', 3)
+        if len(chunks) != 4:
+            return
+        _, _, count_text, payload = chunks
+        values = payload.split('^')
+        count = _parse_data_count(count_text, default=0)
+        if not count or len(values) % count:
+            return
+        width = len(values) // count
+        # KIS publishes 63 columns today. The legacy 59-column frame shares these offsets.
+        if width not in {59, 63}:
+            return
+        with self._state_lock:
+            for offset in range(0, len(values), width):
+                symbol, hour, session_class = values[offset:offset + 3]
+                if symbol not in self._orderbook_symbols:
+                    continue
+                if len(hour) != 6 or not hour.isascii() or not hour.isdecimal():
+                    self._orderbooks.pop(symbol, None)
+                    continue
+                try:
+                    exchange_time = datetime.strptime(hour, '%H%M%S').time()
+                except ValueError:
+                    self._orderbooks.pop(symbol, None)
+                    continue
+                as_of = datetime.combine(received_at.astimezone(KST).date(), exchange_time, KST)
+                previous = self._orderbooks.get(symbol)
+                if previous and as_of < previous.as_of:
+                    continue
+                ask = _parse_decimal(values[offset + 3])
+                bid = _parse_decimal(values[offset + 13])
+                ask_size = _parse_decimal(values[offset + 23])
+                bid_size = _parse_decimal(values[offset + 33])
+                if (
+                    session_class != '0' or not datetime_time(9) <= exchange_time < datetime_time(15, 30)
+                    or not timedelta(0) <= received_at - as_of <= KIS_REALTIME_ORDERBOOK_MAX_AGE
+                    or ask is None or bid is None or not 0 < bid <= ask
+                    or ask_size is None or not 0 < ask_size == ask_size.to_integral_value()
+                    or bid_size is None or not 0 < bid_size == bid_size.to_integral_value()
+                ):
+                    self._orderbooks.pop(symbol, None)
+                    continue
+                self._orderbooks[symbol] = KISRealtimeOrderbook(
+                    bid=bid, ask=ask, bid_size=int(bid_size), ask_size=int(ask_size),
+                    as_of=as_of, received_at=received_at,
+                )
+
+    def orderbooks_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
+        now = now or _utc_now()
+        with self._state_lock:
+            market_open = self._recorded_market_session_is_active()
+            connected = market_open and self._health['websocket_connected']
+            samples = self._health.get('wait_orderbook_observation', {})
+            sampled_at = _parse_iso_datetime(samples.get('last_sample_at'))
+            return {
+                'connected': connected,
+                'passive_quote_symbols': (
+                    sorted(self._wait_orderbook_sampled_symbols)
+                    if market_open and sampled_at and timedelta(0) <= now - sampled_at <= timedelta(seconds=10)
+                    else []
+                ),
+                'items': [
+                    {
+                        'symbol': symbol,
+                        'bid_price': _to_json_number(book.bid), 'ask_price': _to_json_number(book.ask),
+                        'bid_size': book.bid_size, 'ask_size': book.ask_size,
+                        'price_as_of': _isoformat(book.as_of),
+                        'price_received_at': _isoformat(book.received_at),
+                        'source': 'kis_orderbook_ws',
+                    }
+                    for symbol, book in self._orderbooks.items()
+                    if connected and symbol in self._protected_symbols
+                    and timedelta(0) <= now - book.as_of <= KIS_REALTIME_ORDERBOOK_MAX_AGE
+                ],
+            }
 
     @staticmethod
     def _system_message_symbol(*, header: dict[str, Any], body: dict[str, Any]) -> str | None:

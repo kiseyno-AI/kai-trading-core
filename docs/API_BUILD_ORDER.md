@@ -95,6 +95,7 @@
 - `GET /quotes/tracked`
 - `GET /quotes/realtime/monitored?refresh_symbols=false`
 - `GET /quotes/realtime/monitored/stream`
+- `GET /quotes/realtime/orderbooks`
 - `GET /quotes/005930`
 - `GET /market-data/crypto/markets`
 - `GET /market-data/crypto/tickers?markets=KRW-BTC,KRW-ETH`
@@ -356,6 +357,7 @@
 - The KIS realtime price consumer uses domestic realtime transaction TR `H0STCNT0` for both real and mock environments, matching the Korea Investment open-trading-api sample for `ccnl_krx`; there is no `H0STCNT9` mock-price split in that sample.
 - Latest ticks are stored only in process-local memory. They are not persisted to quote tables or realtime DB tables for dashboard live display.
 - `GET /quotes/realtime/monitored` reads that local memory snapshot and returns explicit `available`, `stale`, `pending`, `limited`, `not_configured`, `disabled`, or `not_monitored` price states. `refresh_symbols=true` only asks Core to refresh the monitored-symbol subscription source in a debounced way; it does not call KIS for prices. When WAIT orderbook sampling is active, the latest sampling coverage is available separately in `health.wait_orderbook_observation`.
+- `GET /quotes/realtime/orderbooks` returns fresh KRX websocket book hints for holdings and active Exec watches from the same KIS session. Quote and trade channels share the subscription cap. It also reports symbols covered by the latest passive WAIT sampling round.
 - `GET /quotes/realtime/monitored/stream` is a Server-Sent Events fan-out over the same local memory snapshot. Browsers should consume Core's route and must not open KIS sockets directly.
 - Subscription updates are bounded, deduplicated, and priority ordered from the dashboard read model. `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS` caps active symbols, with excess symbols surfaced as `price_status=limited` and listed under `health.limited_symbols` instead of exceeding an uncertain upstream limit. Priority order is held target/stop monitors first, active intraday watch-buy rows next, recently active order tracking next, then the rest of the monitored set.
 - The websocket loop uses the shared KIS realtime websocket URL settings plus `KIS_REALTIME_RECONNECT_BASE_DELAY_SECONDS` / `KIS_REALTIME_RECONNECT_MAX_DELAY_SECONDS` for reconnect backoff. It does not introduce aggressive REST polling or per-browser KIS connections.
