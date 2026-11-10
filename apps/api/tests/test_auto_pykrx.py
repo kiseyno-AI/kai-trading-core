@@ -18446,6 +18446,27 @@ class PykrxBackfillServiceTests(TestCase):
             'reason': 'factor_provider_failure',
         }
 
+        async def rebuild_market_risk(**kwargs):
+            kwargs['progress_callback'](
+                status='running',
+                current_step='fetching_kis_market_risk_snapshots',
+                current_activity='Fetched KIS market-risk snapshot for 005930',
+                processed=1,
+                total=1,
+                succeeded=1,
+                failed=0,
+                current_symbol='005930',
+            )
+            return {
+                'results_persisted': 1,
+                'results_failed': 0,
+                'summary': {'passed_count': 1, 'watchlist_count': 0},
+                **_atomic_exact_scope_proof(
+                    manifest_version='market_risk_filter_scope_outcomes_v1',
+                    selected_symbols=['005930'],
+                ),
+            }
+
         with ExitStack() as stack:
             stack.enter_context(patch('app.eod.pykrx_backfill.settings.dart_api_key', 'test-dart-key'))
             stack.enter_context(patch('app.eod.pykrx_backfill.settings.kis_app_key', 'test-kis-key'))
@@ -18572,20 +18593,7 @@ class PykrxBackfillServiceTests(TestCase):
             stack.enter_context(
                 patch(
                     'app.eod.pykrx_backfill.daily_market_risk_filter_service.rebuild_for_market_date',
-                    return_value={
-                        'results_persisted': 1,
-                        'results_failed': 0,
-                        'summary': {
-                            'passed_count': 1,
-                            'watchlist_count': 0,
-                        },
-                        **_atomic_exact_scope_proof(
-                            manifest_version=(
-                                'market_risk_filter_scope_outcomes_v1'
-                            ),
-                            selected_symbols=['005930'],
-                        ),
-                    },
+                    side_effect=rebuild_market_risk,
                 )
             )
             fundamentals_refresh = stack.enter_context(
@@ -18708,6 +18716,15 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertIn('momentum_factors', fake_run_state_service.start_runs[0]['resolved_stages'])
         self.assertIn('signal_decider', fake_run_state_service.start_runs[0]['resolved_stages'])
         self.assertNotIn('signal_decider_evaluations', fake_run_state_service.start_runs[0]['resolved_stages'])
+        risk_progress = next(
+            item
+            for item in fake_run_state_service.stage_updates
+            if item['stage_id'] == 'market_risk_filter'
+            and item['current_step'] == 'fetching_kis_market_risk_snapshots'
+        )
+        self.assertEqual(risk_progress['status'], 'running')
+        self.assertEqual((risk_progress['processed'], risk_progress['total']), (1, 1))
+        self.assertEqual(risk_progress['current_symbol'], '005930')
         stage_statuses = {
             (item['stage_id'], item['status'])
             for item in fake_run_state_service.stage_updates

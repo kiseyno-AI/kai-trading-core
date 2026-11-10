@@ -6815,8 +6815,18 @@ class EODPipelineStatusService:
                 and isinstance(blocking_stages, list)
                 and not blocking_stages
             )
+            scope_isolated_completed = (
+                existing_status == 'completed'
+                and existing_gate_status == 'blocked'
+                and existing_gate_reason == 'missing_rows_intersect_exact_run_universe'
+                and validated_exact_universe_has_residual_debt
+                and not daily_pipeline_result_has_no_ready_content(stage)
+                and not blocking_stages
+                and not details.get('failed_blocking_stages')
+            )
             scope_can_isolate_aggregate_gap = (
                 scope_isolated_pending
+                or scope_isolated_completed
                 or (
                     existing_status == 'partial'
                     and (
@@ -6870,7 +6880,8 @@ class EODPipelineStatusService:
             completed_quality_is_degraded = bool(
                 existing_status == 'completed'
                 and (
-                    str(stage.get('severity') or '').strip().lower()
+                    scope_isolated_completed
+                    or str(stage.get('severity') or '').strip().lower()
                     == 'degraded'
                     or str(details.get('quality_status') or '')
                     .strip()

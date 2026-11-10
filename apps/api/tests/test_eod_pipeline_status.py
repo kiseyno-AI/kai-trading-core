@@ -7,6 +7,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     SUMMARIZER_AGENT_NAMES,
@@ -1278,6 +1279,94 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ],
             ['005930'],
         )
+
+    def test_feedback_prerequisite_isolates_completed_signal_feature_scope(self):
+        market_date = '2026-04-21'
+        candidates = ['000660', '005930']
+        outside_scope = '0162D0'
+        universe = [*candidates, outside_scope]
+        membership = build_market_membership_snapshot(
+            symbols=[SimpleNamespace(symbol=symbol, market='KOSPI') for symbol in universe],
+            markets=['KOSPI'],
+        )
+
+        def scope_gap_loader(*, stage_id, market_date, symbols):
+            missing = (
+                [outside_scope]
+                if stage_id == 'signal_features' and outside_scope in symbols
+                else []
+            )
+            return _scope_gap_evidence(
+                requested_count=len(symbols),
+                present_count=len(symbols) - len(missing),
+                missing_symbols_sample=missing,
+            )
+
+        official_run = {
+            'id': 644,
+            'market_date': market_date,
+            'status': 'partial',
+            'run_metadata': {'resolved_stages': ['signal_features', 'agent_feedback_summaries']},
+            'stages': {
+                'signal_features': {
+                    'stage_id': 'signal_features',
+                    'market_date': market_date,
+                    'status': 'completed',
+                    'total': len(candidates),
+                    'processed': len(candidates),
+                    'succeeded': len(candidates),
+                    'failed': 0,
+                    'source_run_ids': {'eod_run_id': 593},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=_FakeMarketState,
+            pykrx_run_loader=lambda **_: {
+                'id': 593,
+                'status': 'completed',
+                'symbols_total': len(universe),
+                'symbols_succeeded': len(universe),
+                'run_metadata': {
+                    'markets': ['KOSPI'],
+                    'requested_symbols': universe,
+                    'universe_snapshot': {'markets': ['KOSPI'], 'market_membership': membership},
+                },
+            },
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: len(universe),
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: len(universe),
+            technical_snapshot_count_loader=lambda *_: len(universe),
+            action_summary_count_loader=lambda *_: len(universe),
+            row_count_stage_counts_loader=lambda **_: {},
+            row_count_scope_gap_loader=scope_gap_loader,
+            signal_feature_counts_loader=lambda **_: {'persisted': len(candidates)},
+        )
+
+        prerequisite_service = AgentFeedbackPrerequisiteService()
+        with patch('app.eod.pipeline_status.eod_pipeline_status_service', service):
+            for requested, gate, reason in (
+                (candidates, 'ready', 'requested_scope_rows_complete'),
+                (universe, 'blocked', 'missing_rows_intersect_requested_scope'),
+                (None, 'blocked', 'missing_rows_intersect_exact_run_universe'),
+            ):
+                with self.subTest(symbols=requested):
+                    result = prerequisite_service.inspect_feedback_prerequisites(
+                        market_date=market_date,
+                        symbols=requested,
+                        required_stage_ids=('signal_features',),
+                    )
+                    stage = result['stages']['signal_features']
+                    self.assertEqual(stage['status'], 'completed')
+                    self.assertEqual(stage['gate_status'], gate)
+                    self.assertEqual(stage['details']['gate_reason'], reason)
+                    self.assertEqual(
+                        stage['details']['exact_universe_coverage']['missing_count'], 1
+                    )
+                    self.assertEqual(result['ready'], gate == 'ready')
 
     def test_read_blocks_complete_factor_count_when_requested_symbol_is_missing(self):
         requested_symbols = ['000660', '005930']

@@ -7,6 +7,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from functools import partial
 from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -5516,6 +5517,9 @@ def run_market_data_pipeline(
                     symbols=price_context_symbols,
                     source=MARKET_RISK_FILTER_SOURCE,
                     run_id=run_id,
+                    progress_callback=partial(
+                        persist_stage_progress, stage='market_risk_filter'
+                    ),
                     exact_scope_symbols=(
                         exact_piotroski_membership_symbols
                     ),
