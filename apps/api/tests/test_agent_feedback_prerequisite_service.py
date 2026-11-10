@@ -253,6 +253,28 @@ def test_completed_explicit_zero_blocks_but_absent_legacy_counts_remain_ready():
     ) == 'ready'
 
 
+def test_completed_dart_scope_can_have_zero_new_filings():
+    coverage = {
+        'evidence_version': 'dart_daily_data_scope_outcomes_v1',
+        'authoritative': True,
+        'requested_count': 2,
+        'present_count': 1,
+        'not_applicable_count': 1,
+        'missing_count': 0,
+    }
+    stage = {
+        'task': 'fundamentals_daily_refresh',
+        'status': 'completed',
+        'gate_status': 'ready',
+        'succeeded': 0,
+        'details': {'requested_scope_coverage': coverage},
+    }
+    classify = AgentFeedbackPrerequisiteService._classify_stage_gate_status
+    assert classify(stage) == 'ready'
+    coverage['missing_count'] = 1
+    assert classify(stage) == 'blocked'
+
+
 def test_partial_coverage_uses_largest_reported_denominator():
     for total, expected_rows in ((1, 100), (100, 1)):
         payload = {

@@ -2861,6 +2861,7 @@ class DartFundamentalsCaptureService:
                         'successful_stock_codes',
                         'retry_debt_stock_codes',
                         'terminal_not_applicable_stock_codes',
+                        'preferred_not_applicable_stock_codes',
                         'terminal_policy_version',
                         'scope_outcome_manifest',
                         'share_issuance_global_scan',

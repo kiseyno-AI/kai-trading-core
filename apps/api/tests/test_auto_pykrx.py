@@ -17678,20 +17678,23 @@ class PykrxBackfillServiceTests(TestCase):
                     side_effect=lambda **_: followup_order.append('factor_scoring')
                     or {
                         'triggered': True,
-                        'status': 'completed',
+                        'status': 'partial',
                         'results_persisted': 1,
                         'results_failed': 0,
                         'gate_status': 'ready',
                         'blocking_status': 'non_blocking',
                         'stages': {
-                            stage_id: {
-                                'status': 'completed',
-                                'result': {'successful_stock_codes': signal_symbols},
-                            }
-                            for stage_id in (
-                                'momentum_factors', 'value_factors',
-                                'low_risk_factors', 'beta_factors',
-                            )
+                            **{
+                                stage_id: {
+                                    'status': 'completed',
+                                    'result': {'successful_stock_codes': signal_symbols},
+                                }
+                                for stage_id in (
+                                    'momentum_factors', 'value_factors',
+                                    'low_risk_factors', 'beta_factors',
+                                )
+                            },
+                            'advanced_value_factors': {'status': 'partial'},
                         },
                         **build_exact_symbol_scope_outcome(
                             manifest_version=(

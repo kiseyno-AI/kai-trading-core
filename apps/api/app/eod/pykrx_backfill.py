@@ -2675,6 +2675,7 @@ def _followup_exact_result_authority(
         'full_signal_unusable_count',
         'full_signal_usable_count',
         'gate_status',
+        'nullable_output_completed',
         'persisted_ready_count',
         'persisted_unready_count',
         'quality_status',

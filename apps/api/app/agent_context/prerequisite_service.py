@@ -77,6 +77,8 @@ class AgentFeedbackPrerequisiteService:
             ._has_explicit_zero_success_or_persistence(stage_payload)
             and not AgentFeedbackPrerequisiteService
             ._is_explicitly_not_applicable_pykrx_scope(stage_payload)
+            and not AgentFeedbackPrerequisiteService
+            ._has_completed_dart_scope(stage_payload, details)
         ):
             return 'blocked'
         if daily_pipeline_result_has_no_ready_content(stage_payload):
@@ -107,6 +109,31 @@ class AgentFeedbackPrerequisiteService:
         if status in PREREQUISITE_WAITING_STATUSES:
             return 'waiting'
         return 'waiting'
+
+    @staticmethod
+    def _has_completed_dart_scope(
+        stage_payload: dict[str, Any],
+        details: dict[str, Any],
+    ) -> bool:
+        # The DART stage counts new captures, which can be zero after a valid check.
+        coverage = details.get('requested_scope_coverage')
+        if (
+            stage_payload.get('task') != 'fundamentals_daily_refresh'
+            or stage_payload.get('gate_status') != 'ready'
+            or not isinstance(coverage, dict)
+            or coverage.get('authoritative') is not True
+            or coverage.get('evidence_version') != 'dart_daily_data_scope_outcomes_v1'
+        ):
+            return False
+        requested = coverage.get('requested_count')
+        present = coverage.get('present_count')
+        not_applicable = coverage.get('not_applicable_count', 0)
+        return (
+            all(type(count) is int and count >= 0 for count in (requested, present, not_applicable))
+            and requested > 0
+            and present + not_applicable == requested
+            and coverage.get('missing_count') == 0
+        )
 
     @staticmethod
     def _is_progressable_terminal_partial(stage_payload: dict[str, Any]) -> bool:

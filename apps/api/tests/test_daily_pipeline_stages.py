@@ -31,6 +31,7 @@ from app.eod.pykrx_pipeline_runner import (
     _build_exact_scope_outcome,
     _build_pykrx_invocation_scope_proof,
 )
+from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 
 
 def _atomic_scope_finalization(
@@ -5972,6 +5973,131 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                     'admitted_stock_codes': ['005930'],
                 }
             ],
+        )
+
+    def test_preferred_scope_bypasses_only_inapplicable_dependencies(self) -> None:
+        market_date = '2026-04-14'
+        common, preferred, failed_dart = '005930', '005935', '035420'
+        selected = [common, preferred, failed_dart]
+        dart_factor_stages = [
+            'advanced_value_factors',
+            'unified_value_factors',
+            'quality_factors',
+            'composite_factors',
+        ]
+
+        for preferred_has_price_factor in (True, False):
+            with self.subTest(preferred_has_price_factor=preferred_has_price_factor):
+                service = DailyPipelineStageService()
+                expected_signal_symbols = (
+                    [common, preferred] if preferred_has_price_factor else [common]
+                )
+
+                def execute(stage_id, **kwargs):
+                    scope = kwargs['symbols']
+                    payload = {'market_date': market_date, 'status': 'completed'}
+                    if stage_id == 'fundamentals_daily_refresh':
+                        return {
+                            **payload,
+                            'status': 'partial',
+                            'preferred_not_applicable_stock_codes': [preferred],
+                            **build_exact_symbol_scope_outcome(
+                                manifest_version='dart_daily_data_scope_outcomes_v1',
+                                selected_symbols=selected,
+                                successful_symbols=[common],
+                                retry_debt_symbols=[failed_dart],
+                                terminal_not_applicable_symbols=[preferred],
+                            ),
+                        }
+                    if stage_id == 'piotroski_filter':
+                        self.assertEqual(scope, [common, preferred])
+                        manifest = 'piotroski_scope_outcomes_v1'
+                        successes, debts, inapplicable = [common], [], [preferred]
+                    elif stage_id == 'momentum_factors':
+                        self.assertEqual(scope, selected)
+                        manifest = 'factor_scope_outcomes_v1'
+                        debts = [] if preferred_has_price_factor else [preferred]
+                        successes = [symbol for symbol in scope if symbol not in debts]
+                        inapplicable = []
+                        if debts:
+                            payload.update(status='partial', gate_status='ready')
+                    elif stage_id in dart_factor_stages:
+                        self.assertEqual(scope, [common])
+                        self.assertEqual(kwargs['ranking_scope_symbols'], [common, failed_dart])
+                        manifest = 'factor_scope_outcomes_v1'
+                        successes, debts, inapplicable = [common], [], []
+                    elif stage_id == 'signal_features':
+                        self.assertEqual(scope, expected_signal_symbols)
+                        manifest = 'signal_features_scope_outcomes_v1'
+                        successes, debts, inapplicable = scope, [], []
+                    elif stage_id == 'external_news_collect':
+                        self.assertEqual(scope, expected_signal_symbols)
+                        return payload
+                    else:
+                        raise AssertionError(f'unexpected stage: {stage_id}')
+                    return {
+                        **payload,
+                        **build_exact_symbol_scope_outcome(
+                            manifest_version=manifest,
+                            selected_symbols=scope,
+                            successful_symbols=successes,
+                            retry_debt_symbols=debts,
+                            terminal_not_applicable_symbols=inapplicable,
+                        ),
+                        'scope_finalization': _atomic_scope_finalization(
+                            stage_id=stage_id,
+                            exact_symbols=scope if stage_id == 'signal_features' else selected,
+                            successful_symbols=successes,
+                            market_date=market_date,
+                        ),
+                    }
+
+                with (
+                    patch.object(service, '_normalize_market_date', return_value=market_date),
+                    patch.object(service, '_execute_stage', side_effect=execute),
+                ):
+                    result = service.run(
+                        market_date=market_date,
+                        stages=[
+                            'fundamentals_daily_refresh',
+                            'piotroski_filter',
+                            'momentum_factors',
+                            *dart_factor_stages,
+                            'signal_features',
+                            'external_news_collect',
+                        ],
+                        symbols=selected,
+                    )
+
+                self.assertEqual(result['stages']['signal_features']['status'], 'completed')
+                self.assertEqual(result['stages']['external_news_collect']['status'], 'completed')
+
+    def test_dart_preferred_terminal_proof_survives_result_compaction(self) -> None:
+        market_date = '2026-04-14'
+        preferred = [f'{index:05d}5' for index in range(101)]
+        selected = ['005930', *preferred]
+        result = {
+            'market_date': market_date,
+            'status': 'completed',
+            'preferred_not_applicable_stock_codes': preferred,
+            **build_exact_symbol_scope_outcome(
+                manifest_version='dart_daily_data_scope_outcomes_v1',
+                selected_symbols=selected,
+                successful_symbols=['005930'],
+                retry_debt_symbols=[],
+                terminal_not_applicable_symbols=preferred,
+            ),
+        }
+        details = DailyPipelineStageService._build_stage_run_details(
+            stage_id='fundamentals_daily_refresh',
+            result=result,
+            invocation_symbols=selected,
+            market_date=market_date,
+        )
+        self.assertNotIn('preferred_not_applicable_stock_codes', details['result_summary'])
+        self.assertEqual(
+            details['exact_scope_outcome_proof']['preferred_not_applicable_stock_codes'],
+            preferred,
         )
 
     def test_pitr_retry_subset_rebuilds_full_exact_finalization_scope(

@@ -682,12 +682,15 @@ class DailyPiotroskiFilterService:
                 == len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
                 else 'unavailable'
             )
-            score_ratio = score / PIOTROSKI_SIGNAL_COUNT
+            complete_score = score if full_signal_coverage_status == 'usable' else None
+            score_ratio = (
+                complete_score / PIOTROSKI_SIGNAL_COUNT
+                if complete_score is not None
+                else None
+            )
             signal_coverage_ratio = available_signal_count / PIOTROSKI_SIGNAL_COUNT
             passes_piotroski_score = (
-                required_financial_signals_available
-                == len(PIOTROSKI_REQUIRED_FINANCIAL_SIGNAL_NAMES)
-                and score >= PIOTROSKI_PASS_SCORE
+                complete_score is not None and complete_score >= PIOTROSKI_PASS_SCORE
             )
             dilution_evidence_available = signals[
                 'no_new_share_issuance'
@@ -714,7 +717,7 @@ class DailyPiotroskiFilterService:
                 'has_profitability_issue': has_profitability_issue,
                 'has_capital_impairment': has_capital_impairment,
                 'has_audit_issue': has_audit_issue,
-                'piotroski_score': score,
+                'piotroski_score': complete_score,
                 'passes_piotroski_score': passes_piotroski_score,
                 'momentum_percentile_rank': momentum_rank,
                 'is_bottom_momentum': is_bottom_momentum,
@@ -746,7 +749,7 @@ class DailyPiotroskiFilterService:
                     },
                     'signals': {key: {'value': result.value, 'available': result.available} for key, result in signals.items()},
                     'score_summary': {
-                        'score': score,
+                        'score': complete_score,
                         'available_signal_count': available_signal_count,
                         'score_ratio': score_ratio,
                         'signal_coverage_ratio': signal_coverage_ratio,
@@ -944,10 +947,8 @@ class DailyPiotroskiFilterService:
         evidence_reason: str | None = None
         if scope_status != 'failed':
             if full_signal_coverage_status == 'unusable':
-                status = 'partial'
                 evidence_reason = 'piotroski_evidence_unusable'
             elif full_signal_coverage_status == 'incomplete':
-                status = 'partial'
                 evidence_reason = 'piotroski_evidence_incomplete'
         ranking_dependency_contract: dict[str, Any] = {}
         attach_ranking_dependency_contract(
@@ -1038,10 +1039,13 @@ class DailyPiotroskiFilterService:
             },
         }
         if evidence_reason is not None:
-            result['reason'] = evidence_reason
             result['quality_warning'] = evidence_reason
+        if ranking_dependency_failed_symbols and scope_status != 'failed':
+            result['reason'] = 'ranking_dependency_incomplete'
         elif full_signal_coverage_status == 'not_applicable':
             result['reason'] = 'preferred_share_not_applicable'
+        if status == 'completed' and successful_symbols and not has_blocking_retry_debt:
+            result['nullable_output_completed'] = True
         if scope_finalization is not None:
             result['scope_finalization'] = scope_finalization
         return result

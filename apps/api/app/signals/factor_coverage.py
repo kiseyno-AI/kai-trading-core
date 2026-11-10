@@ -559,9 +559,8 @@ def factor_stage_result_contract(
     *,
     explicit_empty_scope: bool = False,
 ) -> dict[str, Any]:
-    """Expose coverage as a nonblocking partial only when usable rows exist."""
+    """Report persisted scope completion separately from score availability."""
 
-    ready_count = int(summary.get('ready_count') or 0)
     retryable_symbols = list(summary.get('retryable_symbols') or [])
     retryable_count = int(
         summary.get('retryable_symbol_count')
@@ -581,25 +580,19 @@ def factor_stage_result_contract(
     ranking_dependency_incomplete = (
         not explicit_empty_scope and ranking_dependency_failed_count > 0
     )
-    gate_ready = explicit_empty_scope or (
-        ready_count > 0
-        and has_exact_scope_outcome
+    has_persisted_scope = (
+        has_exact_scope_outcome
+        and bool(summary['successful_stock_codes'])
         and not ranking_dependency_incomplete
     )
+    scope_completed = (
+        has_persisted_scope
+        and not retryable_count
+        and not summary['retry_debt_stock_codes']
+    )
+    gate_ready = explicit_empty_scope or has_persisted_scope
     result = {
-        'status': (
-            'completed'
-            if explicit_empty_scope
-            else (
-                (
-                    'partial'
-                    if ranking_dependency_incomplete
-                    else str(summary.get('coverage_status') or 'partial')
-                )
-                if has_exact_scope_outcome
-                else 'partial'
-            )
-        ),
+        'status': 'completed' if explicit_empty_scope or scope_completed else 'partial',
         'reason': (
             'explicit_empty_scope_noop'
             if explicit_empty_scope
@@ -639,6 +632,8 @@ def factor_stage_result_contract(
             [] if explicit_empty_scope else retryable_symbols
         ),
     }
+    if scope_completed and not explicit_empty_scope:
+        result['nullable_output_completed'] = True
     for key in (
         'scope_outcome_manifest_version',
         'selected_stock_codes',

@@ -135,7 +135,7 @@ class CoreFactorCoverageContractTests(unittest.TestCase):
             ),
         )
 
-    def test_mixed_usable_cohort_is_partial_but_nonblocking(self) -> None:
+    def test_mixed_usable_cohort_completes_with_partial_coverage(self) -> None:
         for name, builder, usable, unusable in self._cases():
             with self.subTest(factor=name):
                 summary = builder(
@@ -152,10 +152,12 @@ class CoreFactorCoverageContractTests(unittest.TestCase):
                 self.assertEqual(summary['ready_count'], 1)
                 self.assertEqual(summary['complete_count'], 1)
                 self.assertEqual(summary['unusable_count'], 1)
+                self.assertEqual(stage['status'], 'completed')
+                self.assertIs(stage['nullable_output_completed'], True)
                 self.assertEqual(stage['gate_status'], 'ready')
                 self.assertEqual(stage['blocking_status'], 'non_blocking')
 
-    def test_all_unusable_cohort_is_partial_and_blocking(self) -> None:
+    def test_all_nullable_rows_complete_with_unavailable_coverage(self) -> None:
         for name, builder, _, unusable in self._cases():
             with self.subTest(factor=name):
                 summary = builder(
@@ -172,8 +174,28 @@ class CoreFactorCoverageContractTests(unittest.TestCase):
                 self.assertEqual(summary['complete_count'], 0)
                 self.assertEqual(summary['unusable_count'], 1)
                 self.assertEqual(summary['quality_status'], 'unavailable')
-                self.assertEqual(stage['gate_status'], 'blocked')
-                self.assertEqual(stage['blocking_status'], 'blocking')
+                self.assertEqual(stage['status'], 'completed')
+                self.assertIs(stage['nullable_output_completed'], True)
+                self.assertEqual(stage['successful_stock_codes'], [unusable['symbol']])
+                self.assertEqual(stage['gate_status'], 'ready')
+                self.assertEqual(stage['blocking_status'], 'non_blocking')
+
+    def test_nullable_success_advances_when_another_symbol_needs_retry(self) -> None:
+        for name, builder, _, unusable in self._cases():
+            with self.subTest(factor=name):
+                summary = builder(
+                    items=[unusable],
+                    persisted_items=[unusable],
+                    missing_symbols=['000003'],
+                    failed_symbols=[],
+                )
+                stage = factor_stage_result_contract(summary)
+
+                self.assertEqual(stage['status'], 'partial')
+                self.assertEqual(stage['gate_status'], 'ready')
+                self.assertEqual(stage['successful_stock_codes'], [unusable['symbol']])
+                self.assertEqual(stage['retry_debt_stock_codes'], ['000003'])
+                self.assertNotIn('nullable_output_completed', stage)
 
     def test_persistence_failure_remains_explicit_retry_debt(self) -> None:
         for name, builder, usable, _ in self._cases():

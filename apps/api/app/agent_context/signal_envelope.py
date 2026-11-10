@@ -430,8 +430,10 @@ def build_factor_signal_envelopes(
         score = _to_float(entry.get('score'))
         if score is None:
             score = _to_float(entry.get('percentile'))
-        value = 0.0 if score is None or status != 'available' else (score * 2.0) - 1.0
-        evidence_count = _to_int(entry.get('components_used')) or (1 if score is not None else 0)
+        if score is None:
+            continue
+        value = (score * 2.0) - 1.0 if status == 'available' else 0.0
+        evidence_count = _to_int(entry.get('components_used')) or 1
         evidence_ref = {
             key: entry.get(key)
             for key in ('source', 'feature_version', 'as_of_market_date', 'captured_at', 'rank', 'percentile', 'source_status')
@@ -462,7 +464,7 @@ def build_factor_signal_envelopes(
         )
 
     signal_features = _as_dict(summary.get('signal_features'))
-    if signal_features:
+    if signal_features and signal_features.get('row_kind') != 'no_signal':
         status = str(signal_features.get('status') or 'missing_source_row').strip().lower()
         signal_count = _to_int(signal_features.get('signal_count')) or 0
         direct_source_count = _to_int(signal_features.get('direct_signal_source_count')) or 0
