@@ -957,6 +957,106 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_lightweight_status_keeps_preferred_shares_out_of_factor_missing_rows(self):
+        session = MagicMock()
+
+        def execute(statement):
+            if 'SELECT symbols.id' in str(statement):
+                return [
+                    SimpleNamespace(id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'),
+                    SimpleNamespace(id=2, symbol='005935', name_ko='삼성전자우', market='KOSPI'),
+                    SimpleNamespace(id=3, symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+                ]
+            return MagicMock(one=lambda: (2, None, 2, 0, None, present))
+
+        session.execute.side_effect = execute
+        for present, missing in ((2, 0), (1, 1)):
+            with (
+                self.subTest(present=present),
+                patch('app.eod.pipeline_status.session_scope') as scope,
+                patch('app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS', {
+                    'quality_factors': FACTOR_STAGE_MODELS['quality_factors'],
+                }),
+            ):
+                scope.return_value.__enter__.return_value = session
+                row_counts = _load_row_count_stage_counts(
+                    market_date='2026-04-21',
+                    include_missing_diagnostics=False,
+                )
+                service = EODPipelineStatusService(
+                    market_state_loader=_FakeMarketState,
+                    pykrx_run_loader=lambda **_: None,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 3,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    price_bar_count_loader=lambda **_: 3,
+                    row_count_stage_counts_loader=lambda **_: row_counts,
+                )
+                result = service.read(
+                    market_date='2026-04-21',
+                    include_row_count_diagnostics=False,
+                )
+                stage = result['stages']['quality_factors']
+                self.assertEqual(stage['total'], 2)
+                self.assertEqual(stage['details']['missing_count'], missing)
+                self.assertEqual(stage['details']['not_applicable_count'], 1)
+                self.assertEqual(stage['details']['not_applicable_symbols_sample'], ['005935'])
+
+    def test_universe_refresh_status_uses_same_date_saved_membership(self):
+        market_date = '2026-04-21'
+        symbols = ['000660', '005930']
+        membership = build_market_membership_snapshot(
+            symbols=[SimpleNamespace(symbol=symbol, market='KOSPI') for symbol in symbols],
+            markets=['KOSPI'],
+        )
+        saved_run = {
+            'id': 593,
+            'trade_date': market_date,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': symbols,
+                'universe_refreshed': True,
+                'universe_snapshot': {
+                    'complete': True,
+                    'latest_trade_date': market_date,
+                    'markets': ['KOSPI'],
+                    'market_membership': membership,
+                },
+            },
+        }
+        for label, refreshed, complete, snapshot_date, expected_status in (
+            ('verified', True, True, market_date, 'completed'),
+            ('not_refreshed', False, True, market_date, 'skipped'),
+            ('incomplete', True, False, market_date, 'skipped'),
+            ('wrong_date', True, True, '2026-04-20', 'skipped'),
+        ):
+            with self.subTest(label=label):
+                run = deepcopy(saved_run)
+                run['run_metadata']['universe_refreshed'] = refreshed
+                run['run_metadata']['universe_snapshot'].update(
+                    complete=complete, latest_trade_date=snapshot_date,
+                )
+                service = EODPipelineStatusService(
+                    market_state_loader=_FakeMarketState,
+                    pykrx_run_loader=lambda **_: run,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 2,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    price_bar_count_loader=lambda **_: 2,
+                )
+                result = service.read(market_date=market_date)
+                stage = result['stages']['pykrx_universe_refresh']
+                self.assertEqual(stage['status'], expected_status)
+                self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
+                if expected_status == 'completed':
+                    self.assertEqual(stage['total'], 2)
+                    self.assertEqual(stage['source_run_ids'], {'eod_run_id': 593})
+
     def test_factor_stage_count_queries_classify_all_score_fields(self):
         class AggregateResult:
             def __init__(self, values):
@@ -972,7 +1072,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
             def execute(self, statement):
                 self.statements.append(statement)
-                return AggregateResult(self.values)
+                if 'SELECT symbols.id' in str(statement):
+                    return [
+                        SimpleNamespace(id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'),
+                        SimpleNamespace(id=2, symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+                    ]
+                values = self.values
+                if len(statement.selected_columns) > len(values):
+                    values += (2,)
+                return AggregateResult(values)
 
         for stage_id, score_field in FACTOR_STAGE_SCORE_FIELDS.items():
             with self.subTest(stage_id=stage_id, score_field=score_field):
@@ -1000,7 +1108,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         include_missing_diagnostics=False,
                     )
 
-                statement = str(session.statements[0])
+                statement = str(session.statements[-1])
                 self.assertIn(score_field, statement)
                 self.assertIn('IS NOT NULL', statement)
                 self.assertIn('IS NULL', statement)
@@ -7648,7 +7756,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(
             result['stages']['master_refresh']['details']['reason'],
-            'preopen_global_stage_not_required_for_resumed_market_date_status',
+            'preopen_stage_not_executed_in_market_date_run',
         )
         self.assertEqual(result['stages']['signal_features']['status'], 'partial')
         self.assertEqual(

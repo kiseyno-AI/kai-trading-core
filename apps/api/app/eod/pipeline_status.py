@@ -41,7 +41,10 @@ from app.db_models import (
     SignalDeciderDecisionSnapshot,
     Symbol,
 )
-from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.dart.fundamentals_capture_service import (
+    dart_fundamentals_capture_service,
+    fundamentals_snapshot_availability,
+)
 from app.eod.daily_pipeline_stages import (
     DAILY_STAGE_ORDER,
     FACTOR_STAGE_ORDER,
@@ -800,16 +803,22 @@ def _load_row_count_stage_counts(
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
-        preferred_ids = set()
-        if include_missing_diagnostics:
-            preferred_ids = {
-                row.id for row in session.execute(
-                    select(Symbol.id, Symbol.symbol, Symbol.name_ko, Symbol.market)
-                    .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-                    .where(DailyPriceBar.trade_date == normalized_market_date)
-                )
-                if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
-            }
+        price_symbols = []
+        if (
+            include_missing_diagnostics
+            or PREFERRED_SHARE_NOT_APPLICABLE_STAGES.intersection(ROW_COUNT_STAGE_MODELS)
+        ):
+            price_symbols = list(session.execute(
+                select(Symbol.id, Symbol.symbol, Symbol.name_ko, Symbol.market)
+                .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+                .where(DailyPriceBar.trade_date == normalized_market_date)
+            ))
+        preferred_ids = {
+            row.id for row in price_symbols
+            if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
+        }
+        applicable_price_ids = {row.id for row in price_symbols} - preferred_ids
+        preferred_symbols = sorted(row.symbol for row in price_symbols if row.id in preferred_ids)
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
             aggregate_columns = [
                 func.count(model.id),
@@ -835,6 +844,11 @@ def _load_row_count_stage_counts(
                         ),
                     )
                 )
+            preferred_not_applicable = stage_id in PREFERRED_SHARE_NOT_APPLICABLE_STAGES
+            if preferred_not_applicable and not include_missing_diagnostics:
+                aggregate_columns.append(
+                    func.count(model.id).filter(model.symbol_id.in_(applicable_price_ids))
+                )
             aggregate = session.execute(
                 select(*aggregate_columns)
                 .select_from(model)
@@ -850,6 +864,19 @@ def _load_row_count_stage_counts(
                     'missing_sample_limit': ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
                     'missing_diagnostics_omitted': True,
                 }
+                if preferred_not_applicable:
+                    present = int(aggregate[-1] or 0)
+                    missing_diagnostics.update(
+                        {
+                            'membership_evidence_version': 'row_count_scope_gap_v1',
+                            'membership_authoritative': True,
+                            'membership_requested_count': len(applicable_price_ids),
+                            'membership_present_count': present,
+                            'membership_extra_count': persisted_count - present,
+                            'missing_count': len(applicable_price_ids) - present,
+                            'not_applicable_count': len(preferred_ids),
+                        }
+                    )
             else:
                 missing_diagnostics = _load_row_count_missing_diagnostics_for_model(
                     session=session,
@@ -865,6 +892,10 @@ def _load_row_count_stage_counts(
                 'updated_at': updated_at.isoformat() if updated_at else None,
                 **missing_diagnostics,
             }
+            if preferred_not_applicable:
+                counts[stage_id]['not_applicable_symbols_sample'] = (
+                    preferred_symbols[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT]
+                )
             next_column_index = 2
             if score_field_name is not None:
                 ready_count, degraded_count, latest_ready_at = aggregate[2:5]
@@ -2009,7 +2040,7 @@ class EODPipelineStatusService:
                     stage=stages[stage_id],
                     scope_symbols=normalized_scope_symbols,
                 )
-        stages = self._mark_preopen_stage_skips(stages=stages)
+        stages = self._mark_preopen_stage_skips(stages=stages, pykrx_run=pykrx_run)
         stages = self._normalize_stage_contract(stages)
         execution_stages = self._execution_stages(stages)
         warning_metadata = daily_pipeline_warning_metadata(execution_stages)
@@ -2707,6 +2738,7 @@ class EODPipelineStatusService:
         self,
         *,
         stages: dict[str, dict[str, Any]],
+        pykrx_run: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
         if not self._has_date_scoped_activity(stages=stages):
             return stages
@@ -2715,10 +2747,53 @@ class EODPipelineStatusService:
             stage = dict(overlaid.get(stage_id) or {})
             if str(stage.get('status') or '').strip().lower() != 'pending':
                 continue
+            metadata = get_run_metadata(pykrx_run)
+            universe_snapshot = (
+                metadata.get('universe_snapshot')
+                if isinstance(metadata.get('universe_snapshot'), dict)
+                else {}
+            )
+            universe_symbols = (
+                _resolve_exact_run_universe_symbols(pykrx_run)
+                if stage_id == 'pykrx_universe_refresh'
+                and metadata.get('universe_refreshed') is True
+                and universe_snapshot.get('complete') is True
+                and str((pykrx_run or {}).get('trade_date') or '')[:10] == stage.get('market_date')
+                and universe_snapshot.get('latest_trade_date') == stage.get('market_date')
+                else []
+            )
+            if universe_symbols:
+                overlaid[stage_id] = {
+                    **stage,
+                    'status': 'completed',
+                    'source_status': 'universe_refreshed',
+                    'gate_status': 'ready',
+                    'severity': 'ready',
+                    'blocking_status': 'non_blocking',
+                    'processed': len(universe_symbols),
+                    'total': len(universe_symbols),
+                    'succeeded': len(universe_symbols),
+                    'failed': 0,
+                    'remaining': 0,
+                    'completed_at': resolve_run_updated_at(pykrx_run),
+                    'current_activity': 'Universe refresh verified from the daily collection run',
+                    'source_run_ids': {'eod_run_id': pykrx_run.get('id')},
+                    'details': {
+                        **(stage.get('details') or {}),
+                        'reason': 'universe_refresh_verified_by_eod_run',
+                        'execution_recorded': True,
+                        'universe_snapshot': {
+                            'complete': True,
+                            'latest_trade_date': universe_snapshot['latest_trade_date'],
+                            'symbol_count': len(universe_symbols),
+                        },
+                    },
+                }
+                continue
             overlaid[stage_id] = self._build_skipped_stage(
                 stage_id=stage_id,
                 market_date=str(stage.get('market_date') or ''),
-                reason='preopen_global_stage_not_required_for_resumed_market_date_status',
+                reason='preopen_stage_not_executed_in_market_date_run',
             )
         return overlaid
 
@@ -5967,6 +6042,7 @@ class EODPipelineStatusService:
                 'symbol_limit': run.get('symbol_limit'),
                 'symbol_offset': run.get('symbol_offset'),
                 'symbols_missing': int(run.get('symbols_missing') or 0),
+                'snapshot_availability': fundamentals_snapshot_availability(run),
                 'symbols_stale': int(run.get('symbols_stale') or 0),
                 'symbols_fresh': metrics.fresh,
                 'symbols_refreshed': metrics.refreshed,
@@ -6457,6 +6533,9 @@ class EODPipelineStatusService:
             'min_non_blocking_coverage_ratio': PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO,
             'missing_count': missing_count,
             'not_applicable_count': _coerce_int(aggregate.get('not_applicable_count')),
+            'not_applicable_symbols_sample': self._normalize_symbol_list(
+                aggregate.get('not_applicable_symbols_sample')
+            ),
             'missing_symbols_sample': missing_symbols_sample,
             'missing_symbol_details_sample': missing_symbol_details_sample,
             'missing_sample_limit': aggregate.get('missing_sample_limit') or ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,

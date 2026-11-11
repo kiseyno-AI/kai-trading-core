@@ -44,7 +44,7 @@ from app.signals.preferred_share_fundamentals import (
 )
 from app.market.symbol_codes import normalize_symbol_scope as _normalize_symbols, require_symbol_text as _normalize_symbol
 
-ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v1'
+ADVANCED_VALUE_FACTOR_VERSION = 'advanced_value_v2'
 ADVANCED_VALUE_FACTOR_SOURCE = ADVANCED_VALUE_FACTOR_VERSION
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ ADVANCED_VALUE_FUNDAMENTALS_FS_DIV = 'CFS'
 ADVANCED_VALUE_FUNDAMENTALS_FS_DIVS = ('CFS', 'OFS')
 ADVANCED_VALUE_FUNDAMENTALS_REPORT_CODE = '11011'
 ADVANCED_VALUE_FUNDAMENTALS_PERIOD_TYPE = 'annual'
-ADVANCED_VALUE_MIN_COMPONENTS = 2
+ADVANCED_VALUE_MIN_COMPONENTS = 1
 ADVANCED_VALUE_ELIGIBLE_SCORE = 0.70
 ADVANCED_VALUE_WATCHLIST_SCORE = 0.50
 ADVANCED_VALUE_SCORE_WEIGHTS = {
@@ -181,6 +181,7 @@ CAPEX_PPE_MATCHER = {
         '유형자산의취득',
         '유형자산취득',
         'propertyplantandequipment',
+        '시설장치의취득',
     },
     'account_name_excludes': {
         '유형자산의처분',
@@ -322,8 +323,14 @@ def _fallback_statement_row_filter():
         conditions.append(DartFundamentalsRow.account_id.in_(account_ids))
     if account_names:
         conditions.append(DartFundamentalsRow.account_name.in_(account_names))
+    normalized_name = func.regexp_replace(
+        func.lower(DartFundamentalsRow.account_name),
+        MATCH_NORMALIZATION_PATTERN.pattern,
+        '',
+        'g',
+    )
     for token in contains_tokens:
-        conditions.append(DartFundamentalsRow.account_name.ilike(f'%{token}%'))
+        conditions.append(normalized_name.like(f'%{_normalize_match_text(token)}%'))
     return or_(*conditions)
 
 
@@ -537,6 +544,52 @@ def _extract_metric_with_fallback(
     return value, _build_source_metadata(source_type='statement_row', row=matched_row, amount_field=amount_field)
 
 
+def _extract_capex(
+    rows: Sequence[dict[str, Any]], matcher: dict[str, Any],
+) -> tuple[float | None, dict[str, Any] | None]:
+    candidates = [
+        row for row in rows
+        if row.get('statement_type') == 'CF'
+        and _match_score(row, matcher=matcher) is not None
+        and _statement_amount(row, flow=True)[0] is not None
+    ]
+    total_names = {_normalize_match_text(name) for name in matcher['account_names']}
+    totals = [
+        row for row in candidates
+        if row.get('account_id') in matcher['account_ids']
+        or any(_normalize_match_text(row.get('account_name')).startswith(name) for name in total_names)
+    ]
+    components_by_account: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in candidates:
+        account = str(row.get('account_id') or '')
+        if not account or '미사용' in account:
+            account = _normalize_match_text(row.get('account_name'))
+        components_by_account[(account, str(row.get('account_detail') or ''))].append(row)
+    selected = (
+        [_find_statement_row(totals, matcher, flow=True)]
+        if totals else [
+            _find_statement_row(group, matcher, flow=True)
+            for group in components_by_account.values()
+        ]
+    )
+    sources = []
+    values = []
+    for row in selected:
+        value, field = _statement_amount(row, flow=True, absolute=True)
+        values.append(value)
+        sources.append(_build_source_metadata(source_type='statement_row', row=row, amount_field=field))
+    if not values:
+        return None, None
+    amount = _round(sum(values), 4)
+    if len(sources) == 1:
+        return amount, sources[0]
+    return amount, {
+        'source_type': 'statement_row_components',
+        'amount_value': amount,
+        'components': sources,
+    }
+
+
 @dataclass(slots=True)
 class AnnualFundamentalsSnapshot:
     symbol: str
@@ -621,18 +674,8 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
         flow=False,
     )
 
-    capex_ppe_row = _find_statement_row(rows, CAPEX_PPE_MATCHER, flow=True)
-    capex_ppe, capex_ppe_amount_field = _statement_amount(capex_ppe_row, flow=True, absolute=True)
-    capex_intangible_row = _find_statement_row(
-        rows,
-        CAPEX_INTANGIBLE_MATCHER,
-        flow=True,
-    )
-    capex_intangible, capex_intangible_amount_field = _statement_amount(
-        capex_intangible_row,
-        flow=True,
-        absolute=True,
-    )
+    capex_ppe, capex_ppe_source = _extract_capex(rows, CAPEX_PPE_MATCHER)
+    capex_intangible, capex_intangible_source = _extract_capex(rows, CAPEX_INTANGIBLE_MATCHER)
     capital_expenditure_components = [value for value in (capex_ppe, capex_intangible) if value is not None]
     capital_expenditure = (
         _round(sum(capital_expenditure_components), 4) if capital_expenditure_components else None
@@ -711,16 +754,8 @@ def derive_annual_financial_context(snapshot: AnnualFundamentalsSnapshot) -> dic
                 'operating_income': operating_income_source,
                 'operating_cash_flow': operating_cash_flow_source,
                 'cash_and_cash_equivalents': cash_and_cash_equivalents_source,
-                'capex_ppe': _build_source_metadata(
-                    source_type='statement_row',
-                    row=capex_ppe_row,
-                    amount_field=capex_ppe_amount_field,
-                ),
-                'capex_intangible': _build_source_metadata(
-                    source_type='statement_row',
-                    row=capex_intangible_row,
-                    amount_field=capex_intangible_amount_field,
-                ),
+                'capex_ppe': capex_ppe_source,
+                'capex_intangible': capex_intangible_source,
                 'depreciation_and_amortization': _build_source_metadata(
                     source_type='statement_row',
                     row=depreciation_and_amortization_row,
@@ -1641,12 +1676,14 @@ class DailyAdvancedValueFactorService:
         for item in items:
             components_used = 0
             weighted_sum = 0.0
+            available_weight = 0.0
             for key, weight in ADVANCED_VALUE_SCORE_WEIGHTS.items():
                 value = item.get(key)
                 if value is None:
                     continue
                 components_used += 1
                 weighted_sum += float(value) * float(weight)
+                available_weight += float(weight)
 
             item['advanced_value_components_used'] = components_used
             if components_used < ADVANCED_VALUE_MIN_COMPONENTS:
@@ -1660,7 +1697,7 @@ class DailyAdvancedValueFactorService:
                 item['is_advanced_value_eligible'] = False
                 continue
 
-            item['advanced_value_score'] = _round(weighted_sum, 6)
+            item['advanced_value_score'] = _round(weighted_sum / available_weight, 6)
             if float(item['advanced_value_score']) >= ADVANCED_VALUE_ELIGIBLE_SCORE:
                 item['advanced_value_classification'] = CLASSIFICATION_ELIGIBLE
                 item['is_advanced_value_eligible'] = True
@@ -1713,6 +1750,7 @@ class DailyAdvancedValueFactorService:
                         'abs(property_plant_equipment_acquisition_cash_outflow) + '
                         'abs(intangible_asset_acquisition_cash_outflow)'
                     ),
+                    'capital_expenditure_rollup': 'reported_total_else_sum_acquisition_components',
                     'yield_denominator': 'market_cap_proxy',
                 },
                 'enterprise_value_policy': {
@@ -1728,7 +1766,7 @@ class DailyAdvancedValueFactorService:
                     ),
                 },
                 'scoring': {
-                    'score_method': 'equal_weight_mean_of_component_percentiles',
+                    'score_method': 'weighted_mean_of_available_component_percentiles',
                     'weights': ADVANCED_VALUE_SCORE_WEIGHTS,
                     'minimum_valid_components': ADVANCED_VALUE_MIN_COMPONENTS,
                     'ranking_directions': {
@@ -1747,6 +1785,9 @@ class DailyAdvancedValueFactorService:
                 'fcf_yield_valid_for_scoring': item['fcf_yield_valid_for_scoring'],
                 'ev_to_ebitda_valid_for_scoring': item['ev_to_ebitda_valid_for_scoring'],
                 'advanced_value_components_used': item['advanced_value_components_used'],
+                'component_coverage_ratio': (
+                    item['advanced_value_components_used'] / len(ADVANCED_VALUE_SCORE_WEIGHTS)
+                ),
             },
             'inputs': {
                 'pbr': item.get('_pbr'),
