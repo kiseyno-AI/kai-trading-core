@@ -112,7 +112,12 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
                 sample_clock = now + timedelta(seconds=len(batches))
                 batches.append(batch)
                 return [
-                    {'inter_shrn_iscd': symbol, 'inter2_askp': '99', 'inter2_bidp': '98', 'seln_rsqn': '3'}
+                    {
+                        'inter_shrn_iscd': symbol, 'inter2_askp': '99', 'inter2_bidp': '98',
+                        'seln_rsqn': '3', 'shnu_rsqn': '4', 'inter2_prpr': '99',
+                        'inter2_prdy_clpr': '100', 'inter2_prdy_vrss': '1',
+                        'prdy_vrss_sign': '5', 'prdy_ctrt': '-1.00',
+                    }
                     for symbol in batch
                 ]
 
@@ -132,6 +137,7 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
         monkeypatch.setattr(prices, '_is_configured', lambda: (True, None))
         monkeypatch.setattr(prices, '_recorded_market_session_is_active', lambda: True)
         monkeypatch.setattr(prices, '_run', skip_trade_socket)
+        prices.observe_monitored_symbols(symbols, trigger='test')
         async def wait_for_round():
             while 'wait_orderbook_observation' not in prices.health_snapshot():
                 await asyncio.sleep(0.001)
@@ -142,6 +148,22 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
             assert [len(batch) for batch in batches] == batch_sizes
             assert [symbol for batch in batches for symbol in batch] == symbols
             assert prices.health_snapshot()['wait_orderbook_observation']['sampled_count'] == symbol_count
+            quotes = prices.monitored_snapshot()['items']
+            assert len(quotes) == symbol_count
+            last = quotes[-1]
+            assert last['current_price'] == 99
+            assert last['bid_price'] == 98
+            assert last['ask_price'] == 99
+            assert last['change'] == -1
+            assert last['change_pct'] == -1
+            assert last['previous_close_price'] == 100
+            assert last['price_source'] == 'kis_rest_multi_quote'
+            assert last['price_time_basis'] == 'received_at'
+            assert last['price_status'] == 'available'
+            assert last['display_price_available'] is True
+            assert last['realtime_subscribed'] is False
+            assert prices._prices == {}
+            assert all(item['status'] == 'not_observed' for item in observer.history(now.date()))
             snapshot = prices.orderbooks_snapshot()
             assert snapshot['passive_quote_symbols'] == symbols
             assert snapshot['passive_quote_expires_at'] == (now + timedelta(seconds=10)).isoformat()
@@ -160,6 +182,13 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
             assert all(row['ask_touch']['price_as_of'] is None for row in records)
             assert records[0]['ask_entry']['source'] == 'kis_orderbook_rest_confirmed'
             assert 'ask_entry' not in records[1]
+            monkeypatch.setattr(prices, '_recorded_market_session_is_active', lambda: False)
+            assert prices.monitored_snapshot()['items'][-1]['display_price_available'] is False
+            monkeypatch.setattr(prices, '_recorded_market_session_is_active', lambda: True)
+            sample_clock += timedelta(seconds=120)
+            expired_price = prices.monitored_snapshot()['items'][-1]
+            assert expired_price['display_price_available'] is False
+            assert expired_price['current_price'] is None
         finally:
             await prices.stop()
 
