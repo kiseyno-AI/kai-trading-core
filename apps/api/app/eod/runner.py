@@ -703,6 +703,20 @@ class EODBackgroundRunner:
         self._async_step_tasks[name] = task
         task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
 
+    def _start_core_quantity_refresh(self, target_trade_date: str) -> None:
+        name = 'core_quantity_refresh'
+        running = self._async_step_tasks.get(name)
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(
+            signal_decider_exec_integration_service.refresh_core_quantities_if_due(
+                target_trade_date=target_trade_date,
+            ),
+            name=f'eod-background-async:{name}',
+        )
+        self._async_step_tasks[name] = task
+        task.add_done_callback(lambda completed: self._finalize_async_step(name, completed))
+
     def _start_overtime_ranking_capture_if_due(self, market: object) -> None:
         # Read-only after-hours ranking snapshot (17:45-18:30 KST), started in
         # the background so a slow or failing KIS call never delays or fails
@@ -887,6 +901,8 @@ class EODBackgroundRunner:
                                 trigger='preopen_exec_dispatch',
                             ),
                         )
+                        if delegate_execution and not recovery_blocks_new_buys:
+                            self._start_core_quantity_refresh(market.server_time[:10])
                     elif recovery_blocks_new_buys and delegate_execution:
                         self._schedule_exec_readback_refresh(
                             target_trade_date=market.server_time[:10],
@@ -932,6 +948,7 @@ class EODBackgroundRunner:
                                 ),
                             )
                             if dispatch_completed:
+                                self._start_core_quantity_refresh(market.server_time[:10])
                                 self._schedule_exec_readback_refresh(
                                     target_trade_date=market.server_time[:10],
                                     trigger='market_open_scheduler',

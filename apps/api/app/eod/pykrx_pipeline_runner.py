@@ -7,11 +7,12 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from functools import partial
 from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.eod.agent_chain_gates import finished_partial_feeds_downstream
+from app.eod.agent_chain_gates import empty_agent_scope_followup, finished_partial_feeds_downstream
 from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
@@ -5516,6 +5517,9 @@ def run_market_data_pipeline(
                     symbols=price_context_symbols,
                     source=MARKET_RISK_FILTER_SOURCE,
                     run_id=run_id,
+                    progress_callback=partial(
+                        persist_stage_progress, stage='market_risk_filter'
+                    ),
                     exact_scope_symbols=(
                         exact_piotroski_membership_symbols
                     ),
@@ -5950,8 +5954,15 @@ def run_market_data_pipeline(
         default_total: int = 0,
     ) -> dict[str, Any]:
         record_followup_start(stage_id, activity)
+        upstream_key = {
+            'signal_decider': 'feedback_followup',
+            'next_open_execution_plan': 'signal_decider_followup',
+        }.get(stage_id)
         try:
-            stage_result = call()
+            skipped = empty_agent_scope_followup(
+                result.get(upstream_key), market_date=latest_trade_date,
+            ) if upstream_key else None
+            stage_result = skipped if skipped is not None else call()
         except Exception as exc:
             record_followup_failure(stage_id, exc)
             raise

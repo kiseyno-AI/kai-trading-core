@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from math import ceil
+from math import ceil, isfinite
 from typing import Any, Sequence
 
 from sqlalchemy import select
@@ -33,6 +33,7 @@ from app.market_data_store import (
     load_daily_piotroski_filter_results,
 )
 from app.orders.domain import BrokerOrderStatus, OrderRequestSubmissionStatus
+from app.orders.signal_decider_performance_gates import SHORT_TERM_MIN_REWARD_RISK_RATIO
 from app.market.symbol_codes import is_krx_preferred_share
 from app.market.symbol_codes import normalize_symbol_text as _normalize_symbol
 from app.repositories.symbol_repository import load_symbols
@@ -44,6 +45,7 @@ AGENT_FEEDBACK_ELIGIBILITY_FILTERS: tuple[str, ...] = (
 AGENT_FEEDBACK_ELIGIBILITY_RULE = 'strategy_aware_prefilter_scoring_v1'
 AGENT_FEEDBACK_CANDIDATE_CAP_RULE = 'strategy_aware_prefilter_broad_top_percentile_cap_v3'
 AGENT_FEEDBACK_CANDIDATE_SCORE_VERSION = 'decider_role_gated_candidate_score_v3'
+CANDIDATE_ENTRY_ECONOMICS_RULE = 'stored_long_setup_reward_risk_v1'
 AGENT_FEEDBACK_CANDIDATE_TIE_BREAK_VERSION = (
     'score_then_evidence_completeness_freshness_risk_v2'
 )
@@ -887,6 +889,55 @@ def _candidate_score_payload(
     }
 
 
+def _candidate_entry_economics(row: dict[str, Any]) -> dict[str, Any] | None:
+    price_at = _evidence_timestamp_sort_value(row.get('price_captured_at'))
+    action_at = _evidence_timestamp_sort_value(row.get('action_captured_at'))
+    if row.get('action_label') != 'long_bias' or not isfinite(price_at) or action_at < price_at:
+        return None
+    trigger = _as_float(row.get('trigger_price'))
+    stop = _as_float(row.get('invalidation_price'))
+    resistance = _as_float(row.get('resistance_price'))
+    low = _as_float(row.get('session_low_price'))
+    high = _as_float(row.get('session_high_price'))
+    if not (
+        all(isfinite(price) for price in (trigger, stop, resistance, low, high))
+        and trigger == _as_float(row.get('close_price'))
+        and 0 < stop < low <= trigger <= high
+        and trigger < resistance
+    ):
+        return None
+
+    # Give the existing setup its best observed pullback and upside before screening it.
+    support = _as_float(row.get('support_price'))
+    entry = min(low, support) if stop < support < trigger else low
+    target = max(resistance, high)
+    gross_ratio = (target - entry) / (entry - stop)
+    cost_bps = settings.signal_decider_next_open_non_spread_round_trip_cost_bps
+    cost = entry * cost_bps / 10_000
+    role_floors = {
+        'signal-decider': settings.signal_decider_next_open_min_reward_risk_ratio,
+        'short-term-decider': float(SHORT_TERM_MIN_REWARD_RISK_RATIO),
+    }
+    excluded_roles = [role for role, floor in role_floors.items() if gross_ratio < floor]
+    return {
+        'code': 'entry_reward_risk_below_role_floor',
+        'entry_price': entry,
+        'target_price': target,
+        'invalidation_price': stop,
+        'gross_reward_risk_ratio': round(gross_ratio, 6),
+        'reward_risk_after_non_spread_cost_estimate': round((target - entry - cost) / (entry - stop + cost), 6),
+        'non_spread_cost_bps': cost_bps,
+        'raw_trading_value_krw': row.get('raw_trading_value_krw'),
+        'min_reward_risk_by_role': role_floors,
+        'excluded_roles': excluded_roles,
+    } if excluded_roles else None
+
+
+def _entry_economics_excludes(record: dict[str, Any], roles: Sequence[str]) -> bool:
+    excluded_roles = _as_dict(record.get('entry_economics')).get('excluded_roles') or []
+    return bool(roles) and all(role in excluded_roles for role in roles)
+
+
 def _feedback_payload_positive_action(payload: dict[str, Any]) -> str | None:
     for key in (
         'candidate_action',
@@ -1518,6 +1569,7 @@ def _apply_candidate_cap(
     *,
     records: list[dict[str, Any]],
     requested_symbols: Sequence[str] | None,
+    apply_entry_economics: bool = True,
 ) -> list[dict[str, Any]]:
     dispatchable = [record for record in records if not bool(record.get('hard_blocked'))]
     requested_cap_bypass = _requested_scope_bypasses_caps(requested_symbols)
@@ -1538,12 +1590,21 @@ def _apply_candidate_cap(
     )
     score_by_symbol = _score_rows_by_symbol(score_rows)
     for record in dispatchable:
+        score_row = score_by_symbol.get(str(record.get('symbol')))
         score_payload = _candidate_score_payload(
             record=record,
-            score_row=score_by_symbol.get(str(record.get('symbol'))),
+            score_row=score_row,
         )
         record['candidate_score'] = score_payload['score']
         record['candidate_score_payload'] = score_payload
+        if (
+            apply_entry_economics
+            and not requested_cap_bypass
+            and record.get('strategy_scope') == AGENT_FEEDBACK_DEFAULT_STRATEGY_SCOPE
+        ):
+            economics = _candidate_entry_economics(score_row or {})
+            if economics is not None:
+                record['entry_economics'] = economics
     ranked = _rank_scored_candidates(dispatchable)
 
     if requested_cap_bypass:
@@ -1586,14 +1647,20 @@ def _apply_candidate_cap(
         for symbol, reasons in forced_reasons_by_symbol.items()
         if reasons
     }
-    selected_symbols: set[str] = set()
+    rank_selected_symbols: set[str] = set()
+    economics_excluded = {
+        str(record['symbol']) for record in ranked
+        if requested_symbols is None
+        and str(record['symbol']) not in forced_symbols
+        and _entry_economics_excludes(record, DECISION_SUPPORT_AGENT_NAMES)
+    }
     for record in ranked:
-        if len(selected_symbols) >= limit and limit > 0:
+        if len(rank_selected_symbols) >= limit and limit > 0:
             break
-        selected_symbols.add(str(record.get('symbol')))
-    selected_symbols.update(forced_symbols)
-    if limit <= 0:
-        selected_symbols = {str(record.get('symbol')) for record in ranked}
+        symbol = str(record['symbol'])
+        if symbol not in economics_excluded:
+            rank_selected_symbols.add(symbol)
+    selected_symbols = rank_selected_symbols | forced_symbols
     cap_applied = len(selected_symbols) < len(dispatchable)
     metadata = _cap_metadata(
         total=len(dispatchable),
@@ -1617,13 +1684,17 @@ def _apply_candidate_cap(
         if cap_applied and symbol not in selected_symbols:
             record['eligible'] = False
             record['cap_excluded'] = True
-            record['status'] = 'candidate_cap_excluded'
-            record['candidate_selection_reason'] = 'broad_rank_cap_excluded'
+            if symbol in economics_excluded:
+                record['status'] = 'entry_economics_excluded'
+                record['candidate_selection_reason'] = 'entry_reward_risk_below_role_floor'
+            else:
+                record['status'] = 'candidate_cap_excluded'
+                record['candidate_selection_reason'] = 'broad_rank_cap_excluded'
         else:
             record['cap_excluded'] = False
             record['candidate_selection_reason'] = (
                 'forced_included_over_broad_rank_cap'
-                if forced_reasons and index > limit
+                if forced_reasons and symbol not in rank_selected_symbols
                 else 'broad_rank_within_cap'
             )
             if forced_reasons and record['status'] == 'dispatched':
@@ -1701,6 +1772,7 @@ def load_agent_feedback_eligibility_records(
     market_date: date,
     requested_symbols: Sequence[str] | None = None,
     strategy_scope: str = AGENT_FEEDBACK_DEFAULT_STRATEGY_SCOPE,
+    apply_entry_economics: bool = True,
 ) -> list[dict[str, Any]]:
     symbol_scope = _normalize_symbol_scope(requested_symbols)
     if requested_symbols is not None and not symbol_scope:
@@ -1742,6 +1814,7 @@ def load_agent_feedback_eligibility_records(
     return _apply_candidate_cap(
         records=records,
         requested_symbols=symbol_scope if requested_symbols is not None else None,
+        apply_entry_economics=apply_entry_economics,
     )
 
 
@@ -1919,9 +1992,22 @@ def _build_role_scope_selection(
     feedback_scope_mode: str,
     decider_scope_symbols: Sequence[str] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
+    economics_roles = (role,) if role in DECISION_SUPPORT_AGENT_NAMES else (
+        DECISION_SUPPORT_AGENT_NAMES if role in SUMMARIZER_AGENT_NAMES else ()
+    )
+    economics_exclusions = {
+        str(record['symbol']): record['entry_economics']
+        for record in records
+        if not requested_scope_bypass
+        and _entry_economics_excludes(record, economics_roles)
+        and not _merge_forced_reasons(
+            record=record,
+            forced_inclusion_reasons_by_symbol=forced_inclusion_reasons_by_symbol,
+        )
+    }
     ranked = _role_ranked_records(
         role=role,
-        records=records,
+        records=[record for record in records if str(record['symbol']) not in economics_exclusions],
         summarizer_gate_by_symbol=summarizer_gate_by_symbol,
     )
     forced_reasons_by_symbol: dict[str, list[dict[str, Any]]] = {}
@@ -2043,6 +2129,7 @@ def _build_role_scope_selection(
             for symbol, reasons in selection_reasons_by_symbol.items()
         },
         'role_rank_by_symbol': rank_by_symbol,
+        'entry_economics_exclusions': economics_exclusions,
     }
     return ordered_selected, diagnostics
 
@@ -2229,6 +2316,10 @@ def build_agent_feedback_eligibility_diagnostics(
         'soft_penalized_dispatched_symbol_count': len(soft_penalized),
         'hard_blocked_symbols': [str(record.get('symbol')) for record in hard_blocked],
         'candidate_cap_excluded_symbols': [str(record.get('symbol')) for record in cap_excluded[:100]],
+        'entry_economics_exclusions': {
+            str(record['symbol']): record['entry_economics'] for record in cap_excluded
+            if record.get('status') == 'entry_economics_excluded'
+        },
         'forced_included_symbols': [str(record.get('symbol')) for record in forced_included],
         'soft_penalized_symbols': [str(record.get('symbol')) for record in soft_penalized],
         'candidate_cap': (
@@ -2260,11 +2351,13 @@ def load_agent_feedback_eligible_symbols(
     market_date: date,
     requested_symbols: Sequence[str] | None = None,
     strategy_scope: str = AGENT_FEEDBACK_DEFAULT_STRATEGY_SCOPE,
+    apply_entry_economics: bool = True,
 ) -> list[str]:
     records = load_agent_feedback_eligibility_records(
         market_date=market_date,
         requested_symbols=requested_symbols,
         strategy_scope=strategy_scope,
+        apply_entry_economics=apply_entry_economics,
     )
     ordered_records = (
         records

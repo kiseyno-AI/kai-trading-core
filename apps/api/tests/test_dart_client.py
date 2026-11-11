@@ -541,6 +541,76 @@ class DartClientTests(unittest.IsolatedAsyncioTestCase):
                 'persistent_cache',
             )
 
+    async def test_resolves_missing_master_codes_only_when_company_overview_confirms_them(self):
+        names = {
+            '0162D0': '동원파츠',
+            '123456': 'Another IPO',
+            '123457': 'Conflicting IPO',
+            '123458': 'Ambiguous IPO',
+            '123459': 'Unavailable IPO',
+            '123460': 'Unknown issuer',
+            '123461': 'Former Listing',
+        }
+        corp_rows = [
+            {'stock_code': '005930', 'corp_code': '00126380', 'corp_name': 'Samsung'},
+            {'stock_code': '654321', 'corp_code': '00000006', 'corp_name': 'Current Listing'},
+            *[
+                {'stock_code': '', 'corp_code': corp, 'corp_name': name}
+                for corp, name in (
+                    ('00784184', '동원파츠'),
+                    ('00000001', 'Another IPO'),
+                    ('00000002', 'Conflicting IPO'),
+                    ('00000003', 'Ambiguous IPO'),
+                    ('00000004', 'Ambiguous IPO'),
+                    ('00000005', 'Unavailable IPO'),
+                    ('00000006', 'Former Listing'),
+                )
+            ],
+        ]
+        client = DartClient(krx_stock_name_loader=lambda codes: {
+            code: names[code] for code in codes if code in names
+        })
+        client._corp_codes_authoritative = True
+        overview = AsyncMock(side_effect=[
+            {'status': '000', 'stock_code': '0162D0'},
+            {'status': '000', 'stock_code': '123456'},
+            {'status': '000', 'stock_code': '654321'},
+            DartAPIError('temporarily unavailable'),
+            {'status': '000', 'stock_code': '0162D0'},
+        ])
+        with (
+            patch.object(client, '_load_corp_codes', return_value=corp_rows),
+            patch.object(client, 'fetch_company_overview', overview),
+        ):
+            batch = await client.lookup_corp_codes_for_stocks(
+                stock_codes=['005930', *names],
+            )
+            single = await client.lookup_corp_code(stock_code='0162D0')
+            client._corp_codes_authoritative = False
+            stale = await client.lookup_corp_codes_for_stocks(stock_codes=['0162D0'])
+
+        self.assertEqual(
+            [(row['stock_code'], row['corp_code']) for row in batch['resolved']],
+            [('005930', '00126380'), ('0162D0', '00784184'), ('123456', '00000001')],
+        )
+        self.assertEqual(batch['unsupported_stock_codes'], ['123460'])
+        self.assertEqual(
+            {row['stock_code']: row['reason'] for row in batch['conflicting_mappings']},
+            {
+                '123457': 'company_overview_stock_code_unconfirmed',
+                '123458': 'ambiguous_company_name',
+                '123459': 'company_overview_lookup_failed',
+                '123461': 'ambiguous_company_name',
+            },
+        )
+        self.assertEqual((single['stock_code'], single['corp_code']), ('0162D0', '00784184'))
+        self.assertEqual(stale['resolved'], [])
+        self.assertEqual(stale['unsupported_stock_codes'], [])
+        self.assertEqual(
+            [call.args[0] for call in overview.await_args_list],
+            ['00784184', '00000001', '00000002', '00000005', '00784184'],
+        )
+
     async def test_stale_persisted_corp_list_keeps_all_mappings_retryable(self):
         with TemporaryDirectory() as directory:
             cache_file = Path(directory) / 'corp-codes.xml'

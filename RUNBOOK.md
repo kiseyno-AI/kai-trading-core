@@ -1,5 +1,12 @@
 # RUNBOOK
 
+Core-owned quantity planning and the 2-hour regular-session refresh are described
+in [CORE_QUANTITY_SIZING.md](docs/CORE_QUANTITY_SIZING.md). Deploy compatible Exec
+intake/revision handling first. Inspect existing plan submission sizing evidence
+and Exec v4 `core_quantity_state` readback; never rerun the daily pipeline or
+deciders merely to refresh quantity, and never use quantity refresh to change
+accepted price levels or sell filled holdings.
+
 ## Goal
 Run `kai-trading-core` as a 24/7 local service.
 

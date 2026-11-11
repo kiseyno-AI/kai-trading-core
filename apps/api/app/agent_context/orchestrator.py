@@ -34,6 +34,7 @@ from app.agent_context.prerequisite_service import (
 from app.agent_context.eligibility import (
     AGENT_FEEDBACK_ELIGIBILITY_FILTERS,
     AGENT_FEEDBACK_ELIGIBILITY_RULE,
+    CANDIDATE_ENTRY_ECONOMICS_RULE,
     build_agent_feedback_role_funnel,
     load_agent_feedback_eligibility_records,
     resolve_agent_feedback_scope,
@@ -642,7 +643,9 @@ def _attach_agent_feedback_eligibility_context(
         symbol = str(item.get('symbol') or '').strip().upper()
         record = records_by_symbol.get(symbol)
         if isinstance(record, dict):
-            item['agent_feedback_eligibility'] = record
+            item['agent_feedback_eligibility'] = {
+                key: value for key, value in record.items() if key != 'entry_economics'
+            }
 
 
 def _normalize_role_symbol_scopes(
@@ -651,14 +654,14 @@ def _normalize_role_symbol_scopes(
     symbols: Sequence[str],
     role_symbol_scopes: dict[str, Sequence[str]] | None,
 ) -> dict[str, list[str]]:
-    fallback_symbols = _normalize_requested_symbols(symbols)
+    fallback_symbols = _normalize_requested_symbols(symbols) if symbols else []
     normalized: dict[str, list[str]] = {}
     for role in roles:
         source = role_symbol_scopes.get(role) if isinstance(role_symbol_scopes, dict) else None
         if source is None:
             normalized[role] = list(fallback_symbols)
         else:
-            normalized[role] = _normalize_requested_symbols(source)
+            normalized[role] = _normalize_requested_symbols(source) if source else []
     return normalized
 
 
@@ -3670,6 +3673,7 @@ class AgentFeedbackOrchestrator:
         authoritative_summary_run_id: str | None = None,
         revalidate_post_decision_material_context: bool = False,
         post_decision_check_at: datetime | None = None,
+        apply_entry_economics: bool | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         symbols = _normalize_requested_symbols(
             [str(item.get('symbol') or '') for item in source_items]
@@ -3742,9 +3746,16 @@ class AgentFeedbackOrchestrator:
 
         try:
             if eligibility_scope_symbols is None:
+                if apply_entry_economics is None:
+                    apply_entry_economics = all(
+                        (item.get('source_revalidation_request') or {}).get('candidate_selection_rule')
+                        == CANDIDATE_ENTRY_ECONOMICS_RULE
+                        for item in source_items
+                    )
                 refreshed_records = load_agent_feedback_eligibility_records(
                     market_date=market_date,
                     requested_symbols=None,
+                    apply_entry_economics=apply_entry_economics,
                 )
                 refreshed_records_by_symbol = {
                     str(record.get('symbol') or '').strip().upper(): record
@@ -3962,8 +3973,8 @@ class AgentFeedbackOrchestrator:
             )
             if isinstance(refreshed_item, dict) and eligibility_was_part_of_generation:
                 if isinstance(refreshed_eligibility_record, dict):
-                    refreshed_item['agent_feedback_eligibility'] = (
-                        refreshed_eligibility_record
+                    _attach_agent_feedback_eligibility_context(
+                        items=[refreshed_item], diagnostics=refreshed_eligibility,
                     )
                 else:
                     refreshed_item.pop('agent_feedback_eligibility', None)
@@ -4803,6 +4814,9 @@ class AgentFeedbackOrchestrator:
                     'source_context_scope_symbols'
                 ],
                 'eligibility_scope_symbols': raw_eligibility_scope,
+                'apply_entry_economics': (
+                    revalidation_request.get('candidate_selection_rule') == CANDIDATE_ENTRY_ECONOMICS_RULE
+                ),
                 'source_knowledge_cutoff_at': normalized_knowledge_cutoff,
                 'policy_context_as_of_date': (
                     effective_policy_context_as_of_date.isoformat()
@@ -4852,6 +4866,7 @@ class AgentFeedbackOrchestrator:
                         eligibility_scope_symbols=material[
                             'eligibility_scope_symbols'
                         ],
+                        apply_entry_economics=material['apply_entry_economics'],
                         fs_div=material['fs_div'],
                         disclosures_limit=material['disclosures_limit'],
                         allow_current_run_feedback=True,
@@ -4957,6 +4972,7 @@ class AgentFeedbackOrchestrator:
         symbol_context_items: Sequence[dict[str, Any]],
         source_context_scope_symbols: Sequence[str],
         eligibility_scope_symbols: Sequence[str] | None,
+        apply_entry_economics: bool = True,
         fs_div: str | None,
         disclosures_limit: int,
         source_knowledge_cutoff_at: str | None,
@@ -5205,6 +5221,7 @@ class AgentFeedbackOrchestrator:
             )
             payload['source_revalidation_request'] = {
                 'schema_version': 'decider_source_revalidation_request_v1',
+                'candidate_selection_rule': CANDIDATE_ENTRY_ECONOMICS_RULE if apply_entry_economics else None,
                 'source_context_scope_symbols': list(
                     source_context_scope_symbols
                 ),
@@ -7689,6 +7706,7 @@ class AgentFeedbackOrchestrator:
                         eligibility_scope_symbols=(
                             eligibility_scope_symbols_for_revalidation
                         ),
+                        apply_entry_economics=funnel_diagnostics.get('apply_entry_economics', True),
                         fs_div=source_fs_div,
                         disclosures_limit=source_disclosures_limit,
                         source_knowledge_cutoff_at=(

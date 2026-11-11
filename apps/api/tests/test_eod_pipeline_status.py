@@ -3,16 +3,19 @@ import json
 import unittest
 from copy import deepcopy
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
+from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     SUMMARIZER_AGENT_NAMES,
 )
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
-from app.db_models import DailyMomentumFactorResult
+from app.db_models import DailyMomentumFactorResult, DailyPriceBar, DailyQualityFactorResult, Symbol
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
@@ -956,6 +959,160 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_factor_score_quality_uses_applicable_membership_in_both_modes(self):
+        memory_engine = create_engine('sqlite://')
+        for model in (Symbol, DailyPriceBar, DailyQualityFactorResult):
+            model.__table__.create(memory_engine)
+        market_date = date(2026, 4, 21)
+        common_at = datetime(2026, 4, 21, 16)
+        preferred_at = datetime(2026, 4, 21, 17)
+        with Session(memory_engine) as session:
+            for sid, symbol, name in ((1, '005930', '삼성전자'), (2, '005935', '삼성전자우')):
+                session.add(Symbol(id=sid, symbol=symbol, name_ko=name, market='KOSPI'))
+                session.add(DailyPriceBar(
+                    symbol_id=sid, trade_date=market_date, open_price=100,
+                    high_price=100, low_price=100, close_price=100,
+                    volume=1, turnover=100, source='test',
+                ))
+            common = DailyQualityFactorResult(
+                symbol_id=1, market_date=market_date, factor_payload={},
+                captured_at=common_at,
+            )
+            preferred = DailyQualityFactorResult(
+                symbol_id=2, market_date=market_date, factor_payload={},
+                captured_at=preferred_at,
+            )
+            session.add_all([common, preferred])
+            session.commit()
+
+            @contextmanager
+            def scope():
+                yield session
+
+            for common_score, preferred_score in ((0.7, None), (None, 0.9), (0.7, 0.9)):
+                common.quality_score = common_score
+                preferred.quality_score = preferred_score
+                session.commit()
+                for detailed in (False, True):
+                    with (
+                        self.subTest(common=common_score, preferred=preferred_score, detailed=detailed),
+                        patch('app.eod.pipeline_status.session_scope', scope),
+                        patch('app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS', {
+                            'quality_factors': DailyQualityFactorResult,
+                        }),
+                    ):
+                        counts = _load_row_count_stage_counts(
+                            market_date=market_date.isoformat(),
+                            include_missing_diagnostics=detailed,
+                        )['quality_factors']
+                    self.assertEqual(counts['decision_ready_count'], int(common_score is not None))
+                    self.assertEqual(counts['decision_degraded_count'], int(common_score is None))
+                    self.assertEqual(
+                        counts['latest_decision_ready_at'],
+                        common_at.isoformat() if common_score is not None else None,
+                    )
+        memory_engine.dispose()
+
+    def test_lightweight_status_keeps_preferred_shares_out_of_factor_missing_rows(self):
+        session = MagicMock()
+
+        def execute(statement):
+            if 'SELECT symbols.id' in str(statement):
+                return [
+                    SimpleNamespace(id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'),
+                    SimpleNamespace(id=2, symbol='005935', name_ko='삼성전자우', market='KOSPI'),
+                    SimpleNamespace(id=3, symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+                ]
+            return MagicMock(one=lambda: (2, None, 2, 0, None, present))
+
+        session.execute.side_effect = execute
+        for present, missing in ((2, 0), (1, 1)):
+            with (
+                self.subTest(present=present),
+                patch('app.eod.pipeline_status.session_scope') as scope,
+                patch('app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS', {
+                    'quality_factors': FACTOR_STAGE_MODELS['quality_factors'],
+                }),
+            ):
+                scope.return_value.__enter__.return_value = session
+                row_counts = _load_row_count_stage_counts(
+                    market_date='2026-04-21',
+                    include_missing_diagnostics=False,
+                )
+                service = EODPipelineStatusService(
+                    market_state_loader=_FakeMarketState,
+                    pykrx_run_loader=lambda **_: None,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 3,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    price_bar_count_loader=lambda **_: 3,
+                    row_count_stage_counts_loader=lambda **_: row_counts,
+                )
+                result = service.read(
+                    market_date='2026-04-21',
+                    include_row_count_diagnostics=False,
+                )
+                stage = result['stages']['quality_factors']
+                self.assertEqual(stage['total'], 2)
+                self.assertEqual(stage['details']['missing_count'], missing)
+                self.assertEqual(stage['details']['not_applicable_count'], 1)
+                self.assertEqual(stage['details']['not_applicable_symbols_sample'], ['005935'])
+
+    def test_universe_refresh_status_uses_same_date_saved_membership(self):
+        market_date = '2026-04-21'
+        symbols = ['000660', '005930']
+        membership = build_market_membership_snapshot(
+            symbols=[SimpleNamespace(symbol=symbol, market='KOSPI') for symbol in symbols],
+            markets=['KOSPI'],
+        )
+        saved_run = {
+            'id': 593,
+            'trade_date': market_date,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': symbols,
+                'universe_refreshed': True,
+                'universe_snapshot': {
+                    'complete': True,
+                    'latest_trade_date': market_date,
+                    'markets': ['KOSPI'],
+                    'market_membership': membership,
+                },
+            },
+        }
+        for label, refreshed, complete, snapshot_date, expected_status in (
+            ('verified', True, True, market_date, 'completed'),
+            ('not_refreshed', False, True, market_date, 'skipped'),
+            ('incomplete', True, False, market_date, 'skipped'),
+            ('wrong_date', True, True, '2026-04-20', 'skipped'),
+        ):
+            with self.subTest(label=label):
+                run = deepcopy(saved_run)
+                run['run_metadata']['universe_refreshed'] = refreshed
+                run['run_metadata']['universe_snapshot'].update(
+                    complete=complete, latest_trade_date=snapshot_date,
+                )
+                service = EODPipelineStatusService(
+                    market_state_loader=_FakeMarketState,
+                    pykrx_run_loader=lambda **_: run,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 2,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    price_bar_count_loader=lambda **_: 2,
+                )
+                result = service.read(market_date=market_date)
+                stage = result['stages']['pykrx_universe_refresh']
+                self.assertEqual(stage['status'], expected_status)
+                self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
+                if expected_status == 'completed':
+                    self.assertEqual(stage['total'], 2)
+                    self.assertEqual(stage['source_run_ids'], {'eod_run_id': 593})
+
     def test_factor_stage_count_queries_classify_all_score_fields(self):
         class AggregateResult:
             def __init__(self, values):
@@ -971,7 +1128,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
             def execute(self, statement):
                 self.statements.append(statement)
-                return AggregateResult(self.values)
+                if 'SELECT symbols.id' in str(statement):
+                    return [
+                        SimpleNamespace(id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'),
+                        SimpleNamespace(id=2, symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+                    ]
+                values = self.values
+                if len(statement.selected_columns) > len(values):
+                    values += (2,)
+                return AggregateResult(values)
 
         for stage_id, score_field in FACTOR_STAGE_SCORE_FIELDS.items():
             with self.subTest(stage_id=stage_id, score_field=score_field):
@@ -999,7 +1164,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         include_missing_diagnostics=False,
                     )
 
-                statement = str(session.statements[0])
+                statement = str(session.statements[-1])
                 self.assertIn(score_field, statement)
                 self.assertIn('IS NOT NULL', statement)
                 self.assertIn('IS NULL', statement)
@@ -1286,6 +1451,94 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 self.assertEqual(stage['status'], 'completed')
                 self.assertEqual(stage['gate_status'], 'ready')
                 self.assertEqual((stage['processed'], stage['succeeded'], stage['failed']), (2, 2, 0))
+
+    def test_feedback_prerequisite_isolates_completed_signal_feature_scope(self):
+        market_date = '2026-04-21'
+        candidates = ['000660', '005930']
+        outside_scope = '0162D0'
+        universe = [*candidates, outside_scope]
+        membership = build_market_membership_snapshot(
+            symbols=[SimpleNamespace(symbol=symbol, market='KOSPI') for symbol in universe],
+            markets=['KOSPI'],
+        )
+
+        def scope_gap_loader(*, stage_id, market_date, symbols):
+            missing = (
+                [outside_scope]
+                if stage_id == 'signal_features' and outside_scope in symbols
+                else []
+            )
+            return _scope_gap_evidence(
+                requested_count=len(symbols),
+                present_count=len(symbols) - len(missing),
+                missing_symbols_sample=missing,
+            )
+
+        official_run = {
+            'id': 644,
+            'market_date': market_date,
+            'status': 'partial',
+            'run_metadata': {'resolved_stages': ['signal_features', 'agent_feedback_summaries']},
+            'stages': {
+                'signal_features': {
+                    'stage_id': 'signal_features',
+                    'market_date': market_date,
+                    'status': 'completed',
+                    'total': len(candidates),
+                    'processed': len(candidates),
+                    'succeeded': len(candidates),
+                    'failed': 0,
+                    'source_run_ids': {'eod_run_id': 593},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=_FakeMarketState,
+            pykrx_run_loader=lambda **_: {
+                'id': 593,
+                'status': 'completed',
+                'symbols_total': len(universe),
+                'symbols_succeeded': len(universe),
+                'run_metadata': {
+                    'markets': ['KOSPI'],
+                    'requested_symbols': universe,
+                    'universe_snapshot': {'markets': ['KOSPI'], 'market_membership': membership},
+                },
+            },
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: len(universe),
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: len(universe),
+            technical_snapshot_count_loader=lambda *_: len(universe),
+            action_summary_count_loader=lambda *_: len(universe),
+            row_count_stage_counts_loader=lambda **_: {},
+            row_count_scope_gap_loader=scope_gap_loader,
+            signal_feature_counts_loader=lambda **_: {'persisted': len(candidates)},
+        )
+
+        prerequisite_service = AgentFeedbackPrerequisiteService()
+        with patch('app.eod.pipeline_status.eod_pipeline_status_service', service):
+            for requested, gate, reason in (
+                (candidates, 'ready', 'requested_scope_rows_complete'),
+                (universe, 'blocked', 'missing_rows_intersect_requested_scope'),
+                (None, 'blocked', 'missing_rows_intersect_exact_run_universe'),
+            ):
+                with self.subTest(symbols=requested):
+                    result = prerequisite_service.inspect_feedback_prerequisites(
+                        market_date=market_date,
+                        symbols=requested,
+                        required_stage_ids=('signal_features',),
+                    )
+                    stage = result['stages']['signal_features']
+                    self.assertEqual(stage['status'], 'completed')
+                    self.assertEqual(stage['gate_status'], gate)
+                    self.assertEqual(stage['details']['gate_reason'], reason)
+                    self.assertEqual(
+                        stage['details']['exact_universe_coverage']['missing_count'], 1
+                    )
+                    self.assertEqual(result['ready'], gate == 'ready')
 
     def test_read_blocks_complete_factor_count_when_requested_symbol_is_missing(self):
         requested_symbols = ['000660', '005930']
@@ -7621,7 +7874,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(
             result['stages']['master_refresh']['details']['reason'],
-            'preopen_global_stage_not_required_for_resumed_market_date_status',
+            'preopen_stage_not_executed_in_market_date_run',
         )
         self.assertEqual(result['stages']['signal_features']['status'], 'partial')
         self.assertEqual(

@@ -11,6 +11,26 @@ from app.orders.exec_payload_slimming import (
 )
 
 
+def test_quantity_write_ahead_survives_diagnostic_payload_slimming():
+    state = {
+        'initial_policy': {'type': 'core_sized', 'target_quantity': 10, 'revision': 1},
+        'policy': {'type': 'core_sized', 'target_quantity': 10, 'revision': 1},
+        'pending_request': {
+            'core_item_key': 'entry-1', 'execution_plan_id': 'exec-plan-1',
+            'expected_revision': 1, 'revision': 2, 'target_quantity': 7,
+            'sizing_inputs': {'price_contract_digest': 'a' * 64},
+        },
+        'last_ack_at': '2026-11-11T00:00:00+00:00',
+    }
+    result = slim_signal_decider_exec_submission_payload({
+        'exec_dispatch': {'plan_id': 'plan-1', 'dispatch_status': 'accepted', 'item_links': []},
+        'core_quantity_sizing': state,
+        'latest': {'unused_diagnostics': 'x' * 20000},
+    }, max_bytes=1500)
+    assert result.payload['core_quantity_sizing'] == state
+    assert json_size_bytes(result.payload) <= 1500
+
+
 def test_compact_exec_readback_preserves_execution_plan_item_identity() -> None:
     compact = compact_exec_readback(
         {

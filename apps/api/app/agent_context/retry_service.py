@@ -137,6 +137,7 @@ def _resolve_terminal_role_success_scopes(
         str,
         Sequence[str],
     ] | None = None,
+    allow_empty_roles: bool = False,
 ) -> dict[str, Any]:
     """Validate exact terminal success/failure partitions for every role.
 
@@ -226,7 +227,7 @@ def _resolve_terminal_role_success_scopes(
                 raw_expected_scope
             )
             if (
-                not expected_scope
+                (not expected_scope and not allow_empty_roles)
                 or len(expected_scope) != len(raw_expected_scope)
             ):
                 return base_result
@@ -255,7 +256,7 @@ def _resolve_terminal_role_success_scopes(
         if (
             raw_scope != scope
             or raw_failed != failed_symbols
-            or not scope
+            or (not scope and not allow_empty_roles)
             or not set(failed_symbols).issubset(scope)
             or (
                 normalized_expected_role_scopes is not None
@@ -465,6 +466,7 @@ def resolve_terminal_independent_role_success(
         progress_summary=progress_summary,
         roles=roles,
         expected_role_symbol_scopes=expected_role_symbol_scopes,
+        allow_empty_roles=True,
     )
     if resolution.get('ready') is not True:
         return resolution
@@ -821,9 +823,9 @@ def _normalize_role_symbol_scopes(
         ):
             raise ValueError('role_symbol_scopes entries must be symbol lists')
         role_symbols = _normalize_optional_symbol_scope(raw_symbols)
-        if not role_symbols or len(role_symbols) != len(raw_symbols):
+        if len(role_symbols) != len(raw_symbols):
             raise ValueError(
-                'role_symbol_scopes entries must be non-empty and unique'
+                'role_symbol_scopes entries must be unique'
             )
         if requested_set is not None and not set(role_symbols).issubset(
             requested_set
@@ -832,6 +834,8 @@ def _normalize_role_symbol_scopes(
                 'role_symbol_scopes must stay within requested symbols'
             )
         normalized[role] = role_symbols
+    if not any(normalized.values()):
+        raise ValueError('role_symbol_scopes must include at least one symbol')
     return normalized
 
 
@@ -3100,10 +3104,12 @@ class AgentFeedbackRetryService:
         *,
         market_date: date,
         requested_symbols: Sequence[str] | None = None,
+        apply_entry_economics: bool = True,
     ) -> list[str]:
         return load_agent_feedback_eligible_symbols(
             market_date=market_date,
             requested_symbols=requested_symbols,
+            apply_entry_economics=apply_entry_economics,
         )
 
     def load_incomplete_symbols(
@@ -5455,6 +5461,7 @@ class AgentFeedbackRetryService:
         eligible_symbols = self._load_eligible_symbols(
             market_date=config.market_date,
             requested_symbols=requested_symbols,
+            **({'apply_entry_economics': False} if resolved_role_symbol_scopes is not None else {}),
         )
         if requested_symbols is not None and not eligible_symbols:
             prerequisites = {
@@ -5925,6 +5932,7 @@ class AgentFeedbackRetryService:
             else self._load_eligible_symbols(
                 market_date=config.market_date,
                 requested_symbols=requested_symbols,
+                **({'apply_entry_economics': False} if resolved_role_symbol_scopes is not None else {}),
             )
         )
         if prerequisites is None:
@@ -5989,6 +5997,7 @@ class AgentFeedbackRetryService:
         eligibility_records = load_agent_feedback_eligibility_records(
             market_date=config.market_date,
             requested_symbols=requested_symbols,
+            apply_entry_economics=resolved_role_symbol_scopes is None,
         )
         eligibility_diagnostics = build_agent_feedback_eligibility_diagnostics(
             records=eligibility_records,
@@ -6024,6 +6033,7 @@ class AgentFeedbackRetryService:
                 role: list(symbols)
                 for role, symbols in explicit_role_symbol_scopes.items()
             }
+            role_funnel['apply_entry_economics'] = False
             role_funnel['role_symbol_counts'] = {
                 role: len(symbols)
                 for role, symbols in explicit_role_symbol_scopes.items()
@@ -6043,7 +6053,13 @@ class AgentFeedbackRetryService:
             }
         scoped_feedback_symbols = _ordered_symbol_union(
             [role_symbol_scopes.get(role, ()) for role in roles]
-        ) or list(eligible_symbols)
+        )
+        entry_economics_scope_empty = not scoped_feedback_symbols and any(
+            diagnostic.get('entry_economics_exclusions')
+            for diagnostic in (eligibility_diagnostics, *role_funnel.get('role_diagnostics', {}).values())
+        )
+        if not scoped_feedback_symbols and not entry_economics_scope_empty:
+            scoped_feedback_symbols = list(eligible_symbols)
         if effective_knowledge_cutoff_at is None:
             raw_knowledge_cutoff_at = getattr(
                 config,
@@ -6265,7 +6281,7 @@ class AgentFeedbackRetryService:
             len(role_symbol_scopes.get(role, ()))
             for role in roles
         )
-        if scoped_role_symbol_total <= 0:
+        if scoped_role_symbol_total == 0 and not entry_economics_scope_empty:
             scoped_role_symbol_total = len(scoped_feedback_symbols) * max(1, len(roles))
         skipped_symbols = (
             [symbol for symbol in requested_symbols or () if symbol not in set(eligible_symbols)]
@@ -7078,7 +7094,15 @@ class AgentFeedbackRetryService:
             'eligible_symbols': list(eligible_symbols) if requested_symbols is not None else None,
             'skipped_symbols': skipped_symbols,
             'run_id': request_run_id,
-            'status': final_status,
+            'status': 'skipped' if entry_economics_scope_empty else final_status,
+            **(
+                {
+                    'triggered': False,
+                    'reason': 'no_agent_feedback_eligible_symbols',
+                    'entry_economics_scope_empty': True,
+                }
+                if entry_economics_scope_empty else {}
+            ),
             'cycles': cycles,
             'final_pending': len(final_pending_symbols),
             'completed': final_status == 'completed',
