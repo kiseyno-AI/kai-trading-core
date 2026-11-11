@@ -167,10 +167,11 @@ def test_reads_the_latest_verified_trade_in_existing_wait_history(client, tracke
     assert row['change'] == 500
 
 
-def _store_decision(session, agent: str, *, action: str, trigger: int, decided_at: datetime):
+def _store_decision(session, agent: str, *, action: str, trigger: int, decided_at: datetime, market_date=PREVIOUS_DATE):
     snapshot = SignalDeciderDecisionSnapshot(
-        market_date=PREVIOUS_DATE, symbol=SYMBOL, agent_name=agent, thesis_summary='fixture',
-        created_at=decided_at, feedback_received_at=decided_at, next_day_open_action='wait',
+        market_date=market_date, symbol=SYMBOL, agent_name=agent, thesis_summary='fixture',
+        created_at=decided_at, feedback_received_at=decided_at,
+        next_day_open_action=action if agent == 'signal-decider' else 'wait',
         supporting_evidence_payload=[], decision_risks_payload=[], invalidation_conditions_payload=[],
         data_quality_warnings_payload=[], specialist_disagreement_payload=[], traceability_payload={},
         input_feature_snapshot_payload={}, request_payload={}, response_summary_payload={},
@@ -206,13 +207,13 @@ def _store_plan(
 
 
 @pytest.mark.parametrize(('short_action', 'short_quantity', 'short_time', 'return_pct'), [
-    ('wait', 1, '08:15:00', 12.5),
+    ('wait', 1, '08:15:00', 5.0),
     ('wait', 0, '08:15:00', 5.0),
     ('reject', 1, '08:15:00', 5.0),
     ('avoid_chase', 1, '08:15:00', 5.0),
     ('wait', 1, '15:31:00', 5.0),
 ])
-def test_hypothetical_return_uses_only_same_session_wait_plans(
+def test_hypothetical_return_uses_long_term_once_regardless_of_execution_quantity(
     client, tracked_symbol, short_action, short_quantity, short_time, return_pct,
 ):
     _store_bar(tracked_symbol, TRADE_DATE, 10_500)
@@ -240,8 +241,8 @@ def test_hypothetical_return_uses_only_same_session_wait_plans(
 
 
 @pytest.mark.parametrize(('rejected_at', 'return_pct'), [
-    ('2026-11-06T15:29:00+09:00', 5.0),
-    ('2026-11-06T15:31:00+09:00', 12.5),
+    ('2026-11-06T15:29:00+09:00', 31.25),
+    ('2026-11-06T15:31:00+09:00', 5.0),
 ])
 def test_newer_reject_only_replaces_wait_if_known_before_close(
     client, tracked_symbol, rejected_at, return_pct,
@@ -254,7 +255,7 @@ def test_newer_reject_only_replaces_wait_if_known_before_close(
             _store_plan(session, 'short-term-decider', action='wait', quantity=1, trigger=8_000, planned_at=planned_at),
         ]
         _store_decision(
-            session, 'short-term-decider', action='reject', trigger=8_000,
+            session, 'signal-decider', action='reject', trigger=10_000,
             decided_at=datetime.fromisoformat(rejected_at),
         )
     wait_price_observations.wait_price_observations.configure(
@@ -306,3 +307,145 @@ def test_holiday_default_uses_last_session_and_explicit_holiday_is_empty(client,
     result = client.get(RESULTS_PATH, params={'market_date': '2026-07-17'}).json()
     assert result['market_date'] == '2026-07-17'
     assert result['items'] == []
+
+
+def test_equal_capital_return_includes_each_wait_symbol_without_execution_plans(client, tracked_symbol, monkeypatch):
+    _set_clock(monkeypatch, '2026-11-06T15:31:00+09:00')
+    other = '987652'
+    with session_scope() as session:
+        row = Symbol(symbol=other, market='KOSPI', name_ko='Equal capital fixture')
+        session.add(row)
+        session.flush()
+        other_id = row.id
+        first = _store_decision(session, 'signal-decider', action='wait', trigger=100,
+            decided_at=datetime.fromisoformat('2026-11-05T21:00:00+09:00'))
+        second = _store_decision(session, 'signal-decider', action='wait', trigger=1000,
+            decided_at=datetime.fromisoformat('2026-11-05T21:00:00+09:00'))
+        second.symbol = other
+        watches = [WaitPriceWatch(
+            decision_snapshot_id=snapshot.id, decision_agent_name='signal-decider',
+            symbol=symbol, source_market_date=PREVIOUS_DATE.isoformat(),
+            observed_at='2026-11-05T21:00:00+09:00', trigger_price=str(trigger),
+        ) for snapshot, symbol, trigger in [(first, SYMBOL, 100), (second, other, 1000)]]
+    try:
+        wait_price_observations.wait_price_observations.configure(
+            TRADE_DATE, watches, now=datetime.fromisoformat('2026-11-06T09:02:00+09:00'),
+        )
+        _store_bar(tracked_symbol, TRADE_DATE, 110)
+        _store_bar(other_id, TRADE_DATE, 900)
+        result = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+        # Equal money buys ten times as many of the first stock: +10% and -10% average to zero.
+        assert result['hypothetical_return'] == {
+            'return_pct': 0.0, 'included_symbol_count': 2, 'monitored_symbol_count': 2,
+        }
+    finally:
+        with session_scope() as session:
+            session.execute(delete(SignalDeciderDecisionSnapshot).where(
+                SignalDeciderDecisionSnapshot.symbol == other,
+                SignalDeciderDecisionSnapshot.market_date == PREVIOUS_DATE,
+            ))
+            session.execute(delete(Symbol).where(Symbol.id == other_id))
+
+
+@pytest.mark.parametrize(('sample_time', 'status', 'source', 'expected'), [
+    ('2026-11-06T10:00:00+09:00', 'available', 'kis_rest_multi_quote', 10.0),
+    ('2026-11-06T10:00:00+09:00', 'available', 'kis_realtime_ws', 10.0),
+    ('2026-11-06T10:00:00+09:00', 'stale', 'kis_rest_multi_quote', 1.0),
+    ('2026-11-06T10:00:01+09:00', 'available', 'kis_rest_multi_quote', 1.0),
+    ('2026-11-06T08:59:00+09:00', 'available', 'kis_rest_multi_quote', 1.0),
+    ('2026-11-05T10:00:00+09:00', 'available', 'kis_rest_multi_quote', 1.0),
+    ('2026-11-06T10:00:00', 'available', 'kis_rest_multi_quote', 1.0),
+    ('2026-11-06T10:00:00+09:00', 'available', 'unknown', 1.0),
+])
+def test_current_valuation_uses_fresh_display_quotes_without_recording_a_trade(
+    client, tracked_symbol, monkeypatch, sample_time, status, source, expected,
+):
+    _set_clock(monkeypatch, '2026-11-06T10:00:00+09:00')
+    with session_scope() as session:
+        watch = _store_plan(session, 'signal-decider', action='wait', quantity=0,
+            trigger=10000, planned_at='2026-11-06T08:15:00+09:00')
+    wait_price_observations.wait_price_observations.configure(
+        TRADE_DATE, [watch], now=datetime.fromisoformat('2026-11-06T09:02:00+09:00'),
+    )
+    archive = monitoring_session_history.monitoring_session_history
+    archive.record(TRADE_DATE, {SYMBOL: MonitoringLastQuote(
+        Decimal('10100'), datetime.fromisoformat('2026-11-06T09:59:00+09:00'),
+    )})
+    monkeypatch.setattr(monitoring_session_results.kis_realtime_price_service, 'price_fields_for_symbol',
+        lambda symbol: {'current_price': 11000, 'price_as_of': sample_time, 'price_status': status,
+                        'price_source': source, 'display_price_available': True})
+    before = archive.read(TRADE_DATE)
+    response = client.get(RESULTS_PATH)
+    result = response.json()
+    assert result['hypothetical_return']['return_pct'] == expected
+    assert result['hypothetical_return']['included_symbol_count'] == 1
+    assert result['items'][0]['last_price'] == 10100
+    assert datetime.fromisoformat(result['items'][0]['last_price_at']) == datetime.fromisoformat('2026-11-06T09:59:00+09:00')
+    assert archive.read(TRADE_DATE) == before
+    _set_clock(monkeypatch, '2026-11-06T15:31:00+09:00')
+    assert client.get(RESULTS_PATH).json()['hypothetical_return']['return_pct'] == 1.0
+    _set_clock(monkeypatch, '2026-11-09T10:00:00+09:00')
+    def later_session_quote(symbol):
+        raise AssertionError('Historical valuation must not use the later session display quote')
+    monkeypatch.setattr(monitoring_session_results.kis_realtime_price_service,
+        'price_fields_for_symbol', later_session_quote)
+    archived = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+    assert archived['hypothetical_return']['return_pct'] == 1.0
+
+
+def test_rest_sample_values_a_wait_without_a_plan_or_recorded_trade(client, tracked_symbol, monkeypatch):
+    _set_clock(monkeypatch, '2026-11-06T10:00:00+09:00')
+    with session_scope() as session:
+        snapshot = _store_decision(session, 'signal-decider', action='wait', trigger=10000,
+            decided_at=datetime.fromisoformat('2026-11-05T21:00:00+09:00'))
+        watch = WaitPriceWatch(snapshot.id, 'signal-decider', SYMBOL, PREVIOUS_DATE.isoformat(),
+            '2026-11-05T21:00:00+09:00', '10000')
+    wait_price_observations.wait_price_observations.configure(
+        TRADE_DATE, [watch], now=datetime.fromisoformat('2026-11-06T09:02:00+09:00'),
+    )
+    monkeypatch.setattr(monitoring_session_results.kis_realtime_price_service, 'price_fields_for_symbol',
+        lambda symbol: {'current_price': 11000, 'price_as_of': '2026-11-06T10:00:00+09:00',
+            'price_status': 'available', 'price_source': 'kis_rest_multi_quote', 'display_price_available': True})
+    result = client.get(RESULTS_PATH).json()
+    assert result['hypothetical_return'] == {
+        'return_pct': 10.0, 'included_symbol_count': 1, 'monitored_symbol_count': 1,
+    }
+    assert result['items'][0]['price_status'] == 'unavailable'
+    assert result['items'][0]['last_price_at'] is None
+    assert monitoring_session_history.monitoring_session_history.read(TRADE_DATE) == {}
+
+
+@pytest.mark.parametrize(('newer_source', 'rejected_at', 'expected'), [
+    (None, None, 10.0),
+    (PREVIOUS_DATE, '2026-11-06T15:29:00+09:00', None),
+    (PREVIOUS_DATE, '2026-11-06T15:31:00+09:00', 10.0),
+    (TRADE_DATE, '2026-11-06T15:29:00+09:00', 10.0),
+    (date(2026, 11, 9), '2026-11-06T15:29:00+09:00', 10.0),
+])
+def test_carried_wait_survives_until_a_newer_prior_session_decision_replaces_it(
+    client, tracked_symbol, monkeypatch, newer_source, rejected_at, expected,
+):
+    _set_clock(monkeypatch, '2026-11-06T15:31:00+09:00')
+    source_date = date(2026, 11, 4)
+    with session_scope() as session:
+        snapshot = _store_decision(session, 'signal-decider', action='wait', trigger=10000,
+            decided_at=datetime.fromisoformat('2026-11-04T21:00:00+09:00'), market_date=source_date)
+        watch = WaitPriceWatch(snapshot.id, 'signal-decider', SYMBOL, source_date.isoformat(),
+            '2026-11-04T21:00:00+09:00', '10000')
+        if newer_source is not None:
+            _store_decision(session, 'signal-decider', action='reject', trigger=10000,
+                decided_at=datetime.fromisoformat(rejected_at), market_date=newer_source)
+    try:
+        wait_price_observations.wait_price_observations.configure(
+            TRADE_DATE, [watch], now=datetime.fromisoformat('2026-11-06T09:02:00+09:00'),
+        )
+        _store_bar(tracked_symbol, TRADE_DATE, 11000)
+        result = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+        assert result['hypothetical_return']['return_pct'] == expected
+        assert result['hypothetical_return']['included_symbol_count'] == (0 if expected is None else 1)
+    finally:
+        with session_scope() as session:
+            session.execute(delete(SignalDeciderDecisionSnapshot).where(
+                SignalDeciderDecisionSnapshot.symbol == SYMBOL,
+                SignalDeciderDecisionSnapshot.market_date.in_([source_date, TRADE_DATE, date(2026, 11, 9)]),
+            ))

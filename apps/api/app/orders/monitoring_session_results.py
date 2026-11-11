@@ -14,7 +14,6 @@ from app.db import session_scope
 from app.db_models import (
     DailyPriceBar,
     SignalDeciderDecisionSnapshot,
-    SignalDeciderExecutionPlanItem,
     Symbol,
 )
 from app.market.clock import KST
@@ -26,6 +25,7 @@ from app.market.session import (
 from app.market.symbol_codes import is_canonical_krx_short_code
 from app.quotes import monitoring_session_history
 from app.quotes.monitoring_session_history import MonitoringLastQuote
+from app.quotes.kis_realtime_prices import kis_realtime_price_service
 
 
 class MonitoringSymbolResult(BaseModel):
@@ -125,8 +125,8 @@ def _read_session(
                 )
             )
         }
-        lots = _verified_wait_lots(
-            session, market_date=market_date, previous_date=previous_date,
+        entries = _verified_wait_entries(
+            session, market_date=market_date,
             symbols=set(quotes), waits=waits, as_of=as_of,
         )
 
@@ -157,20 +157,43 @@ def _read_session(
             change=change,
             change_pct=change_pct,
         ))
-    cost = pnl = Decimal(0)
-    included = set()
-    for symbol, entry, quantity in lots:
-        if (price := evaluation_prices.get(symbol)) is not None:
-            cost += entry * quantity
-            pnl += (price - entry) * quantity
-            included.add(symbol)
+    if not session_closed:
+        opened_at = KRX_EXCHANGE_CALENDAR.session_open(market_date.isoformat()).to_pydatetime()
+        closed_at = KRX_EXCHANGE_CALENDAR.session_close(market_date.isoformat()).to_pydatetime()
+        valuation_cutoff = min(datetime.now(KST), closed_at)
+        for symbol in entries:
+            sample = kis_realtime_price_service.price_fields_for_symbol(symbol)
+            if (
+                sample.get('price_source') not in {'kis_realtime_ws', 'kis_rest_multi_quote'}
+                or sample.get('price_status') != 'available'
+                or sample.get('display_price_available') is not True
+                or (price := _positive_decimal(sample.get('current_price'))) is None
+            ):
+                continue
+            try:
+                sampled_at = datetime.fromisoformat(str(sample.get('price_as_of')))
+            except ValueError:
+                continue
+            if (
+                sampled_at.tzinfo is None or sampled_at > valuation_cutoff
+                or sampled_at.astimezone(KST).date() != market_date
+                or sampled_at < opened_at
+            ):
+                continue
+            recorded = quotes.get(symbol)
+            if recorded is None or sampled_at >= recorded.as_of:
+                evaluation_prices[symbol] = price
+    returns = [
+        (evaluation_prices[symbol] / entry - 1) * 100
+        for symbol, entry in entries.items() if symbol in evaluation_prices
+    ]
     return MonitoringSessionResults(
         market_date=market_date,
         previous_trade_date=previous_date,
         items=items,
         hypothetical_return=HypotheticalMonitoringReturn(
-            return_pct=float(pnl / cost * 100) if cost else None,
-            included_symbol_count=len(included),
+            return_pct=float(sum(returns) / len(returns)) if returns else None,
+            included_symbol_count=len(returns),
             monitored_symbol_count=len(quotes),
         ),
     )
@@ -188,35 +211,35 @@ def _is_wait(value: str | None) -> bool:
     return isinstance(value, str) and value.strip().lower() == 'wait'
 
 
-def _verified_wait_lots(
+def _verified_wait_entries(
     session: Session,
     *,
     market_date: date,
-    previous_date: date | None,
     symbols: set[str],
     waits: list[dict[str, Any]],
     as_of: datetime,
-) -> list[tuple[str, Decimal, Decimal]]:
-    if previous_date is None:
-        return []
-    triggers = {
-        (row['decision_snapshot_id'], row['symbol'], row['decision_agent_name']): trigger
-        for row in waits
-        if row['symbol'] in symbols and row['source_market_date'] == previous_date.isoformat()
-        and (trigger := _positive_decimal(row.get('trigger_price'))) is not None
-    }
+) -> dict[str, Decimal]:
+    triggers = {}
+    for row in waits:
+        try:
+            source_date = date.fromisoformat(row['source_market_date'])
+        except (TypeError, ValueError):
+            continue
+        trigger = _positive_decimal(row.get('trigger_price'))
+        if row['symbol'] in symbols and source_date < market_date and trigger is not None:
+            triggers[(row['decision_snapshot_id'], row['symbol'], row['decision_agent_name'], source_date)] = trigger
     if not triggers:
-        return []
+        return {}
     snapshot = SignalDeciderDecisionSnapshot
-    plan = SignalDeciderExecutionPlanItem
     latest = select(
         snapshot.id,
         func.row_number().over(
             partition_by=(snapshot.symbol, snapshot.agent_name),
-            order_by=(snapshot.created_at.desc(), snapshot.id.desc()),
+            order_by=(snapshot.market_date.desc(), snapshot.created_at.desc(), snapshot.id.desc()),
         ).label('rank'),
     ).where(
-        snapshot.market_date == previous_date,
+        snapshot.market_date >= min(key[3] for key in triggers),
+        snapshot.market_date < market_date,
         snapshot.symbol.in_(symbols),
         snapshot.agent_name.in_(DECISION_SUPPORT_AGENT_NAMES),
         snapshot.created_at <= as_of,
@@ -224,41 +247,22 @@ def _verified_wait_lots(
     ).subquery()
     rows = session.execute(
         select(
-            plan.symbol, plan.decision_agent_name, plan.decision_snapshot_id, plan.planned_quantity,
-            plan.traceability_payload['raw_action'].as_string().label('raw_action'),
-            plan.traceability_payload['trigger_price'].as_string().label('trigger_price'),
-            snapshot.next_day_open_action,
+            snapshot.id, snapshot.symbol, snapshot.agent_name, snapshot.market_date, snapshot.next_day_open_action,
             snapshot.response_payload['tactical_action'].as_string().label('tactical_action'),
             snapshot.response_payload['preferred_action'].as_string().label('preferred_action'),
         )
-        .join(snapshot, snapshot.id == plan.decision_snapshot_id)
         .join(latest, latest.c.id == snapshot.id)
-        .where(
-            latest.c.rank == 1,
-            snapshot.symbol == plan.symbol,
-            snapshot.agent_name == plan.decision_agent_name,
-            plan.target_trade_date == market_date,
-            plan.source_market_date == previous_date,
-            plan.execution_window == 'next_open',
-            plan.broker_name == 'kis',
-            plan.planned_side == 'buy',
-            plan.planned_quantity > 0,
-            plan.created_at <= as_of,
-            func.coalesce(plan.last_evaluated_at, plan.created_at) <= as_of,
-        )
-    )
-    lots = []
-    for row in rows:
+        .where(latest.c.rank == 1)
+    ).all()
+    entries = {}
+    for row in sorted(rows, key=lambda row: row.agent_name != SIGNAL_DECIDER_AGENT_NAME):
         action = row.next_day_open_action
-        if row.decision_agent_name != SIGNAL_DECIDER_AGENT_NAME:
+        if row.agent_name != SIGNAL_DECIDER_AGENT_NAME:
             action = row.tactical_action if row.tactical_action is not None else row.preferred_action
-        trigger = triggers.get((row.decision_snapshot_id, row.symbol, row.decision_agent_name))
-        quantity = _positive_decimal(row.planned_quantity)
+        trigger = triggers.get((row.id, row.symbol, row.agent_name, row.market_date))
         if (
-            _is_wait(action) and _is_wait(row.raw_action)
-            and (row.preferred_action is None or _is_wait(row.preferred_action))
-            and trigger is not None and trigger == _positive_decimal(row.trigger_price)
-            and quantity is not None
+            _is_wait(action) and (row.preferred_action is None or _is_wait(row.preferred_action))
+            and trigger is not None
         ):
-            lots.append((row.symbol, trigger, quantity))
-    return lots
+            entries.setdefault(row.symbol, trigger)
+    return entries
