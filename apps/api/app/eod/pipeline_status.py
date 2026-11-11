@@ -820,6 +820,7 @@ def _load_row_count_stage_counts(
         applicable_price_ids = {row.id for row in price_symbols} - preferred_ids
         preferred_symbols = sorted(row.symbol for row in price_symbols if row.id in preferred_ids)
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
+            preferred_not_applicable = stage_id in PREFERRED_SHARE_NOT_APPLICABLE_STAGES
             aggregate_columns = [
                 func.count(model.id),
                 func.max(model.captured_at),
@@ -828,10 +829,15 @@ def _load_row_count_stage_counts(
             if score_field_name is not None:
                 score_column = getattr(model, score_field_name)
                 decision_ready = score_column.is_not(None)
+                decision_degraded = score_column.is_(None)
+                if preferred_not_applicable:
+                    applicable_scope = model.symbol_id.in_(applicable_price_ids)
+                    decision_ready &= applicable_scope
+                    decision_degraded &= applicable_scope
                 aggregate_columns.extend(
                     (
                         func.count(model.id).filter(decision_ready),
-                        func.count(model.id).filter(score_column.is_(None)),
+                        func.count(model.id).filter(decision_degraded),
                         func.max(model.captured_at).filter(decision_ready),
                     )
                 )
@@ -844,7 +850,6 @@ def _load_row_count_stage_counts(
                         ),
                     )
                 )
-            preferred_not_applicable = stage_id in PREFERRED_SHARE_NOT_APPLICABLE_STAGES
             if preferred_not_applicable and not include_missing_diagnostics:
                 aggregate_columns.append(
                     func.count(model.id).filter(model.symbol_id.in_(applicable_price_ids))

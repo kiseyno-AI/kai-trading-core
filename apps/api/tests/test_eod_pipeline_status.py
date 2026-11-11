@@ -3,9 +3,11 @@ import json
 import unittest
 from copy import deepcopy
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
 from app.agent_context.roles import (
@@ -13,7 +15,7 @@ from app.agent_context.roles import (
     SUMMARIZER_AGENT_NAMES,
 )
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
-from app.db_models import DailyMomentumFactorResult
+from app.db_models import DailyMomentumFactorResult, DailyPriceBar, DailyQualityFactorResult, Symbol
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
@@ -957,6 +959,60 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def test_factor_score_quality_uses_applicable_membership_in_both_modes(self):
+        memory_engine = create_engine('sqlite://')
+        for model in (Symbol, DailyPriceBar, DailyQualityFactorResult):
+            model.__table__.create(memory_engine)
+        market_date = date(2026, 4, 21)
+        common_at = datetime(2026, 4, 21, 16)
+        preferred_at = datetime(2026, 4, 21, 17)
+        with Session(memory_engine) as session:
+            for sid, symbol, name in ((1, '005930', '삼성전자'), (2, '005935', '삼성전자우')):
+                session.add(Symbol(id=sid, symbol=symbol, name_ko=name, market='KOSPI'))
+                session.add(DailyPriceBar(
+                    symbol_id=sid, trade_date=market_date, open_price=100,
+                    high_price=100, low_price=100, close_price=100,
+                    volume=1, turnover=100, source='test',
+                ))
+            common = DailyQualityFactorResult(
+                symbol_id=1, market_date=market_date, factor_payload={},
+                captured_at=common_at,
+            )
+            preferred = DailyQualityFactorResult(
+                symbol_id=2, market_date=market_date, factor_payload={},
+                captured_at=preferred_at,
+            )
+            session.add_all([common, preferred])
+            session.commit()
+
+            @contextmanager
+            def scope():
+                yield session
+
+            for common_score, preferred_score in ((0.7, None), (None, 0.9), (0.7, 0.9)):
+                common.quality_score = common_score
+                preferred.quality_score = preferred_score
+                session.commit()
+                for detailed in (False, True):
+                    with (
+                        self.subTest(common=common_score, preferred=preferred_score, detailed=detailed),
+                        patch('app.eod.pipeline_status.session_scope', scope),
+                        patch('app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS', {
+                            'quality_factors': DailyQualityFactorResult,
+                        }),
+                    ):
+                        counts = _load_row_count_stage_counts(
+                            market_date=market_date.isoformat(),
+                            include_missing_diagnostics=detailed,
+                        )['quality_factors']
+                    self.assertEqual(counts['decision_ready_count'], int(common_score is not None))
+                    self.assertEqual(counts['decision_degraded_count'], int(common_score is None))
+                    self.assertEqual(
+                        counts['latest_decision_ready_at'],
+                        common_at.isoformat() if common_score is not None else None,
+                    )
+        memory_engine.dispose()
+
     def test_lightweight_status_keeps_preferred_shares_out_of_factor_missing_rows(self):
         session = MagicMock()
 
