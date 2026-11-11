@@ -10703,7 +10703,10 @@ class PykrxBackfillService:
                     market='KRX',
                     trade_date=market_date_iso,
                     source='pykrx',
+                    **({'automatic_only': True} if trigger == 'auto_close_scheduler' else {}),
                 )
+                if trigger == 'auto_close_scheduler' and latest_run is not None:
+                    recovery_eod_run_id = int(latest_run['id'])
             if latest_run and not force:
                 latest_run = self.reconcile_latest_daily_run_status(
                     trade_date=market_date_iso,

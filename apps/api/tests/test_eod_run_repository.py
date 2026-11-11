@@ -213,6 +213,145 @@ class EODCollectionCoverageTests(unittest.TestCase):
         )
 
 
+class AutomaticEODCollectionSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sqlite_engine = create_engine('sqlite+pysqlite:///:memory:')
+        EODCollectionRun.__table__.create(self.sqlite_engine)
+        self.session_factory = sessionmaker(bind=self.sqlite_engine, future=True)
+
+    def tearDown(self) -> None:
+        self.sqlite_engine.dispose()
+
+    @contextmanager
+    def _session_scope(self):
+        with self.session_factory.begin() as session:
+            yield session
+
+    def _add_run(self, *, trigger: str, mode: str | None, minute: int) -> int:
+        with self.session_factory.begin() as session:
+            run = EODCollectionRun(
+                market='KRX',
+                trade_date=date(2026, 11, 11),
+                source='pykrx',
+                trigger=trigger,
+                status='completed',
+                started_at=datetime(2026, 11, 11, 12, minute, tzinfo=timezone.utc),
+                run_metadata={'mode': mode} if mode is not None else {},
+            )
+            session.add(run)
+            session.flush()
+            return run.id
+
+    def test_automatic_only_selects_before_ordering_and_limit(self) -> None:
+        automatic_run_id = self._add_run(
+            trigger='auto_close_scheduler', mode='daily_auto', minute=0,
+        )
+        for minute in range(1, 13):
+            self._add_run(
+                trigger='manual_daily_api',
+                mode='daily_auto' if minute % 2 else None,
+                minute=minute,
+            )
+        self._add_run(
+            trigger='auto_close_scheduler', mode='historical_backfill', minute=13,
+        )
+        self._add_run(
+            trigger='autoXclose', mode='daily_auto', minute=14,
+        )
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            latest = load_latest_eod_collection_run(
+                market='KRX',
+                trade_date='2026-11-11',
+                source='pykrx',
+                automatic_only=True,
+            )
+            rows = list_eod_collection_runs(
+                market='KRX',
+                trade_date='2026-11-11',
+                source='pykrx',
+                automatic_only=True,
+                limit=1,
+            )
+
+        self.assertEqual(latest['id'], automatic_run_id)
+        self.assertEqual([row['id'] for row in rows], [automatic_run_id])
+
+    def test_default_selection_keeps_latest_manual_run(self) -> None:
+        self._add_run(
+            trigger='auto_close_scheduler', mode='daily_auto', minute=0,
+        )
+        for minute, mode in enumerate(('daily_auto', None, ''), start=1):
+            with self.subTest(mode=mode):
+                manual_run_id = self._add_run(
+                    trigger='manual_daily_api', mode=mode, minute=minute,
+                )
+                with patch(
+                    'app.repositories.eod_run_repository.session_scope',
+                    self._session_scope,
+                ):
+                    latest = load_latest_eod_collection_run(
+                        market='KRX', trade_date='2026-11-11', source='pykrx',
+                    )
+                    rows = list_eod_collection_runs(
+                        market='KRX',
+                        trade_date='2026-11-11',
+                        source='pykrx',
+                        automatic_only=False,
+                        limit=1,
+                    )
+
+                self.assertEqual(latest['id'], manual_run_id)
+                self.assertEqual([row['id'] for row in rows], [manual_run_id])
+
+    def test_automatic_only_accepts_legacy_and_normalized_daily_runs(self) -> None:
+        cases = (
+            ('auto_close', None),
+            (' auto_close_scheduler ', ''),
+            ('auto_other_scheduler', ' daily_auto '),
+        )
+        for minute, (trigger, mode) in enumerate(cases):
+            with self.subTest(trigger=trigger, mode=mode):
+                run_id = self._add_run(trigger=trigger, mode=mode, minute=minute)
+                with patch(
+                    'app.repositories.eod_run_repository.session_scope',
+                    self._session_scope,
+                ):
+                    latest = load_latest_eod_collection_run(
+                        market='KRX',
+                        trade_date='2026-11-11',
+                        source='pykrx',
+                        automatic_only=True,
+                    )
+
+                self.assertEqual(latest['id'], run_id)
+
+    def test_automatic_only_returns_no_manual_or_non_daily_fallback(self) -> None:
+        for minute, (trigger, mode) in enumerate((
+            ('manual_daily_api', 'daily_auto'),
+            ('manual_api', None),
+            ('auto_close_scheduler', 'historical_backfill'),
+            ('auto_other_scheduler', None),
+        )):
+            self._add_run(trigger=trigger, mode=mode, minute=minute)
+
+        with patch(
+            'app.repositories.eod_run_repository.session_scope',
+            self._session_scope,
+        ):
+            latest = load_latest_eod_collection_run(
+                market='KRX',
+                trade_date='2026-11-11',
+                source='pykrx',
+                automatic_only=True,
+            )
+
+        self.assertIsNone(latest)
+
+
 class DailyPriceBarRunProvenanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sqlite_engine = create_engine('sqlite+pysqlite:///:memory:')

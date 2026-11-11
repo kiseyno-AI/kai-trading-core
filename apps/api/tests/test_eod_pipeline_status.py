@@ -1420,8 +1420,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             official_run_loader=lambda **_: None,
             official_stage_history_loader=lambda **_: {},
             price_bar_count_loader=lambda **_: 2,
-            technical_snapshot_count_loader=lambda *_: 2,
-            action_summary_count_loader=lambda *_: 2,
+            # The historical membership includes one symbol that is inactive today.
+            price_context_count_loader=lambda *_: 1,
+            technical_snapshot_count_loader=lambda *_: 1,
+            action_summary_count_loader=lambda *_: 1,
             row_count_stage_counts_loader=lambda **_: {},
             row_count_scope_gap_loader=scope_gap_loader,
         )
@@ -1443,6 +1445,12 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ],
             ['005930'],
         )
+        for stage_id in ('technical_snapshots', 'action_summaries'):
+            with self.subTest(stage=stage_id):
+                stage = result['stages'][stage_id]
+                self.assertEqual(stage['status'], 'completed')
+                self.assertEqual(stage['gate_status'], 'ready')
+                self.assertEqual((stage['processed'], stage['succeeded'], stage['failed']), (2, 2, 0))
 
     def test_feedback_prerequisite_isolates_completed_signal_feature_scope(self):
         market_date = '2026-04-21'
@@ -1531,6 +1539,22 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         stage['details']['exact_universe_coverage']['missing_count'], 1
                     )
                     self.assertEqual(result['ready'], gate == 'ready')
+
+    def test_exact_scope_counts_include_missing_rows_in_processed(self):
+        stage = EODPipelineStatusService._normalize_stored_pykrx_coverage_stage(
+            {'status': 'missing'},
+            persisted=1,
+            expected_total=2,
+            exact_scope_gap=_scope_gap_evidence(
+                requested_count=2,
+                present_count=1,
+                missing_symbols_sample=['005930'],
+            ),
+        )
+        self.assertEqual(stage['succeeded'], 1)
+        self.assertEqual(stage['failed'], 1)
+        self.assertEqual(stage['processed'], 2)
+        self.assertEqual(stage['remaining'], 0)
 
     def test_read_blocks_complete_factor_count_when_requested_symbol_is_missing(self):
         requested_symbols = ['000660', '005930']
@@ -3218,6 +3242,60 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(coverage['present_count'], 1)
         self.assertEqual(coverage['not_applicable_count'], 1)
         self.assertEqual(coverage['missing_symbols_sample'], ['035420', '999999'])
+
+    def test_legacy_dart_completion_recognizes_only_scoped_preferred_symbols(self):
+        market_date = '2026-11-09'
+        metadata = build_exact_symbol_scope_outcome(
+            manifest_version='dart_daily_data_scope_outcomes_v1',
+            selected_symbols=['005930', '005935', '035420'],
+            successful_symbols=['005930'],
+            retry_debt_symbols=[],
+            terminal_not_applicable_symbols=['005935', '035420'],
+        )
+        metadata['terminal_policy_version'] = 'dart_missing_corp_mapping_not_applicable_v1'
+        service = EODPipelineStatusService(
+            market_state_loader=_FakeMarketState,
+            pykrx_run_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            live_symbol_count_loader=lambda: 4,
+            fundamentals_refresh_loader=lambda **_: {
+                'id': 538,
+                'market_date': market_date,
+                'fs_div': 'CFS',
+                'status': 'completed',
+                'run_metadata': metadata,
+            },
+        )
+
+        with patch('app.eod.pipeline_status.session_scope') as scope:
+            scope.return_value.__enter__.return_value.execute.return_value = [
+                SimpleNamespace(symbol='005935', name_ko='삼성전자우', market='KOSPI'),
+                SimpleNamespace(symbol='035420', name_ko='NAVER', market='KOSPI'),
+                SimpleNamespace(symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+            ]
+            accepted = service.read(
+                market_date=market_date, fs_div='CFS', scope_symbols=['005930', '005935'],
+            )
+            wider = service.read(
+                market_date=market_date, fs_div='CFS',
+                scope_symbols=['005930', '005935', '035420', '000660'],
+            )
+            different_date = service.read(
+                market_date='2026-11-06', fs_div='CFS', scope_symbols=['005935'],
+            )
+            metadata['preferred_not_applicable_stock_codes'] = []
+            explicit_empty = service.read(
+                market_date=market_date, fs_div='CFS', scope_symbols=['005935'],
+            )
+
+        self.assertEqual(accepted['stages']['fundamentals_daily_refresh']['gate_status'], 'ready')
+        dart_stage = wider['stages']['fundamentals_daily_refresh']
+        self.assertEqual(dart_stage['gate_status'], 'blocked')
+        coverage = dart_stage['details']['requested_scope_coverage']
+        self.assertEqual(coverage['not_applicable_count'], 1)
+        self.assertEqual(coverage['missing_symbols_sample'], ['035420', '000660'])
+        for result in (different_date, explicit_empty):
+            self.assertEqual(result['stages']['fundamentals_daily_refresh']['gate_status'], 'blocked')
 
     def test_pykrx_global_completion_does_not_cover_missing_requested_symbol(self):
         coverage = _full_pykrx_enrichment_coverage(

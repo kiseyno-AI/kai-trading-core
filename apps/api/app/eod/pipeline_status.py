@@ -5979,6 +5979,8 @@ class EODPipelineStatusService:
             self._build_fundamentals_requested_scope_coverage(
                 run=run,
                 scope_symbols=scope_symbols or [],
+                market_date=date.fromisoformat(market_date),
+                fs_div=fs_div,
             )
             if scope_symbols
             else None
@@ -6081,6 +6083,8 @@ class EODPipelineStatusService:
         *,
         run: dict[str, Any],
         scope_symbols: list[str],
+        market_date: date | None = None,
+        fs_div: str | None = None,
     ) -> dict[str, Any]:
         requested_symbols = cls._normalize_symbol_list(scope_symbols)
         unresolved = set(requested_symbols)
@@ -6203,15 +6207,40 @@ class EODPipelineStatusService:
                 continue
             if run_status == 'completed' and run_retry_debt:
                 continue
-            raw_preferred = evidence_metadata.get(
-                'preferred_not_applicable_stock_codes'
+            preferred = set(
+                cls._normalize_symbol_list(
+                    evidence_metadata.get('preferred_not_applicable_stock_codes')
+                )
             )
-            preferred = (
-                set(cls._normalize_symbol_list(raw_preferred))
-                if isinstance(raw_preferred, list)
-                else set()
-            )
-            not_applicable.update(covered & run_terminal & preferred)
+            terminal_in_scope = covered & run_terminal
+            if (
+                terminal_in_scope
+                and 'preferred_not_applicable_stock_codes' not in evidence_metadata
+                and evidence_version == 'dart_daily_data_scope_outcomes_v1'
+                and evidence_metadata.get('terminal_policy_version')
+                == 'dart_missing_corp_mapping_not_applicable_v1'
+                and run_status == 'completed'
+                and evidence_run.get('id') is not None
+                and market_date is not None
+                and evidence_run.get('market_date') == market_date.isoformat()
+                and fs_div is not None
+                and evidence_run.get('fs_div') == fs_div
+            ):
+                # Legacy manifests did not distinguish preferred shares from other unmapped symbols.
+                with session_scope() as session:
+                    preferred = {
+                        row.symbol
+                        for row in session.execute(
+                            select(Symbol.symbol, Symbol.name_ko, Symbol.market)
+                            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+                            .where(
+                                Symbol.symbol.in_(terminal_in_scope),
+                                DailyPriceBar.trade_date == market_date,
+                            )
+                        )
+                        if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
+                    }
+            not_applicable.update(terminal_in_scope & preferred)
             valid_evidence_run_ids.append(evidence_run.get('id'))
             for symbol in covered:
                 source_run_ids_by_symbol[symbol] = evidence_run.get('id')
@@ -7188,9 +7217,9 @@ class EODPipelineStatusService:
         )
         counts = build_stage_counts(
             total=normalized_total,
-            succeeded=min(exact_present_count, normalized_total),
-            failed=max(exact_missing_count, normalized_total - persisted, 0),
-            processed=min(persisted, normalized_total),
+            succeeded=exact_present_count,
+            failed=exact_missing_count,
+            processed=exact_present_count + exact_missing_count,
         )
         if coverage_verified:
             status = (

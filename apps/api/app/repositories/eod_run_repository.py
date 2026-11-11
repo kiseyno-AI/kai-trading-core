@@ -548,7 +548,9 @@ def load_latest_eod_collection_run(
     source: str | None = None,
     statuses: Sequence[str] | None = None,
     statement_timeout_ms: int | None = None,
+    automatic_only: bool = False,
 ) -> dict | None:
+    automatic_options = {'automatic_only': True} if automatic_only else {}
     rows = list_eod_collection_runs(
         market=market,
         trade_date=trade_date,
@@ -556,6 +558,7 @@ def load_latest_eod_collection_run(
         statuses=statuses,
         limit=1,
         statement_timeout_ms=statement_timeout_ms,
+        **automatic_options,
     )
     if not rows:
         return None
@@ -571,6 +574,7 @@ def list_eod_collection_runs(
     excluded_run_metadata_modes: Sequence[str] | None = None,
     limit: int = 10,
     statement_timeout_ms: int | None = None,
+    automatic_only: bool = False,
 ) -> list[dict[str, Any]]:
     session_options = (
         {'statement_timeout_ms': statement_timeout_ms}
@@ -586,6 +590,25 @@ def list_eod_collection_runs(
             stmt = stmt.where(EODCollectionRun.source == source)
         if statuses:
             stmt = stmt.where(EODCollectionRun.status.in_(statuses))
+        if automatic_only:
+            normalized_trigger = func.trim(
+                func.coalesce(EODCollectionRun.trigger, '')
+            )
+            metadata_mode = func.trim(
+                func.coalesce(EODCollectionRun.run_metadata['mode'].as_string(), '')
+            )
+            stmt = stmt.where(
+                or_(
+                    and_(
+                        metadata_mode == 'daily_auto',
+                        normalized_trigger.like(r'auto\_%', escape='\\'),
+                    ),
+                    and_(
+                        metadata_mode == '',
+                        normalized_trigger.in_(_AUTO_DAILY_LEGACY_EOD_TRIGGERS),
+                    ),
+                )
+            )
         if excluded_run_metadata_modes:
             metadata_mode = func.coalesce(
                 EODCollectionRun.run_metadata['mode'].as_string(),
