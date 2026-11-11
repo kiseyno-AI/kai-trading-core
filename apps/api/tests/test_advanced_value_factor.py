@@ -1564,7 +1564,7 @@ class DailyAdvancedValueFactorFundamentalsLoaderIntegrationTests(unittest.TestCa
                 statement_type='CF', statement_name='현금흐름표',
                 account_id='dart_PurchaseOfOtherIntangibleAssets',
                 account_name='기타 무형자산의 취득', current_amount=40,
-                row_order=1, currency='KRW',
+                row_order=1, currency='KRW', payload={},
             ))
         loaded = self.service._load_latest_annual_fundamentals(
             market_date=date(2026, 4, 24), symbols=[stock_code],
