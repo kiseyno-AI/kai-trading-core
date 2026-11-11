@@ -9916,6 +9916,9 @@ class DailyPipelineStageService:
         ):
             return None
         expected_role_symbol_scopes: dict[str, list[str]] = {}
+        expected_symbols = set(normalized_expected_symbols)
+        diagnostics = (progress_summary.get('funnel_diagnostics') or {}).get('role_diagnostics') or {}
+        economically_excluded: set[str] = set()
         for role in DECISION_SUPPORT_AGENT_NAMES:
             raw_role_scope = raw_role_symbol_scopes.get(role)
             if not isinstance(raw_role_scope, list):
@@ -9923,33 +9926,31 @@ class DailyPipelineStageService:
             normalized_role_scope = normalize_symbol_codes(raw_role_scope)
             if (
                 normalized_role_scope != raw_role_scope
-                or not set(normalized_role_scope).issubset(
-                    normalized_expected_symbols
-                )
+                or not set(normalized_role_scope).issubset(expected_symbols)
             ):
                 return None
             expected_role_symbol_scopes[role] = normalized_role_scope
-        dispatched_symbols = set().union(*expected_role_symbol_scopes.values())
-        omitted_symbols = set(normalized_expected_symbols) - dispatched_symbols
-        if omitted_symbols:
-            diagnostics = (progress_summary.get('funnel_diagnostics') or {}).get('role_diagnostics') or {}
-            economically_excluded: set[str] = set()
-            for role in DECISION_SUPPORT_AGENT_NAMES:
-                role_diagnostics = diagnostics.get(role) or {}
-                economics = {
-                    symbol for symbol, evidence in (role_diagnostics.get('entry_economics_exclusions') or {}).items()
-                    if isinstance(evidence, Mapping)
-                    and evidence.get('code') == 'entry_reward_risk_below_role_floor'
-                    and role in (evidence.get('excluded_roles') or [])
-                }
-                capped = role_diagnostics.get('cap_excluded_symbols') or []
-                if role_diagnostics.get('cap_excluded_symbol_count') != len(capped):
-                    capped = []
-                if not omitted_symbols <= economics.union(capped):
-                    return None
-                economically_excluded.update(economics)
-            if not omitted_symbols <= economically_excluded:
+            missing_from_role = expected_symbols.difference(normalized_role_scope)
+            if not missing_from_role:
+                continue
+            role_diagnostics = diagnostics.get(role) or {}
+            economics = {
+                symbol
+                for symbol, evidence in (role_diagnostics.get('entry_economics_exclusions') or {}).items()
+                if isinstance(evidence, Mapping)
+                and evidence.get('code') == 'entry_reward_risk_below_role_floor'
+                and role in (evidence.get('excluded_roles') or [])
+            }
+            capped = role_diagnostics.get('cap_excluded_symbols') or []
+            if role_diagnostics.get('cap_excluded_symbol_count') != len(capped):
+                capped = []
+            if not missing_from_role <= economics.union(capped):
                 return None
+            economically_excluded.update(economics & missing_from_role)
+        dispatched_symbols = set().union(*expected_role_symbol_scopes.values())
+        omitted_symbols = expected_symbols - dispatched_symbols
+        if not omitted_symbols <= economically_excluded:
+            return None
 
         resolution = resolve_terminal_independent_role_success(
             progress_summary=progress_summary,

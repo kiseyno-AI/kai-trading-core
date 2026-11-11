@@ -12685,10 +12685,13 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertIsNone(build_proof(outcome, expected_decider_symbols=symbols, feedback_cutoff_resolution=cutoff))
         outcome['result']['progress']['summary']['funnel_diagnostics'] = {
             'role_diagnostics': {
-                role: {'entry_economics_exclusions': {
-                    '005930': {'code': 'entry_reward_risk_below_role_floor', 'excluded_roles': [role]},
-                }}
-                for role in DECISION_SUPPORT_AGENT_NAMES
+                'signal-decider': {'entry_economics_exclusions': {
+                    '005930': {'code': 'entry_reward_risk_below_role_floor', 'excluded_roles': ['signal-decider']},
+                }},
+                'short-term-decider': {'entry_economics_exclusions': {
+                    '000660': {'code': 'entry_reward_risk_below_role_floor', 'excluded_roles': ['short-term-decider']},
+                    '005930': {'code': 'entry_reward_risk_below_role_floor', 'excluded_roles': ['short-term-decider']},
+                }},
             },
         }
         proof = build_proof(outcome, expected_decider_symbols=symbols, feedback_cutoff_resolution=cutoff)
@@ -12696,6 +12699,36 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(proof['entry_economics_excluded_symbols'], ['005930'])
         self.assertEqual(proof['completed_symbols_by_role'], {'signal-decider': ['000660'], 'short-term-decider': []})
         self.assertEqual(proof['total_items'], 1)
+
+    def test_terminal_proof_requires_exclusion_evidence_for_each_lane(self) -> None:
+        symbols = ['000660']
+        outcome, cutoff = _terminal_decider_outcome_with_role_failures(
+            symbols=symbols,
+            failed_symbols_by_role={},
+            cutoff_at=datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc),
+            role_scopes={'signal-decider': symbols, 'short-term-decider': []},
+        )
+        build_proof = DailyPipelineStageService._terminal_decider_progression_proof
+        proof_kwargs = {
+            'expected_decider_symbols': symbols,
+            'feedback_cutoff_resolution': cutoff,
+        }
+        self.assertIsNone(build_proof(outcome, **proof_kwargs))
+
+        outcome['result']['progress']['summary']['funnel_diagnostics'] = {
+            'role_diagnostics': {'short-term-decider': {'entry_economics_exclusions': {
+                '000660': {
+                    'code': 'entry_reward_risk_below_role_floor',
+                    'excluded_roles': ['short-term-decider'],
+                },
+            }}},
+        }
+        proof = build_proof(outcome, **proof_kwargs)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['completed_symbols_by_role'], {
+            'signal-decider': symbols,
+            'short-term-decider': [],
+        })
 
     def test_run_advances_short_lane_without_unscoped_signal_evaluation(
         self,
