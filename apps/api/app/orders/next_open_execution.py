@@ -4341,6 +4341,53 @@ class SignalDeciderNextOpenExecutionService:
             'items': [self._serialize_row(row) for row in rows],
         }
 
+    def list_plan_overview(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+    ) -> dict[str, Any]:
+        resolved_target_date = self._resolve_target_trade_date(target_trade_date)
+        model = SignalDeciderExecutionPlanItem
+        price_fields = ('raw_action', 'trigger_price', 'chase_limit_price', 'target_price', 'stop_loss_price')
+        # Extract only display fields in SQL so evidence blobs never cross the DB boundary.
+        stmt = select(
+            model,
+            *(model.traceability_payload[field].label(field) for field in price_fields),
+            model.traceability_payload['tactical_action'].label('tactical_action'),
+        ).options(
+            defer(model.traceability_payload),
+            defer(model.validation_payload),
+            defer(model.submission_payload),
+        ).where(
+            model.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+            model.target_trade_date == resolved_target_date,
+        ).order_by(model.decision_agent_name, model.symbol, model.id)
+        with session_scope() as session:
+            selected = session.execute(stmt).all()
+            rows = [selected_row[0] for selected_row in selected]
+            summary = self._build_summary(
+                rows=rows,
+                target_trade_date=resolved_target_date,
+                runtime=self.runtime_status(),
+            )
+            items = []
+            for selected_row in selected:
+                row = selected_row[0]
+                display = {field: selected_row._mapping[field] for field in price_fields}
+                display['raw_action'] = display['raw_action'] or selected_row._mapping['tactical_action']
+                items.append({
+                    'symbol': row.symbol,
+                    'decision_agent_name': row.decision_agent_name,
+                    **display,
+                })
+        return {
+            'summary': {key: summary[key] for key in (
+                'target_trade_date', 'source_market_date', 'items_total',
+                'planned_count', 'blocked_count', 'awaiting_trigger_count',
+            )},
+            'items': items,
+        }
+
     def refresh_plan_if_due(
         self,
         *,
