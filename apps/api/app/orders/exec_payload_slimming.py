@@ -1235,6 +1235,9 @@ def slim_signal_decider_exec_submission_payload(
         'mode': payload.get('mode') or 'exec_dispatch',
         'exec_dispatch': critical_exec,
     }
+    if isinstance(payload.get('core_quantity_sizing'), dict):
+        # Quantity replay/CAS evidence must survive diagnostic payload trimming.
+        slimmed_payload['core_quantity_sizing'] = copy.deepcopy(_json_safe(payload['core_quantity_sizing']))
     if critical_revocation is not None:
         slimmed_payload['revocation'] = critical_revocation
     if critical_revocation_history is not None:

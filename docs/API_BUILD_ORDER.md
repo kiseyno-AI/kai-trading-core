@@ -81,6 +81,15 @@
 - `GET /execution/runtime/daily-board?market_date=YYYY-MM-DD&refresh=true`
 - `GET /execution/runtime/symbols/005930?market_date=YYYY-MM-DD&refresh=true`
 - `GET /trading/orders/next-open-execution?target_trade_date=YYYY-MM-DD&refresh=false`
+
+New dispatch BUY quantities use Core-owned `core_sized` cumulative whole-share
+allowances. Inspect `submission.core_quantity_sizing` for calculation inputs,
+immutable initial policy, last acknowledged policy and pending quantity-only
+delivery. The shared preopen/OPEN runner refreshes quantities every two hours
+without rerunning daily stages or agents. Filled holdings and price levels are
+unchanged; Exec retains order-state and execution-time checks. Accepted legacy
+agent-sized plans remain compatible. See [quantity planning](CORE_QUANTITY_SIZING.md).
+
 - `GET /trading/orders/next-open-execution/overview?target_trade_date=YYYY-MM-DD`
 - `POST /trading/orders/next-open-execution/run-if-due`
 - `GET /trading/orders/intraday-auto-sell?account_reference=KIS:12345678-01&symbol=005930&refresh=false`

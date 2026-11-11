@@ -19,6 +19,7 @@
 - **`app/dart/`** — DART company snapshot logic plus incremental disclosure-event sync, fundamentals capture, and DART persistence/repository code.
 - **`app/brokers/kis/`** — KIS client/provider/schemas.
 - **`app/orders/next_open_execution.py`** — persisted next-open planner and safety checks. Core-local next-open BUY submission is disabled in every mode; `app/orders/exec_integration.py` owns Core-side plan registration, activation, and readback (see [execution boundary](docs/architecture/README.md#execution)).
+- **`app/orders/core_quantity_sizing.py` + `core_quantity_refresh.py`** — deterministic account/cohort sizing and durable preopen/open/two-hour quantity revisions. Core owns quantities; Exec owns orders and execution-time checks. Decider prices and filled inventory remain unchanged (see [quantity planning](docs/CORE_QUANTITY_SIZING.md)).
 - **`app/orders/intraday_auto_sell.py`** — retained compatibility watcher for linked positions. It checks target/stop thresholds, current quantities, duplicate exits, and dry-run settings before the durable sell flow; disabled by default (see [auto-sell](docs/architecture/README.md#auto-sell)).
 - **`app/integrations/`** — BOK, FX (Korea Exim), etc.
 - **`app/fx/`** — Korea Exim FX service-level normalization, filtering, and date fallback behavior.

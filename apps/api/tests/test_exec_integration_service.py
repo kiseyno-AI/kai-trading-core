@@ -4033,6 +4033,7 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             tuple[str, datetime | None]
         ] = []
         self.original_settings = {
+            'core_quantity_sizing_enabled': settings.core_quantity_sizing_enabled,
             'signal_decider_exec_integration_mode': settings.signal_decider_exec_integration_mode,
             'signal_decider_exec_base_url': settings.signal_decider_exec_base_url,
             'signal_decider_exec_bearer_token': settings.signal_decider_exec_bearer_token,
@@ -4044,6 +4045,8 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
             'signal_decider_next_open_account_targets': settings.signal_decider_next_open_account_targets,
         }
         settings.signal_decider_exec_integration_mode = 'dispatch'
+        # This fixture exercises legacy agent-sized handoff compatibility.
+        settings.core_quantity_sizing_enabled = False
         settings.signal_decider_exec_base_url = 'http://exec.test'
         settings.signal_decider_exec_bearer_token = ''
         settings.signal_decider_exec_dispatch_source = 'kai-trading-core'
@@ -4229,6 +4232,70 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             session.execute(delete(Symbol).where(Symbol.symbol.in_(self.seeded_symbols)))
+
+    async def test_core_sized_handoff_uses_each_roles_quantity_without_exec_agent_sizing(self) -> None:
+        short_id = self._seed_short_term_snapshot()
+        self._seed_short_term_plan_item(snapshot_id=short_id)
+        prepared = {}
+
+        async def prepare_initial(*, rows, snapshots, dry_run):
+            from app.orders.core_quantity_refresh import CoreQuantityRefreshService
+
+            self.assertFalse(dry_run)
+            for row in rows:
+                quantity = 7 if row.decision_agent_name == 'signal-decider' else 3
+                policy = {
+                    'type': 'core_sized', 'target_quantity': quantity, 'revision': 1,
+                    'calculated_at': '2026-04-30T00:00:00+00:00',
+                    'valid_until': '2026-04-30T02:00:00+00:00',
+                    'sizing_inputs': {'price_contract_digest': CoreQuantityRefreshService._candidate(
+                        row, snapshots[row.decision_snapshot_id],
+                    )['price_contract_digest']},
+                }
+                prepared[row.decision_agent_name] = quantity
+                row.submission_payload = {'core_quantity_sizing': {
+                    'initial_policy': policy, 'policy': policy,
+                    'source_binding': _row_dispatch_revision_fingerprint(row),
+                }}
+
+        self.service._core_quantity_refresh_service = SimpleNamespace(
+            prepare_initial=AsyncMock(side_effect=prepare_initial),
+        )
+        settings.core_quantity_sizing_enabled = True
+        result = await self.service.dispatch_next_open_plan(
+            target_trade_date=self.target_trade_date, refresh_plan=False, trigger='test_core_quantity',
+        )
+        self.assertEqual(result['summary']['dispatched_group_count'], 2)
+        for payload in self.client.post_calls:
+            entry = next(item for item in payload['items'] if item['side'] == 'buy')
+            self.assertEqual(entry['quantity_policy']['type'], 'core_sized')
+            self.assertEqual(entry['quantity_policy']['target_quantity'], prepared[entry['decision_agent_name']])
+            self.assertNotIn('budget_krw', entry['quantity_policy'])
+            self.assertNotIn('quantity', entry['quantity_policy'])
+            for item in payload['items']:
+                if item['side'] == 'sell':
+                    self.assertEqual(item['quantity_policy']['type'], 'position_exit_from_entry')
+
+    def test_plan_inspection_reports_the_core_quantity_instead_of_a_legacy_fixed_preview(self) -> None:
+        short_id = self._seed_short_term_snapshot()
+        row_id = self._seed_short_term_plan_item(snapshot_id=short_id)
+        policy = {
+            'type': 'core_sized', 'target_quantity': 9, 'revision': 2,
+            'calculated_at': '2026-04-30T00:00:00+00:00',
+            'valid_until': '2026-04-30T02:00:00+00:00',
+            'sizing_inputs': {'sizing_price': '51500', 'price_contract_digest': 'a' * 64},
+        }
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            row.submission_payload = {'core_quantity_sizing': {'policy': policy, 'status': 'acknowledged'}}
+        result = signal_decider_next_open_execution_service.list_plan_items(
+            target_trade_date=self.target_trade_date, account_reference=self.account_reference, refresh=False,
+        )
+        item = next(item for item in result['items'] if item['plan_item_id'] == row_id)
+        self.assertEqual(Decimal(item['planned_quantity']), Decimal('9'))
+        self.assertEqual(Decimal(item['estimated_notional_krw']), Decimal('463500'))
+        self.assertEqual(item['quantity_basis'], 'cumulative_buy_allowance')
+        self.assertEqual(item['approval_state'], 'core_quantity_acknowledged')
 
     def test_dispatch_revision_fingerprint_covers_server_owned_order_material(self) -> None:
         row = SimpleNamespace(
