@@ -308,6 +308,28 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
                 self.assertEqual(derive_annual_financial_context(snapshot)['capital_expenditure'], 80.0)
                 snapshot.statement_rows.remove(total)
 
+    def test_capex_components_exclude_non_cash_amortisation(self) -> None:
+        snapshot = _snapshot(
+            '005930', total_equity=1000, total_liabilities=400,
+            operating_income=120, operating_cash_flow=260,
+            cash=150, capex_ppe=None,
+        )
+        snapshot.statement_rows.extend([
+            _statement_row(
+                'other_intangible', statement_type='CF',
+                account_id='dart_PurchaseOfOtherIntangibleAssets',
+                account_name='Purchase of other intangible assets', amount=40, row_order=2,
+            ),
+            _statement_row(
+                'amortisation', statement_type='CF',
+                account_id='ifrs-full_AdjustmentsForAmortisationExpense',
+                account_name='Amortisation of intangible assets', amount=10, row_order=3,
+            ),
+        ])
+        context = derive_annual_financial_context(snapshot)
+        self.assertEqual(context['capital_expenditure'], 40.0)
+        self.assertEqual(context['depreciation_and_amortization'], 10.0)
+
     def test_derive_annual_financial_context_prefers_canonical_cash_highlight(self) -> None:
         snapshot = _snapshot(
             '005930',

@@ -547,12 +547,19 @@ def _extract_metric_with_fallback(
 def _extract_capex(
     rows: Sequence[dict[str, Any]], matcher: dict[str, Any],
 ) -> tuple[float | None, dict[str, Any] | None]:
-    candidates = [
-        row for row in rows
-        if row.get('statement_type') == 'CF'
-        and _match_score(row, matcher=matcher) is not None
-        and _statement_amount(row, flow=True)[0] is not None
-    ]
+    candidates = []
+    for row in rows:
+        account_text = _normalize_match_text(
+            str(row.get('account_id') or '') + str(row.get('account_name') or '')
+        )
+        acquisition = any(token in account_text for token in ('취득', 'purchase', 'acquisition'))
+        if (
+            str(row.get('statement_type') or '').strip().upper() == 'CF'
+            and acquisition
+            and _match_score(row, matcher=matcher) is not None
+            and _statement_amount(row, flow=True)[0] is not None
+        ):
+            candidates.append(row)
     total_names = {_normalize_match_text(name) for name in matcher['account_names']}
     totals = [
         row for row in candidates
