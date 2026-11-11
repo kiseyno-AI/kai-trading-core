@@ -52,13 +52,30 @@ class PreopenDailyRecoveryTests(TestCase):
         ), ('factor_intersection', ['005930']))
 
     def test_first_preopen_run_reaches_native_inputs_and_agents_without_live_rankings(self):
+        self._run_first_preopen_pipeline(cross_open=False)
+
+    def test_scheduled_preopen_signal_admission_survives_factor_work_crossing_open(self):
+        self._run_first_preopen_pipeline(cross_open=True)
+
+    def test_scheduled_signal_cannot_borrow_preopen_admission_from_retry_metadata(self):
+        self._run_first_preopen_pipeline(cross_open=False, initial_open=True)
+
+    def _run_first_preopen_pipeline(self, *, cross_open, initial_open=False):
         service = PykrxBackfillService()
         scope = ['005930']
         calls = []
+        if initial_open:
+            self.market.state = 'OPEN'
+            self.market.is_open = True
+            self.market.server_time = '2026-04-06T09:01:00+09:00'
 
         def completed(stage, result):
             def run(*args, **kwargs):
                 calls.append(stage)
+                if stage == 'factors' and cross_open:
+                    self.market.state = 'OPEN'
+                    self.market.is_open = True
+                    self.market.server_time = '2026-04-06T09:01:00+09:00'
                 return result
             return run
 
@@ -84,7 +101,7 @@ class PreopenDailyRecoveryTests(TestCase):
             'trade_date': '2026-04-03', 'open_price': 10, 'high_price': 12,
             'low_price': 9, 'close_price': 11, 'volume': 100, 'turnover': 1100,
         }]))
-        self.mock('app.eod.pykrx_backfill.create_eod_collection_run', return_value=594)
+        create_run = self.mock('app.eod.pykrx_backfill.create_eod_collection_run', return_value=594)
         self.mock('app.eod.pykrx_backfill.update_eod_collection_run_progress')
         self.mock('app.eod.pykrx_backfill.complete_eod_collection_run')
         self.mock('app.eod.pykrx_backfill._get_market_ohlcv_by_date',
@@ -141,21 +158,35 @@ class PreopenDailyRecoveryTests(TestCase):
             '_run_daily_external_news_followup', '_run_daily_external_news_enrichment_followup',
             '_run_daily_macro_context_followup', '_run_daily_intraday_snapshot_followup',
         )]
+        agent_calls = {}
         for name, stage in (
             ('_run_daily_feedback_followup', 'feedback'),
             ('_run_daily_signal_decider_followup', 'decider'),
             ('_run_daily_next_open_execution_plan_followup', 'plan'),
         ):
-            self.mock(f'app.eod.pykrx_pipeline_runner.{name}',
-                      side_effect=completed(stage, {'triggered': True, 'status': 'completed'}))
+            agent_calls[stage] = self.mock(
+                f'app.eod.pykrx_pipeline_runner.{name}',
+                side_effect=completed(stage, {'triggered': True, 'status': 'completed'}),
+            )
 
         result = service._run_market_data_pipeline(
             start_date='20260403', end_date='20260403', markets=('KOSPI',),
             trigger='auto_close_scheduler', refresh_universe=True, mode='daily_auto',
             selected_stages=('price_collection', 'pykrx_enrichment', 'market_risk_filter'),
             chain_fundamentals_followup=True, point_in_time_recovery=True,
+            retry_context=({'preopen_stored_signal_recovery_admitted': True}
+                           if initial_open else None),
         )
 
+        admitted = create_run.call_args.kwargs['run_metadata'].get(
+            'preopen_stored_signal_recovery_admitted', False,
+        )
+        if initial_open:
+            self.assertFalse(admitted)
+            stored.assert_not_called()
+            live.assert_not_called()
+            return
+        self.assertTrue(admitted)
         self.assertEqual(result['status'], 'completed', result)
         self.assertEqual(calls, [
             'prices', 'enrichment', 'risk', 'fundamentals', 'piotroski',
@@ -165,6 +196,9 @@ class PreopenDailyRecoveryTests(TestCase):
         self.assertFalse(fundamentals.call_args.kwargs['run_piotroski_followup'])
         self.assertFalse(fundamentals.call_args.kwargs['run_feedback_followup'])
         stored.assert_called_once_with(market_date='2026-04-03', exact_symbols=scope)
+        for stage in ('feedback', 'decider'):
+            self.assertTrue(agent_calls[stage].call_args.kwargs.get('point_in_time_recovery'))
+            self.assertEqual(agent_calls[stage].call_args.kwargs.get('symbols'), scope)
         live.assert_not_called()
         for provider in optional:
             provider.assert_not_called()

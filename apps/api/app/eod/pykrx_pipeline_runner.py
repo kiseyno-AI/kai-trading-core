@@ -3454,6 +3454,15 @@ def run_market_data_pipeline(
     # fixture/simulation calls depend on the process wall clock.
     point_in_time_recovery = bool(point_in_time_recovery)
     point_in_time_scope = historical_backfill or point_in_time_recovery
+    preopen_stored_signal_recovery_admitted = bool(
+        point_in_time_recovery
+        and mode == 'daily_auto'
+        and chain_fundamentals_followup
+        and trigger in {'auto_close', 'auto_close_scheduler'}
+        and not should_skip_point_in_time_current_only_stage(
+            stage_id='signal_features', market_date=normalized_end,
+        )
+    )
     resolved_selected_stages = _resolve_requested_stages(
         mode=mode,
         selected_stages=selected_stages,
@@ -3650,6 +3659,10 @@ def run_market_data_pipeline(
     }:
         inherited_downstream_resume_from_stage = ''
     unattempted_symbols = list(requested_symbol_codes)
+    preopen_stored_signal_recovery_admitted = bool(
+        preopen_stored_signal_recovery_admitted
+        and _parse_market_date(normalized_end) == _parse_market_date(latest_trade_date)
+    )
     run_metadata = {
         'mode': mode,
         'point_in_time_recovery': point_in_time_recovery,
@@ -3669,6 +3682,8 @@ def run_market_data_pipeline(
         'failed_symbols': [],
         'failed_symbols_count': 0,
         'unattempted_symbols': unattempted_symbols,
+        **({'preopen_stored_signal_recovery_admitted': True}
+           if preopen_stored_signal_recovery_admitted else {}),
     }
     if normalized_owning_pipeline_run_id is not None:
         run_metadata['daily_pipeline_run_id'] = (
@@ -3737,6 +3752,8 @@ def run_market_data_pipeline(
             'selected_stages': list(resolved_selected_stages),
             'chain_fundamentals_followup': chain_fundamentals_followup,
             'retry': retry_context,
+            **({'preopen_stored_signal_recovery_admitted': True}
+               if preopen_stored_signal_recovery_admitted else {}),
         },
         provider_admission_fence_owned=provider_admission_fence_owned,
     )
@@ -5958,6 +5975,10 @@ def run_market_data_pipeline(
         if (
             point_in_time_recovery
             and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+            and not (
+                stage_id == 'signal_features'
+                and preopen_stored_signal_recovery_admitted
+            )
             and should_skip_point_in_time_current_only_stage(
                 stage_id=stage_id, market_date=latest_trade_date,
             )
@@ -7105,6 +7126,11 @@ def run_market_data_pipeline(
                 and bool(signal_feature_successful_symbols)
             ):
                 feedback_scope_kwargs: dict[str, Any] = {}
+                if point_in_time_recovery:
+                    feedback_scope_kwargs.update({
+                        'point_in_time_recovery': True,
+                        'symbols': list(signal_feature_successful_symbols or []),
+                    })
                 if set(signal_feature_successful_symbols or []) != set(
                     exact_followup_symbols
                 ):
