@@ -16825,7 +16825,11 @@ class PykrxBackfillServiceTests(TestCase):
                         },
                     },
                 ],
-            ),
+            ) as read_runs,
+            patch(
+                'app.eod.pykrx_backfill.load_exact_automatic_daily_eod_collection_run',
+                side_effect=read_runs,
+            ) as reload_exact,
             patch('app.eod.pykrx_backfill.count_eod_run_persisted_symbols', return_value=3),
             patch(
                 'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
@@ -16861,6 +16865,7 @@ class PykrxBackfillServiceTests(TestCase):
             )
 
         self.assertTrue(result['triggered'])
+        reload_exact.assert_called_once_with(eod_run_id=8, trade_date='2026-04-03')
         complete_run.assert_called_once_with(
             8,
             status='failed',
@@ -16940,7 +16945,11 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch(
                 'app.eod.pykrx_backfill.load_latest_eod_collection_run',
-                side_effect=[stale_run, failed_run],
+                return_value=stale_run,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_exact_automatic_daily_eod_collection_run',
+                return_value=failed_run,
             ),
             patch(
                 'app.eod.pykrx_backfill.count_eod_run_persisted_symbols',
@@ -21159,6 +21168,40 @@ class PykrxBackfillServiceTests(TestCase):
             'Turnover coverage incomplete',
             complete_run.call_args.kwargs['error_message'],
         )
+
+    def test_scheduler_admission_ignores_completed_manual_collection(self) -> None:
+        for trigger in ('auto_close_scheduler', 'manual_api'):
+            with self.subTest(trigger=trigger):
+                service = PykrxBackfillService()
+                manual = {
+                    'id': 8, 'trade_date': '2026-04-03', 'status': 'completed',
+                    'symbols_total': 0, 'symbols_succeeded': 0, 'symbols_failed': 0,
+                    'run_metadata': {'mode': 'manual'},
+                }
+                with (
+                    patch.object(service, 'resolve_latest_trade_date', return_value='2026-04-03'),
+                    patch('app.eod.pykrx_backfill.advisory_eod_collection_lock') as lock,
+                    patch(
+                        'app.eod.pykrx_backfill.load_latest_eod_collection_run',
+                        side_effect=lambda **kwargs: None if kwargs.get('automatic_only') else manual,
+                    ) as load_latest,
+                    patch.object(service, '_resume_auto_daily_followups_if_due', return_value=None),
+                    patch.object(service, '_run_market_data_pipeline', return_value={
+                        'run_id': 9, 'status': 'completed', 'source': 'pykrx',
+                    }) as collect,
+                ):
+                    lock.return_value.__enter__.return_value = True
+                    result = service.run_daily_pipeline_if_due(
+                        market_date='2026-04-03', trigger=trigger,
+                        point_in_time_recovery=True,
+                    )
+                if trigger == 'auto_close_scheduler':
+                    self.assertTrue(result['triggered'])
+                    collect.assert_called_once()
+                    self.assertTrue(load_latest.call_args.kwargs['automatic_only'])
+                else:
+                    self.assertEqual(result['reason'], 'already_completed')
+                    collect.assert_not_called()
 
     def test_recovery_target_reloads_exact_automatic_lineage_inside_lock(
         self,
