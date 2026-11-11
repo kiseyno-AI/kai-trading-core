@@ -1540,6 +1540,22 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                     )
                     self.assertEqual(result['ready'], gate == 'ready')
 
+    def test_exact_scope_counts_include_missing_rows_in_processed(self):
+        stage = EODPipelineStatusService._normalize_stored_pykrx_coverage_stage(
+            {'status': 'missing'},
+            persisted=1,
+            expected_total=2,
+            exact_scope_gap=_scope_gap_evidence(
+                requested_count=2,
+                present_count=1,
+                missing_symbols_sample=['005930'],
+            ),
+        )
+        self.assertEqual(stage['succeeded'], 1)
+        self.assertEqual(stage['failed'], 1)
+        self.assertEqual(stage['processed'], 2)
+        self.assertEqual(stage['remaining'], 0)
+
     def test_read_blocks_complete_factor_count_when_requested_symbol_is_missing(self):
         requested_symbols = ['000660', '005930']
         membership = build_market_membership_snapshot(

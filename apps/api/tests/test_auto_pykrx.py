@@ -23483,6 +23483,102 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             recovery_eod_run_id=73,
         )
 
+    async def test_preopen_recovers_previous_session_despite_older_debt(self) -> None:
+        market = MarketState(
+            market='KRX',
+            state='PREOPEN',
+            is_trading_day=True,
+            is_open=False,
+            server_time='2026-11-12T02:42:00+09:00',
+            session_open_at='2026-11-12T09:00:00+09:00',
+            session_close_at='2026-11-12T15:30:00+09:00',
+        )
+        older_target = AutoEODRecoveryTarget(trade_date='2026-11-09', eod_run_id=592)
+        previous_target = AutoEODRecoveryTarget(trade_date='2026-11-11', eod_run_id=593)
+        cases = (
+            (older_target, None, None),
+            (older_target, previous_target, None),
+            (None, None, None),
+            (older_target, None, {'status': 'completed', 'run_metadata': {'mode': 'manual'}}),
+            (older_target, None, {'status': 'completed', 'run_metadata': {'mode': 'daily_auto'}}),
+            (older_target, None, {
+                'status': 'completed', 'trigger': 'manual_api',
+                'symbols_total': 1, 'symbols_succeeded': 1, 'symbols_failed': 0,
+                'run_metadata': {'mode': 'daily_auto'},
+            }),
+            (older_target, None, {'status': 'running', 'run_metadata': {'mode': 'daily_auto'}}),
+        )
+        for oldest, target, previous_run in cases:
+            with self.subTest(oldest=oldest, previous_target=target, previous_run=previous_run):
+                scheduler = AutoPykrxEODScheduler()
+                with (
+                    patch('app.eod.auto_pykrx.async_get_market_state', return_value=market),
+                    patch(
+                        'app.eod.auto_pykrx.load_oldest_outstanding_auto_eod_recovery_target',
+                        side_effect=[oldest, target],
+                    ) as load_recovery,
+                    patch('app.eod.auto_pykrx.load_latest_eod_collection_run', return_value=previous_run),
+                    patch.object(
+                        scheduler, '_run_scheduled_daily_pipeline', new=AsyncMock(),
+                    ) as run_pipeline,
+                ):
+                    disposition = await scheduler.schedule_recovery_if_due(
+                        expected_market_state='PREOPEN',
+                    )
+                    self.assertIsNotNone(scheduler._task)
+                    await scheduler._task
+
+                self.assertEqual(disposition, RecoveryOnlyScheduleDisposition.DUE_STARTED)
+                self.assertEqual(load_recovery.call_args_list[-1], call(
+                    on_or_after='2026-11-11', on_or_before='2026-11-11',
+                ))
+                expected = {
+                    'markets': ('KOSPI', 'KOSDAQ'),
+                    'point_in_time_recovery': True,
+                }
+                if target is not None:
+                    expected['recovery_eod_run_id'] = target.eod_run_id
+                run_pipeline.assert_awaited_once_with('2026-11-11', **expected)
+
+    async def test_preopen_recovery_requires_calendar_and_unchanged_session(self) -> None:
+        preopen = MarketState(
+            market='KRX', state='PREOPEN', is_trading_day=True, is_open=False,
+            server_time='2026-11-12T08:59:00+09:00',
+            session_open_at='2026-11-12T09:00:00+09:00',
+            session_close_at='2026-11-12T15:30:00+09:00',
+        )
+        opened = MarketState(
+            market='KRX', state='OPEN', is_trading_day=True, is_open=True,
+            server_time='2026-11-12T09:00:00+09:00',
+            session_open_at=preopen.session_open_at,
+            session_close_at=preopen.session_close_at,
+        )
+        for calendar_available in (False, True):
+            with self.subTest(calendar_available=calendar_available):
+                scheduler = AutoPykrxEODScheduler()
+                with (
+                    patch('app.eod.auto_pykrx.async_get_market_state', side_effect=[preopen, opened]),
+                    patch(
+                        'app.eod.auto_pykrx.async_previous_krx_trading_date',
+                        new=AsyncMock(return_value=date(2026, 11, 11) if calendar_available else None),
+                    ),
+                    patch('app.eod.auto_pykrx.load_latest_eod_collection_run', return_value=None),
+                    patch.object(scheduler, '_run_scheduled_daily_pipeline', new=AsyncMock()) as run_pipeline,
+                ):
+                    disposition = await scheduler.schedule_recovery_if_due(
+                        expected_market_state='PREOPEN',
+                    )
+                self.assertIsNone(scheduler._task)
+                run_pipeline.assert_not_awaited()
+                self.assertEqual(disposition, (
+                    RecoveryOnlyScheduleDisposition.DUE_BLOCKED
+                    if calendar_available else RecoveryOnlyScheduleDisposition.UNKNOWN
+                ))
+                self.assertEqual(scheduler.snapshot()['last_reason'], (
+                    'market_state_changed:PREOPEN->OPEN'
+                    if calendar_available else 'previous_session_calendar_unavailable'
+                ))
+
     async def test_preopen_recovery_keeps_older_than_previous_session_blocked(
         self,
     ) -> None:
@@ -23506,10 +23602,21 @@ class AutoPykrxEODSchedulerTests(IsolatedAsyncioTestCase):
             patch(
                 'app.eod.auto_pykrx.'
                 'load_oldest_outstanding_auto_eod_recovery_target',
-                return_value=AutoEODRecoveryTarget(
-                    trade_date='2026-09-10',
-                    eod_run_id=72,
-                ),
+                side_effect=[
+                    AutoEODRecoveryTarget(trade_date='2026-09-10', eod_run_id=72),
+                    None,
+                ],
+            ),
+            patch(
+                'app.eod.auto_pykrx.load_latest_eod_collection_run',
+                return_value={
+                    'status': 'completed',
+                    'symbols_total': 2,
+                    'symbols_succeeded': 2,
+                    'symbols_failed': 0,
+                    'trigger': 'auto_close_scheduler',
+                    'run_metadata': {'mode': 'daily_auto'},
+                },
             ),
             patch(
                 'app.eod.auto_pykrx.async_previous_krx_trading_date',

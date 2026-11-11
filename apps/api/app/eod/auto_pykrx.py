@@ -303,6 +303,8 @@ class AutoPykrxEODScheduler:
             self._task = None
             self._state.active_task = False
 
+        previous_session_date = None
+        uncollected_previous_session = None
         try:
             recovery_window_latest_date = (
                 current_market_date
@@ -324,6 +326,46 @@ class AutoPykrxEODScheduler:
                 on_or_after=recovery_window_start_date,
                 on_or_before=current_market_date,
             )
+            if recovery_only and market.state == 'PREOPEN':
+                previous_session_date = await async_previous_krx_trading_date(
+                    date.fromisoformat(current_market_date),
+                    allow_fallback=True,
+                )
+                if previous_session_date is None:
+                    self._state.last_status = 'blocked'
+                    self._state.last_reason = 'previous_session_calendar_unavailable'
+                    return RecoveryOnlyScheduleDisposition.UNKNOWN
+                if (
+                    recovery_target is None
+                    or recovery_target.trade_date != previous_session_date.isoformat()
+                ):
+                    previous_date = previous_session_date.isoformat()
+                    previous_target = await asyncio.to_thread(
+                        load_oldest_outstanding_auto_eod_recovery_target,
+                        on_or_after=previous_date,
+                        on_or_before=previous_date,
+                    )
+                    if previous_target is not None:
+                        recovery_target = previous_target
+                    else:
+                        previous_run = await asyncio.to_thread(
+                            load_latest_eod_collection_run,
+                            market='KRX',
+                            trade_date=previous_date,
+                            source='pykrx',
+                        )
+                        previous_metadata = (previous_run or {}).get('run_metadata') or {}
+                        previous_total = int((previous_run or {}).get('symbols_total') or 0)
+                        previous_complete = (
+                            previous_metadata.get('mode') == 'daily_auto'
+                            and str(previous_run.get('trigger') or '').startswith('auto_')
+                            and previous_total > 0
+                            and int(previous_run.get('symbols_succeeded') or 0) == previous_total
+                            and _terminal_run_skip_reason(previous_run) is not None
+                        )
+                        if not previous_complete:
+                            recovery_target = None
+                            uncollected_previous_session = previous_date
         except Exception as exc:
             logger.exception('Could not inspect automatic EOD recovery state: %s', exc)
             self._state.last_status = 'blocked'
@@ -337,7 +379,7 @@ class AutoPykrxEODScheduler:
         recovery_market_date = (
             recovery_target.trade_date
             if recovery_target is not None
-            else None
+            else uncollected_previous_session
         )
         older_recovery_due = (
             recovery_market_date is not None
@@ -351,12 +393,6 @@ class AutoPykrxEODScheduler:
                 self._state.last_reason = 'no_older_recovery_debt'
                 return RecoveryOnlyScheduleDisposition.NO_DEBT
             if market.state == 'PREOPEN':
-                previous_session_date = (
-                    await async_previous_krx_trading_date(
-                        date.fromisoformat(current_market_date),
-                        allow_fallback=True,
-                    )
-                )
                 previous_session_preopen_recovery_due = bool(
                     previous_session_date is not None
                     and recovery_market_date

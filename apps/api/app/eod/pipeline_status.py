@@ -7219,7 +7219,7 @@ class EODPipelineStatusService:
             total=normalized_total,
             succeeded=exact_present_count,
             failed=exact_missing_count,
-            processed=exact_present_count,
+            processed=exact_present_count + exact_missing_count,
         )
         if coverage_verified:
             status = (
