@@ -830,6 +830,266 @@ def _parent_admission_outcome() -> dict:
     )
 
 
+def _native_preferred_followup_evidence(*, quality_retry: bool = False) -> tuple[dict, dict]:
+    common = ['000001', '000002']
+    preferred = ['005935']
+    parent = common + preferred
+    dart = {
+        **_exact_result(
+            selected=parent,
+            successful=common,
+            retry_debt=[],
+            terminal_not_applicable=preferred,
+            version='dart_daily_data_scope_outcomes_v1',
+        ),
+        'preferred_not_applicable_stock_codes': preferred,
+    }
+    results = {
+        'fundamentals_daily_refresh': dart,
+        'piotroski_filter': _exact_result(
+            selected=parent,
+            successful=common,
+            retry_debt=[],
+            terminal_not_applicable=preferred,
+            version='piotroski_scope_outcomes_v1',
+        ),
+    }
+    for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
+        selected = (
+            parent if stage_id in {
+                'momentum_factors', 'value_factors',
+                'low_risk_factors', 'beta_factors',
+            } else common
+        )
+        debt = ['000002'] if quality_retry and stage_id == 'quality_factors' else []
+        results[stage_id] = _exact_result(
+            selected=selected,
+            successful=[symbol for symbol in selected if symbol not in debt],
+            retry_debt=debt,
+            version='factor_scope_outcomes_v1',
+            stage_id=stage_id,
+            publication_symbols=parent,
+        )
+    signal_symbols = ['000001', '005935'] if quality_retry else parent
+    results['signal_features'] = _exact_result(
+        selected=signal_symbols,
+        successful=signal_symbols,
+        retry_debt=[],
+        version='signal_features_scope_outcomes_v1',
+        publication_symbols=signal_symbols,
+    )
+    return {
+        'followup_admission_scope_outcome': build_exact_symbol_scope_outcome(
+            manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+            selected_symbols=parent,
+            successful_symbols=parent,
+            retry_debt_symbols=[],
+        ),
+    }, {
+        stage_id: {'status': result['status'], 'result': result}
+        for stage_id, result in results.items()
+    }
+
+
+def test_native_preferred_followup_manifests_complete_without_scope_debt() -> None:
+    metadata, stages = _native_preferred_followup_evidence()
+    result = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=metadata,
+        stage_rows=stages,
+        incomplete_stages=['agent_feedback_summaries'],
+    )
+    assert result == {'required': False, 'ready': False}
+
+
+def test_preferred_signal_success_survives_debt_roundtrip_and_reconciliation() -> None:
+    metadata, stages = _native_preferred_followup_evidence(quality_retry=True)
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=metadata,
+        stage_rows=stages,
+        incomplete_stages=['quality_factors', 'agent_feedback_summaries'],
+    )
+    assert resolution['ready'] is True, resolution
+    state = resolution['state']
+    assert state['pending_by_stage'] == {'quality_factors': ['000002']}
+    assert state['successful_by_stage']['signal_features'] == ['000001', '005935']
+    assert not state['terminal_by_stage'].get('signal_features')
+    assert _validated_followup_stage_debt_state(
+        state,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=['000001', '000002', '005935'],
+        publication_symbols=['000001', '000002', '005935'],
+    ) is not None
+    tampered = deepcopy(state)
+    tampered['proofs_by_stage']['fundamentals_daily_refresh'][0][
+        'preferred_not_applicable_stock_codes'
+    ] = ['000002']
+    assert _validated_followup_stage_debt_state(
+        tampered,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=['000001', '000002', '005935'],
+        publication_symbols=['000001', '000002', '005935'],
+    ) is None
+
+    recovered_quality = _exact_result(
+        selected=['000002'],
+        successful=['000002'],
+        retry_debt=[],
+        version='factor_scope_outcomes_v1',
+        stage_id='quality_factors',
+    )
+    reconciled = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata={**metadata, 'followup_stage_debt': state},
+        stage_rows={'quality_factors': {
+            'status': 'completed', 'result': recovered_quality,
+        }},
+        incomplete_stages=['quality_factors'],
+        latest_pipeline_run={
+            'id': 901,
+            'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
+            'run_metadata': {
+                'resolved_stages': ['quality_factors'],
+                'reused_eod_collection_run_id': 77,
+            },
+        },
+    )
+    assert reconciled['ready'] is True, reconciled
+    assert reconciled['source'] == 'persisted_stage_debt_reconciled'
+    advanced = reconciled['state']
+    assert advanced['successful_by_stage']['signal_features'] == ['000001', '005935']
+    assert advanced['pending_by_stage'] == {'signal_features': ['000002']}
+    assert _validated_followup_stage_debt_state(
+        advanced,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=['000001', '000002', '005935'],
+        publication_symbols=['000001', '000002', '005935'],
+    ) is not None
+
+
+@pytest.mark.parametrize('claim', [None, ['000002'], ['005935', '000002']])
+def test_preferred_exemption_requires_the_dart_terminal_claim(claim: object) -> None:
+    metadata, stages = _native_preferred_followup_evidence()
+    stages['fundamentals_daily_refresh']['result'][
+        'preferred_not_applicable_stock_codes'
+    ] = claim
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=metadata,
+        stage_rows=stages,
+        incomplete_stages=['agent_feedback_summaries'],
+    )
+    assert resolution['required'] is True
+    assert resolution['ready'] is False
+
+
+def test_compact_dart_proof_retains_preferred_terminal_authority() -> None:
+    metadata, stages = _native_preferred_followup_evidence()
+    dart = stages['fundamentals_daily_refresh']['result']
+    proof = DailyPipelineStageService._build_exact_scope_outcome_proof(
+        dart,
+        stage_id='fundamentals_daily_refresh',
+        invocation_symbols=['000001', '000002', '005935'],
+        expected_market_date='2026-10-30',
+        publication_symbols=['000001', '000002', '005935'],
+    )
+    assert proof is not None
+    stages['fundamentals_daily_refresh'] = {
+        'status': 'completed',
+        'details': {
+            'result_summary': {'status': 'completed'},
+            'exact_scope_outcome_proof': proof,
+        },
+    }
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=metadata,
+        stage_rows=stages,
+        incomplete_stages=['agent_feedback_summaries'],
+    )
+    assert resolution == {'required': False, 'ready': False}
+
+
+def test_preferred_price_factor_failure_waits_for_real_recovery() -> None:
+    metadata, stages = _native_preferred_followup_evidence()
+    stages['momentum_factors'] = {'status': 'partial', 'result': _exact_result(
+        selected=['000001', '000002', '005935'],
+        successful=['000001', '000002'],
+        retry_debt=['005935'],
+        version='factor_scope_outcomes_v1',
+        stage_id='momentum_factors',
+    )}
+    stages['signal_features'] = {'status': 'completed', 'result': _exact_result(
+        selected=['000001', '000002'],
+        successful=['000001', '000002'],
+        retry_debt=[],
+        version='signal_features_scope_outcomes_v1',
+    )}
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=metadata,
+        stage_rows=stages,
+        incomplete_stages=['momentum_factors'],
+    )
+    assert resolution['ready'] is True, resolution
+    state = resolution['state']
+    assert state['pending_by_stage'] == {'momentum_factors': ['005935']}
+    assert '005935' not in state['successful_by_stage']['signal_features']
+    recovered = _advance_followup_stage_debt_state(
+        state,
+        stage_id='momentum_factors',
+        invocation_symbols=['005935'],
+        stage_result=_exact_result(
+            selected=['005935'],
+            successful=['005935'],
+            retry_debt=[],
+            version='factor_scope_outcomes_v1',
+            stage_id='momentum_factors',
+        ),
+        recovery_pipeline_run_id=902,
+    )
+    assert recovered is not None
+    assert recovered['pending_by_stage'] == {'signal_features': ['005935']}
+    assert not recovered['terminal_by_stage'].get('signal_features')
+    assert _validated_followup_stage_debt_state(
+        recovered,
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        parent_symbols=['000001', '000002', '005935'],
+        publication_symbols=['000001', '000002', '005935'],
+    ) is not None
+
+
+def test_preferred_exemption_does_not_hide_an_attempted_dart_factor_failure() -> None:
+    metadata, stages = _native_preferred_followup_evidence()
+    stages['quality_factors'] = {'status': 'partial', 'result': _exact_result(
+        selected=['000001', '000002', '005935'],
+        successful=['000001', '000002'],
+        retry_debt=['005935'],
+        version='factor_scope_outcomes_v1',
+        stage_id='quality_factors',
+    )}
+    resolution = _resolve_followup_stage_debt_state(
+        market_date='2026-10-30',
+        eod_collection_run_id=77,
+        latest_eod_metadata=metadata,
+        stage_rows=stages,
+        incomplete_stages=['quality_factors'],
+    )
+    assert resolution['required'] is True
+    assert resolution['ready'] is False
+
+
 def _completed_stage_debt_prerequisites(
     target_stage_id: str,
 ) -> tuple[dict[str, list[str]], dict[str, list[dict]]]:
@@ -1255,7 +1515,7 @@ def test_run607_shape_advances_existing_factor_success_cohort() -> None:
         promoted,
         point_in_time_recovery=True,
         require_prior_attempts=False,
-    ) == ('factor_intersection', [proven_symbol])
+    ) == ('signal_features', [proven_symbol])
 
 
 @pytest.mark.parametrize(

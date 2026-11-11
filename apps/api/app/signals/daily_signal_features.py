@@ -2428,25 +2428,74 @@ class DailySignalFeatureService:
                 preserved_direct_source_rows += 1
             rebuilt_rows.append(merged)
 
-        persisted_count = upsert_daily_signal_features(
-            rebuilt_rows,
-            delete_rows_outside_scope=False,
-        )
-        if persisted_count != len(rebuilt_rows):
-            raise RuntimeError(
-                'deterministic signal-feature repair persistence mismatch: '
-                f'expected={len(rebuilt_rows)}, observed={persisted_count}'
-            )
-        return {
+        result = {
             'market_date': normalized_market_date,
             'stored_rows': len(stored_rows),
-            'features_persisted': persisted_count,
             'preserved_direct_source_rows': preserved_direct_source_rows,
             'scope_symbol_count': len(target_symbols),
             'scope_membership_sha256': market_membership_sha256(
                 target_symbols
             ),
             'exact_scope': normalized_exact_symbols is not None,
+        }
+        if normalized_exact_symbols is None:
+            persisted_count = upsert_daily_signal_features(
+                rebuilt_rows,
+                delete_rows_outside_scope=False,
+            )
+            if persisted_count != len(rebuilt_rows):
+                raise RuntimeError(
+                    'deterministic signal-feature repair persistence mismatch: '
+                    f'expected={len(rebuilt_rows)}, observed={persisted_count}'
+                )
+            return {**result, 'features_persisted': persisted_count}
+
+        publication_items, _, _ = _prepare_signal_feature_publication_items(
+            items=rebuilt_rows,
+            expected_market_date=normalized_market_date,
+            incomplete_sources=(),
+        )
+        publication_symbols = {item['symbol'] for item in publication_items}
+        # Historical capture fingerprints include the original payload shape.
+        publication_items = [
+            row for row in rebuilt_rows if row['symbol'] in publication_symbols
+        ]
+        publication = replace_daily_signal_features_exact_scope(
+            market_date=normalized_market_date,
+            features=publication_items,
+            exact_symbols=normalized_exact_symbols,
+        )
+        persisted_symbols = set(publication.get('successful_symbols') or ())
+        successful_symbols = [
+            symbol
+            for symbol in normalized_exact_symbols
+            if symbol in persisted_symbols and symbol in publication_symbols
+        ]
+        successful_set = set(successful_symbols)
+        retry_debt_symbols = [
+            symbol
+            for symbol in normalized_exact_symbols
+            if symbol not in successful_set
+        ]
+        return {
+            **result,
+            **build_exact_symbol_scope_outcome(
+                manifest_version=SIGNAL_FEATURE_SCOPE_OUTCOME_MANIFEST_VERSION,
+                selected_symbols=normalized_exact_symbols,
+                successful_symbols=successful_symbols,
+                retry_debt_symbols=retry_debt_symbols,
+            ),
+            'status': 'partial' if retry_debt_symbols else 'completed',
+            'reason': (
+                'stored_signal_feature_publication_incomplete'
+                if retry_debt_symbols else None
+            ),
+            'features_persisted': len(successful_symbols),
+            'features_failed': len(retry_debt_symbols),
+            'failed_symbols': retry_debt_symbols,
+            'scope_finalization': publication.get('scope_finalization'),
+            'repair_mode': 'stored_owned_fallback_exact_scope',
+            'direct_collection_performed': False,
         }
 
     def build_stored_owned_fallback_rows(

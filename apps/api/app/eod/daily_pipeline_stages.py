@@ -8104,8 +8104,14 @@ class DailyPipelineStageService:
             point_in_time_recovery
             and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
             and not (
-                exact_stage_recovery_authorized
-                and stage_id == 'fundamentals_daily_refresh'
+                (
+                    exact_stage_recovery_authorized
+                    and stage_id == 'fundamentals_daily_refresh'
+                )
+                or (
+                    allow_previous_session_preopen_recovery
+                    and stage_id == 'signal_features'
+                )
             )
             and should_skip_point_in_time_current_only_stage(
                 stage_id=stage_id,
@@ -8433,6 +8439,14 @@ class DailyPipelineStageService:
                 authoritative_scope=True,
             )
         if stage_id == 'signal_features':
+            if point_in_time_recovery:
+                signal_scope = symbols if symbols is not None else exact_scope_symbols
+                if signal_scope is None:
+                    raise ValueError('point-in-time signal recovery requires exact symbol scope')
+                return daily_signal_feature_service.rebuild_stored_owned_fallback_for_market_date(
+                    market_date=market_date,
+                    exact_symbols=signal_scope,
+                )
             return asyncio.run(
                 daily_signal_feature_service.refresh_for_market_date(
                     market_date=market_date,
