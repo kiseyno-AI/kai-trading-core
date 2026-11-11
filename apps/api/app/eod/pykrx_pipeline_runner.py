@@ -210,6 +210,8 @@ PREOPEN_PREVIOUS_SESSION_CURRENT_ONLY_STAGE_IDS: frozenset[str] = frozenset(
     {
         'market_risk_snapshots',
         'market_risk_filter',
+        'fundamentals_daily_refresh',
+        'signal_features',
     }
 )
 
@@ -5953,6 +5955,18 @@ def run_market_data_pipeline(
         call: Callable[[], dict[str, Any]],
         default_total: int = 0,
     ) -> dict[str, Any]:
+        if (
+            point_in_time_recovery
+            and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+            and should_skip_point_in_time_current_only_stage(
+                stage_id=stage_id, market_date=latest_trade_date,
+            )
+        ):
+            stage_result = _build_point_in_time_current_only_skip(
+                stage_id=stage_id, market_date=latest_trade_date,
+            )
+            record_followup_result(stage_id, stage_result)
+            return stage_result
         record_followup_start(stage_id, activity)
         upstream_key = {
             'signal_decider': 'feedback_followup',
@@ -6201,13 +6215,23 @@ def run_market_data_pipeline(
             refresh_kwargs['authoritative_market_scope'] = (
                 daily_derived_market_scope_authority
             )
-        stage_result = dict(
-            asyncio.run(
+        if point_in_time_recovery:
+            stage_result = dict(
+                dependencies.signal_feature_service.rebuild_stored_owned_fallback_for_market_date(
+                    market_date=latest_trade_date,
+                    exact_symbols=(
+                        list(signal_feature_admitted_symbols)
+                        if signal_feature_admitted_symbols is not None
+                        else list(exact_piotroski_membership_symbols or [])
+                    ),
+                )
+            )
+        else:
+            stage_result = dict(asyncio.run(
                 dependencies.signal_feature_service.refresh_for_market_date(
                     **refresh_kwargs,
                 )
-            )
-        )
+            ))
         source_errors = stage_result.get('source_errors')
         incomplete_sources = stage_result.get('incomplete_sources')
         if source_errors or incomplete_sources:
@@ -6603,6 +6627,10 @@ def run_market_data_pipeline(
             )
         elif (
             point_in_time_recovery
+            and should_skip_point_in_time_current_only_stage(
+                stage_id='fundamentals_daily_refresh',
+                market_date=latest_trade_date,
+            )
             and chain_fundamentals_followup
             and mode == 'daily_auto'
             and status in {'completed', 'completed_with_errors'}

@@ -1433,6 +1433,7 @@ class DartFundamentalsCaptureService:
                             event=event,
                             run_id=run_id,
                             fs_div=resolved_fs_div,
+                            receipt_date_to=receipt_date_to,
                             expected_recovery_candidate=(
                                 expected_recovery_candidate
                             ),
@@ -1968,6 +1969,7 @@ class DartFundamentalsCaptureService:
         event: dict[str, Any],
         run_id: int,
         fs_div: str,
+        receipt_date_to: date | None = None,
         expected_recovery_candidate: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         company_overview = await self.client.fetch_company_overview(event['corp_code'])
@@ -2022,6 +2024,17 @@ class DartFundamentalsCaptureService:
             )
         if not source_payload.get('list'):
             raise RuntimeError('DART fundamentals returned success with no statement rows')
+        if receipt_date_to is not None:
+            for row in source_payload['list']:
+                receipt_no = str(row.get('rcept_no') or '').strip()
+                if not re.fullmatch(r'[0-9]{14}', receipt_no):
+                    raise RuntimeError('DART statement receipt date is unproven for bounded capture')
+                statement_receipt_date = datetime.strptime(receipt_no[:8], '%Y%m%d').date()
+                if statement_receipt_date > receipt_date_to:
+                    raise RuntimeError(
+                        'DART statement receipt date exceeds bounded capture date '
+                        f'{receipt_date_to.isoformat()}'
+                    )
         dataset = build_fundamentals_dataset(source_payload)
         snapshot_payload = {
             'rcept_no': event['rcept_no'],
@@ -3528,6 +3541,20 @@ class DartFundamentalsCaptureService:
                 terminal_event = state.get('latest_terminal_fundamentals_event') or {}
                 latest_terminal_status = terminal_event.get('fundamentals_capture_status')
                 latest_terminal_date = _parse_optional_iso_date(terminal_event.get('receipt_date'))
+                if any(
+                    receipt_date is not None and receipt_date > resolved_market_date
+                    for receipt_date in (
+                        latest_fundamentals_date,
+                        latest_resolved_date,
+                        latest_terminal_date,
+                    )
+                ):
+                    symbol_results[stock_code] = {
+                        'stock_code': stock_code,
+                        'state': 'receipt_date_after_market_date',
+                        'receipt_date_to': resolved_market_date.isoformat(),
+                    }
+                    continue
                 latest_fundamentals_date_by_symbol[stock_code] = latest_fundamentals_date
                 latest_resolved_date_by_symbol[stock_code] = latest_resolved_date
                 if (
@@ -3798,6 +3825,9 @@ class DartFundamentalsCaptureService:
             if list_rechecks is not None and recheck_room > 0:
                 known_ids = {int(event['id']) for event in candidate_events}
                 for event in list_rechecks(stock_codes=selected_stock_codes, limit=recheck_room):
+                    receipt_date = _parse_optional_iso_date(event.get('receipt_date'))
+                    if receipt_date is not None and receipt_date > resolved_market_date:
+                        continue
                     if int(event['id']) not in known_ids:
                         candidate_events.append(event)
                         known_ids.add(int(event['id']))

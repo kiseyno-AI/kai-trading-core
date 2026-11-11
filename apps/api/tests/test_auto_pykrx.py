@@ -416,6 +416,28 @@ class PykrxPipelineResultStatusTests(TestCase):
             )
         )
 
+    def test_preopen_required_inputs_rebuild_only_for_previous_session(self) -> None:
+        market = SimpleNamespace(
+            state='PREOPEN', is_trading_day=True, is_open=False,
+            server_time='2026-04-06T06:30:00+09:00',
+        )
+        for stage_id in ('fundamentals_daily_refresh', 'signal_features'):
+            with self.subTest(stage_id=stage_id):
+                self.assertFalse(should_skip_point_in_time_current_only_stage(
+                    stage_id=stage_id, market_date='2026-04-03',
+                    market=market, previous_trading_date=date(2026, 4, 3),
+                ))
+                self.assertTrue(should_skip_point_in_time_current_only_stage(
+                    stage_id=stage_id, market_date='2026-04-02',
+                    market=market, previous_trading_date=date(2026, 4, 3),
+                ))
+                market.state, market.is_open = 'OPEN', True
+                self.assertTrue(should_skip_point_in_time_current_only_stage(
+                    stage_id=stage_id, market_date='2026-04-03',
+                    market=market, previous_trading_date=date(2026, 4, 3),
+                ))
+                market.state, market.is_open = 'PREOPEN', False
+
     def test_open_session_previous_market_risk_remains_safety_skipped(
         self,
     ) -> None:
@@ -1908,6 +1930,99 @@ class _FakeDeduplicatingDailyPipelineRunStateService(_FakeDailyPipelineRunStateS
 
 
 class PykrxBackfillServiceTests(TestCase):
+    def test_preopen_rebuilds_safety_skipped_inputs_before_debt_validation(self) -> None:
+        service = PykrxBackfillService()
+        symbols = [PykrxSymbol('000660', 'KOSPI', 'SK하이닉스'),
+                   PykrxSymbol('005935', 'KOSPI', '삼성전자우')]
+        scope = sorted(item.symbol for item in symbols)
+        admission = build_exact_symbol_scope_outcome(
+            manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+            selected_symbols=scope, successful_symbols=scope,
+            retry_debt_symbols=[],
+        )
+        stages = {stage_id: {'status': 'completed'}
+                  for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER}
+        for stage_id in ('fundamentals_daily_refresh', 'signal_features'):
+            stages[stage_id]['details'] = {'result_summary': {
+                'triggered': False,
+                'status': 'skipped', 'skipped': True, 'safe_skip': True,
+                'stage': stage_id, 'market_date': '2026-04-03',
+                'reason': 'point_in_time_recovery_current_only_stage',
+            }}
+        stages['piotroski_filter']['result'] = {
+            'status': 'completed', 'market_date': '2026-04-03',
+            **_atomic_exact_scope_proof(
+                manifest_version='piotroski_scope_outcomes_v1',
+                selected_symbols=scope, successful_symbols=['000660'],
+                terminal_not_applicable_symbols=['005935'],
+            ),
+        }
+        for stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES:
+            stages[stage_id] = {'status': 'blocked'}
+        pipeline_run = {
+            'id': 646, 'trigger': 'auto_close_scheduler', 'status': 'partial',
+            'run_metadata': {'eod_collection_run_id': 594,
+                             'point_in_time_recovery': True,
+                             'resolved_stages': list(stages)},
+            'stages': stages,
+        }
+        eod_run = {
+            'id': 594, 'trade_date': '2026-04-03',
+            'trigger': 'auto_close_scheduler', 'status': 'completed',
+            'symbols_total': 2, 'symbols_succeeded': 2, 'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'], 'requested_symbols': scope,
+                'point_in_time_recovery': True,
+                'universe_snapshot': {
+                    **_stored_daily_universe_snapshot(symbols),
+                    'point_in_time': True, 'current_universe_mutated': False,
+                },
+                'followup_admission_scope_outcome': admission,
+            },
+        }
+        with (
+            patch('app.eod.pykrx_backfill._current_krx_calendar_date',
+                  return_value=date(2026, 4, 6)),
+            patch('app.eod.pykrx_pipeline_runner.get_market_state',
+                  return_value=SimpleNamespace(
+                      state='PREOPEN', is_trading_day=True, is_open=False,
+                      server_time='2026-04-06T06:30:00+09:00')) as market_state,
+            patch('app.eod.pykrx_pipeline_runner.previous_krx_trading_date',
+                  return_value=date(2026, 4, 3)),
+            patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                  'get_latest_run_for_context', return_value=pipeline_run),
+            patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                  'count_runs', return_value=0),
+            patch('app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                  return_value=scope),
+            patch('app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                  return_value={'status': 'partial', 'pipeline_run_id': 647}) as resume,
+        ):
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03', latest_available_trade_date='2026-04-03',
+                latest_eod_run=eod_run, markets=('KOSPI',),
+                point_in_time_recovery=True, provider_admission_fence_owned=True,
+            )
+            market_state.return_value.state = 'OPEN'
+            market_state.return_value.is_open = True
+            late = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03', latest_available_trade_date='2026-04-03',
+                latest_eod_run=eod_run, markets=('KOSPI',),
+                point_in_time_recovery=True, provider_admission_fence_owned=True,
+            )
+            self.assertFalse(late.get('triggered'), late)
+            self.assertEqual(resume.call_count, 1)
+        self.assertTrue(result.get('triggered'), result)
+        kwargs = resume.call_args.kwargs
+        self.assertEqual(kwargs['resume_from_stage'], 'fundamentals_daily_refresh')
+        self.assertEqual(kwargs['symbols'], scope)
+        self.assertEqual(kwargs['exact_membership_symbols'], scope)
+        self.assertEqual(kwargs['reused_eod_collection_run_id'], 594)
+        self.assertFalse(kwargs['force'])
+        self.assertFalse(kwargs['reuse_existing_feedback'])
+        self.assertNotIn('price_collection', kwargs['stages'])
+        self.assertNotIn('market_risk_filter', kwargs['stages'])
+
     def test_terminal_followup_suffix_ends_at_execution_plan(self) -> None:
         self.assertEqual(
             TERMINAL_FOLLOWUP_CONTINUATION_STAGES,
@@ -4449,7 +4564,7 @@ class PykrxBackfillServiceTests(TestCase):
 
         self.assertEqual(result['status'], 'completed')
         self.assertTrue(result['market_risk_filter']['safe_skip'])
-        current_only_stage_policy.assert_called_once_with(
+        current_only_stage_policy.assert_any_call(
             stage_id='market_risk_filter',
             market_date='2026-09-11',
         )

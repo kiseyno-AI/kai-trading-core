@@ -106,8 +106,10 @@ from app.eod.pykrx_pipeline_runner import (
     POINT_IN_TIME_RECOVERY_BOUNDARY_TRIGGERS,
     PykrxPipelineDependencies,
     _validated_exact_scope_outcome,
+    _is_canonical_point_in_time_current_only_skip,
     resolve_point_in_time_recovery,
     run_market_data_pipeline,
+    should_skip_point_in_time_current_only_stage,
 )
 from app.market.session import latest_krx_trading_date
 from app.eod.technical_snapshots import daily_technical_snapshot_service
@@ -246,6 +248,78 @@ def _is_price_cohort_factor_stage(
     return stage_id in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS and bool(
         accounted - dependency_scope
     )
+
+
+def _followup_stage_dependency_scope(
+    stage_id: str,
+    *,
+    successful: Mapping[str, Iterable[str]],
+    terminal: Mapping[str, Iterable[str]],
+    proofs: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[set[str], set[str]]:
+    """Apply preferred-share exemptions only to proven supported inputs."""
+
+    dependencies = FOLLOWUP_EXACT_STAGE_DEPENDENCIES.get(stage_id, ())
+    eligible = (
+        set(successful.get(dependencies[0]) or ())
+        if dependencies else set()
+    )
+    for dependency in dependencies[1:]:
+        eligible.intersection_update(successful.get(dependency) or ())
+    inherited_terminal = set().union(
+        *(set(terminal.get(dependency) or ()) for dependency in dependencies)
+    )
+    preferred: set[str] = set()
+    for proof in proofs.get('fundamentals_daily_refresh') or ():
+        claim = proof.get('preferred_not_applicable_stock_codes')
+        proof_terminal = set(
+            proof.get('terminal_not_applicable_stock_codes') or ()
+        )
+        if (
+            isinstance(claim, list)
+            and claim == _dedupe_symbol_codes(claim)
+            and set(claim).issubset(proof_terminal)
+        ):
+            preferred.update(claim)
+    preferred.intersection_update(
+        terminal.get('fundamentals_daily_refresh') or ()
+    )
+
+    def selected(stage: str) -> set[str]:
+        return set().union(*(
+            set(proof.get('selected_stock_codes') or ())
+            for proof in proofs.get(stage) or ()
+        ))
+
+    if stage_id == 'piotroski_filter':
+        eligible.update(preferred)
+    elif stage_id in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS:
+        price_preferred = preferred & selected(stage_id)
+        eligible.update(price_preferred)
+        inherited_terminal.difference_update(price_preferred)
+    elif stage_id == 'signal_features':
+        supported_preferred = preferred & set(
+            terminal.get('piotroski_filter') or ()
+        )
+        for dependency in NON_DART_FACTOR_FOLLOWUP_STAGE_IDS:
+            supported_preferred.intersection_update(
+                successful.get(dependency) or ()
+            )
+        for dependency in (
+            set(FACTOR_FOLLOWUP_STAGE_ORDER)
+            - set(NON_DART_FACTOR_FOLLOWUP_STAGE_IDS)
+        ):
+            if not proofs.get(dependency):
+                supported_preferred.clear()
+                break
+            supported_preferred.difference_update(
+                selected(dependency) - set(successful.get(dependency) or ())
+            )
+        eligible.update(supported_preferred)
+        inherited_terminal.difference_update(supported_preferred)
+    return eligible, inherited_terminal
+
+
 RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS = (
     'pykrx_enrichment',
     'technical_snapshots',
@@ -2668,6 +2742,16 @@ def _followup_exact_result_authority(
             terminal_not_applicable_symbols=terminal,
         ),
     }
+    if stage_id == 'fundamentals_daily_refresh':
+        preferred = proof.get('preferred_not_applicable_stock_codes')
+        if preferred is not None:
+            if (
+                not isinstance(preferred, list)
+                or preferred != _dedupe_symbol_codes(preferred)
+                or not set(preferred).issubset(terminal_set)
+            ):
+                return None
+            reconstructed['preferred_not_applicable_stock_codes'] = list(preferred)
     for scalar_key in (
         'blocking_status',
         'full_signal_coverage_status',
@@ -3275,17 +3359,15 @@ def _validated_followup_stage_debt_state(
         dependencies = FOLLOWUP_EXACT_STAGE_DEPENDENCIES.get(stage_id, ())
         if not dependencies:
             return None
-        eligible = set(successful_sets.get(dependencies[0], set()))
-        for dependency in dependencies[1:]:
-            eligible.intersection_update(
-                successful_sets.get(dependency, set())
-            )
+        eligible, inherited_terminal = _followup_stage_dependency_scope(
+            stage_id,
+            successful=successful_sets,
+            terminal=terminal_sets,
+            proofs=normalized_proofs,
+        )
         stage_pending = pending_sets.get(stage_id, set())
         stage_successful = successful_sets.get(stage_id, set())
         stage_terminal = terminal_sets.get(stage_id, set())
-        inherited_terminal = set().union(
-            *(terminal_sets.get(dependency, set()) for dependency in dependencies)
-        )
         if _is_price_cohort_factor_stage(
             stage_id,
             stage_pending | stage_successful | stage_terminal,
@@ -3347,6 +3429,7 @@ def _canonicalize_followup_stage_debt_graph(
     pending: dict[str, list[str]],
     successful: dict[str, list[str]],
     terminal: dict[str, list[str]],
+    proofs: Mapping[str, Sequence[Mapping[str, Any]]],
     admit_newly_eligible: bool,
 ) -> None:
     """Propagate dependency closure without inventing successful output."""
@@ -3358,13 +3441,11 @@ def _canonicalize_followup_stage_debt_graph(
             dependencies = FOLLOWUP_EXACT_STAGE_DEPENDENCIES.get(stage_id)
             if not dependencies:
                 continue
-            eligible = set(successful.get(dependencies[0]) or [])
-            for dependency in dependencies[1:]:
-                eligible.intersection_update(
-                    successful.get(dependency) or []
-                )
-            inherited_terminal = set().union(
-                *(set(terminal.get(dependency) or []) for dependency in dependencies)
+            eligible, inherited_terminal = _followup_stage_dependency_scope(
+                stage_id,
+                successful=successful,
+                terminal=terminal,
+                proofs=proofs,
             )
             stage_present = bool(
                 pending.get(stage_id)
@@ -3387,6 +3468,16 @@ def _canonicalize_followup_stage_debt_graph(
             stage_pending = set(pending.get(stage_id) or [])
             stage_successful = set(successful.get(stage_id) or [])
             stage_terminal = set(terminal.get(stage_id) or [])
+            proven_terminal = set().union(*(
+                set(proof.get('terminal_not_applicable_stock_codes') or ())
+                for proof in proofs.get(stage_id) or ()
+            ))
+            restored_eligible = (
+                stage_terminal & eligible
+            ) - inherited_terminal - proven_terminal
+            if restored_eligible:
+                stage_terminal.difference_update(restored_eligible)
+                changed = True
             new_terminal = inherited_terminal - stage_terminal
             if new_terminal:
                 stage_pending.difference_update(new_terminal)
@@ -3636,6 +3727,7 @@ def _advance_followup_stage_debt_state(
         pending=pending,
         successful=successful,
         terminal=terminal,
+        proofs=proofs,
         admit_newly_eligible=True,
     )
 
@@ -3751,10 +3843,8 @@ def _followup_stage_debt_terminal_cohort(
 ) -> tuple[str, list[str]] | None:
     """Return the exact cohort safe to enter the terminal suffix.
 
-    Prior-date recovery must not recreate current-only KIS signal features.
-    It therefore uses the intersection that completed every stored-data
-    factor.  A current-date recovery requires the stricter published signal
-    feature success set.
+    Use published signal success when available, including stored-only
+    recovery. Legacy prior-date runs without it retain the factor intersection.
     """
 
     successful = state.get('successful_by_stage')
@@ -3762,10 +3852,12 @@ def _followup_stage_debt_terminal_cohort(
     attempts = state.get('recovery_attempts_by_stage')
     if not isinstance(successful, Mapping) or not isinstance(pending, Mapping):
         return None
+    signal_cohort = _dedupe_symbol_codes(successful.get('signal_features') or [])
+    use_factor_intersection = point_in_time_recovery and not signal_cohort
     attempts = attempts if isinstance(attempts, Mapping) else {}
     attempted_stage_ids = (
         ('piotroski_filter', *FACTOR_FOLLOWUP_STAGE_ORDER)
-        if point_in_time_recovery
+        if use_factor_intersection
         else (
             'piotroski_filter',
             *FACTOR_FOLLOWUP_STAGE_ORDER,
@@ -3786,7 +3878,7 @@ def _followup_stage_debt_terminal_cohort(
             if stage_pending and attempt_count == 0:
                 return None
 
-    if point_in_time_recovery:
+    if use_factor_intersection:
         factor_sets: list[set[str]] = []
         for stage_id in FACTOR_FOLLOWUP_STAGE_ORDER:
             stage_symbols = _dedupe_symbol_codes(
@@ -3798,11 +3890,7 @@ def _followup_stage_debt_terminal_cohort(
         cohort = set.intersection(*factor_sets)
         cohort_basis = 'factor_intersection'
     else:
-        cohort = set(
-            _dedupe_symbol_codes(
-                successful.get('signal_features') or []
-            )
-        )
+        cohort = set(signal_cohort)
         cohort_basis = 'signal_features'
     if not cohort:
         return None
@@ -4332,11 +4420,19 @@ def _resolve_followup_stage_debt_state(
                             'signal_features_stage_debt_manifest_invalid'
                         ),
                     }
-                eligible_signal_symbols = set(parent_symbols)
-                for dependency_partition in dependency_partitions:
-                    eligible_signal_symbols.intersection_update(
-                        dependency_partition['successful_stock_codes']
-                    )
+                eligible_signal_symbols, _ = _followup_stage_dependency_scope(
+                    stage_id,
+                    successful={
+                        key: item['successful_stock_codes']
+                        for key, item in partitions.items()
+                    },
+                    terminal={
+                        key: item['terminal_not_applicable_stock_codes']
+                        for key, item in partitions.items()
+                    },
+                    proofs=proofs_by_stage,
+                )
+                eligible_signal_symbols.intersection_update(parent_symbols)
                 if set(normalized_signal_selected) != (
                     eligible_signal_symbols
                 ):
@@ -4429,19 +4525,18 @@ def _resolve_followup_stage_debt_state(
                     if legacy_piotroski_quality_authority:
                         expected_selected = set(parent_symbols)
                     else:
-                        expected_selected = set(
-                            dependency_partitions[0][
-                                'successful_stock_codes'
-                            ]
+                        expected_selected, _ = _followup_stage_dependency_scope(
+                            stage_id,
+                            successful={
+                                key: item['successful_stock_codes']
+                                for key, item in partitions.items()
+                            },
+                            terminal={
+                                key: item['terminal_not_applicable_stock_codes']
+                                for key, item in partitions.items()
+                            },
+                            proofs={**proofs_by_stage, stage_id: [proof]},
                         )
-                        for dependency_partition in (
-                            dependency_partitions[1:]
-                        ):
-                            expected_selected.intersection_update(
-                                dependency_partition[
-                                    'successful_stock_codes'
-                                ]
-                            )
                 else:
                     expected_selected = set(parent_symbols)
                 if (
@@ -4499,6 +4594,7 @@ def _resolve_followup_stage_debt_state(
         pending=pending_by_stage,
         successful=successful_by_stage,
         terminal=terminal_by_stage,
+        proofs=proofs_by_stage,
         admit_newly_eligible=False,
     )
     pending_by_stage = {
@@ -7703,7 +7799,35 @@ class PykrxBackfillService:
             )
             is None
         )
-        if upstream_admission_rebuild_pending:
+        preopen_prerequisite_rebuild_stage = next(
+            (
+                stage_id
+                for stage_id in ('fundamentals_daily_refresh', 'signal_features')
+                if point_in_time_recovery
+                and not price_retry_symbols
+                and stage_id in recovery_scope
+                and latest_eod_metadata.get(FOLLOWUP_STAGE_DEBT_METADATA_KEY) is None
+                and set(_validated_followup_admitted_symbols(latest_eod_metadata) or [])
+                == set(full_point_in_time_scope)
+                and full_point_in_time_scope
+                and _is_canonical_point_in_time_current_only_skip(
+                    _stage_result_summary(stage_rows.get(stage_id)),
+                    stage_id=stage_id,
+                    market_date=market_date,
+                )
+                and not should_skip_point_in_time_current_only_stage(
+                    stage_id=stage_id, market_date=market_date,
+                )
+            ),
+            None,
+        )
+        if preopen_prerequisite_rebuild_stage is not None:
+            incomplete_stages = [
+                stage_id for stage_id in recovery_scope
+                if stage_id in incomplete_stages
+                or stage_id == preopen_prerequisite_rebuild_stage
+            ]
+        if upstream_admission_rebuild_pending or preopen_prerequisite_rebuild_stage:
             # Exact follow-up debt is scoped by the upstream admission
             # partition. When enrichment (or another admission prerequisite)
             # must be rebuilt first, the persisted downstream partition is
@@ -7985,6 +8109,9 @@ class PykrxBackfillService:
                 debt_stage_id == 'signal_features'
                 and date.fromisoformat(market_date)
                 < current_krx_calendar_date
+                and should_skip_point_in_time_current_only_stage(
+                    stage_id=debt_stage_id, market_date=market_date,
+                )
             ):
                 result = build_daily_skip_result(
                     reason='followup_stage_debt_current_only_expired',
@@ -8005,7 +8132,10 @@ class PykrxBackfillService:
                     'stage_debt_preserved': True,
                 }
                 return result
-            point_in_time_recovery = debt_stage_id != 'signal_features'
+            point_in_time_recovery = (
+                debt_stage_id != 'signal_features'
+                or date.fromisoformat(market_date) < current_krx_calendar_date
+            )
             point_in_time_membership_symbols = (
                 _validated_followup_admitted_symbols(latest_eod_metadata)
             )
@@ -8264,12 +8394,20 @@ class PykrxBackfillService:
                 'provider_admission': required_provider_admission,
             }
             return result
-        dart_recovery_scope = _resolve_dart_followup_recovery_scope(
-            incomplete_stages=incomplete_stages,
-            stage_rows=stage_rows,
-            run_metadata=run_metadata,
-            latest_eod_metadata=latest_eod_metadata,
-        )
+        if preopen_prerequisite_rebuild_stage == 'fundamentals_daily_refresh':
+            # A canonical safety skip published no DART partition to retry.
+            # Rebuild the verified parent scope rather than borrowing factor proof.
+            dart_recovery_scope = {
+                'required': True, 'ready': True,
+                'symbols': list(full_point_in_time_scope),
+            }
+        else:
+            dart_recovery_scope = _resolve_dart_followup_recovery_scope(
+                incomplete_stages=incomplete_stages,
+                stage_rows=stage_rows,
+                run_metadata=run_metadata,
+                latest_eod_metadata=latest_eod_metadata,
+            )
         if (
             dart_recovery_scope.get('required') is True
             and dart_recovery_scope.get('ready') is not True
@@ -9094,7 +9232,7 @@ class PykrxBackfillService:
             'market_date': market_date,
             'stages': recovery_stages,
             'markets': recovery_markets,
-            'force': force_feedback_recompute,
+            'force': force_feedback_recompute and not point_in_time_recovery,
             'reuse_existing_feedback': not force_feedback_recompute,
             'resume_from_stage': resume_from_stage,
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
