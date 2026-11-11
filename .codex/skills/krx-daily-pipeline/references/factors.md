@@ -46,7 +46,7 @@ For a mixed explicit/resumed scope, keep proven preferred-share Piotroski exempt
 ## 16. advanced_value_factors
 
 - **Input and output** — Exact-date prices and market cap with selected annual DART inputs. Writes `daily_advanced_value_factor_results`. Uses free-cash-flow yield and EV/EBITDA.
-- **Completion and blocking** — The combined score requires both components. Operating cash flow, CAPEX, D&A, positive EBITDA and valid EV are metric inputs. Unknown values remain unknown, including missing D&A. Distinguish a missing raw account from a recognized account excluded by the DB prefilter before matching. DART non-applicability, normal missing input and real compute/write debt are separate.
+- **Completion and blocking** — The v2 score renormalizes equal weights over available component percentiles. One valid component supports a score, with the used component count and coverage ratio retained. Operating cash flow, CAPEX, D&A, positive EBITDA and valid EV are individual metric inputs. Unknown values remain unknown, including missing D&A. Distinguish a missing raw account from a recognized account excluded by the DB prefilter before matching. DART non-applicability, normal missing input and real compute/write debt are separate.
 - **Trace** — `signals/advanced_value_factor.py` and `GET /eod/advanced-value-factors`. Check the selected annual raw rows and matcher predicates before assuming the issuer omitted an item.
 
 ## 17. unified_value_factors

@@ -988,6 +988,52 @@ def _build_daily_refresh_updated_entries_summary(
     }
 
 
+def fundamentals_snapshot_availability(run: dict[str, Any]) -> dict[str, Any]:
+    metadata = run.get('run_metadata') or {}
+    saved = metadata.get('snapshot_availability')
+    if isinstance(saved, dict):
+        return dict(saved)
+    checked = int(run.get('symbols_checked') or 0)
+    raw_entries = metadata.get('updated_entries')
+    entries = _extract_daily_refresh_updated_entries(run) if isinstance(raw_entries, list) else []
+    refreshed = int(run.get('symbols_refreshed') or 0)
+    retry_debt_count = int(
+        metadata.get('retry_debt_count') or run.get('symbols_failed') or 0
+    )
+    if int(run.get('symbols_missing') or 0) and refreshed and (
+        len(entries) != refreshed
+        or len(raw_entries or []) != refreshed
+        or any(
+            not isinstance(entry, dict)
+            or entry.get('update_category') not in UPDATED_ENTRY_CATEGORY_LABELS
+            for entry in raw_entries or []
+        )
+    ):
+        return {
+            'available_snapshot_count': None,
+            'reused_snapshot_count': None,
+            'refreshed_snapshot_count': refreshed,
+            'unavailable_snapshot_count': None,
+            'retry_debt_count': retry_debt_count,
+            'coverage_basis': 'incomplete_legacy_update_manifest',
+        }
+    initial_captures = sum(
+        entry.get('update_category') == 'initial_fundamentals_capture'
+        for entry in entries
+    )
+    available = min(
+        checked,
+        max(checked - int(run.get('symbols_missing') or 0) + initial_captures, 0),
+    )
+    return {
+        'available_snapshot_count': available,
+        'reused_snapshot_count': max(available - refreshed, 0),
+        'refreshed_snapshot_count': refreshed,
+        'unavailable_snapshot_count': checked - available,
+        'retry_debt_count': retry_debt_count,
+    }
+
+
 class DartFundamentalsCaptureService:
     def __init__(
         self,
@@ -4138,6 +4184,22 @@ class DartFundamentalsCaptureService:
                 state_histogram[state] += 1
             normalized_state_histogram = dict(sorted(state_histogram.items()))
             retry_debt_count = len(exact_retry_debt_symbols)
+            available_snapshot_symbols = ({
+                stock_code
+                for stock_code, latest_date in latest_fundamentals_date_by_symbol.items()
+                if latest_date is not None
+            } | refreshed_symbols) & set(selected_stock_codes)
+            snapshot_availability = {
+                'available_snapshot_count': len(available_snapshot_symbols),
+                'reused_snapshot_count': len(
+                    available_snapshot_symbols - refreshed_symbols
+                ),
+                'refreshed_snapshot_count': len(refreshed_symbols),
+                'unavailable_snapshot_count': len(
+                    set(selected_stock_codes) - available_snapshot_symbols
+                ),
+                'retry_debt_count': retry_debt_count,
+            }
             all_selected_symbols_stale_deferred = bool(
                 selected_stock_codes
             ) and all(
@@ -4211,6 +4273,7 @@ class DartFundamentalsCaptureService:
                 'missing_candidate_symbols_sample': _limited_sample(sorted(missing_candidate_symbols)),
                 'refreshed_symbols_sample': _limited_sample(sorted(refreshed_symbols)),
                 'updated_entries': updated_entries,
+                'snapshot_availability': snapshot_availability,
                 'failed_symbols_sample': _limited_sample(sorted(failed_symbols)),
                 'terminal_no_data_symbols_sample': _limited_sample(
                     sorted(terminal_symbols_by_status.get(CAPTURE_STATUS_NO_DATA, set()))
@@ -4371,6 +4434,7 @@ class DartFundamentalsCaptureService:
                 'symbols_fresh': symbols_fresh,
                 'symbols_refreshed': symbols_refreshed,
                 'symbols_failed': symbols_failed,
+                'snapshot_availability': snapshot_availability,
                 'events_detected': events_detected,
                 'events_captured': events_captured,
                 'events_failed': events_failed,
@@ -4511,6 +4575,7 @@ class DartFundamentalsCaptureService:
         updated_count = int(run.get('symbols_refreshed') or len(updated_entries))
         return {
             **run,
+            'snapshot_availability': fundamentals_snapshot_availability(run),
             'updated_entries_summary': _build_daily_refresh_updated_entries_summary(
                 updated_count=updated_count,
                 updated_entries=updated_entries,

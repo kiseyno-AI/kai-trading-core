@@ -3,7 +3,7 @@
 ## Summary
 Computes or reads persisted advanced value-factor rows built from stored `daily_price_bars` and stored annual DART fundamentals snapshots.
 
-`advanced_value_v1` is a follow-up layer to value v1, not a replacement for it. The slice scores:
+`advanced_value_v2` is a follow-up layer to value v1, not a replacement for it. The score uses available component percentiles with their base weights renormalized. One valid component is sufficient. The slice scores:
 - higher `fcf_yield` as better
 - lower `ev_to_ebitda` as better
 
@@ -15,26 +15,26 @@ The compute path uses the latest stored annual `CFS` DART snapshot on or before 
 - `ebitda = operating_income + depreciation_and_amortization`
 - `ev_to_ebitda = enterprise_value / ebitda`
 
-Rows with incomplete or invalid inputs still persist with explicit component statuses and `advanced_value_classification`.
+Rows with incomplete or invalid inputs persist with explicit component statuses and `advanced_value_classification`. The `advanced_value_components_used` count and `factor_payload.availability.component_coverage_ratio` expose scoring coverage. With one usable component the coverage ratio is 0.5 and the existing coverage summary records a partial-quality row. With neither component the score remains null. The daily stage can complete after publishing either output.
 
 ## Compute query parameters
 - `market_date` (required): ISO trade date to score.
 - `symbols` (optional): comma-separated symbol subset. When omitted, the route uses the full stored symbol universe with a bar on `market_date`.
-- `source` (optional): persisted feature-version string. Defaults to `advanced_value_v1`.
+- `source` (optional): persisted feature-version string. Defaults to `advanced_value_v2`.
 
 If `symbols` is provided but trims down to an explicit empty subset, the route returns a no-op response with zero persisted rows.
 
 ## Example compute request
 ```http
-POST /eod/advanced-value-factors/compute?market_date=2026-04-24&symbols=005930,000660&source=advanced_value_v1
+POST /eod/advanced-value-factors/compute?market_date=2026-04-24&symbols=005930,000660&source=advanced_value_v2
 ```
 
 ## Example compute response
 ```json
 {
   "market_date": "2026-04-24",
-  "source": "advanced_value_v1",
-  "feature_version": "advanced_value_v1",
+  "source": "advanced_value_v2",
+  "feature_version": "advanced_value_v2",
   "requested_symbols": ["005930", "000660"],
   "matched_symbols": ["005930", "000660"],
   "missing_symbols": [],
@@ -68,8 +68,8 @@ POST /eod/advanced-value-factors/compute?market_date=2026-04-24&symbols=005930,0
       "name_ko": "삼성전자",
       "market": "KOSPI",
       "market_date": "2026-04-24",
-      "source": "advanced_value_v1",
-      "feature_version": "advanced_value_v1",
+      "source": "advanced_value_v2",
+      "feature_version": "advanced_value_v2",
       "market_cap_proxy": 425000000000000.0,
       "enterprise_value": 452000000000000.0,
       "ebitda": 80200000000000.0,
@@ -91,7 +91,11 @@ POST /eod/advanced-value-factors/compute?market_date=2026-04-24&symbols=005930,0
       "advanced_value_classification": "eligible",
       "is_advanced_value_eligible": true,
       "factor_payload": {
-        "feature_version": "advanced_value_v1",
+        "feature_version": "advanced_value_v2",
+        "availability": {
+          "advanced_value_components_used": 2,
+          "component_coverage_ratio": 1.0
+        },
         "methodology": {
           "financial_snapshot_policy": {
             "report_code": "11011",
@@ -121,7 +125,7 @@ GET /eod/advanced-value-factors?market_date=2026-04-24&symbol=005930
 ```json
 {
   "market_date": "2026-04-24",
-  "feature_version": "advanced_value_v1",
+  "feature_version": "advanced_value_v2",
   "summary": {
     "entries": 1,
     "requested_symbol": "005930",
@@ -140,7 +144,7 @@ GET /eod/advanced-value-factors?market_date=2026-04-24&symbol=005930
     "fcf_yield": 0.070118,
     "ev_to_ebitda": 5.63591,
     "factor_payload": {
-      "feature_version": "advanced_value_v1",
+      "feature_version": "advanced_value_v2",
       "availability": {
         "fcf_yield_status": "available",
         "ev_to_ebitda_status": "available"

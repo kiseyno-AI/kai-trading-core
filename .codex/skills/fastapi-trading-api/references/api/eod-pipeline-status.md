@@ -23,6 +23,17 @@ When `market_date` is omitted, the route answers from a short in-process cache p
 
 When diagnostics are enabled, row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
 
+For Piotroski, advanced value, unified value, quality, and composite stages,
+row coverage excludes verified preferred shares from the applicable denominator.
+`details.not_applicable_count` and `not_applicable_symbols_sample` identify those
+shares in both lightweight and detailed responses. Missing counts concern the
+remaining applicable symbols. A stored row with a null score still counts as a
+published row.
+
+`fundamentals_daily_refresh.details.snapshot_availability` reports existing
+snapshot reuse, refreshed snapshots, unavailable data, and retry debt. No new
+filing leaves a previously captured valid snapshot usable.
+
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
 
 `macro_context_refresh` reports persisted slow-moving macro context availability from `macro_context_observations`. `available` context maps to a completed stage, stale or partial context maps to partial, and missing context remains pending. Source statuses preserve World Bank availability and optional FRED disabled/missing-key state without blocking the whole pipeline.
@@ -45,6 +56,11 @@ available as `source_status`, while
 included in `running_stages` or selected as current live work.
 
 Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may be `skipped` with reason metadata once same-date downstream output exists and there is no active/pre-open official stage row. This prevents `current_stage` from pointing at `master_refresh` after a resumed EOD or agent-stage recovery has already completed.
+
+When the same-date collection run records `universe_refreshed=true` with a
+complete, verified same-date membership snapshot, `pykrx_universe_refresh`
+reports `completed` and its verified symbol count. An unexecuted master refresh
+reports `skipped` with `reason=preopen_stage_not_executed_in_market_date_run`.
 
 ## Example request
 ```http
