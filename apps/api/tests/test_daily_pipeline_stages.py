@@ -253,12 +253,14 @@ def _terminal_decider_outcome_with_role_failures(
     cutoff_at: datetime,
     source_summary_run_id: str = 'summary-run',
     run_id: str = 'signal-decider-partial',
+    role_scopes: dict[str, list[str]] | None = None,
 ) -> tuple[dict, dict]:
     roles = list(DECISION_SUPPORT_AGENT_NAMES)
+    role_scopes = role_scopes if role_scopes is not None else {role: list(symbols) for role in roles}
     completed_symbols_by_role = {
         role: [
             symbol
-            for symbol in symbols
+            for symbol in role_scopes[role]
             if symbol not in set(failed_symbols_by_role.get(role, []))
         ]
         for role in roles
@@ -296,10 +298,10 @@ def _terminal_decider_outcome_with_role_failures(
             'role': role,
             'status': role_status,
             'boundary_status': role_status,
-            'total_symbols': len(symbols),
-            'processed_symbols': len(symbols),
+            'total_symbols': len(role_scopes[role]),
+            'processed_symbols': len(role_scopes[role]),
             'completed_symbols': role_completed_items,
-            'terminal_symbols': len(symbols),
+            'terminal_symbols': len(role_scopes[role]),
             'failed_items': role_failed_items,
             'in_progress_symbols': 0,
             'pending_symbols': 0,
@@ -345,14 +347,14 @@ def _terminal_decider_outcome_with_role_failures(
                 'run_table_status': run_status,
                 'run_completed_at': cutoff_at.isoformat(),
                 'is_live': False,
-                'expected_feedback_count': len(symbols) * len(roles),
+                'expected_feedback_count': sum(map(len, role_scopes.values())),
                 'completed_feedback_count': completed_items,
                 'failed_items': failed_items,
                 'role_symbol_scopes': {
-                    role: list(symbols) for role in roles
+                    role: list(role_scopes[role]) for role in roles
                 },
                 'role_symbol_counts': {
-                    role: len(symbols) for role in roles
+                    role: len(role_scopes[role]) for role in roles
                 },
                 'failed_symbols_by_role': {
                     role: list(failed_symbols_by_role.get(role, []))
@@ -12670,6 +12672,30 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
                 feedback_cutoff_resolution=cutoff_resolution,
             )
         )
+
+    def test_terminal_proof_keeps_successful_lane_after_economics_exclusion(self) -> None:
+        symbols = ['000660', '005930']
+        outcome, cutoff = _terminal_decider_outcome_with_role_failures(
+            symbols=symbols,
+            failed_symbols_by_role={},
+            cutoff_at=datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc),
+            role_scopes={'signal-decider': ['000660'], 'short-term-decider': []},
+        )
+        build_proof = DailyPipelineStageService._terminal_decider_progression_proof
+        self.assertIsNone(build_proof(outcome, expected_decider_symbols=symbols, feedback_cutoff_resolution=cutoff))
+        outcome['result']['progress']['summary']['funnel_diagnostics'] = {
+            'role_diagnostics': {
+                role: {'entry_economics_exclusions': {
+                    '005930': {'code': 'entry_reward_risk_below_role_floor', 'excluded_roles': [role]},
+                }}
+                for role in DECISION_SUPPORT_AGENT_NAMES
+            },
+        }
+        proof = build_proof(outcome, expected_decider_symbols=symbols, feedback_cutoff_resolution=cutoff)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['entry_economics_excluded_symbols'], ['005930'])
+        self.assertEqual(proof['completed_symbols_by_role'], {'signal-decider': ['000660'], 'short-term-decider': []})
+        self.assertEqual(proof['total_items'], 1)
 
     def test_run_advances_short_lane_without_unscoped_signal_evaluation(
         self,

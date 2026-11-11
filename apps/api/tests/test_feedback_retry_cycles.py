@@ -7277,6 +7277,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         load_eligible.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
             requested_symbols=None,
+            apply_entry_economics=True,
         )
         build_decisions.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
@@ -7302,6 +7303,7 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         load_eligible.assert_called_once_with(
             market_date=date.fromisoformat('2026-04-16'),
             requested_symbols=('035420', '005930', '114630'),
+            apply_entry_economics=True,
         )
         self.assertEqual(result, ['035420', '005930'])
 
@@ -7452,6 +7454,34 @@ class FeedbackRetryCycleTests(unittest.TestCase):
         self.assertEqual(result['progress']['summary']['first_feedback_at'], '2026-04-16T01:00:00+00:00')
         self.assertEqual(result['progress']['summary']['completed_feedback_per_minute'], 0.6)
         self.assertEqual(result['progress']['summary']['estimated_completion_at'], '2026-04-16T01:05:00+00:00')
+
+    def test_run_retry_cycles_reports_no_work_when_entry_economics_excludes_all(self):
+        service = AgentFeedbackRetryService()
+        run_state_service = RecordingRunStateService()
+        role = 'signal-decider'
+        with (
+            patch.object(service, '_load_eligible_symbols', return_value=['005930']),
+            patch(
+                'app.agent_context.retry_service.load_agent_feedback_eligibility_records',
+                return_value=[{'symbol': '005930', 'entry_economics': {'excluded_roles': [role]}}],
+            ),
+            patch(
+                'app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+                return_value=_feedback_prerequisites(),
+            ),
+            patch('app.agent_context.retry_service.agent_context_feedback_run_state_service', run_state_service),
+            patch('app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols') as dispatch,
+        ):
+            result = service.run_retry_cycles(config=SimpleNamespace(
+                market_date=date(2026, 4, 16), roles=(role,), max_cycles=1,
+                outer_batch_size=1, reuse_existing=True,
+            ))
+
+        dispatch.assert_not_called()
+        self.assertEqual(run_state_service.started[0]['symbols_total'], 0)
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['reason'], 'no_agent_feedback_eligible_symbols')
+        self.assertTrue(result['entry_economics_scope_empty'])
 
     def test_run_retry_cycles_joins_identical_active_scope_when_admission_is_busy(self):
         service = AgentFeedbackRetryService()

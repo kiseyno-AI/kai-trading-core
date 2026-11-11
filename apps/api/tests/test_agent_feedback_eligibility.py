@@ -1086,6 +1086,85 @@ class AgentFeedbackEligibilityTests(unittest.TestCase):
         self.assertEqual(funnel['role_symbols']['short-term-decider'], ['005930', '000660'])
         self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930', '000660'])
 
+    def test_proven_weak_entry_economics_refill_role_caps(self) -> None:
+        market_date = date(2026, 11, 10)
+        score_rows = [
+            {
+                'symbol': symbol,
+                'signal_score': score,
+                'action_label': action,
+                'close_price': 100,
+                'trigger_price': 100,
+                'invalidation_price': 90,
+                'support_price': 85,
+                'resistance_price': resistance,
+                'session_low_price': 100,
+                'session_high_price': 104,
+                'raw_trading_value_krw': 3_000_000_000,
+                'price_captured_at': '2026-11-10T07:00:00+00:00',
+                'action_captured_at': '2026-11-10T07:01:00+00:00',
+            }
+            for symbol, score, action, resistance in (
+                ('005930', 100, 'long_bias', 106),
+                ('000660', 90, 'long_bias', 115),
+                ('035420', 80, 'long_breakout', 99),
+                ('051910', 70, 'long_bias', 125),
+            )
+        ]
+        with (
+            patch('app.agent_context.eligibility.load_daily_piotroski_filter_results', return_value=[]),
+            patch('app.agent_context.eligibility.load_daily_market_risk_filter_results', return_value=[
+                {'symbol': row['symbol'], 'passed_filter': True} for row in score_rows
+            ]),
+            patch('app.agent_context.eligibility.load_symbols', return_value=[]),
+            patch('app.agent_context.eligibility.load_agent_feedback_candidate_score_rows', return_value=score_rows),
+            patch('app.agent_context.eligibility._load_forced_inclusion_reasons', return_value=({}, {})),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_broad_candidate_cap_min_symbols', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_broad_candidate_cap_max_symbols', 2),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_signal_decider', 1),
+            patch('app.agent_context.eligibility.settings.openclaw_feedback_role_cap_short_term_decider', 1),
+        ):
+            records = load_agent_feedback_eligibility_records(market_date=market_date)
+            roles = ['technical-summarizer', 'signal-decider', 'short-term-decider']
+            for mode in (FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH, FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE):
+                with self.subTest(mode=mode):
+                    funnel = build_agent_feedback_role_funnel(records=records, roles=roles, feedback_scope_mode=mode)
+                    self.assertEqual(funnel['role_symbols']['signal-decider'], ['000660'])
+                    self.assertEqual(funnel['role_symbols']['short-term-decider'], ['035420'])
+                    self.assertCountEqual(funnel['role_symbols']['technical-summarizer'], ['000660', '035420'])
+                    self.assertEqual(
+                        set(funnel['role_diagnostics']['short-term-decider']['entry_economics_exclusions']),
+                        {'000660'},
+                    )
+            unprotected = [
+                {**record, 'cap_excluded': False}
+                for record in records if record['symbol'] == '005930'
+            ]
+            funnel = build_agent_feedback_role_funnel(records=unprotected, roles=roles)
+            self.assertEqual(funnel['role_symbols'], {role: [] for role in roles})
+            protected = build_agent_feedback_role_funnel(
+                records=unprotected,
+                roles=roles,
+                forced_inclusion_reasons_by_symbol={'005930': [{'code': 'active_watch'}]},
+            )
+            self.assertEqual(protected['role_symbols'], {role: ['005930'] for role in roles})
+            exact = load_agent_feedback_eligibility_records(market_date=market_date, requested_symbols=['005930'])
+            funnel = build_agent_feedback_role_funnel(records=exact, roles=roles, requested_symbols=['005930'])
+            self.assertEqual(funnel['role_symbols']['signal-decider'], ['005930'])
+            self.assertEqual(funnel['role_symbols']['short-term-decider'], ['005930'])
+            legacy = load_agent_feedback_eligibility_records(market_date=market_date, apply_entry_economics=False)
+            self.assertFalse(next(row for row in legacy if row['symbol'] == '005930')['cap_excluded'])
+            for updated in (
+                {'session_low_price': 94},
+                {'session_low_price': 100, 'action_captured_at': '2026-11-10T06:59:00+00:00'},
+            ):
+                with self.subTest(updated=updated):
+                    score_rows[0].update(updated)
+                    candidates = load_agent_feedback_eligibility_records(market_date=market_date)
+                    selected = build_agent_feedback_role_funnel(records=candidates, roles=roles)
+                    self.assertEqual(selected['role_symbols']['signal-decider'], ['005930'])
+                    self.assertEqual(selected['role_symbols']['short-term-decider'], ['005930'])
+
     def test_role_funnel_fast_path_preserves_distinct_decider_top_rankings(self) -> None:
         records = [
             {

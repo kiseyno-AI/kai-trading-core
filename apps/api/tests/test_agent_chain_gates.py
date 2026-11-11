@@ -5,7 +5,12 @@ from __future__ import annotations
 import unittest
 
 from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
-from app.eod.agent_chain_gates import finished_partial_feeds_downstream, summary_partial_dependency_is_proven
+from app.eod.agent_chain_gates import (
+    empty_agent_scope_followup,
+    finished_partial_feeds_downstream,
+    summary_partial_dependency_is_proven,
+)
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.summary_cutoff_contract import COMPLETED_SUMMARIZER_INTERSECTION_PROOF_VERSION
 
 COMPLETED = ['000660', '005930']
@@ -90,6 +95,22 @@ class FinishedPartialRuleTests(unittest.TestCase):
             with self.subTest(summary=summary):
                 self.assertFalse(finished_partial_feeds_downstream(self._result(**summary), status='partial'))
         self.assertFalse(finished_partial_feeds_downstream({}, status='partial'))
+
+
+class EmptyAgentScopeTests(unittest.TestCase):
+    def test_same_day_empty_candidate_scope_skips_decider_and_plan(self):
+        market_date = '2026-11-10'
+        summaries = {
+            'status': 'skipped', 'reason': 'no_agent_feedback_eligible_symbols',
+            'market_date': market_date, 'entry_economics_scope_empty': True,
+        }
+        decider = empty_agent_scope_followup(summaries, market_date=market_date)
+        plan = empty_agent_scope_followup({'result': decider}, market_date=market_date)
+        self.assertTrue(daily_pipeline_outcome_is_satisfied(decider))
+        self.assertEqual(plan, decider)
+        self.assertFalse(plan['triggered'])
+        self.assertIsNone(empty_agent_scope_followup(summaries, market_date='2026-11-11'))
+        self.assertIsNone(empty_agent_scope_followup({**summaries, 'entry_economics_scope_empty': False}, market_date=market_date))
 
 
 if __name__ == '__main__':
