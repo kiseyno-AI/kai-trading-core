@@ -43,7 +43,7 @@ from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_zero_scope_gate_status,
     pykrx_enrichment_preflight_is_ready,
 )
-from app.eod.agent_chain_gates import summary_partial_dependency_is_proven
+from app.eod.agent_chain_gates import empty_agent_scope_followup, summary_partial_dependency_is_proven
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.summary_cutoff_contract import (
     CUTOFF_REPAIR_STAGE_IDS,
@@ -2760,6 +2760,30 @@ class DailyPipelineStageService:
         dart_preferred_not_applicable: set[str] = set()
         for stage_id in resolved_stages:
             if stage_id in handled:
+                continue
+            agent_upstream = {
+                'signal_decider': 'agent_feedback_summaries',
+                'next_open_execution_plan': 'signal_decider',
+            }.get(stage_id)
+            empty_scope_result = empty_agent_scope_followup(
+                stage_outcomes.get(agent_upstream), market_date=resolved_market_date,
+            ) if agent_upstream else None
+            if empty_scope_result is not None:
+                self._start_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                )
+                outcome = self._build_stage_outcome(stage_id, empty_scope_result)
+                stage_outcomes[stage_id] = outcome
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    outcome=outcome,
+                    result=empty_scope_result,
+                    invocation_symbols=[],
+                )
                 continue
             stage_symbols = resolved_symbols
             if (
@@ -6678,6 +6702,14 @@ class DailyPipelineStageService:
             completed_by_role = proof.get('completed_symbols_by_role')
             failed_by_role = proof.get('failed_symbols_by_role')
             decision_identities = proof.get('decision_identities')
+            prefilter_excluded = proof.get('entry_economics_excluded_symbols', [])
+            role_symbol_scopes = proof.get('role_symbol_scopes', {
+                role: admitted_symbols for role in DECISION_SUPPORT_AGENT_NAMES
+            })
+            if 'entry_economics_excluded_symbols' in proof:
+                expected_keys.add('entry_economics_excluded_symbols')
+            if 'role_symbol_scopes' in proof:
+                expected_keys.add('role_symbol_scopes')
             try:
                 knowledge_cutoff_at = datetime.fromisoformat(
                     str(proof.get('knowledge_cutoff_at') or '').strip()
@@ -6702,6 +6734,11 @@ class DailyPipelineStageService:
                 and normalize_symbol_codes(admitted_symbols)
                 == admitted_symbols
                 and sorted(set(admitted_symbols)) == admitted_symbols
+                and isinstance(prefilter_excluded, list)
+                and sorted(set(normalize_symbol_codes(prefilter_excluded))) == prefilter_excluded
+                and set(prefilter_excluded) <= set(admitted_symbols)
+                and isinstance(role_symbol_scopes, Mapping)
+                and set(role_symbol_scopes) == set(DECISION_SUPPORT_AGENT_NAMES)
                 and isinstance(completed_symbols, list)
                 and completed_symbols
                 and normalize_symbol_codes(completed_symbols)
@@ -6725,8 +6762,11 @@ class DailyPipelineStageService:
             for role in DECISION_SUPPORT_AGENT_NAMES:
                 failed_symbols = failed_by_role.get(role)
                 role_completed_symbols = completed_by_role.get(role)
+                role_scope = role_symbol_scopes[role]
                 if not (
-                    isinstance(failed_symbols, list)
+                    isinstance(role_scope, list)
+                    and sorted(set(normalize_symbol_codes(role_scope))) == role_scope
+                    and isinstance(failed_symbols, list)
                     and normalize_symbol_codes(failed_symbols)
                     == failed_symbols
                     and sorted(set(failed_symbols)) == failed_symbols
@@ -6736,8 +6776,8 @@ class DailyPipelineStageService:
                     == role_completed_symbols
                     and sorted(set(role_completed_symbols))
                     == role_completed_symbols
-                    and set(role_completed_symbols)
-                    == set(admitted_symbols).difference(failed_symbols)
+                    and set(failed_symbols) <= set(role_scope)
+                    and set(role_completed_symbols) == set(role_scope).difference(failed_symbols)
                 ):
                     return None
                 canonical_failed_by_role[role] = list(failed_symbols)
@@ -6813,12 +6853,10 @@ class DailyPipelineStageService:
                     for symbol in symbols
                 }
             )
+            dispatched_union = set(completed_union).union(*canonical_failed_by_role.values())
             if not (
                 type(total_items) is int
-                and total_items == (
-                    len(admitted_symbols)
-                    * len(DECISION_SUPPORT_AGENT_NAMES)
-                )
+                and dispatched_union == set(admitted_symbols).difference(prefilter_excluded)
                 and type(completed_items) is int
                 and type(failed_items) is int
                 and completed_items + failed_items == total_items
@@ -9878,23 +9916,40 @@ class DailyPipelineStageService:
         ):
             return None
         expected_role_symbol_scopes: dict[str, list[str]] = {}
+        expected_symbols = set(normalized_expected_symbols)
+        diagnostics = (progress_summary.get('funnel_diagnostics') or {}).get('role_diagnostics') or {}
+        economically_excluded: set[str] = set()
         for role in DECISION_SUPPORT_AGENT_NAMES:
             raw_role_scope = raw_role_symbol_scopes.get(role)
             if not isinstance(raw_role_scope, list):
                 return None
             normalized_role_scope = normalize_symbol_codes(raw_role_scope)
             if (
-                not normalized_role_scope
-                or normalized_role_scope != raw_role_scope
-                or not set(normalized_role_scope).issubset(
-                    normalized_expected_symbols
-                )
+                normalized_role_scope != raw_role_scope
+                or not set(normalized_role_scope).issubset(expected_symbols)
             ):
                 return None
             expected_role_symbol_scopes[role] = normalized_role_scope
-        if set().union(
-            *(set(scope) for scope in expected_role_symbol_scopes.values())
-        ) != set(normalized_expected_symbols):
+            missing_from_role = expected_symbols.difference(normalized_role_scope)
+            if not missing_from_role:
+                continue
+            role_diagnostics = diagnostics.get(role) or {}
+            economics = {
+                symbol
+                for symbol, evidence in (role_diagnostics.get('entry_economics_exclusions') or {}).items()
+                if isinstance(evidence, Mapping)
+                and evidence.get('code') == 'entry_reward_risk_below_role_floor'
+                and role in (evidence.get('excluded_roles') or [])
+            }
+            capped = role_diagnostics.get('cap_excluded_symbols') or []
+            if role_diagnostics.get('cap_excluded_symbol_count') != len(capped):
+                capped = []
+            if not missing_from_role <= economics.union(capped):
+                return None
+            economically_excluded.update(economics & missing_from_role)
+        dispatched_symbols = set().union(*expected_role_symbol_scopes.values())
+        omitted_symbols = expected_symbols - dispatched_symbols
+        if not omitted_symbols <= economically_excluded:
             return None
 
         resolution = resolve_terminal_independent_role_success(
@@ -10015,6 +10070,12 @@ class DailyPipelineStageService:
             'total_items': resolution['total_items'],
             'completed_items': resolution['completed_items'],
             'failed_items': resolution['failed_items'],
+            **({'entry_economics_excluded_symbols': sorted(omitted_symbols)} if omitted_symbols else {}),
+            **(
+                {'role_symbol_scopes': {role: sorted(scope) for role, scope in expected_role_symbol_scopes.items()}}
+                if any(set(scope) != set(normalized_expected_symbols) for scope in expected_role_symbol_scopes.values())
+                else {}
+            ),
         }
         proof['proof_digest'] = (
             DailyPipelineStageService

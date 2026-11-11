@@ -123,7 +123,10 @@ from app.orders.signal_decider_execution_outcomes import (
     EXECUTION_STATUS_WATCH_EXPIRED,
     signal_decider_execution_outcome_service,
 )
-from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
+from app.orders.signal_decider_performance_gates import (
+    SHORT_TERM_MIN_REWARD_RISK_RATIO,
+    evaluate_next_open_performance_gate,
+)
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
@@ -202,7 +205,6 @@ SHORT_TERM_MIN_RETURN_PERCENTILE = Decimal('0.60')
 SHORT_TERM_HARD_MIN_RETURN_PERCENTILE = Decimal('0.50')
 SHORT_TERM_MIN_VOLUME_PERCENTILE = Decimal('0.45')
 SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
-SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
 SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
 SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
 # Daily contexts can be captured at slightly different points in the same session.
