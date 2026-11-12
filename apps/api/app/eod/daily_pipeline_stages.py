@@ -209,7 +209,12 @@ EXACT_FINALIZATION_STAGE_IDS = frozenset(
         'signal_features',
     }
 )
+EARLY_STAGE_RECOVERY_IDS = frozenset({'technical_snapshots', 'action_summaries'})
 EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS = {
+    **{
+        stage_id: frozenset({f'{stage_id}_scope_outcomes_v1'})
+        for stage_id in EARLY_STAGE_RECOVERY_IDS
+    },
     'market_risk_filter': frozenset(
         {'market_risk_filter_scope_outcomes_v1'}
     ),
@@ -1001,6 +1006,7 @@ class DailyPipelineStageService:
         recovery_parent_partition: dict[str, Any] | None = None
         recovery_stage_partition: dict[str, Any] | None = None
         recovery_stage_id: str | None = None
+        deferred_recovery_stage_outcomes: dict[str, dict[str, Any]] | None = None
         validated_recovery_price_outcome: dict[str, Any] | None = None
         resolved_markets = self._normalize_markets(markets)
         if exact_membership_symbols is not None:
@@ -1085,6 +1091,7 @@ class DailyPipelineStageService:
             expected_parent_membership = (
                 recovery_parent_partition['selected_stock_codes']
                 if market_risk_suffix_recovery
+                or requested_recovery_stage_id in EARLY_STAGE_RECOVERY_IDS
                 or recovery_stage_scope_outcome is None
                 else recovery_parent_partition['successful_stock_codes']
             )
@@ -1116,6 +1123,42 @@ class DailyPipelineStageService:
                         'stage first and a non-empty retry scope'
                     )
                 recovery_stage_id = requested_recovery_stage_id
+                if recovery_stage_id in EARLY_STAGE_RECOVERY_IDS and (
+                    recovery_stage_scope_outcome.get('market_date')
+                    != normalized_market_date
+                    or recovery_stage_scope_outcome.get('eod_collection_run_id')
+                    != reused_eod_collection_run_id
+                ):
+                    raise ValueError(
+                        'early stage recovery scope must match its market date '
+                        'and EOD collection run'
+                    )
+                if (
+                    recovery_stage_id in EARLY_STAGE_RECOVERY_IDS
+                    and 'deferred_stage_outcomes' in recovery_stage_scope_outcome
+                ):
+                    deferred = recovery_stage_scope_outcome['deferred_stage_outcomes']
+                    if not isinstance(deferred, Mapping):
+                        raise ValueError('deferred recovery stages must be a mapping')
+                    deferred_recovery_stage_outcomes = {}
+                    for deferred_stage_id, deferred_outcome in deferred.items():
+                        if (
+                            deferred_stage_id not in STAGE_DEFINITIONS
+                            or deferred_stage_id in resolved_stages
+                            or not isinstance(deferred_outcome, Mapping)
+                            or str(deferred_outcome.get('status') or '').strip().lower()
+                            not in {'failed', 'blocked', 'partial', 'interrupted', 'pending', 'waiting'}
+                            or daily_pipeline_outcome_is_satisfied({
+                                **dict(deferred_outcome), 'stage': deferred_stage_id,
+                            })
+                        ):
+                            raise ValueError(
+                                'deferred recovery stages must name only omitted '
+                                'unfinished stages'
+                            )
+                        deferred_recovery_stage_outcomes[deferred_stage_id] = dict(
+                            deferred_outcome
+                        )
                 allowed_versions = (
                     EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS.get(
                         recovery_stage_id
@@ -2233,6 +2276,10 @@ class DailyPipelineStageService:
                 resolved_stages=resolved_stages,
                 run_metadata={
                     'entrypoint': 'daily_pipeline_stage_service.run',
+                    **(
+                        {'deferred_recovery_stage_outcomes': deferred_recovery_stage_outcomes}
+                        if deferred_recovery_stage_outcomes is not None else {}
+                    ),
                     'resume_from_stage': resume_from_stage,
                     'symbols': resolved_symbols,
                     'exact_membership_symbol_count': len(
@@ -3676,7 +3723,9 @@ class DailyPipelineStageService:
                             publication_scope_symbols=(
                                 list(stage_symbols or [])
                                 if stage_id == recovery_stage_id
-                                and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                                and stage_id in (
+                                    EXACT_FINALIZATION_STAGE_IDS | EARLY_STAGE_RECOVERY_IDS
+                                )
                                 else None
                             ),
                             markets=resolved_markets,
@@ -3922,7 +3971,9 @@ class DailyPipelineStageService:
                         if stage_id == 'signal_features'
                         else list(stage_symbols or [])
                         if stage_id == recovery_stage_id
-                        and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                        and stage_id in (
+                            EXACT_FINALIZATION_STAGE_IDS | EARLY_STAGE_RECOVERY_IDS
+                        )
                         else official_membership_symbols
                     ),
                     completion_parent_proof=(
@@ -4117,6 +4168,10 @@ class DailyPipelineStageService:
         )
         run_metadata = {
             'stage_statuses': merged_stage_statuses,
+            **(
+                {'deferred_recovery_stage_outcomes': deferred_recovery_stage_outcomes}
+                if deferred_recovery_stage_outcomes is not None else {}
+            ),
             **warning_metadata,
             **self._feedback_cutoff_run_metadata(
                 feedback_knowledge_cutoff_at,
@@ -8100,6 +8155,9 @@ class DailyPipelineStageService:
             if publication_scope_symbols is not None
             else exact_scope_symbols
         )
+        if exact_stage_recovery_authorized and stage_id in EARLY_STAGE_RECOVERY_IDS:
+            # Atomic early-stage publishers must never finalize successful siblings.
+            exact_scope_symbols = derived_publication_scope_symbols
         if (
             point_in_time_recovery
             and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS

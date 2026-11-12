@@ -4077,18 +4077,55 @@ def _resolve_followup_recovery_stages(
     incomplete_stages: Sequence[str],
     has_exact_stage_debt_request: bool,
 ) -> list[str]:
-    """Return the minimal safe suffix, isolating exact trending repair."""
+    """Retry only stages with unresolved work, preserving successful siblings."""
 
     if not incomplete_stages:
         return []
     resume_from_stage = incomplete_stages[0]
     recovery_scope_list = list(recovery_scope)
-    resume_index = recovery_scope_list.index(resume_from_stage)
-    if has_exact_stage_debt_request or list(incomplete_stages) == [
-        'trending_ranks'
-    ]:
+    if has_exact_stage_debt_request:
         return [resume_from_stage]
-    return recovery_scope_list[resume_index:]
+    required_stages = set(incomplete_stages)
+    # Revalidate dependent decisions with source-valid reuse, then republish
+    # their plan; this does not authorize recomputing healthy model results.
+    if 'agent_feedback_summaries' in required_stages:
+        required_stages.update(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    elif 'signal_decider' in required_stages:
+        required_stages.add('next_open_execution_plan')
+    return [
+        stage_id for stage_id in recovery_scope_list
+        if stage_id in required_stages
+    ]
+
+
+def _proven_followup_recovery_symbols(
+    *, stages: Mapping[str, Any], stage_ids: Sequence[str],
+    symbols: Sequence[str], market_date: str,
+) -> list[str]:
+    """A requested scope is not evidence that its rows were repaired."""
+
+    proven = set(symbols)
+    for stage_id in stage_ids:
+        stage = stages.get(stage_id)
+        if not isinstance(stage, Mapping):
+            return []
+        result = _followup_exact_result_authority(stage_id=stage_id, stage=stage)
+        if result is None:
+            return []
+        selected = result.get('selected_stock_codes')
+        if not isinstance(selected, list):
+            return []
+        partition = validate_stage_bound_scope_outcome(
+            result=result, expected_stage_id=stage_id,
+            invocation_symbols=selected,
+            status=str(result.get('status') or stage.get('status') or ''),
+            expected_market_date=market_date,
+            publication_symbols=selected,
+        )
+        if partition is None:
+            return []
+        proven.intersection_update(partition['successful_stock_codes'])
+    return sorted(proven) if stage_ids else []
 
 
 def _resolve_followup_stage_debt_state(
@@ -6742,11 +6779,6 @@ class PykrxBackfillService:
             and stage_id in expected_stage_ids
         )
         resumable_stage_order = expected_stages or all_resumable_stages
-        has_downstream_scope = bool(
-            _dedupe_symbol_codes(
-                metadata.get('downstream_retry_symbols') or []
-            )
-        )
         incomplete_indexes = [
             index
             for index, stage_id in enumerate(resumable_stage_order)
@@ -6760,35 +6792,9 @@ class PykrxBackfillService:
                 else {}
             )
         ]
-        if has_downstream_scope:
-            durable_resume_stage = str(
-                metadata.get('downstream_retry_resume_from_stage') or ''
-            ).strip()
-            if durable_resume_stage not in resumable_stage_order:
-                durable_resume_stage = next(
-                    (
-                        stage_id
-                        for stage_id in (
-                            'pykrx_enrichment',
-                            'technical_snapshots',
-                        )
-                        if stage_id in resumable_stage_order
-                    ),
-                    resumable_stage_order[0],
-                )
-            resume_index = resumable_stage_order.index(
-                durable_resume_stage
-            )
-        elif not incomplete_indexes:
-            resume_index = (
-                resumable_stage_order.index('technical_snapshots')
-                if 'technical_snapshots' in resumable_stage_order
-                else 0
-            )
-        else:
-            resume_index = min(incomplete_indexes)
-        resolved_stages = list(resumable_stage_order[resume_index:])
-        resume_stage = resolved_stages[0]
+        resolved_stages = [
+            resumable_stage_order[index] for index in incomplete_indexes
+        ]
         stages: dict[str, dict[str, Any]] = {}
         for stage_id in resolved_stages:
             raw_progress = stage_progress.get(stage_id)
@@ -6798,11 +6804,8 @@ class PykrxBackfillService:
                 else 'pending'
             )
             stages[stage_id] = {
-                'status': (
-                    'interrupted'
-                    if stage_id == resume_stage
-                    else stage_status or 'pending'
-                )
+                **(dict(raw_progress) if isinstance(raw_progress, Mapping) else {}),
+                'status': stage_status or 'pending',
             }
         return {
             'id': None,
@@ -7450,6 +7453,9 @@ class PykrxBackfillService:
             else {}
         )
         stage_rows = pipeline_run.get('stages') if isinstance(pipeline_run.get('stages'), dict) else {}
+        deferred_stage_rows = run_metadata.get('deferred_recovery_stage_outcomes')
+        if isinstance(deferred_stage_rows, Mapping):
+            stage_rows = {**dict(deferred_stage_rows), **stage_rows}
         recovered_admission = _recovered_followup_admission_scope_outcome(
             latest_eod_run=latest_eod_run,
             market_date=market_date,
@@ -7571,6 +7577,8 @@ class PykrxBackfillService:
             for stage_id in (run_metadata.get('resolved_stages') or stage_rows.keys())
             if str(stage_id).strip()
         }
+        if isinstance(deferred_stage_rows, Mapping):
+            resolved_stage_ids.update(deferred_stage_rows)
         # Price failures are retried by the collection-specific branch. All
         # later tracked stages can safely resume from persisted prices without
         # another provider download.
@@ -7585,7 +7593,19 @@ class PykrxBackfillService:
             if stage_id in resolved_stage_ids or stage_id in stage_rows
         ]
         if not recovery_scope:
-            return None
+            if price_retry_symbols:
+                return None
+            result = build_daily_skip_result(
+                reason='followup_recovery_scope_unavailable',
+                market_date=market_date,
+                latest_available_trade_date=latest_available_trade_date,
+                existing_run=latest_eod_run,
+            )
+            result['followup_recovery'] = {
+                'status': 'blocked', 'retry_scheduled': False,
+                'blocker': 'failed_stage_evidence_unavailable',
+            }
+            return result
 
         pipeline_status = str(
             pipeline_run.get('status') or ''
@@ -7704,18 +7724,25 @@ class PykrxBackfillService:
             )
         ):
             incomplete_stages.insert(0, ordering_repair_stage)
+        if ordering_repair_stage is not None:
+            incomplete_stages = [
+                stage_id for stage_id in recovery_scope
+                if stage_id in incomplete_stages
+                or stage_id in TERMINAL_FOLLOWUP_CONTINUATION_STAGES
+            ]
         downstream_resume_from_stage = str(
             latest_eod_metadata.get('downstream_retry_resume_from_stage') or ''
         ).strip()
-        if downstream_resume_from_stage not in recovery_scope:
+        if downstream_resume_from_stage not in incomplete_stages:
             downstream_resume_from_stage = next(
                 (
                     stage_id
                     for stage_id in (
                         'pykrx_enrichment',
                         'technical_snapshots',
+                        'action_summaries',
                     )
-                    if stage_id in recovery_scope
+                    if stage_id in incomplete_stages
                 ),
                 '',
             )
@@ -7730,74 +7757,18 @@ class PykrxBackfillService:
         full_point_in_time_scope = sorted(
             point_in_time_membership_symbols or []
         )
-        persisted_recovery_symbols = _dedupe_symbol_codes(
-            run_metadata.get('symbols') or []
-        )
-        downstream_resume_stage = stage_rows.get(
-            downstream_resume_from_stage
-        )
-        narrow_upstream_recovery_scope = bool(
-            pipeline_run.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER
-            and point_in_time_recovery
-            and not price_retry_symbols
-            and run_metadata.get('point_in_time_recovery') is True
-            and str(run_metadata.get('resume_from_stage') or '').strip()
-            == downstream_resume_from_stage
-            and downstream_resume_from_stage == 'pykrx_enrichment'
-            and downstream_resume_from_stage in recovery_scope
-            and first_exact_followup_index is not None
-            and recovery_scope.index(downstream_resume_from_stage)
-            < first_exact_followup_index
-            and full_point_in_time_scope
-            and run_metadata.get('exact_membership_symbol_count')
-            == len(full_point_in_time_scope)
-            and run_metadata.get('exact_membership_sha256')
-            == market_membership_sha256(full_point_in_time_scope)
-            and persisted_recovery_symbols
-            and set(persisted_recovery_symbols)
-            < set(full_point_in_time_scope)
-            and set(persisted_recovery_symbols)
-            == set(downstream_retry_symbols)
-            and isinstance(downstream_resume_stage, Mapping)
-            and daily_pipeline_outcome_is_satisfied(
-                {
-                    **dict(downstream_resume_stage),
-                    'stage': downstream_resume_from_stage,
-                }
-            )
-        )
-        if (
-            (
-                pipeline_run.get('trigger')
-                != AUTO_FOLLOWUP_RECOVERY_TRIGGER
-                or narrow_upstream_recovery_scope
-            )
-            and downstream_retry_symbols
-            and downstream_resume_from_stage in recovery_scope
-            and (
-                not incomplete_stages
-                or recovery_scope.index(downstream_resume_from_stage)
-                < recovery_scope.index(incomplete_stages[0])
-            )
-        ):
-            incomplete_stages.insert(0, downstream_resume_from_stage)
         if persisted_nonblocking_marker is not None:
             # A crash can occur after the suffix run is finalized but before
             # its proof is copied to the EOD ancestor. Reconcile that exact
             # durable proof instead of rerunning a partial decider.
             incomplete_stages.clear()
         upstream_admission_rebuild_pending = bool(
-            downstream_retry_symbols
-            and incomplete_stages
+            incomplete_stages
             and incomplete_stages[0] == downstream_resume_from_stage
             and downstream_resume_from_stage in recovery_scope
             and first_exact_followup_index is not None
             and recovery_scope.index(downstream_resume_from_stage)
             < first_exact_followup_index
-            and latest_eod_metadata.get(
-                FOLLOWUP_STAGE_DEBT_METADATA_KEY
-            )
-            is None
         )
         preopen_prerequisite_rebuild_stage = next(
             (
@@ -8207,6 +8178,23 @@ class PykrxBackfillService:
             if debt_stage_id not in recovery_scope:
                 recovery_scope.append(debt_stage_id)
         if not incomplete_stages:
+            if downstream_retry_symbols and persisted_nonblocking_marker is None:
+                proven_symbols = _proven_followup_recovery_symbols(
+                    stages=stage_rows, stage_ids=recovery_scope,
+                    symbols=downstream_retry_symbols, market_date=market_date,
+                )
+                if set(proven_symbols) != set(downstream_retry_symbols):
+                    result = build_daily_skip_result(
+                        reason='followup_recovery_scope_unavailable',
+                        market_date=market_date,
+                        latest_available_trade_date=latest_available_trade_date,
+                        existing_run=latest_eod_run,
+                    )
+                    result['followup_recovery'] = {
+                        'status': 'blocked', 'retry_scheduled': False,
+                        'blocker': 'unresolved_downstream_stage_scope',
+                    }
+                    return result
             is_followup_recovery_parent = bool(
                 pipeline_run.get('trigger')
                 == AUTO_FOLLOWUP_RECOVERY_TRIGGER
@@ -8281,7 +8269,15 @@ class PykrxBackfillService:
                 if persisted_recovery_symbols:
                     convergence_result[
                         '_proven_resolved_downstream_symbols'
-                    ] = persisted_recovery_symbols
+                    ] = (
+                        persisted_recovery_symbols
+                        if persisted_nonblocking_marker is not None
+                        else _proven_followup_recovery_symbols(
+                            stages=stage_rows, stage_ids=recovery_scope,
+                            symbols=persisted_recovery_symbols,
+                            market_date=market_date,
+                        )
+                    )
                 if (
                     pending_same_day_rearm is not None
                     and legacy_evaluation_only_completion is None
@@ -9080,6 +9076,69 @@ class PykrxBackfillService:
                     ),
                 )
 
+        early_recovery_scope: dict[str, Any] | None = None
+        early_recovery_parent = _validated_followup_admission_partition(
+            latest_eod_metadata
+        )
+        early_stage = stage_rows.get(resume_from_stage)
+        if resume_from_stage in {'technical_snapshots', 'action_summaries'}:
+            exact_result = _followup_exact_result_authority(
+                stage_id=resume_from_stage, stage=early_stage,
+            ) if isinstance(early_stage, Mapping) else None
+            parent_symbols = (
+                early_recovery_parent['selected_stock_codes']
+                if early_recovery_parent is not None else []
+            )
+            partition = (
+                validate_stage_bound_scope_outcome(
+                    result=exact_result, expected_stage_id=resume_from_stage,
+                    invocation_symbols=exact_result.get('selected_stock_codes'),
+                    status=str(exact_result.get('status') or early_stage.get('status') or ''),
+                    allow_failed_all=True,
+                    expected_market_date=market_date,
+                    publication_symbols=exact_result.get('selected_stock_codes'),
+                )
+                if exact_result is not None and parent_symbols else None
+            )
+            if partition is not None and not set(
+                partition['selected_stock_codes']
+            ).issubset(parent_symbols):
+                partition = None
+            deferred = {
+                stage_id: dict(stage_rows.get(stage_id) or {'status': 'pending'})
+                for stage_id in recovery_stages if stage_id != resume_from_stage
+            }
+            if partition is None or not partition['retry_debt_stock_codes'] or any(
+                daily_pipeline_outcome_is_satisfied({**stage, 'stage': stage_id})
+                for stage_id, stage in deferred.items()
+            ):
+                result = build_daily_skip_result(
+                    reason='followup_recovery_scope_unavailable',
+                    market_date=market_date,
+                    latest_available_trade_date=latest_available_trade_date,
+                    existing_run=latest_eod_run,
+                )
+                result['followup_recovery'] = {
+                    'status': 'blocked', 'retry_scheduled': False,
+                    'resume_from_stage': resume_from_stage,
+                    'blocker': 'early_stage_exact_retry_scope_unavailable',
+                }
+                return result
+            early_recovery_scope = {
+                'schema_version': FOLLOWUP_STAGE_RECOVERY_SCOPE_SCHEMA_VERSION,
+                'stage_id': resume_from_stage, 'market_date': market_date,
+                'eod_collection_run_id': int(latest_eod_run['id']),
+                'deferred_stage_outcomes': deferred,
+                **build_exact_symbol_scope_outcome(
+                    manifest_version=partition['manifest_version'],
+                    selected_symbols=partition['selected_stock_codes'],
+                    successful_symbols=partition['successful_stock_codes'],
+                    retry_debt_symbols=partition['retry_debt_stock_codes'],
+                    terminal_not_applicable_symbols=partition['terminal_not_applicable_stock_codes'],
+                ),
+            }
+            recovery_stages = [resume_from_stage]
+
         # Imported lazily because the stage orchestrator depends on this service.
         from app.eod.daily_pipeline_stages import daily_pipeline_stage_service
 
@@ -9223,7 +9282,7 @@ class PykrxBackfillService:
             'agent_feedback_summaries' in recovery_stages
             and feedback_input_stage_ids.intersection(recovery_stages)
         )
-        force_feedback_recompute = bool(
+        revalidates_feedback_inputs = bool(
             ordering_repair_stage is not None
             or rebuilds_feedback_inputs
         )
@@ -9232,8 +9291,8 @@ class PykrxBackfillService:
             'market_date': market_date,
             'stages': recovery_stages,
             'markets': recovery_markets,
-            'force': force_feedback_recompute and not point_in_time_recovery,
-            'reuse_existing_feedback': not force_feedback_recompute,
+            'force': revalidates_feedback_inputs and not point_in_time_recovery,
+            'reuse_existing_feedback': True,
             'resume_from_stage': resume_from_stage,
             'trigger': AUTO_FOLLOWUP_RECOVERY_TRIGGER,
             'reused_eod_collection_run_id': int(latest_eod_run['id']),
@@ -9263,7 +9322,8 @@ class PykrxBackfillService:
         if (
             retryable_feedback_rearm_candidate
             and not proven_partial_summary_downstream_continuation
-            and not force_feedback_recompute
+            and not revalidates_feedback_inputs
+            and feedback_retry_stage_id in recovery_stages
         ):
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
@@ -9399,6 +9459,14 @@ class PykrxBackfillService:
                 recovery_kwargs['recovery_parent_scope_outcome'] = dict(
                     parent_scope_outcome
                 )
+        if early_recovery_scope is not None:
+            recovery_kwargs['exact_membership_symbols'] = list(
+                early_recovery_parent['selected_stock_codes']
+            )
+            recovery_kwargs['recovery_parent_scope_outcome'] = dict(
+                latest_eod_metadata['followup_admission_scope_outcome']
+            )
+            recovery_kwargs['recovery_stage_scope_outcome'] = early_recovery_scope
         # A later follow-up can fail independently of the immediate PyKRX
         # stages, so a healthy collection resumes the full universe. When a
         # price failure coexists, however, an unscoped resume would include a
@@ -9407,7 +9475,9 @@ class PykrxBackfillService:
             stage_id in AUTO_DAILY_FOLLOWUP_STAGE_ORDER
             for stage_id in incomplete_stages
         )
-        if stage_debt_terminal_progression:
+        if early_recovery_scope is not None:
+            recovery_symbols = list(early_recovery_scope['retry_debt_stock_codes'])
+        elif stage_debt_terminal_progression:
             recovery_symbols = list(
                 stage_debt_terminal_progression_symbols
             )
@@ -9427,7 +9497,7 @@ class PykrxBackfillService:
             # would either violate the suffix contract or replace the proven
             # success scope with the failed scope.
             recovery_symbols = []
-        elif retryable_feedback_rearm_candidate and not force_feedback_recompute:
+        elif retryable_feedback_rearm_candidate and not revalidates_feedback_inputs:
             recovery_symbols = (
                 []
                 if feedback_retry_stage_id == 'signal_decider'
@@ -9677,7 +9747,26 @@ class PykrxBackfillService:
         ):
             recovery_result[
                 '_proven_resolved_downstream_symbols'
-            ] = list(recovery_symbols)
+            ] = (
+                list(recovery_symbols)
+                if validated_nonblocking_partial_progression_marker(
+                    recovery_result,
+                    expected_eod_collection_run_id=int(latest_eod_run['id']),
+                ) is not None
+                else _proven_followup_recovery_symbols(
+                    stages={
+                        **(early_recovery_scope['deferred_stage_outcomes']
+                           if early_recovery_scope is not None else {}),
+                        **(recovery_result.get('stages') or {}),
+                    },
+                    stage_ids=[
+                        *recovery_stages,
+                        *(early_recovery_scope['deferred_stage_outcomes']
+                          if early_recovery_scope is not None else {}),
+                    ],
+                    symbols=recovery_symbols, market_date=market_date,
+                )
+            )
         pending_rearm_after_recovery = (
             pending_same_day_intraday_watch_rearm_marker(
                 (
