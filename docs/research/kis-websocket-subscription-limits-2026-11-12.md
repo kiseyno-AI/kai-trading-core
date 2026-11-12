@@ -20,7 +20,7 @@ Short source excerpts:
 | Can Core and Exec multiply capacity using separate sockets? | No such entitlement is established. Process or socket separation does not justify multiplying the published allowance. |
 | Is a higher allowance available or authorized? | No supporting broker policy or account-specific authorization was found. |
 
-Capacity arithmetic must include every registration: 40 trade registrations plus one execution-notice registration already equal 41; adding one order-book registration would exceed that total. This arithmetic is an application of the published cap, not proof of the deployed Core/Exec topology.
+Capacity arithmetic must include every registration. Forty trade registrations plus one execution-notice registration equal 41 only within an allowed single session. Core currently runs price and notice consumers on separate sockets; enabling both is not made valid by reserving one registration. Use only one current consumer for the same allowance. Multiplexing both onto one connection would require a separate implementation change.
 
 ## What the official examples establish
 
@@ -34,6 +34,6 @@ The running Core reported `KIS_REALTIME_ORDER_NOTICE_ENABLED=false`; its notice 
 
 Only the private deployment setting `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=41` was added, followed by a managed restart. Python logic, order controls, decider scores, and strategy eligibility were unchanged. Subsequent local read APIs reported 54 desired symbols, 41 trade subscriptions, zero book subscriptions, 13 capacity-limited symbols, an active connection, and no subscription error. All 54 symbols had display prices; a subscribed symbol may still use a labeled REST price until its next trade arrives.
 
-If notices or another realtime consumer are enabled, reduce the price/book allowance so all registrations together remain within 41. The default stays 40 to leave one notice registration available. AppKey/HTS-ID identity scope and account-specific exceptions are not established by this FAQ; separate processes or sockets do not grant additional capacity.
+The default 40 remains unchanged as a local configuration value. It does not authorize enabling the separate notice socket beside the price socket. Any future shared-session implementation must include notices within the same total of 41. AppKey/HTS-ID identity scope and account-specific exceptions are not established by this FAQ; separate processes or sockets do not grant additional capacity.
 
 The browser investigation tab was closed after the portal's recurring developer-tools alert. The decisive FAQ was retrieved using two public JSON reads without executing page scripts. No further browser access or live quota test was used.

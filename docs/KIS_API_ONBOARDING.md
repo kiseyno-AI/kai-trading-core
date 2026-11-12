@@ -35,10 +35,11 @@
    - `KIS_INTRADAY_SNAPSHOT_NEWS_LIMIT=5`
 5. Optional realtime monitored price knobs:
    - `KIS_REALTIME_PRICE_ENABLED=true`
+   - `KIS_REALTIME_ORDER_NOTICE_ENABLED=false`
    - `KIS_REALTIME_PRICE_TR_ID=H0STCNT0`
    - `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=40`
    - `KIS_REALTIME_PRICE_STALE_AFTER_SECONDS=30`
-   - KIS allows 41 combined realtime registrations, including trade feeds, order books, and execution notices. The default 40-channel price/book budget leaves one registration for notices. If execution notices are disabled and no other registrations consume the allowance, set `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=41`. Do not count this as 41 symbols when subscribing to both trades and books. See the [official quota and deployment evidence](research/kis-websocket-subscription-limits-2026-11-12.md).
+   - KIS permits one session and 41 combined realtime registrations, including trade feeds, order books, and execution notices. Core's current price and order-notice consumers open separate sockets: enable only one for the same allowance. With the price consumer enabled and the separate notice consumer disabled, `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=41` is usable if no other registration consumes the allowance. The default 40 is a local setting, not KIS's published maximum. Do not count 41 registrations as 41 symbols when receiving both trades and books. See the [official quota and deployment evidence](research/kis-websocket-subscription-limits-2026-11-12.md).
 6. Install dependencies:
    - `pip install -r apps/api/requirements.txt`
 7. Run server:
