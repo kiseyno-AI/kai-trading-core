@@ -52,6 +52,7 @@ from app.eod.daily_pipeline_stages import (
     DailyPipelineStageService,
 )
 from app.eod.daily_pipeline_outcomes import (
+    _semantic_result_payloads,
     daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_nullable_output_is_completed,
@@ -1270,6 +1271,22 @@ def _factor_scope_has_no_decision_ready_rows(
         evidence.get('decision_degraded_count')
     )
     return bool(ready_count == 0 and (degraded_count or 0) > 0)
+
+
+def _nullable_output_covers_scope(
+    stage: dict[str, Any], scope_symbols: Collection[str],
+) -> bool:
+    if not daily_pipeline_nullable_output_is_completed(stage):
+        return False
+    selected_scopes = []
+    for payload in _semantic_result_payloads(stage):
+        for candidate in (payload, payload.get('exact_scope_outcome_proof')):
+            codes = candidate.get('selected_stock_codes') if isinstance(candidate, dict) else None
+            if isinstance(codes, list) and all(isinstance(code, str) for code in codes):
+                selected_scopes.append(set(codes))
+    requested = set(scope_symbols)
+    # Every identity claim must cover the child, including the validated proof.
+    return bool(selected_scopes) and all(requested <= scope for scope in selected_scopes)
 
 
 def _validated_row_count_scope_gap_evidence(
@@ -2967,6 +2984,10 @@ class EODPipelineStatusService:
                 )
                 > 0
             )
+        if isinstance(official_stage, dict) and daily_pipeline_nullable_output_is_completed(
+            official_stage
+        ):
+            return False
         if daily_pipeline_result_has_no_ready_content(
             official_details.get('result_summary')
         ):
@@ -3071,6 +3092,8 @@ class EODPipelineStatusService:
             current=official_stage,
         ):
             return False
+        if daily_pipeline_nullable_output_is_completed(official_stage):
+            return True
         fallback_details = (
             fallback_stage.get('details')
             if isinstance(fallback_stage.get('details'), dict)
@@ -6864,7 +6887,7 @@ class EODPipelineStatusService:
                     stage_id=stage_id,
                     evidence=validated_scope_gap,
                 )
-                and not daily_pipeline_nullable_output_is_completed(stage)
+                and not _nullable_output_covers_scope(stage, scope_symbols)
             ):
                 details['gate_reason'] = (
                     'no_decision_ready_factor_rows_in_requested_scope'

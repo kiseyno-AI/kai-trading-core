@@ -33,7 +33,7 @@ from app.eod.pipeline_status import (
     _load_signal_feature_counts,
     _signal_feature_row_is_semantically_ready,
 )
-from app.eod.market_membership import build_market_membership_snapshot
+from app.eod.market_membership import build_market_membership_snapshot, market_membership_sha256
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.signals.signal_feature_readiness import (
     SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
@@ -2417,6 +2417,138 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             stage['details']['gate_reason'],
             'no_decision_ready_factor_rows_in_exact_scope',
         )
+
+    def test_nullable_publication_survives_coverage_overlay_for_child_scope(self):
+        market_date = '2026-04-21'
+        stage_id = 'unified_value_factors'
+        universe = ['000660', '005930', '035420']
+        child_symbols = universe[:2]
+        publication = {
+            'status': 'completed',
+            'market_date': market_date,
+            'nullable_output_completed': True,
+            'results_persisted': 3,
+            'results_failed': 0,
+            'summary': {'ready_count': 1, 'unready_count': 2},
+            **build_exact_symbol_scope_outcome(
+                manifest_version='factor_scope_outcomes_v1',
+                selected_symbols=universe,
+                successful_symbols=universe,
+                retry_debt_symbols=[],
+            ),
+            'scope_finalization': {
+                'stage': stage_id,
+                'market_date': market_date,
+                'exact_symbol_count': 3,
+                'exact_membership_sha256': market_membership_sha256(universe),
+                'successful_symbol_count': 3,
+                'successful_membership_sha256': market_membership_sha256(universe),
+                'deleted_stale_row_count': 0,
+                'ready': True,
+            },
+        }
+        proof = DailyPipelineStageService._build_exact_scope_outcome_proof(
+            publication,
+            stage_id=stage_id,
+            invocation_symbols=universe,
+            publication_symbols=universe,
+            expected_market_date=market_date,
+        )
+        self.assertIsNotNone(proof)
+        compact_publication = {
+            key: value
+            for key, value in publication.items()
+            if key not in {
+                'selected_stock_codes', 'successful_stock_codes',
+                'retry_debt_stock_codes', 'terminal_not_applicable_stock_codes',
+                'scope_outcome_manifest', 'scope_outcome_manifest_version',
+            }
+        }
+        official = _completed_official_stage(
+            run_id=647, stage_id=stage_id, market_date=market_date,
+            processed=3, total=3, updated_at='2026-04-21T08:00:00+00:00',
+        )
+        official['stage']['details'] = {
+            'result_summary': compact_publication,
+            'exact_scope_outcome_proof': proof,
+        }
+        fallback = {
+            'task': stage_id, 'market_date': market_date,
+            'status': 'completed', 'gate_status': 'ready',
+            'severity': 'degraded', 'succeeded': 3,
+            'details': {
+                'mode': 'derived_from_factor_rows', 'rows_persisted': 3,
+                'decision_ready_count': 1, 'decision_degraded_count': 2,
+                'latest_decision_ready_at': '2026-04-21T07:59:59+00:00',
+            },
+        }
+        for source in ('latest_run', 'stage_history'):
+            for case in ('valid', 'missing_row', 'wrong_date', 'wrong_stage', 'failed', 'missing_proof', 'fresher_rows', 'outside_publication_scope'):
+                with self.subTest(source=source, case=case):
+                    candidate = deepcopy(official)
+                    stored = deepcopy(fallback)
+                    if case == 'wrong_date':
+                        candidate['stage']['details']['exact_scope_outcome_proof']['market_date'] = '2026-04-20'
+                    elif case == 'wrong_stage':
+                        candidate['stage']['details']['exact_scope_outcome_proof']['stage_id'] = 'quality_factors'
+                    elif case == 'failed':
+                        candidate['stage']['details']['result_summary']['results_failed'] = 1
+                    elif case == 'missing_proof':
+                        candidate['stage']['details'].pop('exact_scope_outcome_proof')
+                    elif case == 'fresher_rows':
+                        stored['details']['latest_decision_ready_at'] = '2026-04-21T09:00:00+00:00'
+                    elif case == 'outside_publication_scope':
+                        narrower = deepcopy(publication)
+                        narrower.update(build_exact_symbol_scope_outcome(
+                            manifest_version='factor_scope_outcomes_v1',
+                            selected_symbols=universe[-1:],
+                            successful_symbols=universe[-1:],
+                            retry_debt_symbols=[],
+                        ))
+                        narrower.update(results_persisted=1, summary={'ready_count': 1, 'unready_count': 0})
+                        narrower['scope_finalization'].update(
+                            successful_symbol_count=1,
+                            successful_membership_sha256=market_membership_sha256(universe[-1:]),
+                        )
+                        candidate['stage'].update(processed=1, succeeded=1, total=1)
+                        candidate['stage']['details'] = {
+                            'result_summary': narrower,
+                            'exact_scope_outcome_proof': DailyPipelineStageService._build_exact_scope_outcome_proof(
+                                narrower, stage_id=stage_id,
+                                invocation_symbols=universe[-1:], publication_symbols=universe,
+                                expected_market_date=market_date,
+                            ),
+                        }
+                    service = EODPipelineStatusService(
+                        row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                            requested_count=2,
+                            present_count=1 if case == 'missing_row' else 2,
+                            decision_ready_count=0,
+                            decision_degraded_count=1 if case == 'missing_row' else 2,
+                            quality_status='degraded',
+                        ),
+                    )
+                    stages = {stage_id: stored}
+                    if source == 'latest_run':
+                        projected = service._overlay_official_run_stages(
+                            stages=stages,
+                            official_run={**candidate['run'], 'stages': {stage_id: candidate['stage']}},
+                            market_date=market_date,
+                        )
+                    else:
+                        projected = service._overlay_official_stage_history(
+                            stages=stages, stage_history={stage_id: candidate},
+                            market_date=market_date,
+                        )
+                    stage = service._apply_scope_coverage_gate(
+                        stage_id=stage_id, market_date=market_date,
+                        stage=projected[stage_id], scope_symbols=child_symbols,
+                    )
+                    self.assertEqual(stage['gate_status'], 'ready' if case == 'valid' else 'blocked', (source, case, stage))
+                    if case == 'valid':
+                        self.assertEqual(stage['details']['requested_scope_decision_ready_count'], 0)
+                        self.assertEqual(stage['details']['requested_scope_decision_degraded_count'], 2)
+                        self.assertEqual(stage['details']['exact_scope_outcome_proof'], proof)
 
     def test_requested_scope_gate_fails_closed_on_malformed_zero_gap_proof(self):
         service = EODPipelineStatusService(
