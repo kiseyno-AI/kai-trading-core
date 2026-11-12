@@ -9252,6 +9252,7 @@ class PykrxBackfillService:
         if (
             retryable_feedback_rearm_candidate
             and not proven_partial_summary_downstream_continuation
+            and not force_feedback_recompute
         ):
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
@@ -9422,7 +9423,7 @@ class PykrxBackfillService:
             # would either violate the suffix contract or replace the proven
             # success scope with the failed scope.
             recovery_symbols = []
-        elif retryable_feedback_rearm_candidate:
+        elif retryable_feedback_rearm_candidate and not force_feedback_recompute:
             recovery_symbols = (
                 []
                 if feedback_retry_stage_id == 'signal_decider'
