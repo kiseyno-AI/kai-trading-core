@@ -127,10 +127,11 @@ def test_exact_early_repair_rejects_unrelated_scope_before_execution(service, ov
     execute.assert_not_called()
 
 
-def test_exact_early_repair_persists_unfinished_siblings_for_restart(service):
+@pytest.mark.parametrize('status', ['failed', 'abandoned'])
+def test_exact_early_repair_persists_unfinished_siblings_for_restart(service, status):
     request = _repair_request('action_summaries')
     deferred = {
-        'external_news_collect': {'status': 'failed', 'details': {'reason': 'provider_error'}},
+        'external_news_collect': {'status': status, 'details': {'reason': 'provider_error'}},
         'signal_decider': {'status': 'blocked', 'details': {'reason': 'summaries_incomplete'}},
     }
     request['recovery_stage_scope_outcome']['deferred_stage_outcomes'] = deferred

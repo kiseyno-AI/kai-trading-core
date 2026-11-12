@@ -1147,7 +1147,7 @@ class DailyPipelineStageService:
                             or deferred_stage_id in resolved_stages
                             or not isinstance(deferred_outcome, Mapping)
                             or str(deferred_outcome.get('status') or '').strip().lower()
-                            not in {'failed', 'blocked', 'partial', 'interrupted', 'pending', 'waiting'}
+                            not in {'failed', 'blocked', 'partial', 'interrupted', 'abandoned', 'pending', 'waiting'}
                             or daily_pipeline_outcome_is_satisfied({
                                 **dict(deferred_outcome), 'stage': deferred_stage_id,
                             })
