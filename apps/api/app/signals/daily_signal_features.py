@@ -2477,6 +2477,17 @@ class DailySignalFeatureService:
             for symbol in normalized_exact_symbols
             if symbol not in successful_set
         ]
+        # A narrow retry must not replace the date's full market aggregate.
+        participation_context = (
+            daily_market_participation_context_service.rebuild_for_market_date(
+                market_date=normalized_market_date,
+                market='KRX',
+                source=SIGNAL_FEATURE_SOURCE,
+                exact_symbols=list_symbols_with_daily_bar_on_date(
+                    normalized_market_date
+                ),
+            )
+        )
         return {
             **result,
             **build_exact_symbol_scope_outcome(
@@ -2493,6 +2504,7 @@ class DailySignalFeatureService:
             'features_persisted': len(successful_symbols),
             'features_failed': len(retry_debt_symbols),
             'failed_symbols': retry_debt_symbols,
+            'participation_context': participation_context,
             'scope_finalization': publication.get('scope_finalization'),
             'repair_mode': 'stored_owned_fallback_exact_scope',
             'direct_collection_performed': False,
