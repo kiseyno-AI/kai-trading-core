@@ -2,6 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
@@ -306,3 +307,32 @@ def test_holiday_default_uses_last_session_and_explicit_holiday_is_empty(client,
     result = client.get(RESULTS_PATH, params={'market_date': '2026-07-17'}).json()
     assert result['market_date'] == '2026-07-17'
     assert result['items'] == []
+
+
+def test_session_boundaries_follow_the_selected_exchange_calendar_not_clock_defaults(
+    client, tracked_symbol, monkeypatch,
+):
+    opened_at = datetime.fromisoformat('2026-11-06T10:00:00+09:00')
+    closed_at = datetime.fromisoformat('2026-11-06T16:30:00+09:00')
+    class Calendar:
+        def session_open(self, value):
+            assert value == TRADE_DATE.isoformat()
+            return pd.Timestamp(opened_at)
+        def session_close(self, value):
+            assert value == TRADE_DATE.isoformat()
+            return pd.Timestamp(closed_at)
+    monkeypatch.setattr(monitoring_session_results, 'KRX_EXCHANGE_CALENDAR', Calendar())
+    _set_clock(monkeypatch, '2026-11-07T12:00:00+09:00')
+    monitoring_session_history.monitoring_session_history.record(TRADE_DATE, {SYMBOL: None})
+    result = client.get(RESULTS_PATH).json()
+    assert result['market_date'] == TRADE_DATE.isoformat()
+    assert datetime.fromisoformat(result['session_open_at']) == opened_at
+    assert datetime.fromisoformat(result['session_close_at']) == closed_at
+
+
+def test_unrecorded_session_does_not_invent_session_boundaries(client, monkeypatch):
+    _set_clock(monkeypatch, '2026-11-07T12:00:00+09:00')
+    result = client.get(RESULTS_PATH, params={'market_date': '2026-11-06'}).json()
+    assert result['items'] == []
+    assert result['session_open_at'] is None
+    assert result['session_close_at'] is None
