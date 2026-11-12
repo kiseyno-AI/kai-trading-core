@@ -2675,6 +2675,134 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertNotIn('feedback_max_cycles', recovery_kwargs)
 
+    def test_interrupted_full_run_rebuild_does_not_inherit_summary_retry_contract(self) -> None:
+        from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+        service = PykrxBackfillService()
+        symbols = ['000660', '005930', '035420']
+        summary_symbols = symbols[:2]
+        cutoff = '2026-04-03T08:00:00+00:00'
+        stages = {
+            stage_id: {'status': 'completed'}
+            for stage_id in AUTO_DAILY_TRACKED_STAGE_ORDER
+        }
+        stages['agent_feedback_summaries'] = {'status': 'partial'}
+        stages['signal_decider'] = {'status': 'interrupted'}
+        stages.pop('next_open_execution_plan')
+        pipeline_run = {
+            'id': 650, 'status': 'interrupted',
+            'trigger': 'auto_close_scheduler',
+            'run_metadata': {
+                'eod_collection_run_id': 595,
+                'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
+                'fs_div': 'OFS',
+            },
+            'stages': stages,
+        }
+        admission = build_exact_symbol_scope_outcome(
+            manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+            selected_symbols=symbols, successful_symbols=symbols,
+            retry_debt_symbols=[],
+        )
+        eod_run = {
+            'id': 595, 'trade_date': '2026-04-03', 'status': 'completed',
+            'symbols_total': 3, 'symbols_succeeded': 3, 'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'], 'requested_symbols': symbols,
+                'downstream_retry_symbols': symbols,
+                'followup_admission_scope_outcome': admission,
+            },
+        }
+        retry_config = {
+            'source_run_id': 'summary-partial',
+            'knowledge_cutoff_at': cutoff,
+            'feedback_scope_mode': 'decider_scope_fast_path',
+            'requested_symbols': summary_symbols,
+            'roles': list(SUMMARIZER_AGENT_NAMES),
+            'role_symbol_scopes': {
+                role: summary_symbols for role in SUMMARIZER_AGENT_NAMES
+            },
+            'outer_batch_size': 20, 'fs_div': 'OFS',
+        }
+
+        class ReachedRunPersistence(Exception):
+            pass
+
+        run_state = SimpleNamespace(
+            start_run=MagicMock(side_effect=ReachedRunPersistence),
+        )
+        stage_service = DailyPipelineStageService(run_state_service=run_state)
+        observed_kwargs = {}
+
+        def validate_at_stage_boundary(**kwargs):
+            observed_kwargs.update(kwargs)
+            with (
+                patch('app.eod.daily_pipeline_stages.get_market_state',
+                      return_value=MarketState(
+                          market='KRX', state='PREOPEN',
+                          is_trading_day=True, is_open=False,
+                          server_time='2026-04-06T06:00:00+09:00',
+                          session_open_at='2026-04-06T09:00:00+09:00',
+                          session_close_at='2026-04-06T15:30:00+09:00',
+                      )),
+                self.assertRaises(ReachedRunPersistence),
+            ):
+                stage_service.run(**kwargs)
+            return {'status': 'blocked', 'pipeline_run_id': 651}
+
+        with ExitStack() as stack:
+            stack.enter_context(patch(
+                'app.eod.daily_pipeline_stages.settings.dart_fundamentals_default_fs_div',
+                'CFS',
+            ))
+            for target, value in {
+                'daily_pipeline_run_state_service.get_latest_run_for_context': pipeline_run,
+                'daily_pipeline_run_state_service.count_runs': 0,
+                '_select_summary_cutoff_proof': None,
+                '_is_retryable_feedback_rearm_candidate': True,
+                '_retryable_feedback_rearm_config': retry_config,
+                '_retryable_feedback_rearm_max_cycles': 3,
+                '_resolve_followup_stage_debt_state': {'required': False, 'ready': False},
+                'load_eod_run_persisted_symbols': symbols,
+            }.items():
+                stack.enter_context(patch(
+                    f'app.eod.pykrx_backfill.{target}', return_value=value,
+                ))
+            stack.enter_context(patch.object(
+                service, '_resolve_point_in_time_followup_membership',
+                return_value=(set(symbols), ('KOSPI',)),
+            ))
+            stack.enter_context(patch.object(
+                service, '_preflight_untracked_followup_price_scope',
+                return_value={'result': None, 'symbols': [], 'downstream_symbols': []},
+            ))
+            stack.enter_context(patch(
+                'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                side_effect=validate_at_stage_boundary,
+            ))
+            result = service._resume_auto_daily_followups_if_due(
+                market_date='2026-04-03', latest_available_trade_date='2026-04-03',
+                latest_eod_run=eod_run, markets=('KOSPI',),
+                point_in_time_recovery=True,
+            )
+
+        self.assertTrue(result['triggered'])
+        self.assertEqual(observed_kwargs['resume_from_stage'], 'pykrx_enrichment')
+        self.assertFalse(observed_kwargs['reuse_existing_feedback'])
+        self.assertIs(observed_kwargs['point_in_time_recovery'], True)
+        self.assertEqual(observed_kwargs['symbols'], symbols)
+        self.assertEqual(
+            run_state.start_run.call_args.kwargs['run_metadata']['fs_div'],
+            'OFS',
+        )
+        for key in (
+            'inherited_feedback_retry_config',
+            'inherited_feedback_source_run_id',
+            'inherited_feedback_knowledge_cutoff_at',
+            'inherit_feedback_prerequisite_admission',
+        ):
+            self.assertNotIn(key, observed_kwargs)
+
     def test_market_turnover_enrichment_rejects_invalid_turnover_but_preserves_zero_volume_bar(self) -> None:
         frames = {
             '20260402': pd.DataFrame({'거래대금': [0]}, index=['005930']),
