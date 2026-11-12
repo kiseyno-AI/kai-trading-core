@@ -767,6 +767,68 @@ class DurableDeciderInputGenerationTests(unittest.TestCase):
             generation(changed_value),
         )
 
+    def test_derived_fx_age_does_not_revoke_input_generation(self):
+        freshness = {
+            'fetched_at': '2026-11-12T12:28:32+00:00',
+            'age_hours': 8.306,
+            'freshness_status': 'fresh',
+        }
+        source = {
+            'symbol': '007980',
+            'market_regime_context': {
+                'fx_context': {
+                    'usd_krw': 1361.89,
+                    'observation_date': '2026-11-06',
+                    'freshness': deepcopy(freshness),
+                },
+                'freshness': {'fx_context': deepcopy(freshness)},
+            },
+            'context_provenance': {
+                'market_regime_context': {'fx_context': deepcopy(freshness)},
+            },
+        }
+        freshness_paths = (
+            ('market_regime_context', 'fx_context', 'freshness'),
+            ('market_regime_context', 'freshness', 'fx_context'),
+            ('context_provenance', 'market_regime_context', 'fx_context'),
+        )
+
+        def generation(context: dict) -> dict:
+            return build_decider_input_generation(
+                source_context=context,
+                market_context={},
+                policy_context={},
+                previous_decision_context={},
+                upstream_summaries={},
+                upstream_traceability={},
+            )
+
+        refreshed = deepcopy(source)
+        for first, second, third in freshness_paths:
+            refreshed[first][second][third]['age_hours'] = 8.329
+
+        self.assertEqual(generation(source), generation(refreshed))
+
+        for path, key, value in (
+            (('market_regime_context', 'fx_context'), 'usd_krw', 1400.0),
+            (('market_regime_context', 'fx_context'), 'observation_date', '2026-11-09'),
+            *(
+                (path, key, value)
+                for path in freshness_paths
+                for key, value in (
+                    ('fetched_at', '2026-11-12T12:30:00+00:00'),
+                    ('freshness_status', 'stale'),
+                )
+            ),
+        ):
+            with self.subTest(path=path, key=key):
+                changed = deepcopy(refreshed)
+                target = changed
+                for part in path:
+                    target = target[part]
+                target[key] = value
+                self.assertNotEqual(generation(source), generation(changed))
+
     def test_replay_timestamps_do_not_revoke_durable_generation(self):
         original = self._source_context()
         original['context_provenance']['signal_features'] = {
