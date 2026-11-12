@@ -2695,7 +2695,7 @@ class PykrxBackfillServiceTests(TestCase):
             'run_metadata': {
                 'eod_collection_run_id': 595,
                 'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
-                'fs_div': 'CFS',
+                'fs_div': 'OFS',
             },
             'stages': stages,
         }
@@ -2722,7 +2722,7 @@ class PykrxBackfillServiceTests(TestCase):
             'role_symbol_scopes': {
                 role: summary_symbols for role in SUMMARIZER_AGENT_NAMES
             },
-            'outer_batch_size': 20, 'fs_div': 'CFS',
+            'outer_batch_size': 20, 'fs_div': 'OFS',
         }
 
         class ReachedRunPersistence(Exception):
@@ -2751,6 +2751,10 @@ class PykrxBackfillServiceTests(TestCase):
             return {'status': 'blocked', 'pipeline_run_id': 651}
 
         with ExitStack() as stack:
+            stack.enter_context(patch(
+                'app.eod.daily_pipeline_stages.settings.dart_fundamentals_default_fs_div',
+                'CFS',
+            ))
             for target, value in {
                 'daily_pipeline_run_state_service.get_latest_run_for_context': pipeline_run,
                 'daily_pipeline_run_state_service.count_runs': 0,
@@ -2787,6 +2791,10 @@ class PykrxBackfillServiceTests(TestCase):
         self.assertFalse(observed_kwargs['reuse_existing_feedback'])
         self.assertIs(observed_kwargs['point_in_time_recovery'], True)
         self.assertEqual(observed_kwargs['symbols'], symbols)
+        self.assertEqual(
+            run_state.start_run.call_args.kwargs['run_metadata']['fs_div'],
+            'OFS',
+        )
         for key in (
             'inherited_feedback_retry_config',
             'inherited_feedback_source_run_id',

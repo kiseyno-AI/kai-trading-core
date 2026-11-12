@@ -9252,16 +9252,23 @@ class PykrxBackfillService:
         if (
             retryable_feedback_rearm_candidate
             and not proven_partial_summary_downstream_continuation
+        ):
+            # Rebuilt inputs keep the verified parent's financial basis,
+            # even though its frozen feedback retry contract cannot be reused.
+            recovery_kwargs['fs_div'] = str(
+                summary_cutoff_proof['fs_div']
+                if feedback_retry_stage_id == 'signal_decider'
+                else retryable_feedback_rearm_config['fs_div']
+            )
+        if (
+            retryable_feedback_rearm_candidate
+            and not proven_partial_summary_downstream_continuation
             and not force_feedback_recompute
         ):
             recovery_kwargs['feedback_max_cycles'] = (
                 retryable_feedback_max_cycles
             )
-            if feedback_retry_stage_id == 'signal_decider':
-                recovery_kwargs['fs_div'] = str(
-                    summary_cutoff_proof['fs_div']
-                )
-            else:
+            if feedback_retry_stage_id != 'signal_decider':
                 # Historical suffix-only retries reuse the parent's
                 # prerequisite admission because their completed prefix is
                 # no longer the latest pipeline row. Same-day retries keep
@@ -9278,9 +9285,6 @@ class PykrxBackfillService:
                 )
                 recovery_kwargs['feedback_outer_batch_size'] = int(
                     retryable_feedback_rearm_config['outer_batch_size']
-                )
-                recovery_kwargs['fs_div'] = str(
-                    retryable_feedback_rearm_config['fs_div']
                 )
                 recovery_kwargs[
                     'inherited_feedback_retry_config'
