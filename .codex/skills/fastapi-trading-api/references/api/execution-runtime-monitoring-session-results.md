@@ -2,6 +2,8 @@
 
 Read the results for a recorded KRX monitoring session. Omit `market_date` to get the most recent trading date with recorded monitoring. Before the next session opens and on non-trading days, the default stays on the latest recorded session. With an explicit date and no recorded monitoring, the response has that date and an empty item list. When the default finds no session, `market_date` is null.
 
+`session_open_at` and `session_close_at` are timezone-aware boundaries of the selected KRX exchange-calendar session, including nonstandard schedules. They identify the regular-session window, not when Core actually started or stopped monitoring and not a daily-bar ingestion timestamp. They are null when no recorded session is returned. `last_price_at` remains the saved trade observation timestamp; a `close` is associated with the selected session’s `session_close_at`.
+
 Each symbol appears once. Membership comes from KIS price subscriptions confirmed during the session by a successful acknowledgment or verified trade, verified same-session Exec monitoring, and existing WAIT observation records with evidence of tracking during the session. Core saves KIS trade observations in a local session archive with a two-second checkpoint interval and a final checkpoint on graceful shutdown. The endpoint reads Core's archive and database with the usual Core bearer authentication.
 
 | `price_status` | Price used for change and valuation |
@@ -26,6 +28,8 @@ GET /execution/runtime/monitoring-session-results?market_date=2026-11-06
 {
   "market_date": "2026-11-06",
   "previous_trade_date": "2026-11-05",
+  "session_open_at": "2026-11-06T00:00:00Z",
+  "session_close_at": "2026-11-06T06:30:00Z",
   "items": [
     {
       "symbol": "005930",

@@ -50,6 +50,8 @@ class HypotheticalMonitoringReturn(BaseModel):
 class MonitoringSessionResults(BaseModel):
     market_date: date | None
     previous_trade_date: date | None = None
+    session_open_at: datetime | None = None
+    session_close_at: datetime | None = None
     items: list[MonitoringSymbolResult]
     hypothetical_return: HypotheticalMonitoringReturn
 
@@ -94,6 +96,7 @@ def read_monitoring_session_results(market_date: date | None = None) -> Monitori
         if quotes:
             return _read_session(
                 day, quotes=quotes, waits=waits, as_of=as_of, session_closed=now >= closed_at,
+                opened_at=opened_at, closed_at=closed_at,
             )
     return MonitoringSessionResults(
         market_date=market_date, items=[], hypothetical_return=HypotheticalMonitoringReturn(),
@@ -107,6 +110,8 @@ def _read_session(
     waits: list[dict[str, Any]],
     as_of: datetime,
     session_closed: bool,
+    opened_at: datetime,
+    closed_at: datetime,
 ) -> MonitoringSessionResults:
     previous_date = latest_krx_exchange_calendar_trading_date(market_date - timedelta(days=1))
     dates = {previous_date} if previous_date is not None else set()
@@ -167,6 +172,8 @@ def _read_session(
     return MonitoringSessionResults(
         market_date=market_date,
         previous_trade_date=previous_date,
+        session_open_at=opened_at,
+        session_close_at=closed_at,
         items=items,
         hypothetical_return=HypotheticalMonitoringReturn(
             return_pct=float(pnl / cost * 100) if cost else None,
