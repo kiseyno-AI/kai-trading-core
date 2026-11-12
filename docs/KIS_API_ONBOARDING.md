@@ -38,6 +38,7 @@
    - `KIS_REALTIME_PRICE_TR_ID=H0STCNT0`
    - `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=40`
    - `KIS_REALTIME_PRICE_STALE_AFTER_SECONDS=30`
+   - KIS allows 41 combined realtime registrations, including trade feeds, order books, and execution notices. The default 40-channel price/book budget leaves one registration for notices. If execution notices are disabled and no other registrations consume the allowance, set `KIS_REALTIME_PRICE_MAX_SUBSCRIPTIONS=41`. Do not count this as 41 symbols when subscribing to both trades and books. See the [official quota and deployment evidence](research/kis-websocket-subscription-limits-2026-11-12.md).
 6. Install dependencies:
    - `pip install -r apps/api/requirements.txt`
 7. Run server:
