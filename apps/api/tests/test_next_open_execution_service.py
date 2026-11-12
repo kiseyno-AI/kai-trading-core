@@ -5947,6 +5947,81 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['trigger_price'], 50_500)
         self.assertEqual(item['chase_limit_price'], 51_500)
 
+    def test_low_confidence_waits_remain_independent_trigger_watches(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        signal_id = self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='wait',
+            entry_price_basis='trigger_limit',
+            trigger_price=50_500,
+            chase_limit_price=51_500,
+            target_price=54_000,
+            stop_loss_price=49_000,
+        )
+        short_id = self._seed_short_term_snapshot(
+            symbol='005930', confidence_score_10=4.2,
+        )
+        with session_scope() as session:
+            session.get(SignalDeciderDecisionSnapshot, signal_id).confidence_score_10 = Decimal('5.5')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+
+        self.assertEqual({item['decision_snapshot_id'] for item in result['items']}, {signal_id, short_id})
+        for item in result['items']:
+            self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
+            self.assertEqual(item['execution_status'], EXECUTION_STATUS_AWAITING_TRIGGER)
+            self.assertTrue(item['exec_monitoring_active'])
+            self.assertIn(
+                'confidence_below_threshold_watch_only',
+                {reason['code'] for reason in item['validation']['warnings']},
+            )
+
+    def test_waits_with_missing_or_invalid_confidence_remain_blocked(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        signal_id = self._seed_snapshot(
+            symbol='005930', next_day_open_action='wait', entry_price_basis='trigger_limit',
+            trigger_price=50_500, chase_limit_price=51_500, target_price=54_000, stop_loss_price=49_000,
+        )
+        short_id = self._seed_short_term_snapshot(symbol='005930')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+        for confidence in (None, Decimal('-1'), Decimal('11'), Decimal('NaN')):
+            with self.subTest(confidence=confidence):
+                with session_scope() as session:
+                    for snapshot_id in (signal_id, short_id):
+                        session.get(SignalDeciderDecisionSnapshot, snapshot_id).confidence_score_10 = confidence
+                with patch(
+                    'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                    return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+                ):
+                    result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+                self.assertEqual(len(result['items']), 2)
+                for item in result['items']:
+                    self.assertEqual(item['eligibility_status'], ELIGIBILITY_BLOCKED)
+                    self.assertIn('confidence_below_threshold', {
+                        reason['code'] for reason in item['validation']['blocking_reasons']
+                    })
+
+    def test_immediate_buy_still_requires_minimum_confidence(self) -> None:
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        snapshot_id = self._seed_snapshot(symbol='005930')
+        with session_scope() as session:
+            session.get(SignalDeciderDecisionSnapshot, snapshot_id).confidence_score_10 = Decimal('5.5')
+        service = self._service(state='PREOPEN', server_time='2026-04-30T08:40:00+09:00')
+        with patch(
+            'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+            return_value=[{'trade_date': '2026-04-29', 'close_price': 50_000}],
+        ):
+            result = service.refresh_plan_items(target_trade_date=self.target_trade_date, trigger='test')
+        self.assertEqual(result['items'][0]['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertIn('confidence_below_threshold', {
+            reason['code'] for reason in result['items'][0]['validation']['blocking_reasons']
+        })
+
     def test_complete_signal_wait_does_not_require_source_day_expected_return(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         snapshot_id = self._seed_snapshot(
@@ -6661,7 +6736,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             for key in forbidden:
                 self.assertNotIn(f'"{key}"', serialized)
 
-    def test_refresh_plan_items_hard_blocks_low_confidence_short_term_buy_authority(self) -> None:
+    def test_refresh_plan_items_keeps_low_confidence_short_term_as_watch_authority(self) -> None:
         settings.signal_decider_exec_integration_mode = 'dispatch'
         self._seed_short_term_snapshot(symbol='005930', confidence_score_10=6.0)
         self._seed_short_term_snapshot(
@@ -6686,12 +6761,12 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         items_by_symbol = {item['symbol']: item for item in result['items']}
         self.assertEqual(result['summary']['eligible_count'], 0)
-        self.assertEqual(result['summary']['monitor_candidate_count'], 1)
+        self.assertEqual(result['summary']['monitor_candidate_count'], 2)
         self.assertEqual(items_by_symbol['005930']['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
-        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_BLOCKED)
+        self.assertEqual(items_by_symbol['000660']['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
         self.assertIn(
-            'confidence_below_threshold',
-            {reason['code'] for reason in items_by_symbol['000660']['validation']['blocking_reasons']},
+            'confidence_below_threshold_watch_only',
+            {reason['code'] for reason in items_by_symbol['000660']['validation']['warnings']},
         )
         self.assertEqual(
             Decimal(str(items_by_symbol['000660']['validation']['short_term']['confidence_score_10'])),
@@ -6699,7 +6774,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(items_by_symbol['000660']['validation']['short_term']['tactical_action'], 'watch_for_trigger')
         self.assertEqual(items_by_symbol['000660']['validation']['short_term']['handoff_intent'], 'intraday_watch_buy')
-        self.assertNotEqual(items_by_symbol['000660']['validation']['handoff']['approval_state'], 'pending_exec_agent')
+        self.assertEqual(items_by_symbol['000660']['validation']['handoff']['approval_state'], 'pending_exec_agent')
         self.assertEqual(items_by_symbol['000660']['validation']['short_term']['trigger_price'], 252000)
         self.assertEqual(items_by_symbol['000660']['validation']['short_term']['chase_limit_price'], 255000)
         self.assertEqual(
@@ -6708,7 +6783,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             items_by_symbol['000660']['traceability']['core_execution_classification'],
-            'blocked',
+            'delegated_for_exec_agent_sizing',
         )
 
     def test_refresh_plan_items_attaches_pre_decider_enrichment_to_short_term_validation(self) -> None:

@@ -7,6 +7,8 @@ Inspect or dispatch the persisted next-open plan derived from the latest previou
 
 Each decider owns its decision and prices. A `REJECT` or `AVOID_CHASE` creates no buy handoff for its lane. If both lanes qualify on the same account and symbol, Exec can submit two separately identified buys, each at its own price conditions and within the shared account and symbol exposure limits. Specialist disagreement remains in `validation.warnings`. The compatibility field `safety_rails.block_on_specialist_disagreement` always reports `false`.
 
+A complete, bounded WAIT from either decider remains a trigger watch when its valid 0–10 confidence score is below the immediate-buy threshold. Core records `confidence_below_threshold_watch_only` in `validation.warnings`; it does not veto that watch. Missing, non-finite, or out-of-range confidence stays blocked. Immediate buys retain their confidence threshold, and Exec still checks live entry, cost, risk, quantity, and exposure before any order.
+
 The daily EOD pipeline refreshes this persisted plan immediately after the decision-support decider stage completes. PREOPEN refresh remains as an idempotent safety net, but operators no longer need to wait until the next morning for buy snapshots to become inspectable execution-plan rows.
 
 When PREOPEN validation finds that a candidate was generated against an older

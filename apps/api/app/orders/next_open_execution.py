@@ -8627,17 +8627,32 @@ class SignalDeciderNextOpenExecutionService:
             )
 
         confidence_score = _to_decimal(snapshot.confidence_score_10)
+        confidence_invalid = (
+            confidence_score is None or not Decimal('0') <= confidence_score <= Decimal('10')
+        )
         if (
-            confidence_score is None
+            confidence_invalid
             or min_confidence_threshold is None
             or confidence_score < min_confidence_threshold
         ):
-            blocking_reasons.append(
-                _reason(
-                    'confidence_below_threshold',
-                    'Confidence score is below the next-open automation threshold.',
+            if (
+                not confidence_invalid
+                and min_confidence_threshold is not None
+                and _is_bounded_intraday_watch_snapshot(snapshot)
+            ):
+                warnings.append(
+                    _reason(
+                        'confidence_below_threshold_watch_only',
+                        'Low confidence does not veto a bounded decider watch; Exec must approve live entry conditions before any order.',
+                    )
                 )
-            )
+            else:
+                blocking_reasons.append(
+                    _reason(
+                        'confidence_below_threshold',
+                        'Confidence score is invalid or below the next-open automation threshold.',
+                    )
+                )
         data_quality_warnings = _normalize_text_list(snapshot.data_quality_warnings_payload)
         if settings.signal_decider_next_open_block_on_data_warnings and data_quality_warnings:
             if _has_trustworthy_decision_input_quality_envelope(snapshot):
