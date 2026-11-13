@@ -1473,6 +1473,13 @@ class KISRealtimePriceService:
             symbol, ask, int(size_text), price_as_of=as_of, received_at=received_at,
             source='kis_orderbook_rest_confirmed',
         )
+        bid_size_text = _normalize_text(book.get('bidp_rsqn1'))
+        if bid_size_text.isascii() and bid_size_text.isdecimal():
+            await asyncio.to_thread(
+                wait_price_observations.observe_bid,
+                symbol, bid, int(bid_size_text), price_as_of=as_of, received_at=received_at,
+                source='kis_orderbook_rest_confirmed',
+            )
 
     async def _run(self) -> None:
         base_reconnect_delay = max(
@@ -1909,6 +1916,7 @@ class KISRealtimePriceService:
         # KIS publishes 63 columns today. The legacy 59-column frame shares these offsets.
         if width not in {59, 63}:
             return
+        observations = []
         with self._state_lock:
             for offset in range(0, len(values), width):
                 symbol, hour, session_class = values[offset:offset + 3]
@@ -1943,6 +1951,18 @@ class KISRealtimePriceService:
                     bid=bid, ask=ask, bid_size=int(bid_size), ask_size=int(ask_size),
                     as_of=as_of, received_at=received_at,
                 )
+                observations.append((symbol, self._orderbooks[symbol]))
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        for symbol, book in observations:
+            wait_price_observations.observe_ask(
+                symbol, book.ask, book.ask_size, price_as_of=book.as_of, received_at=book.received_at,
+                source='kis_orderbook_websocket',
+            )
+            wait_price_observations.observe_bid(
+                symbol, book.bid, book.bid_size, price_as_of=book.as_of, received_at=book.received_at,
+                source='kis_orderbook_websocket',
+            )
 
     def orderbooks_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         now = now or _utc_now()
@@ -2013,7 +2033,6 @@ class KISRealtimePriceService:
         from app.agent_context.wait_price_observations import wait_price_observations
 
         for tick in ticks:
-            wait_price_observations.observe(tick)
             size = tick.raw_fields.get('ASKP_RSQN1', '')
             if (
                 not tick.trade_halt and size.isascii() and size.isdecimal()
@@ -2025,6 +2044,13 @@ class KISRealtimePriceService:
                     tick.symbol, tick.ask_price, int(size), price_as_of=tick.price_as_of,
                     received_at=tick.received_at, source='kis_trade_packet_ask',
                 )
+                bid_size = tick.raw_fields.get('BIDP_RSQN1', '')
+                if bid_size.isascii() and bid_size.isdecimal():
+                    wait_price_observations.observe_bid(
+                        tick.symbol, tick.bid_price, int(bid_size), price_as_of=tick.price_as_of,
+                        received_at=tick.received_at, source='kis_trade_packet_bid',
+                    )
+            wait_price_observations.observe(tick)
         return [tick.to_public_dict() for tick in ticks]
 
     def _collect_session_trade_locked(self, tick: KISRealtimePriceTick) -> None:

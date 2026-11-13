@@ -399,3 +399,50 @@ def test_review_includes_only_market_headlines_known_before_the_cutoff(tmp_path,
     assert review['coverage']['market_headlines']['items'] == 2
     assert review['roles']['signal-decider']['source_status']['news'] == 'unavailable'
     assert review['roles']['signal-decider']['source_status']['market'] == 'unavailable'
+
+
+def test_review_consumes_paper_ledger_with_cutoff_without_claiming_actual_fills(tmp_path, monkeypatch, review_db):
+    from types import SimpleNamespace
+
+    day = date(2026, 11, 10)
+    cutoff = datetime(2026, 11, 10, 16, 30, tzinfo=KST)
+    monkeypatch.setattr(daily_review_inputs, 'wait_price_observations', WaitPriceObservations(tmp_path / 'watches'))
+    rows = [
+        {'decision_snapshot_id': 1, 'symbol': '005930', 'decision_agent_name': 'signal-decider',
+         'status': 'stop_exited', 'coverage': 'complete', 'filled_quantity': '2',
+         'realized_gross_pnl_krw': '-200', 'realized_net_pnl_krw': '-203.8', 'cost_krw': '3.8',
+         'events': [{'kind': 'trade', 'price': '100'}] * 1000},
+        {'decision_snapshot_id': 2, 'symbol': '005930', 'decision_agent_name': 'short-term-decider',
+         'status': 'open', 'coverage': 'incomplete', 'filled_quantity': '1',
+         'unrealized_gross_pnl_krw': None, 'unrealized_net_pnl_krw': None,
+         'coverage_reasons': ['unknown_path_gap']},
+    ]
+    rows.extend({'decision_snapshot_id': key, 'symbol': '005930', 'decision_agent_name': 'signal-decider',
+                 'status': 'pending', 'coverage': 'complete'} for key in range(3, 10))
+    def history(market_date, *, as_of):
+        assert market_date == day
+        assert as_of == cutoff
+        return rows
+    monkeypatch.setattr(daily_review_inputs, 'wait_paper_ledger', SimpleNamespace(history=history), raising=False)
+
+    review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
+
+    signal = review['roles']['signal-decider']
+    short = review['roles']['short-term-decider']
+    assert signal['paper_trades'][0] == {key: value for key, value in rows[0].items() if key != 'events'}
+    assert len(signal['paper_trades']) == 6
+    assert signal['paper_summary']['trade_count'] == 8
+    assert signal['paper_summary']['realized_net_pnl_krw'] == '-203.8'
+    assert signal['actual_entry_fill_count'] == 0
+    assert signal['source_status']['actual_execution'] == 'unavailable'
+    assert signal['source_status']['paper_execution'] == 'available'
+    assert short['source_status']['paper_execution'] == 'incomplete'
+    assert short['paper_summary']['realized_net_pnl_krw'] is None
+    assert short['paper_summary']['open_unrealized_net_pnl_krw'] is None
+    assert review['coverage']['paper_execution']['incomplete_count'] == 1
+    assert review['coverage']['actual_execution']['status'] == 'unavailable'
+
+    monkeypatch.setattr(daily_review_inputs.wait_price_observations, 'paper_recording_error', 'OSError: /private/path', raising=False)
+    degraded = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
+    assert degraded['coverage']['paper_execution']['recording_error'] == 'OSError'
+    assert degraded['roles']['signal-decider']['source_status']['paper_execution'] == 'incomplete'
