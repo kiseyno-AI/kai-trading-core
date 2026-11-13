@@ -9007,6 +9007,11 @@ class DailyPipelineStageService:
                     ),
                     scope_authority=scope_authority,
                     role_symbol_scopes=retry_role_symbol_scopes,
+                    source_summary_run_id=(
+                        feedback_cutoff_resolution.get('source_run_id')
+                        if stage_id == 'signal_decider' and isinstance(feedback_cutoff_resolution, dict)
+                        else None
+                    ),
                     progress_callback=progress_callback,
                 ),
                 # A forced pipeline recovery must bypass stale prerequisite

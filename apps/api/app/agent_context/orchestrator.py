@@ -41,7 +41,11 @@ from app.agent_context.eligibility import (
     split_requested_symbols_by_agent_feedback_eligibility_with_diagnostics,
 )
 from app.agent_context.feedback_failure_service import agent_context_feedback_failure_service
-from app.agent_context.feedback_failure_taxonomy import FeedbackFailureKind, classify_feedback_failure
+from app.agent_context.feedback_failure_taxonomy import (
+    FeedbackFailureKind,
+    classify_feedback_failure,
+    is_gateway_authority_reload,
+)
 from app.agent_context.orchestrator_helpers import (
     attach_timesfm_forecast_evidence,
     validate_timesfm_forecast_evidence,
@@ -1831,7 +1835,7 @@ class OpenClawAgentClient:
                 message,
                 allowed_types={'text', 'input_text', 'output_text'},
             )
-            if request_marker in candidate_text:
+            if re.search(rf'(?<![\w:./-]){re.escape(request_marker)}(?![\w:./-])', candidate_text):
                 marker_index = idx
 
         diagnostics['marker_found'] = marker_index is not None
@@ -1845,6 +1849,10 @@ class OpenClawAgentClient:
 
         last_json_failure = None
         for message in session_history[marker_index + 1:]:
+            if str(message.get('role') or '') == 'user' and 'batch-request::' in self._message_text(
+                message, allowed_types={'text', 'input_text', 'output_text'},
+            ):
+                break
             if str(message.get('role') or '') != 'assistant':
                 continue
             diagnostics['assistant_messages_after_marker'] += 1
@@ -2944,6 +2952,43 @@ class OpenClawAgentClient:
         except Exception as exc:  # noqa: BLE001
             raise AgentDispatchRetryableError(str(exc)) from exc
 
+    def _recover_interrupted_batch(
+        self, *, spec: AgentDispatchSpec, market_date: date, batch_symbols: Sequence[str],
+        session_key: str, request_marker: str, request_run_id: str | None,
+        error: AgentDispatchRetryableError,
+    ) -> dict[str, Any]:
+        try:
+            history = self.fetch_session_history(session_key=session_key, limit=80, include_tools=True)
+        except (AgentDispatchError, httpx.HTTPError, ValueError) as exc:
+            recovery = {'decoded': None, 'diagnostics': {
+                'checked': True, 'failure_mode': 'session_history_unavailable',
+                'error_type': type(exc).__name__, 'error': str(exc)[:300],
+            }}
+        else:
+            recovery = self._recover_from_session_history(session_history=history, request_marker=request_marker)
+        decoded, correlation = _correlate_decoded_batch_response(
+            decoded=recovery.get('decoded'), expected_symbols=batch_symbols,
+        )
+        valid = correlation.get('attribution_status') == 'matched'
+        if valid:
+            for item in decoded['items']:
+                normalized = _normalize_symbol_feedback(
+                    normalize_agent_response=normalize_agent_response,
+                    role=spec.role, agent_name=spec.agent_name,
+                    feedback_candidate=item.get('feedback'), market_date=market_date.isoformat(),
+                    symbol=item['symbol'],
+                )
+                if _normalized_feedback_contract_failure(normalized) is not None:
+                    valid = False
+                    break
+        if not valid:
+            error.details['response_recovery'] = {
+                'history': recovery['diagnostics'], 'response_correlation': correlation,
+            }
+            self._trip_circuit_breaker(error, request_run_id=request_run_id)
+            raise error
+        return recovery
+
     def dispatch_batch(
         self,
         *,
@@ -3085,6 +3130,7 @@ class OpenClawAgentClient:
                     'dispatch_rate_admission'
                 ] = dispatch_rate_admission
                 request_provenance['runtime_contract'] = runtime_contract
+                authority_changed = is_gateway_authority_reload(response.status_code, response.text)
                 if response.status_code >= 500:
                     raise AgentDispatchRetryableError(
                         f'OpenClaw batch server error '
@@ -3095,12 +3141,47 @@ class OpenClawAgentClient:
                         f'OpenClaw batch retryable error '
                         f'{response.status_code}: {response.text[:300]}'
                     )
-                if response.status_code >= 400:
+                if response.status_code >= 400 and not authority_changed:
                     raise AgentDispatchTerminalError(
                         f'OpenClaw batch failed {response.status_code}: '
                         f'{response.text[:300]}'
                     )
-                parsed = response.json()
+                parsed = {'status': 'interrupted', 'output': []} if authority_changed else response.json()
+                interruption_recovery = None
+                interruption_mode = (
+                    'gateway_requester_authority_changed' if authority_changed else
+                    'gateway_inflight_aborted' if parsed.get('status') in {'aborted', 'cancelled', 'canceled'} else None
+                )
+                if interruption_mode is not None:
+                    error = AgentDispatchRetryableError(
+                        f'OpenClaw in-flight gateway interruption ({interruption_mode}): '
+                        f'{response.text[:300]}'
+                    )
+                    details = self._build_dispatch_exception_details(
+                        exc=error, response=response, request_run_id=request_run_id,
+                        dispatch_id=dispatch_id, attempt_id=attempt_id,
+                        request_session_key=request_session_key, request_marker=request_marker,
+                        slot=slot, batch_symbols=batch_symbols, session_reuse_mode=session_reuse_mode,
+                    )
+                    classification = classify_feedback_failure(
+                        failure_kind=FeedbackFailureKind.OPENCLAW_TRANSPORT_ERROR.value,
+                        context={**details, 'failure_mode': interruption_mode}, error=str(error),
+                    )
+                    error.details = {
+                        **details, **classification.as_payload(),
+                        'failure_classification': classification.as_payload(),
+                        'failure_mode': interruption_mode, 'retryable': True,
+                        'shared_transport_outage': True, 'shared_dispatch_outage': True,
+                    }
+                    interruption_recovery = self._recover_interrupted_batch(
+                        spec=spec, market_date=market_date, batch_symbols=batch_symbols,
+                        session_key=request_session_key, request_marker=request_marker,
+                        request_run_id=circuit_breaker_run_id, error=error,
+                    )
+                    request_provenance['gateway_interruption_recovery'] = {
+                        'failure_mode': interruption_mode, 'response_status_code': response.status_code,
+                        'request_marker': request_marker,
+                    }
                 message_output_text = None
                 for item in parsed.get('output', []):
                     if not isinstance(item, dict) or item.get('type') != 'message':
@@ -3140,7 +3221,7 @@ class OpenClawAgentClient:
                         status_code=response.status_code,
                     ),
                 )
-                if parsed.get('status') in {'failed', 'aborted', 'cancelled', 'canceled'}:
+                if parsed.get('status') == 'failed':
                     raise AgentDispatchRetryableError(
                         f"OpenClaw batch ended with status={parsed.get('status')}"
                     )
@@ -3206,6 +3287,14 @@ class OpenClawAgentClient:
                 trajectory_diagnostics: dict[str, Any] = {'checked': False}
                 history_marker_found = None
                 failure_mode = function_call_failure_mode or json_failure_class
+                if interruption_recovery is not None:
+                    decoded = interruption_recovery['decoded']
+                    output_text = interruption_recovery['output_text']
+                    decoded_source = 'session_history_after_marker'
+                    session_history_diagnostics = interruption_recovery['diagnostics']
+                    history_marker_found = True
+                    json_failure_class = None
+                    failure_mode = None
                 if (
                     decoded is None
                     and request_session_key

@@ -166,7 +166,10 @@ class PreopenDailyRecoveryTests(TestCase):
         ):
             agent_calls[stage] = self.mock(
                 f'app.eod.pykrx_pipeline_runner.{name}',
-                side_effect=completed(stage, {'triggered': True, 'status': 'completed'}),
+                side_effect=completed(stage, {
+                    'triggered': True, 'status': 'completed',
+                    **({'run_id': 'summary-frozen-preopen'} if stage == 'feedback' else {}),
+                }),
             )
 
         result = service._run_market_data_pipeline(
@@ -199,6 +202,10 @@ class PreopenDailyRecoveryTests(TestCase):
         for stage in ('feedback', 'decider'):
             self.assertTrue(agent_calls[stage].call_args.kwargs.get('point_in_time_recovery'))
             self.assertEqual(agent_calls[stage].call_args.kwargs.get('symbols'), scope)
+        self.assertEqual(
+            agent_calls['decider'].call_args.kwargs.get('source_summary_run_id'),
+            'summary-frozen-preopen',
+        )
         live.assert_not_called()
         for provider in optional:
             provider.assert_not_called()

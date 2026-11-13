@@ -18465,7 +18465,7 @@ class PykrxBackfillServiceTests(TestCase):
                 patch(
                     'app.eod.pykrx_pipeline_runner._run_daily_feedback_followup',
                     side_effect=lambda **_: followup_order.append('agent_feedback_summaries')
-                    or {'triggered': True, 'status': 'completed'},
+                    or {'triggered': True, 'status': 'completed', 'run_id': 'summary-exact-partial-cohort'},
                 )
             )
             signal_decider_followup = stack.enter_context(
@@ -18561,6 +18561,7 @@ class PykrxBackfillServiceTests(TestCase):
             knowledge_cutoff_at=ANY,
             progress_callback=ANY,
             symbols=signal_symbols,
+            source_summary_run_id='summary-exact-partial-cohort',
         )
         evaluation_followup.assert_not_called()
         self.assertEqual(
@@ -18593,7 +18594,7 @@ class PykrxBackfillServiceTests(TestCase):
         )
         self.assertEqual(
             result['feedback_followup'],
-            {'triggered': True, 'status': 'completed'},
+            {'triggered': True, 'status': 'completed', 'run_id': 'summary-exact-partial-cohort'},
         )
         self.assertEqual(
             result['signal_decider_followup'],

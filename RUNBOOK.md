@@ -278,6 +278,31 @@ reviewing the versioned template, then rerun `--check`; installation changes
 only that workspace's `AGENTS.md` and never enables dispatch or alters trading
 state.
 
+### Gateway maintenance during daily agent work
+
+Before restarting OpenClaw, require zero queued/running daily, EOD and agent-feedback
+runs. Check `openclaw gateway call gateway.restart.preflight --json` and the
+gateway status `shutdownBudget.activeWork` / `writeCustody`; every work counter
+must be zero. Hold an idle suspension with
+`openclaw gateway suspend --request-id <maintenance-id> --json` and require
+`status=ready` before service maintenance. Release the returned suspension ID
+with `openclaw gateway resume <suspension-id> --json` afterward. Do not force,
+skip deferral or restart while a recovery worker is running.
+
+Check the effective supervisor timeout with `launchctl print`, not only the
+plist: this host still reports 60 seconds after freshly loading a plist that
+requests 330 seconds. A nominal startup drain budget cannot protect a longer
+in-flight model request from that effective shutdown limit. Idle admission is
+the maintenance gate, regardless of the requested timeout.
+
+For a partial agent chain, preserve the original date, knowledge cutoff and
+role-specific scope. Repair only missing summary role/symbol pairs, then only
+failed or unattempted decider pairs; keep successful feedback and snapshot IDs
+unchanged. Bind subsequent daily decider selection to its exact source summary
+run, rather than reranking the universe after summaries finish. A validated
+reply recovered from the original request marker needs no new model call.
+Ordinary authorization failures and malformed replies remain failures.
+
 ## Runtime write-path schema drift diagnostics
 
 When an EOD, DART, signal-decider, or execution write path fails, debug in this order:
