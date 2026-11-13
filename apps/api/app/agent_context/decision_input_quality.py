@@ -206,13 +206,18 @@ def _block_reason(block_name: str, block: dict[str, Any], *, freshness_status: s
 
 def _effect_for_block(block_name: str, block: dict[str, Any], *, source_quality: str) -> tuple[str, int]:
     status = str(block.get('status') or STATUS_UNAVAILABLE).strip().lower()
-    if block_name == 'disclosures_news':
+    if block_name in AUXILIARY_BLOCKS:
         if status in {STATUS_EMPTY, STATUS_UNAVAILABLE, STATUS_NOT_APPLICABLE}:
             return EFFECT_NEUTRAL_SECONDARY_CONTEXT, 0
-        if status == STATUS_PROVIDER_ERROR:
+        if block_name == 'disclosures_news' and status == STATUS_PROVIDER_ERROR:
             return EFFECT_MINOR_DISCOUNT, 3
-    if block_name in AUXILIARY_BLOCKS and status in {STATUS_EMPTY, STATUS_UNAVAILABLE, STATUS_NOT_APPLICABLE}:
-        return EFFECT_NEUTRAL_SECONDARY_CONTEXT, 0
+        if (
+            status in {STATUS_STALE, STATUS_PROVIDER_ERROR}
+            or source_quality in {SOURCE_QUALITY_ESTIMATED_FALLBACK, SOURCE_QUALITY_FALLBACK}
+        ):
+            return EFFECT_MINOR_DISCOUNT, 6
+        if status == STATUS_PARTIAL:
+            return EFFECT_MINOR_DISCOUNT, 4
     if source_quality == SOURCE_QUALITY_ESTIMATED_FALLBACK:
         return EFFECT_MAJOR_DISCOUNT, 20
     if source_quality == SOURCE_QUALITY_FALLBACK:

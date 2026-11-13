@@ -567,6 +567,32 @@ class DecisionInputQualityTests(unittest.TestCase):
         )
         self.assertEqual(result['quality_provenance']['data_policy']['source_policy'], 'free_current_sources_only')
 
+    def test_auxiliary_gaps_have_smaller_weight_in_buy_quality(self) -> None:
+        for financials, expected_financial_penalty, expected_score in (
+            ({'status': 'partial'}, 4, 92),
+            ({'status': 'stale'}, 6, 90),
+            (
+                {'status': 'available', 'freshness': {'provenance_status': 'fallback_from_owned_data'}},
+                6,
+                90,
+            ),
+        ):
+            with self.subTest(financials=financials):
+                quality_context = _quality_context(news_status='partial')
+                quality_context['blocks']['financials_cashflow'] = financials
+                result = build_decision_input_quality_envelope(
+                    decider_data_quality_context=quality_context,
+                    pre_decider_enrichment_context={
+                        'quote_orderbook_snapshot': {'status': 'available'},
+                    },
+                )
+
+                blocks = result['data_quality']['blocks']
+                self.assertEqual(blocks['financials_cashflow']['confidence_penalty'], expected_financial_penalty)
+                self.assertEqual(blocks['disclosures_news']['confidence_penalty'], 4)
+                self.assertEqual(result['final_judgment']['buy_quality_score'], expected_score)
+                self.assertFalse(result['final_judgment']['hard_blocks'])
+
 
 if __name__ == '__main__':
     unittest.main()
