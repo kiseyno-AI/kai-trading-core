@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -2234,6 +2234,7 @@ def _claim_feedback_retry_run(
     fs_div: str | None = None,
     scope_authority: Mapping[str, Any] | None = None,
     point_in_time_recovery: bool = False,
+    source_summary_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomically claim a durable retry scope without holding a pool slot."""
 
@@ -2332,6 +2333,8 @@ def _claim_feedback_retry_run(
             and payload.get('role_symbol_scopes')
             == normalized_role_symbol_scopes
             and normalized_fs_div == active_fs_div
+            and (str(payload.get('source_summary_run_id') or '').strip() or None)
+            == (str(source_summary_run_id or '').strip() or None)
             and _request_payload_matches_point_in_time_recovery(
                 payload,
                 normalized_point_in_time_recovery,
@@ -2512,6 +2515,7 @@ def _claim_feedback_retry_run(
                     ),
                     'feedback_scope_mode': normalized_feedback_scope_mode,
                     'fs_div': normalized_fs_div,
+                    **({'source_summary_run_id': source_summary_run_id} if source_summary_run_id else {}),
                     'admission_knowledge_cutoff_at': (
                         normalized_admission_knowledge_cutoff_at
                     ),
@@ -3028,9 +3032,72 @@ class FeedbackRetryCycleConfig:
     force_recompute: bool = False
     point_in_time_recovery: bool = False
     reuse_parent_run_id: str | None = None
+    source_summary_run_id: str | None = None
     scope_authority: Mapping[str, Any] | None = None
     role_symbol_scopes: Mapping[str, Sequence[str]] | None = None
     progress_callback: Callable[..., Any] | None = None
+
+
+def _bind_source_summary_scope(config: FeedbackRetryCycleConfig) -> tuple[FeedbackRetryCycleConfig, dict | None]:
+    source_id = str(getattr(config, 'source_summary_run_id', None) or '').strip()
+    if not source_id:
+        return config, None
+    if not config.roles or not set(config.roles).issubset(DECISION_SUPPORT_AGENT_NAMES):
+        raise ValueError('source summary binding requires decision-support roles')
+    source = agent_context_feedback_run_state_service.get_run(run_id=source_id)
+    if not isinstance(source, Mapping):
+        raise ValueError('source summary run is unavailable')
+    payload = source.get('request_payload') or {}
+    if not isinstance(payload, Mapping):
+        raise ValueError('source summary request is invalid')
+    if config.scope_authority is not None and config.scope_authority.get('source_summary_run_id') != source_id:
+        raise ValueError('source summary does not match the completed-scope authority')
+    cutoff = _normalize_admission_knowledge_cutoff(config.knowledge_cutoff_at)
+    if (
+        source.get('run_id') != source_id
+        or str(source.get('market_date'))[:10] != config.market_date.isoformat()
+        or source.get('status') not in {'completed', 'partial'}
+        or not source.get('completed_at')
+        or payload.get('mode') != DAILY_RETRY_CYCLE_MODE
+        or set(payload.get('roles') or []) != set(SUMMARIZER_AGENT_NAMES)
+        or _normalize_feedback_fs_div(payload.get('fs_div')) != _normalize_feedback_fs_div(config.fs_div)
+        or cutoff is None
+        or _normalize_admission_knowledge_cutoff(payload.get('knowledge_cutoff_at')) != cutoff
+    ):
+        raise ValueError('source summary date, cutoff or terminal authority does not match request')
+    prepared = _exact_completed_summary_scope(payload)
+    if prepared is None or not prepared[0]:
+        raise ValueError('source summary prepared role scope is unavailable')
+    prepared_symbols = prepared[0]
+    frozen = payload.get('prepared_decider_role_symbol_scopes')
+    provenance = 'frozen_decider_role_scopes_v1'
+    if frozen is None:
+        # Old parents prove prerequisite membership, never an invented role ranking.
+        frozen = {role: prepared_symbols for role in DECISION_SUPPORT_AGENT_NAMES}
+        provenance = 'legacy_prepared_summary_scope'
+    frozen = _normalize_role_symbol_scopes(
+        frozen, roles=DECISION_SUPPORT_AGENT_NAMES, requested_symbols=prepared_symbols,
+    )
+    selected = config.role_symbol_scopes or {role: frozen[role] for role in config.roles}
+    selected = _normalize_role_symbol_scopes(
+        selected, roles=config.roles,
+        requested_symbols=config.symbols if config.role_symbol_scopes is not None else prepared_symbols,
+    )
+    if any(not set(symbols).issubset(frozen[role]) for role, symbols in selected.items()):
+        raise ValueError('source summary role scope does not cover requested decisions')
+    requested = set(config.symbols) if config.symbols is not None else set(prepared_symbols)
+    selected = {role: [symbol for symbol in symbols if symbol in requested] for role, symbols in selected.items()}
+    active_symbols = _ordered_symbol_union(list(selected.values()))
+    if not active_symbols:
+        raise ValueError('source summary scope contains no requested decisions')
+    return replace(
+        config, source_summary_run_id=source_id, role_symbol_scopes=selected,
+        symbols=config.symbols if config.scope_authority is not None else tuple(active_symbols),
+    ), {
+        'source_summary_run_id': source_id, 'knowledge_cutoff_at': cutoff,
+        'provenance': provenance, 'prepared_symbols': prepared_symbols,
+        'prepared_decider_role_symbol_scopes': frozen,
+    }
 
 
 @dataclass(frozen=True)
@@ -5340,6 +5407,7 @@ class AgentFeedbackRetryService:
         force: bool = False,
         bypass_prerequisite_gate: bool = False,
     ) -> dict[str, Any]:
+        config, source_summary_scope = _bind_source_summary_scope(config)
         roles = tuple(config.roles)
         point_in_time_recovery = bool(
             getattr(config, 'point_in_time_recovery', False)
@@ -5495,6 +5563,7 @@ class AgentFeedbackRetryService:
                 weekly_policy_session_guard=(
                     weekly_policy_session_guard
                 ),
+                **({'source_summary_scope': source_summary_scope} if source_summary_scope is not None else {}),
             )
         if effective_knowledge_cutoff_at is None:
             (
@@ -5522,6 +5591,7 @@ class AgentFeedbackRetryService:
             return bool(
                 prior_request.get('scope_authority')
                 == dict(normalized_scope_authority or {})
+                and prior_request.get('source_summary_run_id') == getattr(config, 'source_summary_run_id', None)
                 and prior_request.get('policy_context_as_of_date')
                 == resolved_policy_context_as_of_date.isoformat()
                 and _normalize_optional_symbol_scope(
@@ -5711,6 +5781,7 @@ class AgentFeedbackRetryService:
             role_symbol_scopes=resolved_role_symbol_scopes,
             fs_div=resolved_fs_div,
             scope_authority=normalized_scope_authority,
+            **({'source_summary_run_id': config.source_summary_run_id} if source_summary_scope is not None else {}),
             point_in_time_recovery=point_in_time_recovery,
         )
         if not admission['acquired']:
@@ -5849,6 +5920,7 @@ class AgentFeedbackRetryService:
                     idempotency_attempt=admission.get(
                         'idempotency_attempt'
                     ),
+                    **({'source_summary_scope': source_summary_scope} if source_summary_scope is not None else {}),
                 )
         except Exception as exc:
             _finish_feedback_retry_claim_if_running(
@@ -5884,6 +5956,7 @@ class AgentFeedbackRetryService:
         weekly_policy_session_guard: Callable[..., Any] | None = None,
         retry_of_run_id: str | None = None,
         idempotency_attempt: int | None = None,
+        source_summary_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         roles = tuple(config.roles)
         resolved_idempotency_key = str(
@@ -6003,13 +6076,24 @@ class AgentFeedbackRetryService:
             records=eligibility_records,
             requested_symbols=requested_symbols,
         )
+        freeze_decider_scopes = (
+            set(roles) == set(SUMMARIZER_AGENT_NAMES)
+            and feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+        )
         role_funnel = build_agent_feedback_role_funnel(
             records=eligibility_records,
-            roles=roles,
+            roles=(*roles, *DECISION_SUPPORT_AGENT_NAMES) if freeze_decider_scopes else roles,
             requested_symbols=requested_symbols,
             candidate_symbols=eligible_symbols,
             feedback_scope_mode=feedback_scope_mode,
         )
+        prepared_decider_scopes = (
+            {role: list(role_funnel.get('role_symbols', {}).get(role, [])) for role in DECISION_SUPPORT_AGENT_NAMES}
+            if freeze_decider_scopes else None
+        )
+        if freeze_decider_scopes:
+            for key in ('role_symbols', 'role_symbol_counts', 'role_diagnostics'):
+                role_funnel[key] = {role: value for role, value in role_funnel.get(key, {}).items() if role in roles}
         role_symbol_scopes = {
             role: tuple(symbols)
             for role, symbols in role_funnel.get('role_symbols', {}).items()
@@ -6054,6 +6138,12 @@ class AgentFeedbackRetryService:
         scoped_feedback_symbols = _ordered_symbol_union(
             [role_symbol_scopes.get(role, ()) for role in roles]
         )
+        if prepared_decider_scopes is not None:
+            prepared_symbols = set.intersection(*(set(role_symbol_scopes.get(role, ())) for role in SUMMARIZER_AGENT_NAMES))
+            prepared_decider_scopes = {
+                role: [symbol for symbol in symbols if symbol in prepared_symbols]
+                for role, symbols in prepared_decider_scopes.items()
+            }
         entry_economics_scope_empty = not scoped_feedback_symbols and any(
             diagnostic.get('entry_economics_exclusions')
             for diagnostic in (eligibility_diagnostics, *role_funnel.get('role_diagnostics', {}).values())
@@ -6370,6 +6460,14 @@ class AgentFeedbackRetryService:
             'eligibility_filters': list(AGENT_FEEDBACK_ELIGIBILITY_FILTERS),
             'eligibility_diagnostics': eligibility_diagnostics,
             'funnel_diagnostics': role_funnel,
+            **(
+                {'prepared_decider_role_symbol_scopes': prepared_decider_scopes}
+                if prepared_decider_scopes is not None else {}
+            ),
+            **(
+                {'source_summary_run_id': config.source_summary_run_id, 'source_summary_scope': dict(source_summary_scope)}
+                if source_summary_scope is not None else {}
+            ),
             'decider_upstream_admission': decider_upstream_admission,
             'role_symbol_scopes': {
                 role: list(symbols)
@@ -6660,15 +6758,14 @@ class AgentFeedbackRetryService:
                                     },
                                     upstream_summary_run_id=(
                                         str(
-                                            normalized_scope_authority.get(
+                                            getattr(config, 'source_summary_run_id', None)
+                                            or (normalized_scope_authority or {}).get(
                                                 'source_summary_run_id'
                                             )
                                             or ''
                                         ).strip()
                                         if role
                                         in DECISION_SUPPORT_AGENT_NAMES
-                                        and normalized_scope_authority
-                                        is not None
                                         else None
                                     ),
                                     persistence_guard=(

@@ -2536,6 +2536,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ],
             'feedback-cycle-summary-same-run',
         )
+        self.assertEqual(
+            feedback_retry_service.calls[1]['config'].source_summary_run_id,
+            'feedback-cycle-summary-same-run',
+        )
         resolve_cutoff.assert_called_once_with(
             market_date=datetime(2026, 4, 14).date(),
             feedback_scope_mode='broad_feedback_universe',

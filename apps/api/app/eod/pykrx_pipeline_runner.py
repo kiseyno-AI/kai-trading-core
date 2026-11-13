@@ -3226,6 +3226,7 @@ def _run_daily_signal_decider_followup(
     progress_callback: Callable[..., None] | None = None,
     point_in_time_recovery: bool = False,
     symbols: Sequence[str] | None = None,
+    source_summary_run_id: str | None = None,
 ) -> dict[str, Any]:
     from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
@@ -3240,6 +3241,7 @@ def _run_daily_signal_decider_followup(
         progress_callback=progress_callback,
         point_in_time_recovery=point_in_time_recovery,
         symbols=symbols,
+        source_summary_run_id=source_summary_run_id,
     )
 
 
@@ -3279,6 +3281,7 @@ def _run_daily_agent_feedback_followup(
     progress_callback: Callable[..., None] | None = None,
     point_in_time_recovery: bool = False,
     symbols: Sequence[str] | None = None,
+    source_summary_run_id: str | None = None,
 ) -> dict[str, Any]:
     if not enabled:
         return {
@@ -3332,6 +3335,7 @@ def _run_daily_agent_feedback_followup(
                 knowledge_cutoff_at or datetime.now(timezone.utc)
             ),
             feedback_scope_mode=feedback_scope_mode,
+            source_summary_run_id=source_summary_run_id,
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
             reuse_existing=True,
@@ -6823,6 +6827,7 @@ def run_market_data_pipeline(
                         ),
                         progress_callback=signal_decider_progress_callback,
                         point_in_time_recovery=point_in_time_recovery,
+                        source_summary_run_id=result['feedback_followup'].get('run_id'),
                         **feedback_scope_kwargs,
                     ),
                 )
@@ -7165,6 +7170,7 @@ def run_market_data_pipeline(
                                 resolve_feedback_knowledge_cutoff()
                             ),
                             progress_callback=signal_decider_progress_callback,
+                            source_summary_run_id=result['feedback_followup'].get('run_id'),
                             **feedback_scope_kwargs,
                         ),
                     )

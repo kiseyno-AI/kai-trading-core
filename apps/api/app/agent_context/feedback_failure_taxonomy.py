@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping
@@ -126,6 +127,23 @@ def _status_code_values(*values: Any) -> Iterable[int]:
             yield from _status_code_values(nested_context)
 
 
+def is_gateway_authority_reload(status_code: int | None, text: str | None) -> bool:
+    if status_code != 403:
+        return False
+    message = str(text or '').strip()
+    try:
+        payload = json.loads(message)
+    except ValueError:
+        pass
+    else:
+        error = payload.get('error') if isinstance(payload, dict) else None
+        message = str(error.get('message') or '') if isinstance(error, dict) else ''
+    return message in {
+        'Gateway requester authority changed',
+        'ToolAuthorizationError: Gateway requester authority changed',
+    }
+
+
 def classify_feedback_failure(
     *,
     failure_kind: str | None,
@@ -229,6 +247,24 @@ def classify_feedback_failure(
             failure_status=FeedbackFailureStatus.AUTH_MISSING.value,
             failure_category='auth',
             reason='OpenClaw gateway token is not configured locally',
+        )
+
+    reload_diagnostics = [summary_payload, context_payload]
+    reload_diagnostics.extend(
+        nested for payload in tuple(reload_diagnostics)
+        if isinstance(nested := payload.get('dispatch_diagnostics'), Mapping)
+    )
+    if 403 in status_codes and any(
+        payload.get('failure_mode') == 'gateway_requester_authority_changed'
+        and any(is_gateway_authority_reload(403, payload.get(field))
+                for field in ('response_text_excerpt', 'error_message', 'error'))
+        for payload in reload_diagnostics
+    ):
+        return FeedbackFailureClassification(
+            failure_kind=FeedbackFailureKind.OPENCLAW_TRANSPORT_ERROR.value,
+            failure_status=FeedbackFailureStatus.TRANSPORT_ERROR.value,
+            failure_category='transport',
+            reason='OpenClaw gateway requester authority changed during an in-flight reload',
         )
 
     if (
