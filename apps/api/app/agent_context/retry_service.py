@@ -6076,10 +6076,7 @@ class AgentFeedbackRetryService:
             records=eligibility_records,
             requested_symbols=requested_symbols,
         )
-        freeze_decider_scopes = (
-            set(roles) == set(SUMMARIZER_AGENT_NAMES)
-            and feedback_scope_mode == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
-        )
+        freeze_decider_scopes = set(roles) == set(SUMMARIZER_AGENT_NAMES)
         role_funnel = build_agent_feedback_role_funnel(
             records=eligibility_records,
             roles=(*roles, *DECISION_SUPPORT_AGENT_NAMES) if freeze_decider_scopes else roles,

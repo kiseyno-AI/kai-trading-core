@@ -9,7 +9,11 @@ from app.agent_context.retry_service import (
     AgentFeedbackRetryService, FeedbackRetryCycleConfig, RoleSequenceRoleState, RoleSequenceSnapshot,
 )
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
-from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+from app.agent_context.run_modes import (
+    DAILY_RETRY_CYCLE_MODE,
+    FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+)
 
 
 DAY = date(2026, 11, 13)
@@ -82,7 +86,16 @@ def test_summary_scope_binding_rejects_wrong_date_or_cutoff_before_dispatch(monk
     load.assert_not_called()
 
 
-def test_summary_parent_persists_independent_decider_scopes_before_any_later_ranking(monkeypatch):
+@pytest.mark.parametrize(
+    'feedback_scope_mode',
+    [
+        FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+        FEEDBACK_SCOPE_MODE_BROAD_FEEDBACK_UNIVERSE,
+    ],
+)
+def test_summary_parent_persists_independent_decider_scopes_before_any_later_ranking(
+    monkeypatch, feedback_scope_mode
+):
     from tests.test_feedback_retry_cycles import RecordingRunStateService
 
     service = AgentFeedbackRetryService()
@@ -119,7 +132,12 @@ def test_summary_parent_persists_independent_decider_scopes_before_any_later_ran
 
     monkeypatch.setattr(service, '_build_role_sequence_snapshot', completed_snapshot)
     service._run_retry_cycles_admitted(
-        config=FeedbackRetryCycleConfig(market_date=DAY, roles=SUMMARIZER_AGENT_NAMES, knowledge_cutoff_at=CUTOFF),
+        config=FeedbackRetryCycleConfig(
+            market_date=DAY,
+            roles=SUMMARIZER_AGENT_NAMES,
+            knowledge_cutoff_at=CUTOFF,
+            feedback_scope_mode=feedback_scope_mode,
+        ),
         prerequisites={'ready': True}, preloaded_eligible_symbols=SYMBOLS,
         effective_knowledge_cutoff_at=CUTOFF,
     )
