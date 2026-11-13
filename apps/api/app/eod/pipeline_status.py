@@ -1270,7 +1270,34 @@ def _factor_scope_has_no_decision_ready_rows(
     degraded_count = _strict_nonnegative_int(
         evidence.get('decision_degraded_count')
     )
+    if (
+        ready_count == 0 and (degraded_count or 0) > 0
+        and evidence.get('publication_readiness_required') is False
+    ):
+        return not _published_nullable_factor_scope_is_complete(stage_id=stage_id, evidence=evidence)
     return bool(ready_count == 0 and (degraded_count or 0) > 0)
+
+
+def _published_nullable_factor_scope_is_complete(
+    *, stage_id: str, evidence: dict[str, Any],
+) -> bool:
+    if (
+        stage_id not in FACTOR_STAGE_SCORE_FIELDS
+        or evidence.get('publication_readiness_required') is not False
+    ):
+        return False
+    requested = _strict_nonnegative_int(evidence.get('requested_count'))
+    ready = _strict_nonnegative_int(evidence.get('decision_ready_count'))
+    degraded = _strict_nonnegative_int(evidence.get('decision_degraded_count'))
+    validated = (
+        _validated_row_count_scope_gap_evidence(evidence, requested_count=requested)
+        if requested is not None else None
+    )
+    return bool(
+        validated is not None and validated['missing_count'] == 0
+        and validated['present_count'] > 0 and ready is not None and degraded is not None
+        and ready + degraded == validated['present_count']
+    )
 
 
 def _nullable_output_covers_scope(
@@ -6571,7 +6598,10 @@ class EODPipelineStatusService:
                 quality_reason = (
                     'null_score_rows_preserved_as_supporting_context'
                 )
-                if decision_ready_count == 0:
+                if decision_ready_count == 0 and not (
+                    feedback_scope_gap is not None
+                    and _published_nullable_factor_scope_is_complete(stage_id=stage_id, evidence=feedback_scope_gap)
+                ):
                     gate_status = 'blocked'
                     severity = 'blocked'
                     blocking_status = 'blocking'
@@ -7145,7 +7175,14 @@ class EODPipelineStatusService:
                 and details.get('mode')
                 == 'derived_from_daily_signal_features'
             )
-            if aggregate_signal_gap:
+            nullable_factor_quality_gate = bool(
+                stage_status == 'completed'
+                and details.get('gate_reason') == 'no_decision_ready_factor_rows'
+                and not details.get('blocking_stages')
+                and not details.get('failed_blocking_stages')
+                and _published_nullable_factor_scope_is_complete(stage_id=stage_task, evidence=validated_coverage)
+            )
+            if aggregate_signal_gap or nullable_factor_quality_gate:
                 details['aggregate_status'] = stage_status
                 details['aggregate_gate_status'] = stage.get('gate_status')
                 details['aggregate_gate_reason'] = details.get('gate_reason')

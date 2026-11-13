@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
+import httpx
+
+from app.brokers.kis.client import KISAPIError, KISTimeoutError, KISTransportError
 from app.brokers.kis.provider import kis_client
 from app.core.settings import settings
 from app.market.clock import async_get_market_state
@@ -22,6 +25,7 @@ DEFAULT_MARKET_CODE = 'J'
 DEFAULT_MAX_RANKING_PAGES = 2
 DEFAULT_MAX_NEWS_ITEMS = 5
 DEFAULT_FETCH_CONCURRENCY = 5
+SURFACE_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 RESULT_SYMBOL_PREVIEW_LIMIT = 50
 RESULT_ERROR_MESSAGE_LIMIT = 1000
 KST = timezone(timedelta(hours=9))
@@ -227,6 +231,30 @@ def _has_any_content(value: Any) -> bool:
 def _bounded_exception_message(exc: Exception) -> str:
     message = str(exc).strip() or type(exc).__name__
     return message[:RESULT_ERROR_MESSAGE_LIMIT]
+
+
+def _is_retryable_surface_error(exc: Exception) -> bool:
+    status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else getattr(exc, 'status_code', None)
+    if status_code in (401, 403):
+        return False
+    if status_code is not None and (status_code in (408, 429) or 500 <= status_code < 600):
+        return True
+    if isinstance(exc, KISAPIError):
+        return exc.msg_code == 'EGW00201'
+    if status_code is not None:
+        return False
+    return isinstance(exc, (KISTimeoutError, KISTransportError, TimeoutError, ConnectionError, httpx.TransportError))
+
+
+async def _fetch_read_surface(fetch: Callable[..., Awaitable[dict[str, Any]]], *args, **kwargs) -> dict[str, Any]:
+    for attempt in range(len(SURFACE_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return await fetch(*args, **kwargs)
+        except Exception as exc:
+            if attempt == len(SURFACE_RETRY_DELAYS_SECONDS) or not _is_retryable_surface_error(exc):
+                raise
+            await asyncio.sleep(SURFACE_RETRY_DELAYS_SECONDS[attempt])
+    raise AssertionError('unreachable intraday surface retry state')
 
 
 def _now_kst() -> datetime:
@@ -694,14 +722,14 @@ class KISIntradaySnapshotService:
         include_news: bool,
         source: str,
     ) -> dict[str, Any]:
-        quote_task = self.client.fetch_domestic_quote(symbol_input.symbol, market_code=market_code)
-        orderbook_task = self.client.fetch_domestic_orderbook(symbol_input.symbol, market_code=market_code)
-        program_task = self.client.fetch_domestic_program_trade_by_stock(symbol_input.symbol, market_code=market_code)
-        investor_task = self.client.fetch_domestic_investor_trend_estimate(symbol_input.symbol)
+        quote_task = _fetch_read_surface(self.client.fetch_domestic_quote, symbol_input.symbol, market_code=market_code)
+        orderbook_task = _fetch_read_surface(self.client.fetch_domestic_orderbook, symbol_input.symbol, market_code=market_code)
+        program_task = _fetch_read_surface(self.client.fetch_domestic_program_trade_by_stock, symbol_input.symbol, market_code=market_code)
+        investor_task = _fetch_read_surface(self.client.fetch_domestic_investor_trend_estimate, symbol_input.symbol)
         tasks = [quote_task, orderbook_task, program_task, investor_task]
         if include_news:
             tasks.append(
-                self.client.fetch_domestic_news_titles(
+                _fetch_read_surface(self.client.fetch_domestic_news_titles,
                     symbol=symbol_input.symbol,
                     max_pages=max(1, settings.kis_intraday_snapshot_news_pages),
                 )

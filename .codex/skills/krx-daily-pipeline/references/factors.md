@@ -4,6 +4,8 @@ Source paths are under `apps/api/app/`. A factor output row can carry an empty s
 
 The first-run factor group in `eod/pykrx_pipeline_runner.py` runs momentum, basic value, low-risk and beta over the verified price cohort. DART-dependent stages use the applicable DART/Piotroski cohort. An aggregate partial factor result can still provide its proven successful cohort for the signal-feature and feedback path. The explicit/resume executor in `eod/daily_pipeline_stages.py` applies dependency proofs and may narrow the symbol scope. Do not treat a smaller returned scope or an old stored row as evidence that an omitted symbol succeeded in this attempt.
 
+Status and feedback prerequisites accept a fully published nullable supporting-factor scope as degraded context when authoritative coverage explicitly sets `publication_readiness_required=false` and ready/degraded counts account for every present row. This applies to both requested and exact-universe scopes, including an all-null scope. Missing rows, invalid coverage, required or unknown readiness, and failed dependencies still block; this context rule does not create an atomic stage-completion proof or waive strategy requirements.
+
 For a mixed explicit/resumed scope, keep proven preferred-share Piotroski exemptions only for supported signal, news and feedback stages. A symbol still needs its own price and supported factor evidence. An isolated preferred-only scope does not produce a common-share factor proof. Diagnose that scope separately from an applicable symbol whose factor row contains a null score.
 
 ## 10. fundamentals_daily_refresh
