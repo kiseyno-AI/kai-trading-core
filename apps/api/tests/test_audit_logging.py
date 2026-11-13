@@ -112,6 +112,41 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event['request_headers']['x-request-id'], 'req-upstream-1')
         self.assertEqual(event['status_code'], 200)
 
+    async def test_kis_http_error_logs_provider_code_without_response_body(self):
+        body = {'rt_cd': '1', 'msg_cd': 'EGW00201', 'msg1': 'private response text'}
+        transport = httpx.MockTransport(lambda _: httpx.Response(500, json=body))
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await audit_logging.request_with_audit(
+                client, 'kis', 'GET', 'https://example.test/inquire-balance',
+            )
+
+        event = self._read_log_lines('upstream-http.log')[-1]
+        self.assertEqual(event['kis_msg_cd'], 'EGW00201')
+        self.assertNotIn('private response text', json.dumps(event))
+        self.assertEqual(response.json(), body)
+
+    async def test_upstream_audit_omits_untrusted_or_unrelated_kis_codes(self):
+        cases = (
+            ('kis', 500, b'not json'),
+            ('kis', 500, b'[]'),
+            ('kis', 500, b'{"msg_cd":"12345678"}'),
+            ('kis', 500, b'{"msg_cd":"SECR1234"}'),
+            ('kis', 200, b'{"msg_cd":"EGW00201"}'),
+            ('other', 500, b'{"msg_cd":"EGW00201"}'),
+        )
+        for service, status, body in cases:
+            with self.subTest(service=service, status=status, body=body):
+                transport = httpx.MockTransport(lambda _: httpx.Response(status, content=body))
+                async with httpx.AsyncClient(transport=transport) as client:
+                    response = await audit_logging.request_with_audit(
+                        client, service, 'GET', 'https://example.test/inquire-balance',
+                        headers={'Authorization': 'Bearer SECR1234'},
+                    )
+                event = self._read_log_lines('upstream-http.log')[-1]
+                self.assertNotIn('kis_msg_cd', event)
+                self.assertNotIn('SECR1234', json.dumps(event))
+                self.assertEqual(response.content, body)
+
     async def test_upstream_logging_redacts_secret_values_embedded_in_path(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={}, request=request)

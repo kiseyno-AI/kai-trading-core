@@ -435,6 +435,25 @@ async def request_with_audit(
             'error_type': type(error).__name__ if error else None,
             'error_message': _redact_secret_values(exception_message(error), secrets) if error else None,
         }
+        if (
+            settings.upstream_http_logging_enabled
+            and service == 'kis'
+            and response is not None
+            and response.status_code >= 400
+            and len(response.content) <= 16_384
+        ):
+            try:
+                error_body = response.json()
+            except (ValueError, RecursionError):
+                error_body = None
+            code = error_body.get('msg_cd') if isinstance(error_body, dict) else None
+            if (
+                isinstance(code, str)
+                and re.fullmatch(r'[A-Z]{3,4}[0-9]{4,5}', code)
+                and _redact_secret_values(code, secrets) == code
+                and code not in request.headers.get('authorization', '')
+            ):
+                payload['kis_msg_cd'] = code
         log_upstream_event(payload)
 
 
