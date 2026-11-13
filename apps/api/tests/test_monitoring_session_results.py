@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 import pandas as pd
@@ -61,6 +62,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(
         monitoring_session_history, 'monitoring_session_history', MonitoringSessionHistory(tmp_path / 'archive'),
     )
+    monkeypatch.setattr(monitoring_session_results, 'wait_paper_ledger', SimpleNamespace(dates=lambda: set(), history=lambda *args, **kwargs: []))
     app = FastAPI()
     app.include_router(router)
     return TestClient(app)
@@ -100,6 +102,7 @@ def test_session_close_compares_exact_krx_trading_dates(client, tracked_symbol):
     }]
     assert result['hypothetical_return'] == {
         'return_pct': None, 'included_symbol_count': 0, 'monitored_symbol_count': 1,
+        'method': 'legacy_trigger_to_mark_gross', 'deprecated': True,
     }
 
 
@@ -235,9 +238,9 @@ def test_hypothetical_return_uses_only_same_session_wait_plans(
     assert response.status_code == 200
     assert response.json()['hypothetical_return'] == {
         'return_pct': return_pct, 'included_symbol_count': 1, 'monitored_symbol_count': 1,
+        'method': 'legacy_trigger_to_mark_gross', 'deprecated': True,
     }
     assert 'fixture-private-account' not in response.text
-    assert 'quantity' not in response.text
 
 
 @pytest.mark.parametrize(('rejected_at', 'return_pct'), [
@@ -336,3 +339,143 @@ def test_unrecorded_session_does_not_invent_session_boundaries(client, monkeypat
     assert result['items'] == []
     assert result['session_open_at'] is None
     assert result['session_close_at'] is None
+
+
+def test_paper_ledger_summary_keeps_net_costs_roles_and_unknowns_separate(client, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    _set_clock(monkeypatch, '2026-11-06T15:31:00+09:00')
+    rows = [
+        {'symbol': SYMBOL, 'decision_agent_name': 'signal-decider', 'status': 'target_exited',
+         'coverage': 'complete', 'quantity': '2', 'filled_quantity': '2',
+         'realized_gross_pnl_krw': '1000', 'realized_net_pnl_krw': '959', 'cost_krw': '41'},
+        {'symbol': SYMBOL, 'decision_agent_name': 'short-term-decider', 'status': 'open',
+         'coverage': 'complete', 'quantity': '3', 'filled_quantity': '3',
+         'unrealized_gross_pnl_krw': '1500', 'unrealized_net_pnl_krw': '1438.5', 'cost_krw': '61.5'},
+        {'symbol': '987653', 'decision_agent_name': 'short-term-decider', 'status': 'unavailable',
+         'coverage': 'complete', 'missing_inputs': ['quantity'], 'quantity': None, 'filled_quantity': None,
+         'realized_gross_pnl_krw': None, 'realized_net_pnl_krw': None},
+        {'symbol': '987652', 'decision_agent_name': 'short-term-decider', 'status': 'open',
+         'coverage': 'incomplete', 'active_tracking': False, 'filled_quantity': '5',
+         'unrealized_gross_pnl_krw': '2000', 'unrealized_net_pnl_krw': '1900', 'cost_krw': '100'},
+    ]
+    cutoffs = []
+    def history(day, *, as_of, include_reconstruction=False):
+        assert include_reconstruction is True
+        assert day == TRADE_DATE
+        cutoffs.append(as_of)
+        return rows
+    monkeypatch.setattr(monitoring_session_results, 'wait_paper_ledger', SimpleNamespace(root=tmp_path, history=history), raising=False)
+    # The ledger can exist even when no monitoring archive or legacy WAIT record survived.
+    response = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()})
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result['paper_trades'] == rows
+    assert cutoffs == [datetime.fromisoformat('2026-11-06T15:30:00+09:00')]
+    overall = result['paper_summary']['overall']
+    assert overall['realized_gross_pnl_krw'] == '1000'
+    assert overall['realized_net_pnl_krw'] == '959'
+    assert overall['realized_cost_krw'] == '41'
+    assert overall['closed_quantity'] == '2'
+    assert overall['open_unrealized_gross_pnl_krw'] == '1500'
+    assert overall['open_unrealized_net_pnl_krw'] == '1438.5'
+    assert overall['incomplete_count'] == 2
+    assert overall['open_trade_count'] == 1
+    assert overall['unresolved_open_trade_count'] == 1
+    assert overall['open_quantity'] == '3'
+    assert overall['coverage'] == 'incomplete'
+    signal = result['paper_summary']['by_role']['signal-decider']
+    short = result['paper_summary']['by_role']['short-term-decider']
+    assert signal['realized_net_pnl_krw'] == '959'
+    assert short['realized_net_pnl_krw'] is None
+    assert short['closed_trade_count'] == 0
+    assert result['hypothetical_return']['deprecated'] is True
+    assert result['hypothetical_return']['method'] == 'legacy_trigger_to_mark_gross'
+    monkeypatch.setattr(wait_price_observations.wait_price_observations, 'paper_recording_error',
+                        'OSError: /private/ledger/write failed', raising=False)
+    degraded = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+    assert degraded['paper_recording_error'] == 'OSError'
+    assert degraded['paper_summary']['by_role']['signal-decider']['coverage'] == 'incomplete'
+    assert '/private/ledger' not in str(degraded)
+
+
+def test_session_reader_exposes_carried_exit_only_on_its_realization_day(client, monkeypatch, tmp_path):
+    from app.agent_context.wait_paper_ledger import WaitPaperLedger
+
+    ledger = WaitPaperLedger(tmp_path / 'paper')
+    entered = datetime.fromisoformat('2026-11-06T09:00:01+09:00')
+    exited = datetime.fromisoformat('2026-11-09T15:30:00+09:00')
+    watch = SimpleNamespace(
+        decision_snapshot_id=101, decision_agent_name='signal-decider', symbol=SYMBOL,
+        source_market_date=PREVIOUS_DATE.isoformat(), observed_at='2026-11-06T08:00:00+09:00',
+        trigger_price='100', target_price='110', stop_loss_price='90', quantity='2',
+        quantity_source='core_plan', round_trip_cost_bps='50', buy_direction='at_or_below',
+        chase_limit_price='103',
+    )
+    missing_quantity = SimpleNamespace(**{**vars(watch), 'decision_snapshot_id': 102, 'quantity': None})
+    ledger.configure(TRADE_DATE, [watch, missing_quantity], now=entered)
+    ledger.observe_trade(SYMBOL, Decimal('100'), price_as_of=entered, received_at=entered)
+    ledger.observe_trade(SYMBOL, Decimal('110'), price_as_of=exited, received_at=exited.replace(second=1))
+    monkeypatch.setattr(monitoring_session_results, 'wait_paper_ledger', ledger)
+    _set_clock(monkeypatch, '2026-11-09T16:00:00+09:00')
+
+    cohort = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+    assert cohort['paper_trades'][0]['status'] == 'open'
+    assert cohort['paper_summary']['overall']['realized_net_pnl_krw'] is None
+    assert cohort['paper_summary']['overall']['incomplete_count'] == 1
+    realized = client.get(RESULTS_PATH, params={'market_date': '2026-11-09'}).json()
+    assert realized['paper_trades'][0]['market_date'] == TRADE_DATE.isoformat()
+    assert ledger.history(date(2026, 11, 9), as_of=exited)[0]['status'] == 'open'
+    assert realized['paper_trades'][0]['status'] == 'target_exited'
+    assert realized['paper_trades'][0]['events'][-1]['retrospective'] is True
+    assert realized['paper_trades'][0]['events'][-1]['economic_cutoff'] == exited.isoformat()
+    assert Decimal(realized['paper_summary']['overall']['realized_net_pnl_krw']) == Decimal('18.95')
+    assert client.get(RESULTS_PATH).json()['market_date'] == '2026-11-09'
+
+
+def test_session_report_includes_later_published_no_exit_certificate_without_reactivating(client, monkeypatch, tmp_path):
+    from app.agent_context.wait_paper_ledger import WaitPaperLedger
+
+    ledger = WaitPaperLedger(tmp_path / 'paper')
+    entered = datetime.fromisoformat('2026-11-06T09:00:01+09:00')
+    close = datetime.fromisoformat('2026-11-06T15:30:00+09:00')
+    published = datetime.fromisoformat('2026-11-06T20:30:00+09:00')
+    watch = SimpleNamespace(
+        decision_snapshot_id=33922, decision_agent_name='signal-decider', symbol=SYMBOL,
+        source_market_date=PREVIOUS_DATE.isoformat(), observed_at='2026-11-06T08:00:00+09:00',
+        trigger_price='14230', target_price='16000', stop_loss_price='13000', quantity='6',
+        quantity_source='stored_plan', round_trip_cost_bps='50', buy_direction='at_or_below',
+        chase_limit_price='14500',
+    )
+    ledger.configure(TRADE_DATE, [watch], now=entered)
+    ledger.observe_trade(SYMBOL, Decimal('14230'), price_as_of=entered, received_at=entered)
+    ledger.mark_path_gap(TRADE_DATE, 33922, now=entered.replace(minute=1))
+    ledger.certify_no_exit(TRADE_DATE, 33922, price=Decimal('14690'), price_as_of=close,
+                           received_at=published, evidence={
+                               'retrospective': True, 'economic_cutoff': close.isoformat(),
+                               'published_at': published.isoformat(),
+                               'bars': [{'trade_date': TRADE_DATE.isoformat(), 'low': 14000, 'high': 15000}],
+                           })
+    monkeypatch.setattr(monitoring_session_results, 'wait_paper_ledger', ledger)
+    _set_clock(monkeypatch, '2026-11-09T16:00:00+09:00')
+
+    strict = ledger.history(TRADE_DATE, as_of=close)[0]
+    assert strict['coverage'] == 'incomplete'
+    assert strict['unrealized_net_pnl_krw'] is None
+    result = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+    row = result['paper_trades'][0]
+    assert row['active_tracking'] is False
+    assert row['coverage_basis'] == 'stored_daily_bounds_no_exit'
+    assert row['no_exit_certificate']['evidence']['published_at'] == published.isoformat()
+    summary = result['paper_summary']['overall']
+    assert summary['open_trade_count'] == 1
+    assert summary['unresolved_open_trade_count'] == 0
+    assert Decimal(summary['open_quantity']) == Decimal('6')
+    assert Decimal(summary['open_unrealized_gross_pnl_krw']) == Decimal('2760')
+    assert Decimal(summary['open_unrealized_net_pnl_krw']) == Decimal('2326.20')
+    assert summary['realized_net_pnl_krw'] is None
+    assert ledger.symbols(TRADE_DATE) == ()
+    future = client.get(RESULTS_PATH, params={'market_date': '2026-11-09'}).json()
+    assert future['paper_summary']['overall']['open_trade_count'] == 0
+    assert future['paper_summary']['overall']['open_unrealized_net_pnl_krw'] is None

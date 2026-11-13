@@ -23,6 +23,7 @@ from app.agent_context.decision_input_quality import build_decision_input_qualit
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_price_observations import (
     WaitPriceWatch,
+    hydrate_wait_paper_watches,
     wait_price_observations,
     watch_from_snapshot,
 )
@@ -7576,8 +7577,18 @@ class SignalDeciderExecIntegrationService:
                     }
                 for index, watch in enumerate(recovery):
                     current = enriched.get(watch.decision_snapshot_id)
-                    if current is not None and replace(current, buy_direction=None, chase_limit_price=None) == watch:
-                        recovery[index] = current
+                    if current is not None and all(
+                        getattr(current, field) == getattr(watch, field)
+                        for field in (
+                            'decision_snapshot_id', 'decision_agent_name', 'symbol',
+                            'source_market_date', 'observed_at', 'trigger_price',
+                        )
+                    ):
+                        recovery[index] = replace(
+                            watch, buy_direction=current.buy_direction,
+                            chase_limit_price=current.chase_limit_price,
+                            target_price=current.target_price, stop_loss_price=current.stop_loss_price,
+                        )
             except Exception:
                 logger.exception('Could not recover the buy conditions for enrolled WAIT decisions')
         try:
@@ -7616,10 +7627,18 @@ class SignalDeciderExecIntegrationService:
         closed_ids = signal_decider_execution_outcome_service.closed_snapshot_ids(
             decision_snapshot_ids=list(observations), target_trade_date=target_trade_date,
         )
-        return [
+        remaining = [
             observation for snapshot_id, observation in observations.items()
             if snapshot_id not in closed_ids
         ]
+        try:
+            return [asdict(watch) for watch in hydrate_wait_paper_watches(
+                target_trade_date, [WaitPriceWatch(**row) for row in remaining], now=_utcnow(),
+                allow_reference_quantity=True,
+            )]
+        except Exception:
+            logger.warning('Could not load stored WAIT paper sizing', exc_info=True)
+            return remaining
 
     async def _build_and_cache_runtime_symbol_detail(
         self,

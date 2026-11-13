@@ -13722,6 +13722,91 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail['items'][0]['status'], 'filled')
         self.assertEqual(detail['items'][0]['remote_state']['derived_status'], 'open')
 
+    def test_passive_wait_paper_sizing_reads_frozen_core_quantity_for_low_confidence(self) -> None:
+        known = datetime(2026, 4, 29, 7, tzinfo=timezone.utc)
+        with session_scope() as session:
+            snapshot = session.get(SignalDeciderDecisionSnapshot, self.snapshot_id)
+            snapshot.symbol = '005930'
+            snapshot.created_at = known
+            snapshot.feedback_received_at = known
+            snapshot.decision_action = snapshot.next_day_open_action = 'wait'
+            snapshot.confidence_score_10 = Decimal('4')
+            snapshot.response_payload = {'trigger_price': '50000'}
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.symbol = '005930'
+            row.created_at = row.updated_at = known
+            row.planned_quantity = Decimal('20')
+            row.submission_payload = {'core_quantity_sizing': {'initial_policy': {
+                'type': 'core_sized', 'target_quantity': 3, 'calculated_at': known.isoformat(),
+                'sizing_inputs': {'round_trip_cost_bps': '50'},
+            }}}
+            session.flush()
+            session.expunge(snapshot)
+
+        statements = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _many):
+            if 'FROM signal_decider_execution_plan_items' in statement:
+                statements.append(statement)
+
+        event.listen(engine, 'before_cursor_execute', record)
+        try:
+            with (
+                patch.object(signal_decider_next_open_execution_service, '_load_latest_snapshot_generation_state',
+                             return_value={'snapshots': [snapshot]}),
+                patch('app.orders.exec_integration.wait_price_observations.recovery_watches', return_value=[]),
+            ):
+                observations = SignalDeciderExecIntegrationService._load_passive_signal_wait_observations(
+                    source_market_date=self.market_date, target_trade_date=self.target_trade_date,
+                )
+        finally:
+            event.remove(engine, 'before_cursor_execute', record)
+        self.assertEqual(len(statements), 1)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]['quantity'], '3')
+        self.assertEqual(observations[0]['quantity_source'], 'core_frozen_quantity')
+        self.assertEqual(observations[0]['quantity_account_count'], 1)
+        self.assertEqual(observations[0]['target_price'], '54000')
+        self.assertEqual(observations[0]['stop_loss_price'], '47000')
+
+        legacy = WaitPriceWatch(
+            self.snapshot_id, 'signal-decider', '005930', self.market_date.isoformat(),
+            known.isoformat(), '50000',
+        )
+        with (
+            patch.object(signal_decider_next_open_execution_service, '_load_latest_snapshot_generation_state',
+                         return_value={'snapshots': []}),
+            patch('app.orders.exec_integration.wait_price_observations.recovery_watches', return_value=[legacy]),
+        ):
+            recovered = SignalDeciderExecIntegrationService._load_passive_signal_wait_observations(
+                source_market_date=self.market_date, target_trade_date=self.target_trade_date,
+            )
+        self.assertEqual(recovered[0]['buy_direction'], 'at_or_below')
+
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            row.planned_quantity = None
+            row.submission_payload = None
+            row.eligibility_status = 'blocked'
+            row.updated_at = known + timedelta(seconds=1)
+        with (
+            patch.object(signal_decider_next_open_execution_service, '_load_latest_snapshot_generation_state',
+                         return_value={'snapshots': [snapshot]}),
+            patch('app.orders.exec_integration.wait_price_observations.recovery_watches', return_value=[]),
+        ):
+            modeled = SignalDeciderExecIntegrationService._load_passive_signal_wait_observations(
+                source_market_date=self.market_date, target_trade_date=self.target_trade_date,
+            )
+        self.assertEqual(modeled[0]['quantity'], '7')
+        self.assertEqual(modeled[0]['quantity_source'], 'paper_budget_risk_reference_v1')
+        self.assertEqual(modeled[0]['confidence_score_10'], '4')
+        self.assertEqual(modeled[0]['quantity_basis']['accounts'][0]['allocation_budget_krw'], '1500000.00')
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, self.plan_item_id)
+            self.assertIsNone(row.planned_quantity)
+            self.assertEqual(row.planned_side, 'buy')
+            self.assertEqual(row.eligibility_status, 'blocked')
+
     def test_passive_wait_observations_keep_both_deciders_for_the_same_symbol(self) -> None:
         def snapshot(
             *,
@@ -13815,6 +13900,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'trigger_price': '1300',
                     'buy_direction': 'at_or_below',
                     'chase_limit_price': None,
+                    'target_price': None, 'stop_loss_price': None, 'quantity': None,
+                    'quantity_source': None, 'round_trip_cost_bps': None,
+                    'quantity_account_count': None, 'cost_source': None,
+                    'quantity_basis': None, 'confidence_score_10': None,
                 },
                 {
                     'symbol': '032080',
@@ -13825,6 +13914,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'trigger_price': '1500',
                     'buy_direction': 'at_or_below',
                     'chase_limit_price': None,
+                    'target_price': None, 'stop_loss_price': None, 'quantity': None,
+                    'quantity_source': None, 'round_trip_cost_bps': None,
+                    'quantity_account_count': None, 'cost_source': None,
+                    'quantity_basis': None, 'confidence_score_10': None,
                 },
                 {
                     'symbol': '005930',
@@ -13835,6 +13928,10 @@ class ExecIntegrationServiceTests(unittest.IsolatedAsyncioTestCase):
                     'trigger_price': None,
                     'buy_direction': 'at_or_below',
                     'chase_limit_price': None,
+                    'target_price': None, 'stop_loss_price': None, 'quantity': None,
+                    'quantity_source': None, 'round_trip_cost_bps': None,
+                    'quantity_account_count': None, 'cost_source': None,
+                    'quantity_basis': None, 'confidence_score_10': None,
                 },
             ],
         )
