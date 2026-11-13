@@ -23,7 +23,7 @@ Source paths are under `apps/api/app/`. News, macro and intraday snapshots are o
 ## 24. intraday_snapshots
 
 - **Input and output** — Strategy-eligible symbols and optional KIS program/investor context. Writes `kis_intraday_snapshots`. This is distinct from mandatory `market_risk_snapshots`.
-- **Completion and blocking** — An empty successful response is recorded as empty without retry. Keep provider and malformed-payload errors separate. The default follow-up can make optional degradation terminal for the daily chain. Disabled, non-trading-day and definitive no-eligible-symbol cases can be safe skips.
+- **Completion and blocking** — An empty successful response is recorded as empty without retry. Each per-symbol quote, orderbook, program, investor-estimate and optional news GET retries only its own transient failure, at most four attempts with 1/2/4-second backoff. Successful surfaces remain unchanged. Timeouts, transport errors, HTTP 408/429/5xx and KIS `EGW00201` qualify; authentication and other business errors remain terminal. Exhaustion retains the provider error and partial snapshot. Shared ranking reads keep their separate collection behavior. The default follow-up can make optional degradation terminal for the daily chain. Disabled, non-trading-day and definitive no-eligible-symbol cases can be safe skips.
 - **Trace** — `market/kis_intraday_snapshots.py`, `eod/pykrx_pipeline_runner.py::_terminalize_optional_intraday_snapshot_result` and `GET /broker/kis/intraday-snapshots`.
 
 ## 25. agent_feedback_summaries
