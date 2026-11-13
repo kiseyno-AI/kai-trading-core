@@ -3,6 +3,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -341,3 +342,76 @@ def test_unknown_quantity_condition_visible_at_historical_cutoff_without_later_r
     assert at_close['recovery_evidence']['quantity_status'] == 'unknown'
     assert len(at_close['recovery_evidence']['observed_entry_conditions']) == 1
     assert at_close['recovery_evidence']['observed_entry_conditions'][0]['source'] == 'wait_touch'
+
+
+@pytest.mark.parametrize('bar_case', ['complete', 'missing_session', 'both_bounds_hit', 'partial_session'])
+def test_complete_daily_bounds_prove_no_exit_and_exact_close_mark_only_when_every_session_is_inside(tmp_path, bar_case):
+    folder, watch = recorded_watch(tmp_path)
+    path = folder / '1.watch.json'
+    raw = json.loads(path.read_text())
+    raw['trigger_price'] = '14230'
+    path.write_text(json.dumps(raw))
+    watch = replace(
+        watch, trigger_price='14230', chase_limit_price='14400', target_price='15600',
+        stop_loss_price='13790', quantity='69', round_trip_cost_bps='50', buy_direction='at_or_above',
+    )
+    moment = '2026-11-11T00:00:40+00:00'
+    (folder / '1.ask-entry.json').write_text(json.dumps({
+        'ask_price': '14230', 'ask_size': 6, 'within_chase_limit': True,
+        'price_as_of': moment, 'price_received_at': '2026-11-11T00:00:42+00:00',
+    }))
+    bars = [
+        {'id': 8574344, 'symbol': '130580', 'trade_date': '2026-11-11',
+         'open_price': 14230, 'high_price': 15000, 'low_price': 14020, 'close_price': 14320,
+         'source': 'pykrx', 'complete': True, 'published_at': '2026-11-11T07:00:00+00:00'},
+        {'id': 8577114, 'symbol': '130580', 'trade_date': '2026-11-12',
+         'open_price': 14500, 'high_price': 15000, 'low_price': 14450, 'close_price': 14690,
+         'source': 'pykrx', 'complete': True, 'published_at': '2026-11-12T12:09:43+00:00'},
+    ]
+    if bar_case == 'missing_session':
+        bars.pop()
+    elif bar_case == 'both_bounds_hit':
+        bars[1].update(high_price=16000, low_price=13000)
+    elif bar_case == 'partial_session':
+        bars[1]['complete'] = False
+
+    result = recover_market_date(
+        date(2026, 11, 11), observation_root=folder.parent, ledger_root=tmp_path / 'ledger',
+        watches=[watch], daily_bars=bars, recovery_cutoff=date(2026, 11, 12), apply=True,
+    )
+
+    item = result['items'][0]
+    assert item['entry']['quantity'] == '6'
+    assert item['status'] == 'open'
+    assert item['exit'] is None
+    assert item['realized_gross_pnl_krw'] is None
+    if bar_case == 'complete':
+        assert item['coverage_basis'] == 'stored_daily_bounds_no_exit'
+        assert item['coverage'] == 'complete'
+        assert item['unrealized_gross_pnl_krw'] == '2760'
+        assert Decimal(item['unrealized_net_pnl_krw']) == Decimal('2326.20')
+        assert item['last_event']['source'] == 'stored_daily_close'
+        assert result['unknown_exit_count'] == 0
+        assert result['daily_bounds_confirmed_open_count'] == 1
+        from app.agent_context.wait_paper_ledger import WaitPaperLedger
+
+        ledger = WaitPaperLedger(tmp_path / 'ledger')
+        first_close = datetime(2026, 11, 11, 6, 30, tzinfo=timezone.utc)
+        second_close = datetime(2026, 11, 12, 6, 30, tzinfo=timezone.utc)
+        first = ledger.history(date(2026, 11, 11), as_of=first_close, include_reconstruction=True)[0]
+        strict = ledger.history(date(2026, 11, 11), as_of=second_close)[0]
+        future = ledger.history(date(2026, 11, 11), as_of=datetime(2026, 11, 13, 0, 1, tzinfo=timezone.utc), include_reconstruction=True)[0]
+        assert first['last_event']['price'] == '14320'
+        assert first['unrealized_gross_pnl_krw'] == '540'
+        assert strict['unrealized_gross_pnl_krw'] is None
+        assert future['unrealized_gross_pnl_krw'] is None
+        before = {str(path): path.read_bytes() for path in (tmp_path / 'ledger').rglob('*') if path.is_file()}
+        recover_market_date(
+            date(2026, 11, 11), observation_root=folder.parent, ledger_root=tmp_path / 'ledger',
+            watches=[watch], daily_bars=bars, recovery_cutoff=date(2026, 11, 12), apply=True,
+        )
+        assert {str(path): path.read_bytes() for path in (tmp_path / 'ledger').rglob('*') if path.is_file()} == before
+    else:
+        assert item['coverage'] == 'incomplete'
+        assert item['unrealized_gross_pnl_krw'] is None
+        assert result['unknown_exit_count'] == 1

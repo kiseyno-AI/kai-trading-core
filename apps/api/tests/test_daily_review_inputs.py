@@ -446,3 +446,42 @@ def test_review_consumes_paper_ledger_with_cutoff_without_claiming_actual_fills(
     degraded = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
     assert degraded['coverage']['paper_execution']['recording_error'] == 'OSError'
     assert degraded['roles']['signal-decider']['source_status']['paper_execution'] == 'incomplete'
+
+
+def test_daily_review_never_uses_later_published_no_exit_reconstruction(tmp_path, monkeypatch, review_db):
+    from types import SimpleNamespace
+    from app.agent_context.wait_paper_ledger import WaitPaperLedger
+
+    day = date(2026, 11, 10)
+    entered = datetime(2026, 11, 10, 9, tzinfo=KST)
+    cutoff = datetime(2026, 11, 10, 16, 30, tzinfo=KST)
+    close = cutoff.replace(hour=15, minute=30)
+    published = cutoff.replace(hour=20, minute=30)
+    ledger = WaitPaperLedger(tmp_path / 'paper')
+    watch = SimpleNamespace(
+        decision_snapshot_id=33922, decision_agent_name='signal-decider', symbol='005930',
+        source_market_date='2026-11-09', observed_at=entered.isoformat(),
+        trigger_price='14230', target_price='16000', stop_loss_price='13000', quantity='6',
+        quantity_source='stored_plan', round_trip_cost_bps='50', buy_direction='at_or_below',
+        chase_limit_price='14500',
+    )
+    ledger.configure(day, [watch], now=entered)
+    ledger.observe_trade('005930', Decimal('14230'), price_as_of=entered, received_at=entered)
+    ledger.mark_path_gap(day, 33922, now=entered.replace(minute=1))
+    ledger.certify_no_exit(day, 33922, price=Decimal('14690'), price_as_of=close,
+                           received_at=published, evidence={
+                               'retrospective': True, 'economic_cutoff': close.isoformat(),
+                               'published_at': published.isoformat(),
+                           })
+    monkeypatch.setattr(daily_review_inputs, 'wait_paper_ledger', ledger)
+    monkeypatch.setattr(daily_review_inputs, 'wait_price_observations', WaitPriceObservations(tmp_path / 'watches'))
+
+    review = daily_review_inputs.load_daily_review_evidence(day, observed_at=cutoff, store=SideAgentStore(tmp_path))
+
+    signal = review['roles']['signal-decider']
+    assert signal['source_status']['paper_execution'] == 'incomplete'
+    assert signal['paper_summary']['open_trade_count'] == 0
+    assert signal['paper_summary']['unresolved_open_trade_count'] == 1
+    assert signal['paper_summary']['open_unrealized_net_pnl_krw'] is None
+    assert signal['paper_trades'][0].get('no_exit_certificate') is None
+    assert signal['actual_entry_fill_count'] == 0

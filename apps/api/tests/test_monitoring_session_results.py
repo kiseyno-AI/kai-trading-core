@@ -360,7 +360,8 @@ def test_paper_ledger_summary_keeps_net_costs_roles_and_unknowns_separate(client
          'unrealized_gross_pnl_krw': '2000', 'unrealized_net_pnl_krw': '1900', 'cost_krw': '100'},
     ]
     cutoffs = []
-    def history(day, *, as_of):
+    def history(day, *, as_of, include_reconstruction=False):
+        assert include_reconstruction is True
         assert day == TRADE_DATE
         cutoffs.append(as_of)
         return rows
@@ -404,7 +405,7 @@ def test_session_reader_exposes_carried_exit_only_on_its_realization_day(client,
 
     ledger = WaitPaperLedger(tmp_path / 'paper')
     entered = datetime.fromisoformat('2026-11-06T09:00:01+09:00')
-    exited = datetime.fromisoformat('2026-11-09T09:01:00+09:00')
+    exited = datetime.fromisoformat('2026-11-09T15:30:00+09:00')
     watch = SimpleNamespace(
         decision_snapshot_id=101, decision_agent_name='signal-decider', symbol=SYMBOL,
         source_market_date=PREVIOUS_DATE.isoformat(), observed_at='2026-11-06T08:00:00+09:00',
@@ -415,7 +416,7 @@ def test_session_reader_exposes_carried_exit_only_on_its_realization_day(client,
     missing_quantity = SimpleNamespace(**{**vars(watch), 'decision_snapshot_id': 102, 'quantity': None})
     ledger.configure(TRADE_DATE, [watch, missing_quantity], now=entered)
     ledger.observe_trade(SYMBOL, Decimal('100'), price_as_of=entered, received_at=entered)
-    ledger.observe_trade(SYMBOL, Decimal('110'), price_as_of=exited, received_at=exited)
+    ledger.observe_trade(SYMBOL, Decimal('110'), price_as_of=exited, received_at=exited.replace(second=1))
     monkeypatch.setattr(monitoring_session_results, 'wait_paper_ledger', ledger)
     _set_clock(monkeypatch, '2026-11-09T16:00:00+09:00')
 
@@ -425,6 +426,56 @@ def test_session_reader_exposes_carried_exit_only_on_its_realization_day(client,
     assert cohort['paper_summary']['overall']['incomplete_count'] == 1
     realized = client.get(RESULTS_PATH, params={'market_date': '2026-11-09'}).json()
     assert realized['paper_trades'][0]['market_date'] == TRADE_DATE.isoformat()
+    assert ledger.history(date(2026, 11, 9), as_of=exited)[0]['status'] == 'open'
     assert realized['paper_trades'][0]['status'] == 'target_exited'
+    assert realized['paper_trades'][0]['events'][-1]['retrospective'] is True
+    assert realized['paper_trades'][0]['events'][-1]['economic_cutoff'] == exited.isoformat()
     assert Decimal(realized['paper_summary']['overall']['realized_net_pnl_krw']) == Decimal('18.95')
     assert client.get(RESULTS_PATH).json()['market_date'] == '2026-11-09'
+
+
+def test_session_report_includes_later_published_no_exit_certificate_without_reactivating(client, monkeypatch, tmp_path):
+    from app.agent_context.wait_paper_ledger import WaitPaperLedger
+
+    ledger = WaitPaperLedger(tmp_path / 'paper')
+    entered = datetime.fromisoformat('2026-11-06T09:00:01+09:00')
+    close = datetime.fromisoformat('2026-11-06T15:30:00+09:00')
+    published = datetime.fromisoformat('2026-11-06T20:30:00+09:00')
+    watch = SimpleNamespace(
+        decision_snapshot_id=33922, decision_agent_name='signal-decider', symbol=SYMBOL,
+        source_market_date=PREVIOUS_DATE.isoformat(), observed_at='2026-11-06T08:00:00+09:00',
+        trigger_price='14230', target_price='16000', stop_loss_price='13000', quantity='6',
+        quantity_source='stored_plan', round_trip_cost_bps='50', buy_direction='at_or_below',
+        chase_limit_price='14500',
+    )
+    ledger.configure(TRADE_DATE, [watch], now=entered)
+    ledger.observe_trade(SYMBOL, Decimal('14230'), price_as_of=entered, received_at=entered)
+    ledger.mark_path_gap(TRADE_DATE, 33922, now=entered.replace(minute=1))
+    ledger.certify_no_exit(TRADE_DATE, 33922, price=Decimal('14690'), price_as_of=close,
+                           received_at=published, evidence={
+                               'retrospective': True, 'economic_cutoff': close.isoformat(),
+                               'published_at': published.isoformat(),
+                               'bars': [{'trade_date': TRADE_DATE.isoformat(), 'low': 14000, 'high': 15000}],
+                           })
+    monkeypatch.setattr(monitoring_session_results, 'wait_paper_ledger', ledger)
+    _set_clock(monkeypatch, '2026-11-09T16:00:00+09:00')
+
+    strict = ledger.history(TRADE_DATE, as_of=close)[0]
+    assert strict['coverage'] == 'incomplete'
+    assert strict['unrealized_net_pnl_krw'] is None
+    result = client.get(RESULTS_PATH, params={'market_date': TRADE_DATE.isoformat()}).json()
+    row = result['paper_trades'][0]
+    assert row['active_tracking'] is False
+    assert row['coverage_basis'] == 'stored_daily_bounds_no_exit'
+    assert row['no_exit_certificate']['evidence']['published_at'] == published.isoformat()
+    summary = result['paper_summary']['overall']
+    assert summary['open_trade_count'] == 1
+    assert summary['unresolved_open_trade_count'] == 0
+    assert Decimal(summary['open_quantity']) == Decimal('6')
+    assert Decimal(summary['open_unrealized_gross_pnl_krw']) == Decimal('2760')
+    assert Decimal(summary['open_unrealized_net_pnl_krw']) == Decimal('2326.20')
+    assert summary['realized_net_pnl_krw'] is None
+    assert ledger.symbols(TRADE_DATE) == ()
+    future = client.get(RESULTS_PATH, params={'market_date': '2026-11-09'}).json()
+    assert future['paper_summary']['overall']['open_trade_count'] == 0
+    assert future['paper_summary']['overall']['open_unrealized_net_pnl_krw'] is None

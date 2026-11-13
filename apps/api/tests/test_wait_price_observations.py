@@ -178,6 +178,39 @@ def test_live_trade_packet_prefers_timestamped_ask_entry_and_bid_exit(tmp_path, 
     assert closed['realized_gross_pnl_krw'] == '24'
 
 
+@pytest.mark.parametrize(('price', 'bid', 'ask', 'status'), [
+    ('112', '111', '113', 'target_exited'), ('89', '88', '90', 'stop_exited'),
+])
+def test_trade_packet_exits_open_paper_when_same_packet_bid_depth_is_insufficient(
+    tmp_path, monkeypatch, price, bid, ask, status,
+):
+    opened = datetime(2026, 11, 10, 0, tzinfo=timezone.utc)
+    observer = WaitPriceObservations(tmp_path)
+    observer.configure(opened.date(), [wait_price_observations.WaitPriceWatch(
+        91, 'signal-decider', '005930', '2026-11-09', opened.isoformat(), '100',
+        buy_direction='at_or_below', chase_limit_price='103', target_price='110', stop_loss_price='90',
+        quantity='5', quantity_source='stored_planned_quantity', round_trip_cost_bps='50',
+    )], now=opened)
+    monkeypatch.setattr(wait_price_observations, 'wait_price_observations', observer)
+    prices = KISRealtimePriceService()
+    for second, trade, packet_bid, packet_ask, size in [
+        (1, '100', '98', '99', '5'), (2, price, bid, ask, '1'),
+    ]:
+        fields = {
+            'MKSC_SHRN_ISCD': '005930', 'STCK_PRPR': trade, 'BSOP_DATE': '20261110',
+            'STCK_CNTG_HOUR': f'09000{second}', 'BIDP1': packet_bid, 'ASKP1': packet_ask,
+            'ASKP_RSQN1': size, 'BIDP_RSQN1': size,
+        }
+        message = '0|H0STCNT0|001|' + '^'.join(fields.get(key, '') for key in KIS_REALTIME_PRICE_COLUMNS)
+        prices.ingest_price_message(message, received_at=opened + timedelta(seconds=second))
+    closed = observer.paper_ledger.history(opened.date())[0]
+    assert closed['entry']['price'] == '99'
+    assert closed['filled_quantity'] == '5'
+    assert closed['status'] == status
+    assert closed['exit']['source'] == 'kis_trade'
+    assert closed['exit']['price'] == price
+
+
 def test_paper_write_failure_does_not_block_price_ingestion_or_raw_touch(tmp_path, monkeypatch):
     from unittest.mock import Mock
 

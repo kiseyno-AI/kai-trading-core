@@ -74,6 +74,18 @@ def test_hot_path_marks_coalesced_but_exit_immediate_and_terminal_immutable(tmp_
     assert ledger.history(DAY)[0]['status'] == 'target_exited'
 
 
+def test_rejected_ask_entry_band_does_not_force_repeated_durable_marks(tmp_path):
+    ledger = WaitPaperLedger(tmp_path)
+    ledger.configure(DAY, [watch()], now=OPEN)
+    for second in range(1, 51):
+        now = OPEN+timedelta(seconds=second)
+        ledger.observe_ask('130580', Decimal('80'), 10, price_as_of=now, received_at=now, source='kis_ask')
+    row = ledger.history(DAY)[0]
+    assert row['status'] == 'pending'
+    assert row['entry'] is None
+    assert len(row['events']) == 1
+
+
 def test_restart_open_is_unknown_and_asof_does_not_leak_gap(tmp_path):
     ledger = WaitPaperLedger(tmp_path)
     ledger.configure(DAY, [watch()], now=OPEN)
@@ -204,6 +216,101 @@ def test_recovery_annotation_preserves_unknown_quantity_and_is_idempotent(tmp_pa
     dry.annotate_recovery(DAY, 1, now=OPEN+timedelta(seconds=3), evidence={'quantity_status': 'still_unknown'})
     assert dry.history(DAY)[0]['recovery_evidence']['quantity_status'] == 'still_unknown'
     assert path.read_bytes() == saved
+
+
+def test_equal_time_channels_and_later_receipt_same_second_can_exit(tmp_path):
+    ledger = WaitPaperLedger(tmp_path)
+    ledger.configure(DAY, [watch()], now=OPEN)
+    trade(ledger, 1, '100')
+    now = OPEN+timedelta(seconds=2)
+    ledger.observe_bid('130580', Decimal('110'), 1, price_as_of=now, received_at=now, source='kis_bid')
+    ledger.observe_trade('130580', Decimal('110'), price_as_of=now, received_at=now)
+    assert ledger.history(DAY)[0]['status'] == 'target_exited'
+
+    other = WaitPaperLedger(tmp_path / 'other')
+    other.configure(DAY, [watch()], now=OPEN)
+    trade(other, 1, '100')
+    other.observe_trade('130580', Decimal('101'), price_as_of=now, received_at=now)
+    other.observe_trade('130580', Decimal('110'), price_as_of=now, received_at=now+timedelta(milliseconds=100))
+    assert other.history(DAY)[0]['status'] == 'target_exited'
+
+
+def test_equal_time_trade_does_not_mask_bid_but_entry_packet_cannot_exit(tmp_path):
+    ledger = WaitPaperLedger(tmp_path)
+    ledger.configure(DAY, [watch()], now=OPEN)
+    trade(ledger, 1, '100')
+    now = OPEN+timedelta(seconds=2)
+    ledger.observe_trade('130580', Decimal('101'), price_as_of=now, received_at=now)
+    ledger.observe_bid('130580', Decimal('110'), 10, price_as_of=now, received_at=now, source='kis_bid')
+    assert ledger.history(DAY)[0]['status'] == 'target_exited'
+
+    other = WaitPaperLedger(tmp_path / 'other')
+    other.configure(DAY, [watch()], now=OPEN)
+    other.observe_ask('130580', Decimal('100'), 10, price_as_of=now, received_at=now, source='kis_ask')
+    other.observe_bid('130580', Decimal('90'), 10, price_as_of=now, received_at=now, source='kis_bid')
+    other.observe_trade('130580', Decimal('110'), price_as_of=now, received_at=now)
+    assert other.history(DAY)[0]['status'] == 'open'
+
+
+def test_daily_bounds_certifies_historical_open_valuation_only(tmp_path):
+    ledger = WaitPaperLedger(tmp_path)
+    ledger.configure(DAY, [watch(quantity='6', trigger_price='14230', chase_limit_price='14300', target_price='16000', stop_loss_price='13000')], now=OPEN)
+    ledger.mark_path_gap(DAY, 1, now=OPEN)
+    trade(ledger, 1, '14230')
+    close = OPEN+timedelta(hours=6, minutes=30)
+    evidence = {'sessions': [{'market_date': DAY.isoformat(), 'low': '14000', 'high': '15000'}], 'reconstruction_created_at': (close+timedelta(days=1)).isoformat()}
+    ledger.certify_no_exit(DAY, 1, price=Decimal('14690'), price_as_of=close, received_at=close, evidence=evidence)
+    row = ledger.history(DAY)[0]
+    assert row['status'] == 'open'
+    assert row['coverage'] == 'complete'
+    assert row['coverage_basis'] == 'stored_daily_bounds_no_exit'
+    assert row['coverage_through'] == close.isoformat()
+    assert row['active_tracking'] is False
+    assert row['realized_net_pnl_krw'] is None
+    assert Decimal(row['unrealized_gross_pnl_krw']) == Decimal('2760')
+    assert Decimal(row['unrealized_net_pnl_krw']) == Decimal('2326.20')
+    before = (tmp_path / DAY.isoformat() / '1.json').read_bytes()
+    ledger.certify_no_exit(DAY, 1, price=Decimal('14690'), price_as_of=close, received_at=close, evidence=evidence)
+    assert (tmp_path / DAY.isoformat() / '1.json').read_bytes() == before
+    assert ledger.history(DAY, as_of=OPEN+timedelta(seconds=1))[0]['coverage'] == 'incomplete'
+
+
+def test_historical_certificate_respects_publication_time_and_proof_horizon(tmp_path):
+    ledger = WaitPaperLedger(tmp_path)
+    ledger.configure(DAY, [watch()], now=OPEN)
+    ledger.mark_path_gap(DAY, 1, now=OPEN)
+    trade(ledger, 1, '100')
+    close = OPEN+timedelta(hours=6, minutes=30)
+    published = close+timedelta(hours=5)
+    evidence = {'sessions': [{'market_date': DAY.isoformat(), 'low': '95', 'high': '105'}], 'reconstructed_at': published.isoformat()}
+    ledger.certify_no_exit(DAY, 1, price=Decimal('105'), price_as_of=close, received_at=published, evidence=evidence)
+    assert ledger.history(DAY, as_of=close)[0]['unrealized_net_pnl_krw'] is None
+    reconstructed = ledger.history(DAY, as_of=close, include_reconstruction=True)[0]
+    assert reconstructed['coverage'] == 'complete'
+    assert Decimal(reconstructed['unrealized_net_pnl_krw']) == Decimal('44.875')
+    assert ledger.history(DAY, as_of=published)[0]['coverage'] == 'complete'
+    following = ledger.history(DAY+timedelta(days=1), include_reconstruction=True)[0]
+    assert following['coverage'] == 'incomplete'
+    assert following['unrealized_net_pnl_krw'] is None
+    path = tmp_path / DAY.isoformat() / '1.json'
+    before = path.read_bytes()
+    ledger.certify_no_exit(DAY, 1, price=Decimal('105'), price_as_of=close, received_at=published,
+                           evidence={**evidence, 'reconstructed_at': (published+timedelta(days=1)).isoformat()})
+    assert path.read_bytes() == before
+
+
+def test_retrospective_close_includes_valid_delayed_auction_receipt_only(tmp_path):
+    ledger = WaitPaperLedger(tmp_path)
+    ledger.configure(DAY, [watch()], now=OPEN)
+    trade(ledger, 1, '100')
+    close = OPEN+timedelta(hours=6, minutes=30)
+    ledger.observe_trade('130580', Decimal('110'), price_as_of=close, received_at=close+timedelta(seconds=1))
+    assert ledger.history(DAY, as_of=close)[0]['status'] == 'open'
+    reconstructed = ledger.history(DAY, as_of=close, include_reconstruction=True)[0]
+    assert reconstructed['status'] == 'target_exited'
+    assert reconstructed['retrospective'] is True
+    assert reconstructed['events'][-1]['economic_cutoff'] == close.isoformat()
+    assert ledger.history(DAY, as_of=close-timedelta(seconds=1), include_reconstruction=True)[0]['status'] == 'open'
 
 
 def test_bid_depth_must_cover_exit_and_ask_cannot_hide_trade_exit(tmp_path):

@@ -70,7 +70,9 @@ def summarize_wait_paper_trades(
     def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         closed = [row for row in rows if row['status'] in {'target_exited', 'stop_exited'}]
         opened = [row for row in rows if row['status'] == 'open'
-                  and row.get('coverage') == 'complete' and row.get('active_tracking') is not False]
+                  and row.get('coverage') == 'complete'
+                  and (row.get('active_tracking') is not False
+                       or row.get('coverage_basis') == 'stored_daily_bounds_no_exit')]
         unresolved = sum(row['status'] == 'open' for row in rows) - len(opened)
 
         def total(items: list[dict[str, Any]], key: str) -> str | None:
@@ -135,7 +137,7 @@ def read_monitoring_session_results(market_date: date | None = None) -> Monitori
             for symbol, quote in monitoring_session_history.monitoring_session_history.read(day).items()
         }
         waits = wait_price_observations.wait_price_observations.history(day, as_of=as_of)
-        paper_trades = wait_paper_ledger.history(day, as_of=as_of)
+        paper_trades = wait_paper_ledger.history(day, as_of=as_of, include_reconstruction=True)
         for trade in paper_trades:
             if is_canonical_krx_short_code(trade['symbol']):
                 quotes.setdefault(trade['symbol'], None)

@@ -43,6 +43,42 @@ def _moment(value: str) -> datetime:
     return result
 
 
+def _event_order(event: dict) -> tuple[datetime, datetime]:
+    return _moment(event['price_as_of']), _moment(event['price_received_at'])
+
+
+def _merge_observations(row: dict, cached: dict) -> None:
+    if row['status'] != cached['status']:
+        return
+    for field in ('last_event', 'previous_trade'):
+        old, new = cached.get(field), row.get(field)
+        if old and (not new or _event_order(old) > _event_order(new)):
+            row[field] = old
+    channels = row.setdefault('channel_events', {})
+    for channel, event in cached.get('channel_events', {}).items():
+        if channel not in channels or _event_order(event) > _event_order(channels[channel]):
+            channels[channel] = event
+
+
+def _new_observation(row: dict, kind: str, price_as_of: datetime, received_at: datetime) -> bool:
+    last = row['last_event']
+    if last and (price_as_of < _moment(last['price_as_of']) or received_at < _moment(last['price_received_at'])):
+        return False
+    channel = row.get('channel_events', {}).get(kind)
+    if channel and (price_as_of, received_at) <= _event_order(channel):
+        return False
+    return not (row['status'] == 'open' and (price_as_of, received_at) <= _event_order(row['entry']))
+
+
+def _same_certificate(previous: dict | None, current: dict) -> bool:
+    if previous is None:
+        return False
+    def stable(value):
+        return {key: item for key, item in value.items()
+                if key not in {'reconstruction_created_at', 'reconstructed_at'}}
+    return {**previous, 'evidence': stable(previous['evidence'])} == {**current, 'evidence': stable(current['evidence'])}
+
+
 class WaitPaperLedger:
     def __init__(self, root: Path | None = None, *, persist: bool = True, scope: set[tuple[date, int]] | None = None) -> None:
         self.root = root or default_marker_dir() / 'watch-audit' / 'paper-ledger'
@@ -135,11 +171,8 @@ class WaitPaperLedger:
             if existing is not None and existing['status'] != 'unavailable':
                 if existing['status'] in _ACTIVE and existing.get('active_tracking', True):
                     cached = self._active.get(path)
-                    if cached and cached['status'] == existing['status']:
-                        for field in ('last_event', 'previous_trade'):
-                            old, new = cached.get(field), existing.get(field)
-                            if old and (not new or _moment(old['price_as_of']) > _moment(new['price_as_of'])):
-                                existing[field] = old
+                    if cached:
+                        _merge_observations(existing, cached)
                     self._active[path] = existing
                     if path not in self._configured and existing['status'] == 'pending':
                         self._active[path]['previous_trade'] = None
@@ -196,6 +229,7 @@ class WaitPaperLedger:
                     'realized_gross_pnl_krw': None, 'realized_net_pnl_krw': None,
                     'unrealized_gross_pnl_krw': None, 'unrealized_net_pnl_krw': None,
                     'cost_krw': None, 'last_event': None, 'previous_trade': None,
+                    'channel_events': {},
                 }
                 if prior is not None:
                     if prior['missing_inputs'] == missing:
@@ -255,6 +289,36 @@ class WaitPaperLedger:
             self._event(row, received_at=now, kind='recovery_annotation', updates={'recovery_evidence': copy.deepcopy(evidence)})
             self._save(path, row)
 
+    def certify_no_exit(self, day: date, snapshot_id: int, *, price, price_as_of: datetime, received_at: datetime, evidence: dict) -> None:
+        """Value a reconstructed entry using a caller-validated no-exit daily path."""
+        price = _number(price)
+        if price is None or price <= 0 or price_as_of.tzinfo is None or received_at.tzinfo is None or received_at < price_as_of:
+            raise ValueError('A historical close requires a positive price and ordered aware timestamps')
+        path = self.root / day.isoformat() / f'{int(snapshot_id)}.json'
+        certificate = {'price': str(price), 'price_as_of': price_as_of.isoformat(), 'evidence': copy.deepcopy(evidence)}
+        row = self._read(path)
+        if row is None or row['status'] != 'open' or row.get('active_tracking', True) or _same_certificate(row.get('no_exit_certificate'), certificate):
+            return
+        with self._locked(path):
+            row = self._read(path)
+            if row is None or row['status'] != 'open' or row.get('active_tracking', True) or _same_certificate(row.get('no_exit_certificate'), certificate):
+                return
+            if row.get('coverage_through') and _moment(row['coverage_through']) > price_as_of:
+                return
+            if price_as_of < _moment(row['entry']['price_as_of']) or not Decimal(row['stop_loss_price']) < price < Decimal(row['target_price']):
+                raise ValueError('A no-exit close must follow entry and remain strictly between exit levels')
+            mark = {'kind': 'mark', 'price': str(price), 'source': 'stored_daily_close',
+                    'price_as_of': price_as_of.isoformat(), 'price_received_at': received_at.isoformat()}
+            updates = {'coverage': 'complete', 'coverage_basis': 'stored_daily_bounds_no_exit',
+                       'coverage_through': price_as_of.isoformat(), 'coverage_reasons': [],
+                       'exit_status': 'not_observed_through_cutoff', 'active_tracking': False,
+                       'no_exit_certificate': certificate, 'last_event': mark}
+            updates.update(self._pnl({**row, 'coverage': 'complete'}, row['entry'], price, realized=False))
+            self._event(row, received_at=received_at, kind='no_exit_certificate', updates=updates,
+                        price_as_of=price_as_of.isoformat(), economic_cutoff=price_as_of.isoformat(),
+                        retrospective=True, source='stored_daily_close')
+            self._save(path, row)
+
     def symbols(self, day: date) -> tuple[str, ...]:
         with self._lock:
             return tuple(sorted({
@@ -307,11 +371,7 @@ class WaitPaperLedger:
             version = path.stat().st_mtime_ns if self.persist else None
             if self.persist and version != self._versions.get(path):
                 latest = self._read(path)
-                for field in ('last_event', 'previous_trade'):
-                    old, new = row.get(field), latest.get(field)
-                    if (row['status'] == latest['status'] and old is not None
-                        and (new is None or _moment(old['price_as_of']) > _moment(new['price_as_of']))):
-                        latest[field] = old
+                _merge_observations(latest, row)
                 row = latest
                 self._versions[path] = version
                 if row['status'] not in _ACTIVE or kind != 'mark' and not row.get('active_tracking', True):
@@ -330,8 +390,7 @@ class WaitPaperLedger:
             if row['status'] == 'pending' and kind == 'bid' or row['status'] == 'open' and kind == 'ask':
                 continue
             local_row = row
-            prior = row['last_event']
-            if prior and (price_as_of <= _moment(prior['price_as_of']) or received_at < _moment(prior['price_received_at'])):
+            if not _new_observation(row, kind, price_as_of, received_at):
                 continue
             # Durable marks are bounded; crossing detection still evaluates every accepted trade.
             durable_at = self._durable_at.get(path)
@@ -344,14 +403,16 @@ class WaitPaperLedger:
                 ask_eligible = kind == 'ask' and (price >= trigger if row['buy_direction'] == 'at_or_above' else price <= trigger)
                 chase = _number(row['chase_limit_price'])
                 ask_eligible = ask_eligible and chase is not None and price <= chase
-                force_save = force_save or ask_eligible or price == trigger or previous is not None and (
+                entry_band = Decimal(row['stop_loss_price']) < price < Decimal(row['target_price'])
+                force_save = force_save or entry_band and (ask_eligible or price == trigger or previous is not None and (
                     Decimal(previous['price']) < trigger <= price if row['buy_direction'] == 'at_or_above'
                     else Decimal(previous['price']) > trigger >= price
-                )
+                ))
             if not force_save:
                 event = {'kind': kind, 'price': str(price), 'size': size, 'source': source,
                          'price_as_of': price_as_of.isoformat(), 'price_received_at': received_at.isoformat()}
                 row['last_event'] = event
+                row.setdefault('channel_events', {})[kind] = event
                 if row['status'] == 'pending' and kind == 'trade':
                     row['previous_trade'] = event
                 elif row['status'] == 'open':
@@ -359,21 +420,17 @@ class WaitPaperLedger:
                 continue
             with self._locked(path):
                 row = self._read(path)
-                if row['status'] not in _ACTIVE:
+                if row['status'] not in _ACTIVE or kind != 'mark' and not row.get('active_tracking', True):
                     self._active.pop(path, None)
                     continue
-                if row['status'] == 'pending':
-                    old, new = local_row['previous_trade'], row['previous_trade']
-                    if old is not None and (new is None or _moment(old['price_as_of']) > _moment(new['price_as_of'])):
-                        row['previous_trade'] = old
-                last = row['last_event']
-                if last and (price_as_of <= _moment(last['price_as_of']) or received_at < _moment(last['price_received_at'])):
+                _merge_observations(row, local_row)
+                if not _new_observation(row, kind, price_as_of, received_at):
                     continue
                 event = {
                     'kind': kind, 'price': str(price), 'size': size, 'source': source,
                     'price_as_of': price_as_of.isoformat(), 'price_received_at': received_at.isoformat(),
                 }
-                updates = {'last_event': event}
+                updates = {'last_event': event, 'channel_events': {**row.get('channel_events', {}), kind: event}}
                 if row['status'] == 'pending':
                     trigger = Decimal(row['trigger_price'])
                     direction = row['buy_direction']
@@ -434,7 +491,7 @@ class WaitPaperLedger:
             'unrealized_net_pnl_krw': None if realized or row['coverage'] != 'complete' else str(gross-cost),
         }
 
-    def history(self, day: date, *, as_of: datetime | None = None) -> list[dict]:
+    def history(self, day: date, *, as_of: datetime | None = None, include_reconstruction: bool = False) -> list[dict]:
         as_of = as_of or datetime.combine(day, time(15, 30), KST)
         results = []
         for path in self._paths():
@@ -446,9 +503,29 @@ class WaitPaperLedger:
                 continue
             events = []
             for event in data['events']:
-                if as_of is None or _moment(event['price_received_at']) <= as_of:
+                received = _moment(event['price_received_at'])
+                economic = _moment(event['economic_cutoff']) if event.get('economic_cutoff') else (
+                    _moment(event['price_as_of']) if event.get('price_as_of') else None
+                )
+                retrospective = (include_reconstruction and economic is not None and economic <= as_of
+                                 and received <= datetime.now(KST) and (event.get('retrospective')
+                                 or timedelta(0) <= received-economic <= timedelta(seconds=30)))
+                if received <= as_of or retrospective:
                     row.update(event['updates'])
-                    events.append({key: value for key, value in event.items() if key != 'updates'})
+                    visible_event = {key: value for key, value in event.items() if key != 'updates'}
+                    if received > as_of:
+                        row['retrospective'] = True
+                        visible_event.update(retrospective=True, economic_cutoff=economic.isoformat())
+                    events.append(visible_event)
+            if row.get('coverage_basis') == 'stored_daily_bounds_no_exit':
+                following = _moment(row['coverage_through']).astimezone(KST).date()+timedelta(days=1)
+                while following <= as_of.astimezone(KST).date():
+                    if get_krx_exchange_calendar_day(following).is_open and datetime.combine(following, time(9), KST) <= as_of:
+                        row.update(coverage='incomplete', coverage_reasons=['after_historical_coverage'],
+                                   exit_status='unknown_path_gap', unrealized_gross_pnl_krw=None,
+                                   unrealized_net_pnl_krw=None, cost_krw=None)
+                        break
+                    following += timedelta(days=1)
             if row['market_date'] != day.isoformat():
                 if row['entry'] is None or _moment(row['entry']['price_as_of']).astimezone(KST).date() > day:
                     continue
