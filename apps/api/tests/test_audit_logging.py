@@ -163,6 +163,7 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_upstream_audit_omits_untrusted_or_unrelated_kis_codes(self):
         cases = (
             ('kis', 500, b'not json'),
+            ('kis', 500, b'\xff'),
             ('kis', 500, b'[]'),
             ('kis', 500, b'{"msg_cd":"12345678"}'),
             ('kis', 500, b'{"msg_cd":"12345678-01"}'),
