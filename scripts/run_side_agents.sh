@@ -9,5 +9,8 @@ mkdir -p "$LOG_DIR"
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 PY="$ROOT/apps/api/.venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
-"$PY" -m app.side_agents run-due >> "$LOG_DIR/run-due.log" 2>&1
+if [ "${1:-}" = "com.kai.daily-review" ]; then
+  exec "$PY" -m app.side_agents run-daily-review >> "$LOG_DIR/daily-review.log" 2>&1
+fi
+"$PY" -m app.side_agents run-due --only market-context-analyst --only news-event-analyst >> "$LOG_DIR/run-due.log" 2>&1
 exit 0

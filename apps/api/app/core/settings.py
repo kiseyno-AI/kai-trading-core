@@ -151,6 +151,10 @@ class Settings(BaseSettings):
     signal_decider_next_open_enabled: bool = False
     signal_decider_next_open_dry_run: bool = True
     signal_decider_next_open_account_targets: str = ''
+    core_quantity_sizing_enabled: bool = True
+    core_quantity_refresh_seconds: int = Field(default=7200, ge=60, le=86400)
+    core_quantity_risk_fraction: float = Field(default=0.015, gt=0, le=0.015, allow_inf_nan=False)
+    core_quantity_max_symbol_fraction: float = Field(default=0.30, gt=0, le=1, allow_inf_nan=False)
     signal_decider_next_open_min_confidence_score_10: float = Field(
         default=6.0,
         ge=0,
@@ -170,7 +174,6 @@ class Settings(BaseSettings):
     )
     signal_decider_next_open_require_active_policy: bool = True
     signal_decider_next_open_block_on_data_warnings: bool = True
-    signal_decider_next_open_block_on_specialist_disagreement: bool = True
     signal_decider_next_open_require_target_and_stop: bool = True
     signal_decider_exec_integration_mode: str = 'disabled'
     signal_decider_exec_base_url: str = 'http://127.0.0.1:8010'

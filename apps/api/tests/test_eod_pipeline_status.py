@@ -3,16 +3,19 @@ import json
 import unittest
 from copy import deepcopy
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
+from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
 from app.agent_context.roles import (
     DECISION_SUPPORT_AGENT_NAMES,
     SUMMARIZER_AGENT_NAMES,
 )
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
-from app.db_models import DailyMomentumFactorResult
+from app.db_models import DailyMomentumFactorResult, DailyPriceBar, DailyQualityFactorResult, Symbol
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pipeline_status import (
     DEFAULT_FACTOR_STAGE_ORDER,
@@ -30,7 +33,7 @@ from app.eod.pipeline_status import (
     _load_signal_feature_counts,
     _signal_feature_row_is_semantically_ready,
 )
-from app.eod.market_membership import build_market_membership_snapshot
+from app.eod.market_membership import build_market_membership_snapshot, market_membership_sha256
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.signals.signal_feature_readiness import (
     SIGNAL_FEATURE_READINESS_CONTRACT_VERSION,
@@ -956,6 +959,316 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def _scheduled_no_handoff_stages(self, *, no_plan_items=False):
+        market_date = '2026-05-28'
+        updated_at = '2026-05-28T08:30:00+00:00'
+        total = 1 if no_plan_items else 2
+        decider = _legacy_completed_signal_decider_stage(
+            market_date=market_date, updated_at=updated_at,
+            expected=total * 2, completed=total * 2,
+        )['stage']
+        plan = (
+            _completed_zero_item_next_open_history_stage(
+                run_id=516, market_date=market_date,
+            ) if no_plan_items else _completed_next_open_history_stage(
+                run_id=516, market_date=market_date, total=total,
+            )
+        )['stage']
+        proof = plan['details'].pop('completion_scope_proof')
+        result = plan['details']['result_summary']
+        manifest = result['completion_manifest']
+        manifest['role_symbol_scopes'] = deepcopy(proof['role_symbol_scopes'])
+        for entry in manifest['decision_partition']:
+            for item in entry['included_items']:
+                item.update(
+                    eligibility_status='blocked', handoff_active=False,
+                    exec_monitoring_active=False,
+                )
+        manifest.pop('manifest_digest')
+        manifest['manifest_digest'] = hashlib.sha256(json.dumps(
+            manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        result['summary'] = {
+            'eligible_count': 0, 'monitor_candidate_count': 0,
+            'account_targets_configured': True, 'account_targets_valid': True,
+            'enrichment_preflight_allowed': True,
+            'agent_context_completeness_status': 'complete',
+        }
+        parent = decider['details']['result_summary']
+        parent['run_id'] = manifest['parent_run_id']
+        parent['progress']['summary']['role_symbol_scopes'] = (
+            {role: list(reversed(symbols)) for role, symbols in manifest['role_symbol_scopes'].items()}
+        )
+        decider.update(processed=total * 2, total=total * 2, succeeded=total * 2, failed=0, remaining=0)
+        for stage in (decider, plan):
+            stage['details']['mode'] = 'eod_collection_run_stage_progress'
+            stage['source_run_ids'] = {'eod_run_id': 597}
+        return {'signal_decider': decider, 'next_open_execution_plan': plan}
+
+    def test_read_completed_scheduled_no_handoff_keeps_processing_completed(self):
+        for no_plan_items in (False, True):
+            with self.subTest(no_plan_items=no_plan_items):
+                stages = self._scheduled_no_handoff_stages(no_plan_items=no_plan_items)
+                progress = {
+                    stage_id: {
+                        **{k: v for k, v in stage.items() if k != 'details'},
+                        **stage['details'],
+                    }
+                    for stage_id, stage in stages.items()
+                }
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: {
+                        'id': 597, 'status': 'completed', 'trade_date': '2026-05-28',
+                        'run_metadata': {'stage_progress': progress},
+                    },
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 1,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    signal_decider_counts_loader=lambda **_: {
+                        'feedback_rows': 1, 'updated_at': '2026-05-28T08:29:00+00:00',
+                    },
+                )
+                result = service.read(market_date='2026-05-28')
+                self.assertEqual(result['stages']['signal_decider']['processed'], stages['signal_decider']['total'])
+                plan = result['stages']['next_open_execution_plan']
+                self.assertEqual(plan['status'], 'completed')
+                self.assertNotIn('completion_scope_proof', plan['details'])
+
+    def test_scheduled_no_handoff_malformed_parent_progress_fails_closed(self):
+        mutations = {
+            'missing_progress': lambda parent: parent.pop('progress'),
+            'missing_summary': lambda parent: parent['progress'].pop('summary'),
+            'missing_role_progress': lambda parent: parent['progress']['summary'].pop(
+                'role_progress'
+            ),
+            'missing_completed_feedback_count': lambda parent: parent['progress']['summary'].pop(
+                'completed_feedback_count'
+            ),
+            'integer_role_progress_state': lambda parent: parent['progress']['summary'][
+                'role_progress'
+            ].__setitem__('signal-decider', 7),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(case=name):
+                stages = self._scheduled_no_handoff_stages()
+                parent = stages['signal_decider']['details']['result_summary']
+                mutate(parent)
+                with patch.object(
+                    EODPipelineStatusService,
+                    '_signal_decider_has_legacy_completion_proof',
+                    return_value=True,
+                ):
+                    self.assertFalse(
+                        EODPipelineStatusService._scheduled_no_handoff_plan_completed(
+                            decider=stages['signal_decider'],
+                            plan=stages['next_open_execution_plan'],
+                        )
+                    )
+
+    def test_scheduled_no_handoff_does_not_hide_incomplete_or_mismatched_results(self):
+        mutations = {
+            'parent_pending': ('parent', {'final_pending': 1}),
+            'wrong_parent': ('manifest', {'parent_run_id': 'other-run'}),
+            'incomplete_plan': ('result', {'status': 'partial'}),
+            'bad_account': ('summary', {'account_targets_valid': False}),
+            'write_error': ('result', {'error_message': 'database write failed'}),
+            'failed_plan': ('plan', {'failed': 1}),
+            'failed_decider': ('decider', {'failed': 1}),
+            'inconsistent_success': ('plan', {'succeeded': 0}),
+            'remaining_work': ('plan', {'remaining': 1}),
+            'wrong_source_run': ('source', {'eod_run_id': 598}),
+            'malformed_symbol': ('first_decision', {'symbol': []}),
+            'malformed_role': ('first_decision', {'decision_agent_name': {}}),
+            'malformed_disposition': ('first_decision', {'disposition': []}),
+            'contradictory_partition': ('included_decision', {'disposition': 'non_actionable'}),
+            'active_handoff': ('included_item', {'handoff_active': True}),
+        }
+        for name, (target, update) in mutations.items():
+            with self.subTest(case=name):
+                stages = self._scheduled_no_handoff_stages()
+                plan = stages['next_open_execution_plan']
+                result = plan['details']['result_summary']
+                manifest = result['completion_manifest']
+                partition = manifest['decision_partition']
+                targets = {
+                    'decider': stages['signal_decider'],
+                    'parent': stages['signal_decider']['details']['result_summary'],
+                    'plan': plan, 'result': result, 'summary': result['summary'],
+                    'manifest': manifest, 'source': plan['source_run_ids'],
+                    'first_decision': partition[0],
+                    'included_decision': partition[1],
+                    'included_item': partition[1]['included_items'][0],
+                }
+                targets[target].update(update)
+                manifest.pop('manifest_digest')
+                manifest['manifest_digest'] = hashlib.sha256(json.dumps(
+                    manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+                ).encode()).hexdigest()
+                normalized = EODPipelineStatusService._normalize_stage_contract(stages)
+                self.assertEqual(normalized['next_open_execution_plan']['status'], 'blocked')
+
+    def test_scheduled_no_handoff_rejects_tampered_manifest(self):
+        stages = self._scheduled_no_handoff_stages()
+        stages['next_open_execution_plan']['details']['result_summary']['completion_manifest']['manifest_digest'] = 'invalid'
+        normalized = EODPipelineStatusService._normalize_stage_contract(stages)
+        self.assertEqual(normalized['next_open_execution_plan']['status'], 'blocked')
+
+    def test_factor_score_quality_uses_applicable_membership_in_both_modes(self):
+        memory_engine = create_engine('sqlite://')
+        for model in (Symbol, DailyPriceBar, DailyQualityFactorResult):
+            model.__table__.create(memory_engine)
+        market_date = date(2026, 4, 21)
+        common_at = datetime(2026, 4, 21, 16)
+        preferred_at = datetime(2026, 4, 21, 17)
+        with Session(memory_engine) as session:
+            for sid, symbol, name in ((1, '005930', '삼성전자'), (2, '005935', '삼성전자우')):
+                session.add(Symbol(id=sid, symbol=symbol, name_ko=name, market='KOSPI'))
+                session.add(DailyPriceBar(
+                    symbol_id=sid, trade_date=market_date, open_price=100,
+                    high_price=100, low_price=100, close_price=100,
+                    volume=1, turnover=100, source='test',
+                ))
+            common = DailyQualityFactorResult(
+                symbol_id=1, market_date=market_date, factor_payload={},
+                captured_at=common_at,
+            )
+            preferred = DailyQualityFactorResult(
+                symbol_id=2, market_date=market_date, factor_payload={},
+                captured_at=preferred_at,
+            )
+            session.add_all([common, preferred])
+            session.commit()
+
+            @contextmanager
+            def scope():
+                yield session
+
+            for common_score, preferred_score in ((0.7, None), (None, 0.9), (0.7, 0.9)):
+                common.quality_score = common_score
+                preferred.quality_score = preferred_score
+                session.commit()
+                for detailed in (False, True):
+                    with (
+                        self.subTest(common=common_score, preferred=preferred_score, detailed=detailed),
+                        patch('app.eod.pipeline_status.session_scope', scope),
+                        patch('app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS', {
+                            'quality_factors': DailyQualityFactorResult,
+                        }),
+                    ):
+                        counts = _load_row_count_stage_counts(
+                            market_date=market_date.isoformat(),
+                            include_missing_diagnostics=detailed,
+                        )['quality_factors']
+                    self.assertEqual(counts['decision_ready_count'], int(common_score is not None))
+                    self.assertEqual(counts['decision_degraded_count'], int(common_score is None))
+                    self.assertEqual(
+                        counts['latest_decision_ready_at'],
+                        common_at.isoformat() if common_score is not None else None,
+                    )
+        memory_engine.dispose()
+
+    def test_lightweight_status_keeps_preferred_shares_out_of_factor_missing_rows(self):
+        session = MagicMock()
+
+        def execute(statement):
+            if 'SELECT symbols.id' in str(statement):
+                return [
+                    SimpleNamespace(id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'),
+                    SimpleNamespace(id=2, symbol='005935', name_ko='삼성전자우', market='KOSPI'),
+                    SimpleNamespace(id=3, symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+                ]
+            return MagicMock(one=lambda: (2, None, 2, 0, None, present))
+
+        session.execute.side_effect = execute
+        for present, missing in ((2, 0), (1, 1)):
+            with (
+                self.subTest(present=present),
+                patch('app.eod.pipeline_status.session_scope') as scope,
+                patch('app.eod.pipeline_status.ROW_COUNT_STAGE_MODELS', {
+                    'quality_factors': FACTOR_STAGE_MODELS['quality_factors'],
+                }),
+            ):
+                scope.return_value.__enter__.return_value = session
+                row_counts = _load_row_count_stage_counts(
+                    market_date='2026-04-21',
+                    include_missing_diagnostics=False,
+                )
+                service = EODPipelineStatusService(
+                    market_state_loader=_FakeMarketState,
+                    pykrx_run_loader=lambda **_: None,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 3,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    price_bar_count_loader=lambda **_: 3,
+                    row_count_stage_counts_loader=lambda **_: row_counts,
+                )
+                result = service.read(
+                    market_date='2026-04-21',
+                    include_row_count_diagnostics=False,
+                )
+                stage = result['stages']['quality_factors']
+                self.assertEqual(stage['total'], 2)
+                self.assertEqual(stage['details']['missing_count'], missing)
+                self.assertEqual(stage['details']['not_applicable_count'], 1)
+                self.assertEqual(stage['details']['not_applicable_symbols_sample'], ['005935'])
+
+    def test_universe_refresh_status_uses_same_date_saved_membership(self):
+        market_date = '2026-04-21'
+        symbols = ['000660', '005930']
+        membership = build_market_membership_snapshot(
+            symbols=[SimpleNamespace(symbol=symbol, market='KOSPI') for symbol in symbols],
+            markets=['KOSPI'],
+        )
+        saved_run = {
+            'id': 593,
+            'trade_date': market_date,
+            'status': 'completed',
+            'symbols_total': 2,
+            'symbols_succeeded': 2,
+            'run_metadata': {
+                'markets': ['KOSPI'],
+                'requested_symbols': symbols,
+                'universe_refreshed': True,
+                'universe_snapshot': {
+                    'complete': True,
+                    'latest_trade_date': market_date,
+                    'markets': ['KOSPI'],
+                    'market_membership': membership,
+                },
+            },
+        }
+        for label, refreshed, complete, snapshot_date, expected_status in (
+            ('verified', True, True, market_date, 'completed'),
+            ('not_refreshed', False, True, market_date, 'skipped'),
+            ('incomplete', True, False, market_date, 'skipped'),
+            ('wrong_date', True, True, '2026-04-20', 'skipped'),
+        ):
+            with self.subTest(label=label):
+                run = deepcopy(saved_run)
+                run['run_metadata']['universe_refreshed'] = refreshed
+                run['run_metadata']['universe_snapshot'].update(
+                    complete=complete, latest_trade_date=snapshot_date,
+                )
+                service = EODPipelineStatusService(
+                    market_state_loader=_FakeMarketState,
+                    pykrx_run_loader=lambda **_: run,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 2,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    price_bar_count_loader=lambda **_: 2,
+                )
+                result = service.read(market_date=market_date)
+                stage = result['stages']['pykrx_universe_refresh']
+                self.assertEqual(stage['status'], expected_status)
+                self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
+                if expected_status == 'completed':
+                    self.assertEqual(stage['total'], 2)
+                    self.assertEqual(stage['source_run_ids'], {'eod_run_id': 593})
+
     def test_factor_stage_count_queries_classify_all_score_fields(self):
         class AggregateResult:
             def __init__(self, values):
@@ -971,7 +1284,15 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
 
             def execute(self, statement):
                 self.statements.append(statement)
-                return AggregateResult(self.values)
+                if 'SELECT symbols.id' in str(statement):
+                    return [
+                        SimpleNamespace(id=1, symbol='005930', name_ko='삼성전자', market='KOSPI'),
+                        SimpleNamespace(id=2, symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+                    ]
+                values = self.values
+                if len(statement.selected_columns) > len(values):
+                    values += (2,)
+                return AggregateResult(values)
 
         for stage_id, score_field in FACTOR_STAGE_SCORE_FIELDS.items():
             with self.subTest(stage_id=stage_id, score_field=score_field):
@@ -999,7 +1320,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                         include_missing_diagnostics=False,
                     )
 
-                statement = str(session.statements[0])
+                statement = str(session.statements[-1])
                 self.assertIn(score_field, statement)
                 self.assertIn('IS NOT NULL', statement)
                 self.assertIn('IS NULL', statement)
@@ -1255,8 +1576,10 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             official_run_loader=lambda **_: None,
             official_stage_history_loader=lambda **_: {},
             price_bar_count_loader=lambda **_: 2,
-            technical_snapshot_count_loader=lambda *_: 2,
-            action_summary_count_loader=lambda *_: 2,
+            # The historical membership includes one symbol that is inactive today.
+            price_context_count_loader=lambda *_: 1,
+            technical_snapshot_count_loader=lambda *_: 1,
+            action_summary_count_loader=lambda *_: 1,
             row_count_stage_counts_loader=lambda **_: {},
             row_count_scope_gap_loader=scope_gap_loader,
         )
@@ -1278,6 +1601,116 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             ],
             ['005930'],
         )
+        for stage_id in ('technical_snapshots', 'action_summaries'):
+            with self.subTest(stage=stage_id):
+                stage = result['stages'][stage_id]
+                self.assertEqual(stage['status'], 'completed')
+                self.assertEqual(stage['gate_status'], 'ready')
+                self.assertEqual((stage['processed'], stage['succeeded'], stage['failed']), (2, 2, 0))
+
+    def test_feedback_prerequisite_isolates_completed_signal_feature_scope(self):
+        market_date = '2026-04-21'
+        candidates = ['000660', '005930']
+        outside_scope = '0162D0'
+        universe = [*candidates, outside_scope]
+        membership = build_market_membership_snapshot(
+            symbols=[SimpleNamespace(symbol=symbol, market='KOSPI') for symbol in universe],
+            markets=['KOSPI'],
+        )
+
+        def scope_gap_loader(*, stage_id, market_date, symbols):
+            missing = (
+                [outside_scope]
+                if stage_id == 'signal_features' and outside_scope in symbols
+                else []
+            )
+            return _scope_gap_evidence(
+                requested_count=len(symbols),
+                present_count=len(symbols) - len(missing),
+                missing_symbols_sample=missing,
+            )
+
+        official_run = {
+            'id': 644,
+            'market_date': market_date,
+            'status': 'partial',
+            'run_metadata': {'resolved_stages': ['signal_features', 'agent_feedback_summaries']},
+            'stages': {
+                'signal_features': {
+                    'stage_id': 'signal_features',
+                    'market_date': market_date,
+                    'status': 'completed',
+                    'total': len(candidates),
+                    'processed': len(candidates),
+                    'succeeded': len(candidates),
+                    'failed': 0,
+                    'source_run_ids': {'eod_run_id': 593},
+                },
+            },
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=_FakeMarketState,
+            pykrx_run_loader=lambda **_: {
+                'id': 593,
+                'status': 'completed',
+                'symbols_total': len(universe),
+                'symbols_succeeded': len(universe),
+                'run_metadata': {
+                    'markets': ['KOSPI'],
+                    'requested_symbols': universe,
+                    'universe_snapshot': {'markets': ['KOSPI'], 'market_membership': membership},
+                },
+            },
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: len(universe),
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: official_run,
+            official_stage_history_loader=lambda **_: {},
+            price_bar_count_loader=lambda **_: len(universe),
+            technical_snapshot_count_loader=lambda *_: len(universe),
+            action_summary_count_loader=lambda *_: len(universe),
+            row_count_stage_counts_loader=lambda **_: {},
+            row_count_scope_gap_loader=scope_gap_loader,
+            signal_feature_counts_loader=lambda **_: {'persisted': len(candidates)},
+        )
+
+        prerequisite_service = AgentFeedbackPrerequisiteService()
+        with patch('app.eod.pipeline_status.eod_pipeline_status_service', service):
+            for requested, gate, reason in (
+                (candidates, 'ready', 'requested_scope_rows_complete'),
+                (universe, 'blocked', 'missing_rows_intersect_requested_scope'),
+                (None, 'blocked', 'missing_rows_intersect_exact_run_universe'),
+            ):
+                with self.subTest(symbols=requested):
+                    result = prerequisite_service.inspect_feedback_prerequisites(
+                        market_date=market_date,
+                        symbols=requested,
+                        required_stage_ids=('signal_features',),
+                    )
+                    stage = result['stages']['signal_features']
+                    self.assertEqual(stage['status'], 'completed')
+                    self.assertEqual(stage['gate_status'], gate)
+                    self.assertEqual(stage['details']['gate_reason'], reason)
+                    self.assertEqual(
+                        stage['details']['exact_universe_coverage']['missing_count'], 1
+                    )
+                    self.assertEqual(result['ready'], gate == 'ready')
+
+    def test_exact_scope_counts_include_missing_rows_in_processed(self):
+        stage = EODPipelineStatusService._normalize_stored_pykrx_coverage_stage(
+            {'status': 'missing'},
+            persisted=1,
+            expected_total=2,
+            exact_scope_gap=_scope_gap_evidence(
+                requested_count=2,
+                present_count=1,
+                missing_symbols_sample=['005930'],
+            ),
+        )
+        self.assertEqual(stage['succeeded'], 1)
+        self.assertEqual(stage['failed'], 1)
+        self.assertEqual(stage['processed'], 2)
+        self.assertEqual(stage['remaining'], 0)
 
     def test_read_blocks_complete_factor_count_when_requested_symbol_is_missing(self):
         requested_symbols = ['000660', '005930']
@@ -2141,6 +2574,138 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
             'no_decision_ready_factor_rows_in_exact_scope',
         )
 
+    def test_nullable_publication_survives_coverage_overlay_for_child_scope(self):
+        market_date = '2026-04-21'
+        stage_id = 'unified_value_factors'
+        universe = ['000660', '005930', '035420']
+        child_symbols = universe[:2]
+        publication = {
+            'status': 'completed',
+            'market_date': market_date,
+            'nullable_output_completed': True,
+            'results_persisted': 3,
+            'results_failed': 0,
+            'summary': {'ready_count': 1, 'unready_count': 2},
+            **build_exact_symbol_scope_outcome(
+                manifest_version='factor_scope_outcomes_v1',
+                selected_symbols=universe,
+                successful_symbols=universe,
+                retry_debt_symbols=[],
+            ),
+            'scope_finalization': {
+                'stage': stage_id,
+                'market_date': market_date,
+                'exact_symbol_count': 3,
+                'exact_membership_sha256': market_membership_sha256(universe),
+                'successful_symbol_count': 3,
+                'successful_membership_sha256': market_membership_sha256(universe),
+                'deleted_stale_row_count': 0,
+                'ready': True,
+            },
+        }
+        proof = DailyPipelineStageService._build_exact_scope_outcome_proof(
+            publication,
+            stage_id=stage_id,
+            invocation_symbols=universe,
+            publication_symbols=universe,
+            expected_market_date=market_date,
+        )
+        self.assertIsNotNone(proof)
+        compact_publication = {
+            key: value
+            for key, value in publication.items()
+            if key not in {
+                'selected_stock_codes', 'successful_stock_codes',
+                'retry_debt_stock_codes', 'terminal_not_applicable_stock_codes',
+                'scope_outcome_manifest', 'scope_outcome_manifest_version',
+            }
+        }
+        official = _completed_official_stage(
+            run_id=647, stage_id=stage_id, market_date=market_date,
+            processed=3, total=3, updated_at='2026-04-21T08:00:00+00:00',
+        )
+        official['stage']['details'] = {
+            'result_summary': compact_publication,
+            'exact_scope_outcome_proof': proof,
+        }
+        fallback = {
+            'task': stage_id, 'market_date': market_date,
+            'status': 'completed', 'gate_status': 'ready',
+            'severity': 'degraded', 'succeeded': 3,
+            'details': {
+                'mode': 'derived_from_factor_rows', 'rows_persisted': 3,
+                'decision_ready_count': 1, 'decision_degraded_count': 2,
+                'latest_decision_ready_at': '2026-04-21T07:59:59+00:00',
+            },
+        }
+        for source in ('latest_run', 'stage_history'):
+            for case in ('valid', 'missing_row', 'wrong_date', 'wrong_stage', 'failed', 'missing_proof', 'fresher_rows', 'outside_publication_scope'):
+                with self.subTest(source=source, case=case):
+                    candidate = deepcopy(official)
+                    stored = deepcopy(fallback)
+                    if case == 'wrong_date':
+                        candidate['stage']['details']['exact_scope_outcome_proof']['market_date'] = '2026-04-20'
+                    elif case == 'wrong_stage':
+                        candidate['stage']['details']['exact_scope_outcome_proof']['stage_id'] = 'quality_factors'
+                    elif case == 'failed':
+                        candidate['stage']['details']['result_summary']['results_failed'] = 1
+                    elif case == 'missing_proof':
+                        candidate['stage']['details'].pop('exact_scope_outcome_proof')
+                    elif case == 'fresher_rows':
+                        stored['details']['latest_decision_ready_at'] = '2026-04-21T09:00:00+00:00'
+                    elif case == 'outside_publication_scope':
+                        narrower = deepcopy(publication)
+                        narrower.update(build_exact_symbol_scope_outcome(
+                            manifest_version='factor_scope_outcomes_v1',
+                            selected_symbols=universe[-1:],
+                            successful_symbols=universe[-1:],
+                            retry_debt_symbols=[],
+                        ))
+                        narrower.update(results_persisted=1, summary={'ready_count': 1, 'unready_count': 0})
+                        narrower['scope_finalization'].update(
+                            successful_symbol_count=1,
+                            successful_membership_sha256=market_membership_sha256(universe[-1:]),
+                        )
+                        candidate['stage'].update(processed=1, succeeded=1, total=1)
+                        candidate['stage']['details'] = {
+                            'result_summary': narrower,
+                            'exact_scope_outcome_proof': DailyPipelineStageService._build_exact_scope_outcome_proof(
+                                narrower, stage_id=stage_id,
+                                invocation_symbols=universe[-1:], publication_symbols=universe,
+                                expected_market_date=market_date,
+                            ),
+                        }
+                    service = EODPipelineStatusService(
+                        row_count_scope_gap_loader=lambda **_: _scope_gap_evidence(
+                            requested_count=2,
+                            present_count=1 if case == 'missing_row' else 2,
+                            decision_ready_count=0,
+                            decision_degraded_count=1 if case == 'missing_row' else 2,
+                            quality_status='degraded',
+                        ),
+                    )
+                    stages = {stage_id: stored}
+                    if source == 'latest_run':
+                        projected = service._overlay_official_run_stages(
+                            stages=stages,
+                            official_run={**candidate['run'], 'stages': {stage_id: candidate['stage']}},
+                            market_date=market_date,
+                        )
+                    else:
+                        projected = service._overlay_official_stage_history(
+                            stages=stages, stage_history={stage_id: candidate},
+                            market_date=market_date,
+                        )
+                    stage = service._apply_scope_coverage_gate(
+                        stage_id=stage_id, market_date=market_date,
+                        stage=projected[stage_id], scope_symbols=child_symbols,
+                    )
+                    self.assertEqual(stage['gate_status'], 'ready' if case == 'valid' else 'blocked', (source, case, stage))
+                    if case == 'valid':
+                        self.assertEqual(stage['details']['requested_scope_decision_ready_count'], 0)
+                        self.assertEqual(stage['details']['requested_scope_decision_degraded_count'], 2)
+                        self.assertEqual(stage['details']['exact_scope_outcome_proof'], proof)
+
     def test_requested_scope_gate_fails_closed_on_malformed_zero_gap_proof(self):
         service = EODPipelineStatusService(
             row_count_scope_gap_loader=lambda **_: {
@@ -2965,6 +3530,60 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(coverage['present_count'], 1)
         self.assertEqual(coverage['not_applicable_count'], 1)
         self.assertEqual(coverage['missing_symbols_sample'], ['035420', '999999'])
+
+    def test_legacy_dart_completion_recognizes_only_scoped_preferred_symbols(self):
+        market_date = '2026-11-09'
+        metadata = build_exact_symbol_scope_outcome(
+            manifest_version='dart_daily_data_scope_outcomes_v1',
+            selected_symbols=['005930', '005935', '035420'],
+            successful_symbols=['005930'],
+            retry_debt_symbols=[],
+            terminal_not_applicable_symbols=['005935', '035420'],
+        )
+        metadata['terminal_policy_version'] = 'dart_missing_corp_mapping_not_applicable_v1'
+        service = EODPipelineStatusService(
+            market_state_loader=_FakeMarketState,
+            pykrx_run_loader=lambda **_: None,
+            official_run_loader=lambda **_: None,
+            live_symbol_count_loader=lambda: 4,
+            fundamentals_refresh_loader=lambda **_: {
+                'id': 538,
+                'market_date': market_date,
+                'fs_div': 'CFS',
+                'status': 'completed',
+                'run_metadata': metadata,
+            },
+        )
+
+        with patch('app.eod.pipeline_status.session_scope') as scope:
+            scope.return_value.__enter__.return_value.execute.return_value = [
+                SimpleNamespace(symbol='005935', name_ko='삼성전자우', market='KOSPI'),
+                SimpleNamespace(symbol='035420', name_ko='NAVER', market='KOSPI'),
+                SimpleNamespace(symbol='000660', name_ko='SK하이닉스', market='KOSPI'),
+            ]
+            accepted = service.read(
+                market_date=market_date, fs_div='CFS', scope_symbols=['005930', '005935'],
+            )
+            wider = service.read(
+                market_date=market_date, fs_div='CFS',
+                scope_symbols=['005930', '005935', '035420', '000660'],
+            )
+            different_date = service.read(
+                market_date='2026-11-06', fs_div='CFS', scope_symbols=['005935'],
+            )
+            metadata['preferred_not_applicable_stock_codes'] = []
+            explicit_empty = service.read(
+                market_date=market_date, fs_div='CFS', scope_symbols=['005935'],
+            )
+
+        self.assertEqual(accepted['stages']['fundamentals_daily_refresh']['gate_status'], 'ready')
+        dart_stage = wider['stages']['fundamentals_daily_refresh']
+        self.assertEqual(dart_stage['gate_status'], 'blocked')
+        coverage = dart_stage['details']['requested_scope_coverage']
+        self.assertEqual(coverage['not_applicable_count'], 1)
+        self.assertEqual(coverage['missing_symbols_sample'], ['035420', '000660'])
+        for result in (different_date, explicit_empty):
+            self.assertEqual(result['stages']['fundamentals_daily_refresh']['gate_status'], 'blocked')
 
     def test_pykrx_global_completion_does_not_cover_missing_requested_symbol(self):
         coverage = _full_pykrx_enrichment_coverage(
@@ -7559,7 +8178,7 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
         self.assertEqual(result['stages']['master_refresh']['status'], 'skipped')
         self.assertEqual(
             result['stages']['master_refresh']['details']['reason'],
-            'preopen_global_stage_not_required_for_resumed_market_date_status',
+            'preopen_stage_not_executed_in_market_date_run',
         )
         self.assertEqual(result['stages']['signal_features']['status'], 'partial')
         self.assertEqual(

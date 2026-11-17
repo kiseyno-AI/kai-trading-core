@@ -8,7 +8,7 @@ import re
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 EXECUTION_HANDOFF_CONTRACT_VERSION = 'execution_handoff_contract_v4'
 EXECUTION_HANDOFF_SOURCE = 'kai-trading-core'
@@ -363,6 +363,56 @@ class ExecutionSymbolDetailPayload(_ContractModel):
     items: list[ExecutionDailyBoardRowPayload]
 
 
+class _CoreQuantityFields(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    target_quantity: StrictInt = Field(ge=0)
+    revision: StrictInt = Field(ge=1)
+    calculated_at: AwareDatetime
+    valid_until: AwareDatetime
+    sizing_inputs: dict[str, Any]
+
+    @model_validator(mode='after')
+    def validate_quantity_evidence(self) -> '_CoreQuantityFields':
+        if self.valid_until <= self.calculated_at:
+            raise ValueError('quantity validity must end after calculation')
+        digest = self.sizing_inputs.get('price_contract_digest')
+        if not isinstance(digest, str) or _DISPATCH_MATERIAL_FINGERPRINT_PATTERN.fullmatch(digest) is None:
+            raise ValueError('quantity sizing requires an immutable price contract digest')
+        return self
+
+
+class CoreQuantityPolicy(_CoreQuantityFields):
+    type: Literal['core_sized']
+
+
+class ExecutionQuantityRefreshItem(_CoreQuantityFields):
+    external_plan_id: str = Field(min_length=1)
+    execution_plan_id: str = Field(min_length=1)
+    core_item_key: str = Field(min_length=1)
+    decision_snapshot_id: str = Field(min_length=1)
+    expected_revision: StrictInt = Field(ge=1)
+
+    @model_validator(mode='after')
+    def validate_revision_order(self) -> 'ExecutionQuantityRefreshItem':
+        if self.revision <= self.expected_revision:
+            raise ValueError('quantity revision must advance its expected revision')
+        return self
+
+
+class ExecutionQuantityRefreshPayload(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    items: list[ExecutionQuantityRefreshItem] = Field(min_length=1, max_length=500)
+
+    @model_validator(mode='after')
+    def validate_unique_items(self) -> 'ExecutionQuantityRefreshPayload':
+        keys = [(item.execution_plan_id, item.core_item_key) for item in self.items]
+        if len(keys) != len(set(keys)):
+            raise ValueError('quantity revisions must identify unique plan items')
+        return self
+
+
 class ExecutionPlanDispatchItemPayload(_ContractModel):
     model_config = ConfigDict(extra='forbid')
 
@@ -486,8 +536,10 @@ class ExecutionPlanDispatchPayload(_ContractModel):
             for entry_key in entries
         }
         for entry in entries.values():
-            if entry.quantity_policy.get('type') != 'exec_agent_sized':
-                raise ValueError('buy quantity_policy.type must be exec_agent_sized')
+            if entry.quantity_policy.get('type') == 'core_sized':
+                CoreQuantityPolicy.model_validate(entry.quantity_policy)
+            elif entry.quantity_policy.get('type') != 'exec_agent_sized':
+                raise ValueError('buy quantity_policy.type must be core_sized or exec_agent_sized')
         for item in self.items:
             if item.side != 'sell':
                 continue

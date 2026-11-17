@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as datetime_time, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -30,6 +30,11 @@ from app.market.session import (
     CALENDAR_SOURCE_STATUS_UNAVAILABLE,
 )
 from app.market.symbol_codes import is_canonical_krx_short_code
+from app.quotes.monitoring_session_history import (
+    MonitoringLastQuote,
+    MonitoringSessionHistory,
+    monitoring_session_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,10 @@ KST = ZoneInfo('Asia/Seoul')
 KIS_REALTIME_PRICE_TR_ID = 'H0STCNT0'
 KIS_REALTIME_ORDERBOOK_TR_ID = 'H0STASP0'
 KIS_REALTIME_ORDERBOOK_MAX_AGE = timedelta(seconds=2)
+KIS_WAIT_ORDERBOOK_COVERAGE_MAX_AGE = timedelta(seconds=10)
+MONITORING_SESSION_CHECKPOINT_SECONDS = 2.0
 KIS_REALTIME_MAX_CHANNELS = 41
+KIS_UNSUBSCRIBE_ACK_TIMEOUT_SECONDS = 10.0
 KIS_REALTIME_PRICE_SOURCE = 'kis_realtime_ws'
 KIS_REALTIME_PRICE_PING_INTERVAL_SECONDS = 30.0
 KIS_REALTIME_PRICE_PING_TIMEOUT_SECONDS = 10.0
@@ -311,10 +319,15 @@ class KISRealtimeOrderbook:
 
 
 class KISRealtimePriceService:
-    def __init__(self, *, client: KISClient | None = None) -> None:
+    def __init__(
+        self, *, client: KISClient | None = None, session_history: MonitoringSessionHistory | None = None,
+    ) -> None:
         self.client = client or kis_client
         self._task: asyncio.Task[None] | None = None
         self._wait_orderbook_task: asyncio.Task[None] | None = None
+        self._session_history = session_history
+        self._session_history_task: asyncio.Task[None] | None = None
+        self._pending_session_history: dict[date, dict[str, MonitoringLastQuote | None]] = {}
         self._websocket: Any = None
         self._stop_requested = False
         self._subscription_changed_event: asyncio.Event | None = None
@@ -324,6 +337,7 @@ class KISRealtimePriceService:
         self._last_source_refresh_monotonic = 0.0
         self._state_lock = threading.RLock()
         self._prices: dict[str, KISRealtimePriceTick] = {}
+        self._sampled_display_prices: dict[str, dict[str, Any]] = {}
         self._base_symbols: set[str] = set()
         self._base_symbol_order: list[str] = []
         self._desired_symbols: set[str] = set()
@@ -335,8 +349,11 @@ class KISRealtimePriceService:
         self._subscribed_symbols: set[str] = set()
         self._orderbook_symbols: set[str] = set()
         self._rejected_orderbook_symbols: set[str] = set()
+        self._pending_unsubscriptions: dict[tuple[str, str], float] = {}
+        self._orderbook_fallback_market_date: date | None = None
         self._orderbooks: dict[str, KISRealtimeOrderbook] = {}
         self._wait_orderbook_sampled_symbols: set[str] = set()
+        self._wait_orderbook_first_sample_at: datetime | None = None
         self._limited_symbols: set[str] = set()
         self._last_observed_symbols_at: datetime | None = None
         self._health: dict[str, Any] = self._build_health_state()
@@ -435,6 +452,7 @@ class KISRealtimePriceService:
         )
         self._health['subscribed_symbols'] = sorted(self._subscribed_symbols)
         self._health['orderbook_subscribed_symbols'] = sorted(self._orderbook_symbols)
+        self._health['pending_unsubscribe_count'] = len(self._pending_unsubscriptions)
         self._health['limited_symbols'] = sorted(self._limited_symbols)
         self._health['last_observed_symbols_at'] = _isoformat(self._last_observed_symbols_at)
 
@@ -460,6 +478,7 @@ class KISRealtimePriceService:
             self._subscribed_symbols.clear()
             self._orderbook_symbols.clear()
             self._rejected_orderbook_symbols.clear()
+            self._pending_unsubscriptions.clear()
             self._orderbooks.clear()
             self._sync_health_symbols_locked()
 
@@ -470,6 +489,7 @@ class KISRealtimePriceService:
             self._subscribed_symbols.clear()
             self._orderbook_symbols.clear()
             self._rejected_orderbook_symbols.clear()
+            self._pending_unsubscriptions.clear()
             self._orderbooks.clear()
             self._sync_health_symbols_locked()
 
@@ -507,7 +527,7 @@ class KISRealtimePriceService:
             and session_open_at <= now <= session_close_at
         )
 
-    def _recorded_market_session_is_active(self) -> bool:
+    def _recorded_market_session_is_active(self, *, at: datetime | None = None) -> bool:
         with self._state_lock:
             active = bool(self._health.get('market_session_active'))
             session_open_at = _parse_iso_datetime(
@@ -516,12 +536,12 @@ class KISRealtimePriceService:
             session_close_at = _parse_iso_datetime(
                 self._health.get('market_session_close_at')
             )
-        now = _utc_now()
+        observed_at = at if at is not None else _utc_now()
         return bool(
             active
             and session_open_at is not None
             and session_close_at is not None
-            and session_open_at <= now <= session_close_at
+            and session_open_at <= observed_at <= session_close_at
         )
 
     def _record_market_session(self, market: Any, *, active: bool) -> str:
@@ -608,6 +628,10 @@ class KISRealtimePriceService:
             self._run_wait_orderbooks(),
             name='kis-wait-orderbooks',
         )
+        if self._session_history is not None:
+            self._session_history_task = asyncio.create_task(
+                self._run_session_checkpoints(), name='kis-monitoring-session-history',
+            )
 
     async def stop(self) -> None:
         self._stop_requested = True
@@ -651,7 +675,33 @@ class KISRealtimePriceService:
 
         if orderbook_task is not None:
             await asyncio.gather(orderbook_task, return_exceptions=True)
+        history_task = self._session_history_task
+        self._session_history_task = None
+        if history_task is not None:
+            # The checkpoint's file write must finish before the final flush.
+            await asyncio.gather(history_task, return_exceptions=True)
+        await self._flush_session_history()
         self._set_status('stopped')
+
+    async def _run_session_checkpoints(self) -> None:
+        while not self._stop_requested:
+            await self._flush_session_history()
+            await asyncio.sleep(MONITORING_SESSION_CHECKPOINT_SECONDS)
+
+    async def _flush_session_history(self) -> None:
+        if self._session_history is None:
+            return
+        with self._state_lock:
+            pending = {day: rows.copy() for day, rows in self._pending_session_history.items()}
+        for day, rows in pending.items():
+            try:
+                await asyncio.to_thread(self._session_history.record, day, rows)
+            except Exception:
+                logger.exception('Could not save KRX monitoring history for %s', day)
+                continue
+            with self._state_lock:
+                if self._pending_session_history.get(day) == rows:
+                    self._pending_session_history.pop(day, None)
 
     @staticmethod
     def _normalize_monitored_symbols(
@@ -1305,6 +1355,7 @@ class KISRealtimePriceService:
                 await asyncio.sleep(2)
                 continue
             sampled = set()
+            first_sample_at = None
             failures = 0
             confirmation_candidates = set()
             for offset in range(0, len(symbols), 30):
@@ -1318,9 +1369,12 @@ class KISRealtimePriceService:
                 except KISClientError:
                     failures += 1
                     continue
+                received_at = _utc_now()
                 received, candidates = await asyncio.to_thread(
-                    self._record_wait_ask_samples, batch, rows, _utc_now(),
+                    self._record_wait_ask_samples, batch, rows, received_at,
                 )
+                if received and first_sample_at is None:
+                    first_sample_at = received_at
                 sampled.update(received)
                 confirmation_candidates.update(candidates)
             if confirmation_candidates and self._recorded_market_session_is_active():
@@ -1334,15 +1388,15 @@ class KISRealtimePriceService:
                 await self._confirm_wait_ask(symbol)
             with self._state_lock:
                 self._wait_orderbook_sampled_symbols = sampled
+                self._wait_orderbook_first_sample_at = first_sample_at
                 self._health['wait_orderbook_observation'] = {
                     'requested_count': len(symbols), 'sampled_count': len(sampled),
                     'failed_batches': failures, 'last_sample_at': _isoformat(_utc_now()),
                 }
             await asyncio.sleep(2 if self.client._environment() == 'demo' else 1)
 
-    @staticmethod
     def _record_wait_ask_samples(
-        batch: list[str], rows: list[dict[str, Any]], received_at: datetime,
+        self, batch: list[str], rows: list[dict[str, Any]], received_at: datetime,
     ) -> tuple[set[str], set[str]]:
         from app.agent_context.wait_price_observations import wait_price_observations
 
@@ -1350,12 +1404,33 @@ class KISRealtimePriceService:
         confirmation_candidates: set[str] = set()
         for row in rows:
             symbol = _normalize_symbol(row.get('inter_shrn_iscd'))
+            if symbol is None or symbol not in batch:
+                continue
+            price = _parse_decimal(row.get('inter2_prpr'))
             ask = _parse_decimal(row.get('inter2_askp'))
             bid = _parse_decimal(row.get('inter2_bidp'))
+            previous_close = _parse_decimal(row.get('inter2_prdy_clpr'))
+            if price is not None and price > 0:
+                change = price - previous_close if previous_close is not None and previous_close > 0 else None
+                valid_book = ask is not None and bid is not None and 0 < bid <= ask
+                with self._state_lock:
+                    # REST snapshots have no exchange trade time and must never become execution ticks.
+                    self._sampled_display_prices[symbol] = {
+                        'current_price': _to_json_number(price),
+                        'price_as_of': _isoformat(received_at),
+                        'price_received_at': _isoformat(received_at),
+                        'price_time_basis': 'received_at',
+                        'price_source': 'kis_rest_multi_quote',
+                        'previous_close_price': _to_json_number(previous_close),
+                        'change': _to_json_number(change),
+                        'change_pct': _to_json_number(_parse_decimal(row.get('prdy_ctrt'))),
+                        'bid_price': _to_json_number(bid) if valid_book else None,
+                        'ask_price': _to_json_number(ask) if valid_book else None,
+                    }
+
             size_text = _normalize_text(row.get('seln_rsqn'))
             if (
-                symbol is None or symbol not in batch
-                or ask is None or bid is None or not 0 < bid <= ask
+                ask is None or bid is None or not 0 < bid <= ask
                 or not size_text.isascii() or not size_text.isdecimal() or int(size_text) <= 0
             ):
                 continue
@@ -1365,6 +1440,10 @@ class KISRealtimePriceService:
                 received_at=received_at, source='kis_orderbook_rest_sample',
             ):
                 confirmation_candidates.add(symbol)
+        with self._state_lock:
+            for key in list(self._sampled_display_prices):
+                if key not in self._desired_symbols:
+                    self._sampled_display_prices.pop(key, None)
         return sampled, confirmation_candidates
 
     async def _confirm_wait_ask(self, symbol: str) -> None:
@@ -1394,6 +1473,13 @@ class KISRealtimePriceService:
             symbol, ask, int(size_text), price_as_of=as_of, received_at=received_at,
             source='kis_orderbook_rest_confirmed',
         )
+        bid_size_text = _normalize_text(book.get('bidp_rsqn1'))
+        if bid_size_text.isascii() and bid_size_text.isdecimal():
+            await asyncio.to_thread(
+                wait_price_observations.observe_bid,
+                symbol, bid, int(bid_size_text), price_as_of=as_of, received_at=received_at,
+                source='kis_orderbook_rest_confirmed',
+            )
 
     async def _run(self) -> None:
         base_reconnect_delay = max(
@@ -1558,7 +1644,9 @@ class KISRealtimePriceService:
                 approval_key=approval_key,
             )
             return
-        await self.refresh_subscription_source_if_due(trigger='background', force=False)
+        # Read pending ACKs before a potentially slow source refresh.
+        if not self._pending_unsubscriptions:
+            await self.refresh_subscription_source_if_due(trigger='background', force=False)
         await self._sync_subscriptions(websocket, approval_key=approval_key)
 
     async def _wait_for_change_or_timeout(self, timeout_seconds: float) -> None:
@@ -1603,11 +1691,14 @@ class KISRealtimePriceService:
         )
 
     def _orderbook_targets_locked(self, desired: list[str]) -> list[str]:
+        book_capacity = max(0, self._channel_limit() - 1)
+        if not book_capacity or self._orderbook_fallback_market_date == _utc_now().astimezone(KST).date():
+            return []
         candidates = self._protected_symbols - self._rejected_orderbook_symbols
         return sorted(
             (symbol for symbol in desired if symbol in candidates),
             key=lambda symbol: symbol not in self._critical_protected_symbols,
-        )[:self._channel_limit() - 1]
+        )[:book_capacity]
 
     def _target_symbols_snapshot_locked(self) -> tuple[list[str], list[str]]:
         desired = self._ordered_desired_symbols_locked()
@@ -1627,6 +1718,16 @@ class KISRealtimePriceService:
             return
         price_tr_id = self._price_tr_id()
         with self._state_lock:
+            now_monotonic = time.monotonic()
+            overdue = {
+                tr_id for (tr_id, _), deadline in self._pending_unsubscriptions.items()
+                if now_monotonic >= deadline
+            }
+            if overdue:
+                reason = 'KIS unsubscribe acknowledgment timed out'
+                if KIS_REALTIME_ORDERBOOK_TR_ID in overdue:
+                    self._record_orderbook_fallback_locked(_utc_now().astimezone(KST).date(), reason)
+                raise KISRealtimePriceSubscriptionError(reason)
             allowed_symbols, limited_symbols = self._target_symbols_snapshot_locked()
             book_targets = self._orderbook_targets_locked(self._ordered_desired_symbols_locked())
             channel_symbols = {
@@ -1646,6 +1747,7 @@ class KISRealtimePriceService:
             )
             with self._state_lock:
                 channel_symbols[tr_id].discard(symbol)
+                self._pending_unsubscriptions[(tr_id, symbol)] = time.monotonic() + KIS_UNSUBSCRIBE_ACK_TIMEOUT_SECONDS
                 if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID:
                     self._orderbooks.pop(symbol, None)
                 self._health['metrics']['unsubscribe_requests'] += 1
@@ -1653,6 +1755,12 @@ class KISRealtimePriceService:
         for tr_id, symbol in sorted(target - subscribed):
             if not self._recorded_market_session_is_active():
                 return
+            with self._state_lock:
+                occupied = sum(map(len, channel_symbols.values())) + len(self._pending_unsubscriptions)
+                if occupied >= self._channel_limit():
+                    break
+                if (tr_id, symbol) in self._pending_unsubscriptions:
+                    continue
             await self._send_subscription(
                 websocket, approval_key=approval_key, symbol=symbol, tr_id=tr_id, tr_type='1',
             )
@@ -1733,30 +1841,51 @@ class KISRealtimePriceService:
             return
 
         result_code = _normalize_text(body.get('rt_cd'))
+        message_code = _normalize_text(body.get('msg_cd'))
+        symbol = self._system_message_symbol(header=header, body=body)
+        if result_code == '0' and message_code == 'OPSP0001' and symbol:
+            with self._state_lock:
+                self._pending_unsubscriptions.pop((tr_id, symbol), None)
+                if (
+                    self._session_history is not None
+                    and tr_id == self._price_tr_id()
+                    and symbol in self._subscribed_symbols
+                    and self._recorded_market_session_is_active(at=received_at)
+                ):
+                    market_date = received_at.astimezone(KST).date()
+                    self._pending_session_history.setdefault(market_date, {}).setdefault(symbol, None)
+                self._sync_health_symbols_locked()
+            return
         message_text = _normalize_text(body.get('msg1')) or 'system_message'
         if result_code and result_code != '0':
-            failed_symbol = self._system_message_symbol(header=header, body=body)
+            failed_symbol = symbol
             failure_message = (
                 f'{message_text} (rt_cd={result_code}, symbol={failed_symbol})'
                 if failed_symbol
                 else f'{message_text} (rt_cd={result_code})'
             )
             with self._state_lock:
-                if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID and failed_symbol in self._orderbook_symbols:
-                    self._orderbook_symbols.discard(failed_symbol)
-                    self._rejected_orderbook_symbols.add(failed_symbol)
-                    self._orderbooks.pop(failed_symbol, None)
+                if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID:
+                    market_date = received_at.astimezone(KST).date()
+                    if self._orderbook_fallback_market_date == market_date:
+                        return
                     self._health['last_orderbook_subscription_error'] = failure_message
-                    self._sync_health_symbols_locked()
-                    return
-                subscribed = (
-                    self._orderbook_symbols if tr_id == KIS_REALTIME_ORDERBOOK_TR_ID
-                    else self._subscribed_symbols
-                )
-                if failed_symbol:
-                    subscribed.discard(failed_symbol)
+                    if (
+                        failed_symbol in self._orderbook_symbols
+                        and message_code not in {'OPSP0002', 'OPSP0003'}
+                    ):
+                        self._orderbook_symbols.discard(failed_symbol)
+                        self._rejected_orderbook_symbols.add(failed_symbol)
+                        self._orderbooks.pop(failed_symbol, None)
+                        self._sync_health_symbols_locked()
+                        return
+                    # The broker may still reserve an unconfirmed channel. Reset once
+                    # and keep trades on the next socket without retrying books today.
+                    self._record_orderbook_fallback_locked(market_date, failure_message)
+                elif failed_symbol:
+                    self._subscribed_symbols.discard(failed_symbol)
                 else:
-                    subscribed.clear()
+                    self._subscribed_symbols.clear()
                 self._health['status'] = 'reconnecting'
                 self._health['subscription'] = {
                     'status': 'failed',
@@ -1767,6 +1896,12 @@ class KISRealtimePriceService:
                 }
                 self._sync_health_symbols_locked()
             raise KISRealtimePriceSubscriptionError(failure_message)
+
+    def _record_orderbook_fallback_locked(self, market_date: date, reason: str) -> None:
+        self._orderbook_fallback_market_date = market_date
+        self._health['orderbook_fallback_market_date'] = market_date.isoformat()
+        self._health['last_orderbook_subscription_error'] = reason
+        self._orderbooks.clear()
 
     def _ingest_orderbook_message(self, message: str, *, received_at: datetime) -> None:
         chunks = message.split('|', 3)
@@ -1781,6 +1916,7 @@ class KISRealtimePriceService:
         # KIS publishes 63 columns today. The legacy 59-column frame shares these offsets.
         if width not in {59, 63}:
             return
+        observations = []
         with self._state_lock:
             for offset in range(0, len(values), width):
                 symbol, hour, session_class = values[offset:offset + 3]
@@ -1815,21 +1951,37 @@ class KISRealtimePriceService:
                     bid=bid, ask=ask, bid_size=int(bid_size), ask_size=int(ask_size),
                     as_of=as_of, received_at=received_at,
                 )
+                observations.append((symbol, self._orderbooks[symbol]))
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        for symbol, book in observations:
+            wait_price_observations.observe_ask(
+                symbol, book.ask, book.ask_size, price_as_of=book.as_of, received_at=book.received_at,
+                source='kis_orderbook_websocket',
+            )
+            wait_price_observations.observe_bid(
+                symbol, book.bid, book.bid_size, price_as_of=book.as_of, received_at=book.received_at,
+                source='kis_orderbook_websocket',
+            )
 
     def orderbooks_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         now = now or _utc_now()
         with self._state_lock:
             market_open = self._recorded_market_session_is_active()
             connected = market_open and self._health['websocket_connected']
-            samples = self._health.get('wait_orderbook_observation', {})
-            sampled_at = _parse_iso_datetime(samples.get('last_sample_at'))
+            sampled_at = self._wait_orderbook_first_sample_at
+            session_close_at = _parse_iso_datetime(self._health.get('market_session_close_at'))
+            coverage_expires_at = None
+            if market_open and sampled_at and sampled_at <= now:
+                coverage_expires_at = sampled_at + KIS_WAIT_ORDERBOOK_COVERAGE_MAX_AGE
+                if session_close_at is not None:
+                    coverage_expires_at = min(coverage_expires_at, session_close_at)
+                if now >= coverage_expires_at:
+                    coverage_expires_at = None
             return {
                 'connected': connected,
-                'passive_quote_symbols': (
-                    sorted(self._wait_orderbook_sampled_symbols)
-                    if market_open and sampled_at and timedelta(0) <= now - sampled_at <= timedelta(seconds=10)
-                    else []
-                ),
+                'passive_quote_symbols': sorted(self._wait_orderbook_sampled_symbols) if coverage_expires_at else [],
+                'passive_quote_expires_at': _isoformat(coverage_expires_at),
                 'items': [
                     {
                         'symbol': symbol,
@@ -1877,10 +2029,10 @@ class KISRealtimePriceService:
             self._health['last_price_received_at'] = _isoformat(received_at)
             for tick in ticks:
                 self._prices[tick.symbol] = tick
+                self._collect_session_trade_locked(tick)
         from app.agent_context.wait_price_observations import wait_price_observations
 
         for tick in ticks:
-            wait_price_observations.observe(tick)
             size = tick.raw_fields.get('ASKP_RSQN1', '')
             if (
                 not tick.trade_halt and size.isascii() and size.isdecimal()
@@ -1892,7 +2044,41 @@ class KISRealtimePriceService:
                     tick.symbol, tick.ask_price, int(size), price_as_of=tick.price_as_of,
                     received_at=tick.received_at, source='kis_trade_packet_ask',
                 )
+                bid_size = tick.raw_fields.get('BIDP_RSQN1', '')
+                if bid_size.isascii() and bid_size.isdecimal():
+                    wait_price_observations.observe_bid(
+                        tick.symbol, tick.bid_price, int(bid_size), price_as_of=tick.price_as_of,
+                        received_at=tick.received_at, source='kis_trade_packet_bid',
+                    )
+            wait_price_observations.observe(tick)
         return [tick.to_public_dict() for tick in ticks]
+
+    def _collect_session_trade_locked(self, tick: KISRealtimePriceTick) -> None:
+        if (
+            self._session_history is None
+            or not self._health.get('market_session_active')
+            or tick.symbol not in self._subscribed_symbols
+            or tick.trade_halt
+            or tick.current_price is None
+            or not tick.current_price.is_finite()
+            or tick.current_price <= 0
+        ):
+            return
+        opened_at = _parse_iso_datetime(self._health.get('market_session_open_at'))
+        closed_at = _parse_iso_datetime(self._health.get('market_session_close_at'))
+        local = tick.price_as_of.astimezone(KST)
+        if (
+            opened_at is None or closed_at is None
+            or not opened_at <= tick.price_as_of <= min(closed_at, tick.received_at)
+            or local.date() != tick.received_at.astimezone(KST).date()
+            or tick.raw_fields.get('BSOP_DATE') != local.strftime('%Y%m%d')
+            or tick.raw_fields.get('STCK_CNTG_HOUR') != local.strftime('%H%M%S')
+        ):
+            return
+        session = self._pending_session_history.setdefault(local.date(), {})
+        previous = session.get(tick.symbol)
+        if previous is None or tick.price_as_of >= previous.as_of:
+            session[tick.symbol] = MonitoringLastQuote(tick.current_price, tick.price_as_of)
 
     def ingest_price_fields(
         self,
@@ -1919,6 +2105,7 @@ class KISRealtimePriceService:
         with self._state_lock:
             self._target_symbols_snapshot_locked()
             tick = self._prices.get(normalized)
+            sampled = self._sampled_display_prices.get(normalized)
             desired = normalized in self._desired_symbols
             subscribed = normalized in self._subscribed_symbols
             limited = normalized in self._limited_symbols
@@ -1951,6 +2138,17 @@ class KISRealtimePriceService:
                     ),
                 },
             )
+
+        if (
+            sampled is not None and (desired or subscribed or limited)
+            and enabled and configured and self._recorded_market_session_is_active()
+        ):
+            received_at = _parse_iso_datetime(sampled.get('price_received_at'))
+            fresh = received_at is not None and timedelta(0) <= now - received_at <= timedelta(
+                seconds=max(1.0, float(settings.kis_realtime_price_stale_after_seconds)),
+            )
+            if fresh and (tick is None or limited or self._price_status_for_tick(tick, now=now) != 'available'):
+                return {**sampled, 'price_status': 'available', 'display_price_available': True, **subscription_fields}
 
         if tick is not None:
             status = 'limited' if limited else self._price_status_for_tick(tick, now=now)
@@ -2089,4 +2287,4 @@ class KISRealtimePriceService:
         return payload
 
 
-kis_realtime_price_service = KISRealtimePriceService()
+kis_realtime_price_service = KISRealtimePriceService(session_history=monitoring_session_history)

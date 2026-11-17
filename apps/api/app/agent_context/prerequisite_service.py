@@ -81,11 +81,29 @@ class AgentFeedbackPrerequisiteService:
             ._has_completed_dart_scope(stage_payload, details)
         ):
             return 'blocked'
-        if daily_pipeline_result_has_no_ready_content(stage_payload):
-            return 'blocked'
         explicit_gate_status = str(
             stage_payload.get('gate_status') or details.get('gate_status') or ''
         ).strip().lower()
+        if daily_pipeline_result_has_no_ready_content(stage_payload):
+            from app.eod.pipeline_status import _published_nullable_factor_scope_is_complete
+
+            if (
+                explicit_gate_status != 'ready'
+                or details.get('blocking_stages')
+                or details.get('failed_blocking_stages')
+                or details.get('scope_verification_required') is True
+                or not any(
+                    isinstance(evidence, dict)
+                    and _published_nullable_factor_scope_is_complete(
+                        stage_id=str(stage_payload.get('task') or ''), evidence=evidence,
+                    )
+                    for evidence in (
+                        details.get('requested_scope_coverage'), details.get('feedback_scope_gap'),
+                        details.get('exact_universe_coverage'),
+                    )
+                )
+            ):
+                return 'blocked'
         if explicit_gate_status in {'ready', 'blocked', 'waiting'}:
             return explicit_gate_status
         if str(stage_payload.get('task') or '') != PYKRX_ENRICHMENT_PREREQUISITE_STAGE_ID:

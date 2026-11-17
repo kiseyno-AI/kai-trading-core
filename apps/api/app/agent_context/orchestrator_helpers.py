@@ -86,6 +86,7 @@ DURABLE_DECIDER_INPUT_GENERATION_SCHEMA_VERSION = (
 )
 DECIDER_SOURCE_CONTEXT_VOLATILE_KEYS = frozenset(
     {
+        'age_hours',
         'age_seconds',
         'decision_time',
         'knowledge_cutoff_at',

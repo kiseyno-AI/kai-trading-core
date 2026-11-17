@@ -24,6 +24,29 @@ from typing import Any, Mapping, Sequence
 from app.eod.summary_cutoff_contract import completed_summary_scope_matches_parent
 
 
+def empty_agent_scope_followup(
+    upstream: Mapping[str, Any] | None, *, market_date: str,
+) -> dict[str, Any] | None:
+    if not isinstance(upstream, Mapping):
+        return None
+    result = upstream.get('result', upstream)
+    if not (
+        isinstance(result, Mapping)
+        and result.get('status') == 'skipped'
+        and result.get('reason') == 'no_agent_feedback_eligible_symbols'
+        and result.get('entry_economics_scope_empty') is True
+        and result.get('market_date') == market_date
+    ):
+        return None
+    return {
+        'triggered': False,
+        'status': 'skipped',
+        'reason': 'no_agent_feedback_eligible_symbols',
+        'entry_economics_scope_empty': True,
+        'market_date': market_date,
+    }
+
+
 def finished_partial_feeds_downstream(result: Mapping[str, Any], *, status: str) -> bool:
     """First-run rule for a ``partial`` upstream agent run (``status`` as resolved by the caller)."""
 

@@ -13,7 +13,6 @@ from app.eod.pykrx_backfill import (
     PykrxSymbol,
 )
 from app.eod.pykrx_pipeline_runner import (
-    AUTO_DAILY_TRACKED_STAGE_ORDER,
     _is_already_completed_followup_result,
 )
 
@@ -155,7 +154,7 @@ class PykrxAutomaticRetryPacingTests(TestCase):
                 )
                 run_collection.assert_not_called()
 
-    def test_five_price_attempts_with_two_failures_recovers_safe_downstream_scope(
+    def test_price_retry_limit_does_not_invent_missing_downstream_stages(
         self,
     ) -> None:
         service = PykrxBackfillService()
@@ -285,60 +284,13 @@ class PykrxAutomaticRetryPacingTests(TestCase):
                 point_in_time_recovery=True,
             )
 
-        self.assertTrue(result['triggered'])
-        self.assertEqual(result['reason'], 'incomplete_followups_resumed')
-        self.assertEqual(
-            result['followup_recovery']['symbols'],
-            ['005930', '000660'],
-        )
-        recovery_call = resume_stages.call_args.kwargs
-        self.assertEqual(recovery_call['symbols'], ['005930', '000660'])
-        self.assertNotIn('price_collection', recovery_call['stages'])
-        self.assertIn('next_open_execution_plan', recovery_call['stages'])
-        price_scope = recovery_call['recovery_price_scope_outcome']
-        self.assertEqual(price_scope['status'], 'partial')
-        self.assertEqual(
-            price_scope['selected_stock_codes'],
-            ['000660', '005930', '121850', '472220'],
-        )
-        self.assertEqual(
-            price_scope['successful_stock_codes'],
-            ['000660', '005930'],
-        )
-        self.assertEqual(
-            price_scope['retry_debt_stock_codes'],
-            ['121850', '472220'],
-        )
-        recovery_start_index = AUTO_DAILY_TRACKED_STAGE_ORDER.index(
-            'pykrx_enrichment'
-        )
-        self.assertEqual(
-            recovery_call['stages'],
-            list(
-                AUTO_DAILY_TRACKED_STAGE_ORDER[
-                    recovery_start_index:
-                ]
-            ),
-        )
-        finalize_parent.assert_called_once_with(
-            pipeline_run_id=92,
-            allow_satisfied_terminal=True,
-        )
-        persisted_metadata = update_eod_run.call_args.kwargs['run_metadata']
-        self.assertEqual(
-            persisted_metadata['failed_symbols'],
-            ['472220', '121850'],
-        )
-        self.assertEqual(
-            persisted_metadata['downstream_retry_symbols'],
-            ['472220', '121850'],
-        )
-        self.assertEqual(update_eod_run.call_args.kwargs['symbols_failed'], 2)
-        self.assertTrue(
-            result['followup_recovery']['state_convergence'][
-                'price_retry_pending'
-            ]
-        )
+        self.assertFalse(result['triggered'])
+        self.assertEqual(result['reason'], 'auto_retry_limit_reached')
+        self.assertEqual(latest_run['symbols_failed'], 2)
+        self.assertEqual(latest_run['run_metadata']['failed_symbols'], ['472220', '121850'])
+        resume_stages.assert_not_called()
+        finalize_parent.assert_not_called()
+        update_eod_run.assert_not_called()
         load_failed_symbol_codes.assert_not_called()
         load_retry_symbols.assert_not_called()
         run_collection.assert_not_called()

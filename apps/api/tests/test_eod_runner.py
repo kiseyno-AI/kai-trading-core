@@ -1199,6 +1199,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value={'summary': {'delegated_to_exec': True}}),
             ) as dispatch_exec,
             patch(
+                'app.eod.runner.signal_decider_exec_integration_service.refresh_core_quantities_if_due',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ) as refresh_quantities,
+            patch(
                 'app.eod.runner.trading_order_reconciliation_service.run_periodic_if_due',
                 new=AsyncMock(),
             ),
@@ -1212,6 +1216,9 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             refresh_plan=False,
             trigger='preopen_exec_dispatch',
         )
+        await asyncio.sleep(0)
+        refresh_quantities.assert_awaited_once_with(target_trade_date='2026-04-30')
+
 
     async def test_preopen_loop_waits_until_0800_for_exec_dispatch(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)
@@ -1298,6 +1305,10 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value={'summary': {'delegated_to_exec': True}}),
             ) as dispatch_exec,
             patch(
+                'app.eod.runner.signal_decider_exec_integration_service.refresh_core_quantities_if_due',
+                new=AsyncMock(return_value={'status': 'completed'}),
+            ) as refresh_quantities,
+            patch(
                 'app.eod.runner.signal_decider_exec_integration_service.schedule_signal_decider_exec_readback_refresh',
                 return_value={
                     'request': {'target_trade_date': '2026-04-30'},
@@ -1331,6 +1342,9 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             trigger='market_open_scheduler',
             timeout_seconds=BACKGROUND_RUNNER_STEP_TIMEOUT_SECONDS,
         )
+        await asyncio.sleep(0)
+        refresh_quantities.assert_awaited_once_with(target_trade_date='2026-04-30')
+
 
     async def test_open_loop_defers_readback_until_shielded_dispatch_completes(
         self,
@@ -1565,6 +1579,8 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.dispatch_calls: list[dict] = []
                 self.refresh_started = asyncio.Event()
                 self.release_refresh = asyncio.Event()
+                self.quantity_started = asyncio.Event()
+                self.release_quantity = asyncio.Event()
                 self.refresh_state = {
                     'status': 'not_requested',
                     'in_flight': False,
@@ -1577,6 +1593,11 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             async def dispatch_next_open_plan(self, **kwargs) -> dict:
                 self.dispatch_calls.append(kwargs)
                 return {'summary': {'delegated_to_exec': True}}
+
+            async def refresh_core_quantities_if_due(self, **kwargs) -> dict:
+                self.quantity_started.set()
+                await self.release_quantity.wait()
+                return {'status': 'completed'}
 
             def schedule_signal_decider_exec_readback_refresh(self, **kwargs) -> dict:
                 self.calls.append(kwargs)
@@ -1633,6 +1654,7 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(runner._run_loop(), timeout=0.25)
 
             await asyncio.wait_for(fake_service.refresh_started.wait(), timeout=0.25)
+            await asyncio.wait_for(fake_service.quantity_started.wait(), timeout=0.25)
             self.assertEqual(
                 fake_service.calls,
                 [
@@ -1660,8 +1682,11 @@ class EODBackgroundRunnerTests(unittest.IsolatedAsyncioTestCase):
             reconcile.assert_awaited_once_with()
         finally:
             fake_service.release_refresh.set()
+            fake_service.release_quantity.set()
             if fake_service.task is not None:
                 await asyncio.gather(fake_service.task, return_exceptions=True)
+            if 'core_quantity_refresh' in runner._async_step_tasks:
+                await asyncio.gather(runner._async_step_tasks['core_quantity_refresh'], return_exceptions=True)
 
     async def test_closed_loop_schedules_eod_when_runtime_background_disabled(self) -> None:
         runner = EODBackgroundRunner(interval_seconds=0)

@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.orders.exec_integration import signal_decider_exec_integration_service
+from app.orders.monitoring_session_results import MonitoringSessionResults, read_monitoring_session_results
 
 router = APIRouter(prefix='/execution/runtime', tags=['execution:runtime'])
 
@@ -35,6 +36,13 @@ async def list_execution_runtime_monitored_symbols(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Execution runtime monitored-symbols read failed: {exc}') from exc
+
+
+@router.get('/monitoring-session-results')
+def get_monitoring_session_results(
+    market_date: date | None = Query(default=None),
+) -> MonitoringSessionResults:
+    return read_monitoring_session_results(market_date)
 
 
 @router.get('/daily-board')

@@ -1,7 +1,7 @@
 # GET /quotes/realtime/monitored and /stream
 
 ## Summary
-Read or stream Core's process-local realtime price snapshot for execution-runtime monitored symbols. Core owns the KIS websocket and fans out the latest in-memory ticks; this route does not call KIS REST and does not persist realtime dashboard prices. The route is a realtime diagnostic surface; execution-runtime dashboard endpoints add local cache/daily display fallback fields for web cards.
+Read or stream Core's process-local realtime price snapshot for execution-runtime monitored symbols. Core owns the KIS websocket and fans out the latest in-memory ticks. The existing background WAIT multi-quote sampler also supplies display-only current prices and best bid/ask for candidates without a fresh websocket tick, including subscription-capacity-limited symbols; the route itself does not call KIS REST or persist these display samples. The route is a realtime diagnostic surface; execution-runtime dashboard endpoints add local cache/daily display fallback fields for web cards.
 
 ## Example request
 ```http
@@ -58,3 +58,17 @@ When WAIT orderbook sampling is active, `health.wait_orderbook_observation`
 reports `requested_count`, `sampled_count`, `failed_batches`, and
 `last_sample_at` for the latest regular-session sampling round. The
 sampled count measures orderbook coverage separately from trade subscriptions.
+
+## WAIT display samples
+
+Fresh background samples use `price_source=kis_rest_multi_quote`,
+`price_status=available`, and `display_price_available=true` even when
+`realtime_subscribed=false` and `realtime_subscription_reason=capacity_limited`.
+They expose `current_price`, `bid_price`, `ask_price`, `previous_close_price`,
+`change`, and `change_pct`. Invalid/crossed bid/ask pairs are omitted as null.
+Both `price_as_of` and `price_received_at` are the REST receipt time, identified
+by `price_time_basis=received_at`: KIS does not supply an exchange trade time
+in this response. These samples expire under the existing realtime stale
+threshold and are hidden outside a verified active regular session. They are
+never websocket ticks, trade-touch evidence, or orderbook-depth events.
+The stream includes display samples using the same snapshot serializer.

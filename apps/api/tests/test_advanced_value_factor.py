@@ -275,6 +275,61 @@ class AdvancedValueFactorMathTests(unittest.TestCase):
         self.assertIsNone(context['capital_expenditure'])
         self.assertIsNone(context['audit']['matched_inputs']['capex_ppe'])
 
+    def test_capex_sums_acquisition_components_and_prefers_reported_total(self) -> None:
+        snapshot = _snapshot(
+            '005930', total_equity=1000, total_liabilities=400,
+            operating_income=120, operating_cash_flow=260,
+            cash=150, capex_ppe=None,
+        )
+        snapshot.statement_rows.extend([
+            _statement_row(
+                'other_ppe', statement_type='CF', account_id='dart_PurchaseOfOtherPropertyPlantAndEquipment',
+                account_name='기타유형자산의 취득', amount=30, row_order=2,
+            ),
+            _statement_row(
+                'construction', statement_type='CF', account_id='dart_PurchaseOfConstructionInProgress',
+                account_name='건설중인유형자산의 취득', amount=50, row_order=3,
+            ),
+        ])
+        self.assertEqual(derive_annual_financial_context(snapshot)['capital_expenditure'], 80.0)
+        duplicate = dict(snapshot.statement_rows[1], row_key='other_ppe_duplicate', row_order=5)
+        snapshot.statement_rows.append(duplicate)
+        self.assertEqual(derive_annual_financial_context(snapshot)['capital_expenditure'], 80.0)
+        for account_id, name in (
+            ('ifrs-full_PurchaseOfPropertyPlantAndEquipment', '유형자산의 취득'),
+            ('-표준계정코드 미사용-', '유형자산의 취득으로 인한 현금유출'),
+        ):
+            with self.subTest(total_name=name):
+                total = _statement_row(
+                    'total_ppe', statement_type='CF', account_id=account_id,
+                    account_name=name, amount=80, row_order=4,
+                )
+                snapshot.statement_rows.append(total)
+                self.assertEqual(derive_annual_financial_context(snapshot)['capital_expenditure'], 80.0)
+                snapshot.statement_rows.remove(total)
+
+    def test_capex_components_exclude_non_cash_amortisation(self) -> None:
+        snapshot = _snapshot(
+            '005930', total_equity=1000, total_liabilities=400,
+            operating_income=120, operating_cash_flow=260,
+            cash=150, capex_ppe=None,
+        )
+        snapshot.statement_rows.extend([
+            _statement_row(
+                'other_intangible', statement_type='CF',
+                account_id='dart_PurchaseOfOtherIntangibleAssets',
+                account_name='Purchase of other intangible assets', amount=40, row_order=2,
+            ),
+            _statement_row(
+                'amortisation', statement_type='CF',
+                account_id='ifrs-full_AdjustmentsForAmortisationExpense',
+                account_name='Amortisation of intangible assets', amount=10, row_order=3,
+            ),
+        ])
+        context = derive_annual_financial_context(snapshot)
+        self.assertEqual(context['capital_expenditure'], 40.0)
+        self.assertEqual(context['depreciation_and_amortization'], 10.0)
+
     def test_derive_annual_financial_context_prefers_canonical_cash_highlight(self) -> None:
         snapshot = _snapshot(
             '005930',
@@ -660,6 +715,35 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         self.assertEqual(negative['fcf_yield_rank'], 2)
         self.assertEqual(positive['fcf_yield_rank'], 1)
 
+    def test_rebuild_scores_available_cash_flow_without_depreciation(self) -> None:
+        service = DailyAdvancedValueFactorService()
+        market_date = date(2026, 4, 24)
+        inputs = [
+            _input(
+                '005930', market_date, pbr=1.0,
+                snapshot=_snapshot(
+                    '005930', total_equity=1000, total_liabilities=300,
+                    operating_income=100, operating_cash_flow=200,
+                    cash=100, capex_ppe=-60,
+                ),
+            ),
+        ]
+        with (
+            patch.object(service, '_load_inputs', return_value=(inputs, ['005930'], [])),
+            patch('app.signals.advanced_value_factor.upsert_daily_advanced_value_factor_results') as upsert,
+        ):
+            result = service.rebuild_for_market_date(market_date=market_date)
+
+        persisted = upsert.call_args.args[0][0]
+        self.assertEqual(persisted['fcf_yield'], 0.14)
+        self.assertIsNone(persisted['ev_to_ebitda'])
+        self.assertEqual(persisted['advanced_value_score'], 1.0)
+        self.assertEqual(persisted['advanced_value_components_used'], 1)
+        self.assertEqual(persisted['factor_payload']['availability']['component_coverage_ratio'], 0.5)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['summary']['ready_count'], 1)
+        self.assertEqual(result['summary']['partial_count'], 1)
+
     def test_rebuild_marks_negative_ebitda_as_invalid_for_scoring(self) -> None:
         service = DailyAdvancedValueFactorService()
         market_date = date(2026, 4, 24)
@@ -691,9 +775,9 @@ class DailyAdvancedValueFactorServiceTests(unittest.TestCase):
         persisted = upsert.call_args.args[0][0]
         self.assertEqual(persisted['ev_to_ebitda_status'], METRIC_STATUS_INVALID_NON_POSITIVE_EBITDA)
         self.assertFalse(persisted['ev_to_ebitda_valid_for_scoring'])
-        self.assertIsNone(persisted['advanced_value_score'])
-        self.assertEqual(persisted['advanced_value_classification'], 'insufficient_components')
-        self.assertEqual(result['summary']['insufficient_components_count'], 1)
+        self.assertEqual(persisted['advanced_value_score'], 1.0)
+        self.assertEqual(persisted['advanced_value_components_used'], 1)
+        self.assertEqual(result['summary']['partial_count'], 1)
 
     def test_rebuild_persists_missing_fundamentals_as_insufficient_fundamentals(self) -> None:
         service = DailyAdvancedValueFactorService()
@@ -1467,6 +1551,25 @@ class DailyAdvancedValueFactorFundamentalsLoaderIntegrationTests(unittest.TestCa
         self.created_event_ids.append(event_id)
         self.created_snapshot_ids.append(snapshot_id)
         return snapshot_id
+
+    def test_loader_keeps_capex_accounts_with_spaced_names(self) -> None:
+        stock_code = f'TAVD{uuid4().hex[:8].upper()}'
+        snapshot_id = self._create_fundamentals_snapshot(
+            stock_code=stock_code, business_year=2025,
+            receipt_date=date(2026, 3, 20), total_equity=1000,
+        )
+        with session_scope() as session:
+            session.add(DartFundamentalsRow(
+                snapshot_id=snapshot_id, row_key='other_intangible',
+                statement_type='CF', statement_name='현금흐름표',
+                account_id='dart_PurchaseOfOtherIntangibleAssets',
+                account_name='기타 무형자산의 취득', current_amount=40,
+                row_order=1, currency='KRW', payload={},
+            ))
+        loaded = self.service._load_latest_annual_fundamentals(
+            market_date=date(2026, 4, 24), symbols=[stock_code],
+        )
+        self.assertEqual(derive_annual_financial_context(loaded[stock_code])['capital_expenditure'], 40.0)
 
     def test_load_latest_annual_fundamentals_respects_receipt_date_for_historical_market_date(self) -> None:
         stock_code = f'TAVD{uuid4().hex[:8].upper()}'

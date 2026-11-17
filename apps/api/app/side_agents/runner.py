@@ -278,11 +278,13 @@ def daily_inputs_ready(market_date: date) -> tuple[bool, str]:
     return ready, f'risk_rows={risk_rows} bar_rows={bar_rows}'
 
 
-def target_market_date(current: datetime, is_trading_day: Callable[[date], bool]) -> date | None:
-    """Today's session after DAILY_DUE_HHMM; before 06:00, the previous session (late pipeline catch-up)."""
+def target_market_date(
+    current: datetime, is_trading_day: Callable[[date], bool], *, due_hhmm: tuple[int, int] = DAILY_DUE_HHMM,
+) -> date | None:
+    """Select today's session once due, or the previous session for overnight catch-up."""
     hhmm = (current.hour, current.minute)
     today = current.date()
-    if hhmm >= DAILY_DUE_HHMM:
+    if hhmm >= due_hhmm:
         return today if is_trading_day(today) else None
     if hhmm < CATCHUP_UNTIL_HHMM:
         day = today - timedelta(days=1)

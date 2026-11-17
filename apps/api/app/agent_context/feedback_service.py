@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Query
 
@@ -11,6 +11,7 @@ from app.db import session_scope
 from app.db_models import AgentContextFeedback
 from app.core.settings import settings
 from app.agent_context.missing_data_taxonomy import build_missing_data_categories, enrich_missing_data_categories
+from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.signal_decider_loop_service import signal_decider_loop_service
 
 BULK_UPSERT_CHUNK_SIZE = 100
@@ -442,10 +443,29 @@ class AgentContextFeedbackRepository:
         symbols: list[str],
         agent_name: str | None = None,
         limit: int = 50,
+        watch_only: bool = False,
     ) -> list[dict[str, Any]]:
         with session_scope() as session:
             stmt = select(AgentContextFeedback)
             stmt = _apply_feedback_filters(stmt, market_date=market_date, symbols=symbols, agent_name=agent_name)
+            if watch_only:
+                payload = AgentContextFeedback.feedback_payload
+                preferred_action = func.lower(func.trim(payload['preferred_action'].as_string()))
+                signal_action = func.lower(func.trim(payload['next_day_open_action'].as_string()))
+                tactical_action = func.lower(func.trim(payload['tactical_action'].as_string()))
+                short_watch_actions = ('wait', 'watch_for_trigger')
+                stmt = stmt.where(or_(
+                    and_(
+                        AgentContextFeedback.agent_name == SIGNAL_DECIDER_AGENT_NAME,
+                        func.coalesce(signal_action, preferred_action) == 'wait',
+                        or_(preferred_action.is_(None), preferred_action == 'wait'),
+                    ),
+                    and_(
+                        AgentContextFeedback.agent_name == SHORT_TERM_DECIDER_AGENT_NAME,
+                        func.coalesce(tactical_action, preferred_action).in_(short_watch_actions),
+                        or_(preferred_action.is_(None), preferred_action.in_(short_watch_actions)),
+                    ),
+                ))
             stmt = stmt.order_by(AgentContextFeedback.received_at.desc(), AgentContextFeedback.id.desc()).limit(limit)
             rows = session.execute(stmt).scalars().all()
             return [
@@ -629,6 +649,7 @@ class AgentContextFeedbackService:
         symbols: Sequence[str],
         agent_name: str | None = None,
         limit: int = 50,
+        watch_only: bool = False,
     ) -> dict[str, Any]:
         normalized_market_date = _normalize_market_date(market_date)
         normalized_symbols = _normalize_symbols(symbols)
@@ -638,6 +659,7 @@ class AgentContextFeedbackService:
             symbols=normalized_symbols,
             agent_name=normalized_agent_name,
             limit=limit,
+            watch_only=watch_only,
         )
         return {
             'request': {
@@ -645,6 +667,7 @@ class AgentContextFeedbackService:
                 'symbols': normalized_symbols,
                 'agent_name': normalized_agent_name,
                 'limit': limit,
+                **({'watch_only': True} if watch_only else {}),
             },
             'summary': {'count': len(items)},
             'items': items,

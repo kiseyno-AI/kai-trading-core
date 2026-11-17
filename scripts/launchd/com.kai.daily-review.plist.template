@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>__ROOT__/scripts/run_side_agents.sh</string><string>__LABEL__</string></array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>__ROOT__/var/side-agents/logs/__LABEL__.out</string>
+  <key>StandardErrorPath</key><string>__ROOT__/var/side-agents/logs/__LABEL__.err</string>
+</dict>
+</plist>

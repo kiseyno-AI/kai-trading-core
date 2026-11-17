@@ -53,16 +53,17 @@ def test_default_check_is_read_only_and_reports_version_and_hash(tmp_path: Path)
     assert target.stat().st_mtime_ns == before.st_mtime_ns
 
 
-def test_explicit_check_supports_short_term_decider(tmp_path: Path) -> None:
+@pytest.mark.parametrize("role", ["short-term-decider", "weekly-learning-analyst"])
+def test_explicit_check_supports_contract_role(tmp_path: Path, role: str) -> None:
     openclaw_home = tmp_path / ".openclaw"
-    target = openclaw_home / "workspace-short-term-decider" / "AGENTS.md"
+    target = openclaw_home / f"workspace-{role}" / "AGENTS.md"
     target.parent.mkdir(parents=True)
     template = (
         REPO_ROOT
         / "runtime_contracts"
         / "openclaw"
         / "v1"
-        / "short-term-decider"
+        / role
         / "AGENTS.md"
     )
     target.write_bytes(template.read_bytes())
@@ -75,7 +76,7 @@ def test_explicit_check_supports_short_term_decider(tmp_path: Path) -> None:
             "--openclaw-home",
             str(openclaw_home),
             "--agent",
-            "short-term-decider",
+            role,
         ],
         check=False,
         capture_output=True,
@@ -83,7 +84,7 @@ def test_explicit_check_supports_short_term_decider(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "agent=short-term-decider" in result.stdout
+    assert f"agent={role}" in result.stdout
     assert "version=v1" in result.stdout
     assert "status=match" in result.stdout
 

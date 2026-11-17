@@ -8,6 +8,7 @@ import stat
 import tempfile
 from urllib.parse import unquote
 import zipfile
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,11 @@ import httpx
 
 from app.core.audit_logging import log_fetch_event, request_read_with_retry_and_audit
 from app.core.settings import settings
+from app.market.symbol_codes import (
+    KRX_EQUITY_MARKETS,
+    is_krx_preferred_share,
+    normalize_krx_short_code,
+)
 
 
 class DartAPIError(RuntimeError):
@@ -37,10 +43,12 @@ class DartClient:
         self,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        krx_stock_name_loader: Callable[[list[str]], dict[str, str]] | None = None,
     ) -> None:
         self.base_url = settings.dart_base_url.rstrip('/')
         self.api_key = settings.dart_api_key
         self.transport = transport
+        self._krx_stock_name_loader = krx_stock_name_loader
         self._corp_codes: list[dict[str, str]] = []
         self._corp_codes_loaded_at: datetime | None = None
         self._corp_codes_source = 'uninitialized'
@@ -253,11 +261,6 @@ class DartClient:
         )
         return payload
 
-    async def has_supported_stock_code(self, stock_code: str) -> bool:
-        normalized_stock_code = stock_code.strip().zfill(6)
-        corp_codes = await self._load_corp_codes()
-        return any(item['stock_code'] == normalized_stock_code for item in corp_codes)
-
     def corp_code_mapping_authority(self) -> dict[str, Any]:
         return {
             'source': self._corp_codes_source,
@@ -290,9 +293,21 @@ class DartClient:
 
         if stock_code:
             normalized_stock_code = stock_code.strip().zfill(6)
-            corp = await self._find_corp(lambda item: item['stock_code'] == normalized_stock_code)
-            if corp:
-                return corp
+            corp_codes = await self._load_corp_codes()
+            for corp in corp_codes:
+                if corp['stock_code'] == normalized_stock_code:
+                    return corp
+            if self._corp_codes_authoritative:
+                recovered, conflicts = await self._recover_missing_stock_mappings(
+                    corp_codes, [normalized_stock_code],
+                )
+                if normalized_stock_code in recovered:
+                    return recovered[normalized_stock_code]
+                if conflicts:
+                    raise DartLookupError(
+                        f'Unverified mapping for stock_code {normalized_stock_code}: '
+                        f'{conflicts[0]["reason"]}'
+                    )
             raise DartLookupError(f'Unknown stock_code: {normalized_stock_code}')
 
         if corp_name:
@@ -355,6 +370,14 @@ class DartClient:
             if stock_code not in resolved_by_stock
             and stock_code not in candidates_by_stock
         ]
+        if self._corp_codes_authoritative:
+            recovered, fallback_conflicts = await self._recover_missing_stock_mappings(
+                corp_codes, absent_stock_codes,
+            )
+            resolved_by_stock.update(recovered)
+            conflicting_mappings.extend(fallback_conflicts)
+            attempted = recovered.keys() | {item['stock_code'] for item in fallback_conflicts}
+            absent_stock_codes = [code for code in absent_stock_codes if code not in attempted]
         if not self._corp_codes_authoritative:
             conflicting_mappings.extend(
                 {
@@ -401,6 +424,60 @@ class DartClient:
             'conflicting_mappings': conflicting_mappings,
             'mapping_authority': self.corp_code_mapping_authority(),
         }
+
+    async def _recover_missing_stock_mappings(
+        self,
+        corp_codes: list[dict[str, str]],
+        stock_codes: list[str],
+    ) -> tuple[dict[str, dict[str, str]], list[dict[str, Any]]]:
+        if not stock_codes or self._krx_stock_name_loader is None:
+            return {}, []
+
+        stock_names = await asyncio.to_thread(self._krx_stock_name_loader, stock_codes)
+        candidates_by_name: dict[str, list[dict[str, str]]] = {
+            name.strip().casefold(): [] for name in stock_names.values() if name.strip()
+        }
+        if not candidates_by_name:
+            return {}, []
+        listed_corp_codes: set[str] = set()
+        for corp in corp_codes:
+            candidates = candidates_by_name.get(corp['corp_name'].strip().casefold())
+            if candidates is not None:
+                candidates.append(corp)
+            if corp['stock_code']:
+                listed_corp_codes.add(corp['corp_code'])
+
+        recovered: dict[str, dict[str, str]] = {}
+        conflicts: list[dict[str, Any]] = []
+        for stock_code in stock_codes:
+            name = stock_names.get(stock_code, '').strip().casefold()
+            candidates = candidates_by_name.get(name, [])
+            blank_code_candidates = [corp for corp in candidates if not corp['stock_code']]
+            if not blank_code_candidates:
+                continue
+            candidate_codes = sorted({corp['corp_code'] for corp in candidates})
+            reason = 'ambiguous_company_name'
+            if len(candidate_codes) == 1 and candidate_codes[0] not in listed_corp_codes:
+                candidate = blank_code_candidates[0]
+                try:
+                    overview = await self.fetch_company_overview(candidate['corp_code'])
+                except (DartAPIError, httpx.HTTPError, ValueError, AttributeError):
+                    reason = 'company_overview_lookup_failed'
+                else:
+                    # The name only locates a candidate. DART must confirm its stock code.
+                    if (
+                        overview.get('status') == '000'
+                        and normalize_krx_short_code(overview.get('stock_code')) == stock_code
+                    ):
+                        recovered[stock_code] = {**candidate, 'stock_code': stock_code}
+                        continue
+                    reason = 'company_overview_stock_code_unconfirmed'
+            conflicts.append({
+                'stock_code': stock_code,
+                'corp_codes': candidate_codes,
+                'reason': reason,
+            })
+        return recovered, conflicts
 
     async def _find_corp(self, predicate) -> dict[str, str] | None:
         corp_codes = await self._load_corp_codes()
@@ -911,4 +988,18 @@ class DartClient:
             raise DartAPIError(f'DART request failed [{status}]: {message}')
 
 
-dart_client = DartClient()
+def _load_krx_stock_names(stock_codes: list[str]) -> dict[str, str]:
+    from app.repositories.symbol_repository import load_symbols
+
+    rows = load_symbols(
+        is_active=True, markets=sorted(KRX_EQUITY_MARKETS), symbols=stock_codes,
+    )
+    return {
+        row['symbol']: row['name_ko']
+        for row in rows
+        if row['instrument_type'] == 'equity'
+        and not is_krx_preferred_share(row['symbol'], row['name_ko'], row['market'])
+    }
+
+
+dart_client = DartClient(krx_stock_name_loader=_load_krx_stock_names)

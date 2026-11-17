@@ -4,11 +4,14 @@ Source paths are under `apps/api/app/`. A factor output row can carry an empty s
 
 The first-run factor group in `eod/pykrx_pipeline_runner.py` runs momentum, basic value, low-risk and beta over the verified price cohort. DART-dependent stages use the applicable DART/Piotroski cohort. An aggregate partial factor result can still provide its proven successful cohort for the signal-feature and feedback path. The explicit/resume executor in `eod/daily_pipeline_stages.py` applies dependency proofs and may narrow the symbol scope. Do not treat a smaller returned scope or an old stored row as evidence that an omitted symbol succeeded in this attempt.
 
+Status and feedback prerequisites accept a fully published nullable supporting-factor scope as degraded context when authoritative coverage explicitly sets `publication_readiness_required=false` and ready/degraded counts account for every present row. This applies to both requested and exact-universe scopes, including an all-null scope. Missing rows, invalid coverage, required or unknown readiness, and failed dependencies still block; this context rule does not create an atomic stage-completion proof or waive strategy requirements.
+
 For a mixed explicit/resumed scope, keep proven preferred-share Piotroski exemptions only for supported signal, news and feedback stages. A symbol still needs its own price and supported factor evidence. An isolated preferred-only scope does not produce a common-share factor proof. Diagnose that scope separately from an applicable symbol whose factor row contains a null score.
 
 ## 10. fundamentals_daily_refresh
 
 - **Input and output** — Applicable KRX issuers, DART mappings, filing events and existing snapshots. Updates `dart_fundamentals_snapshots` and `dart_fundamentals_rows`. Output also records fresh, missing, deferred and retry-debt states.
+- **Mapping** — For an active KRX equity missing from an authoritative DART company list, its name can locate a single company whose listed stock code is blank. The DART company overview must confirm the exact requested stock code. Conflicts and lookup failures stay retryable. The scheduled and explicit runs share this resolver.
 - **Completion and blocking** — For a requested scope, count only verified preferred symbols in its terminal not-applicable partition as satisfying the DART dependency without DART rows. A valid no-new-filing or no-data result can finish with no new statement. Agent prerequisite checks accept zero captures when the entire requested DART scope is proven. Inspect mapping failures, actual provider/capture errors, retryable filing backlog and missing authority separately. A completed incremental check does not prove that usable annual statements exist.
 - **Trace** — `dart/fundamentals_capture_service.py::run_daily_incremental_refresh` and `GET /disclosures/dart/fundamentals/daily/inspect`. To explain a financial gap, inspect filings and saved snapshots as of the pipeline cutoff, then check the newest chosen annual report, comparative columns and CFS/OFS selection. Distinguish no annual snapshots, fields absent in the selected report, and fields the parser missed.
 
@@ -45,7 +48,7 @@ For a mixed explicit/resumed scope, keep proven preferred-share Piotroski exempt
 ## 16. advanced_value_factors
 
 - **Input and output** — Exact-date prices and market cap with selected annual DART inputs. Writes `daily_advanced_value_factor_results`. Uses free-cash-flow yield and EV/EBITDA.
-- **Completion and blocking** — The combined score requires both components. Operating cash flow, CAPEX, D&A, positive EBITDA and valid EV are metric inputs. Unknown values remain unknown, including missing D&A. Distinguish a missing raw account from a recognized account excluded by the DB prefilter before matching. DART non-applicability, normal missing input and real compute/write debt are separate.
+- **Completion and blocking** — The v2 score renormalizes equal weights over available component percentiles. One valid component supports a score, with the used component count and coverage ratio retained. Operating cash flow, CAPEX, D&A, positive EBITDA and valid EV are individual metric inputs. Unknown values remain unknown, including missing D&A. Distinguish a missing raw account from a recognized account excluded by the DB prefilter before matching. DART non-applicability, normal missing input and real compute/write debt are separate.
 - **Trace** — `signals/advanced_value_factor.py` and `GET /eod/advanced-value-factors`. Check the selected annual raw rows and matcher predicates before assuming the issuer omitted an item.
 
 ## 17. unified_value_factors

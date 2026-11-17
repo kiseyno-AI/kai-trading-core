@@ -394,6 +394,15 @@ class DailySignalFeatureAuthorityTests(unittest.TestCase):
             None,
             None,
             None,
+            None,  # trigger
+            None,  # invalidation
+            None,  # support
+            None,  # resistance
+            100,   # close
+            97,    # low
+            103,   # high
+            4000,  # turnover
+            captured_at,
             3,
             1,
             999.99,
@@ -439,6 +448,8 @@ class DailySignalFeatureAuthorityTests(unittest.TestCase):
         self.assertIsNone(rows[0]['volume_power_rank'])
         self.assertIsNone(rows[0]['overtime_volume_rank'])
         self.assertEqual(rows[0]['overtime_fluctuation_rank'], 3)
+        self.assertEqual(rows[0]['session_low_price'], 97)
+        self.assertEqual(rows[0]['price_captured_at'], captured_at.isoformat())
         sql = str(statements[0].compile(dialect=postgresql.dialect())).lower()
         self.assertIn('join daily_price_bars', sql)
 

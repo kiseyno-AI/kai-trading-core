@@ -164,9 +164,10 @@ class MarketNewsService:
         start: datetime | None = None,
         end: datetime | None = None,
         as_of: datetime | None = None,
+        persisted_before: datetime | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """Newest first. ``as_of`` keeps only articles Core had seen before it."""
+        """Newest first, with optional cutoffs for observation and persisted revision."""
 
         query = select(MarketNewsItem).order_by(
             MarketNewsItem.published_at.desc().nullslast(), MarketNewsItem.id.desc()
@@ -179,6 +180,8 @@ class MarketNewsService:
             query = query.where(MarketNewsItem.published_at < end)
         if as_of is not None:
             query = query.where(MarketNewsItem.first_seen_at < as_of)
+        if persisted_before is not None:
+            query = query.where(MarketNewsItem.created_at < persisted_before, MarketNewsItem.updated_at < persisted_before)
         with session_scope() as session:
             rows = session.execute(query.limit(max(1, min(int(limit), 500)))).scalars().all()
             return [

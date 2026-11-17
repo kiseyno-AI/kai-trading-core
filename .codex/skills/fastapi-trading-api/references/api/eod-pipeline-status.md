@@ -5,6 +5,8 @@ Operator-facing live status API for the post-close EOD pipeline.
 
 Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 
+Stage processing and execution eligibility are distinct: a completed scheduled plan with an exact, validated decision partition and no eligible handoff remains `completed`, even if every candidate is below the confidence threshold. Per-item exclusions remain intact and this status grants no execution authority. DART `symbols_missing` is the initial snapshot gap; normal provider no-data is informational, while malformed responses and request/processing/storage failures remain errors. Use `snapshot_availability` for current availability and retry debt.
+
 Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the first-class durable daily pipeline run state first, merges same-date historical official stage rows when the latest run is only a resumed subset, then falls back to persisted-row and source-run inference for stages with no official stage row. It reports the current stage status from master refresh through signal-decider evaluations for the requested `market_date`.
 
 Automatic `/eod/pykrx/daily/run-if-due` runs publish official daily pipeline run state for their scheduled PyKRX stages and chained follow-ups. The official run remains active until the follow-ups finish or fail. If a currently active auto run has no official rows, the route promotes non-PyKRX follow-up entries from `eod_collection_runs.run_metadata.stage_progress` as live stage progress so `running_stages`, `current_stage`, source run IDs, timestamps, and stale-running threshold metadata are still visible.
@@ -22,6 +24,17 @@ By default, dashboard/status reads omit expensive row-count missing-symbol sampl
 When `market_date` is omitted, the route answers from a short in-process cache per query-flag combination: a result younger than 10 s is returned as is; an older one (up to 60 s) is returned immediately while a background rebuild runs, so polling dashboards get millisecond responses with data at most about 30 s old (`generated_at` shows when it was built). Only the first read after a restart, or after 60 s with no reads, waits for a full rebuild. Reads with an explicit `market_date` are always computed fresh.
 
 When diagnostics are enabled, row-count-derived stages expose missing-row diagnostics when they are partial. For example, `market_risk_filter.details.missing_count` and `missing_symbols_sample` show the full-universe coverage gap, while `gate_status`, `severity`, and `blocking_status` tell feedback/dashboard consumers whether that gap blocks the active feedback scope.
+
+For Piotroski, advanced value, unified value, quality, and composite stages,
+row coverage excludes verified preferred shares from the applicable denominator.
+`details.not_applicable_count` and `not_applicable_symbols_sample` identify those
+shares in both lightweight and detailed responses. Missing counts concern the
+remaining applicable symbols. A stored row with a null score still counts as a
+published row.
+
+`fundamentals_daily_refresh.details.snapshot_availability` reports existing
+snapshot reuse, refreshed snapshots, unavailable data, and retry debt. No new
+filing leaves a previously captured valid snapshot usable.
 
 When a same-day feedback run is active, `agent_feedback_summaries` reflects the run from feedback runtime/durable state even if no official daily pipeline stage row exists. That keeps active feedback progress separate from upstream degraded coverage.
 
@@ -45,6 +58,11 @@ available as `source_status`, while
 included in `running_stages` or selected as current live work.
 
 Pre-open/global stages such as `master_refresh` and `pykrx_universe_refresh` may be `skipped` with reason metadata once same-date downstream output exists and there is no active/pre-open official stage row. This prevents `current_stage` from pointing at `master_refresh` after a resumed EOD or agent-stage recovery has already completed.
+
+When the same-date collection run records `universe_refreshed=true` with a
+complete, verified same-date membership snapshot, `pykrx_universe_refresh`
+reports `completed` and its verified symbol count. An unexecuted master refresh
+reports `skipped` with `reason=preopen_stage_not_executed_in_market_date_run`.
 
 ## Example request
 ```http

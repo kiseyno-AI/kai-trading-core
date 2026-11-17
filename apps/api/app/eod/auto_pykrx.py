@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 
 from app.core.settings import settings
+from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
 from app.eod.pykrx_backfill import DEFAULT_MARKETS, PYKRX_BACKFILL_SERVICE
 from app.eod.pykrx_pipeline_support import (
     build_daily_skip_result,
@@ -28,6 +29,15 @@ _INCOMPLETE_UNIVERSE_ERROR_PREFIX = (
 _INCOMPLETE_UNIVERSE_RETRY_BASE_MINUTES = 30
 _INCOMPLETE_UNIVERSE_RETRY_MAX_MINUTES = 240
 _RECOVERY_WINDOW_SESSION_COUNT = 5
+_RECOVERY_IN_PROGRESS_REASONS = frozenset(
+    {
+        'already_running',
+        'followup_recovery_already_running',
+        'overlapping_run_already_active',
+        'pipeline_run_ownership_lost',
+        'stale_run_requires_explicit_reconciliation',
+    }
+)
 
 
 class RecoveryOnlyScheduleDisposition(StrEnum):
@@ -70,6 +80,39 @@ def _scheduled_pipeline_result_status(result: dict) -> str:
     ):
         return 'completed'
     return 'completed' if result.get('triggered') else 'skipped'
+
+
+def _historical_recovery_stalled(result: dict) -> bool:
+    if (
+        result.get('status') in {'running', 'queued'}
+        or result.get('reason') in _RECOVERY_IN_PROGRESS_REASONS
+    ):
+        return False
+    if not daily_pipeline_outcome_is_satisfied(result):
+        return True
+
+    recovery = result.get('followup_recovery') or {}
+    convergence = recovery.get('state_convergence') or {}
+    if convergence.get('updated') is False:
+        return True
+
+    # A full run's top-level status can describe only price collection.
+    for key in (
+        'fundamentals_followup',
+        'piotroski_filter_followup',
+        'factor_scoring_followup',
+        'signal_feature_followup',
+        'feedback_followup',
+        'signal_decider_followup',
+        'next_open_execution_plan_followup',
+    ):
+        followup = result.get(key) or {}
+        if followup.get('status') in {
+            'blocked', 'failed', 'waiting', 'interrupted', 'abandoned',
+            'partial', 'completed_with_errors',
+        } and not daily_pipeline_outcome_is_satisfied(followup):
+            return True
+    return False
 
 
 def _parse_markets(raw: str | None) -> tuple[str, ...]:
@@ -164,6 +207,7 @@ class AutoPykrxEODScheduler:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._state = AutoPykrxEODState()
+        self._deferred_historical_recovery_for: str | None = None
 
     @property
     def state(self) -> AutoPykrxEODState:
@@ -259,20 +303,69 @@ class AutoPykrxEODScheduler:
             self._task = None
             self._state.active_task = False
 
+        previous_session_date = None
+        uncollected_previous_session = None
         try:
             recovery_window_latest_date = (
                 current_market_date
                 if market.is_trading_day
                 else market.latest_valid_trading_date or current_market_date
             )
-            recovery_window_start_date = await _oldest_recovery_window_date(
-                recovery_window_latest_date
-            )
+            if (
+                not recovery_only
+                and market.state == 'CLOSED'
+                and self._deferred_historical_recovery_for == current_market_date
+            ):
+                recovery_window_start_date = current_market_date
+            else:
+                recovery_window_start_date = await _oldest_recovery_window_date(
+                    recovery_window_latest_date
+                )
             recovery_target = await asyncio.to_thread(
                 load_oldest_outstanding_auto_eod_recovery_target,
                 on_or_after=recovery_window_start_date,
                 on_or_before=current_market_date,
             )
+            if recovery_only and market.state == 'PREOPEN':
+                previous_session_date = await async_previous_krx_trading_date(
+                    date.fromisoformat(current_market_date),
+                    allow_fallback=True,
+                )
+                if previous_session_date is None:
+                    self._state.last_status = 'blocked'
+                    self._state.last_reason = 'previous_session_calendar_unavailable'
+                    return RecoveryOnlyScheduleDisposition.UNKNOWN
+                if (
+                    recovery_target is None
+                    or recovery_target.trade_date != previous_session_date.isoformat()
+                ):
+                    previous_date = previous_session_date.isoformat()
+                    previous_target = await asyncio.to_thread(
+                        load_oldest_outstanding_auto_eod_recovery_target,
+                        on_or_after=previous_date,
+                        on_or_before=previous_date,
+                    )
+                    if previous_target is not None:
+                        recovery_target = previous_target
+                    else:
+                        previous_run = await asyncio.to_thread(
+                            load_latest_eod_collection_run,
+                            market='KRX',
+                            trade_date=previous_date,
+                            source='pykrx',
+                        )
+                        previous_metadata = (previous_run or {}).get('run_metadata') or {}
+                        previous_total = int((previous_run or {}).get('symbols_total') or 0)
+                        previous_complete = (
+                            previous_metadata.get('mode') == 'daily_auto'
+                            and str(previous_run.get('trigger') or '').startswith('auto_')
+                            and previous_total > 0
+                            and int(previous_run.get('symbols_succeeded') or 0) == previous_total
+                            and _terminal_run_skip_reason(previous_run) is not None
+                        )
+                        if not previous_complete:
+                            recovery_target = None
+                            uncollected_previous_session = previous_date
         except Exception as exc:
             logger.exception('Could not inspect automatic EOD recovery state: %s', exc)
             self._state.last_status = 'blocked'
@@ -286,7 +379,7 @@ class AutoPykrxEODScheduler:
         recovery_market_date = (
             recovery_target.trade_date
             if recovery_target is not None
-            else None
+            else uncollected_previous_session
         )
         older_recovery_due = (
             recovery_market_date is not None
@@ -300,12 +393,6 @@ class AutoPykrxEODScheduler:
                 self._state.last_reason = 'no_older_recovery_debt'
                 return RecoveryOnlyScheduleDisposition.NO_DEBT
             if market.state == 'PREOPEN':
-                previous_session_date = (
-                    await async_previous_krx_trading_date(
-                        date.fromisoformat(current_market_date),
-                        allow_fallback=True,
-                    )
-                )
                 previous_session_preopen_recovery_due = bool(
                     previous_session_date is not None
                     and recovery_market_date
@@ -460,6 +547,11 @@ class AutoPykrxEODScheduler:
                     if recovery_target is not None
                     else {}
                 ),
+                **(
+                    {'fallback_market_date': current_market_date}
+                    if older_recovery_due and not recovery_only and market.state == 'CLOSED'
+                    else {}
+                ),
             ),
             name='auto-pykrx-eod',
         )
@@ -476,6 +568,7 @@ class AutoPykrxEODScheduler:
         markets: tuple[str, ...] | None = None,
         point_in_time_recovery: bool = False,
         recovery_eod_run_id: int | None = None,
+        fallback_market_date: str | None = None,
     ) -> None:
         resolved_markets = markets or _parse_markets(settings.eod_auto_pykrx_markets)
         try:
@@ -497,8 +590,12 @@ class AutoPykrxEODScheduler:
             self._state.last_result = compact_daily_pipeline_result(result)
             self._state.last_status = _scheduled_pipeline_result_status(result)
             self._state.last_reason = result.get('reason') or result.get('status')
+            if fallback_market_date is not None and _historical_recovery_stalled(result):
+                self._deferred_historical_recovery_for = fallback_market_date
         except Exception as exc:
             logger.exception('Automatic pykrx EOD scheduler failed for %s: %s', market_date, exc)
+            if fallback_market_date is not None:
+                self._deferred_historical_recovery_for = fallback_market_date
             error_message = str(exc)
             if error_message.startswith(_INCOMPLETE_UNIVERSE_ERROR_PREFIX):
                 same_failure_scope = (

@@ -21,6 +21,7 @@ AGENT_WORKSPACES = {
     "short-term-decider": "workspace-short-term-decider",
     "signal-decider": "workspace-signal-decider",
     "technical-summarizer": "workspace-technical-summarizer",
+    "weekly-learning-analyst": "workspace-weekly-learning-analyst",
 }
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -3,11 +3,20 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import unittest
+from unittest.mock import patch
 
+from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent_context.signal_decider_weekly_learning_service import (
     SignalDeciderWeeklyLearningService,
+)
+from app.db_models import (
+    Base,
+    SignalDeciderActualExecutionOutcome,
+    SignalDeciderDecisionSnapshot,
+    SignalDeciderWeeklyLearningArtifact,
 )
 
 
@@ -255,6 +264,76 @@ class RacingWeeklyLearningRepository(FakeWeeklyLearningRepository):
 
 
 class SignalDeciderWeeklyLearningServiceTests(unittest.TestCase):
+    def test_publish_includes_stored_closed_trade_after_database_read(self) -> None:
+        engine = create_engine('sqlite+pysqlite:///:memory:')
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                SignalDeciderDecisionSnapshot.__table__,
+                SignalDeciderActualExecutionOutcome.__table__,
+                SignalDeciderWeeklyLearningArtifact.__table__,
+            ],
+        )
+        market_date = date(2026, 10, 8)
+        model = 'openai/gpt-6.1-sol'
+        with Session(engine) as session, session.begin():
+            session.add(SignalDeciderDecisionSnapshot(
+                id=1,
+                market_date=market_date,
+                symbol='005930',
+                thesis_summary='Closed trade',
+                supporting_evidence_payload=[],
+                decision_risks_payload=[],
+                invalidation_conditions_payload=[],
+                data_quality_warnings_payload=[],
+                specialist_disagreement_payload=[],
+                traceability_payload={},
+                input_feature_snapshot_payload={},
+                request_payload={},
+                response_payload={},
+                response_summary_payload={'model_identity': {
+                    'actual_model_ref': model,
+                    'verified': True,
+                    'verification_basis': 'post_dispatch_session_observation',
+                }},
+            ))
+            session.add(SignalDeciderActualExecutionOutcome(
+                decision_snapshot_id=1,
+                entry_plan_item_id=1,
+                market_date=market_date,
+                source_market_date=market_date,
+                target_trade_date=date(2026, 10, 9),
+                account_reference='test',
+                symbol='005930',
+                policy_version='signal_decider_policy_v1',
+                lifecycle_status='closed',
+                entry_filled_quantity=1,
+                exit_filled_quantity=1,
+                closed_quantity=1,
+                open_quantity=0,
+                entry_average_fill_price=10000,
+                exit_average_fill_price=11000,
+                entry_notional_krw=10000,
+                exit_notional_krw=11000,
+                realized_pnl_krw=1000,
+            ))
+        service = SignalDeciderWeeklyLearningService(calibration_service=FakeCalibrationService())
+        with (
+            patch('app.db.SessionLocal', sessionmaker(bind=engine)),
+            patch('app.agent_context.signal_decider_weekly_learning_service.expected_decider_model', return_value=model),
+        ):
+            result = service.publish(
+                week_start=date(2026, 10, 5),
+                week_end=date(2026, 10, 11),
+                evidence_manifest=_evidence_manifest(),
+            )
+
+        self.assertEqual(result['status'], 'published')
+        execution = result['artifact']['learning_context']['performance_criteria']['actual_execution']
+        self.assertEqual(execution['eligible_count'], 1)
+        self.assertEqual(execution['total_realized_pnl_krw'], '1000.00')
+
     def test_horizon_five_publish_uses_mature_prior_rolling_cohorts(self) -> None:
         calibration_service = MaturityAwareCalibrationService()
         service = SignalDeciderWeeklyLearningService(

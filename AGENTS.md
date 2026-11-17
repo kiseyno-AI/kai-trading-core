@@ -8,6 +8,7 @@ This repository is part of the KAI trading system — **backend / core API** (Fa
 - Before doing task work, create and switch to a dedicated branch for that task. Writable agents own branch creation, switching, cleanup, and PR workflow; read-only agents must stay within the provided branch context without performing checkout or branch mutation steps themselves.
 - Prefer simple, practical architecture over premature complexity.
 - Keep modules loosely coupled and clearly named.
+- For every KRX daily pipeline change, check both the scheduled whole-day PyKRX path and `DailyPipelineStageService` for explicit runs and recovery. Apply shared behavior in both paths and verify both using the [KRX daily pipeline checklist](.codex/skills/krx-daily-pipeline/SKILL.md).
 - Update docs when structure or design changes.
 - Do not add live-trading or order-execution behavior without explicit approval.
 - Commit clear, scoped changes.

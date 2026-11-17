@@ -336,6 +336,21 @@ async def get_exec_signal_decider_overview(
         raise HTTPException(status_code=500, detail=f'Exec signal-decider overview read failed: {exc}') from exc
 
 
+@router.get('/next-open-execution/overview')
+async def list_next_open_execution_overview(
+    target_trade_date: date | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        return await run_in_threadpool(
+            signal_decider_next_open_execution_service.list_plan_overview,
+            target_trade_date=target_trade_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail='Next-open execution overview read failed') from exc
+
+
 @router.get('/next-open-execution')
 async def list_next_open_execution_plan(
     target_trade_date: date | None = Query(default=None),

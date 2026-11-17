@@ -4,10 +4,14 @@ from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from app.api import routes_agent_context
 from app.agent_context.prerequisite_service import FEEDBACK_DATA_PREREQUISITE_STAGE_ORDER
 from app.agent_context.runtime_state import RuntimeFeedbackStateStore
+from app.db_models import AgentContextFeedback
 
 
 def _feedback_prerequisites(*, status: str = 'ready', missing_stage_ids: list[str] | None = None) -> dict:
@@ -1943,6 +1947,56 @@ class AgentContextRouteTests(unittest.TestCase):
         self.assertEqual(fake_service.list_args['agent_name'], 'openclaw')
         self.assertEqual(fake_service.list_args['limit'], 10)
         self.assertEqual(response.json()['items'][0]['symbol'], '005930')
+
+    def test_feedback_payloads_watch_only_filters_lane_actions_before_limit(self):
+        engine = create_engine(
+            'sqlite+pysqlite://',
+            connect_args={'check_same_thread': False},
+            poolclass=StaticPool,
+        )
+        self.addCleanup(engine.dispose)
+        AgentContextFeedback.__table__.create(engine)
+        market_date = date(2026, 4, 14)
+        signal = 'signal-decider'
+        short = 'short-term-decider'
+        rows = [
+            ('005930', signal, {'next_day_open_action': 'wait', 'trigger_price': 70000}),
+            ('005930', short, {'tactical_action': 'watch_for_trigger', 'preferred_action': 'wait', 'trigger_price': 71000}),
+            ('000660', signal, {'preferred_action': ' WAIT '}),
+            ('000660', short, {'tactical_action': 'avoid_chase', 'preferred_action': 'wait', 'decision_action': 'wait'}),
+            ('035420', short, {'tactical_action': 'unknown', 'preferred_action': 'wait'}),
+            ('035420', signal, {'next_day_open_action': 'reject', 'preferred_action': 'wait'}),
+            ('035720', signal, {'next_day_open_action': 'wait', 'preferred_action': 'reject'}),
+            ('068270', short, {'decision_action': 'wait'}),
+            ('051910', 'technical-summarizer', {'preferred_action': 'wait'}),
+        ]
+        with Session(engine) as session:
+            for symbol, agent_name, payload in rows:
+                session.add(AgentContextFeedback(
+                    market_date=market_date,
+                    symbol=symbol,
+                    agent_name=agent_name,
+                    summary_payload={},
+                    feedback_payload=payload,
+                ))
+            session.commit()
+
+        client = TestClient(self.app)
+        path = '/agent-context/feedback/payloads'
+        params = {'market_date': market_date.isoformat(), 'symbols': list(dict.fromkeys(row[0] for row in rows))}
+        with patch('app.agent_context.feedback_service.session_scope', side_effect=lambda: Session(engine)):
+            response = client.get(path, params={**params, 'watch_only': 'true', 'limit': 3})
+            audit_response = client.get(path, params={**params, 'symbols': '000660'})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            {(item['symbol'], item['agent_name'], item['payload'].get('trigger_price')) for item in response.json()['items']},
+            {('005930', signal, 70000), ('005930', short, 71000), ('000660', signal, None)},
+        )
+        self.assertTrue(response.json()['request']['watch_only'])
+        self.assertEqual(audit_response.status_code, 200, audit_response.text)
+        self.assertNotIn('watch_only', audit_response.json()['request'])
+        self.assertEqual({item['agent_name'] for item in audit_response.json()['items']}, {signal, short})
 
     def test_agent_feedback_data_gap_summary_route_calls_service(self):
         fake_service = FakeAgentContextMissingDataReportService()
