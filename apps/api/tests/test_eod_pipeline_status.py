@@ -1036,6 +1036,37 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 self.assertEqual(plan['status'], 'completed')
                 self.assertNotIn('completion_scope_proof', plan['details'])
 
+    def test_scheduled_no_handoff_malformed_parent_progress_fails_closed(self):
+        mutations = {
+            'missing_progress': lambda parent: parent.pop('progress'),
+            'missing_summary': lambda parent: parent['progress'].pop('summary'),
+            'missing_role_progress': lambda parent: parent['progress']['summary'].pop(
+                'role_progress'
+            ),
+            'missing_completed_feedback_count': lambda parent: parent['progress']['summary'].pop(
+                'completed_feedback_count'
+            ),
+            'integer_role_progress_state': lambda parent: parent['progress']['summary'][
+                'role_progress'
+            ].__setitem__('signal-decider', 7),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(case=name):
+                stages = self._scheduled_no_handoff_stages()
+                parent = stages['signal_decider']['details']['result_summary']
+                mutate(parent)
+                with patch.object(
+                    EODPipelineStatusService,
+                    '_signal_decider_has_legacy_completion_proof',
+                    return_value=True,
+                ):
+                    self.assertFalse(
+                        EODPipelineStatusService._scheduled_no_handoff_plan_completed(
+                            decider=stages['signal_decider'],
+                            plan=stages['next_open_execution_plan'],
+                        )
+                    )
+
     def test_scheduled_no_handoff_does_not_hide_incomplete_or_mismatched_results(self):
         mutations = {
             'parent_pending': ('parent', {'final_pending': 1}),

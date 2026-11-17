@@ -2468,19 +2468,30 @@ class EODPipelineStatusService:
             and _strict_non_negative_int(summary, 'monitor_candidate_count') == 0
         ):
             return False
-        parent_summary = parent['progress']['summary']
+        parent_progress = parent.get('progress')
+        if not isinstance(parent_progress, dict):
+            return False
+        parent_summary = parent_progress.get('summary')
+        if not isinstance(parent_summary, dict):
+            return False
         scopes = parent_summary.get('role_symbol_scopes')
-        role_progress = parent_summary['role_progress']
+        role_progress = parent_summary.get('role_progress')
         partition = manifest.get('decision_partition')
         if not (
             isinstance(scopes, dict)
             and set(scopes) == set(DECISION_SUPPORT_AGENT_NAMES)
+            and isinstance(role_progress, dict)
             and set(role_progress) == set(scopes)
             and all(
                 isinstance(symbols, list)
                 and all(isinstance(symbol, str) for symbol in symbols)
                 and len(symbols) == len(set(symbols))
-                and len(symbols) == role_progress[role]['completed_symbols']
+                and isinstance(role_progress.get(role), dict)
+                and len(symbols)
+                == _strict_non_negative_int(
+                    role_progress[role],
+                    'completed_symbols',
+                )
                 for role, symbols in scopes.items()
             )
             and manifest.get('role_symbol_scopes') == {
@@ -2488,7 +2499,10 @@ class EODPipelineStatusService:
             }
             and isinstance(partition, list)
             and len(partition) == manifest.get('decision_count')
-            == parent_summary['completed_feedback_count']
+            == _strict_non_negative_int(
+                parent_summary,
+                'completed_feedback_count',
+            )
         ):
             return False
         expected = {(symbol, role) for role, symbols in scopes.items() for symbol in symbols}
