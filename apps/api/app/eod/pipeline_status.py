@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
-from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.core.settings import settings
 from app.db import session_scope
@@ -41,7 +43,10 @@ from app.db_models import (
     SignalDeciderDecisionSnapshot,
     Symbol,
 )
-from app.dart.fundamentals_capture_service import dart_fundamentals_capture_service
+from app.dart.fundamentals_capture_service import (
+    dart_fundamentals_capture_service,
+    fundamentals_snapshot_availability,
+)
 from app.eod.daily_pipeline_stages import (
     DAILY_STAGE_ORDER,
     FACTOR_STAGE_ORDER,
@@ -49,6 +54,7 @@ from app.eod.daily_pipeline_stages import (
     DailyPipelineStageService,
 )
 from app.eod.daily_pipeline_outcomes import (
+    _semantic_result_payloads,
     daily_pipeline_nonblocking_warning_stage_ids,
     daily_pipeline_outcome_is_satisfied,
     daily_pipeline_nullable_output_is_completed,
@@ -800,17 +806,24 @@ def _load_row_count_stage_counts(
     normalized_market_date = date.fromisoformat(market_date)
     counts: dict[str, dict[str, Any]] = {}
     with session_scope() as session:
-        preferred_ids = set()
-        if include_missing_diagnostics:
-            preferred_ids = {
-                row.id for row in session.execute(
-                    select(Symbol.id, Symbol.symbol, Symbol.name_ko, Symbol.market)
-                    .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
-                    .where(DailyPriceBar.trade_date == normalized_market_date)
-                )
-                if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
-            }
+        price_symbols = []
+        if (
+            include_missing_diagnostics
+            or PREFERRED_SHARE_NOT_APPLICABLE_STAGES.intersection(ROW_COUNT_STAGE_MODELS)
+        ):
+            price_symbols = list(session.execute(
+                select(Symbol.id, Symbol.symbol, Symbol.name_ko, Symbol.market)
+                .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+                .where(DailyPriceBar.trade_date == normalized_market_date)
+            ))
+        preferred_ids = {
+            row.id for row in price_symbols
+            if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
+        }
+        applicable_price_ids = {row.id for row in price_symbols} - preferred_ids
+        preferred_symbols = sorted(row.symbol for row in price_symbols if row.id in preferred_ids)
         for stage_id, model in ROW_COUNT_STAGE_MODELS.items():
+            preferred_not_applicable = stage_id in PREFERRED_SHARE_NOT_APPLICABLE_STAGES
             aggregate_columns = [
                 func.count(model.id),
                 func.max(model.captured_at),
@@ -819,10 +832,15 @@ def _load_row_count_stage_counts(
             if score_field_name is not None:
                 score_column = getattr(model, score_field_name)
                 decision_ready = score_column.is_not(None)
+                decision_degraded = score_column.is_(None)
+                if preferred_not_applicable:
+                    applicable_scope = model.symbol_id.in_(applicable_price_ids)
+                    decision_ready &= applicable_scope
+                    decision_degraded &= applicable_scope
                 aggregate_columns.extend(
                     (
                         func.count(model.id).filter(decision_ready),
-                        func.count(model.id).filter(score_column.is_(None)),
+                        func.count(model.id).filter(decision_degraded),
                         func.max(model.captured_at).filter(decision_ready),
                     )
                 )
@@ -834,6 +852,10 @@ def _load_row_count_stage_counts(
                             == 'insufficient_history'
                         ),
                     )
+                )
+            if preferred_not_applicable and not include_missing_diagnostics:
+                aggregate_columns.append(
+                    func.count(model.id).filter(model.symbol_id.in_(applicable_price_ids))
                 )
             aggregate = session.execute(
                 select(*aggregate_columns)
@@ -850,6 +872,19 @@ def _load_row_count_stage_counts(
                     'missing_sample_limit': ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
                     'missing_diagnostics_omitted': True,
                 }
+                if preferred_not_applicable:
+                    present = int(aggregate[-1] or 0)
+                    missing_diagnostics.update(
+                        {
+                            'membership_evidence_version': 'row_count_scope_gap_v1',
+                            'membership_authoritative': True,
+                            'membership_requested_count': len(applicable_price_ids),
+                            'membership_present_count': present,
+                            'membership_extra_count': persisted_count - present,
+                            'missing_count': len(applicable_price_ids) - present,
+                            'not_applicable_count': len(preferred_ids),
+                        }
+                    )
             else:
                 missing_diagnostics = _load_row_count_missing_diagnostics_for_model(
                     session=session,
@@ -865,6 +900,10 @@ def _load_row_count_stage_counts(
                 'updated_at': updated_at.isoformat() if updated_at else None,
                 **missing_diagnostics,
             }
+            if preferred_not_applicable:
+                counts[stage_id]['not_applicable_symbols_sample'] = (
+                    preferred_symbols[:ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT]
+                )
             next_column_index = 2
             if score_field_name is not None:
                 ready_count, degraded_count, latest_ready_at = aggregate[2:5]
@@ -1233,7 +1272,50 @@ def _factor_scope_has_no_decision_ready_rows(
     degraded_count = _strict_nonnegative_int(
         evidence.get('decision_degraded_count')
     )
+    if (
+        ready_count == 0 and (degraded_count or 0) > 0
+        and evidence.get('publication_readiness_required') is False
+    ):
+        return not _published_nullable_factor_scope_is_complete(stage_id=stage_id, evidence=evidence)
     return bool(ready_count == 0 and (degraded_count or 0) > 0)
+
+
+def _published_nullable_factor_scope_is_complete(
+    *, stage_id: str, evidence: dict[str, Any],
+) -> bool:
+    if (
+        stage_id not in FACTOR_STAGE_SCORE_FIELDS
+        or evidence.get('publication_readiness_required') is not False
+    ):
+        return False
+    requested = _strict_nonnegative_int(evidence.get('requested_count'))
+    ready = _strict_nonnegative_int(evidence.get('decision_ready_count'))
+    degraded = _strict_nonnegative_int(evidence.get('decision_degraded_count'))
+    validated = (
+        _validated_row_count_scope_gap_evidence(evidence, requested_count=requested)
+        if requested is not None else None
+    )
+    return bool(
+        validated is not None and validated['missing_count'] == 0
+        and validated['present_count'] > 0 and ready is not None and degraded is not None
+        and ready + degraded == validated['present_count']
+    )
+
+
+def _nullable_output_covers_scope(
+    stage: dict[str, Any], scope_symbols: Collection[str],
+) -> bool:
+    if not daily_pipeline_nullable_output_is_completed(stage):
+        return False
+    selected_scopes = []
+    for payload in _semantic_result_payloads(stage):
+        for candidate in (payload, payload.get('exact_scope_outcome_proof')):
+            codes = candidate.get('selected_stock_codes') if isinstance(candidate, dict) else None
+            if isinstance(codes, list) and all(isinstance(code, str) for code in codes):
+                selected_scopes.append(set(codes))
+    requested = set(scope_symbols)
+    # Every identity claim must cover the child, including the validated proof.
+    return bool(selected_scopes) and all(requested <= scope for scope in selected_scopes)
 
 
 def _validated_row_count_scope_gap_evidence(
@@ -2009,7 +2091,7 @@ class EODPipelineStatusService:
                     stage=stages[stage_id],
                     scope_symbols=normalized_scope_symbols,
                 )
-        stages = self._mark_preopen_stage_skips(stages=stages)
+        stages = self._mark_preopen_stage_skips(stages=stages, pykrx_run=pykrx_run)
         stages = self._normalize_stage_contract(stages)
         execution_stages = self._execution_stages(stages)
         warning_metadata = daily_pipeline_warning_metadata(execution_stages)
@@ -2289,6 +2371,13 @@ class EODPipelineStatusService:
             and next_open_proof['parent_completed_symbols']
             == signal_decider_proof['completed_symbols']
         )
+        no_handoff_processing_completed = (
+            next_open_stage is not None
+            and EODPipelineStatusService._scheduled_no_handoff_plan_completed(
+                decider=signal_decider_stage,
+                plan=next_open_stage,
+            )
+        )
         if (
             next_open_stage is not None
             and (
@@ -2302,6 +2391,7 @@ class EODPipelineStatusService:
                 == 'completed'
             )
             and not next_open_is_bound_to_parent
+            and not no_handoff_processing_completed
             and dict(next_open_stage.get('details') or {}).get(
                 'status_repair_reason'
             )
@@ -2320,6 +2410,141 @@ class EODPipelineStatusService:
                 'details': repaired_details,
             }
         return normalized
+
+    @staticmethod
+    def _scheduled_no_handoff_plan_completed(
+        *, decider: dict[str, Any], plan: dict[str, Any],
+    ) -> bool:
+        """Recognize completed scheduled processing without granting execution authority."""
+        decider_details = decider.get('details') or {}
+        plan_details = plan.get('details') or {}
+        if any(
+            details.get('mode') != 'eod_collection_run_stage_progress'
+            or 'completion_scope_proof' in details
+            for details in (decider_details, plan_details)
+        ):
+            return False
+        source_run_id = (decider.get('source_run_ids') or {}).get('eod_run_id')
+        if (
+            source_run_id is None
+            or source_run_id != (plan.get('source_run_ids') or {}).get('eod_run_id')
+        ):
+            return False
+        parent = decider_details.get('result_summary')
+        result = plan_details.get('result_summary')
+        if not (
+            decider.get('status') == 'completed'
+            and plan.get('status') == 'completed'
+            and decider.get('market_date') == plan.get('market_date')
+            and isinstance(parent, dict)
+            and EODPipelineStatusService._signal_decider_has_legacy_completion_proof(parent)
+            and isinstance(result, dict)
+            and result.get('status') == 'completed'
+            and _coerce_int(plan.get('failed')) == 0
+            and _coerce_int(plan.get('processed')) == _coerce_int(plan.get('total'))
+            and _coerce_int(plan.get('succeeded')) == _coerce_int(plan.get('total'))
+            and _coerce_int(plan.get('remaining')) == 0
+        ):
+            return False
+        manifest = result.get('completion_manifest')
+        summary = result.get('summary')
+        if not (isinstance(manifest, dict) and isinstance(summary, dict)):
+            return False
+        if any(
+            _recovery_payload_has_reported_failure(payload)
+            for payload in (decider, plan, result, summary)
+        ):
+            return False
+        if not (
+            manifest.get('schema_version') == 'next_open_completion_manifest_v1'
+            and manifest.get('parent_run_id') == parent.get('run_id')
+            and bool(parent.get('run_id'))
+            and manifest.get('incomplete_decision_count') == 0
+            and summary.get('account_targets_configured') is True
+            and summary.get('account_targets_valid') is True
+            and summary.get('enrichment_preflight_allowed') is True
+            and summary.get('agent_context_completeness_status') == 'complete'
+            and _strict_non_negative_int(summary, 'eligible_count') == 0
+            and _strict_non_negative_int(summary, 'monitor_candidate_count') == 0
+        ):
+            return False
+        parent_progress = parent.get('progress')
+        if not isinstance(parent_progress, dict):
+            return False
+        parent_summary = parent_progress.get('summary')
+        if not isinstance(parent_summary, dict):
+            return False
+        scopes = parent_summary.get('role_symbol_scopes')
+        role_progress = parent_summary.get('role_progress')
+        partition = manifest.get('decision_partition')
+        if not (
+            isinstance(scopes, dict)
+            and set(scopes) == set(DECISION_SUPPORT_AGENT_NAMES)
+            and isinstance(role_progress, dict)
+            and set(role_progress) == set(scopes)
+            and all(
+                isinstance(symbols, list)
+                and all(isinstance(symbol, str) for symbol in symbols)
+                and len(symbols) == len(set(symbols))
+                and isinstance(role_progress.get(role), dict)
+                and len(symbols)
+                == _strict_non_negative_int(
+                    role_progress[role],
+                    'completed_symbols',
+                )
+                for role, symbols in scopes.items()
+            )
+            and manifest.get('role_symbol_scopes') == {
+                role: sorted(symbols) for role, symbols in scopes.items()
+            }
+            and isinstance(partition, list)
+            and len(partition) == manifest.get('decision_count')
+            == _strict_non_negative_int(
+                parent_summary,
+                'completed_feedback_count',
+            )
+        ):
+            return False
+        expected = {(symbol, role) for role, symbols in scopes.items() for symbol in symbols}
+        seen = set()
+        included_items = []
+        for entry in partition:
+            if not (
+                isinstance(entry, dict)
+                and isinstance(entry.get('symbol'), str)
+                and isinstance(entry.get('decision_agent_name'), str)
+                and isinstance(entry.get('disposition'), str)
+            ):
+                return False
+            key = (entry.get('symbol'), entry.get('decision_agent_name'))
+            items = entry.get('included_items')
+            if (
+                key not in expected or key in seen
+                or entry.get('disposition') not in {'included', 'non_actionable'}
+                or not isinstance(items, list)
+                or (entry['disposition'] == 'included') != bool(items)
+            ):
+                return False
+            seen.add(key)
+            included_items.extend(items)
+        if not (
+            seen == expected
+            and len(included_items) == manifest.get('included_item_count')
+            == _coerce_int(plan.get('total'))
+            and all(
+                isinstance(item, dict)
+                and item.get('eligibility_status') == 'blocked'
+                and item.get('handoff_active') is False
+                and item.get('exec_monitoring_active') is False
+                for item in included_items
+            )
+        ):
+            return False
+        digest = hashlib.sha256(json.dumps(
+            {k: v for k, v in manifest.items() if k != 'manifest_digest'},
+            ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        return manifest.get('manifest_digest') == digest
 
     @staticmethod
     def _restore_fundamentals_scope_gate_after_official_overlay(
@@ -2588,6 +2813,15 @@ class EODPipelineStatusService:
             fallback_stage=fallback_stage,
         ):
             return False
+        if (
+            stage_id == 'signal_decider'
+            and progress_status == 'completed'
+            and isinstance(progress.get('result_summary'), dict)
+            and EODPipelineStatusService._signal_decider_has_legacy_completion_proof(
+                progress['result_summary']
+            )
+        ):
+            return True
         if progress_status == 'running':
             return fallback_status != 'running'
         if fallback_status == 'pending':
@@ -2707,6 +2941,7 @@ class EODPipelineStatusService:
         self,
         *,
         stages: dict[str, dict[str, Any]],
+        pykrx_run: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
         if not self._has_date_scoped_activity(stages=stages):
             return stages
@@ -2715,10 +2950,53 @@ class EODPipelineStatusService:
             stage = dict(overlaid.get(stage_id) or {})
             if str(stage.get('status') or '').strip().lower() != 'pending':
                 continue
+            metadata = get_run_metadata(pykrx_run)
+            universe_snapshot = (
+                metadata.get('universe_snapshot')
+                if isinstance(metadata.get('universe_snapshot'), dict)
+                else {}
+            )
+            universe_symbols = (
+                _resolve_exact_run_universe_symbols(pykrx_run)
+                if stage_id == 'pykrx_universe_refresh'
+                and metadata.get('universe_refreshed') is True
+                and universe_snapshot.get('complete') is True
+                and str((pykrx_run or {}).get('trade_date') or '')[:10] == stage.get('market_date')
+                and universe_snapshot.get('latest_trade_date') == stage.get('market_date')
+                else []
+            )
+            if universe_symbols:
+                overlaid[stage_id] = {
+                    **stage,
+                    'status': 'completed',
+                    'source_status': 'universe_refreshed',
+                    'gate_status': 'ready',
+                    'severity': 'ready',
+                    'blocking_status': 'non_blocking',
+                    'processed': len(universe_symbols),
+                    'total': len(universe_symbols),
+                    'succeeded': len(universe_symbols),
+                    'failed': 0,
+                    'remaining': 0,
+                    'completed_at': resolve_run_updated_at(pykrx_run),
+                    'current_activity': 'Universe refresh verified from the daily collection run',
+                    'source_run_ids': {'eod_run_id': pykrx_run.get('id')},
+                    'details': {
+                        **(stage.get('details') or {}),
+                        'reason': 'universe_refresh_verified_by_eod_run',
+                        'execution_recorded': True,
+                        'universe_snapshot': {
+                            'complete': True,
+                            'latest_trade_date': universe_snapshot['latest_trade_date'],
+                            'symbol_count': len(universe_symbols),
+                        },
+                    },
+                }
+                continue
             overlaid[stage_id] = self._build_skipped_stage(
                 stage_id=stage_id,
                 market_date=str(stage.get('market_date') or ''),
-                reason='preopen_global_stage_not_required_for_resumed_market_date_status',
+                reason='preopen_stage_not_executed_in_market_date_run',
             )
         return overlaid
 
@@ -2887,6 +3165,10 @@ class EODPipelineStatusService:
                 )
                 > 0
             )
+        if isinstance(official_stage, dict) and daily_pipeline_nullable_output_is_completed(
+            official_stage
+        ):
+            return False
         if daily_pipeline_result_has_no_ready_content(
             official_details.get('result_summary')
         ):
@@ -2991,6 +3273,8 @@ class EODPipelineStatusService:
             current=official_stage,
         ):
             return False
+        if daily_pipeline_nullable_output_is_completed(official_stage):
+            return True
         fallback_details = (
             fallback_stage.get('details')
             if isinstance(fallback_stage.get('details'), dict)
@@ -5899,6 +6183,8 @@ class EODPipelineStatusService:
             self._build_fundamentals_requested_scope_coverage(
                 run=run,
                 scope_symbols=scope_symbols or [],
+                market_date=date.fromisoformat(market_date),
+                fs_div=fs_div,
             )
             if scope_symbols
             else None
@@ -5967,6 +6253,7 @@ class EODPipelineStatusService:
                 'symbol_limit': run.get('symbol_limit'),
                 'symbol_offset': run.get('symbol_offset'),
                 'symbols_missing': int(run.get('symbols_missing') or 0),
+                'snapshot_availability': fundamentals_snapshot_availability(run),
                 'symbols_stale': int(run.get('symbols_stale') or 0),
                 'symbols_fresh': metrics.fresh,
                 'symbols_refreshed': metrics.refreshed,
@@ -6000,6 +6287,8 @@ class EODPipelineStatusService:
         *,
         run: dict[str, Any],
         scope_symbols: list[str],
+        market_date: date | None = None,
+        fs_div: str | None = None,
     ) -> dict[str, Any]:
         requested_symbols = cls._normalize_symbol_list(scope_symbols)
         unresolved = set(requested_symbols)
@@ -6122,15 +6411,40 @@ class EODPipelineStatusService:
                 continue
             if run_status == 'completed' and run_retry_debt:
                 continue
-            raw_preferred = evidence_metadata.get(
-                'preferred_not_applicable_stock_codes'
+            preferred = set(
+                cls._normalize_symbol_list(
+                    evidence_metadata.get('preferred_not_applicable_stock_codes')
+                )
             )
-            preferred = (
-                set(cls._normalize_symbol_list(raw_preferred))
-                if isinstance(raw_preferred, list)
-                else set()
-            )
-            not_applicable.update(covered & run_terminal & preferred)
+            terminal_in_scope = covered & run_terminal
+            if (
+                terminal_in_scope
+                and 'preferred_not_applicable_stock_codes' not in evidence_metadata
+                and evidence_version == 'dart_daily_data_scope_outcomes_v1'
+                and evidence_metadata.get('terminal_policy_version')
+                == 'dart_missing_corp_mapping_not_applicable_v1'
+                and run_status == 'completed'
+                and evidence_run.get('id') is not None
+                and market_date is not None
+                and evidence_run.get('market_date') == market_date.isoformat()
+                and fs_div is not None
+                and evidence_run.get('fs_div') == fs_div
+            ):
+                # Legacy manifests did not distinguish preferred shares from other unmapped symbols.
+                with session_scope() as session:
+                    preferred = {
+                        row.symbol
+                        for row in session.execute(
+                            select(Symbol.symbol, Symbol.name_ko, Symbol.market)
+                            .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+                            .where(
+                                Symbol.symbol.in_(terminal_in_scope),
+                                DailyPriceBar.trade_date == market_date,
+                            )
+                        )
+                        if is_krx_preferred_share(row.symbol, row.name_ko, row.market)
+                    }
+            not_applicable.update(terminal_in_scope & preferred)
             valid_evidence_run_ids.append(evidence_run.get('id'))
             for symbol in covered:
                 source_run_ids_by_symbol[symbol] = evidence_run.get('id')
@@ -6438,7 +6752,10 @@ class EODPipelineStatusService:
                 quality_reason = (
                     'null_score_rows_preserved_as_supporting_context'
                 )
-                if decision_ready_count == 0:
+                if decision_ready_count == 0 and not (
+                    feedback_scope_gap is not None
+                    and _published_nullable_factor_scope_is_complete(stage_id=stage_id, evidence=feedback_scope_gap)
+                ):
                     gate_status = 'blocked'
                     severity = 'blocked'
                     blocking_status = 'blocking'
@@ -6457,6 +6774,9 @@ class EODPipelineStatusService:
             'min_non_blocking_coverage_ratio': PARTIAL_ROW_COUNT_MIN_NON_BLOCKING_COVERAGE_RATIO,
             'missing_count': missing_count,
             'not_applicable_count': _coerce_int(aggregate.get('not_applicable_count')),
+            'not_applicable_symbols_sample': self._normalize_symbol_list(
+                aggregate.get('not_applicable_symbols_sample')
+            ),
             'missing_symbols_sample': missing_symbols_sample,
             'missing_symbol_details_sample': missing_symbol_details_sample,
             'missing_sample_limit': aggregate.get('missing_sample_limit') or ROW_COUNT_STAGE_MISSING_SAMPLE_LIMIT,
@@ -6751,7 +7071,7 @@ class EODPipelineStatusService:
                     stage_id=stage_id,
                     evidence=validated_scope_gap,
                 )
-                and not daily_pipeline_nullable_output_is_completed(stage)
+                and not _nullable_output_covers_scope(stage, scope_symbols)
             ):
                 details['gate_reason'] = (
                     'no_decision_ready_factor_rows_in_requested_scope'
@@ -7009,7 +7329,14 @@ class EODPipelineStatusService:
                 and details.get('mode')
                 == 'derived_from_daily_signal_features'
             )
-            if aggregate_signal_gap:
+            nullable_factor_quality_gate = bool(
+                stage_status == 'completed'
+                and details.get('gate_reason') == 'no_decision_ready_factor_rows'
+                and not details.get('blocking_stages')
+                and not details.get('failed_blocking_stages')
+                and _published_nullable_factor_scope_is_complete(stage_id=stage_task, evidence=validated_coverage)
+            )
+            if aggregate_signal_gap or nullable_factor_quality_gate:
                 details['aggregate_status'] = stage_status
                 details['aggregate_gate_status'] = stage.get('gate_status')
                 details['aggregate_gate_reason'] = details.get('gate_reason')
@@ -7104,9 +7431,9 @@ class EODPipelineStatusService:
         )
         counts = build_stage_counts(
             total=normalized_total,
-            succeeded=min(exact_present_count, normalized_total),
-            failed=max(exact_missing_count, normalized_total - persisted, 0),
-            processed=min(persisted, normalized_total),
+            succeeded=exact_present_count,
+            failed=exact_missing_count,
+            processed=exact_present_count + exact_missing_count,
         )
         if coverage_verified:
             status = (

@@ -43,7 +43,7 @@ from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_zero_scope_gate_status,
     pykrx_enrichment_preflight_is_ready,
 )
-from app.eod.agent_chain_gates import summary_partial_dependency_is_proven
+from app.eod.agent_chain_gates import empty_agent_scope_followup, summary_partial_dependency_is_proven
 from app.eod.daily_pipeline_state import daily_pipeline_run_state_service
 from app.eod.summary_cutoff_contract import (
     CUTOFF_REPAIR_STAGE_IDS,
@@ -209,7 +209,12 @@ EXACT_FINALIZATION_STAGE_IDS = frozenset(
         'signal_features',
     }
 )
+EARLY_STAGE_RECOVERY_IDS = frozenset({'technical_snapshots', 'action_summaries'})
 EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS = {
+    **{
+        stage_id: frozenset({f'{stage_id}_scope_outcomes_v1'})
+        for stage_id in EARLY_STAGE_RECOVERY_IDS
+    },
     'market_risk_filter': frozenset(
         {'market_risk_filter_scope_outcomes_v1'}
     ),
@@ -1001,6 +1006,7 @@ class DailyPipelineStageService:
         recovery_parent_partition: dict[str, Any] | None = None
         recovery_stage_partition: dict[str, Any] | None = None
         recovery_stage_id: str | None = None
+        deferred_recovery_stage_outcomes: dict[str, dict[str, Any]] | None = None
         validated_recovery_price_outcome: dict[str, Any] | None = None
         resolved_markets = self._normalize_markets(markets)
         if exact_membership_symbols is not None:
@@ -1085,6 +1091,7 @@ class DailyPipelineStageService:
             expected_parent_membership = (
                 recovery_parent_partition['selected_stock_codes']
                 if market_risk_suffix_recovery
+                or requested_recovery_stage_id in EARLY_STAGE_RECOVERY_IDS
                 or recovery_stage_scope_outcome is None
                 else recovery_parent_partition['successful_stock_codes']
             )
@@ -1116,6 +1123,42 @@ class DailyPipelineStageService:
                         'stage first and a non-empty retry scope'
                     )
                 recovery_stage_id = requested_recovery_stage_id
+                if recovery_stage_id in EARLY_STAGE_RECOVERY_IDS and (
+                    recovery_stage_scope_outcome.get('market_date')
+                    != normalized_market_date
+                    or recovery_stage_scope_outcome.get('eod_collection_run_id')
+                    != reused_eod_collection_run_id
+                ):
+                    raise ValueError(
+                        'early stage recovery scope must match its market date '
+                        'and EOD collection run'
+                    )
+                if (
+                    recovery_stage_id in EARLY_STAGE_RECOVERY_IDS
+                    and 'deferred_stage_outcomes' in recovery_stage_scope_outcome
+                ):
+                    deferred = recovery_stage_scope_outcome['deferred_stage_outcomes']
+                    if not isinstance(deferred, Mapping):
+                        raise ValueError('deferred recovery stages must be a mapping')
+                    deferred_recovery_stage_outcomes = {}
+                    for deferred_stage_id, deferred_outcome in deferred.items():
+                        if (
+                            deferred_stage_id not in STAGE_DEFINITIONS
+                            or deferred_stage_id in resolved_stages
+                            or not isinstance(deferred_outcome, Mapping)
+                            or str(deferred_outcome.get('status') or '').strip().lower()
+                            not in {'failed', 'blocked', 'partial', 'interrupted', 'abandoned', 'pending', 'waiting'}
+                            or daily_pipeline_outcome_is_satisfied({
+                                **dict(deferred_outcome), 'stage': deferred_stage_id,
+                            })
+                        ):
+                            raise ValueError(
+                                'deferred recovery stages must name only omitted '
+                                'unfinished stages'
+                            )
+                        deferred_recovery_stage_outcomes[deferred_stage_id] = dict(
+                            deferred_outcome
+                        )
                 allowed_versions = (
                     EXACT_STAGE_RECOVERY_MANIFEST_VERSIONS.get(
                         recovery_stage_id
@@ -2233,6 +2276,10 @@ class DailyPipelineStageService:
                 resolved_stages=resolved_stages,
                 run_metadata={
                     'entrypoint': 'daily_pipeline_stage_service.run',
+                    **(
+                        {'deferred_recovery_stage_outcomes': deferred_recovery_stage_outcomes}
+                        if deferred_recovery_stage_outcomes is not None else {}
+                    ),
                     'resume_from_stage': resume_from_stage,
                     'symbols': resolved_symbols,
                     'exact_membership_symbol_count': len(
@@ -2760,6 +2807,30 @@ class DailyPipelineStageService:
         dart_preferred_not_applicable: set[str] = set()
         for stage_id in resolved_stages:
             if stage_id in handled:
+                continue
+            agent_upstream = {
+                'signal_decider': 'agent_feedback_summaries',
+                'next_open_execution_plan': 'signal_decider',
+            }.get(stage_id)
+            empty_scope_result = empty_agent_scope_followup(
+                stage_outcomes.get(agent_upstream), market_date=resolved_market_date,
+            ) if agent_upstream else None
+            if empty_scope_result is not None:
+                self._start_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                )
+                outcome = self._build_stage_outcome(stage_id, empty_scope_result)
+                stage_outcomes[stage_id] = outcome
+                self._finish_tracked_stage(
+                    pipeline_run_id=pipeline_run_id,
+                    stage_id=stage_id,
+                    market_date=resolved_market_date,
+                    outcome=outcome,
+                    result=empty_scope_result,
+                    invocation_symbols=[],
+                )
                 continue
             stage_symbols = resolved_symbols
             if (
@@ -3652,7 +3723,9 @@ class DailyPipelineStageService:
                             publication_scope_symbols=(
                                 list(stage_symbols or [])
                                 if stage_id == recovery_stage_id
-                                and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                                and stage_id in (
+                                    EXACT_FINALIZATION_STAGE_IDS | EARLY_STAGE_RECOVERY_IDS
+                                )
                                 else None
                             ),
                             markets=resolved_markets,
@@ -3898,7 +3971,9 @@ class DailyPipelineStageService:
                         if stage_id == 'signal_features'
                         else list(stage_symbols or [])
                         if stage_id == recovery_stage_id
-                        and stage_id in EXACT_FINALIZATION_STAGE_IDS
+                        and stage_id in (
+                            EXACT_FINALIZATION_STAGE_IDS | EARLY_STAGE_RECOVERY_IDS
+                        )
                         else official_membership_symbols
                     ),
                     completion_parent_proof=(
@@ -4093,6 +4168,10 @@ class DailyPipelineStageService:
         )
         run_metadata = {
             'stage_statuses': merged_stage_statuses,
+            **(
+                {'deferred_recovery_stage_outcomes': deferred_recovery_stage_outcomes}
+                if deferred_recovery_stage_outcomes is not None else {}
+            ),
             **warning_metadata,
             **self._feedback_cutoff_run_metadata(
                 feedback_knowledge_cutoff_at,
@@ -6678,6 +6757,14 @@ class DailyPipelineStageService:
             completed_by_role = proof.get('completed_symbols_by_role')
             failed_by_role = proof.get('failed_symbols_by_role')
             decision_identities = proof.get('decision_identities')
+            prefilter_excluded = proof.get('entry_economics_excluded_symbols', [])
+            role_symbol_scopes = proof.get('role_symbol_scopes', {
+                role: admitted_symbols for role in DECISION_SUPPORT_AGENT_NAMES
+            })
+            if 'entry_economics_excluded_symbols' in proof:
+                expected_keys.add('entry_economics_excluded_symbols')
+            if 'role_symbol_scopes' in proof:
+                expected_keys.add('role_symbol_scopes')
             try:
                 knowledge_cutoff_at = datetime.fromisoformat(
                     str(proof.get('knowledge_cutoff_at') or '').strip()
@@ -6702,6 +6789,11 @@ class DailyPipelineStageService:
                 and normalize_symbol_codes(admitted_symbols)
                 == admitted_symbols
                 and sorted(set(admitted_symbols)) == admitted_symbols
+                and isinstance(prefilter_excluded, list)
+                and sorted(set(normalize_symbol_codes(prefilter_excluded))) == prefilter_excluded
+                and set(prefilter_excluded) <= set(admitted_symbols)
+                and isinstance(role_symbol_scopes, Mapping)
+                and set(role_symbol_scopes) == set(DECISION_SUPPORT_AGENT_NAMES)
                 and isinstance(completed_symbols, list)
                 and completed_symbols
                 and normalize_symbol_codes(completed_symbols)
@@ -6725,8 +6817,11 @@ class DailyPipelineStageService:
             for role in DECISION_SUPPORT_AGENT_NAMES:
                 failed_symbols = failed_by_role.get(role)
                 role_completed_symbols = completed_by_role.get(role)
+                role_scope = role_symbol_scopes[role]
                 if not (
-                    isinstance(failed_symbols, list)
+                    isinstance(role_scope, list)
+                    and sorted(set(normalize_symbol_codes(role_scope))) == role_scope
+                    and isinstance(failed_symbols, list)
                     and normalize_symbol_codes(failed_symbols)
                     == failed_symbols
                     and sorted(set(failed_symbols)) == failed_symbols
@@ -6736,8 +6831,8 @@ class DailyPipelineStageService:
                     == role_completed_symbols
                     and sorted(set(role_completed_symbols))
                     == role_completed_symbols
-                    and set(role_completed_symbols)
-                    == set(admitted_symbols).difference(failed_symbols)
+                    and set(failed_symbols) <= set(role_scope)
+                    and set(role_completed_symbols) == set(role_scope).difference(failed_symbols)
                 ):
                     return None
                 canonical_failed_by_role[role] = list(failed_symbols)
@@ -6813,12 +6908,10 @@ class DailyPipelineStageService:
                     for symbol in symbols
                 }
             )
+            dispatched_union = set(completed_union).union(*canonical_failed_by_role.values())
             if not (
                 type(total_items) is int
-                and total_items == (
-                    len(admitted_symbols)
-                    * len(DECISION_SUPPORT_AGENT_NAMES)
-                )
+                and dispatched_union == set(admitted_symbols).difference(prefilter_excluded)
                 and type(completed_items) is int
                 and type(failed_items) is int
                 and completed_items + failed_items == total_items
@@ -8062,12 +8155,21 @@ class DailyPipelineStageService:
             if publication_scope_symbols is not None
             else exact_scope_symbols
         )
+        if exact_stage_recovery_authorized and stage_id in EARLY_STAGE_RECOVERY_IDS:
+            # Atomic early-stage publishers must never finalize successful siblings.
+            exact_scope_symbols = derived_publication_scope_symbols
         if (
             point_in_time_recovery
             and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
             and not (
-                exact_stage_recovery_authorized
-                and stage_id == 'fundamentals_daily_refresh'
+                (
+                    exact_stage_recovery_authorized
+                    and stage_id == 'fundamentals_daily_refresh'
+                )
+                or (
+                    allow_previous_session_preopen_recovery
+                    and stage_id == 'signal_features'
+                )
             )
             and should_skip_point_in_time_current_only_stage(
                 stage_id=stage_id,
@@ -8395,6 +8497,14 @@ class DailyPipelineStageService:
                 authoritative_scope=True,
             )
         if stage_id == 'signal_features':
+            if point_in_time_recovery:
+                signal_scope = symbols if symbols is not None else exact_scope_symbols
+                if signal_scope is None:
+                    raise ValueError('point-in-time signal recovery requires exact symbol scope')
+                return daily_signal_feature_service.rebuild_stored_owned_fallback_for_market_date(
+                    market_date=market_date,
+                    exact_symbols=signal_scope,
+                )
             return asyncio.run(
                 daily_signal_feature_service.refresh_for_market_date(
                     market_date=market_date,
@@ -8897,6 +9007,11 @@ class DailyPipelineStageService:
                     ),
                     scope_authority=scope_authority,
                     role_symbol_scopes=retry_role_symbol_scopes,
+                    source_summary_run_id=(
+                        feedback_cutoff_resolution.get('source_run_id')
+                        if stage_id == 'signal_decider' and isinstance(feedback_cutoff_resolution, dict)
+                        else None
+                    ),
                     progress_callback=progress_callback,
                 ),
                 # A forced pipeline recovery must bypass stale prerequisite
@@ -9878,23 +9993,40 @@ class DailyPipelineStageService:
         ):
             return None
         expected_role_symbol_scopes: dict[str, list[str]] = {}
+        expected_symbols = set(normalized_expected_symbols)
+        diagnostics = (progress_summary.get('funnel_diagnostics') or {}).get('role_diagnostics') or {}
+        economically_excluded: set[str] = set()
         for role in DECISION_SUPPORT_AGENT_NAMES:
             raw_role_scope = raw_role_symbol_scopes.get(role)
             if not isinstance(raw_role_scope, list):
                 return None
             normalized_role_scope = normalize_symbol_codes(raw_role_scope)
             if (
-                not normalized_role_scope
-                or normalized_role_scope != raw_role_scope
-                or not set(normalized_role_scope).issubset(
-                    normalized_expected_symbols
-                )
+                normalized_role_scope != raw_role_scope
+                or not set(normalized_role_scope).issubset(expected_symbols)
             ):
                 return None
             expected_role_symbol_scopes[role] = normalized_role_scope
-        if set().union(
-            *(set(scope) for scope in expected_role_symbol_scopes.values())
-        ) != set(normalized_expected_symbols):
+            missing_from_role = expected_symbols.difference(normalized_role_scope)
+            if not missing_from_role:
+                continue
+            role_diagnostics = diagnostics.get(role) or {}
+            economics = {
+                symbol
+                for symbol, evidence in (role_diagnostics.get('entry_economics_exclusions') or {}).items()
+                if isinstance(evidence, Mapping)
+                and evidence.get('code') == 'entry_reward_risk_below_role_floor'
+                and role in (evidence.get('excluded_roles') or [])
+            }
+            capped = role_diagnostics.get('cap_excluded_symbols') or []
+            if role_diagnostics.get('cap_excluded_symbol_count') != len(capped):
+                capped = []
+            if not missing_from_role <= economics.union(capped):
+                return None
+            economically_excluded.update(economics & missing_from_role)
+        dispatched_symbols = set().union(*expected_role_symbol_scopes.values())
+        omitted_symbols = expected_symbols - dispatched_symbols
+        if not omitted_symbols <= economically_excluded:
             return None
 
         resolution = resolve_terminal_independent_role_success(
@@ -10015,6 +10147,12 @@ class DailyPipelineStageService:
             'total_items': resolution['total_items'],
             'completed_items': resolution['completed_items'],
             'failed_items': resolution['failed_items'],
+            **({'entry_economics_excluded_symbols': sorted(omitted_symbols)} if omitted_symbols else {}),
+            **(
+                {'role_symbol_scopes': {role: sorted(scope) for role, scope in expected_role_symbol_scopes.items()}}
+                if any(set(scope) != set(normalized_expected_symbols) for scope in expected_role_symbol_scopes.values())
+                else {}
+            ),
         }
         proof['proof_digest'] = (
             DailyPipelineStageService

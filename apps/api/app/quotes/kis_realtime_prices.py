@@ -337,6 +337,7 @@ class KISRealtimePriceService:
         self._last_source_refresh_monotonic = 0.0
         self._state_lock = threading.RLock()
         self._prices: dict[str, KISRealtimePriceTick] = {}
+        self._sampled_display_prices: dict[str, dict[str, Any]] = {}
         self._base_symbols: set[str] = set()
         self._base_symbol_order: list[str] = []
         self._desired_symbols: set[str] = set()
@@ -1394,9 +1395,8 @@ class KISRealtimePriceService:
                 }
             await asyncio.sleep(2 if self.client._environment() == 'demo' else 1)
 
-    @staticmethod
     def _record_wait_ask_samples(
-        batch: list[str], rows: list[dict[str, Any]], received_at: datetime,
+        self, batch: list[str], rows: list[dict[str, Any]], received_at: datetime,
     ) -> tuple[set[str], set[str]]:
         from app.agent_context.wait_price_observations import wait_price_observations
 
@@ -1404,12 +1404,33 @@ class KISRealtimePriceService:
         confirmation_candidates: set[str] = set()
         for row in rows:
             symbol = _normalize_symbol(row.get('inter_shrn_iscd'))
+            if symbol is None or symbol not in batch:
+                continue
+            price = _parse_decimal(row.get('inter2_prpr'))
             ask = _parse_decimal(row.get('inter2_askp'))
             bid = _parse_decimal(row.get('inter2_bidp'))
+            previous_close = _parse_decimal(row.get('inter2_prdy_clpr'))
+            if price is not None and price > 0:
+                change = price - previous_close if previous_close is not None and previous_close > 0 else None
+                valid_book = ask is not None and bid is not None and 0 < bid <= ask
+                with self._state_lock:
+                    # REST snapshots have no exchange trade time and must never become execution ticks.
+                    self._sampled_display_prices[symbol] = {
+                        'current_price': _to_json_number(price),
+                        'price_as_of': _isoformat(received_at),
+                        'price_received_at': _isoformat(received_at),
+                        'price_time_basis': 'received_at',
+                        'price_source': 'kis_rest_multi_quote',
+                        'previous_close_price': _to_json_number(previous_close),
+                        'change': _to_json_number(change),
+                        'change_pct': _to_json_number(_parse_decimal(row.get('prdy_ctrt'))),
+                        'bid_price': _to_json_number(bid) if valid_book else None,
+                        'ask_price': _to_json_number(ask) if valid_book else None,
+                    }
+
             size_text = _normalize_text(row.get('seln_rsqn'))
             if (
-                symbol is None or symbol not in batch
-                or ask is None or bid is None or not 0 < bid <= ask
+                ask is None or bid is None or not 0 < bid <= ask
                 or not size_text.isascii() or not size_text.isdecimal() or int(size_text) <= 0
             ):
                 continue
@@ -1419,6 +1440,10 @@ class KISRealtimePriceService:
                 received_at=received_at, source='kis_orderbook_rest_sample',
             ):
                 confirmation_candidates.add(symbol)
+        with self._state_lock:
+            for key in list(self._sampled_display_prices):
+                if key not in self._desired_symbols:
+                    self._sampled_display_prices.pop(key, None)
         return sampled, confirmation_candidates
 
     async def _confirm_wait_ask(self, symbol: str) -> None:
@@ -1448,6 +1473,13 @@ class KISRealtimePriceService:
             symbol, ask, int(size_text), price_as_of=as_of, received_at=received_at,
             source='kis_orderbook_rest_confirmed',
         )
+        bid_size_text = _normalize_text(book.get('bidp_rsqn1'))
+        if bid_size_text.isascii() and bid_size_text.isdecimal():
+            await asyncio.to_thread(
+                wait_price_observations.observe_bid,
+                symbol, bid, int(bid_size_text), price_as_of=as_of, received_at=received_at,
+                source='kis_orderbook_rest_confirmed',
+            )
 
     async def _run(self) -> None:
         base_reconnect_delay = max(
@@ -1884,6 +1916,7 @@ class KISRealtimePriceService:
         # KIS publishes 63 columns today. The legacy 59-column frame shares these offsets.
         if width not in {59, 63}:
             return
+        observations = []
         with self._state_lock:
             for offset in range(0, len(values), width):
                 symbol, hour, session_class = values[offset:offset + 3]
@@ -1918,6 +1951,18 @@ class KISRealtimePriceService:
                     bid=bid, ask=ask, bid_size=int(bid_size), ask_size=int(ask_size),
                     as_of=as_of, received_at=received_at,
                 )
+                observations.append((symbol, self._orderbooks[symbol]))
+        from app.agent_context.wait_price_observations import wait_price_observations
+
+        for symbol, book in observations:
+            wait_price_observations.observe_ask(
+                symbol, book.ask, book.ask_size, price_as_of=book.as_of, received_at=book.received_at,
+                source='kis_orderbook_websocket',
+            )
+            wait_price_observations.observe_bid(
+                symbol, book.bid, book.bid_size, price_as_of=book.as_of, received_at=book.received_at,
+                source='kis_orderbook_websocket',
+            )
 
     def orderbooks_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         now = now or _utc_now()
@@ -1988,7 +2033,6 @@ class KISRealtimePriceService:
         from app.agent_context.wait_price_observations import wait_price_observations
 
         for tick in ticks:
-            wait_price_observations.observe(tick)
             size = tick.raw_fields.get('ASKP_RSQN1', '')
             if (
                 not tick.trade_halt and size.isascii() and size.isdecimal()
@@ -2000,6 +2044,13 @@ class KISRealtimePriceService:
                     tick.symbol, tick.ask_price, int(size), price_as_of=tick.price_as_of,
                     received_at=tick.received_at, source='kis_trade_packet_ask',
                 )
+                bid_size = tick.raw_fields.get('BIDP_RSQN1', '')
+                if bid_size.isascii() and bid_size.isdecimal():
+                    wait_price_observations.observe_bid(
+                        tick.symbol, tick.bid_price, int(bid_size), price_as_of=tick.price_as_of,
+                        received_at=tick.received_at, source='kis_trade_packet_bid',
+                    )
+            wait_price_observations.observe(tick)
         return [tick.to_public_dict() for tick in ticks]
 
     def _collect_session_trade_locked(self, tick: KISRealtimePriceTick) -> None:
@@ -2054,6 +2105,7 @@ class KISRealtimePriceService:
         with self._state_lock:
             self._target_symbols_snapshot_locked()
             tick = self._prices.get(normalized)
+            sampled = self._sampled_display_prices.get(normalized)
             desired = normalized in self._desired_symbols
             subscribed = normalized in self._subscribed_symbols
             limited = normalized in self._limited_symbols
@@ -2086,6 +2138,17 @@ class KISRealtimePriceService:
                     ),
                 },
             )
+
+        if (
+            sampled is not None and (desired or subscribed or limited)
+            and enabled and configured and self._recorded_market_session_is_active()
+        ):
+            received_at = _parse_iso_datetime(sampled.get('price_received_at'))
+            fresh = received_at is not None and timedelta(0) <= now - received_at <= timedelta(
+                seconds=max(1.0, float(settings.kis_realtime_price_stale_after_seconds)),
+            )
+            if fresh and (tick is None or limited or self._price_status_for_tick(tick, now=now) != 'available'):
+                return {**sampled, 'price_status': 'available', 'display_price_available': True, **subscription_fields}
 
         if tick is not None:
             status = 'limited' if limited else self._price_status_for_tick(tick, now=now)

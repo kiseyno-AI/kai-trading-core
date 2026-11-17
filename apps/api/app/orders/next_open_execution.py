@@ -123,7 +123,10 @@ from app.orders.signal_decider_execution_outcomes import (
     EXECUTION_STATUS_WATCH_EXPIRED,
     signal_decider_execution_outcome_service,
 )
-from app.orders.signal_decider_performance_gates import evaluate_next_open_performance_gate
+from app.orders.signal_decider_performance_gates import (
+    SHORT_TERM_MIN_REWARD_RISK_RATIO,
+    evaluate_next_open_performance_gate,
+)
 from app.orders.service import (
     TradingOrderPendingSubmissionError,
     TradingOrderRejectedError,
@@ -202,7 +205,6 @@ SHORT_TERM_MIN_RETURN_PERCENTILE = Decimal('0.60')
 SHORT_TERM_HARD_MIN_RETURN_PERCENTILE = Decimal('0.50')
 SHORT_TERM_MIN_VOLUME_PERCENTILE = Decimal('0.45')
 SHORT_TERM_MIN_RAW_TRADING_VALUE_KRW = Decimal('3000000000')
-SHORT_TERM_MIN_REWARD_RISK_RATIO = Decimal('1.80')
 SHORT_TERM_MIN_BUY_QUALITY_SCORE = Decimal('60')
 SHORT_TERM_HARD_MIN_BUY_QUALITY_SCORE = Decimal('50')
 # Daily contexts can be captured at slightly different points in the same session.
@@ -4337,6 +4339,53 @@ class SignalDeciderNextOpenExecutionService:
                 agent_context_completeness=agent_context_completeness,
             ),
             'items': [self._serialize_row(row) for row in rows],
+        }
+
+    def list_plan_overview(
+        self,
+        *,
+        target_trade_date: str | date | None = None,
+    ) -> dict[str, Any]:
+        resolved_target_date = self._resolve_target_trade_date(target_trade_date)
+        model = SignalDeciderExecutionPlanItem
+        price_fields = ('raw_action', 'trigger_price', 'chase_limit_price', 'target_price', 'stop_loss_price')
+        # Extract only display fields in SQL so evidence blobs never cross the DB boundary.
+        stmt = select(
+            model,
+            *(model.traceability_payload[field].label(field) for field in price_fields),
+            model.traceability_payload['tactical_action'].label('tactical_action'),
+        ).options(
+            defer(model.traceability_payload),
+            defer(model.validation_payload),
+            defer(model.submission_payload),
+        ).where(
+            model.execution_window == EXECUTION_WINDOW_NEXT_OPEN,
+            model.target_trade_date == resolved_target_date,
+        ).order_by(model.decision_agent_name, model.symbol, model.id)
+        with session_scope() as session:
+            selected = session.execute(stmt).all()
+            rows = [selected_row[0] for selected_row in selected]
+            summary = self._build_summary(
+                rows=rows,
+                target_trade_date=resolved_target_date,
+                runtime=self.runtime_status(),
+            )
+            items = []
+            for selected_row in selected:
+                row = selected_row[0]
+                display = {field: selected_row._mapping[field] for field in price_fields}
+                display['raw_action'] = display['raw_action'] or selected_row._mapping['tactical_action']
+                items.append({
+                    'symbol': row.symbol,
+                    'decision_agent_name': row.decision_agent_name,
+                    **display,
+                })
+        return {
+            'summary': {key: summary[key] for key in (
+                'target_trade_date', 'source_market_date', 'items_total',
+                'planned_count', 'blocked_count', 'awaiting_trigger_count',
+            )},
+            'items': items,
         }
 
     def refresh_plan_if_due(
@@ -10280,6 +10329,9 @@ class SignalDeciderNextOpenExecutionService:
                 'quarantine_observed_at'
             ),
         }
+        retired_quantity = submission.pop('core_quantity_sizing', None)
+        if isinstance(retired_quantity, dict) and isinstance(retired_quantity.get('policy'), dict):
+            archived_revision['retired_core_quantity_policy'] = copy.deepcopy(retired_quantity['policy'])
         submission['revision_history'] = revision_history[
             -EXECUTION_REVISION_HISTORY_LIMIT:
         ]
@@ -10747,6 +10799,20 @@ class SignalDeciderNextOpenExecutionService:
             traceability.get('approval_state')
             or ('pending_exec_agent' if handoff_active else 'blocked' if blocker_reason else None)
         )
+        quantity_state = submission_payload.get('core_quantity_sizing') if isinstance(submission_payload, dict) else None
+        quantity_state = quantity_state if isinstance(quantity_state, dict) else {}
+        quantity_policy = quantity_state.get('policy')
+        quantity_policy = quantity_policy if isinstance(quantity_policy, dict) else {}
+        core_quantity = quantity_policy.get('target_quantity')
+        core_sized = quantity_policy.get('type') == 'core_sized' and type(core_quantity) is int and core_quantity >= 0
+        core_notional = None
+        if core_sized:
+            approval_state = f"core_quantity_{quantity_state.get('status') or 'prepared'}"
+            price = _to_decimal((quantity_policy.get('sizing_inputs') or {}).get('sizing_price'))
+            if price is not None and price > 0:
+                core_notional = Decimal(core_quantity) * price
+            elif core_quantity == 0:
+                core_notional = Decimal(0)
         request = (
             load_order_request(
                 account_reference=row.account_reference,
@@ -10799,8 +10865,9 @@ class SignalDeciderNextOpenExecutionService:
             'planned_time_in_force': row.planned_time_in_force,
             'allocation_budget_krw': _decimal_to_text(_to_decimal(row.allocation_budget_krw)),
             'estimated_reference_price': row.estimated_reference_price,
-            'planned_quantity': _decimal_to_text(_to_decimal(row.planned_quantity)),
-            'estimated_notional_krw': _decimal_to_text(_to_decimal(row.estimated_notional_krw)),
+            'planned_quantity': _decimal_to_text(Decimal(core_quantity) if core_sized else _to_decimal(row.planned_quantity)),
+            'estimated_notional_krw': _decimal_to_text(core_notional if core_sized else _to_decimal(row.estimated_notional_krw)),
+            **({'quantity_basis': 'cumulative_buy_allowance', 'core_allocation_budget_krw': _decimal_to_text(core_notional)} if core_sized else {}),
             'eligibility_status': row.eligibility_status,
             'execution_status': row.execution_status,
             'client_order_id': row.client_order_id,

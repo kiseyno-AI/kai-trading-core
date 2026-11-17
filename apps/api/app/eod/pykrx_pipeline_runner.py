@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.eod.agent_chain_gates import finished_partial_feeds_downstream
+from app.eod.agent_chain_gates import empty_agent_scope_followup, finished_partial_feeds_downstream
 from app.eod.live_progress import daily_pipeline_live_progress
 from app.eod.daily_pipeline_outcomes import (
     daily_pipeline_nonblocking_warning_stage_ids,
@@ -210,6 +210,8 @@ PREOPEN_PREVIOUS_SESSION_CURRENT_ONLY_STAGE_IDS: frozenset[str] = frozenset(
     {
         'market_risk_snapshots',
         'market_risk_filter',
+        'fundamentals_daily_refresh',
+        'signal_features',
     }
 )
 
@@ -3224,6 +3226,7 @@ def _run_daily_signal_decider_followup(
     progress_callback: Callable[..., None] | None = None,
     point_in_time_recovery: bool = False,
     symbols: Sequence[str] | None = None,
+    source_summary_run_id: str | None = None,
 ) -> dict[str, Any]:
     from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
     from app.agent_context.run_modes import FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
@@ -3238,6 +3241,7 @@ def _run_daily_signal_decider_followup(
         progress_callback=progress_callback,
         point_in_time_recovery=point_in_time_recovery,
         symbols=symbols,
+        source_summary_run_id=source_summary_run_id,
     )
 
 
@@ -3277,6 +3281,7 @@ def _run_daily_agent_feedback_followup(
     progress_callback: Callable[..., None] | None = None,
     point_in_time_recovery: bool = False,
     symbols: Sequence[str] | None = None,
+    source_summary_run_id: str | None = None,
 ) -> dict[str, Any]:
     if not enabled:
         return {
@@ -3330,6 +3335,7 @@ def _run_daily_agent_feedback_followup(
                 knowledge_cutoff_at or datetime.now(timezone.utc)
             ),
             feedback_scope_mode=feedback_scope_mode,
+            source_summary_run_id=source_summary_run_id,
             max_cycles=settings.openclaw_feedback_retry_max_cycles,
             outer_batch_size=settings.openclaw_feedback_retry_outer_batch_size,
             reuse_existing=True,
@@ -3452,6 +3458,15 @@ def run_market_data_pipeline(
     # fixture/simulation calls depend on the process wall clock.
     point_in_time_recovery = bool(point_in_time_recovery)
     point_in_time_scope = historical_backfill or point_in_time_recovery
+    preopen_stored_signal_recovery_admitted = bool(
+        point_in_time_recovery
+        and mode == 'daily_auto'
+        and chain_fundamentals_followup
+        and trigger in {'auto_close', 'auto_close_scheduler'}
+        and not should_skip_point_in_time_current_only_stage(
+            stage_id='signal_features', market_date=normalized_end,
+        )
+    )
     resolved_selected_stages = _resolve_requested_stages(
         mode=mode,
         selected_stages=selected_stages,
@@ -3648,6 +3663,10 @@ def run_market_data_pipeline(
     }:
         inherited_downstream_resume_from_stage = ''
     unattempted_symbols = list(requested_symbol_codes)
+    preopen_stored_signal_recovery_admitted = bool(
+        preopen_stored_signal_recovery_admitted
+        and _parse_market_date(normalized_end) == _parse_market_date(latest_trade_date)
+    )
     run_metadata = {
         'mode': mode,
         'point_in_time_recovery': point_in_time_recovery,
@@ -3667,6 +3686,8 @@ def run_market_data_pipeline(
         'failed_symbols': [],
         'failed_symbols_count': 0,
         'unattempted_symbols': unattempted_symbols,
+        **({'preopen_stored_signal_recovery_admitted': True}
+           if preopen_stored_signal_recovery_admitted else {}),
     }
     if normalized_owning_pipeline_run_id is not None:
         run_metadata['daily_pipeline_run_id'] = (
@@ -3735,6 +3756,8 @@ def run_market_data_pipeline(
             'selected_stages': list(resolved_selected_stages),
             'chain_fundamentals_followup': chain_fundamentals_followup,
             'retry': retry_context,
+            **({'preopen_stored_signal_recovery_admitted': True}
+               if preopen_stored_signal_recovery_admitted else {}),
         },
         provider_admission_fence_owned=provider_admission_fence_owned,
     )
@@ -5953,9 +5976,32 @@ def run_market_data_pipeline(
         call: Callable[[], dict[str, Any]],
         default_total: int = 0,
     ) -> dict[str, Any]:
+        if (
+            point_in_time_recovery
+            and stage_id in POINT_IN_TIME_RECOVERY_CURRENT_ONLY_STAGE_IDS
+            and not (
+                stage_id == 'signal_features'
+                and preopen_stored_signal_recovery_admitted
+            )
+            and should_skip_point_in_time_current_only_stage(
+                stage_id=stage_id, market_date=latest_trade_date,
+            )
+        ):
+            stage_result = _build_point_in_time_current_only_skip(
+                stage_id=stage_id, market_date=latest_trade_date,
+            )
+            record_followup_result(stage_id, stage_result)
+            return stage_result
         record_followup_start(stage_id, activity)
+        upstream_key = {
+            'signal_decider': 'feedback_followup',
+            'next_open_execution_plan': 'signal_decider_followup',
+        }.get(stage_id)
         try:
-            stage_result = call()
+            skipped = empty_agent_scope_followup(
+                result.get(upstream_key), market_date=latest_trade_date,
+            ) if upstream_key else None
+            stage_result = skipped if skipped is not None else call()
         except Exception as exc:
             record_followup_failure(stage_id, exc)
             raise
@@ -6194,13 +6240,23 @@ def run_market_data_pipeline(
             refresh_kwargs['authoritative_market_scope'] = (
                 daily_derived_market_scope_authority
             )
-        stage_result = dict(
-            asyncio.run(
+        if point_in_time_recovery:
+            stage_result = dict(
+                dependencies.signal_feature_service.rebuild_stored_owned_fallback_for_market_date(
+                    market_date=latest_trade_date,
+                    exact_symbols=(
+                        list(signal_feature_admitted_symbols)
+                        if signal_feature_admitted_symbols is not None
+                        else list(exact_piotroski_membership_symbols or [])
+                    ),
+                )
+            )
+        else:
+            stage_result = dict(asyncio.run(
                 dependencies.signal_feature_service.refresh_for_market_date(
                     **refresh_kwargs,
                 )
-            )
-        )
+            ))
         source_errors = stage_result.get('source_errors')
         incomplete_sources = stage_result.get('incomplete_sources')
         if source_errors or incomplete_sources:
@@ -6596,6 +6652,10 @@ def run_market_data_pipeline(
             )
         elif (
             point_in_time_recovery
+            and should_skip_point_in_time_current_only_stage(
+                stage_id='fundamentals_daily_refresh',
+                market_date=latest_trade_date,
+            )
             and chain_fundamentals_followup
             and mode == 'daily_auto'
             and status in {'completed', 'completed_with_errors'}
@@ -6767,6 +6827,7 @@ def run_market_data_pipeline(
                         ),
                         progress_callback=signal_decider_progress_callback,
                         point_in_time_recovery=point_in_time_recovery,
+                        source_summary_run_id=result['feedback_followup'].get('run_id'),
                         **feedback_scope_kwargs,
                     ),
                 )
@@ -7070,6 +7131,11 @@ def run_market_data_pipeline(
                 and bool(signal_feature_successful_symbols)
             ):
                 feedback_scope_kwargs: dict[str, Any] = {}
+                if point_in_time_recovery:
+                    feedback_scope_kwargs.update({
+                        'point_in_time_recovery': True,
+                        'symbols': list(signal_feature_successful_symbols or []),
+                    })
                 if set(signal_feature_successful_symbols or []) != set(
                     exact_followup_symbols
                 ):
@@ -7104,6 +7170,7 @@ def run_market_data_pipeline(
                                 resolve_feedback_knowledge_cutoff()
                             ),
                             progress_callback=signal_decider_progress_callback,
+                            source_summary_run_id=result['feedback_followup'].get('run_id'),
                             **feedback_scope_kwargs,
                         ),
                     )

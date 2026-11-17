@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, load_only
 from app.agent_context.decider_replay_service import actual_execution_outcome_exclusion_reason
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES
 from app.agent_context.wait_price_observations import wait_price_observations
+from app.agent_context.wait_paper_ledger import wait_paper_ledger
 from app.db import session_scope, session_timeout_budget
 from app.db_models import (
     DailyMarketRiskSnapshot, DailyPriceBar, DailyTechnicalSnapshot, DartDisclosureEvent,
@@ -21,6 +22,7 @@ from app.market.clock import KST
 from app.market.session import get_krx_exchange_calendar_day
 from app.market_data_store import load_current_market_snapshot_context
 from app.market_news.service import market_news_service
+from app.orders.monitoring_session_results import summarize_wait_paper_trades
 from app.side_agents.market_inputs import _num, aggregate_breadth
 from app.side_agents.schemas import MARKET_AGENT
 from app.side_agents.store import SideAgentStore
@@ -436,6 +438,10 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
     session_open = datetime.combine(market_date, time(9), KST)
     watches = wait_price_observations.history(market_date, as_of=observed_at)
     watches = [watch for watch in watches if watch['decision_agent_name'] in DECISION_SUPPORT_AGENT_NAMES]
+    paper_trades = wait_paper_ledger.history(market_date, as_of=observed_at)
+    error = wait_price_observations.paper_recording_error
+    paper_error = error.split(':', 1)[0] if error else None
+    paper_summary = summarize_wait_paper_trades(paper_trades, recording_error=paper_error)
     roles = {}
     with session_scope(statement_timeout_ms=10_000) as db:
         executions = _stored_execution(db, market_date, observed_at, watches)
@@ -443,6 +449,11 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
         breadth = _market_breadth(db, market_date, observed_at)
         for role in DECISION_SUPPORT_AGENT_NAMES:
             role_watches = _role_watches(watches, role)
+            role_paper = sorted(
+                [row for row in paper_trades if row['decision_agent_name'] == role],
+                key=lambda row: (row['status'] not in {'target_exited', 'stop_exited'}, row['status'] != 'open',
+                                 row['decision_snapshot_id']),
+            )
             ordered = sorted(role_watches, key=lambda watch: (
                 watch['decision_snapshot_id'] not in filled_ids,
                 not bool(watch.get('ask_entry')), not bool(watch.get('ask_touch')),
@@ -466,6 +477,11 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
                 'actual_entry_fill_count': sum(row['entry_fill_observed'] for row in role_execution),
                 'actual_closed_trade_count': sum(row['closed_trade_observed'] for row in role_execution),
                 'execution_lifecycle_counts': dict(Counter(row['lifecycle_status'] for row in role_execution)),
+                'paper_trades': [
+                    {key: value for key, value in row.items() if key != 'events'}
+                    for row in role_paper[:MAX_EXAMPLES_PER_ROLE]
+                ],
+                'paper_summary': paper_summary['by_role'][role],
                 'examples': [
                     {**watch, 'recorded_execution': executions.get(watch['decision_snapshot_id'], [])[:3]}
                     for watch in selected
@@ -513,6 +529,10 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
             'watch': 'available' if role['watch_event_count'] else 'unavailable',
             'actual_execution': _execution_status(
                 role['actual_entry_fill_count'], sum(role['execution_lifecycle_counts'].values()),
+            ),
+            'paper_execution': (
+                'available' if role['paper_summary']['coverage'] == 'complete'
+                else role['paper_summary']['coverage']
             ),
             'market': _source_status(
                 has_market or bool(current_technicals) or any(example['session_price'] for example in role_examples),
@@ -568,6 +588,14 @@ def load_daily_review_evidence(market_date: date, *, observed_at: datetime, stor
                 'status': _execution_status(sum(role['actual_entry_fill_count'] for role in roles.values()), execution_records),
                 'scope': 'Stored records linked to the watched decisions for this session. Records without fills describe lifecycle only.',
                 'records': execution_records,
+            },
+            'paper_execution': {
+                **paper_summary['overall'],
+                'recording_error': paper_error,
+                'scope': 'Virtual WAIT ledger only; never broker fills. Realized net outcomes include the frozen cost assumption. '
+                         'Open marks are separate, and incomplete paths or missing inputs are unknown rather than zero. '
+                         'Summaries cover all rows; paper_trades samples up to six per role with closed and open trades first, '
+                         'omitting raw event timelines.',
             },
             'decision_context': {'covered_examples': len(contexts), 'examples': len(examples)},
             'market_risk': {'records': len(breadth), 'source': 'daily_market_risk_snapshots'},

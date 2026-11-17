@@ -7093,6 +7093,9 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['eligibility_status'], ELIGIBILITY_MONITOR_CANDIDATE)
 
     async def test_paper_unspecified_route_has_no_cross_lane_metadata(self) -> None:
+        legacy_sizing = patch.object(settings, 'core_quantity_sizing_enabled', False)
+        legacy_sizing.start()
+        self.addCleanup(legacy_sizing.stop)
         settings.signal_decider_exec_integration_mode = 'dispatch'
         settings.signal_decider_exec_runtime_mode = 'paper'
         self._seed_snapshot(symbol='005930', next_day_open_action='wait')
@@ -11478,6 +11481,17 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(acknowledged['execution_status'], EXECUTION_STATUS_REVOKED)
         self.assertIn('exec_dispatch', acknowledged['submission'])
 
+        with session_scope() as session:
+            row = session.get(SignalDeciderExecutionPlanItem, row_id)
+            row.submission_payload = {
+                **row.submission_payload,
+                'core_quantity_sizing': {
+                    'initial_policy': {'type': 'core_sized', 'target_quantity': 10, 'revision': 1},
+                    'policy': {'type': 'core_sized', 'target_quantity': 7, 'revision': 3},
+                    'source_binding': 'retired-family',
+                },
+            }
+
         healthy_snapshot = self._live_market_snapshot_context(
             observed_at=datetime(
                 2026,
@@ -11514,6 +11528,8 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered['execution_status'], EXECUTION_STATUS_PLANNED)
         self.assertIsNone(recovered['submitted_at'])
         self.assertNotIn('exec_dispatch', recovered['submission'])
+        self.assertNotIn('core_quantity_sizing', recovered['submission'])
+        self.assertEqual(recovered['submission']['revision_history'][-1]['retired_core_quantity_policy']['revision'], 3)
         self.assertEqual(
             recovered['submission']['revocation']['recovery']['status'],
             'authority_revalidated',

@@ -3,6 +3,16 @@
 ## Summary
 Reads persisted daily DART fundamentals refresh runs for the requested `market_date` and `fs_div`.
 
+`latest_run.snapshot_availability` and each `runs[].snapshot_availability` report
+`available_snapshot_count`, `reused_snapshot_count`,
+`refreshed_snapshot_count`, `unavailable_snapshot_count`, and
+`retry_debt_count`. A valid previous snapshot remains usable when no newer
+filing is found. A symbol with no usable snapshot has unavailable data and keeps
+its explicit reason. Refresh failures and retry debt retain their own counters.
+For legacy runs with incomplete saved update manifests, the available, reused,
+and unavailable counts are null and `coverage_basis` is
+`incomplete_legacy_update_manifest`.
+
 The inspect payload keeps run-level counters such as `symbols_checked`, `symbols_refreshed`, and `symbols_failed`, and now also exposes a dedicated cycle-day updated-company activity surface through:
 - `updated_entries_summary`
 - `updated_entries_preview`

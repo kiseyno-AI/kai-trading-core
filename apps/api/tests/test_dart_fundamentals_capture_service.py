@@ -661,6 +661,56 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.mock_piotroski_filter = self.piotroski_filter_patcher.start()
         self.addCleanup(self.piotroski_filter_patcher.stop)
 
+    async def test_dated_refresh_cannot_certify_future_receipt_state_as_fresh(self):
+        repository = FakeCaptureRepository()
+        repository.symbol_states['111111'] = {
+            'stock_code': '111111',
+            'has_fundamentals': True,
+            'latest_fundamentals_receipt_date': '2026-04-15',
+            'latest_resolved_fundamentals_receipt_date': '2026-04-15',
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [{'symbol': '111111'}],
+        )
+
+        result = await service.run_daily_incremental_refresh(
+            market_date='2026-04-14',
+            symbols=['111111'],
+            run_piotroski_followup=False,
+            run_feedback_followup=False,
+        )
+
+        self.assertEqual(result['successful_stock_codes'], [])
+        self.assertEqual(result['retry_debt_stock_codes'], ['111111'])
+        self.assertNotEqual(result['status'], 'completed')
+        self.assertEqual(repository.completed_refresh_runs[-1][1]['symbols_fresh'], 0)
+
+    async def test_dated_capture_rejects_future_statement_receipt_before_persisting(self):
+        class FutureStatementClient(FakeCaptureClient):
+            async def fetch_financial_statements(self, **kwargs):
+                payload = await super().fetch_financial_statements(**kwargs)
+                payload['list'][0]['rcept_no'] = '20260415000001'
+                return payload
+
+        repository = FakeCaptureRepository()
+        service = DartFundamentalsCaptureService(
+            client=FutureStatementClient(), repository=repository,
+        )
+
+        result = await service.capture_recent_fundamentals(
+            limit=1,
+            stock_codes=['005930'],
+            event_ids=[4],
+            receipt_date_to=date(2026, 4, 14),
+        )
+
+        self.assertEqual(result['events_failed'], 1)
+        self.assertEqual(result['events_captured'], 0)
+        self.assertEqual(repository.snapshots, [])
+        self.assertEqual(repository.successes, [])
+
     async def test_non_authoritative_corp_cache_cannot_terminalize_absence(self):
         class NonAuthoritativeClient:
             async def lookup_corp_code(self, *, stock_code):
@@ -1885,6 +1935,39 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['latest_run']['updated_entries_preview'], result['latest_run']['updated_entries'])
         self.assertEqual(result['latest_run']['updated_entries_summary']['updated_count'], 1)
 
+    async def test_daily_inspection_distinguishes_prior_snapshots_from_retry_debt(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 146,
+            'market_date': '2026-04-14',
+            'status': 'partial',
+            'symbols_checked': 3,
+            'symbols_missing': 1,
+            'symbols_refreshed': 0,
+            'symbols_failed': 1,
+            'run_metadata': {
+                'retry_debt_count': 1,
+                'retry_debt_stock_codes': ['005930'],
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+        )
+
+        result = service.inspect_daily_refresh_status(
+            market_date=date(2026, 4, 14), fs_div='CFS',
+        )['latest_run']
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['snapshot_availability'], {
+            'available_snapshot_count': 2,
+            'reused_snapshot_count': 2,
+            'refreshed_snapshot_count': 0,
+            'unavailable_snapshot_count': 1,
+            'retry_debt_count': 1,
+        })
+
     async def test_inspect_daily_refresh_status_exposes_preview_and_more_counts_for_many_entries(self):
         repository = FakeCaptureRepository()
         repository.latest_refresh_run = {
@@ -1932,6 +2015,40 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['latest_run']['updated_entries_summary']['has_more'])
         self.assertEqual(result['latest_run']['updated_entries_summary']['remaining_count'], 1)
         self.assertTrue(result['latest_run']['updated_entries_summary']['full_list_available'])
+
+    async def test_snapshot_availability_stays_unknown_when_legacy_updates_are_truncated(self):
+        repository = FakeCaptureRepository()
+        repository.latest_refresh_run = {
+            'id': 148,
+            'market_date': '2026-04-14',
+            'status': 'completed',
+            'symbols_checked': 3,
+            'symbols_missing': 2,
+            'symbols_refreshed': 2,
+            'run_metadata': {
+                'updated_entries': [{
+                    'stock_code': '005930',
+                    'update_category': 'initial_fundamentals_capture',
+                }],
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(), repository=repository,
+        )
+
+        run = service.inspect_daily_refresh_status(
+            market_date=date(2026, 4, 14), fs_div='CFS',
+        )['latest_run']
+
+        self.assertFalse(run['updated_entries_summary']['full_list_available'])
+        self.assertEqual(run['snapshot_availability'], {
+            'available_snapshot_count': None,
+            'reused_snapshot_count': None,
+            'refreshed_snapshot_count': 2,
+            'unavailable_snapshot_count': None,
+            'retry_debt_count': 0,
+            'coverage_basis': 'incomplete_legacy_update_manifest',
+        })
 
     async def test_backfill_current_universe_uses_2015_floor_and_selected_active_symbols(self):
         client = FakeCaptureClient()
@@ -2601,6 +2718,13 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['symbols_missing'], 1)
         self.assertEqual(result['symbols_stale'], 1)
         self.assertEqual(result['symbols_fresh'], 1)
+        self.assertEqual(result['snapshot_availability'], {
+            'available_snapshot_count': 3,
+            'reused_snapshot_count': 1,
+            'refreshed_snapshot_count': 2,
+            'unavailable_snapshot_count': 0,
+            'retry_debt_count': 0,
+        })
         self.assertEqual(result['events_detected'], 2)
         self.assertEqual(result['events_captured'], 2)
         self.assertEqual(result['piotroski_filter']['symbols_evaluated'], 3)
@@ -2857,6 +2981,13 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['retry_debt_stock_codes'], [])
         self.assertEqual(result['retry_debt_count'], 0)
         self.assertEqual(result['symbols_fresh'], 0)
+        self.assertEqual(result['snapshot_availability'], {
+            'available_snapshot_count': 2,
+            'reused_snapshot_count': 2,
+            'refreshed_snapshot_count': 0,
+            'unavailable_snapshot_count': 0,
+            'retry_debt_count': 0,
+        })
         self.assertEqual(
             result['maintenance_deferred_stock_codes'],
             ['000660', '005930'],
@@ -2943,6 +3074,58 @@ class DartFundamentalsCaptureServiceTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(repository.successes, [7])
+
+    async def test_no_new_filing_reuses_prior_snapshot_and_keeps_unknown_financials_nullable(self):
+        repository = FakeCaptureRepository()
+        repository.symbol_states = {
+            '005930': {
+                'stock_code': '005930',
+                'has_fundamentals': True,
+                'latest_fundamentals_receipt_date': '2026-04-01',
+                'latest_snapshot': {'id': 100},
+            },
+            '000660': {
+                'stock_code': '000660',
+                'has_fundamentals': False,
+                'latest_fundamentals_receipt_date': None,
+                'latest_snapshot': None,
+            },
+        }
+        service = DartFundamentalsCaptureService(
+            client=FakeCaptureClient(),
+            repository=repository,
+            active_symbol_loader=lambda: [
+                {'symbol': '005930'}, {'symbol': '000660'},
+            ],
+        )
+        with patch.object(
+            repository, 'list_capture_candidates', return_value=[],
+        ), patch(
+            'app.dart.sync_service.dart_disclosure_sync_service.sync_disclosures_for_corporations',
+            return_value={'status': 'completed', 'financial_report_events': 0},
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_initial_backfill_enabled',
+            True,
+        ), patch(
+            'app.dart.fundamentals_capture_service.settings.dart_fundamentals_daily_incremental_lookback_days',
+            5000,
+        ):
+            result = await service.run_daily_incremental_refresh(
+                market_date=date(2026, 4, 14),
+                run_piotroski_followup=False,
+                run_feedback_followup=False,
+            )
+
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['successful_stock_codes'], ['000660', '005930'])
+        self.assertEqual(result['snapshot_availability'], {
+            'available_snapshot_count': 1,
+            'reused_snapshot_count': 1,
+            'refreshed_snapshot_count': 0,
+            'unavailable_snapshot_count': 1,
+            'retry_debt_count': 0,
+        })
+        self.assertEqual(repository.snapshots, [])
 
     async def test_daily_incremental_refresh_propagates_company_sync_failures_as_retryable_partial(self):
         client = FakeCaptureClient()
@@ -4783,7 +4966,15 @@ class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
 
             def list_file_not_found_rechecks(self, *, stock_codes, limit=20):
                 self.recheck_call = {'stock_codes': list(stock_codes), 'limit': limit}
-                return [recheck_event]
+                return [
+                    recheck_event,
+                    {
+                        **recheck_event,
+                        'id': 78,
+                        'rcept_no': '20260415000078',
+                        'receipt_date': '2026-04-15',
+                    },
+                ]
 
         repository = RecheckRepository()
         repository.symbol_states['111111'] = {
@@ -4819,7 +5010,7 @@ class FileNotFoundRecheckDailyPathTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(repository.recheck_call, {'stock_codes': ['111111'], 'limit': 10})
         metadata = repository.completed_refresh_runs[-1][1]['run_metadata']
-        self.assertGreaterEqual(int(metadata.get('events_detected') or repository.completed_refresh_runs[-1][1].get('events_detected') or 0), 1)
+        self.assertEqual(int(metadata.get('events_detected') or repository.completed_refresh_runs[-1][1].get('events_detected') or 0), 1)
         self.assertEqual(result['capture']['events_captured'], 1)
         self.assertEqual(repository.successes, [77])
         self.assertEqual(repository.snapshots[0]['snapshot_payload']['rcept_no'], recheck_event['rcept_no'])

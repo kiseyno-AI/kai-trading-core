@@ -23,6 +23,7 @@ from app.agent_context.decision_input_quality import build_decision_input_qualit
 from app.agent_context.roles import SHORT_TERM_DECIDER_AGENT_NAME, SIGNAL_DECIDER_AGENT_NAME
 from app.agent_context.wait_price_observations import (
     WaitPriceWatch,
+    hydrate_wait_paper_watches,
     wait_price_observations,
     watch_from_snapshot,
 )
@@ -41,6 +42,8 @@ from app.market.session import (
 )
 from app.market.symbol_codes import is_canonical_krx_short_code
 from app.orders.execution_handoff_contract import (
+    CoreQuantityPolicy,
+    ExecutionQuantityRefreshPayload,
     EXEC_AGENT_DECIDER_HANDOFF_SCHEMA_VERSION,
     EXECUTION_HANDOFF_ACK_SCHEMA_VERSION,
     EXECUTION_HANDOFF_CAPABILITY,
@@ -2640,6 +2643,10 @@ class SignalDeciderExecClient:
     async def post_execution_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request_json('POST', '/v4/execution-plans', json_body=payload)
 
+    async def post_execution_plan_quantities(self, payload: dict[str, Any]) -> dict[str, Any]:
+        validated = ExecutionQuantityRefreshPayload.model_validate(payload).model_dump(mode='json')
+        return await self._request_json('POST', '/v4/execution-plans/quantities', json_body=validated)
+
     async def post_execution_plan_activation(
         self,
         payload: dict[str, Any],
@@ -2780,6 +2787,7 @@ class SignalDeciderExecIntegrationService:
         session_history: MonitoringSessionHistory | None = None,
     ) -> None:
         self.client = client or SignalDeciderExecClient()
+        self._core_quantity_refresh_service = None
         self._session_history = session_history
         self.dashboard_cache_ttl_seconds = max(int(settings.signal_decider_exec_dashboard_cache_ttl_seconds), 0)
         self.dashboard_refresh_debounce_seconds = max(
@@ -3135,6 +3143,24 @@ class SignalDeciderExecIntegrationService:
         return bool(
             self.integration_status()['delegate_execution']
             and settings.signal_decider_next_open_enabled
+        )
+
+    def _core_quantity_service(self):
+        if self._core_quantity_refresh_service is None:
+            from app.orders.core_quantity_refresh import CoreQuantityRefreshService
+
+            self._core_quantity_refresh_service = CoreQuantityRefreshService(integration=self)
+        return self._core_quantity_refresh_service
+
+    async def refresh_core_quantities_if_due(self, *, target_trade_date: str | date) -> dict[str, Any]:
+        if (
+            not settings.core_quantity_sizing_enabled
+            or not self.should_delegate_execution()
+            or settings.signal_decider_next_open_dry_run
+        ):
+            return {'status': 'disabled', 'updated_count': 0}
+        return await self._core_quantity_service().refresh_if_due(
+            target_trade_date=_normalize_date(target_trade_date),
         )
 
     @staticmethod
@@ -5318,13 +5344,46 @@ class SignalDeciderExecIntegrationService:
                 account_reference=resolved_account_reference,
             )
         snapshots = self._load_snapshots(rows)
+        quantity_unprepared = []
+        if settings.core_quantity_sizing_enabled:
+            quantity_rows = [
+                row for row in rows
+                if buy_authority_sync.get('applies') is not True
+                or (buy_authority_sync.get('accounts', {}).get(row.account_reference) or {}).get('dispatch_allowed') is True
+            ]
+            await self._core_quantity_service().prepare_initial(
+                rows=quantity_rows, snapshots=snapshots, dry_run=resolved_dry_run,
+            )
+            from app.orders.core_quantity_refresh import CoreQuantityRefreshService
+
+            for row in quantity_rows:
+                if (
+                    is_canonical_krx_short_code(row.symbol)
+                    and self._row_is_dispatchable(row)
+                    and not _row_has_accepted_exec_dispatch(row)
+                    and not CoreQuantityRefreshService.policy_matches_source(
+                        row, snapshots.get(row.decision_snapshot_id),
+                    )
+                ):
+                    quantity_unprepared.append(row)
+            if quantity_unprepared:
+                unprepared_ids = {row.id for row in quantity_unprepared}
+                rows = [row for row in rows if row.id not in unprepared_ids]
         grouped = self._group_rows_by_dispatch_scope(rows)
 
-        group_results: list[dict[str, Any]] = []
+        group_results: list[dict[str, Any]] = [
+            {
+                'account_reference': row.account_reference, 'decision_agent_name': row.decision_agent_name,
+                'plan_item_id': row.id, 'dispatch_status': EXEC_DISPATCH_STATUS_SKIPPED,
+                'reason': 'core_quantity_unprepared',
+                'message': 'Core quantity evidence is unavailable; the candidate remains observable.',
+            }
+            for row in quantity_unprepared
+        ]
         translated_item_count = 0
         dispatched_group_count = 0
         failed_group_count = 0
-        skipped_group_count = 0
+        skipped_group_count = len(quantity_unprepared)
         preview_plans: list[dict[str, Any]] = []
 
         for (account_key, decision_agent_name, route_family), account_rows in grouped.items():
@@ -7518,8 +7577,18 @@ class SignalDeciderExecIntegrationService:
                     }
                 for index, watch in enumerate(recovery):
                     current = enriched.get(watch.decision_snapshot_id)
-                    if current is not None and replace(current, buy_direction=None, chase_limit_price=None) == watch:
-                        recovery[index] = current
+                    if current is not None and all(
+                        getattr(current, field) == getattr(watch, field)
+                        for field in (
+                            'decision_snapshot_id', 'decision_agent_name', 'symbol',
+                            'source_market_date', 'observed_at', 'trigger_price',
+                        )
+                    ):
+                        recovery[index] = replace(
+                            watch, buy_direction=current.buy_direction,
+                            chase_limit_price=current.chase_limit_price,
+                            target_price=current.target_price, stop_loss_price=current.stop_loss_price,
+                        )
             except Exception:
                 logger.exception('Could not recover the buy conditions for enrolled WAIT decisions')
         try:
@@ -7558,10 +7627,18 @@ class SignalDeciderExecIntegrationService:
         closed_ids = signal_decider_execution_outcome_service.closed_snapshot_ids(
             decision_snapshot_ids=list(observations), target_trade_date=target_trade_date,
         )
-        return [
+        remaining = [
             observation for snapshot_id, observation in observations.items()
             if snapshot_id not in closed_ids
         ]
+        try:
+            return [asdict(watch) for watch in hydrate_wait_paper_watches(
+                target_trade_date, [WaitPriceWatch(**row) for row in remaining], now=_utcnow(),
+                allow_reference_quantity=True,
+            )]
+        except Exception:
+            logger.warning('Could not load stored WAIT paper sizing', exc_info=True)
+            return remaining
 
     async def _build_and_cache_runtime_symbol_detail(
         self,
@@ -10178,6 +10255,18 @@ class SignalDeciderExecIntegrationService:
                     'quantity_multiplier_valid_until': market_regime_sizing_policy['valid_until'],
                 }
             )
+            quantity_state = (
+                row.submission_payload.get('core_quantity_sizing')
+                if isinstance(row.submission_payload, dict) else None
+            )
+            if isinstance(quantity_state, dict) and isinstance(quantity_state.get('initial_policy'), dict):
+                from app.orders.core_quantity_refresh import CoreQuantityRefreshService
+
+                if not CoreQuantityRefreshService.policy_matches_source(row, snapshot):
+                    raise SignalDeciderExecPayloadContractError('core_quantity_source_changed')
+                quantity_policy = CoreQuantityPolicy.model_validate(
+                    quantity_state['initial_policy'],
+                ).model_dump(mode='json')
             entry_risk_context = _bounded_dispatch_object(
                 {
                     **entry_common_risk_context,

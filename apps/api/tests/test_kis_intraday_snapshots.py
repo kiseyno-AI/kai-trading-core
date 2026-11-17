@@ -3,6 +3,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from app.brokers.kis.client import KISAPIError, KISHTTPError, KISTimeoutError, KISTransportError
 from app.core.settings import settings
 from app.market.kis_intraday_snapshots import (
     KIS_INTRADAY_SNAPSHOT_SOURCE,
@@ -191,6 +192,99 @@ class KISIntradaySnapshotServiceTests(unittest.IsolatedAsyncioTestCase):
         settings.kis_app_key = self.original_app_key
         settings.kis_app_secret = self.original_app_secret
         settings.kis_intraday_snapshot_enabled = self.original_enabled
+
+    async def test_transient_investor_failure_retries_only_that_surface(self) -> None:
+        client = FakeKISIntradayClient()
+        investor_response = await client.fetch_domestic_investor_trend_estimate('115480')
+        client.fetch_domestic_investor_trend_estimate = AsyncMock(side_effect=[
+            KISHTTPError('KIS request failed [500]: 초당 거래건수를 초과하였습니다.', status_code=500, retryable=True),
+            investor_response,
+        ])
+        for method in ('fetch_domestic_quote', 'fetch_domestic_orderbook', 'fetch_domestic_program_trade_by_stock'):
+            setattr(client, method, AsyncMock(wraps=getattr(client, method)))
+        service = KISIntradaySnapshotService(client=client)
+        with (
+            patch.object(service, '_capture_universe', return_value=[IntradaySymbolInput('115480', None, 'KRX')]),
+            patch('app.market.kis_intraday_snapshots.async_get_market_state', return_value=SimpleNamespace(
+                state='CLOSED', is_trading_day=True, server_time='2026-05-07T16:15:35+09:00',
+            )),
+            patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot') as persist,
+            patch('app.market.kis_intraday_snapshots.asyncio.sleep', new_callable=AsyncMock) as sleep,
+        ):
+            result = await service.collect_snapshots(symbols=['115480'], include_news=False)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(client.fetch_domestic_investor_trend_estimate.await_count, 2)
+        client.fetch_domestic_quote.assert_awaited_once()
+        client.fetch_domestic_orderbook.assert_awaited_once()
+        client.fetch_domestic_program_trade_by_stock.assert_awaited_once()
+        sleep.assert_awaited_once_with(1.0)
+        payload = result['items'][0]
+        self.assertEqual(payload['quote']['price'], 71550)
+        self.assertEqual(payload['investor_program_activity']['investor_trend_estimate']['combined_estimated_net_quantity'], 2100)
+        self.assertNotIn('investor_trend_estimate', payload['provenance'].get('surface_errors', {}))
+        persist.assert_called_once()
+
+    async def test_surface_exhaustion_preserves_error_and_auth_business_errors_do_not_retry(self) -> None:
+        cases = (
+            (KISHTTPError('original KIS HTTP 500 rate-limit error', status_code=500), 4, [1.0, 2.0, 4.0]),
+            (KISHTTPError('original KIS HTTP 403 authorization error', status_code=403, retryable=True), 1, []),
+            (KISAPIError('original KIS business rejection', status_code=200, msg_code='BUSINESS_ERROR', retryable=True), 1, []),
+        )
+        for error, attempts, delays in cases:
+            with self.subTest(error=str(error)):
+                client = FakeKISIntradayClient()
+                client.fetch_domestic_investor_trend_estimate = AsyncMock(side_effect=error)
+                client.fetch_domestic_quote = AsyncMock(wraps=client.fetch_domestic_quote)
+                client.fetch_domestic_orderbook = AsyncMock(wraps=client.fetch_domestic_orderbook)
+                service = KISIntradaySnapshotService(client=client)
+                with (
+                    patch.object(service, '_capture_universe', return_value=[IntradaySymbolInput('115480', None, 'KRX')]),
+                    patch('app.market.kis_intraday_snapshots.async_get_market_state', return_value=SimpleNamespace(
+                        state='CLOSED', is_trading_day=True, server_time='2026-05-07T16:15:35+09:00',
+                    )),
+                    patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot') as persist,
+                    patch('app.market.kis_intraday_snapshots.asyncio.sleep', new_callable=AsyncMock) as sleep,
+                ):
+                    result = await service.collect_snapshots(symbols=['115480'], include_news=False)
+                self.assertEqual(result['status'], 'partial')
+                self.assertEqual(client.fetch_domestic_investor_trend_estimate.await_count, attempts)
+                self.assertEqual([item.args[0] for item in sleep.await_args_list], delays)
+                client.fetch_domestic_quote.assert_awaited_once()
+                client.fetch_domestic_orderbook.assert_awaited_once()
+                payload = result['items'][0]
+                self.assertEqual(payload['quote']['price'], 71550)
+                self.assertEqual(payload['provenance']['surface_errors']['investor_trend_estimate'], str(error))
+                self.assertEqual(payload['investor_program_activity']['source_statuses']['investor_trend_estimate'], 'unavailable')
+                self.assertNotIn('investor_trend_estimate', payload['investor_program_activity'])
+                persist.assert_called_once()
+
+    async def test_timeout_transport_429_and_kis_rate_code_retry_but_valid_empty_does_not(self) -> None:
+        for error in (
+            KISTimeoutError('KIS timed out'),
+            KISTransportError('KIS connection reset'),
+            KISHTTPError('KIS HTTP 429', status_code=429),
+            KISAPIError('KIS rate limit', status_code=200, msg_code='EGW00201'),
+            None,
+        ):
+            with self.subTest(error=type(error).__name__):
+                client = FakeKISIntradayClient()
+                client.fetch_domestic_investor_trend_estimate = AsyncMock(
+                    side_effect=[error, {'output2': []}] if error else None, return_value={'output2': []},
+                )
+                service = KISIntradaySnapshotService(client=client)
+                with (
+                    patch.object(service, '_capture_universe', return_value=[IntradaySymbolInput('115480', None, 'KRX')]),
+                    patch('app.market.kis_intraday_snapshots.async_get_market_state', return_value=SimpleNamespace(
+                        state='CLOSED', is_trading_day=True, server_time='2026-05-07T16:15:35+09:00',
+                    )),
+                    patch('app.market.kis_intraday_snapshots.persist_kis_intraday_snapshot'),
+                    patch('app.market.kis_intraday_snapshots.asyncio.sleep', new_callable=AsyncMock) as sleep,
+                ):
+                    result = await service.collect_snapshots(symbols=['115480'], include_news=False)
+                self.assertEqual(result['status'], 'ok')
+                self.assertEqual(client.fetch_domestic_investor_trend_estimate.await_count, 2 if error else 1)
+                self.assertEqual(sleep.await_count, 1 if error else 0)
+                self.assertEqual(result['items'][0]['investor_program_activity']['source_statuses']['investor_trend_estimate'], 'empty')
 
     async def test_collect_snapshots_normalizes_execution_context_and_persists_rows(self) -> None:
         service = KISIntradaySnapshotService(client=FakeKISIntradayClient())

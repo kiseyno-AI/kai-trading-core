@@ -10,6 +10,7 @@ from app.eod.exact_signal_feature_repair import (
     _preserved_direct_signal_payload,
 )
 from app.eod.market_membership import market_membership_sha256
+from app.eod.scope_outcomes import validate_stage_bound_scope_outcome
 from app.market_data_store import sanitize_daily_signal_feature_payload
 from app.signals.daily_signal_features import (
     OVERTIME_FLUCTUATION,
@@ -999,6 +1000,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             ) as persist,
             patch(
+                'app.signals.daily_signal_features.list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
+            patch(
                 'app.signals.daily_signal_features.daily_market_participation_context_service.'
                 'rebuild_for_market_date',
             ),
@@ -1264,9 +1269,18 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                 return_value=support_maps,
             ),
             patch(
-                'app.signals.daily_signal_features.upsert_daily_signal_features',
-                return_value=1,
-            ) as upsert,
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={
+                    'successful_symbols': ['005930'],
+                    'scope_finalization': {'ready': True},
+                },
+            ) as persist,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.rebuild_for_market_date',
+                return_value={'captured_symbol_count': 1},
+            ),
         ):
             result = service.rebuild_stored_owned_fallback_for_market_date(
                 market_date='2026-05-06',
@@ -1274,7 +1288,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result['features_persisted'], 1)
-        rebuilt = upsert.call_args.args[0][0]
+        rebuilt = persist.call_args.kwargs['features'][0]
         self.assertEqual(rebuilt['signal_count'], 1)
         self.assertEqual(rebuilt['volume_power_rank'], 1)
         self.assertEqual(rebuilt['volume_power'], Decimal('145.7000'))
@@ -1487,6 +1501,10 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                 'upsert_daily_signal_features',
                 return_value=1,
             ) as upsert,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.rebuild_for_market_date',
+            ) as rebuild_participation,
         ):
             result = service.rebuild_stored_owned_fallback_for_market_date(
                 market_date='2026-05-06',
@@ -1513,6 +1531,8 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             [VOLUME_POWER],
         )
         self.assertFalse(result['exact_scope'])
+        self.assertNotIn('participation_context', result)
+        rebuild_participation.assert_not_called()
 
     def test_repair_exact_scope_creates_missing_fallback_rows(self) -> None:
         service = DailySignalFeatureService(client=EmptyKISRankingClient())
@@ -1530,6 +1550,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             'overtime_fluctuation_rank': None,
             'overtime_fluctuation_rate': None,
             'feature_payload': {
+                'market_date': '2026-05-06',
                 'sources': {
                     VOLUME_POWER: {
                         'data_rank': '1',
@@ -1555,7 +1576,7 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
                     'market': 'KOSPI',
                 },
             },
-            'quote_map': {},
+            'quote_map': {'000660': {'price': 999_999}},
             'price_bars_by_symbol': {
                 symbol: [
                     {
@@ -1609,9 +1630,30 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 'app.signals.daily_signal_features.'
-                'upsert_daily_signal_features',
-                return_value=2,
-            ) as upsert,
+                'replace_daily_signal_features_exact_scope',
+                return_value={
+                    'successful_symbols': ['000660', '005930'],
+                    'scope_finalization': {
+                        'stage': 'signal_features',
+                        'market_date': '2026-05-06',
+                        'exact_symbol_count': 2,
+                        'exact_membership_sha256': market_membership_sha256(
+                            ['000660', '005930']
+                        ),
+                        'successful_symbol_count': 2,
+                        'successful_membership_sha256': market_membership_sha256(
+                            ['000660', '005930']
+                        ),
+                        'deleted_stale_row_count': 0,
+                        'ready': True,
+                    },
+                },
+            ) as persist,
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.rebuild_for_market_date',
+                return_value={'captured_symbol_count': 2},
+            ) as rebuild_participation,
         ):
             result = service.rebuild_stored_owned_fallback_for_market_date(
                 market_date='2026-05-06',
@@ -1623,14 +1665,23 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
             symbols=['000660', '005930'],
         )
         rebuilt_by_symbol = {
-            row['symbol']: row for row in upsert.call_args.args[0]
+            row['symbol']: row for row in persist.call_args.kwargs['features']
         }
-        self.assertFalse(
-            upsert.call_args.kwargs['delete_rows_outside_scope']
+        self.assertEqual(
+            persist.call_args.kwargs['exact_symbols'], ['000660', '005930']
         )
         self.assertEqual(set(rebuilt_by_symbol), {'000660', '005930'})
         self.assertEqual(rebuilt_by_symbol['005930']['signal_count'], 1)
         self.assertEqual(rebuilt_by_symbol['000660']['signal_count'], 0)
+        self.assertIsNone(rebuilt_by_symbol['000660']['volume_power'])
+        self.assertIsNone(rebuilt_by_symbol['000660']['overtime_volume'])
+        missing_payload = rebuilt_by_symbol['000660']['feature_payload']
+        self.assertEqual(missing_payload['sources'], {})
+        self.assertNotIn('quote_snapshot', missing_payload['fallback_features'])
+        self.assertEqual(
+            missing_payload['collection']['repair_mode'],
+            'stored_owned_fallback_exact_scope',
+        )
         self.assertEqual(
             rebuilt_by_symbol['000660']['feature_payload'][
                 'row_provenance'
@@ -1639,11 +1690,240 @@ class DailySignalFeatureServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result['features_persisted'], 2)
         self.assertEqual(result['scope_symbol_count'], 2)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(
+            result['scope_outcome_manifest_version'],
+            'signal_features_scope_outcomes_v1',
+        )
+        self.assertEqual(
+            result['successful_stock_codes'], ['000660', '005930']
+        )
+        self.assertEqual(result['retry_debt_stock_codes'], [])
+        self.assertFalse(result['direct_collection_performed'])
+        self.assertEqual(
+            result['participation_context'], {'captured_symbol_count': 2}
+        )
+        rebuild_participation.assert_called_once_with(
+            market_date='2026-05-06',
+            market='KRX',
+            source='kis_ranking',
+            exact_symbols=['000660', '005930'],
+        )
+        self.assertIsNotNone(
+            validate_stage_bound_scope_outcome(
+                result=result,
+                expected_stage_id='signal_features',
+                invocation_symbols=['000660', '005930'],
+                status=result['status'],
+                expected_market_date='2026-05-06',
+                publication_symbols=['000660', '005930'],
+            )
+        )
         self.assertEqual(
             result['scope_membership_sha256'],
             market_membership_sha256(('000660', '005930')),
         )
         self.assertTrue(result['exact_scope'])
+
+    def test_repair_exact_scope_keeps_unpersisted_symbols_as_retry_debt(self) -> None:
+        service = DailySignalFeatureService(client=SimpleNamespace())
+        symbols = ['000660', '005930']
+        finalization = {
+            'stage': 'signal_features',
+            'market_date': '2026-05-06',
+            'exact_symbol_count': 2,
+            'exact_membership_sha256': market_membership_sha256(symbols),
+            'successful_symbol_count': 1,
+            'successful_membership_sha256': market_membership_sha256(['000660']),
+            'deleted_stale_row_count': 1,
+            'ready': True,
+        }
+        with (
+            patch(
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
+                return_value=[],
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                '_resolve_exact_repair_generation_universe',
+                return_value={
+                    'target_symbols': symbols,
+                    'active_symbols': symbols,
+                    'candidate_symbols': symbols,
+                    'candidate_universe_availability': 'available',
+                },
+            ),
+            patch(
+                'app.signals.daily_signal_features._load_support_maps',
+                return_value={
+                    'price_bars_by_symbol': {
+                        symbol: [{
+                            'trade_date': '2026-05-06',
+                            'open_price': 100,
+                            'high_price': 110,
+                            'low_price': 90,
+                            'close_price': 105,
+                            'volume': 1_000,
+                        }]
+                        for symbol in symbols
+                    },
+                },
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={
+                    'features_persisted': 2,
+                    'successful_symbols': ['000660'],
+                    'failed_symbols': ['005930'],
+                    'scope_finalization': finalization,
+                },
+            ) as persist,
+            patch(
+                'app.signals.daily_signal_features.list_symbols_with_daily_bar_on_date',
+                return_value=symbols,
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.rebuild_for_market_date',
+                return_value={'captured_symbol_count': 1},
+            ) as rebuild_participation,
+        ):
+            result = service.rebuild_stored_owned_fallback_for_market_date(
+                market_date='2026-05-06',
+                exact_symbols=symbols,
+            )
+
+        self.assertEqual(len(persist.call_args.kwargs['features']), 2)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['features_persisted'], 1)
+        self.assertEqual(result['features_failed'], 1)
+        self.assertEqual(result['successful_stock_codes'], ['000660'])
+        self.assertEqual(result['retry_debt_stock_codes'], ['005930'])
+        self.assertEqual(
+            result['participation_context'], {'captured_symbol_count': 1}
+        )
+        rebuild_participation.assert_called_once_with(
+            market_date='2026-05-06',
+            market='KRX',
+            source='kis_ranking',
+            exact_symbols=symbols,
+        )
+        self.assertIs(result['scope_finalization'], finalization)
+        self.assertIsNotNone(
+            validate_stage_bound_scope_outcome(
+                result=result,
+                expected_stage_id='signal_features',
+                invocation_symbols=symbols,
+                status='partial',
+                expected_market_date='2026-05-06',
+                publication_symbols=symbols,
+            )
+        )
+
+    def test_narrow_repair_preserves_bar_backed_market_participation_scope(self) -> None:
+        service = DailySignalFeatureService(client=SimpleNamespace())
+        stored_context_rows = [
+            {
+                'symbol': '005930', 'name_ko': 'fixture', 'market': 'KOSPI',
+                'signal_count': 1, 'volume_power_rank': 1, 'volume_power': 145.7,
+            },
+            {'symbol': '000660', 'signal_count': 0},
+            {'symbol': '999999', 'signal_count': 0},
+        ]
+        with (
+            patch(
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
+                return_value=[_ready_direct_feature_item('005930')],
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                '_resolve_exact_repair_generation_universe',
+                return_value={'target_symbols': ['005930']},
+            ),
+            patch(
+                'app.signals.daily_signal_features._load_support_maps',
+                return_value={},
+            ),
+            patch(
+                'app.signals.daily_signal_features.list_symbols_with_daily_bar_on_date',
+                return_value=['000660', '005930'],
+            ) as load_bar_symbols,
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={'successful_symbols': ['005930']},
+            ),
+            patch(
+                'app.agent_context.derived_contexts.load_daily_signal_feature_context_rows',
+                side_effect=lambda *, market_date, symbols: [
+                    row for row in stored_context_rows if row['symbol'] in symbols
+                ],
+            ),
+            patch(
+                'app.agent_context.derived_contexts.upsert_daily_market_participation_context',
+            ) as persist_context,
+        ):
+            result = service.rebuild_stored_owned_fallback_for_market_date(
+                market_date='2026-04-14',
+                exact_symbols=['005930'],
+            )
+
+        self.assertEqual(result['selected_stock_codes'], ['005930'])
+        self.assertEqual(result['participation_context']['captured_symbol_count'], 2)
+        load_bar_symbols.assert_called_once_with('2026-04-14')
+        self.assertEqual(
+            persist_context.call_args.kwargs['context_payload']['captured_symbol_count'],
+            2,
+        )
+
+    def test_repair_exact_scope_exposes_participation_write_failure(self) -> None:
+        service = DailySignalFeatureService(client=SimpleNamespace())
+        with (
+            patch(
+                'app.signals.daily_signal_features.'
+                'load_raw_daily_signal_features_for_repair',
+                return_value=[_ready_direct_feature_item('005930')],
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                '_resolve_exact_repair_generation_universe',
+                return_value={'target_symbols': ['005930']},
+            ),
+            patch(
+                'app.signals.daily_signal_features._load_support_maps',
+                return_value={},
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'replace_daily_signal_features_exact_scope',
+                return_value={'successful_symbols': ['005930']},
+            ) as persist,
+            patch(
+                'app.signals.daily_signal_features.list_symbols_with_daily_bar_on_date',
+                return_value=['005930'],
+            ),
+            patch(
+                'app.signals.daily_signal_features.'
+                'daily_market_participation_context_service.rebuild_for_market_date',
+                side_effect=RuntimeError('participation write failed'),
+            ) as rebuild_participation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'participation write failed'):
+                service.rebuild_stored_owned_fallback_for_market_date(
+                    market_date='2026-04-14',
+                    exact_symbols=['005930'],
+                )
+
+        persist.assert_called_once()
+        rebuild_participation.assert_called_once_with(
+            market_date='2026-04-14',
+            market='KRX',
+            source='kis_ranking',
+            exact_symbols=['005930'],
+        )
 
     def test_repair_exact_scope_rejects_missing_daily_bar(self) -> None:
         service = DailySignalFeatureService(client=EmptyKISRankingClient())

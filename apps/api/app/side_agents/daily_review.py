@@ -58,7 +58,7 @@ ReviewText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=
 class Finding(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    source: Literal['watch', 'actual_execution', 'market', 'business', 'news', 'recent_sessions']
+    source: Literal['watch', 'actual_execution', 'paper_execution', 'market', 'business', 'news', 'recent_sessions']
     observation_ko: ReviewText
     implication_ko: ReviewText
 
