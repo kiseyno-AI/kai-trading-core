@@ -959,6 +959,162 @@ def _legacy_wrapped_signal_decider_evaluations_stage(
 
 
 class EODPipelineStatusServiceTests(unittest.TestCase):
+    def _scheduled_no_handoff_stages(self, *, no_plan_items=False):
+        market_date = '2026-05-28'
+        updated_at = '2026-05-28T08:30:00+00:00'
+        total = 1 if no_plan_items else 2
+        decider = _legacy_completed_signal_decider_stage(
+            market_date=market_date, updated_at=updated_at,
+            expected=total * 2, completed=total * 2,
+        )['stage']
+        plan = (
+            _completed_zero_item_next_open_history_stage(
+                run_id=516, market_date=market_date,
+            ) if no_plan_items else _completed_next_open_history_stage(
+                run_id=516, market_date=market_date, total=total,
+            )
+        )['stage']
+        proof = plan['details'].pop('completion_scope_proof')
+        result = plan['details']['result_summary']
+        manifest = result['completion_manifest']
+        manifest['role_symbol_scopes'] = deepcopy(proof['role_symbol_scopes'])
+        for entry in manifest['decision_partition']:
+            for item in entry['included_items']:
+                item.update(
+                    eligibility_status='blocked', handoff_active=False,
+                    exec_monitoring_active=False,
+                )
+        manifest.pop('manifest_digest')
+        manifest['manifest_digest'] = hashlib.sha256(json.dumps(
+            manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        result['summary'] = {
+            'eligible_count': 0, 'monitor_candidate_count': 0,
+            'account_targets_configured': True, 'account_targets_valid': True,
+            'enrichment_preflight_allowed': True,
+            'agent_context_completeness_status': 'complete',
+        }
+        parent = decider['details']['result_summary']
+        parent['run_id'] = manifest['parent_run_id']
+        parent['progress']['summary']['role_symbol_scopes'] = (
+            {role: list(reversed(symbols)) for role, symbols in manifest['role_symbol_scopes'].items()}
+        )
+        decider.update(processed=total * 2, total=total * 2, succeeded=total * 2, failed=0, remaining=0)
+        for stage in (decider, plan):
+            stage['details']['mode'] = 'eod_collection_run_stage_progress'
+            stage['source_run_ids'] = {'eod_run_id': 597}
+        return {'signal_decider': decider, 'next_open_execution_plan': plan}
+
+    def test_read_completed_scheduled_no_handoff_keeps_processing_completed(self):
+        for no_plan_items in (False, True):
+            with self.subTest(no_plan_items=no_plan_items):
+                stages = self._scheduled_no_handoff_stages(no_plan_items=no_plan_items)
+                progress = {
+                    stage_id: {
+                        **{k: v for k, v in stage.items() if k != 'details'},
+                        **stage['details'],
+                    }
+                    for stage_id, stage in stages.items()
+                }
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: {
+                        'id': 597, 'status': 'completed', 'trade_date': '2026-05-28',
+                        'run_metadata': {'stage_progress': progress},
+                    },
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 1,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: None,
+                    signal_decider_counts_loader=lambda **_: {
+                        'feedback_rows': 1, 'updated_at': '2026-05-28T08:29:00+00:00',
+                    },
+                )
+                result = service.read(market_date='2026-05-28')
+                self.assertEqual(result['stages']['signal_decider']['processed'], stages['signal_decider']['total'])
+                plan = result['stages']['next_open_execution_plan']
+                self.assertEqual(plan['status'], 'completed')
+                self.assertNotIn('completion_scope_proof', plan['details'])
+
+    def test_scheduled_no_handoff_malformed_parent_progress_fails_closed(self):
+        mutations = {
+            'missing_progress': lambda parent: parent.pop('progress'),
+            'missing_summary': lambda parent: parent['progress'].pop('summary'),
+            'missing_role_progress': lambda parent: parent['progress']['summary'].pop(
+                'role_progress'
+            ),
+            'missing_completed_feedback_count': lambda parent: parent['progress']['summary'].pop(
+                'completed_feedback_count'
+            ),
+            'integer_role_progress_state': lambda parent: parent['progress']['summary'][
+                'role_progress'
+            ].__setitem__('signal-decider', 7),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(case=name):
+                stages = self._scheduled_no_handoff_stages()
+                parent = stages['signal_decider']['details']['result_summary']
+                mutate(parent)
+                with patch.object(
+                    EODPipelineStatusService,
+                    '_signal_decider_has_legacy_completion_proof',
+                    return_value=True,
+                ):
+                    self.assertFalse(
+                        EODPipelineStatusService._scheduled_no_handoff_plan_completed(
+                            decider=stages['signal_decider'],
+                            plan=stages['next_open_execution_plan'],
+                        )
+                    )
+
+    def test_scheduled_no_handoff_does_not_hide_incomplete_or_mismatched_results(self):
+        mutations = {
+            'parent_pending': ('parent', {'final_pending': 1}),
+            'wrong_parent': ('manifest', {'parent_run_id': 'other-run'}),
+            'incomplete_plan': ('result', {'status': 'partial'}),
+            'bad_account': ('summary', {'account_targets_valid': False}),
+            'write_error': ('result', {'error_message': 'database write failed'}),
+            'failed_plan': ('plan', {'failed': 1}),
+            'failed_decider': ('decider', {'failed': 1}),
+            'inconsistent_success': ('plan', {'succeeded': 0}),
+            'remaining_work': ('plan', {'remaining': 1}),
+            'wrong_source_run': ('source', {'eod_run_id': 598}),
+            'malformed_symbol': ('first_decision', {'symbol': []}),
+            'malformed_role': ('first_decision', {'decision_agent_name': {}}),
+            'malformed_disposition': ('first_decision', {'disposition': []}),
+            'contradictory_partition': ('included_decision', {'disposition': 'non_actionable'}),
+            'active_handoff': ('included_item', {'handoff_active': True}),
+        }
+        for name, (target, update) in mutations.items():
+            with self.subTest(case=name):
+                stages = self._scheduled_no_handoff_stages()
+                plan = stages['next_open_execution_plan']
+                result = plan['details']['result_summary']
+                manifest = result['completion_manifest']
+                partition = manifest['decision_partition']
+                targets = {
+                    'decider': stages['signal_decider'],
+                    'parent': stages['signal_decider']['details']['result_summary'],
+                    'plan': plan, 'result': result, 'summary': result['summary'],
+                    'manifest': manifest, 'source': plan['source_run_ids'],
+                    'first_decision': partition[0],
+                    'included_decision': partition[1],
+                    'included_item': partition[1]['included_items'][0],
+                }
+                targets[target].update(update)
+                manifest.pop('manifest_digest')
+                manifest['manifest_digest'] = hashlib.sha256(json.dumps(
+                    manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+                ).encode()).hexdigest()
+                normalized = EODPipelineStatusService._normalize_stage_contract(stages)
+                self.assertEqual(normalized['next_open_execution_plan']['status'], 'blocked')
+
+    def test_scheduled_no_handoff_rejects_tampered_manifest(self):
+        stages = self._scheduled_no_handoff_stages()
+        stages['next_open_execution_plan']['details']['result_summary']['completion_manifest']['manifest_digest'] = 'invalid'
+        normalized = EODPipelineStatusService._normalize_stage_contract(stages)
+        self.assertEqual(normalized['next_open_execution_plan']['status'], 'blocked')
+
     def test_factor_score_quality_uses_applicable_membership_in_both_modes(self):
         memory_engine = create_engine('sqlite://')
         for model in (Symbol, DailyPriceBar, DailyQualityFactorResult):

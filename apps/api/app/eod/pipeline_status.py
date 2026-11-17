@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from app.agent_context.prerequisite_service import AgentFeedbackPrerequisiteService
-from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.core.settings import settings
 from app.db import session_scope
@@ -2369,6 +2371,13 @@ class EODPipelineStatusService:
             and next_open_proof['parent_completed_symbols']
             == signal_decider_proof['completed_symbols']
         )
+        no_handoff_processing_completed = (
+            next_open_stage is not None
+            and EODPipelineStatusService._scheduled_no_handoff_plan_completed(
+                decider=signal_decider_stage,
+                plan=next_open_stage,
+            )
+        )
         if (
             next_open_stage is not None
             and (
@@ -2382,6 +2391,7 @@ class EODPipelineStatusService:
                 == 'completed'
             )
             and not next_open_is_bound_to_parent
+            and not no_handoff_processing_completed
             and dict(next_open_stage.get('details') or {}).get(
                 'status_repair_reason'
             )
@@ -2400,6 +2410,141 @@ class EODPipelineStatusService:
                 'details': repaired_details,
             }
         return normalized
+
+    @staticmethod
+    def _scheduled_no_handoff_plan_completed(
+        *, decider: dict[str, Any], plan: dict[str, Any],
+    ) -> bool:
+        """Recognize completed scheduled processing without granting execution authority."""
+        decider_details = decider.get('details') or {}
+        plan_details = plan.get('details') or {}
+        if any(
+            details.get('mode') != 'eod_collection_run_stage_progress'
+            or 'completion_scope_proof' in details
+            for details in (decider_details, plan_details)
+        ):
+            return False
+        source_run_id = (decider.get('source_run_ids') or {}).get('eod_run_id')
+        if (
+            source_run_id is None
+            or source_run_id != (plan.get('source_run_ids') or {}).get('eod_run_id')
+        ):
+            return False
+        parent = decider_details.get('result_summary')
+        result = plan_details.get('result_summary')
+        if not (
+            decider.get('status') == 'completed'
+            and plan.get('status') == 'completed'
+            and decider.get('market_date') == plan.get('market_date')
+            and isinstance(parent, dict)
+            and EODPipelineStatusService._signal_decider_has_legacy_completion_proof(parent)
+            and isinstance(result, dict)
+            and result.get('status') == 'completed'
+            and _coerce_int(plan.get('failed')) == 0
+            and _coerce_int(plan.get('processed')) == _coerce_int(plan.get('total'))
+            and _coerce_int(plan.get('succeeded')) == _coerce_int(plan.get('total'))
+            and _coerce_int(plan.get('remaining')) == 0
+        ):
+            return False
+        manifest = result.get('completion_manifest')
+        summary = result.get('summary')
+        if not (isinstance(manifest, dict) and isinstance(summary, dict)):
+            return False
+        if any(
+            _recovery_payload_has_reported_failure(payload)
+            for payload in (decider, plan, result, summary)
+        ):
+            return False
+        if not (
+            manifest.get('schema_version') == 'next_open_completion_manifest_v1'
+            and manifest.get('parent_run_id') == parent.get('run_id')
+            and bool(parent.get('run_id'))
+            and manifest.get('incomplete_decision_count') == 0
+            and summary.get('account_targets_configured') is True
+            and summary.get('account_targets_valid') is True
+            and summary.get('enrichment_preflight_allowed') is True
+            and summary.get('agent_context_completeness_status') == 'complete'
+            and _strict_non_negative_int(summary, 'eligible_count') == 0
+            and _strict_non_negative_int(summary, 'monitor_candidate_count') == 0
+        ):
+            return False
+        parent_progress = parent.get('progress')
+        if not isinstance(parent_progress, dict):
+            return False
+        parent_summary = parent_progress.get('summary')
+        if not isinstance(parent_summary, dict):
+            return False
+        scopes = parent_summary.get('role_symbol_scopes')
+        role_progress = parent_summary.get('role_progress')
+        partition = manifest.get('decision_partition')
+        if not (
+            isinstance(scopes, dict)
+            and set(scopes) == set(DECISION_SUPPORT_AGENT_NAMES)
+            and isinstance(role_progress, dict)
+            and set(role_progress) == set(scopes)
+            and all(
+                isinstance(symbols, list)
+                and all(isinstance(symbol, str) for symbol in symbols)
+                and len(symbols) == len(set(symbols))
+                and isinstance(role_progress.get(role), dict)
+                and len(symbols)
+                == _strict_non_negative_int(
+                    role_progress[role],
+                    'completed_symbols',
+                )
+                for role, symbols in scopes.items()
+            )
+            and manifest.get('role_symbol_scopes') == {
+                role: sorted(symbols) for role, symbols in scopes.items()
+            }
+            and isinstance(partition, list)
+            and len(partition) == manifest.get('decision_count')
+            == _strict_non_negative_int(
+                parent_summary,
+                'completed_feedback_count',
+            )
+        ):
+            return False
+        expected = {(symbol, role) for role, symbols in scopes.items() for symbol in symbols}
+        seen = set()
+        included_items = []
+        for entry in partition:
+            if not (
+                isinstance(entry, dict)
+                and isinstance(entry.get('symbol'), str)
+                and isinstance(entry.get('decision_agent_name'), str)
+                and isinstance(entry.get('disposition'), str)
+            ):
+                return False
+            key = (entry.get('symbol'), entry.get('decision_agent_name'))
+            items = entry.get('included_items')
+            if (
+                key not in expected or key in seen
+                or entry.get('disposition') not in {'included', 'non_actionable'}
+                or not isinstance(items, list)
+                or (entry['disposition'] == 'included') != bool(items)
+            ):
+                return False
+            seen.add(key)
+            included_items.extend(items)
+        if not (
+            seen == expected
+            and len(included_items) == manifest.get('included_item_count')
+            == _coerce_int(plan.get('total'))
+            and all(
+                isinstance(item, dict)
+                and item.get('eligibility_status') == 'blocked'
+                and item.get('handoff_active') is False
+                and item.get('exec_monitoring_active') is False
+                for item in included_items
+            )
+        ):
+            return False
+        digest = hashlib.sha256(json.dumps(
+            {k: v for k, v in manifest.items() if k != 'manifest_digest'},
+            ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        return manifest.get('manifest_digest') == digest
 
     @staticmethod
     def _restore_fundamentals_scope_gate_after_official_overlay(
@@ -2668,6 +2813,15 @@ class EODPipelineStatusService:
             fallback_stage=fallback_stage,
         ):
             return False
+        if (
+            stage_id == 'signal_decider'
+            and progress_status == 'completed'
+            and isinstance(progress.get('result_summary'), dict)
+            and EODPipelineStatusService._signal_decider_has_legacy_completion_proof(
+                progress['result_summary']
+            )
+        ):
+            return True
         if progress_status == 'running':
             return fallback_status != 'running'
         if fallback_status == 'pending':

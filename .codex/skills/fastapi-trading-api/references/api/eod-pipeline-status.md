@@ -5,6 +5,8 @@ Operator-facing live status API for the post-close EOD pipeline.
 
 Canonical semantics for this route and `GET /eod/freshness` live in `docs/EOD_STATUS_SEMANTICS_CONTRACT.md`.
 
+Stage processing and execution eligibility are distinct: a completed scheduled plan with an exact, validated decision partition and no eligible handoff remains `completed`, even if every candidate is below the confidence threshold. Per-item exclusions remain intact and this status grants no execution authority. DART `symbols_missing` is the initial snapshot gap; normal provider no-data is informational, while malformed responses and request/processing/storage failures remain errors. Use `snapshot_availability` for current availability and retry debt.
+
 Unlike `GET /eod/freshness`, this route focuses on in-flight work. It reads the first-class durable daily pipeline run state first, merges same-date historical official stage rows when the latest run is only a resumed subset, then falls back to persisted-row and source-run inference for stages with no official stage row. It reports the current stage status from master refresh through signal-decider evaluations for the requested `market_date`.
 
 Automatic `/eod/pykrx/daily/run-if-due` runs publish official daily pipeline run state for their scheduled PyKRX stages and chained follow-ups. The official run remains active until the follow-ups finish or fail. If a currently active auto run has no official rows, the route promotes non-PyKRX follow-up entries from `eod_collection_runs.run_metadata.stage_progress` as live stage progress so `running_stages`, `current_stage`, source run IDs, timestamps, and stale-running threshold metadata are still visible.
