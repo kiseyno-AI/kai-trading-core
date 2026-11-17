@@ -4223,6 +4223,9 @@ def _expired_terminal_followup_retirement(
             )
             if not (
                 stage.get('status') == 'skipped'
+                and stage.get('pipeline_run_id', pipeline['id']) == pipeline['id']
+                and stage.get('market_date', market_date) == market_date
+                and stage.get('stage_id', stage.get('stage', stage_id)) == stage_id
                 and not stage.get('source_run_ids')
                 and all(stage.get(key, 0) == 0 for key in (
                     'processed', 'total', 'succeeded', 'failed', 'remaining',

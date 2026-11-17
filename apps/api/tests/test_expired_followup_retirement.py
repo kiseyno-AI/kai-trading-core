@@ -116,7 +116,7 @@ def test_expired_feedback_debt_is_retired_without_claiming_publications():
     'wrong_eod', 'wrong_date', 'wrong_membership', 'missing_stage',
     'mixed_failure', 'missing_expiry', 'live_window', 'false_open_expiry',
     'provider_failure', 'stage_debt', 'price_failure', 'missing_admission',
-    'published_source', 'malformed_upstream',
+    'published_source', 'malformed_upstream', 'wrong_stage_run', 'wrong_stage_date',
 ])
 def test_uncertain_or_nonterminal_debt_is_not_retired(case):
     eod, result = _expired_followup()
@@ -152,6 +152,10 @@ def test_uncertain_or_nonterminal_debt_is_not_retired(case):
         result['stages']['signal_decider']['source_run_ids'] = {'run_id': 'actual-feedback'}
     elif case == 'malformed_upstream':
         meta['stage_progress']['market_risk_filter'] = 3
+    elif case == 'wrong_stage_run':
+        result['stages']['signal_decider']['pipeline_run_id'] = 93
+    elif case == 'wrong_stage_date':
+        result['stages']['signal_decider']['market_date'] = '2026-11-11'
     with (
         patch('app.eod.pykrx_backfill._current_krx_calendar_date', return_value=today),
         patch('app.eod.pykrx_backfill.complete_eod_collection_run') as complete,
