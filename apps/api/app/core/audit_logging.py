@@ -26,6 +26,7 @@ _request_id_var: ContextVar[str | None] = ContextVar('request_id', default=None)
 _configured_signature: tuple[Any, ...] | None = None
 
 _SENSITIVE_KEYS = {
+    'acnt_prdt_cd',
     'access_token',
     'api_key',
     'appkey',
@@ -33,12 +34,14 @@ _SENSITIVE_KEYS = {
     'auth',
     'authkey',
     'authorization',
+    'cano',
     'cookie',
     'crtfc_key',
     'password',
     'proxy-authorization',
     'refresh_token',
     'secret',
+    'secretkey',
     'set-cookie',
     'token',
     'upstream_bearer_token',
@@ -49,6 +52,7 @@ _MAX_AUDIT_STRING_LENGTH = 300
 _MAX_AUDIT_COLLECTION_ITEMS = 25
 _MAX_AUDIT_MAPPING_ITEMS = 25
 _MAX_AUDIT_MAPPING_DEPTH = 6
+_MAX_KIS_ERROR_BODY_BYTES = 16 * 1024
 _AUDIT_DIAGNOSTIC_KEYS = frozenset(
     {
         'status',
@@ -190,6 +194,7 @@ def _upstream_secret_values(
     *,
     headers: Mapping[str, Any] | None = None,
     params: Mapping[str, Any] | None = None,
+    json_body: Mapping[str, Any] | None = None,
     secret_values: Iterable[str] | None = None,
 ) -> tuple[str, ...]:
     values = list(secret_values or ())
@@ -197,6 +202,7 @@ def _upstream_secret_values(
         parse_qsl(urlsplit(url).query, keep_blank_values=True),
         (headers or {}).items(),
         (params or {}).items(),
+        (json_body or {}).items(),
     ):
         for key, value in pairs:
             if _is_sensitive_key(str(key)):
@@ -402,7 +408,10 @@ async def request_with_audit(
 
     request = client.build_request(method, url, headers=request_headers, params=params, json=json_body)
     secrets = _upstream_secret_values(
-        str(request.url), headers=request.headers, secret_values=secret_values,
+        str(request.url),
+        headers=request.headers,
+        json_body=json_body if isinstance(json_body, Mapping) else None,
+        secret_values=secret_values,
     )
     started_at = time.perf_counter()
     error: Exception | None = None
@@ -435,6 +444,25 @@ async def request_with_audit(
             'error_type': type(error).__name__ if error else None,
             'error_message': _redact_secret_values(exception_message(error), secrets) if error else None,
         }
+        if (
+            settings.upstream_http_logging_enabled
+            and service == 'kis'
+            and response is not None
+            and response.status_code >= 400
+            and len(response.content) <= _MAX_KIS_ERROR_BODY_BYTES
+        ):
+            try:
+                error_body = response.json()
+            except (ValueError, RecursionError):
+                error_body = None
+            code = error_body.get('msg_cd') if isinstance(error_body, dict) else None
+            if (
+                isinstance(code, str)
+                and re.fullmatch(r'[A-Z]{3,4}[0-9]{4,5}', code)
+                and _redact_secret_values(code, secrets) == code
+                and code not in request.headers.get('authorization', '')
+            ):
+                payload['kis_msg_cd'] = code
         log_upstream_event(payload)
 
 
@@ -479,6 +507,7 @@ async def request_read_with_retry_and_audit(
         url,
         headers={**client.headers, **(headers or {})},
         params={**client.params, **(params or {})},
+        json_body=json_body if isinstance(json_body, Mapping) else None,
         secret_values=secret_values,
     )
     for attempt in range(1, max_attempts + 1):

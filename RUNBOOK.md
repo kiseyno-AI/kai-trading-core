@@ -655,6 +655,7 @@ These are behaviors of the current code, each observed in production data. Use `
 - Rotation uses `RotatingFileHandler` with `API_LOG_ROTATION_MAX_BYTES` and `API_LOG_ROTATION_BACKUP_COUNT`
 - Logged fields are metadata only: request ID, method, path/target URL, redacted query params, status, timing, content type/length, client IP, user agent, and error type/message when a call fails
 - Request and response bodies are omitted by default; secrets such as bearer tokens, API keys, app secrets, cookies, and token-like query params are redacted
+- KIS HTTP failures may add `kis_msg_cd` only when a response body no larger than 16 KiB contains a validated broker-code shape; account query values remain redacted and no response body or broker message text is logged
 
 Local validation:
 
