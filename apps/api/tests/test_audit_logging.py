@@ -125,6 +125,41 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('private response text', json.dumps(event))
         self.assertEqual(response.json(), body)
 
+    async def test_kis_http_error_redacts_account_query_values(self):
+        transport = httpx.MockTransport(lambda _: httpx.Response(500, json={'msg_cd': 'EGW00201'}))
+        async with httpx.AsyncClient(transport=transport) as client:
+            await audit_logging.request_with_audit(
+                client,
+                'kis',
+                'GET',
+                'https://example.test/inquire-balance',
+                params={'CANO': '87654321', 'ACNT_PRDT_CD': '42'},
+            )
+
+        event = self._read_log_lines('upstream-http.log')[-1]
+        self.assertNotIn('87654321', event['url'])
+        self.assertNotIn('ACNT_PRDT_CD=42', event['url'])
+        self.assertEqual(event['kis_msg_cd'], 'EGW00201')
+
+    async def test_kis_http_error_omits_credentials_echoed_from_json_body(self):
+        for key in ('appkey', 'appsecret', 'secretkey'):
+            with self.subTest(key=key):
+                transport = httpx.MockTransport(
+                    lambda _: httpx.Response(500, json={'msg_cd': 'CRED1234'})
+                )
+                async with httpx.AsyncClient(transport=transport) as client:
+                    await audit_logging.request_with_audit(
+                        client,
+                        'kis',
+                        'POST',
+                        'https://example.test/oauth2/tokenP',
+                        json_body={key: 'CRED1234'},
+                    )
+
+                event = self._read_log_lines('upstream-http.log')[-1]
+                self.assertNotIn('kis_msg_cd', event)
+                self.assertNotIn('CRED1234', json.dumps(event))
+
     async def test_upstream_audit_omits_untrusted_or_unrelated_kis_codes(self):
         cases = (
             ('kis', 500, b'not json'),
@@ -132,7 +167,7 @@ class AuditLoggingTests(unittest.IsolatedAsyncioTestCase):
             ('kis', 500, b'{"msg_cd":"12345678"}'),
             ('kis', 500, b'{"msg_cd":"12345678-01"}'),
             ('kis', 500, b'{"msg_cd":"EGW002011"}'),
-            ('kis', 500, b'{"msg_cd":"EGW00201","padding":"' + (b'x' * 16_384) + b'"}'),
+            ('kis', 500, b'{"msg_cd":"EGW00201","padding":"' + (b'x' * 20_000) + b'"}'),
             ('kis', 500, b'{"msg_cd":"SECR1234"}'),
             ('kis', 200, b'{"msg_cd":"EGW00201"}'),
             ('other', 500, b'{"msg_cd":"EGW00201"}'),
