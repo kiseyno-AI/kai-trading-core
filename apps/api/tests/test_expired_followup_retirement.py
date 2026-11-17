@@ -1,6 +1,8 @@
 from copy import deepcopy
+from contextlib import ExitStack
 from datetime import date
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -227,3 +229,157 @@ def test_live_stage_result_shape_retains_the_same_expiry_evidence():
         )
     assert result['updated'] is True
     assert complete.call_args.kwargs['run_metadata']['downstream_recovery_symbols_count'] == 0
+
+
+@pytest.mark.parametrize('requested_pit', [False, True])
+@pytest.mark.parametrize('verified_prices', [False, True])
+@pytest.mark.parametrize('inherit_retry', [False, True])
+@pytest.mark.parametrize('expired_target', [False, True])
+def test_scheduler_produces_retirable_expiry_through_real_stage_service(
+    requested_pit, verified_prices, inherit_retry, expired_target,
+):
+    from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+    from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+    eod, _ = _expired_followup()
+    symbols = eod['run_metadata']['requested_symbols']
+    eod['run_metadata'].update({'markets': ['KOSPI'], 'fs_div': 'CFS'})
+    prior_stages = deepcopy(eod['run_metadata']['stage_progress'])
+    prior_stages.update({
+        'agent_feedback_summaries': {'status': 'partial'},
+        'signal_decider': {'status': 'interrupted'},
+    })
+    prior = {
+        'id': 91, 'market_date': '2026-11-12', 'status': 'interrupted',
+        'trigger': 'auto_close_scheduler', 'stages': prior_stages,
+        'run_metadata': {
+            'eod_collection_run_id': 7,
+            'resolved_stages': list(AUTO_DAILY_TRACKED_STAGE_ORDER),
+            'point_in_time_recovery': False, 'fs_div': 'CFS',
+        },
+    }
+    retry_config = {
+        'source_run_id': 'original-partial-summary',
+        'knowledge_cutoff_at': '2026-11-12T08:00:00+00:00',
+        'feedback_scope_mode': 'decider_scope_fast_path',
+        'point_in_time_recovery': False,
+        'requested_symbols': ['005930'],
+        'roles': list(SUMMARIZER_AGENT_NAMES),
+        'role_symbol_scopes': {role: ['005930'] for role in SUMMARIZER_AGENT_NAMES},
+        'outer_batch_size': 20, 'fs_div': 'CFS',
+    }
+    tracked = {}
+    run_state = MagicMock()
+
+    def start_run(**kwargs):
+        tracked.update({'id': 92, **kwargs, 'status': 'running', 'stages': {}})
+        tracked['run_metadata'].update({
+            'requested_stages': kwargs['requested_stages'],
+            'resolved_stages': kwargs['resolved_stages'],
+        })
+        return deepcopy(tracked)
+
+    def finish_stage(**kwargs):
+        tracked['stages'][kwargs['stage_id']] = deepcopy(kwargs)
+        return kwargs
+
+    def finish_run(**kwargs):
+        tracked['status'] = kwargs['status']
+        tracked['run_metadata'].update(kwargs.get('run_metadata') or {})
+        return deepcopy(tracked)
+
+    run_state.start_run.side_effect = start_run
+    run_state.finish_stage.side_effect = finish_stage
+    run_state.finish_run.side_effect = finish_run
+    model_runner = MagicMock()
+    stage_service = DailyPipelineStageService(
+        run_state_service=run_state, feedback_retry_service=model_runner,
+    )
+    service = PykrxBackfillService()
+    today = date(2026, 11, 18) if expired_target else date(2026, 11, 13)
+    market = SimpleNamespace(state='CLOSED', server_time=f'{today}T20:00:00+09:00')
+    with ExitStack() as stack:
+        for target, value in {
+            '_current_krx_calendar_date': today,
+            'get_market_state': market,
+            'daily_pipeline_run_state_service.get_latest_run_for_context': prior,
+            'daily_pipeline_run_state_service.count_runs': 0,
+            'daily_pipeline_run_state_service.converge_terminal_stages_run': {
+                'updated': False, 'reason': 'already_non_resumable', 'status': 'completed',
+            },
+            '_select_summary_cutoff_proof': None,
+            '_is_retryable_feedback_rearm_candidate': inherit_retry,
+            '_retryable_feedback_rearm_config': retry_config if inherit_retry else None,
+            '_retryable_feedback_rearm_max_cycles': 3,
+            'count_eod_run_persisted_symbols': 2,
+            'load_eod_run_persisted_symbols': symbols if verified_prices else ['000660', '035420'],
+        }.items():
+            stack.enter_context(patch(f'app.eod.pykrx_backfill.{target}', return_value=value))
+        stack.enter_context(patch.object(
+            service, '_resolve_point_in_time_followup_membership',
+            return_value=(set(symbols), ('KOSPI',)),
+        ))
+        stack.enter_context(patch.object(
+            service, '_preflight_untracked_followup_price_scope',
+            return_value={'result': None, 'symbols': [], 'downstream_symbols': []},
+        ))
+        stack.enter_context(patch(
+            'app.eod.daily_pipeline_stages.get_market_state',
+            return_value=market,
+        ))
+        stack.enter_context(patch(
+            'app.orders.next_open_execution.normalize_next_open_target_trade_date',
+            return_value=date(2026, 11, 13),
+        ))
+        stack.enter_context(patch(
+            'app.eod.daily_pipeline_stages.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+            return_value={'ready': True},
+        ))
+        dispatch = stack.enter_context(patch(
+            'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+            side_effect=stage_service.run,
+        ))
+        complete = stack.enter_context(patch('app.eod.pykrx_backfill.complete_eod_collection_run'))
+        update = stack.enter_context(patch('app.eod.pykrx_backfill.update_eod_collection_run_progress'))
+        provider = stack.enter_context(patch.object(service, 'fetch_recent_universe_snapshot'))
+        result = service._resume_auto_daily_followups_if_due(
+            market_date='2026-11-12', latest_available_trade_date='2026-11-17',
+            latest_eod_run=eod, markets=('KOSPI',),
+            point_in_time_recovery=requested_pit,
+        )
+
+    assert result['status'] == 'completed'
+    if expired_target or requested_pit:
+        assert tracked['run_metadata']['exact_membership_symbol_count'] == 2
+        assert tracked['run_metadata']['exact_membership_sha256'] == market_membership_sha256(symbols)
+    else:
+        assert 'exact_membership_symbols' not in dispatch.call_args.kwargs
+        assert tracked['run_metadata']['exact_membership_symbol_count'] == 0
+    if inherit_retry:
+        assert dispatch.call_args.kwargs['inherited_feedback_retry_config'] == retry_config
+    else:
+        assert 'inherited_feedback_retry_config' not in dispatch.call_args.kwargs
+        if expired_target or requested_pit:
+            assert dispatch.call_args.kwargs['symbols'] == symbols
+    assert tracked['run_metadata']['point_in_time_recovery'] is True
+    assert set(tracked['stages']) == set(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    assert all(row['status'] == 'skipped' for row in tracked['stages'].values())
+    assert all(
+        row['details']['result_summary']['reason'] == 'next_open_window_expired'
+        for row in tracked['stages'].values()
+    )
+    assert model_runner.mock_calls == []
+    provider.assert_not_called()
+    if expired_target and verified_prices:
+        assert complete.called, result
+        metadata = complete.call_args.kwargs['run_metadata']
+        assert metadata['followup_recovery_required'] is False
+        assert metadata['downstream_recovery_symbols_count'] == 0
+        assert metadata['expired_terminal_followup_retirement']['retired_symbols_count'] == 2
+    else:
+        assert result['followup_recovery']['state_convergence']['reason'] == (
+            'expired_recovery_price_scope_unverified' if expired_target
+            else 'resolved_downstream_scope_unavailable'
+        )
+        complete.assert_not_called()
+        update.assert_not_called()

@@ -58,6 +58,7 @@ from app.eod.run_stage_support import (
     SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
     SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
     SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+    build_next_open_window_expired_result,
     is_completed_auto_pitr_intraday_watch_recovery,
     is_canonical_same_day_signal_rearm_proof,
     is_exact_auto_pitr_intraday_watch_recovery_request,
@@ -111,6 +112,7 @@ from app.eod.pykrx_pipeline_runner import (
     run_market_data_pipeline,
     should_skip_point_in_time_current_only_stage,
 )
+from app.market.clock import get_market_state
 from app.market.session import latest_krx_trading_date
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.signals.daily_signal_features import daily_signal_feature_service
@@ -9722,6 +9724,48 @@ class PykrxBackfillService:
             )
         else:
             recovery_symbols = downstream_retry_symbols
+        if (
+            recovery_stages == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            and 'exact_membership_symbols' not in recovery_kwargs
+            and resolve_point_in_time_recovery(
+                market_date=market_date,
+                requested=point_in_time_recovery,
+                recovery_context=True,
+                current_market_date=current_krx_calendar_date,
+            )
+        ):
+            # The stage boundary infers PIT after midnight even when the
+            # scheduler did not request it. Preserve the frozen parent scope
+            # so its zero-work expiry can later be audited without replaying
+            # providers or changing the original feedback retry contract.
+            terminal_expiry = build_next_open_window_expired_result(
+                market_date=market_date, market=get_market_state(),
+            )
+            terminal_parent = _validated_followup_admission_partition(
+                latest_eod_metadata
+            )
+            requested_membership = _dedupe_symbol_codes(
+                latest_eod_metadata.get('requested_symbols') or []
+            )
+            if (
+                terminal_expiry is not None
+                and terminal_expiry['current_market_date']
+                == current_krx_calendar_date.isoformat()
+                and terminal_expiry['target_trade_date']
+                < current_krx_calendar_date.isoformat()
+                and terminal_parent is not None
+                and requested_membership
+                and set(terminal_parent['selected_stock_codes'])
+                == set(requested_membership)
+            ):
+                recovery_kwargs['exact_membership_symbols'] = sorted(
+                    requested_membership
+                )
+                recovery_kwargs['recovery_parent_scope_outcome'] = dict(
+                    latest_eod_metadata['followup_admission_scope_outcome']
+                )
+                if not recovery_symbols:
+                    recovery_symbols = sorted(requested_membership)
         if recovery_symbols:
             recovery_kwargs['symbols'] = recovery_symbols
         if (
