@@ -3644,6 +3644,7 @@ class OpenClawAgentClient:
 class AgentFeedbackOrchestrator:
     def __init__(self) -> None:
         self.client: OpenClawAgentClient | None = None
+        self._cleanup_prequeue_lock = threading.Lock()
 
     @staticmethod
     def _build_upstream_feedback_bundle(
@@ -5882,11 +5883,44 @@ class AgentFeedbackOrchestrator:
         cleanup_results: list[dict[str, Any]] = []
         deferred_session_keys: set[str] = set()
         try:
-            retry_queue = agent_feedback_session_cleanup_service.enqueue_deferred(
-                targets=cleanup_targets,
-                reason='cleanup_time_budget_exhausted',
-                deadline_monotonic=persistence_deadline,
+            if not self._cleanup_prequeue_lock.acquire(blocking=False):
+                raise TimeoutError('cleanup retry prequeue is already in progress')
+            completed_prequeue = threading.Event()
+            prequeue_outcome: dict[str, Any] = {}
+            enqueue_deferred = agent_feedback_session_cleanup_service.enqueue_deferred
+
+            def _prequeue_targets() -> None:
+                try:
+                    prequeue_outcome['result'] = enqueue_deferred(
+                        targets=cleanup_targets,
+                        reason='cleanup_time_budget_exhausted',
+                        deadline_monotonic=persistence_deadline,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    prequeue_outcome['error'] = exc
+                finally:
+                    self._cleanup_prequeue_lock.release()
+                    completed_prequeue.set()
+
+            # Native identity file reads can block before SQL deadlines apply.
+            prequeue_worker = threading.Thread(
+                target=_prequeue_targets,
+                name='agent-feedback-session-prequeue',
+                daemon=True,
             )
+            try:
+                prequeue_worker.start()
+            except Exception:
+                self._cleanup_prequeue_lock.release()
+                raise
+            if not completed_prequeue.wait(
+                timeout=max(0.0, persistence_deadline - time.monotonic()),
+            ):
+                raise TimeoutError('cleanup retry prequeue time budget exhausted')
+            prequeue_error = prequeue_outcome.get('error')
+            if isinstance(prequeue_error, Exception):
+                raise prequeue_error
+            retry_queue = prequeue_outcome['result']
         except Exception as exc:  # noqa: BLE001
             retry_queue = {
                 'status': 'failed',
