@@ -408,7 +408,9 @@ An interrupted summary can expand the general downstream retry scope beyond
 market-risk debt. Compare that general scope with the validated admission
 partition; retry only the partition's exact market-risk failures and preserve
 other unfinished stages. Never remove debt or widen model scope to clear a
-`market_risk_admission_partition_mismatch` block.
+`market_risk_admission_partition_mismatch` block. Reconcile a recovered risk
+scope with its linked publication before the next poll, and require each
+unfinished stage's own publication before clearing its debt.
 
 For frozen decider scopes, completion uses the exact source-bound role assignments
 and their union as the admitted decision cohort. Summary symbols assigned to

@@ -2862,6 +2862,11 @@ def _recovered_followup_admission_scope_outcome(
     normalized_execution_symbols = _dedupe_symbol_codes(
         run_metadata.get('symbols') or []
     )
+    market_risk_recovery = normalized_resolved_stages[:1] == ['market_risk_filter']
+    required_stages = (
+        ('market_risk_filter',) if market_risk_recovery
+        else RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS
+    )
     if (
         str(run_metadata.get('entrypoint') or '').strip()
         != 'daily_pipeline_stage_service.run'
@@ -2870,14 +2875,14 @@ def _recovered_followup_admission_scope_outcome(
         or run_metadata.get('reused_eod_collection_run_id') != eod_run_id
         or run_metadata.get('point_in_time_recovery') is not True
         or str(run_metadata.get('resume_from_stage') or '').strip()
-        != RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS[0]
+        != required_stages[0]
         or not isinstance(resolved_stages, list)
         or normalized_resolved_stages != resolved_stages
         or len(normalized_resolved_stages)
         != len(set(normalized_resolved_stages))
         or not all(
             stage_id in normalized_resolved_stages
-            for stage_id in RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS
+            for stage_id in required_stages
         )
         or not normalized_execution_symbols
         or normalized_execution_symbols
@@ -2899,6 +2904,41 @@ def _recovered_followup_admission_scope_outcome(
         is None
     ):
         return None
+
+    if market_risk_recovery:
+        if set(normalized_execution_symbols) != set(
+            prior_admission['retry_debt_stock_codes']
+        ):
+            return None
+        stage = stage_rows.get('market_risk_filter')
+        exact_result = (
+            _followup_exact_result_authority(stage_id='market_risk_filter', stage=stage)
+            if isinstance(stage, Mapping) else None
+        )
+        partition = (
+            validate_stage_bound_scope_outcome(
+                result=exact_result, expected_stage_id='market_risk_filter',
+                invocation_symbols=normalized_execution_symbols,
+                status=str(exact_result.get('status') or stage.get('status') or ''),
+                allow_failed_all=True, expected_market_date=market_date,
+                publication_symbols=normalized_execution_symbols,
+            ) if exact_result is not None else None
+        )
+        if partition is None:
+            return None
+        return build_exact_symbol_scope_outcome(
+            manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+            selected_symbols=requested_symbols,
+            successful_symbols=[
+                *prior_admission['successful_stock_codes'],
+                *partition['successful_stock_codes'],
+            ],
+            retry_debt_symbols=partition['retry_debt_stock_codes'],
+            terminal_not_applicable_symbols=[
+                *prior_admission['terminal_not_applicable_stock_codes'],
+                *partition['terminal_not_applicable_stock_codes'],
+            ],
+        )
 
     for stage_id in RECOVERED_FOLLOWUP_ADMISSION_STAGE_IDS:
         stage = stage_rows.get(stage_id)
@@ -4103,6 +4143,7 @@ def _resolve_followup_recovery_stages(
 def _proven_followup_recovery_symbols(
     *, stages: Mapping[str, Any], stage_ids: Sequence[str],
     symbols: Sequence[str], market_date: str,
+    market_risk_admission: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """A requested scope is not evidence that its rows were repaired."""
 
@@ -4126,7 +4167,26 @@ def _proven_followup_recovery_symbols(
         )
         if partition is None:
             return []
-        proven.intersection_update(partition['successful_stock_codes'])
+        admission = (
+            _validated_followup_admission_partition({
+                'followup_admission_scope_outcome': market_risk_admission,
+            }) if stage_id == 'market_risk_filter'
+            and len(stage_ids) > 1 and market_risk_admission is not None
+            else None
+        )
+        if admission is not None:
+            if not set(partition['selected_stock_codes']).issubset(
+                admission['selected_stock_codes']
+            ):
+                return []
+            # The old admission and new atomic retry publication are separate proofs.
+            proven.intersection_update(
+                (set(admission['successful_stock_codes'])
+                 - set(partition['selected_stock_codes']))
+                | set(partition['successful_stock_codes'])
+            )
+        else:
+            proven.intersection_update(partition['successful_stock_codes'])
     return sorted(proven) if stage_ids else []
 
 
@@ -8339,6 +8399,9 @@ class PykrxBackfillService:
                 proven_symbols = _proven_followup_recovery_symbols(
                     stages=stage_rows, stage_ids=recovery_scope,
                     symbols=downstream_retry_symbols, market_date=market_date,
+                    market_risk_admission=latest_eod_metadata.get(
+                        'followup_admission_scope_outcome'
+                    ),
                 )
                 if set(proven_symbols) != set(downstream_retry_symbols):
                     result = build_daily_skip_result(
@@ -8421,8 +8484,14 @@ class PykrxBackfillService:
                         'pipeline_status': pipeline_status,
                     }
                 )
+                # A finalized risk retry can have published a wider suffix before the crash.
                 persisted_recovery_symbols = _dedupe_symbol_codes(
-                    run_metadata.get('symbols') or []
+                    downstream_retry_symbols
+                    if persisted_nonblocking_marker is None
+                    and resolved_stage_list[:1] == ['market_risk_filter']
+                    and len(resolved_stage_list) > 1
+                    and downstream_retry_symbols
+                    else run_metadata.get('symbols') or []
                 )
                 if persisted_recovery_symbols:
                     convergence_result[
@@ -8434,6 +8503,9 @@ class PykrxBackfillService:
                             stages=stage_rows, stage_ids=recovery_scope,
                             symbols=persisted_recovery_symbols,
                             market_date=market_date,
+                            market_risk_admission=latest_eod_metadata.get(
+                                'followup_admission_scope_outcome'
+                            ),
                         )
                     )
                 if (
@@ -9987,7 +10059,16 @@ class PykrxBackfillService:
                         *(early_recovery_scope['deferred_stage_outcomes']
                           if early_recovery_scope is not None else {}),
                     ],
-                    symbols=recovery_symbols, market_date=market_date,
+                    symbols=(
+                        downstream_retry_symbols
+                        if market_risk_recovery_scope_outcome is not None
+                        and len(recovery_stages) > 1
+                        else recovery_symbols
+                    ),
+                    market_date=market_date,
+                    market_risk_admission=latest_eod_metadata.get(
+                        'followup_admission_scope_outcome'
+                    ),
                 )
             )
         pending_rearm_after_recovery = (
@@ -10788,6 +10869,15 @@ class PykrxBackfillService:
         ):
             return {'updated': False, 'reason': 'recovery_not_completed'}
 
+        recovered_admission = (
+            _recovered_followup_admission_scope_outcome(
+                latest_eod_run=latest_eod_run,
+                market_date=str(latest_eod_run.get('trade_date') or ''),
+                pipeline_run=recovery_result['pipeline_run'],
+            ) if isinstance(recovery_result.get('pipeline_run'), Mapping) else None
+        )
+        if recovered_admission is not None:
+            metadata['followup_admission_scope_outcome'] = recovered_admission
         downstream_retry_symbols = _dedupe_symbol_codes(
             metadata.get('downstream_retry_symbols') or []
         )
