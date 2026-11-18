@@ -187,6 +187,43 @@ def test_bound_decider_child_dispatch_uses_the_exact_summary_parent(monkeypatch)
     assert dispatch.call_args.kwargs['reuse_existing'] is False
 
 
+def test_bound_retry_result_preserves_validated_summary_scope(monkeypatch):
+    from tests.test_feedback_retry_cycles import RecordingRunStateService
+
+    source = _summary()
+    monkeypatch.setattr(retry_service.agent_context_feedback_run_state_service, 'get_run', Mock(return_value=source))
+    config, binding = retry_service._bind_source_summary_scope(
+        FeedbackRetryCycleConfig(
+            market_date=DAY, roles=DECISION_SUPPORT_AGENT_NAMES,
+            knowledge_cutoff_at=CUTOFF, source_summary_run_id='summary-prepared',
+        )
+    )
+    state = RecordingRunStateService()
+    service = AgentFeedbackRetryService()
+    monkeypatch.setattr(retry_service, 'agent_context_feedback_run_state_service', state)
+    monkeypatch.setattr(retry_service, 'load_agent_feedback_eligibility_records', lambda **_: [])
+    monkeypatch.setattr(service, '_get_retry_progress', lambda **_: {'summary': {'pending_symbols': 0}})
+
+    def completed_snapshot(**kwargs):
+        return RoleSequenceSnapshot(
+            market_date=DAY, symbols=tuple(kwargs['eligible_symbols']), roles=tuple(kwargs['roles']),
+            role_symbol_scopes=kwargs['role_symbol_scopes'],
+            role_states={role: RoleSequenceRoleState(
+                role=role, total_symbols=len(scope), completed_symbols=tuple(scope), failed_symbols=(),
+                terminal_symbols=tuple(scope), boundary_pending_symbols=(), retry_pending_symbols=(),
+                boundary_status='completed',
+            ) for role, scope in kwargs['role_symbol_scopes'].items()},
+        )
+
+    monkeypatch.setattr(service, '_build_role_sequence_snapshot', completed_snapshot)
+    result = service._run_retry_cycles_admitted(
+        config=config, source_summary_scope=binding, prerequisites={'ready': True},
+        preloaded_eligible_symbols=SYMBOLS, effective_knowledge_cutoff_at=CUTOFF,
+    )
+    assert result['source_summary_scope'] == binding
+    assert state.started[0]['request_payload']['source_summary_scope'] == binding
+
+
 def test_retry_admission_never_joins_a_different_summary_source():
     from uuid import uuid4
 

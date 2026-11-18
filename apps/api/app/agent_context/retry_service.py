@@ -3087,6 +3087,10 @@ def _bind_source_summary_scope(config: FeedbackRetryCycleConfig) -> tuple[Feedba
         raise ValueError('source summary role scope does not cover requested decisions')
     requested = set(config.symbols) if config.symbols is not None else set(prepared_symbols)
     selected = {role: [symbol for symbol in symbols if symbol in requested] for role, symbols in selected.items()}
+    bound_role_scopes = {
+        role: [symbol for symbol in frozen[role] if symbol in requested]
+        for role in DECISION_SUPPORT_AGENT_NAMES
+    }
     active_symbols = _ordered_symbol_union(list(selected.values()))
     if not active_symbols:
         raise ValueError('source summary scope contains no requested decisions')
@@ -3095,8 +3099,9 @@ def _bind_source_summary_scope(config: FeedbackRetryCycleConfig) -> tuple[Feedba
         symbols=config.symbols if config.scope_authority is not None else tuple(active_symbols),
     ), {
         'source_summary_run_id': source_id, 'knowledge_cutoff_at': cutoff,
-        'provenance': provenance, 'prepared_symbols': prepared_symbols,
-        'prepared_decider_role_symbol_scopes': frozen,
+        'provenance': provenance,
+        'prepared_symbols': [symbol for symbol in prepared_symbols if symbol in requested],
+        'prepared_decider_role_symbol_scopes': bound_role_scopes,
     }
 
 
@@ -7179,6 +7184,10 @@ class AgentFeedbackRetryService:
                 dict(normalized_scope_authority)
                 if normalized_scope_authority is not None
                 else None
+            ),
+            **(
+                {'source_summary_scope': dict(source_summary_scope)}
+                if source_summary_scope is not None else {}
             ),
             'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
             'role_symbol_scopes': (
