@@ -123,7 +123,8 @@ def admission_db():
         patch.object(repository, 'get_market_state', return_value=market),
         patch.object(repository, 'next_krx_trading_date', side_effect=lambda d, **_: calendar.get(d)) as lookup,
     ):
-        yield SimpleNamespace(factory=factory, engine=engine, fixture=fixture, market=market, calendar=lookup)
+        yield SimpleNamespace(factory=factory, engine=engine, fixture=fixture, market=market, calendar=lookup,
+                              session_scope=session_scope)
     engine.dispose()
 
 
@@ -133,6 +134,164 @@ def _read(**kwargs):
         **({'allow_expired_current_only_debt': True, 'target_trade_date': '2026-11-18',
             'source_market_date': '2026-11-17', 'source_eod_run_id': 598} | kwargs),
     )
+
+
+def _install_actual_native_risk_rows(admission_db, *, with_dormancy=True):
+    fixture = json.loads((Path(__file__).parent / 'fixtures/current_risk_native_null_capture.json').read_text())
+    with admission_db.factory.begin() as session:
+        symbol_ids = dict(session.execute(select(Symbol.symbol, Symbol.id)).all())
+        for table, model in [('daily_market_risk_filter_results', DailyMarketRiskFilterResult),
+                             ('daily_market_risk_snapshots', DailyMarketRiskSnapshot)]:
+            session.execute(delete(model).where(model.market_date == date(2026, 11, 17)))
+            for raw in fixture['tables'][table]:
+                row = deepcopy(raw)
+                row['symbol_id'] = symbol_ids[row.pop('symbol')]
+                row['market_date'] = date.fromisoformat(row['market_date'])
+                for key in ('captured_at', 'created_at', 'updated_at'):
+                    row[key] = _timestamp(row[key])
+                session.add(model(**row))
+        if with_dormancy:
+            history = json.loads((Path(__file__).parent / 'fixtures/current_risk_native_dormancy.json').read_text())
+            for raw in history['owner_eod_runs']:
+                if session.get(EODCollectionRun, raw['id']) is None:
+                    owner = deepcopy(raw)
+                    owner['trade_date'] = date.fromisoformat(owner['trade_date'])
+                    for key in ('started_at', 'completed_at'):
+                        owner[key] = _timestamp(owner[key])
+                    session.add(EODCollectionRun(**owner))
+            dates = [date.fromisoformat(day) for day in history['global_stored_dates']]
+            ids = [symbol_ids[row['symbol']] for row in fixture['tables']['daily_market_risk_snapshots']]
+            session.execute(delete(DailyPriceBar).where(DailyPriceBar.symbol_id.in_(ids), DailyPriceBar.trade_date.in_(dates)))
+            for raw in history['price_rows']:
+                row = deepcopy(raw)
+                row['symbol_id'] = symbol_ids[row.pop('symbol')]
+                row['trade_date'] = date.fromisoformat(row['trade_date'])
+                row['captured_at'] = _timestamp(row['captured_at'])
+                session.add(DailyPriceBar(**row))
+    return fixture
+
+
+def _read_with_native_dormancy(admission_db, **kwargs):
+    with (
+        patch('app.market_data_store.session_scope', admission_db.session_scope),
+        patch('app.core.settings.settings.market_risk_dormant_lookback_trading_days', 10),
+    ):
+        return _read(**kwargs)
+
+
+@pytest.mark.parametrize('exhausted', [False, True])
+def test_actual_native_null_references_recompute_without_rewriting_history(admission_db, exhausted):
+    if exhausted:
+        _install_actual_exhausted_current_lineage(admission_db)
+    fixture = _install_actual_native_risk_rows(admission_db)
+    with admission_db.factory() as session:
+        historical_before = deepcopy(session.get(EODCollectionRun, 596).run_metadata)
+    statements = []
+    event.listen(admission_db.engine, 'before_cursor_execute', lambda _c, _u, statement, *_: statements.append(statement))
+
+    result = _read_with_native_dormancy(admission_db)
+
+    assert len(result.historical_classifications) == 1
+    assert result.current_source_terminal_ready is False
+    assert result.target.eod_run_id == (596 if exhausted else 598)
+    assert repository.load_oldest_outstanding_auto_eod_recovery_target(
+        on_or_after='2026-11-12', on_or_before='2026-11-18',
+    ).eod_run_id == 596
+    classification = result.historical_classifications[0]
+    assert classification['current_risk_rejected_symbols'] == ['377460']
+    for evidence in classification['current_risk_evidence']:
+        proof = evidence['snapshot_reference_evidence']
+        assert proof['method'] == 'native_v1_null_capture_reference_recomputation'
+        assert proof['snapshot_id'] == evidence['snapshot_id']
+        assert proof['stored_snapshot_captured_at'] is None
+        assert proof['snapshot_captured_at'] and proof['filter_captured_at']
+        context = proof['dormancy_revalidation']
+        assert context['lookback_trading_days'] == len(context['window_dates']) == 10
+        assert len(context['price_bar_references']) == 10
+        assert context['no_recent_trading'] is (evidence['symbol'] == '377460')
+        assert context['as_of_market_date'] == '2026-11-17'
+        assert len(context['price_inputs_sha256']) == 64 and context['verified_at']
+    assert not any(s.lstrip().upper().startswith(('INSERT ', 'UPDATE ', 'DELETE ')) for s in statements)
+    with admission_db.factory() as session:
+        original = {row['id']: row for row in fixture['tables']['daily_market_risk_filter_results']}
+        for row in session.execute(select(DailyMarketRiskFilterResult)).scalars():
+            assert row.filter_payload == original[row.id]['filter_payload']
+            assert row.captured_at == _timestamp(original[row.id]['captured_at'])
+        assert session.get(EODCollectionRun, 596).run_metadata == historical_before
+
+
+@pytest.mark.parametrize('case', [
+    'missing_reference', 'invalid_reference', 'empty_reference', 'wrong_nonnull_reference',
+    'foreign_filter_eod', 'foreign_snapshot_eod', 'wrong_snapshot_date', 'unknown_filter_version',
+    'unknown_snapshot_version', 'wrong_market_code', 'changed_filter_flag', 'changed_snapshot_flag',
+    'changed_raw_flag', 'extra_reason', 'newer_snapshot', 'unknown_vi', 'unknown_short_sale_flag', 'missing_history',
+    'missing_bar', 'future_bar', 'foreign_bar_owner', 'foreign_bar_source', 'negative_volume',
+    'infinite_volume', 'changed_dormant_volume', 'future_bar_capture',
+])
+def test_legacy_capture_recomputation_rejects_unverified_inputs(admission_db, case):
+    _install_actual_native_risk_rows(admission_db, with_dormancy=case != 'missing_history')
+    with admission_db.factory.begin() as session:
+        symbol_id = session.execute(select(Symbol.id).where(Symbol.symbol == '016600')).scalar_one()
+        risk = session.execute(select(DailyMarketRiskFilterResult).where(
+            DailyMarketRiskFilterResult.symbol_id == symbol_id)).scalar_one()
+        snapshot = session.execute(select(DailyMarketRiskSnapshot).where(
+            DailyMarketRiskSnapshot.symbol_id == symbol_id)).scalar_one()
+        payload = deepcopy(risk.filter_payload)
+        if case == 'missing_reference':
+            payload.pop('snapshot_captured_at')
+        elif case in {'invalid_reference', 'empty_reference', 'wrong_nonnull_reference'}:
+            payload['snapshot_captured_at'] = {
+                'invalid_reference': 'not-a-timestamp', 'empty_reference': '',
+                'wrong_nonnull_reference': (snapshot.captured_at - timedelta(seconds=1)).isoformat(),
+            }[case]
+        elif case == 'foreign_filter_eod':
+            risk.eod_run_id = 596
+        elif case == 'foreign_snapshot_eod':
+            snapshot.eod_run_id = 596
+        elif case == 'wrong_snapshot_date':
+            snapshot.market_date = date(2026, 11, 16)
+        elif case == 'unknown_filter_version':
+            payload['feature_version'] = 'unknown_v2'
+        elif case == 'unknown_snapshot_version':
+            payload['snapshot_feature_version'] = 'unknown_v2'
+        elif case == 'wrong_market_code':
+            payload['snapshot_market_code'] = 'Q'
+        elif case == 'changed_filter_flag':
+            risk.is_investment_caution = True
+        elif case == 'changed_snapshot_flag':
+            snapshot.is_investment_caution = True
+        elif case in {'changed_raw_flag', 'unknown_vi', 'unknown_short_sale_flag'}:
+            content = deepcopy(snapshot.snapshot_payload)
+            key = {'changed_raw_flag': 'mang_issu_yn', 'unknown_vi': 'vi_cls_code',
+                   'unknown_short_sale_flag': 'ssts_hot_yn'}[case]
+            content['raw'][key] = 'Y' if case == 'changed_raw_flag' else 'unknown'
+            snapshot.snapshot_payload = content
+        elif case == 'extra_reason':
+            payload['blocking_reasons'] = ['trade_halted']
+        elif case == 'newer_snapshot':
+            snapshot.captured_at = risk.captured_at + timedelta(seconds=1)
+        elif case != 'missing_history':
+            bar = session.execute(select(DailyPriceBar).join(Symbol).where(
+                Symbol.symbol == '377460', DailyPriceBar.trade_date == date(2026, 11, 10),
+            )).scalar_one()
+            if case == 'missing_bar':
+                session.delete(bar)
+            elif case == 'future_bar':
+                bar.trade_date = date(2026, 11, 19)
+            elif case == 'foreign_bar_owner':
+                bar.eod_run_id = 598
+            elif case == 'foreign_bar_source':
+                bar.source = 'unknown_provider'
+            elif case in {'negative_volume', 'infinite_volume', 'changed_dormant_volume'}:
+                bar.volume = {'negative_volume': -1, 'infinite_volume': float('inf'), 'changed_dormant_volume': 1}[case]
+            else:
+                bar.captured_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+        risk.filter_payload = payload
+
+    result = _read_with_native_dormancy(admission_db)
+    assert result.historical_classifications == ()
+    assert result.current_source_terminal_ready is False
+    assert result.target.eod_run_id == 596
 
 
 def test_actual_596_classifies_history_but_keeps_current_models_pending(admission_db):

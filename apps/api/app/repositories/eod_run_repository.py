@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -3096,6 +3098,123 @@ def _admission_price_membership(session: Any, run: EODCollectionRun) -> list[str
     return sorted(requested) if len(persisted) == len(requested) and set(persisted) == set(requested) else None
 
 
+def _verified_current_risk_dormancy_inputs(
+    session: Any, *, market_date: date, symbols: list[str],
+) -> dict[str, dict[str, Any]] | None:
+    from app.core.settings import settings
+    from app.market_data_store import load_symbols_without_recent_trading
+
+    verification_time = datetime.now(timezone.utc)
+    lookback = settings.market_risk_dormant_lookback_trading_days
+    dates = list(session.execute(select(DailyPriceBar.trade_date)
+        .where(DailyPriceBar.trade_date <= market_date).distinct()
+        .order_by(DailyPriceBar.trade_date.desc()).limit(lookback)).scalars())
+    if len(dates) != lookback or not dates or dates[0] != market_date:
+        return None
+    rows = session.execute(select(Symbol.symbol, DailyPriceBar)
+        .join(DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id)
+        .where(Symbol.symbol.in_(symbols), DailyPriceBar.trade_date.in_(dates))
+        .order_by(Symbol.symbol, DailyPriceBar.trade_date)).all()
+    if len(rows) != len(symbols) * lookback:
+        return None
+    owner_ids = {bar.repair_origin_eod_run_id if bar.source == KIS_FINAL_BAR_REPAIR_SOURCE else bar.eod_run_id
+                 for _, bar in rows}
+    owner_rows = {row.id: row for row in session.execute(
+        select(EODCollectionRun).where(EODCollectionRun.id.in_(owner_ids))
+    ).scalars()}
+    owners: dict[int, set[int]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in symbols}
+    for symbol, bar in rows:
+        owner_id = bar.repair_origin_eod_run_id if bar.source == KIS_FINAL_BAR_REPAIR_SOURCE else bar.eod_run_id
+        owner = owner_rows.get(owner_id)
+        captured_at = _normalized_datetime(bar.captured_at)
+        if not (
+            type(bar.volume) is int and bar.volume >= 0 and bar.trade_date <= market_date
+            and captured_at is not None and captured_at <= verification_time
+            and owner is not None and owner.market == 'KRX' and owner.source == 'pykrx'
+            and owner.trade_date == bar.trade_date
+            and owner.status in {'completed', 'completed_with_errors'}
+        ):
+            return None
+        owners.setdefault(owner_id, set()).add(bar.id)
+        grouped[symbol].append({
+            'bar_id': bar.id, 'market_date': bar.trade_date.isoformat(), 'volume': bar.volume,
+            'source': bar.source, 'eod_run_id': bar.eod_run_id,
+            'repair_origin_eod_run_id': bar.repair_origin_eod_run_id,
+            'repair_origin_source': bar.repair_origin_source,
+            'captured_at': captured_at.isoformat(),
+        })
+    for owner_id, bar_ids in owners.items():
+        verified_ids = set(session.execute(select(DailyPriceBar.id).where(
+            DailyPriceBar.id.in_(bar_ids),
+            daily_price_bar_has_current_eod_run_provenance(owner_id, original_source='pykrx'),
+        )).scalars())
+        if verified_ids != bar_ids:
+            return None
+    expected_dormant = {symbol for symbol, bars in grouped.items() if all(bar['volume'] == 0 for bar in bars)}
+    native_dormant = set(load_symbols_without_recent_trading(
+        market_date=market_date, symbols=symbols, lookback_trading_days=lookback,
+    ))
+    if native_dormant != expected_dormant:
+        return None
+    return {symbol: {
+        'policy': 'current_native_dormancy_revalidation_not_original_setting',
+        'as_of_market_date': market_date.isoformat(), 'lookback_trading_days': lookback,
+        'window_basis': 'last_n_distinct_stored_trade_dates_on_or_before_source_date',
+        'window_dates': [day.isoformat() for day in sorted(dates)],
+        'no_recent_trading': symbol in native_dormant, 'price_bar_references': bars,
+        'price_inputs_sha256': hashlib.sha256(json.dumps(bars, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+        'verified_at': verification_time.isoformat(),
+    } for symbol, bars in grouped.items()}
+
+
+def _verified_legacy_null_risk_snapshot_reference(
+    *, symbol: str, risk: DailyMarketRiskFilterResult, snapshot: DailyMarketRiskSnapshot,
+    dormancy: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    from app.signals.market_risk_evaluators import build_market_risk_filter_result_from_snapshot
+    from app.signals.market_risk_snapshot import build_market_risk_snapshot
+
+    payload, stored_snapshot = risk.filter_payload or {}, snapshot.snapshot_payload or {}
+    if not (
+        isinstance(payload, Mapping) and isinstance(stored_snapshot, Mapping)
+        and dormancy is not None and 'snapshot_captured_at' in payload
+        and payload['snapshot_captured_at'] is None
+        and payload.get('feature_version') == risk.source == 'kis_market_risk_v1'
+        and payload.get('snapshot_feature_version') == snapshot.source == 'kis_quote2_snapshot_v1'
+        and snapshot.market_code == 'J' and isinstance(stored_snapshot.get('raw'), Mapping)
+        and str(stored_snapshot['raw'].get('ssts_hot_yn') or '').strip() in {'', 'Y', 'N', '0', '1'}
+    ):
+        return None
+    rebuilt_snapshot = build_market_risk_snapshot(
+        symbol=symbol, market_date=snapshot.market_date, source=snapshot.source,
+        market_code=snapshot.market_code, eod_run_id=snapshot.eod_run_id,
+        quote_response={'output': dict(stored_snapshot['raw'])},
+    )
+    if rebuilt_snapshot['snapshot_payload'] != stored_snapshot:
+        return None
+    rebuilt = build_market_risk_filter_result_from_snapshot(
+        {**rebuilt_snapshot, 'no_recent_trading': dormancy['no_recent_trading']},
+        source=risk.source, eod_run_id=risk.eod_run_id,
+    )
+    fields = rebuilt['_snapshot_fields']
+    if not (
+        rebuilt['filter_payload'] == payload
+        and all(getattr(snapshot, key) == value for key, value in fields.items())
+        and all(getattr(risk, key) == value for key, value in fields.items())
+        and all(getattr(risk, key) == rebuilt[key] for key in ('risk_state', 'passed_filter', 'watchlist_flagged'))
+    ):
+        return None
+    return {
+        'method': 'native_v1_null_capture_reference_recomputation',
+        'snapshot_id': snapshot.id, 'filter_id': risk.id,
+        'stored_snapshot_captured_at': None,
+        'snapshot_captured_at': _normalized_datetime(snapshot.captured_at).isoformat(),
+        'filter_captured_at': _normalized_datetime(risk.captured_at).isoformat(),
+        'dormancy_revalidation': dormancy,
+    }
+
+
 def _classify_expired_current_only_debt(
     session: Any, *, historical: EODCollectionRun, current: EODCollectionRun,
     target_date: date,
@@ -3233,14 +3352,30 @@ def _classify_expired_current_only_debt(
     ).all()
     if len(risk_rows) != len(risk_symbols):
         return None
+    legacy_symbols = [symbol for symbol, risk, _ in risk_rows
+                      if isinstance(risk.filter_payload, Mapping)
+                      and 'snapshot_captured_at' in risk.filter_payload
+                      and risk.filter_payload['snapshot_captured_at'] is None]
+    dormancy = _verified_current_risk_dormancy_inputs(
+        session, market_date=current.trade_date, symbols=legacy_symbols,
+    ) if legacy_symbols else None
     current_risk = []
     for symbol, risk, snapshot in risk_rows:
         payload = risk.filter_payload or {}
         snapshot_payload = snapshot.snapshot_payload or {}
+        if not isinstance(payload, Mapping) or not isinstance(snapshot_payload, Mapping):
+            return None
         raw = snapshot_payload.get('raw')
         snapshot_time = _normalized_datetime(snapshot.captured_at)
         filter_time = _normalized_datetime(risk.captured_at)
         expected_snapshot_time = _normalized_datetime(payload.get('snapshot_captured_at'))
+        reference_evidence = None
+        reference_matches = snapshot_time is not None and snapshot_time == expected_snapshot_time
+        if not reference_matches and snapshot_time is not None and filter_time is not None:
+            reference_evidence = _verified_legacy_null_risk_snapshot_reference(
+                symbol=symbol, risk=risk, snapshot=snapshot, dormancy=(dormancy or {}).get(symbol),
+            )
+            reference_matches = reference_evidence is not None
         blocking = payload.get('blocking_reasons')
         watchlist = payload.get('watchlist_reasons')
         if not isinstance(blocking, list) or not isinstance(watchlist, list):
@@ -3273,13 +3408,14 @@ def _classify_expired_current_only_debt(
             and snapshot.is_trade_halted == (str(raw['trht_yn']).strip() in {'Y', '1'})
             and all(isinstance(reason, str) and 'unknown' not in reason.lower() for reason in reasons)
             and snapshot_time is not None and filter_time is not None
-            and snapshot_time == expected_snapshot_time and snapshot_time <= filter_time
+            and reference_matches and snapshot_time <= filter_time
             and snapshot_time.astimezone(ZoneInfo('Asia/Seoul')).date() == current.trade_date
             and filter_time.astimezone(ZoneInfo('Asia/Seoul')).date() == current.trade_date
         ):
             return None
         current_risk.append({'symbol': symbol, 'filter_id': risk.id, 'snapshot_id': snapshot.id,
-                             'risk_state': risk.risk_state, 'passed_filter': risk.passed_filter})
+                             'risk_state': risk.risk_state, 'passed_filter': risk.passed_filter,
+                             **({'snapshot_reference_evidence': reference_evidence} if reference_evidence else {})})
     return {
         'schema_version': 'expired_current_only_debt_admission_v1',
         'classification': 'historical_failures_preserved_outside_current_admission',

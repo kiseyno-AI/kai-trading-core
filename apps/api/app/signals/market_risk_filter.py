@@ -9,6 +9,7 @@ from app.core.settings import settings
 from app.eod.scope_outcomes import build_exact_symbol_scope_outcome
 from app.market_data_store import (
     load_daily_market_risk_filter_results,
+    load_daily_market_risk_snapshots,
     load_latest_available_daily_market_risk_filter_result_date,
     load_symbols_without_recent_trading,
     replace_daily_market_risk_filter_results_exact_scope,
@@ -144,6 +145,16 @@ class DailyMarketRiskFilterService:
                 'is unavailable'
             )
         snapshot_items = list(snapshot_collection.get('items') or [])
+        # Collection returns pre-write objects; capture identity belongs to the
+        # committed snapshot, including on the exact-scope publication path.
+        stored_snapshots = {
+            item['symbol']: item
+            for item in load_daily_market_risk_snapshots(
+                market_date=normalized_market_date,
+                symbols=[item['symbol'] for item in snapshot_items],
+                limit=None,
+            )
+        } if snapshot_items else {}
         requested_symbols = list(snapshot_collection.get('requested_symbols') or [])
         matched_symbols = list(snapshot_collection.get('matched_symbols') or [])
         missing_symbols = list(snapshot_collection.get('missing_symbols') or [])
@@ -154,6 +165,14 @@ class DailyMarketRiskFilterService:
         )
 
         def build_result(snapshot: dict[str, Any]) -> dict[str, Any]:
+            stored = stored_snapshots.get(snapshot['symbol'])
+            if not (
+                stored is not None and stored.get('captured_at')
+                and all(stored.get(key) == value for key, value in snapshot.items()
+                        if key not in {'name_ko', 'market', 'vi_evidence_status', 'captured_at'})
+            ):
+                raise ValueError('persisted_market_risk_snapshot_receipt_mismatch')
+            snapshot = {**snapshot, 'captured_at': stored['captured_at']}
             if str(snapshot.get('symbol') or '') in dormant_symbols:
                 snapshot = {**snapshot, 'no_recent_trading': True}
             return build_market_risk_filter_result_from_snapshot(
