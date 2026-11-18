@@ -1,0 +1,28 @@
+--- a/dist/runtime-web-tools-jL0u7fOn.mjs
++++ b/dist/runtime-web-tools-jL0u7fOn.mjs
+@@ -526,7 +526,7 @@
+ 	return (params.kind === "search" ? providers.resolvePluginWebSearchProviders : providers.resolvePluginWebFetchProviders)({
+ 		config: params.sourceConfig,
+ 		env,
+-		...onlyPluginIds ? { onlyPluginIds } : {},
++		...onlyPluginIds ? { onlyPluginIds } : params.configuredPluginId ? { onlyPluginIds: [params.configuredPluginId] } : {},
+ 		...origin ? { origin } : params.kind === "fetch" ? { sandboxed: true } : {},
+ 		manifestRecords: params.context.manifestRegistry?.plugins
+ 	});
+@@ -616,11 +616,16 @@
+ 				manifestRecords: params.context.manifestRegistry?.plugins
+ 			});
+ 		};
++		const configuredOwnerIds = new Set(kind === "search" && rawProvider ? params.context.manifestRegistry?.plugins
++			.filter((plugin) => plugin.contracts?.[contract]?.some((candidate) => candidate.trim().toLowerCase() === rawProvider))
++			.map((plugin) => plugin.id) : []);
++		const configuredPluginId = configuredOwnerIds.size === 1 ? [...configuredOwnerIds][0] : void 0;
+ 		const resolveProviders = async () => sortPluginEntriesForAutoDetect(await resolveBundledWebProviders({
+ 			kind,
+ 			sourceConfig: params.sourceConfig,
+ 			context: params.context,
+ 			configuredBundledPluginId,
++			configuredPluginId,
+ 			hasCustomPluginRisk: await getHasCustomWebProviderRisk(contract)
+ 		}));
+ 		if (!configuredBundledPluginId && rawProvider) configuredBundledPluginId = await resolveManifestOwner();
