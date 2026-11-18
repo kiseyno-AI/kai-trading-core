@@ -17,6 +17,7 @@ from app.agent_context.lease_loss_evidence import (
 )
 from app.db_models import DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun
 from app.eod.daily_pipeline_outcomes import daily_pipeline_outcome_is_satisfied
+from app.eod.pipeline_status import EODPipelineStatusService
 from app.eod.market_membership import market_membership_sha256
 from app.eod.scope_outcomes import (
     build_exact_scope_partition_identity_proof,
@@ -3484,6 +3485,67 @@ class DailyPipelineRunStateServiceTests(unittest.TestCase):
         self.assertEqual(result['market_date'], '2026-09-11')
         self.assertEqual(result['trigger'], 'manual_daily_api')
         self.assertEqual(result['status'], 'partial')
+
+    def test_historical_recovery_does_not_hide_newer_market_date_status(self) -> None:
+        test_engine = create_engine('sqlite+pysqlite:///:memory:')
+        self.addCleanup(test_engine.dispose)
+        DailyPipelineRun.__table__.create(test_engine)
+        DailyPipelineStageRun.__table__.create(test_engine)
+        sessions = sessionmaker(bind=test_engine)
+        started_at = datetime(2026, 11, 18, 11, tzinfo=timezone.utc)
+        with sessions.begin() as session:
+            for run_id, day, status, offset in [
+                (669, 16, 'running', 0),
+                (670, 18, 'running', 1),
+                (671, 17, 'completed', 2),
+            ]:
+                session.add(DailyPipelineRun(
+                    id=run_id, market_date=date(2026, 11, day),
+                    trigger='auto_close_scheduler' if run_id == 670 else 'manual_recovery',
+                    status=status, started_at=started_at + timedelta(hours=offset),
+                    run_metadata={},
+                ))
+            session.add(DailyPipelineStageRun(
+                pipeline_run_id=670, market_date=date(2026, 11, 18),
+                stage_id='agent_feedback_summaries', status='running', total=354,
+                started_at=started_at + timedelta(hours=1), details={},
+            ))
+
+        @contextmanager
+        def test_session_scope():
+            with sessions.begin() as session:
+                yield session
+
+        status_service = EODPipelineStatusService(
+            market_state_loader=lambda: SimpleNamespace(
+                market='KRX', state='CLOSED', is_trading_day=True, is_open=False,
+                reason=None, server_time='2026-11-19T00:00:00+09:00',
+                current_calendar_date='2026-11-19',
+                latest_valid_trading_date='2026-11-18', market_session='closed',
+            ),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 0,
+            fundamentals_refresh_loader=lambda **_: None,
+        )
+        with patch('app.eod.daily_pipeline_state.session_scope', test_session_scope):
+            result = status_service.read(include_feedback_context=False)
+            self.assertEqual(result['market_date'], '2026-11-18')
+            self.assertEqual(result['official_run']['id'], 670)
+            self.assertEqual(result['stages']['agent_feedback_summaries']['status'], 'running')
+            explicit = status_service.read(market_date='2026-11-17', include_feedback_context=False)
+            self.assertEqual(explicit['official_run']['id'], 671)
+            with sessions.begin() as session:
+                for run_id in (672, 673):
+                    session.add(DailyPipelineRun(
+                        id=run_id, market_date=date(2026, 11, 18),
+                        trigger='manual_recovery', status='completed',
+                        started_at=started_at + timedelta(hours=3), run_metadata={},
+                    ))
+            service = DailyPipelineRunStateService()
+            self.assertEqual(service.get_latest_run(market_date=None)['id'], 673)
+            self.assertEqual(service.get_latest_run(market_date='2026-11-18')['id'], 673)
+            self.assertEqual(service.get_latest_run(market_date='2026-11-17')['id'], 671)
 
     def test_context_lookup_filters_before_limit_with_more_than_100_unrelated_runs(self) -> None:
         engine = create_engine('sqlite+pysqlite:///:memory:')

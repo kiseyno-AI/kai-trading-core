@@ -1986,7 +1986,11 @@ class DailyPipelineRunStateService:
                 )
             row = session.execute(
                 statement
-                .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())
+                .order_by(
+                    DailyPipelineRun.market_date.desc(),
+                    DailyPipelineRun.started_at.desc(),
+                    DailyPipelineRun.id.desc(),
+                )
                 .limit(1)
             ).scalar_one_or_none()
             if row is None:
