@@ -498,6 +498,32 @@ backup suffix `.pre-configured-search-scope` instead of `.pre-copy-only`.
 This changes a different module from the copy workaround; hash and roll back each
 independently. Revalidate both patches after any package reinstall or upgrade.
 
+### OpenClaw 2026.10.5 readable native-catalog config
+
+The [catalog-read patch](ops/patches/openclaw-2026.10.5-readable-catalog-config.patch)
+uses the same version/build pin above. `hasReadableNativeCatalogConfig` stalled
+in `accessSync(R_OK)` on the external config. After the existing `lstat`/`stat`
+regular-file admission, macOS processes with matching real/effective UID and GID
+probe with `O_RDONLY | O_NONBLOCK`, confirm the opened descriptor is a regular
+file with `fstat`, and close it in `finally`. Other platforms and differing
+real/effective IDs retain `accessSync(R_OK)`. The probe reads no file contents
+and changes no permissions.
+
+The actual external-config probe returned readable in 0.032 ms with one open,
+one close, zero access calls and zero content reads. All 19 private fixture
+checks passed, including mode-000 denial, symlinks, FIFOs, path races, descriptor
+cleanup, and platform/identity fallback.
+
+Reuse the stopped-maintenance apply/rollback procedure above with these values
+and backup suffix `.pre-readable-catalog-config`:
+
+| Field | Value |
+| --- | --- |
+| Module | `/opt/homebrew/lib/node_modules/openclaw/dist/registry-HOGUZGcB.mjs` |
+| Patch | `ops/patches/openclaw-2026.10.5-readable-catalog-config.patch` |
+| Baseline SHA-256 | `abc7531223afc0b3e0bb74cdb93a68b7a47e1a1d71f660b02e6a432c96b9bc5d` |
+| Patched SHA-256 | `b32ee100bbf66faf317368e4099715b3eb925488bce56f6a88131239728844b9` |
+
 ## Runtime write-path schema drift diagnostics
 
 When an EOD, DART, signal-decider, or execution write path fails, debug in this order:

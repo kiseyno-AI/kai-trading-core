@@ -1,0 +1,17 @@
+--- a/dist/registry-HOGUZGcB.mjs
++++ b/dist/registry-HOGUZGcB.mjs
+@@ -499,6 +499,14 @@
+ 		const configPath = resolveConfigPath();
+ 		const link = fs.lstatSync(configPath);
+ 		if (!(link.isSymbolicLink() ? fs.statSync(configPath) : link).isFile()) return false;
++		if (process.platform === "darwin" && process.getuid() === process.geteuid() && process.getgid() === process.getegid()) {
++			const fd = fs.openSync(configPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
++			try {
++				return fs.fstatSync(fd).isFile();
++			} finally {
++				fs.closeSync(fd);
++			}
++		}
+ 		fs.accessSync(configPath, fs.constants.R_OK);
+ 		return true;
+ 	} catch {
