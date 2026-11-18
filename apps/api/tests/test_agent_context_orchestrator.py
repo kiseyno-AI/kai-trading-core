@@ -7791,6 +7791,66 @@ class AgentFeedbackOrchestratorTests(unittest.TestCase):
         snapshot = runtime_store.get_run(market_date, run_id=run_id)
         self.assertEqual(snapshot.cleaned_session_keys, set())
 
+    def test_blocked_cleanup_prequeue_does_not_hold_the_next_role(self):
+        release_prequeue = threading.Event()
+        prequeue_finished = threading.Event()
+
+        class BlockingPrequeueService(FakeSessionCleanupService):
+            def enqueue_deferred(self, *, targets, reason, deadline_monotonic=None):
+                self.deferred_batches.append(list(targets))
+                try:
+                    release_prequeue.wait(timeout=2)
+                    raise TimeoutError('native identity file read blocked')
+                finally:
+                    prequeue_finished.set()
+
+        service = AgentFeedbackOrchestrator()
+        client = RecordingBatchClient()
+        service.client = client
+        feedback_service = FakeFeedbackService()
+        cleanup_service = BlockingPrequeueService()
+        run_state_service = RecordingRunStateService()
+        cleanup = service._cleanup_persisted_run_sessions
+        cleanup_results = []
+        cleanup_durations = []
+
+        def bounded_cleanup(**kwargs):
+            started_at = time.monotonic()
+            result = cleanup(**kwargs, max_seconds=0.02)
+            cleanup_durations.append(time.monotonic() - started_at)
+            cleanup_results.extend(result)
+            return result
+
+        try:
+            with (
+                patch.object(orchestrator_module.settings, 'db_connect_timeout_seconds', 0),
+                patch.object(orchestrator_module, 'agent_context_read_service', DynamicFakeAgentContextReadService()),
+                patch.object(orchestrator_module, 'agent_context_feedback_service', feedback_service),
+                patch.object(orchestrator_module, 'agent_feedback_session_cleanup_service', cleanup_service),
+                patch.object(orchestrator_module, 'agent_context_feedback_run_state_service', run_state_service),
+                patch.object(service, '_cleanup_persisted_run_sessions', side_effect=bounded_cleanup),
+                _patch_feedback_eligibility('005930'),
+            ):
+                result = service.dispatch_for_symbols(
+                    market_date='2026-04-14',
+                    symbols=['005930'],
+                    roles=['eod-summarizer', 'fundamental-summarizer'],
+                    reuse_existing=False,
+                )
+        finally:
+            release_prequeue.set()
+
+        self.assertTrue(prequeue_finished.wait(timeout=1))
+        self.assertTrue(all(duration < 1.5 for duration in cleanup_durations))
+        self.assertEqual([call['spec'].role for call in client.calls], ['eod-summarizer', 'fundamental-summarizer'])
+        self.assertEqual(result['summary']['completed'], 2)
+        self.assertEqual(result['summary']['failed'], 0)
+        self.assertEqual(len(cleanup_service.deferred_batches), 1)
+        self.assertEqual(cleanup_service.targets, [])
+        self.assertTrue(cleanup_results)
+        self.assertTrue(all(row['status'] == 'deferred' for row in cleanup_results))
+        self.assertTrue(all(row['retry_queue']['persistence_confirmed'] is False for row in cleanup_results))
+
     def test_persisted_cleanup_surfaces_retry_prequeue_deadline_without_deleting(self):
         class DeadlinePrequeueSessionCleanupService(FakeSessionCleanupService):
             def enqueue_deferred(self, *, targets, reason, deadline_monotonic=None):
