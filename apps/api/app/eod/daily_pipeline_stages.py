@@ -975,6 +975,7 @@ class DailyPipelineStageService:
         summary_cutoff_proof: Mapping[str, Any] | None = None,
         summary_cutoff_contract_repair: bool = False,
         same_day_intraday_watch_rearm_resume: bool = False,
+        preopen_continuation_source_pipeline_run_id: int | None = None,
     ) -> dict[str, Any]:
         normalized_market_date = self._normalize_market_date(market_date)
         point_in_time_recovery = resolve_point_in_time_recovery(
@@ -1420,6 +1421,21 @@ class DailyPipelineStageService:
                 resolved_stages=resolved_stages,
             )
         )
+        # Internal preparation seam only: no scheduler or HTTP caller opts in.
+        # The persisted source and completed summary are revalidated atomically
+        # by start_run; this argument alone never admits an OPEN continuation.
+        if preopen_continuation_source_pipeline_run_id is not None and not (
+            type(preopen_continuation_source_pipeline_run_id) is int
+            and preopen_continuation_source_pipeline_run_id > 0
+            and intraday_watch_candidate
+            and provider_admission_fence_owned is True
+            and bypass_prerequisite_gate is False
+            and same_day_intraday_watch_rearm_resume is False
+        ):
+            raise ValueError(
+                'preopen continuation source requires the exact automatic '
+                'PITR suffix, owned fence, and canonical completed summary proof'
+            )
         intraday_watch_rearm_resume_candidate = bool(
             same_day_intraday_watch_rearm_resume is True
             and allow_expired_analysis_replay is False
@@ -2360,6 +2376,18 @@ class DailyPipelineStageService:
                 provider_admission_fence_owned=(
                     provider_admission_fence_owned
                 ),
+                **(
+                    {
+                        'preopen_continuation_source_pipeline_run_id': (
+                            preopen_continuation_source_pipeline_run_id
+                        ),
+                        'preopen_continuation_summary_proof': (
+                            normalized_summary_cutoff_proof
+                        ),
+                    }
+                    if preopen_continuation_source_pipeline_run_id is not None
+                    else {}
+                ),
             )
         pipeline_run_id = int(pipeline_run['id'])
         if pipeline_run.get('deduplicated'):
@@ -2374,6 +2402,21 @@ class DailyPipelineStageService:
                 'status': pipeline_run.get('status'),
                 'stages': pipeline_run.get('stages') or {},
             }
+
+        if preopen_continuation_source_pipeline_run_id is not None:
+            admitted_metadata = pipeline_run.get('run_metadata') or {}
+            admission = admitted_metadata.get('preopen_summary_continuation') or {}
+            if not (
+                admission.get('schema_version') == 'preopen_summary_continuation_v1'
+                and admission.get('source_pipeline_run_id')
+                == preopen_continuation_source_pipeline_run_id
+                and admission.get('summary_feedback_run_id')
+                == normalized_summary_cutoff_proof['source_run_id']
+                and admitted_metadata.get('same_day_intraday_watch_continuation_admitted') is True
+            ):
+                raise RuntimeError('native preopen continuation claim evidence missing')
+            allow_same_day_intraday_watch_continuation = True
+            allow_previous_session_preopen_recovery = False
 
         pykrx_requested = [
             stage_id

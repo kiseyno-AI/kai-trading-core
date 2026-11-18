@@ -11499,6 +11499,47 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ]
         )
 
+    def test_explicit_preopen_source_uses_only_atomic_native_claim_admission(self):
+        service = DailyPipelineStageService()
+        proof = {
+            'source_run_id': 'completed-preopen-summary',
+            'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+            'requested_symbols': ['005930'],
+            'expected_completed_symbols': ['005930'],
+            'knowledge_cutoff_at': '2026-10-26T12:00:00+00:00',
+            'fs_div': 'CFS',
+        }
+        original_start = self.run_state_service.start_run
+
+        def native_claim(**kwargs):
+            payload = original_start(**kwargs)
+            payload['run_metadata'].update({
+                'same_day_intraday_watch_continuation_admitted': True,
+                'preopen_summary_continuation': {
+                    'schema_version': 'preopen_summary_continuation_v1',
+                    'source_pipeline_run_id': 664,
+                    'summary_feedback_run_id': proof['source_run_id'],
+                },
+            })
+            return payload
+
+        with (
+            patch.object(self.run_state_service, 'start_run', side_effect=native_claim) as claim,
+            patch.object(service, '_execute_stage', return_value={'status': 'completed'}) as execute,
+        ):
+            service.run(
+                market_date='2026-10-26', symbols=['005930'],
+                stages=['signal_decider', 'next_open_execution_plan'],
+                resume_from_stage='signal_decider', trigger='auto_eod_followup_resume',
+                reused_eod_collection_run_id=598, point_in_time_recovery=True,
+                provider_admission_fence_owned=True, summary_cutoff_proof=proof,
+                preopen_continuation_source_pipeline_run_id=664,
+            )
+        self.assertEqual(claim.call_args.kwargs['preopen_continuation_source_pipeline_run_id'], 664)
+        self.assertEqual(claim.call_args.kwargs['preopen_continuation_summary_proof'], proof)
+        self.assertTrue(execute.call_args.kwargs['allow_same_day_intraday_watch_continuation'])
+        self.assertFalse(execute.call_args.kwargs['allow_previous_session_preopen_recovery'])
+
     def test_exact_auto_pitr_recovery_cannot_start_during_open(
         self,
     ) -> None:
