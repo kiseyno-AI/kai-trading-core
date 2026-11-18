@@ -58,6 +58,7 @@ from app.eod.run_stage_support import (
     SAME_DAY_INTRADAY_WATCH_REARM_ATTEMPT_LIMIT,
     SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY,
     SAME_DAY_INTRADAY_WATCH_REARM_VERSION,
+    build_next_open_window_expired_result,
     is_completed_auto_pitr_intraday_watch_recovery,
     is_canonical_same_day_signal_rearm_proof,
     is_exact_auto_pitr_intraday_watch_recovery_request,
@@ -111,6 +112,7 @@ from app.eod.pykrx_pipeline_runner import (
     run_market_data_pipeline,
     should_skip_point_in_time_current_only_stage,
 )
+from app.market.clock import get_market_state
 from app.market.session import latest_krx_trading_date
 from app.eod.technical_snapshots import daily_technical_snapshot_service
 from app.signals.daily_signal_features import daily_signal_feature_service
@@ -4126,6 +4128,150 @@ def _proven_followup_recovery_symbols(
             return []
         proven.intersection_update(partition['successful_stock_codes'])
     return sorted(proven) if stage_ids else []
+
+
+def _expired_terminal_followup_retirement(
+    *,
+    latest_eod_run: Mapping[str, Any],
+    recovery_result: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Retire a closed execution opportunity without claiming publications."""
+
+    metadata = latest_eod_run.get('run_metadata')
+    pipeline = recovery_result.get('pipeline_run')
+    if not isinstance(metadata, Mapping) or not isinstance(pipeline, Mapping):
+        return None
+    run_metadata = pipeline.get('run_metadata')
+    stages = recovery_result.get('stages')
+    persisted_stages = pipeline.get('stages')
+    terminal = list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+    if not all(isinstance(value, Mapping) for value in (
+        run_metadata, stages, persisted_stages,
+    )):
+        return None
+    requested = sorted(_dedupe_symbol_codes(metadata.get('requested_symbols') or []))
+    admission = _validated_followup_admission_partition(metadata)
+    stage_progress = metadata.get('stage_progress')
+    required_upstream = set(AUTO_DAILY_TRACKED_STAGE_ORDER) - set(terminal) - set(
+        ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS
+    )
+    if not (
+        type(latest_eod_run.get('id')) is int
+        and latest_eod_run['id'] > 0
+        and latest_eod_run.get('status') == 'completed'
+        and requested
+        and latest_eod_run.get('symbols_total') == len(requested)
+        and latest_eod_run.get('symbols_succeeded') == len(requested)
+        and latest_eod_run.get('symbols_failed') == 0
+        and not PykrxBackfillService._metadata_retry_symbol_codes(dict(latest_eod_run))
+        and not metadata.get('inherited_downstream_retry_symbols')
+        and sorted(_dedupe_symbol_codes(metadata.get('downstream_retry_symbols') or [])) == requested
+        and metadata.get(FOLLOWUP_STAGE_DEBT_METADATA_KEY) is None
+        and metadata.get(SAME_DAY_INTRADAY_WATCH_REARM_METADATA_KEY) is None
+        and admission is not None
+        and sorted(admission['successful_stock_codes']) == requested
+        and not admission['retry_debt_stock_codes']
+        and metadata.get('expected_daily_pipeline_stages') == list(AUTO_DAILY_TRACKED_STAGE_ORDER)
+        and isinstance(stage_progress, Mapping)
+        and all(
+            isinstance(stage_progress.get(stage_id), Mapping)
+            and daily_pipeline_outcome_is_satisfied({
+                **dict(stage_progress[stage_id]), 'stage': stage_id,
+            })
+            for stage_id in required_upstream
+        )
+        and all(metadata.get(key) in (None, *terminal) for key in (
+            'downstream_retry_resume_from_stage',
+            'inherited_downstream_retry_resume_from_stage',
+        ))
+    ):
+        return None
+    market_date = str(latest_eod_run.get('trade_date') or '')
+    if not (
+        type(pipeline.get('id')) is int
+        and pipeline['id'] > 0
+        and recovery_result.get('pipeline_run_id') == pipeline['id']
+        and recovery_result.get('market_date') == market_date
+        and pipeline.get('market_date') == market_date
+        and pipeline.get('status') == 'completed'
+        and pipeline.get('trigger') == AUTO_FOLLOWUP_RECOVERY_TRIGGER
+        and run_metadata.get('reused_eod_collection_run_id') == latest_eod_run['id']
+        and run_metadata.get('resolved_stages') == terminal
+        and run_metadata.get('requested_stages') == terminal
+        and run_metadata.get('resume_from_stage') == terminal[0]
+        and recovery_result.get('resolved_stages') == terminal
+        and run_metadata.get('exact_membership_symbol_count') == len(requested)
+        and run_metadata.get('exact_membership_sha256') == market_membership_sha256(requested)
+        and run_metadata.get('point_in_time_recovery') is True
+        and run_metadata.get('force') is False
+        and run_metadata.get('reuse_existing_feedback') is True
+        and run_metadata.get('bypass_prerequisite_gate') is False
+        and run_metadata.get('allow_expired_analysis_replay') is False
+        and _dedupe_symbol_codes(run_metadata.get('symbols') or [])
+        and set(_dedupe_symbol_codes(run_metadata['symbols'])).issubset(requested)
+        and set(stages) == set(terminal)
+        and set(persisted_stages) == set(terminal)
+    ):
+        return None
+    expiry = None
+    for stage_id in terminal:
+        for stage in (stages[stage_id], persisted_stages[stage_id]):
+            if not isinstance(stage, Mapping):
+                return None
+            raw_result = stage.get('result')
+            result = (
+                raw_result if isinstance(raw_result, Mapping)
+                else _stage_result_summary(stage)
+            )
+            if not (
+                stage.get('status') == 'skipped'
+                and stage.get('pipeline_run_id', pipeline['id']) == pipeline['id']
+                and stage.get('market_date', market_date) == market_date
+                and stage.get('stage_id', stage.get('stage', stage_id)) == stage_id
+                and not stage.get('source_run_ids')
+                and all(stage.get(key, 0) == 0 for key in (
+                    'processed', 'total', 'succeeded', 'failed', 'remaining',
+                ))
+                and isinstance(result, Mapping)
+                and result.get('triggered') is False
+                and result.get('status') == 'skipped'
+                and result.get('reason') == 'next_open_window_expired'
+                and result.get('market_date') == market_date
+                and result.get('stage') == stage_id
+            ):
+                return None
+            proof = {key: result.get(key) for key in (
+                'target_trade_date', 'current_market_date', 'market_state',
+            )}
+            if expiry is not None and proof != expiry:
+                return None
+            expiry = proof
+    try:
+        source_date = date.fromisoformat(market_date)
+        target_date = date.fromisoformat(expiry['target_trade_date'])
+        observed_date = date.fromisoformat(expiry['current_market_date'])
+    except (TypeError, ValueError):
+        return None
+    today = _current_krx_calendar_date()
+    if not (
+        source_date < target_date <= observed_date <= today
+        and target_date < today
+        and expiry['market_state'] in {'PREOPEN', 'OPEN', 'CLOSED', 'WEEKEND', 'HOLIDAY'}
+        and (observed_date > target_date or expiry['market_state'] == 'CLOSED')
+    ):
+        return None
+    return {
+        'schema_version': 'expired_terminal_followup_retirement_v1',
+        'reason': 'next_open_window_expired',
+        'market_date': market_date,
+        'eod_collection_run_id': latest_eod_run['id'],
+        'source_pipeline_run_id': pipeline['id'],
+        **expiry,
+        'stage_ids': terminal,
+        'retired_symbols': requested,
+        'retired_symbols_count': len(requested),
+        'retired_membership_sha256': market_membership_sha256(requested),
+    }
 
 
 def _resolve_followup_stage_debt_state(
@@ -8178,7 +8324,15 @@ class PykrxBackfillService:
             if debt_stage_id not in recovery_scope:
                 recovery_scope.append(debt_stage_id)
         if not incomplete_stages:
-            if downstream_retry_symbols and persisted_nonblocking_marker is None:
+            expired_retirement = _expired_terminal_followup_retirement(
+                latest_eod_run=latest_eod_run,
+                recovery_result=persisted_recovery_result,
+            )
+            if (
+                downstream_retry_symbols
+                and persisted_nonblocking_marker is None
+                and expired_retirement is None
+            ):
                 proven_symbols = _proven_followup_recovery_symbols(
                     stages=stage_rows, stage_ids=recovery_scope,
                     symbols=downstream_retry_symbols, market_date=market_date,
@@ -8253,6 +8407,7 @@ class PykrxBackfillService:
                     )
                     if persisted_nonblocking_marker is not None
                     or legacy_evaluation_only_completion is not None
+                    or expired_retirement is not None
                     else {
                         # Persisted terminal stage rows remain sufficient for
                         # the legacy non-rearm convergence path. A pending
@@ -9569,6 +9724,48 @@ class PykrxBackfillService:
             )
         else:
             recovery_symbols = downstream_retry_symbols
+        if (
+            recovery_stages == list(TERMINAL_FOLLOWUP_CONTINUATION_STAGES)
+            and 'exact_membership_symbols' not in recovery_kwargs
+            and resolve_point_in_time_recovery(
+                market_date=market_date,
+                requested=point_in_time_recovery,
+                recovery_context=True,
+                current_market_date=current_krx_calendar_date,
+            )
+        ):
+            # The stage boundary infers PIT after midnight even when the
+            # scheduler did not request it. Preserve the frozen parent scope
+            # so its zero-work expiry can later be audited without replaying
+            # providers or changing the original feedback retry contract.
+            terminal_expiry = build_next_open_window_expired_result(
+                market_date=market_date, market=get_market_state(),
+            )
+            terminal_parent = _validated_followup_admission_partition(
+                latest_eod_metadata
+            )
+            requested_membership = _dedupe_symbol_codes(
+                latest_eod_metadata.get('requested_symbols') or []
+            )
+            if (
+                terminal_expiry is not None
+                and terminal_expiry['current_market_date']
+                == current_krx_calendar_date.isoformat()
+                and terminal_expiry['target_trade_date']
+                < current_krx_calendar_date.isoformat()
+                and terminal_parent is not None
+                and requested_membership
+                and set(terminal_parent['selected_stock_codes'])
+                == set(requested_membership)
+            ):
+                recovery_kwargs['exact_membership_symbols'] = sorted(
+                    requested_membership
+                )
+                recovery_kwargs['recovery_parent_scope_outcome'] = dict(
+                    latest_eod_metadata['followup_admission_scope_outcome']
+                )
+                if not recovery_symbols:
+                    recovery_symbols = sorted(requested_membership)
         if recovery_symbols:
             recovery_kwargs['symbols'] = recovery_symbols
         if (
@@ -10590,9 +10787,29 @@ class PykrxBackfillService:
             recovery_result.get('_proven_resolved_downstream_symbols')
             or []
         )
+        expired_retirement = _expired_terminal_followup_retirement(
+            latest_eod_run=latest_eod_run,
+            recovery_result=recovery_result,
+        )
+        if expired_retirement is not None and (
+            count_eod_run_persisted_symbols(
+                int(latest_eod_run['id']),
+                trade_date=latest_eod_run.get('trade_date'),
+            ) != latest_eod_run['symbols_total']
+            or set(load_eod_run_persisted_symbols(
+                int(latest_eod_run['id']),
+                trade_date=latest_eod_run.get('trade_date'),
+            )) != set(expired_retirement['retired_symbols'])
+        ):
+            return {'updated': False, 'reason': 'expired_recovery_price_scope_unverified'}
+        retired_symbols = set(
+            expired_retirement['retired_symbols']
+            if expired_retirement is not None else []
+        )
         if (
             (downstream_retry_symbols or inherited_downstream_retry_symbols)
             and not proven_resolved_symbols
+            and not retired_symbols
         ):
             return {
                 'updated': False,
@@ -10602,7 +10819,7 @@ class PykrxBackfillService:
         remaining_downstream_retry_symbols = [
             symbol
             for symbol in downstream_retry_symbols
-            if symbol not in proven_resolved_set
+            if symbol not in proven_resolved_set | retired_symbols
         ]
         remaining_inherited_downstream_retry_symbols = [
             symbol
@@ -10619,6 +10836,10 @@ class PykrxBackfillService:
             dict(latest_eod_run)
         )
         completed_at = _utcnow_iso()
+        if expired_retirement is not None:
+            metadata['expired_terminal_followup_retirement'] = {
+                **expired_retirement, 'retired_at': completed_at,
+            }
         if not remaining_downstream_retry_symbols:
             metadata.pop('downstream_retry_resume_from_stage', None)
         if not remaining_inherited_downstream_retry_symbols:
