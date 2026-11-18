@@ -160,7 +160,7 @@ class FeedbackRetryConfigCallsiteTests(TestCase):
                 '<default_false>'
             ],
             'app/eod/daily_pipeline_stages.py': [
-                'point_in_time_recovery'
+                'retry_point_in_time_recovery'
             ],
             'app/eod/pykrx_pipeline_runner.py': [
                 'point_in_time_recovery'
@@ -11047,6 +11047,7 @@ class PykrxBackfillServiceTests(TestCase):
                 parent_role_symbol_scopes,
             )
             self.assertEqual(rearm_config['fs_div'], 'OFS')
+            self.assertFalse(rearm_config['point_in_time_recovery'])
             self.assertEqual(
                 rearm_config['policy_context_as_of_date'],
                 date(2026, 4, 6),
@@ -11060,6 +11061,29 @@ class PykrxBackfillServiceTests(TestCase):
             )
         self.assertEqual(get_feedback_run.call_count, 2)
         get_feedback_run.assert_called_with(run_id='feedback-cycle-test')
+        with patch(
+            'app.eod.pykrx_backfill.'
+            'agent_context_feedback_run_state_service.get_run',
+            return_value=parent_feedback_run,
+        ):
+            for original_mode in (False, True):
+                with self.subTest(point_in_time_recovery=original_mode):
+                    parent_feedback_run['request_payload'][
+                        'point_in_time_recovery'
+                    ] = original_mode
+                    self.assertIs(
+                        _retryable_feedback_rearm_config(
+                            latest_pipeline_run, market_date='2026-04-03',
+                        )['point_in_time_recovery'],
+                        original_mode,
+                    )
+            parent_feedback_run['request_payload'][
+                'point_in_time_recovery'
+            ] = 'false'
+            self.assertIsNone(_retryable_feedback_rearm_config(
+                latest_pipeline_run, market_date='2026-04-03',
+            ))
+            parent_feedback_run['request_payload'].pop('point_in_time_recovery')
         failed_pipeline_run = deepcopy(latest_pipeline_run)
         failed_pipeline_run['stages']['agent_feedback_summaries'][
             'status'
