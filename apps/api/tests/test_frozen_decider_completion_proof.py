@@ -1,9 +1,13 @@
 from copy import deepcopy
-from datetime import datetime, timezone
-from unittest.mock import patch
+from datetime import date, datetime, timezone
+from unittest.mock import Mock, patch
 
 import pytest
 
+from app.agent_context import retry_service
+from app.agent_context.retry_service import FeedbackRetryCycleConfig
+from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.eod.daily_pipeline_stages import DailyPipelineStageService
 from app.eod.pykrx_pipeline_runner import _run_daily_signal_decider_followup
 from app.orders.next_open_execution import _normalize_strict_decider_completion_authority
@@ -57,6 +61,73 @@ def test_frozen_scope_proves_exact_independent_lanes_without_economics_claims(fa
     assert proof['failed_symbols_by_role']['signal-decider'] == (['000660'] if failed else [])
     assert _normalize_strict_decider_completion_authority(proof) is not None
     assert DailyPipelineStageService.validated_stage_completion_scope_proof('signal_decider', proof) == proof
+
+
+def test_native_partial_summary_binding_uses_completed_intersection(monkeypatch):
+    cutoff_at = datetime(2026, 4, 14, 8, 30, tzinfo=timezone.utc)
+    completed_symbols = SYMBOLS[:2]
+    prepared_scopes = {
+        'signal-decider': ['000660', '035420'],
+        'short-term-decider': ['005930', '035420'],
+    }
+    source = {
+        'run_id': 'summary-run',
+        'market_date': date(2026, 4, 14).isoformat(),
+        'status': 'partial',
+        'completed_at': cutoff_at.isoformat(),
+        'request_payload': {
+            'mode': DAILY_RETRY_CYCLE_MODE,
+            'roles': list(SUMMARIZER_AGENT_NAMES),
+            'symbols': list(SYMBOLS),
+            'role_symbol_scopes': {
+                role: list(SYMBOLS) for role in SUMMARIZER_AGENT_NAMES
+            },
+            'knowledge_cutoff_at': cutoff_at.isoformat(),
+            'fs_div': 'CFS',
+            'prepared_decider_role_symbol_scopes': prepared_scopes,
+        },
+    }
+    monkeypatch.setattr(
+        retry_service.agent_context_feedback_run_state_service,
+        'get_run',
+        Mock(return_value=source),
+    )
+    _, binding = retry_service._bind_source_summary_scope(
+        FeedbackRetryCycleConfig(
+            market_date=date(2026, 4, 14),
+            roles=DECISION_SUPPORT_AGENT_NAMES,
+            symbols=tuple(completed_symbols),
+            knowledge_cutoff_at=cutoff_at,
+            source_summary_run_id='summary-run',
+            scope_authority={'source_summary_run_id': 'summary-run'},
+        )
+    )
+    outcome, cutoff = _terminal_decider_outcome_with_role_failures(
+        symbols=completed_symbols,
+        role_scopes=SCOPES,
+        failed_symbols_by_role={},
+        cutoff_at=cutoff_at,
+    )
+    cutoff['completed_scope_proof']['admitted_symbols'] = list(SYMBOLS)
+    outcome['result']['source_summary_scope'] = binding
+
+    assert binding['prepared_symbols'] == completed_symbols
+    assert binding['prepared_decider_role_symbol_scopes'] == SCOPES
+    proof = DailyPipelineStageService._terminal_decider_progression_proof(
+        outcome,
+        expected_decider_symbols=completed_symbols,
+        feedback_cutoff_resolution=cutoff,
+    )
+    assert proof is not None
+
+    outcome['result']['source_summary_scope'][
+        'prepared_decider_role_symbol_scopes'
+    ]['signal-decider'].append('035420')
+    assert DailyPipelineStageService._terminal_decider_progression_proof(
+        outcome,
+        expected_decider_symbols=completed_symbols,
+        feedback_cutoff_resolution=cutoff,
+    ) is None
 
 
 @pytest.mark.parametrize('mutation', [
