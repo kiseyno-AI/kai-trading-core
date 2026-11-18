@@ -1,0 +1,11 @@
+--- a/dist/plugin-generation-source-lookup-Dg6DuWgm.mjs
++++ b/dist/plugin-generation-source-lookup-Dg6DuWgm.mjs
+@@ -130,7 +130,7 @@
+ 						dev: admitted.dev,
+ 						ino: admitted.ino
+ 					},
+-					clone: "auto",
++					clone: "never",
+ 					maxBytes: Number(admitted.size),
+ 					mode,
+ 					sourceHardlinks: "allow"
