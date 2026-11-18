@@ -9393,14 +9393,17 @@ class PykrxBackfillService:
             if (
                 admission_partition is None
                 or not exact_membership
+                or not admission_partition['retry_debt_stock_codes']
                 or set(
                     admission_partition['selected_stock_codes']
                 )
                 != set(exact_membership)
-                or set(
+                or not set(
                     admission_partition['retry_debt_stock_codes']
+                ).issubset(downstream_retry_symbols)
+                or not set(downstream_retry_symbols).issubset(
+                    exact_membership
                 )
-                != set(downstream_retry_symbols)
             ):
                 result = build_daily_skip_result(
                     reason='followup_recovery_exact_scope_unavailable',
@@ -9650,6 +9653,11 @@ class PykrxBackfillService:
         )
         if early_recovery_scope is not None:
             recovery_symbols = list(early_recovery_scope['retry_debt_stock_codes'])
+        elif market_risk_recovery_scope_outcome is not None:
+            # Generic restart debt can also cover unfinished sibling stages.
+            recovery_symbols = list(
+                market_risk_recovery_scope_outcome['retry_debt_stock_codes']
+            )
         elif stage_debt_terminal_progression:
             recovery_symbols = list(
                 stage_debt_terminal_progression_symbols

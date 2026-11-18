@@ -9354,6 +9354,8 @@ class PykrxBackfillServiceTests(TestCase):
         latest_eod_run['run_metadata'][
             'downstream_retry_resume_from_stage'
         ] = 'market_risk_filter'
+        # Restart reconciliation also retains unrelated downstream debt.
+        latest_eod_run['run_metadata']['downstream_retry_symbols'] = frozen_scope
         latest_eod_run['run_metadata'][
             'followup_admission_scope_outcome'
         ] = build_exact_symbol_scope_outcome(
@@ -9366,6 +9368,14 @@ class PykrxBackfillServiceTests(TestCase):
             ],
             retry_debt_symbols=['005930'],
         )
+        recovered_market_risk = {
+            'status': 'completed',
+            'market_date': '2026-04-03',
+            **_atomic_exact_scope_proof(
+                manifest_version='market_risk_filter_scope_outcomes_v1',
+                selected_symbols=frozen_scope,
+            ),
+        }
         with (
             patch(
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
@@ -9379,8 +9389,33 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
-                return_value={'status': 'partial', 'pipeline_run_id': 94},
+                return_value={
+                    'status': 'completed',
+                    'pipeline_run_id': 94,
+                    'stages': {
+                        'market_risk_filter': {
+                            'status': 'completed',
+                            'result': recovered_market_risk,
+                        },
+                    },
+                },
             ) as retry_market_risk,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={'updated': True},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.count_eod_run_persisted_symbols',
+                return_value=len(frozen_scope),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=frozen_scope,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run',
+            ) as complete_eod_run,
         ):
             service._resume_auto_daily_followups_if_due(
                 market_date='2026-04-03',
@@ -9390,12 +9425,14 @@ class PykrxBackfillServiceTests(TestCase):
                 point_in_time_recovery=True,
             )
 
+        retry_market_risk.assert_called_once()
         market_risk_call = retry_market_risk.call_args.kwargs
         self.assertEqual(
             market_risk_call['resume_from_stage'],
             'market_risk_filter',
         )
         self.assertEqual(market_risk_call['symbols'], ['005930'])
+        self.assertEqual(market_risk_call['stages'], ['market_risk_filter'])
         self.assertEqual(
             market_risk_call['exact_membership_symbols'],
             frozen_scope,
@@ -9415,6 +9452,79 @@ class PykrxBackfillServiceTests(TestCase):
             market_risk_recovery_scope['retry_debt_stock_codes'],
             ['005930'],
         )
+        persisted = complete_eod_run.call_args.kwargs['run_metadata']
+        self.assertEqual(
+            persisted['downstream_retry_symbols'],
+            ['000660', '472220'],
+        )
+        self.assertEqual(persisted['downstream_retry_symbols_count'], 2)
+        self.assertTrue(persisted['followup_recovery_required'])
+
+        for label, exact_debt, generic_debt in (
+            ('exact_only', ['005930'], ['005930']),
+            ('missing_retry', ['005930'], ['000660']),
+            ('unknown_symbol', ['005930'], [*frozen_scope, '999999']),
+            ('empty_risk_debt', [], frozen_scope),
+            ('missing_admission', None, frozen_scope),
+        ):
+            with self.subTest(label=label):
+                metadata = latest_eod_run['run_metadata']
+                metadata['downstream_retry_symbols'] = generic_debt
+                if exact_debt is None:
+                    metadata.pop('followup_admission_scope_outcome')
+                else:
+                    metadata['followup_admission_scope_outcome'] = (
+                        build_exact_symbol_scope_outcome(
+                            manifest_version=(
+                                'auto_eod_followup_admission_scope_outcomes_v1'
+                            ),
+                            selected_symbols=frozen_scope,
+                            successful_symbols=[
+                                symbol for symbol in frozen_scope
+                                if symbol not in exact_debt
+                            ],
+                            retry_debt_symbols=exact_debt,
+                        )
+                    )
+                with (
+                    patch(
+                        'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                        'get_latest_run_for_context',
+                        return_value=latest_pipeline_run,
+                    ),
+                    patch(
+                        'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                        'count_runs',
+                        return_value=0,
+                    ),
+                    patch.object(
+                        service, '_resolve_point_in_time_followup_membership',
+                        return_value=(set(frozen_scope), ('KOSPI',)),
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                        return_value={'status': 'partial', 'pipeline_run_id': 95},
+                    ) as retry_market_risk,
+                ):
+                    result = service._resume_auto_daily_followups_if_due(
+                        market_date='2026-04-03',
+                        latest_available_trade_date='2026-04-03',
+                        latest_eod_run=latest_eod_run,
+                        markets=('KOSPI',),
+                        point_in_time_recovery=True,
+                    )
+                if label == 'exact_only':
+                    retry_market_risk.assert_called_once()
+                    self.assertEqual(
+                        retry_market_risk.call_args.kwargs['symbols'],
+                        ['005930'],
+                    )
+                else:
+                    retry_market_risk.assert_not_called()
+                    self.assertEqual(
+                        result['followup_recovery']['blocker'],
+                        'market_risk_admission_partition_mismatch',
+                    )
 
     def test_narrow_recovery_requires_verified_stage_debt_even_with_matching_membership(
         self,

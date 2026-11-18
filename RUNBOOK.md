@@ -382,6 +382,34 @@ run, rather than reranking the universe after summaries finish. A validated
 reply recovered from the original request marker needs no new model call.
 Ordinary authorization failures and malformed replies remain failures.
 
+### Daily agent stalls after an external-storage move
+
+Separate durable state from executable and temporary-file placement. On this
+macOS host, external-storage file opens and the bundled Codex executable stalled
+during the November 18 recovery; Gateway health alone did not prove inference
+worked. Keep `OPENCLAW_STATE_DIR` on its physical, mounted directory: the bounded
+contract/session readers intentionally reject a symlinked state root.
+
+Use the macOS default local `TMPDIR` for disposable Gateway files. If the native
+Codex executable stalls, select an identical internal copy with the supported
+`OPENCLAW_CODEX_APP_SERVER_BIN` service environment setting, provided
+`appServer.command` is unset. Preserve the package version, hash, executable mode
+and all security attributes; do not clear quarantine or weaken permissions.
+Keep agent homes, databases, credentials and completed feedback in place.
+
+After the idle maintenance gate above, validate the selected binary's bounded
+`--version` and agent-context initialization, then require a valid summary
+receipt persisted by Core. Check the effective environment in both the running
+Gateway and its LaunchAgent. A foreground recovery does not establish managed
+startup: restore and verify the LaunchAgent separately once work is idle, and
+restore the normal `EOD_AUTO_PYKRX_ENABLED` setting before restarting Core.
+
+An interrupted summary can expand the general downstream retry scope beyond
+market-risk debt. Compare that general scope with the validated admission
+partition; retry only the partition's exact market-risk failures and preserve
+other unfinished stages. Never remove debt or widen model scope to clear a
+`market_risk_admission_partition_mismatch` block.
+
 For frozen decider scopes, completion uses the exact source-bound role assignments
 and their union as the admitted decision cohort. Summary symbols assigned to
 neither decider are not failures or entry-economics exclusions. Preserve the
