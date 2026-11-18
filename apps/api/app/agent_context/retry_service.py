@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -3248,6 +3248,7 @@ class AgentFeedbackRetryService:
         symbols: Sequence[str],
         required_parent_run_id: str | None = None,
         knowledge_cutoff_at: datetime | str | None = None,
+        source_run_session: Any | None = None,
     ) -> _SameDayTerminalSymbols:
         completed_by_role: dict[str, set[str]] = defaultdict(set)
         failed_by_role: dict[str, set[str]] = defaultdict(set)
@@ -3276,7 +3277,10 @@ class AgentFeedbackRetryService:
             if str(symbol or '').strip()
         }
 
-        with session_scope() as session:
+        with (
+            nullcontext(source_run_session)
+            if source_run_session is not None else session_scope()
+        ) as session:
             persisted_feedback_rows = session.execute(
                 select(
                     AgentContextFeedback.id,

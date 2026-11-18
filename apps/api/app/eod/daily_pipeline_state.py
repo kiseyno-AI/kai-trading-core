@@ -58,6 +58,7 @@ from app.repositories.eod_run_repository import (
     daily_price_bar_has_current_eod_run_provenance,
     eod_collection_admission_advisory_lock_keys,
     eod_collection_advisory_lock_keys,
+    eod_collection_advisory_lock_is_held,
 )
 
 
@@ -471,6 +472,293 @@ def _resolve_terminal_summary_knowledge_cutoff(
     )
 
 
+PREOPEN_SUMMARY_CONTINUATION_KEY = 'preopen_summary_continuation'
+_PREOPEN_PARENT_CONTRACT_ERROR = (
+    'required feedback reuse parent does not match the requested cutoff, '
+    'policy context, fs_div, or exact scope contract'
+)
+
+
+def _preopen_continuation_target_session(market_date: date, now: datetime) -> date:
+    from app.market.clock import get_market_state
+    from app.market.session import next_krx_trading_date
+
+    target = next_krx_trading_date(market_date, allow_fallback=False)
+    market = get_market_state(now=now)
+    if not (
+        target is not None
+        and market.state == 'OPEN'
+        and market.is_open is True
+        and market.current_calendar_date == target.isoformat()
+    ):
+        raise ValueError('preopen continuation requires its exact target OPEN session')
+    return target
+
+
+def _preopen_summary_continuation_evidence(
+    *, session: Any, market_date: date, now: datetime,
+    source_pipeline_run_id: int, summary_proof: Mapping[str, Any],
+    metadata: Mapping[str, Any], trigger: str,
+) -> dict[str, Any]:
+    """Validate persisted authority under the native date admission transaction.
+
+    No caller-supplied boolean can create authority. This internal opt-in is
+    intentionally absent from scheduler and HTTP request interfaces.
+    """
+    from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
+    from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
+    from app.agent_context.signal_decider_snapshot_validity import (
+        KRX_TIME_ZONE,
+        decision_snapshot_target_open_at_utc,
+    )
+    from app.eod.market_membership import market_membership_sha256
+
+    def require(condition: Any, reason: str) -> None:
+        if not condition:
+            raise ValueError('preopen continuation: ' + reason)
+
+    def aware(value: Any) -> datetime | None:
+        try:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed.astimezone(timezone.utc) if parsed.utcoffset() is not None else None
+
+    suffix = ['signal_decider', 'next_open_execution_plan']
+    require(type(source_pipeline_run_id) is int and source_pipeline_run_id > 0,
+            'positive source pipeline ID required')
+    require(eod_collection_advisory_lock_is_held(
+        market='KRX', trade_date=market_date, source='daily_price_bars'),
+        'actual owned EOD fence required')
+    require(trigger == 'auto_eod_followup_resume'
+            and metadata.get('entrypoint') == PROVIDER_FENCED_RECOVERY_ENTRYPOINT
+            and metadata.get('requested_stages') == suffix
+            and metadata.get('resolved_stages') == suffix
+            and metadata.get('resume_from_stage') == suffix[0]
+            and metadata.get('point_in_time_recovery') is True
+            and metadata.get('force') is False
+            and metadata.get('reuse_existing_feedback') is True
+            and metadata.get('bypass_prerequisite_gate') is False
+            and metadata.get('allow_expired_analysis_replay') is False,
+            'exact unforced automatic PITR suffix required')
+    target = _preopen_continuation_target_session(market_date, now)
+    target_open = decision_snapshot_target_open_at_utc(target)
+    source = session.execute(select(DailyPipelineRun).where(
+        DailyPipelineRun.id == source_pipeline_run_id).with_for_update()).scalar_one_or_none()
+    require(source is not None, 'native source run missing')
+    old = dict(source.run_metadata or {})
+    require(source.market_date == market_date
+            and source.trigger == trigger and source.status == 'failed'
+            and source.current_stage == 'agent_feedback_summaries'
+            and source.error_message == _PREOPEN_PARENT_CONTRACT_ERROR
+            and old.get('entrypoint') == PROVIDER_FENCED_RECOVERY_ENTRYPOINT
+            and old.get('requested_stages') == list(TERMINAL_CONTINUATION_STAGE_ORDER)
+            and old.get('resolved_stages') == list(TERMINAL_CONTINUATION_STAGE_ORDER)
+            and old.get('resume_from_stage') == 'agent_feedback_summaries'
+            and old.get('previous_session_preopen_recovery_admitted') is True
+            and old.get('inherited_feedback_prerequisite_admission') is True,
+            'source lacks the original native PREOPEN admission/failure')
+    source_started, source_completed = aware(source.started_at), aware(source.completed_at)
+    require(source_started is not None and source_completed is not None
+            and source_started.astimezone(KRX_TIME_ZONE).date() == target
+            and source_started < source_completed < target_open,
+            'source did not fail during target PREOPEN')
+    for field in ('force', 'reuse_existing_feedback', 'point_in_time_recovery',
+                  'bypass_prerequisite_gate', 'allow_expired_analysis_replay',
+                  'fs_div', 'reused_eod_collection_run_id', 'symbols'):
+        require(field in old and old[field] == metadata.get(field)
+                and (type(metadata.get(field)) is not bool or old[field] is metadata[field]),
+                'source contract mismatch: ' + field)
+    stages = list(session.scalars(select(DailyPipelineStageRun).where(
+        DailyPipelineStageRun.pipeline_run_id == source.id).with_for_update()))
+    require(len(stages) == 1 and stages[0].stage_id == 'agent_feedback_summaries'
+            and stages[0].status == 'failed'
+            and stages[0].error_message == source.error_message
+            and not stages[0].processed and not stages[0].succeeded
+            and not stages[0].failed and not stages[0].source_run_ids,
+            'source already produced work or has unknown stage history')
+    eod_id = old.get('reused_eod_collection_run_id')
+    require(type(eod_id) is int and eod_id > 0, 'source EOD identity missing')
+    eod = session.execute(select(EODCollectionRun).where(
+        EODCollectionRun.id == eod_id).with_for_update()).scalar_one_or_none()
+    require(eod is not None and eod.market == 'KRX' and eod.source == 'pykrx'
+            and eod.trade_date == market_date and eod.status == 'completed'
+            and eod.symbols_total > 0 and not eod.symbols_failed
+            and eod.symbols_total == eod.symbols_succeeded
+            and aware(eod.completed_at) is not None
+            and aware(eod.completed_at) <= source_started,
+            'source EOD proof is incomplete')
+    parent_id = old.get('inherited_feedback_source_run_id')
+    summary_id = summary_proof.get('source_run_id')
+    require(isinstance(parent_id, str) and parent_id
+            and isinstance(summary_id, str) and summary_id and parent_id != summary_id,
+            'exact original parent and completed retry required')
+    feedback = list(session.scalars(select(AgentContextFeedbackRun).where(
+        AgentContextFeedbackRun.run_id.in_([parent_id, summary_id]))
+        .order_by(AgentContextFeedbackRun.id).with_for_update()))
+    by_id = {row.run_id: row for row in feedback}
+    require(parent_id in by_id and summary_id in by_id, 'feedback lineage missing')
+    parent, summary = by_id[parent_id], by_id[summary_id]
+    request, retry = dict(parent.request_payload or {}), dict(summary.request_payload or {})
+    require(parent.market_date == summary.market_date == market_date
+            and parent.id < summary.id and summary.status == 'completed'
+            and not summary.failed_count
+            and (summary.summary_payload or {}).get('resumed_from_run_id') == parent_id
+            and retry.get('resumed_from_run_id') == parent_id,
+            'completed retry is not the original parent continuation')
+    parent_started, parent_completed = aware(parent.started_at), aware(parent.completed_at)
+    require(parent_started is not None and parent_completed is not None
+            and parent_started <= parent_completed <= source_started,
+            'original feedback parent did not exist before native admission')
+    summary_started, summary_completed = aware(summary.started_at), aware(summary.completed_at)
+    require(summary_started is not None and summary_completed is not None
+            and source_completed <= summary_started < target_open
+            and summary_started <= summary_completed <= now,
+            'summary started late, is incomplete, or has future timestamps')
+    required_fields = (
+        'market_date', 'policy_context_as_of_date', 'requested_symbols', 'symbols',
+        'roles', 'role_symbol_scopes', 'admission_scope_by_role',
+        'prepared_decider_role_symbol_scopes', 'fs_div', 'knowledge_cutoff_at',
+        'admission_knowledge_cutoff_at', 'requested_knowledge_cutoff_at',
+        'point_in_time_recovery', 'reuse_existing', 'force_recompute',
+        'feedback_scope_mode', 'mode',
+    )
+    require(all(k in request and k in retry and request[k] == retry[k]
+                for k in required_fields), 'frozen summary request changed')
+    require(all(isinstance(request.get(field), list) for field in
+                ('requested_symbols', 'symbols', 'roles'))
+            and all(isinstance(role, str) for role in request['roles']),
+            'summary membership or role proof missing')
+    requested = normalize_symbol_codes(request.get('requested_symbols'))
+    selected = sorted(normalize_symbol_codes(request.get('symbols')))
+    cutoff = aware(request.get('knowledge_cutoff_at'))
+    require(requested and requested == request['requested_symbols'] == metadata.get('symbols')
+            and selected and len(selected) == len(request['symbols'])
+            and set(selected).issubset(requested)
+            and request['market_date'] == request['policy_context_as_of_date'] == market_date.isoformat()
+            and request['point_in_time_recovery'] is False
+            and request['reuse_existing'] is True and request['force_recompute'] is False
+            and request['mode'] == DAILY_RETRY_CYCLE_MODE
+            and request['feedback_scope_mode'] == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
+            and request['fs_div'] == metadata.get('fs_div')
+            and set(request['roles']) == set(SUMMARIZER_AGENT_NAMES)
+            and isinstance(request['role_symbol_scopes'], dict)
+            and set(request['role_symbol_scopes']) == set(SUMMARIZER_AGENT_NAMES)
+            and all(isinstance(scope, list) and sorted(scope) == selected
+                    for scope in request['role_symbol_scopes'].values())
+            and request['admission_scope_by_role'] == {r: requested for r in SUMMARIZER_AGENT_NAMES}
+            and summary.completed_count == len(selected) * len(SUMMARIZER_AGENT_NAMES)
+            and cutoff is not None and cutoff < source_started
+            and aware(old.get('inherited_feedback_knowledge_cutoff_at')) == cutoff
+            and aware(summary_proof.get('knowledge_cutoff_at')) == cutoff
+            and summary_proof.get('requested_symbols') == requested
+            and summary_proof.get('expected_completed_symbols') == selected
+            and summary_proof.get('feedback_scope_mode') == request['feedback_scope_mode']
+            and summary_proof.get('fs_div') == request['fs_div'],
+            'summary scope, policy, cutoff, or completion proof mismatch')
+    persisted = set(session.scalars(select(Symbol.symbol).join(
+        DailyPriceBar, DailyPriceBar.symbol_id == Symbol.id).where(
+            Symbol.symbol.in_(requested), DailyPriceBar.trade_date == market_date,
+            DailyPriceBar.close_price > 0,
+            daily_price_bar_has_current_eod_run_provenance(eod_id),
+        )))
+    require(persisted == set(requested), 'source EOD does not cover the frozen membership')
+    # Runtime batches and exact failed-key repairs belong to the pinned
+    # summary, rather than superseding it. Validate their frozen context,
+    # then let the native latest-child/own-receipt rules prove all role keys.
+    from app.agent_context.retry_service import (
+        CHILD_RUN_LINEAGE_SCHEMA_VERSION,
+        agent_feedback_retry_service,
+    )
+    require(all(payload.get('child_run_lineage') == {
+        'schema_version': CHILD_RUN_LINEAGE_SCHEMA_VERSION,
+        'parent_run_id': run_id, 'child_link_field': 'parent_run_id',
+    } for payload, run_id in ((request, parent_id), (retry, summary_id))),
+        'native parent child-lineage contract missing')
+
+    def owned_summary_child(row: AgentContextFeedbackRun) -> bool:
+        payload = row.request_payload or {}
+        child_roles = payload.get('roles')
+        scopes = payload.get('role_symbol_scopes')
+        if not (
+            isinstance(child_roles, list) and child_roles
+            and all(isinstance(role, str) for role in child_roles)
+            and len(child_roles) == len(set(child_roles))
+            and set(child_roles).issubset(SUMMARIZER_AGENT_NAMES)
+            and isinstance(scopes, dict) and set(scopes) == set(child_roles)
+            and all(isinstance(scope, list) and scope
+                    and all(isinstance(symbol, str) for symbol in scope)
+                    and len(scope) == len(set(scope))
+                    and set(scope).issubset(selected) for scope in scopes.values())
+        ):
+            return False
+        child_symbols = sorted(set().union(*(set(scope) for scope in scopes.values())))
+        child_started = aware(row.started_at)
+        child_completed = aware(row.completed_at)
+        represented = [payload]
+        echoed_request = (row.summary_payload or {}).get('request')
+        if isinstance(echoed_request, dict):
+            represented.append(echoed_request)
+        return bool(child_started is not None and child_completed is not None
+            and row.status in {'completed', 'completed_with_failures', 'partial', 'failed', 'abandoned'}
+            and summary_started <= child_started <= child_completed <= summary_completed
+            and all(p.get('parent_run_id') == summary_id
+                and p.get('request_run_id') == row.run_id
+                and p.get('mode') == 'role_sequential_runtime_buffered'
+                and p.get('market_date') == market_date.isoformat()
+                and p.get('policy_context_as_of_date') == request['policy_context_as_of_date']
+                and p.get('fs_div') == request['fs_div']
+                and p.get('point_in_time_recovery') is request['point_in_time_recovery']
+                and p.get('feedback_scope_mode') == request['feedback_scope_mode']
+                and aware(p.get('knowledge_cutoff_at')) == cutoff
+                and p.get('roles') == child_roles and p.get('role_symbol_scopes') == scopes
+                and isinstance(p.get('symbols'), list) and sorted(p['symbols']) == child_symbols
+                and isinstance(p.get('requested_symbols'), list)
+                and sorted(p['requested_symbols']) == child_symbols
+                for p in represented))
+
+    newer = list(session.scalars(select(AgentContextFeedbackRun).where(
+        AgentContextFeedbackRun.market_date == market_date,
+        AgentContextFeedbackRun.id > summary.id).with_for_update()))
+    require(all(owned_summary_child(row) for row in newer),
+            'newer feedback cohort supersedes this summary')
+    receipts = agent_feedback_retry_service._load_same_day_terminal_symbols(
+        market_date=market_date, roles=SUMMARIZER_AGENT_NAMES, symbols=selected,
+        required_parent_run_id=summary_id, knowledge_cutoff_at=cutoff,
+        source_run_session=session,
+    )
+    require(all(receipts.completed_by_role.get(role, set()) == set(selected)
+                and not receipts.failed_by_role.get(role, set())
+                for role in SUMMARIZER_AGENT_NAMES),
+            'latest native summary child receipts are incomplete')
+    resolved = _resolve_terminal_summary_knowledge_cutoff(
+        market_date=market_date, source_run_id=summary_id,
+        feedback_scope_mode=request['feedback_scope_mode'], requested_symbols=requested,
+        fs_div=request['fs_div'], source_run_session=session,
+    )
+    require(resolved.get('ready') is True
+            and resolved.get('source_run_id') == summary_id
+            and aware(resolved.get('knowledge_cutoff_at')) == cutoff
+            and resolved.get('requested_symbols') == selected
+            and isinstance(resolved.get('completed_scope_proof'), dict),
+            'native completed summary receipt proof unavailable')
+    return {
+        'schema_version': 'preopen_summary_continuation_v1',
+        'source_pipeline_run_id': source.id, 'source_eod_collection_run_id': eod_id,
+        'source_feedback_run_id': parent_id, 'summary_feedback_run_id': summary_id,
+        'market_date': market_date.isoformat(), 'target_trade_date': target.isoformat(),
+        'knowledge_cutoff_at': cutoff.isoformat(), 'claimed_at': now.isoformat(),
+        'fs_div': request['fs_div'], 'policy_context_as_of_date': request['policy_context_as_of_date'],
+        'source_admitted_at': source_started.isoformat(),
+        'summary_started_at': summary_started.isoformat(),
+        'summary_completed_at': summary_completed.isoformat(),
+        'requested_symbol_count': len(requested),
+        'requested_membership_sha256': market_membership_sha256(requested),
+        'completed_symbol_count': len(selected),
+        'completed_membership_sha256': market_membership_sha256(selected),
+    }
+
+
 def _build_counts(
     *,
     processed: Any = None,
@@ -769,6 +1057,8 @@ class DailyPipelineRunStateService:
         resolved_stages: Sequence[str],
         run_metadata: Mapping[str, Any] | None = None,
         provider_admission_fence_owned: bool = False,
+        preopen_continuation_source_pipeline_run_id: int | None = None,
+        preopen_continuation_summary_proof: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = _utcnow()
         normalized_market_date = _normalize_market_date(market_date)
@@ -786,6 +1076,10 @@ class DailyPipelineRunStateService:
             'resolved_stages': list(resolved_stages),
             **dict(run_metadata or {}),
         }
+        if PREOPEN_SUMMARY_CONTINUATION_KEY in metadata:
+            raise ValueError('preopen continuation evidence is native-only')
+        if preopen_continuation_summary_proof is not None and preopen_continuation_source_pipeline_run_id is None:
+            raise ValueError('preopen continuation proof requires an explicit source ID')
         with session_scope() as session:
             # Serialize admission for every entry point. HTTP clients can time
             # out while the worker thread continues, so limiting this guard to
@@ -806,6 +1100,80 @@ class DailyPipelineRunStateService:
                     'trade_key': int(normalized_market_date.strftime('%Y%m%d')),
                 },
             )
+            if preopen_continuation_source_pipeline_run_id is not None:
+                if not (
+                    type(preopen_continuation_source_pipeline_run_id) is int
+                    and preopen_continuation_source_pipeline_run_id > 0
+                    and provider_admission_fence_owned is True
+                    and isinstance(preopen_continuation_summary_proof, Mapping)
+                    and eod_collection_advisory_lock_is_held(
+                        market='KRX', trade_date=normalized_market_date,
+                        source='daily_price_bars',
+                    )
+                ):
+                    raise ValueError('preopen continuation requires actual owned EOD fence and summary proof')
+                from app.agent_context.retry_service import (
+                    _feedback_retry_admission_lock_key,
+                )
+                # EOD -> pipeline-date -> feedback admission -> row locks.
+                # The native retry claim holds only the latter two; it never
+                # waits for an EOD/pipeline fence inside its transaction.
+                # Acquire before any feedback rows, so a writer cannot insert
+                # a superseding cohort between validation and this claim.
+                session.execute(
+                    text('SELECT pg_advisory_xact_lock(:lock_key)'),
+                    {'lock_key': _feedback_retry_admission_lock_key(
+                        market_date=normalized_market_date,
+                        roles=(), symbols=None,
+                    )},
+                )
+                # Deduplicate before checking newer feedback: an already claimed
+                # child may itself have produced that feedback. Returning it
+                # never grants another execution or changes its history.
+                previous_claims = [
+                    row for row in session.scalars(
+                        select(DailyPipelineRun).where(
+                            DailyPipelineRun.market_date == normalized_market_date
+                        ).with_for_update()
+                    )
+                    if isinstance((row.run_metadata or {}).get(PREOPEN_SUMMARY_CONTINUATION_KEY), dict)
+                    and row.run_metadata[PREOPEN_SUMMARY_CONTINUATION_KEY].get(
+                        'source_pipeline_run_id'
+                    ) == preopen_continuation_source_pipeline_run_id
+                ]
+                if len(previous_claims) > 1:
+                    raise ValueError('preopen continuation has ambiguous prior claims')
+                if previous_claims:
+                    prior = previous_claims[0]
+                    audit = prior.run_metadata[PREOPEN_SUMMARY_CONTINUATION_KEY]
+                    if not (
+                        audit.get('schema_version') == 'preopen_summary_continuation_v1'
+                        and audit.get('summary_feedback_run_id')
+                        == preopen_continuation_summary_proof.get('source_run_id')
+                        and audit.get('knowledge_cutoff_at')
+                        == _iso(_parse_utc_datetime(
+                            preopen_continuation_summary_proof.get('knowledge_cutoff_at')
+                        ))
+                    ):
+                        raise ValueError('preopen continuation prior claim proof mismatch')
+                    stage_rows = list(session.scalars(select(DailyPipelineStageRun).where(
+                        DailyPipelineStageRun.pipeline_run_id == prior.id
+                    )))
+                    payload = self._serialize_run(prior, stage_rows)
+                    payload.update(
+                        deduplicated=True,
+                        deduplication_reason='preopen_continuation_already_claimed',
+                    )
+                    return payload
+                evidence = _preopen_summary_continuation_evidence(
+                    session=session, market_date=normalized_market_date, now=now,
+                    source_pipeline_run_id=preopen_continuation_source_pipeline_run_id,
+                    summary_proof=preopen_continuation_summary_proof,
+                    metadata=metadata, trigger=trigger,
+                )
+                metadata[PREOPEN_SUMMARY_CONTINUATION_KEY] = evidence
+                metadata['same_day_intraday_watch_continuation_admitted'] = True
+                metadata['previous_session_preopen_recovery_admitted'] = False
             active_rows = list(
                 session.execute(
                     select(DailyPipelineRun)
