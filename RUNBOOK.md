@@ -379,6 +379,12 @@ run, rather than reranking the universe after summaries finish. A validated
 reply recovered from the original request marker needs no new model call.
 Ordinary authorization failures and malformed replies remain failures.
 
+For frozen decider scopes, completion uses the exact source-bound role assignments
+and their union as the admitted decision cohort. Summary symbols assigned to
+neither decider are not failures or entry-economics exclusions. Preserve the
+validated `source_summary_scope` in the native result when reconciling completion;
+do not reconstruct it from later funnel diagnostics or rerun successful models.
+
 ## Runtime write-path schema drift diagnostics
 
 When an EOD, DART, signal-decider, or execution write path fails, debug in this order:

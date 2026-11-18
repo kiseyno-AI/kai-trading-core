@@ -10038,6 +10038,40 @@ class DailyPipelineStageService:
             return None
         expected_role_symbol_scopes: dict[str, list[str]] = {}
         expected_symbols = set(normalized_expected_symbols)
+        frozen_role_scopes = None
+        if 'source_summary_scope' in result:
+            source_scope = result['source_summary_scope']
+            if not (
+                isinstance(source_scope, Mapping)
+                and set(source_scope) == {
+                    'source_summary_run_id', 'knowledge_cutoff_at', 'provenance',
+                    'prepared_symbols', 'prepared_decider_role_symbol_scopes',
+                }
+                and source_scope.get('source_summary_run_id') == cutoff_source_run_id
+                and source_scope.get('knowledge_cutoff_at') == normalized_cutoff_at.isoformat()
+                and source_scope.get('prepared_symbols') == normalized_expected_symbols
+                and source_scope.get('provenance') in (
+                    'frozen_decider_role_scopes_v1', 'legacy_prepared_summary_scope',
+                )
+                and isinstance(source_scope.get('prepared_decider_role_symbol_scopes'), Mapping)
+                and set(source_scope['prepared_decider_role_symbol_scopes']) == set(DECISION_SUPPORT_AGENT_NAMES)
+            ):
+                return None
+            source_roles = source_scope['prepared_decider_role_symbol_scopes']
+            for role in DECISION_SUPPORT_AGENT_NAMES:
+                scope = source_roles[role]
+                if not (
+                    isinstance(scope, list)
+                    and normalize_symbol_codes(scope) == scope
+                    and set(scope) <= expected_symbols
+                    and (
+                        source_scope['provenance'] != 'legacy_prepared_summary_scope'
+                        or scope == normalized_expected_symbols
+                    )
+                ):
+                    return None
+            if source_scope['provenance'] == 'frozen_decider_role_scopes_v1':
+                frozen_role_scopes = source_roles
         diagnostics = (progress_summary.get('funnel_diagnostics') or {}).get('role_diagnostics') or {}
         economically_excluded: set[str] = set()
         for role in DECISION_SUPPORT_AGENT_NAMES:
@@ -10051,6 +10085,10 @@ class DailyPipelineStageService:
             ):
                 return None
             expected_role_symbol_scopes[role] = normalized_role_scope
+            if frozen_role_scopes is not None:
+                if normalized_role_scope != frozen_role_scopes[role]:
+                    return None
+                continue
             missing_from_role = expected_symbols.difference(normalized_role_scope)
             if not missing_from_role:
                 continue
@@ -10070,8 +10108,10 @@ class DailyPipelineStageService:
             economically_excluded.update(economics & missing_from_role)
         dispatched_symbols = set().union(*expected_role_symbol_scopes.values())
         omitted_symbols = expected_symbols - dispatched_symbols
-        if not omitted_symbols <= economically_excluded:
+        if frozen_role_scopes is None and not omitted_symbols <= economically_excluded:
             return None
+        # Frozen assignments, not a later ranking of the summary intersection, admit decisions.
+        admitted_symbols = sorted(dispatched_symbols) if frozen_role_scopes is not None else list(normalized_expected_symbols)
 
         resolution = resolve_terminal_independent_role_success(
             progress_summary=progress_summary,
@@ -10175,7 +10215,7 @@ class DailyPipelineStageService:
             'source_run_id': str(result.get('run_id') or '').strip(),
             'source_summary_run_id': cutoff_source_run_id,
             'knowledge_cutoff_at': normalized_cutoff_at.isoformat(),
-            'admitted_symbols': list(normalized_expected_symbols),
+            'admitted_symbols': admitted_symbols,
             'completed_symbols': list(completed_symbols),
             'completed_symbols_by_role': {
                 role: list(completed_symbols_by_role[role])
@@ -10191,10 +10231,10 @@ class DailyPipelineStageService:
             'total_items': resolution['total_items'],
             'completed_items': resolution['completed_items'],
             'failed_items': resolution['failed_items'],
-            **({'entry_economics_excluded_symbols': sorted(omitted_symbols)} if omitted_symbols else {}),
+            **({'entry_economics_excluded_symbols': sorted(omitted_symbols)} if omitted_symbols and frozen_role_scopes is None else {}),
             **(
                 {'role_symbol_scopes': {role: sorted(scope) for role, scope in expected_role_symbol_scopes.items()}}
-                if any(set(scope) != set(normalized_expected_symbols) for scope in expected_role_symbol_scopes.values())
+                if any(set(scope) != set(admitted_symbols) for scope in expected_role_symbol_scopes.values())
                 else {}
             ),
         }

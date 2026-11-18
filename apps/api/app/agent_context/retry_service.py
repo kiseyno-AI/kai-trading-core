@@ -7180,6 +7180,10 @@ class AgentFeedbackRetryService:
                 if normalized_scope_authority is not None
                 else None
             ),
+            **(
+                {'source_summary_scope': dict(source_summary_scope)}
+                if source_summary_scope is not None else {}
+            ),
             'requested_symbols': list(requested_symbols) if requested_symbols is not None else None,
             'role_symbol_scopes': (
                 {
