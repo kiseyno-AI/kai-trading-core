@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from datetime import date
 from unittest.mock import AsyncMock, patch
 
@@ -40,6 +41,13 @@ class FakeKISRiskClient:
         if symbol in self.errors:
             raise self.errors[symbol]
         return self.responses[symbol]
+
+
+def _snapshot_receipts(collection):
+    return [
+        {**item, 'captured_at': f"{collection['market_date']}T21:00:00+09:00"}
+        for item in collection['items']
+    ]
 
 
 class MarketRiskEvaluatorTests(unittest.TestCase):
@@ -217,6 +225,8 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
                 'collect_for_market_date',
                 new=AsyncMock(return_value=snapshot_collection),
             ) as collect_snapshots,
+            patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots',
+                  return_value=_snapshot_receipts(snapshot_collection)),
             patch(
                 'app.signals.market_risk_filter.upsert_daily_market_risk_filter_results',
                 side_effect=ValueError('batch contains malformed row'),
@@ -314,6 +324,8 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(snapshot_service, 'collect_for_market_date', new=AsyncMock(return_value=collection)),
+            patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots',
+                  return_value=_snapshot_receipts(collection)),
             patch(
                 'app.signals.market_risk_filter.load_symbols_without_recent_trading',
                 return_value=['000300'],
@@ -338,6 +350,8 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(snapshot_service, 'collect_for_market_date', new=AsyncMock(return_value=collection)),
+            patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots',
+                  return_value=_snapshot_receipts(collection)),
             patch(
                 'app.signals.market_risk_filter.load_symbols_without_recent_trading',
                 side_effect=RuntimeError('db hiccup'),
@@ -349,6 +363,41 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result['results_failed'], 0)
         self.assertTrue(all(item['passed_filter'] for item in result['items']))
+
+    async def test_mismatched_snapshot_receipt_keeps_valid_sibling_and_real_debt(self) -> None:
+        service, snapshot_service, collection = self._service_with(['000300', '005930'])
+        for case in ('missing', 'wrong_eod', 'wrong_date', 'wrong_symbol', 'wrong_source',
+                     'changed_raw', 'changed_halt', 'missing_capture'):
+            with self.subTest(case=case):
+                receipts = deepcopy(_snapshot_receipts(collection))
+                bad = receipts[0]
+                if case == 'missing':
+                    receipts.pop(0)
+                elif case == 'wrong_eod':
+                    bad['eod_run_id'] = 999
+                elif case == 'wrong_date':
+                    bad['market_date'] = '2026-11-05'
+                elif case == 'wrong_symbol':
+                    bad['symbol'] = '999999'
+                elif case == 'wrong_source':
+                    bad['source'] = 'other_provider'
+                elif case == 'changed_raw':
+                    bad['snapshot_payload']['raw']['vi_cls_code'] = 'Y'
+                elif case == 'changed_halt':
+                    bad['is_trade_halted'] = True
+                else:
+                    bad['captured_at'] = None
+                with (
+                    patch.object(snapshot_service, 'collect_for_market_date', new=AsyncMock(return_value=collection)),
+                    patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots', return_value=receipts),
+                    patch('app.signals.market_risk_filter.load_symbols_without_recent_trading', return_value=[]),
+                    patch('app.signals.market_risk_filter.upsert_daily_market_risk_filter_results'),
+                ):
+                    result = await service.rebuild_for_market_date(market_date='2026-11-06')
+                self.assertEqual(result['successful_stock_codes'], ['005930'])
+                self.assertEqual(result['retry_debt_stock_codes'], ['000300'])
+                self.assertEqual(result['results_failed'], 1)
+                self.assertIn('persisted_market_risk_snapshot_receipt_mismatch', result['failed_symbol_errors'][0]['error'])
 
     async def test_exact_scope_preserves_causally_skipped_symbols_as_retry_debt(
         self,
@@ -388,6 +437,8 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
                 'collect_for_market_date',
                 new=AsyncMock(return_value=snapshot_collection),
             ),
+            patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots',
+                  return_value=_snapshot_receipts(snapshot_collection)),
             patch(
                 'app.signals.market_risk_filter.'
                 'replace_daily_market_risk_filter_results_exact_scope',
@@ -454,6 +505,8 @@ class DailyMarketRiskFilterServiceTests(unittest.IsolatedAsyncioTestCase):
                 'collect_for_market_date',
                 new=AsyncMock(return_value=snapshot_collection),
             ),
+            patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots',
+                  return_value=_snapshot_receipts(snapshot_collection)),
             patch(
                 'app.signals.market_risk_filter.'
                 'upsert_daily_market_risk_filter_results'
@@ -637,6 +690,10 @@ class MarketRiskFilterPersistenceIntegrationTests(unittest.IsolatedAsyncioTestCa
         self.assertTrue(stored_filters)
         self.assertEqual(stored_snapshots[0]['eod_run_id'], self.run_id)
         self.assertEqual(stored_filters[0]['eod_run_id'], self.run_id)
+        self.assertEqual(
+            stored_filters[0]['filter_payload']['snapshot_captured_at'],
+            stored_snapshots[0]['captured_at'],
+        )
         self.assertEqual(
             stored_filters[0]['filter_payload']['watchlist_reasons'],
             ['market_warning_01', 'investment_caution'],

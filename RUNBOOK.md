@@ -164,6 +164,20 @@ returns the remaining active target and separate historical classification
 evidence. The scheduler includes that evidence in its existing `last_result`;
 the raw selector still exposes the unchanged old debt after restart.
 
+Risk filters bind `snapshot_captured_at` to the verified persisted snapshot
+receipt, including exact-scope retries. A missing or changed receipt is real
+symbol debt; a cached row from another date, EOD or source cannot replace it.
+For known v1 records whose capture-reference key is literally null, the opt-in
+admission read may reproduce the entire snapshot and filter payload, every risk
+field and every reason using the stored raw snapshot plus dated price history.
+It revalidates dormancy under the current native lookback policy as of the
+explicit source date, recording the current N, complete stored-date window,
+price-bar IDs/ownership/volumes, input hash and verification time. This is not a
+claim about the original unrecorded N. Original payloads, capture timestamps,
+statuses and errors remain unchanged. Missing or malformed references, unknown
+versions/evidence, inconsistent replay, incomplete/foreign/future price inputs
+and a snapshot newer than its filter remain blocking; no provider call is made.
+
 Exhausted automatic retries are never completion evidence. Before returning
 `NO_DEBT`, this opt-in read independently validates the current source's native
 summary, decider and plan completion receipts, matching child run/date/cutoff/

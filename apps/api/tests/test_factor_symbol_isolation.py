@@ -1085,6 +1085,9 @@ class FilterSymbolComputationIsolationTests(unittest.IsolatedAsyncioTestCase):
                 'collect_for_market_date',
                 new=AsyncMock(return_value=snapshot_collection),
             ),
+            patch('app.signals.market_risk_filter.load_daily_market_risk_snapshots',
+                  return_value=[{**item, 'captured_at': '2026-10-30T21:00:00+09:00'}
+                                for item in snapshot_collection['items']]),
             patch(
                 'app.signals.market_risk_filter.'
                 'build_market_risk_filter_result_from_snapshot',
