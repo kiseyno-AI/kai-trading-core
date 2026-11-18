@@ -9354,6 +9354,8 @@ class PykrxBackfillServiceTests(TestCase):
         latest_eod_run['run_metadata'][
             'downstream_retry_resume_from_stage'
         ] = 'market_risk_filter'
+        # Restart reconciliation also retains unrelated downstream debt.
+        latest_eod_run['run_metadata']['downstream_retry_symbols'] = frozen_scope
         latest_eod_run['run_metadata'][
             'followup_admission_scope_outcome'
         ] = build_exact_symbol_scope_outcome(
@@ -9366,6 +9368,14 @@ class PykrxBackfillServiceTests(TestCase):
             ],
             retry_debt_symbols=['005930'],
         )
+        recovered_market_risk = {
+            'status': 'completed',
+            'market_date': '2026-04-03',
+            **_atomic_exact_scope_proof(
+                manifest_version='market_risk_filter_scope_outcomes_v1',
+                selected_symbols=frozen_scope,
+            ),
+        }
         with (
             patch(
                 'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
@@ -9379,8 +9389,33 @@ class PykrxBackfillServiceTests(TestCase):
             ),
             patch(
                 'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
-                return_value={'status': 'partial', 'pipeline_run_id': 94},
+                return_value={
+                    'status': 'completed',
+                    'pipeline_run_id': 94,
+                    'stages': {
+                        'market_risk_filter': {
+                            'status': 'completed',
+                            'result': recovered_market_risk,
+                        },
+                    },
+                },
             ) as retry_market_risk,
+            patch(
+                'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                'converge_terminal_stages_run',
+                return_value={'updated': True},
+            ),
+            patch(
+                'app.eod.pykrx_backfill.count_eod_run_persisted_symbols',
+                return_value=len(frozen_scope),
+            ),
+            patch(
+                'app.eod.pykrx_backfill.load_eod_run_persisted_symbols',
+                return_value=frozen_scope,
+            ),
+            patch(
+                'app.eod.pykrx_backfill.complete_eod_collection_run',
+            ) as complete_eod_run,
         ):
             service._resume_auto_daily_followups_if_due(
                 market_date='2026-04-03',
@@ -9390,12 +9425,14 @@ class PykrxBackfillServiceTests(TestCase):
                 point_in_time_recovery=True,
             )
 
+        retry_market_risk.assert_called_once()
         market_risk_call = retry_market_risk.call_args.kwargs
         self.assertEqual(
             market_risk_call['resume_from_stage'],
             'market_risk_filter',
         )
         self.assertEqual(market_risk_call['symbols'], ['005930'])
+        self.assertEqual(market_risk_call['stages'], ['market_risk_filter'])
         self.assertEqual(
             market_risk_call['exact_membership_symbols'],
             frozen_scope,
@@ -9415,6 +9452,337 @@ class PykrxBackfillServiceTests(TestCase):
             market_risk_recovery_scope['retry_debt_stock_codes'],
             ['005930'],
         )
+        persisted = complete_eod_run.call_args.kwargs['run_metadata']
+        self.assertEqual(
+            persisted['downstream_retry_symbols'],
+            ['000660', '472220'],
+        )
+        self.assertEqual(persisted['downstream_retry_symbols_count'], 2)
+        self.assertTrue(persisted['followup_recovery_required'])
+
+        for label, exact_debt, generic_debt in (
+            ('exact_only', ['005930'], ['005930']),
+            ('missing_retry', ['005930'], ['000660']),
+            ('unknown_symbol', ['005930'], [*frozen_scope, '999999']),
+            ('empty_risk_debt', [], frozen_scope),
+            ('missing_admission', None, frozen_scope),
+        ):
+            with self.subTest(label=label):
+                metadata = latest_eod_run['run_metadata']
+                metadata['downstream_retry_symbols'] = generic_debt
+                if exact_debt is None:
+                    metadata.pop('followup_admission_scope_outcome')
+                else:
+                    metadata['followup_admission_scope_outcome'] = (
+                        build_exact_symbol_scope_outcome(
+                            manifest_version=(
+                                'auto_eod_followup_admission_scope_outcomes_v1'
+                            ),
+                            selected_symbols=frozen_scope,
+                            successful_symbols=[
+                                symbol for symbol in frozen_scope
+                                if symbol not in exact_debt
+                            ],
+                            retry_debt_symbols=exact_debt,
+                        )
+                    )
+                with (
+                    patch(
+                        'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                        'get_latest_run_for_context',
+                        return_value=latest_pipeline_run,
+                    ),
+                    patch(
+                        'app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                        'count_runs',
+                        return_value=0,
+                    ),
+                    patch.object(
+                        service, '_resolve_point_in_time_followup_membership',
+                        return_value=(set(frozen_scope), ('KOSPI',)),
+                    ),
+                    patch(
+                        'app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                        return_value={'status': 'partial', 'pipeline_run_id': 95},
+                    ) as retry_market_risk,
+                ):
+                    result = service._resume_auto_daily_followups_if_due(
+                        market_date='2026-04-03',
+                        latest_available_trade_date='2026-04-03',
+                        latest_eod_run=latest_eod_run,
+                        markets=('KOSPI',),
+                        point_in_time_recovery=True,
+                    )
+                if label == 'exact_only':
+                    retry_market_risk.assert_called_once()
+                    self.assertEqual(
+                        retry_market_risk.call_args.kwargs['symbols'],
+                        ['005930'],
+                    )
+                else:
+                    retry_market_risk.assert_not_called()
+                    self.assertEqual(
+                        result['followup_recovery']['blocker'],
+                        'market_risk_admission_partition_mismatch',
+                    )
+
+    def test_market_risk_recovery_converges_after_full_suffix_publication(self) -> None:
+        for pending_sibling in (False, True):
+            with self.subTest(pending_sibling=pending_sibling):
+                self._assert_market_risk_recovery_across_polls(pending_sibling)
+
+    def test_market_risk_recovery_reconciles_crash_before_ancestor_persistence(self) -> None:
+        self._assert_market_risk_recovery_across_polls(
+            False, crash_before_ancestor_persistence=True,
+        )
+
+    def _assert_market_risk_recovery_across_polls(
+        self, pending_sibling: bool, *, crash_before_ancestor_persistence: bool = False,
+    ) -> None:
+        from app.eod.daily_pipeline_stages import DailyPipelineStageService
+        from app.eod.pykrx_backfill import (
+            _proven_followup_recovery_symbols,
+            _recovered_followup_admission_scope_outcome,
+        )
+        from tests.test_daily_pipeline_stages import _FakePipelineRunStateService
+
+        service = PykrxBackfillService()
+        scope = ['000660', '005930', '035420']
+        risk_debt = ['035420']
+        stage_ids = ['market_risk_filter', 'piotroski_filter']
+        eod_run = {
+            'id': 8, 'trade_date': '2026-04-03',
+            'status': 'completed_with_errors',
+            'symbols_total': 3, 'symbols_succeeded': 3, 'symbols_failed': 0,
+            'run_metadata': {
+                'markets': ['KOSPI'], 'requested_symbols': scope,
+                'downstream_retry_symbols': scope,
+                'downstream_retry_resume_from_stage': 'market_risk_filter',
+                'universe_snapshot': {
+                    **_stored_daily_universe_snapshot([
+                        PykrxSymbol(symbol, 'KOSPI', symbol) for symbol in scope
+                    ]),
+                    'point_in_time': True, 'current_universe_mutated': False,
+                },
+                'followup_admission_scope_outcome': build_exact_symbol_scope_outcome(
+                    manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+                    selected_symbols=scope, successful_symbols=scope[:2],
+                    retry_debt_symbols=risk_debt,
+                ),
+                'stage_progress': {
+                    'fundamentals_daily_refresh': {
+                        'status': 'completed',
+                        'result': {
+                            'status': 'completed', 'market_date': '2026-04-03',
+                            **build_exact_symbol_scope_outcome(
+                                manifest_version='dart_fundamentals_scope_outcomes_v1',
+                                selected_symbols=scope, successful_symbols=scope,
+                                retry_debt_symbols=[],
+                            ),
+                        },
+                    },
+                },
+            },
+        }
+        latest = {
+            'id': 92, 'market_date': '2026-04-03',
+            'status': 'partial', 'trigger': 'auto_close_scheduler',
+            'run_metadata': {'resolved_stages': stage_ids, 'eod_collection_run_id': 8},
+            'stages': {stage_id: {'status': 'partial'} for stage_id in stage_ids},
+        }
+        state = _FakePipelineRunStateService()
+        executor = DailyPipelineStageService(run_state_service=state)
+        original_eod = deepcopy(eod_run)
+        publications = []
+        risk_publication = None
+
+        def publish(stage_id, **kwargs):
+            symbols = list(kwargs['symbols'])
+            publications.append((stage_id, symbols))
+            retry = scope[:1] if (
+                pending_sibling and stage_id == 'piotroski_filter' and symbols == scope
+            ) else []
+            return {
+                'status': 'partial' if retry else 'completed', 'market_date': '2026-04-03',
+                **_atomic_exact_scope_proof(
+                    manifest_version=(
+                        'market_risk_filter_scope_outcomes_v1'
+                        if stage_id == 'market_risk_filter'
+                        else 'piotroski_scope_outcomes_v1'
+                    ),
+                    stage_id=stage_id, selected_symbols=symbols,
+                    successful_symbols=[symbol for symbol in symbols if symbol not in retry],
+                    retry_debt_symbols=retry,
+                ),
+            }
+
+        def execute(**kwargs):
+            nonlocal latest, risk_publication
+            result = executor.run(**kwargs)
+            latest = {
+                **result['pipeline_run'], 'stages': result['stages'],
+                'updated_at': '2026-04-03T08:00:00+00:00',
+                'run_metadata': {
+                    **state.runs[-1]['run_metadata'],
+                    **result['pipeline_run'].get('run_metadata', {}),
+                    'requested_stages': result['requested_stages'],
+                    'resolved_stages': result['resolved_stages'],
+                },
+            }
+            if 'market_risk_filter' in result['stages']:
+                risk_publication = deepcopy(latest)
+            return {**result, 'pipeline_run': latest}
+
+        def persist(_run_id, **kwargs):
+            if crash_before_ancestor_persistence and complete.call_count == 1:
+                raise RuntimeError('simulated ancestor persistence crash')
+            eod_run['run_metadata'] = deepcopy(kwargs['run_metadata'])
+            eod_run['status'] = kwargs['status']
+
+        def persist_progress(_run_id, **kwargs):
+            eod_run['run_metadata'] = deepcopy(kwargs['run_metadata'])
+
+        with (
+            patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                  'get_latest_run_for_context', side_effect=lambda **_: latest),
+            patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                  'count_runs', return_value=0),
+            patch('app.eod.pykrx_backfill.daily_pipeline_run_state_service.'
+                  'converge_terminal_stages_run', return_value={'updated': True}),
+            patch('app.eod.pykrx_backfill.count_eod_run_persisted_symbols', return_value=3),
+            patch('app.eod.pykrx_backfill.load_eod_run_persisted_symbols', return_value=scope),
+            patch('app.eod.pykrx_backfill.complete_eod_collection_run', side_effect=persist) as complete,
+            patch('app.eod.pykrx_backfill.update_eod_collection_run_progress', side_effect=persist_progress),
+            patch('app.eod.daily_pipeline_stages.get_market_state', return_value=MarketState(
+                market='KRX', state='PREOPEN', is_trading_day=True, is_open=False,
+                server_time='2026-04-06T08:30:00+09:00',
+                session_open_at='2026-04-06T09:00:00+09:00',
+                session_close_at='2026-04-06T15:30:00+09:00',
+            )),
+            patch('app.eod.pykrx_pipeline_runner.previous_krx_trading_date',
+                  return_value=date(2026, 4, 3)),
+            patch.object(executor, '_required_provider_blocked_stage_result', return_value=None),
+            patch.object(executor, '_execute_stage', side_effect=publish),
+            patch('app.eod.daily_pipeline_stages.daily_pipeline_stage_service.run',
+                  side_effect=execute),
+        ):
+            for poll in range(2):
+                if crash_before_ancestor_persistence and poll == 0:
+                    with self.assertRaisesRegex(RuntimeError, 'simulated ancestor persistence crash'):
+                        service._resume_auto_daily_followups_if_due(
+                            market_date='2026-04-03', latest_available_trade_date='2026-04-03',
+                            latest_eod_run=eod_run, markets=('KOSPI',), point_in_time_recovery=True,
+                        )
+                    self.assertEqual(eod_run['run_metadata']['downstream_retry_symbols'], scope)
+                    continue
+                result = service._resume_auto_daily_followups_if_due(
+                    market_date='2026-04-03', latest_available_trade_date='2026-04-03',
+                    latest_eod_run=eod_run, markets=('KOSPI',), point_in_time_recovery=True,
+                )
+                self.assertNotEqual(
+                    (result or {}).get('followup_recovery', {}).get('status'),
+                    'blocked',
+                    result,
+                )
+            self.assertEqual(
+                eod_run['run_metadata']['followup_admission_scope_outcome'][
+                    'successful_stock_codes'
+                ],
+                scope,
+            )
+            proof_run = risk_publication
+            for field, value in (
+                ('market_date', '2026-04-02'),
+                ('reused_eod_collection_run_id', 9),
+                ('exact_membership_sha256', '0' * 64),
+                ('symbols', scope[:1]),
+                ('publication_date', '2026-04-02'),
+            ):
+                with self.subTest(forged=field):
+                    forged = deepcopy(proof_run)
+                    if field == 'market_date':
+                        forged[field] = value
+                    elif field == 'publication_date':
+                        forged['stages']['market_risk_filter']['result'][
+                            'scope_finalization'
+                        ]['market_date'] = value
+                    else:
+                        forged['run_metadata'][field] = value
+                    self.assertIsNone(_recovered_followup_admission_scope_outcome(
+                        latest_eod_run=original_eod, market_date='2026-04-03',
+                        pipeline_run=forged,
+                    ))
+            self.assertEqual(_proven_followup_recovery_symbols(
+                stages={'market_risk_filter': proof_run['stages']['market_risk_filter']},
+                stage_ids=stage_ids, symbols=scope, market_date='2026-04-03',
+                market_risk_admission=original_eod['run_metadata'][
+                    'followup_admission_scope_outcome'
+                ],
+            ), [])
+            failed_again = {
+                'status': 'partial', 'result': {
+                    'status': 'partial', 'market_date': '2026-04-03',
+                    **_atomic_exact_scope_proof(
+                        manifest_version='market_risk_filter_scope_outcomes_v1',
+                        selected_symbols=[scope[0], scope[2]],
+                        successful_symbols=scope[2:], retry_debt_symbols=scope[:1],
+                    ),
+                },
+            }
+            self.assertEqual(_proven_followup_recovery_symbols(
+                stages={**proof_run['stages'], 'market_risk_filter': failed_again},
+                stage_ids=stage_ids, symbols=scope, market_date='2026-04-03',
+                market_risk_admission=original_eod['run_metadata'][
+                    'followup_admission_scope_outcome'
+                ],
+            ), scope[1:])
+
+            partial_eod = deepcopy(original_eod)
+            partial_eod['run_metadata']['followup_admission_scope_outcome'] = (
+                build_exact_symbol_scope_outcome(
+                    manifest_version='auto_eod_followup_admission_scope_outcomes_v1',
+                    selected_symbols=scope, successful_symbols=scope[:1],
+                    retry_debt_symbols=scope[1:],
+                )
+            )
+            partial = deepcopy(proof_run)
+            partial['status'] = 'partial'
+            partial['run_metadata']['symbols'] = scope[1:]
+            partial['stages']['market_risk_filter'] = {
+                'status': 'partial', 'result': {
+                    'status': 'partial', 'market_date': '2026-04-03',
+                    **_atomic_exact_scope_proof(
+                        manifest_version='market_risk_filter_scope_outcomes_v1',
+                        selected_symbols=scope[1:], successful_symbols=scope[1:2],
+                        retry_debt_symbols=scope[2:],
+                    ),
+                },
+            }
+            admitted = _recovered_followup_admission_scope_outcome(
+                latest_eod_run=partial_eod, market_date='2026-04-03',
+                pipeline_run=partial,
+            )
+            self.assertEqual(admitted['successful_stock_codes'], scope[:2])
+            self.assertEqual(admitted['retry_debt_stock_codes'], scope[2:])
+            before = complete.call_count
+            self.assertEqual(service._persist_successful_followup_recovery(
+                latest_eod_run=partial_eod,
+                recovery_result={'status': 'partial', 'pipeline_run': partial},
+            ), {'updated': False, 'reason': 'recovery_not_completed'})
+            self.assertEqual(complete.call_count, before)
+            self.assertEqual(partial_eod['run_metadata']['downstream_retry_symbols'], scope)
+        self.assertEqual(publications, [
+            ('market_risk_filter', risk_debt), ('piotroski_filter', scope),
+            *([('piotroski_filter', scope[:1])] if pending_sibling else []),
+        ])
+        if pending_sibling:
+            self.assertNotIn(
+                'piotroski_filter',
+                eod_run['run_metadata']['followup_stage_debt']['pending_by_stage'],
+            )
+            self.assertEqual(eod_run['run_metadata']['downstream_retry_symbols'], scope)
+        else:
+            self.assertEqual(eod_run['run_metadata']['downstream_retry_symbols'], [])
 
     def test_narrow_recovery_requires_verified_stage_debt_even_with_matching_membership(
         self,
