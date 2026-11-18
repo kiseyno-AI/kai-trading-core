@@ -130,6 +130,37 @@ def test_native_partial_summary_binding_uses_completed_intersection(monkeypatch)
     ) is None
 
 
+def test_native_narrow_retry_cannot_shrink_frozen_completion_authority(monkeypatch):
+    from tests.test_feedback_summary_scope import CUTOFF, DAY, ROLE_SCOPES, _summary
+
+    source = _summary()
+    symbols = sorted(source['request_payload']['symbols'])
+    selected = {role: scope[:1] for role, scope in ROLE_SCOPES.items()}
+    outcome, cutoff = _terminal_decider_outcome_with_role_failures(
+        symbols=symbols, role_scopes=selected, failed_symbols_by_role={},
+        cutoff_at=CUTOFF, source_summary_run_id=source['run_id'],
+    )
+    monkeypatch.setattr(
+        retry_service.agent_context_feedback_run_state_service,
+        'get_run', Mock(return_value=source),
+    )
+    config, binding = retry_service._bind_source_summary_scope(FeedbackRetryCycleConfig(
+        market_date=DAY, roles=DECISION_SUPPORT_AGENT_NAMES, symbols=tuple(symbols),
+        role_symbol_scopes=selected, knowledge_cutoff_at=CUTOFF,
+        source_summary_run_id=source['run_id'], scope_authority=outcome['result']['scope_authority'],
+    ))
+    outcome['result']['source_summary_scope'] = binding
+
+    assert DailyPipelineStageService._terminal_decider_progression_proof(
+        outcome, expected_decider_symbols=symbols, feedback_cutoff_resolution=cutoff,
+    ) is None
+    assert config.symbols == tuple(symbols)
+    assert config.scope_authority == outcome['result']['scope_authority']
+    assert config.role_symbol_scopes == selected
+    assert binding['prepared_symbols'] == symbols
+    assert binding['prepared_decider_role_symbol_scopes'] == ROLE_SCOPES
+
+
 @pytest.mark.parametrize('mutation', [
     'wrong_source', 'wrong_cutoff', 'naive_cutoff', 'wrong_prepared', 'swapped_roles',
     'narrowed_role', 'extra_symbol', 'unknown_role', 'unknown_field', 'unknown_provenance',

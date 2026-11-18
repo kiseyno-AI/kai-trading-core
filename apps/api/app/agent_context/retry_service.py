@@ -3088,7 +3088,7 @@ def _bind_source_summary_scope(config: FeedbackRetryCycleConfig) -> tuple[Feedba
     requested = set(config.symbols) if config.symbols is not None else set(prepared_symbols)
     selected = {role: [symbol for symbol in symbols if symbol in requested] for role, symbols in selected.items()}
     bound_role_scopes = {
-        role: selected.get(role, [symbol for symbol in frozen[role] if symbol in requested])
+        role: [symbol for symbol in frozen[role] if symbol in requested]
         for role in DECISION_SUPPORT_AGENT_NAMES
     }
     active_symbols = _ordered_symbol_union(list(selected.values()))
