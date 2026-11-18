@@ -13,7 +13,7 @@ Automatic `/eod/pykrx/daily/run-if-due` runs publish official daily pipeline run
 
 The same payload also reports the default-selected filtering, factor/scoring, external-news, macro-context, agent-feedback, signal-decider, and signal-decider-evaluation stages. Persisted `daily_signal_features`, `external_news_items` classification state, `macro_context_observations`, `agent_context_feedback`, and `signal_decider_decision_snapshots` rows can mark omitted same-day stages completed/available so a resumed single-stage run does not make earlier persisted outputs look pending.
 
-When `market_date` is omitted, the route selects the actual latest persisted official daily run and uses that run's market date for the full pipeline view. It falls back to the current Seoul calendar date only when no official run exists. An explicit `market_date` always wins; the route does not guess a previous trading day from the exchange calendar.
+When `market_date` is omitted, the route selects the newest persisted market date, then its latest official daily run by start time and durable id. A later recovery of an older session cannot replace the newer session in the full pipeline view. It falls back to the current Seoul calendar date only when no official run exists. An explicit `market_date` always wins; the route does not guess a previous trading day from the exchange calendar.
 
 The response now also includes `market` and `market_session` blocks. `market` is the current exchange-clock state, and `market_session` describes the semantics of the requested `market_date`, including the latest valid trading date and whether live quote or intraday data is expected for that date.
 

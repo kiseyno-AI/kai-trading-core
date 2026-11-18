@@ -100,7 +100,7 @@ It freezes the behavior currently shipped on `main` so future web work, core ref
 ### Scope
 
 - This route is operator-facing and live-progress-oriented.
-- When `market_date` is omitted, the route selects the actual latest persisted official daily run by `started_at` and durable id, then uses that run's market date for all fallback and coverage reads.
+- When `market_date` is omitted, the route selects the newest persisted market date first, then the latest official daily run on that date by `started_at` and durable id. A later recovery of an older session cannot hide a newer session. That selected date applies to all fallback and coverage reads.
 - When no official daily run exists, the route falls back to the current Seoul calendar date from `market_state.server_time[:10]`. An explicit `market_date` always wins.
 - For an explicit current KRX trading date before its official/PyKRX run exists, a mixed view containing only `completed`, `skipped`, and `pending` stages remains `pending` when at least one stage is pending. It is not a failed or partial run because the scheduled run has not started yet. Historical dates keep the normal mixed-state `partial` semantics.
 - `fs_div` defaults to the configured DART fundamentals default and is normalized to uppercase.
