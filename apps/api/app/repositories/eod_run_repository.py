@@ -31,6 +31,7 @@ from app.db_models import (
     EODCollectionRun,
     Symbol,
 )
+from app.eod.agent_chain_gates import empty_agent_scope_followup
 from app.eod.daily_pipeline_outcomes import (
     ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS,
     daily_pipeline_outcome_is_satisfied,
@@ -3351,6 +3352,47 @@ def _current_source_terminal_authority_is_ready(
         for row in stages.values()
     ):
         return False
+    empty_stage_rows = {
+        stage_id: stages.get(stage_id)
+        for stage_id in ('signal_decider', 'next_open_execution_plan')
+    }
+    summary_rows = session.execute(select(DailyPipelineStageRun, DailyPipelineRun)
+        .join(DailyPipelineRun, DailyPipelineRun.id == DailyPipelineStageRun.pipeline_run_id)
+        .where(DailyPipelineStageRun.market_date == current.trade_date,
+               DailyPipelineStageRun.stage_id == 'agent_feedback_summaries')
+        .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())).all()
+    empty_stage_rows['agent_feedback_summaries'] = next((
+        row for row, owner in summary_rows
+        if owner.status in {'completed', 'partial'}
+        and _pipeline_run_links_to_eod(owner, current)
+    ), None)
+    definitive_empty = True
+    for row in empty_stage_rows.values():
+        details = row.details if row is not None and isinstance(row.details, Mapping) else {}
+        result_summary = details.get('result_summary')
+        source_run_ids = row.source_run_ids if row is not None and isinstance(row.source_run_ids, Mapping) else {}
+        definitive_empty = bool(
+            definitive_empty
+            and row is not None
+            and row.status == 'skipped'
+            and row.completed_at is not None
+            and row.error_message is None
+            and all(getattr(row, key) == 0 for key in (
+                'processed', 'total', 'succeeded', 'failed', 'remaining',
+            ))
+            and 'completion_scope_proof' not in details
+            and set(source_run_ids) <= {'eod_run_id'}
+            and source_run_ids.get('eod_run_id', current.id) == current.id
+            and isinstance(result_summary, Mapping)
+            and empty_agent_scope_followup(
+                result_summary, market_date=current.trade_date.isoformat(),
+            ) == result_summary
+        )
+    if definitive_empty:
+        return session.execute(select(AgentContextFeedbackRun.id).where(
+            AgentContextFeedbackRun.market_date == current.trade_date,
+            AgentContextFeedbackRun.status.in_(['running', 'queued', 'pending']),
+        ).limit(1)).first() is None
     proofs = {}
     for stage_id in ('signal_decider', 'next_open_execution_plan'):
         row = stages.get(stage_id)
@@ -3409,11 +3451,6 @@ def _current_source_terminal_authority_is_ready(
             return False
         feedback[stage_id] = child
     summary_child = feedback['agent_feedback_summaries']
-    summary_rows = session.execute(select(DailyPipelineStageRun, DailyPipelineRun)
-        .join(DailyPipelineRun, DailyPipelineRun.id == DailyPipelineStageRun.pipeline_run_id)
-        .where(DailyPipelineStageRun.market_date == current.trade_date,
-               DailyPipelineStageRun.stage_id == 'agent_feedback_summaries',
-               DailyPipelineStageRun.status == 'completed')).all()
     summary_proof = None
     for row, owner in summary_rows:
         summary_source = summary_cutoff_proof_from_stage(_pipeline_stage_outcome(row))
@@ -3423,6 +3460,7 @@ def _current_source_terminal_authority_is_ready(
         if ((owner.status == 'completed' or owner.id == pipeline.id)
             and owner.market_date == current.trade_date
             and _pipeline_run_links_to_eod(owner, current)
+            and row.status == 'completed'
             and row.failed == row.remaining == 0 and row.completed_at is not None
             and proof is not None and proof['source_run_id'] == summary_child.run_id
             and summary_source is not None and summary_source['source_run_id'] == summary_child.run_id

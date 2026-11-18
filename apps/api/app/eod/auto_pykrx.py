@@ -339,6 +339,7 @@ class AutoPykrxEODScheduler:
                 source_run = await asyncio.to_thread(
                     load_latest_eod_collection_run, market='KRX',
                     trade_date=source_date.isoformat(), source='pykrx',
+                    automatic_only=True,
                 ) if source_date is not None else None
                 admission = await asyncio.to_thread(
                     load_active_auto_eod_recovery_admission,

@@ -299,6 +299,131 @@ def _install_synthetic_future_completion(admission_db, *, zero_plan_kind=None):
             'downstream_recovery_completed_at': '2026-11-18T00:31:00+00:00'}
 
 
+def _install_native_definitive_empty_completion(admission_db, *, scheduled):
+    from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+    _install_synthetic_future_completion(admission_db)
+    empty_result = {
+        'triggered': False,
+        'status': 'skipped',
+        'reason': 'no_agent_feedback_eligible_symbols',
+        'entry_economics_scope_empty': True,
+        'market_date': '2026-11-17',
+    }
+    completed_at = datetime(2026, 11, 18, 0, 30)
+    with admission_db.factory.begin() as session:
+        current = session.get(EODCollectionRun, 598)
+        metadata = deepcopy(current.run_metadata)
+        pipeline = session.get(DailyPipelineRun, 1901)
+        if scheduled:
+            metadata.pop('downstream_recovery_pipeline_run_id')
+            metadata.pop('downstream_recovery_completed_at')
+            metadata['daily_pipeline_run_id'] = 1901
+            expected = metadata['expected_daily_pipeline_stages']
+            pipeline.trigger = 'auto_close_scheduler'
+            pipeline.run_metadata = {
+                'eod_collection_run_id': 598,
+                'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
+                'requested_stages': expected,
+                'resolved_stages': expected,
+            }
+            summary_row = session.execute(select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.pipeline_run_id == 1900,
+            )).scalar_one()
+            summary_row.pipeline_run_id = 1901
+            for stage in set(expected) - set(repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX):
+                session.add(DailyPipelineStageRun(
+                    pipeline_run_id=1901, market_date=date(2026, 11, 17),
+                    stage_id=stage, status='completed', completed_at=completed_at,
+                ))
+        for stage in repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX:
+            row = session.execute(select(DailyPipelineStageRun).where(
+                DailyPipelineStageRun.stage_id == stage,
+                DailyPipelineStageRun.pipeline_run_id == (
+                    1900 if stage == 'agent_feedback_summaries' and not scheduled else 1901
+                ),
+            )).scalar_one()
+            row.status = 'skipped'
+            row.processed = row.total = row.succeeded = row.failed = row.remaining = 0
+            row.completed_at = completed_at
+            row.error_message = None
+            if scheduled:
+                row.source_run_ids = {'eod_run_id': 598}
+                row.details = {
+                    'mode': 'auto_eod_pipeline_tracking',
+                    'progress_source': 'auto_eod_stage_progress',
+                    'terminal_count_authority': 'result',
+                    'result_summary': deepcopy(empty_result),
+                }
+            else:
+                row.source_run_ids = {}
+                row.details = DailyPipelineStageService._build_stage_run_details(
+                    stage_id=stage,
+                    result=deepcopy(empty_result),
+                    invocation_symbols=[],
+                    market_date='2026-11-17',
+                )
+        session.execute(delete(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.market_date == date(2026, 11, 17),
+        ))
+        current.run_metadata = metadata
+
+
+@pytest.mark.parametrize('scheduled', [False, True])
+def test_native_definitive_empty_agent_chain_proves_current_readiness(admission_db, scheduled):
+    _install_native_definitive_empty_completion(admission_db, scheduled=scheduled)
+
+    result = _read()
+
+    assert result.target is None
+    assert result.current_source_terminal_ready is True
+
+
+@pytest.mark.parametrize('case', [
+    'missing_stage', 'wrong_status', 'nonzero_count', 'wrong_reason',
+    'false_empty_flag', 'wrong_market_date', 'extra_claim', 'wrong_source_run',
+    'active_child',
+])
+def test_native_definitive_empty_agent_chain_remains_fail_closed(admission_db, case):
+    _install_native_definitive_empty_completion(admission_db, scheduled=False)
+    with admission_db.factory.begin() as session:
+        row = session.execute(select(DailyPipelineStageRun).where(
+            DailyPipelineStageRun.pipeline_run_id == 1901,
+            DailyPipelineStageRun.stage_id == 'signal_decider',
+        )).scalar_one()
+        if case == 'active_child':
+            session.add(AgentContextFeedbackRun(
+                run_id='active-empty-chain-child', market_date=date(2026, 11, 17),
+                status='running', symbols_total=0, completed_count=0, failed_count=0,
+                started_at=datetime(2026, 11, 18, 0, 31), request_payload={},
+            ))
+        elif case == 'missing_stage':
+            session.delete(row)
+        elif case == 'wrong_status':
+            row.status = 'completed'
+        elif case == 'nonzero_count':
+            row.total = row.remaining = 1
+        elif case == 'wrong_source_run':
+            row.source_run_ids = {'eod_run_id': 596}
+        else:
+            details = deepcopy(row.details)
+            summary = details['result_summary']
+            if case == 'wrong_reason':
+                summary['reason'] = 'no_candidates'
+            elif case == 'false_empty_flag':
+                summary['entry_economics_scope_empty'] = False
+            elif case == 'wrong_market_date':
+                summary['market_date'] = '2026-11-16'
+            else:
+                summary['grants_trading_authority'] = True
+            row.details = details
+
+    result = _read()
+
+    assert result.target is not None
+    assert result.current_source_terminal_ready is False
+
+
 def test_split_native_completion_proofs_can_prove_future_current_readiness(admission_db):
     _install_synthetic_future_completion(admission_db)
     result = _read()
@@ -605,6 +730,14 @@ def test_current_target_and_superseded_current_source_still_block(admission_db):
 def test_live_scheduler_uses_classification_only_with_opt_in(admission_db, enabled, current_pending):
     if not current_pending:
         _install_synthetic_future_completion(admission_db)
+    with admission_db.factory.begin() as session:
+        session.add(EODCollectionRun(
+            id=599, market='KRX', source='pykrx', trade_date=date(2026, 11, 17),
+            trigger='manual_api', status='completed', symbols_total=0,
+            symbols_succeeded=0, symbols_failed=0, run_metadata={'mode': 'manual'},
+            started_at=datetime(2026, 11, 18, 0, 45),
+            completed_at=datetime(2026, 11, 18, 0, 46),
+        ))
     scheduler = auto_pykrx.AutoPykrxEODScheduler()
     with (
         patch.object(auto_pykrx.settings, 'eod_auto_pykrx_expired_current_only_admission_enabled', enabled),
@@ -622,7 +755,10 @@ def test_live_scheduler_uses_classification_only_with_opt_in(admission_db, enabl
     assert scheduler.state.active_task is False
     dispatch.assert_not_called()
     if enabled:
-        source.assert_called_once_with(market='KRX', trade_date='2026-11-17', source='pykrx')
+        source.assert_called_once_with(
+            market='KRX', trade_date='2026-11-17', source='pykrx',
+            automatic_only=True,
+        )
         calendar.assert_called_once_with(date(2026, 11, 18), allow_fallback=False)
         assert classifier.call_args.kwargs['source_eod_run_id'] == 598
         assert classifier.call_args.kwargs['target_trade_date'] == '2026-11-18'

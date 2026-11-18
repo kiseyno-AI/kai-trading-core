@@ -178,6 +178,11 @@ scheduling path; the policy never creates a retry target or resets a cap.
 Completed decider identities with zero executable plans, zero WAITs, or only
 blocked/low-confidence candidates remain a normal completed outcome when the
 native plan proof confirms that exhaustive result; no positive plan count is required.
+When entry-economics filtering proves the agent scope definitively empty, the
+native three-stage skipped chain is also terminal without decider or plan
+publications. Admission requires the exact no-eligible-symbol reason, empty-scope
+flag, market date, zero counts, linked automatic EOD lineage, and no active child;
+missing, altered, or extra authority claims remain blocking.
 
 The scheduler's admission result feeds the background runner's existing global
 plan-refresh/Exec-handoff/Core-buy gate. All per-plan model, risk, price, quote,
