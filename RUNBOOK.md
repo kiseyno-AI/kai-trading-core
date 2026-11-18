@@ -145,6 +145,54 @@ terminal suffix carries its validated frozen parent admission membership when
 the native calendar proves its target date has already passed. The original
 feedback retry contract and model reuse settings are retained.
 
+`EOD_AUTO_PYKRX_EXPIRED_CURRENT_ONLY_ADMISSION_ENABLED` defaults to `false` and
+requires product approval before enablement. When enabled, only the live
+PREOPEN/OPEN recovery admission read may classify a closed historical model
+opportunity and its exact `inquire-price-2` timeout scope outside the current
+session. The original failures, retry symbols, run statuses and raw recovery
+selector remain unchanged. This is a current-session admission policy, not a
+historical repair or a successful-publication claim.
+
+Classification requires the explicit current KRX target, its calendar-confirmed
+previous-session automatic EOD identity, complete stored price membership and
+mandatory data stages, and authoritative filter **and** snapshot rows for every
+historical risk-failure symbol on that same source EOD/date. Negative risk rows
+remain negative. Current source model/plan debt, current or historical price,
+factor/DART failures, unknown risk, stale/mismatched source, active work and rearm
+markers remain blocking. The native read `load_active_auto_eod_recovery_admission`
+returns the remaining active target and separate historical classification
+evidence. The scheduler includes that evidence in its existing `last_result`;
+the raw selector still exposes the unchanged old debt after restart.
+
+Exhausted automatic retries are never completion evidence. Before returning
+`NO_DEBT`, this opt-in read independently validates the current source's native
+summary, decider and plan completion receipts, matching child run/date/cutoff/
+scope, and actual plan target. It accepts a completed full daily publication or
+the native reconciliation marker referencing a completed SIG/plan suffix plus a
+separately published summary. The summary publisher may start while its child
+is running; completion proof is required only at its finish. Old primary and
+failed retry rows remain unchanged. Missing current proof keeps admission
+blocked even when the raw retry selector returns nothing. An eligible current
+PREOPEN retry or an uncollected prior session still follows its existing native
+scheduling path; the policy never creates a retry target or resets a cap.
+Completed decider identities with zero executable plans, zero WAITs, or only
+blocked/low-confidence candidates remain a normal completed outcome when the
+native plan proof confirms that exhaustive result; no positive plan count is required.
+When entry-economics filtering proves the agent scope definitively empty, the
+native three-stage skipped chain is also terminal without decider or plan
+publications. Admission requires the exact no-eligible-symbol reason, empty-scope
+flag, market date, linked automatic EOD lineage, and a completed zero-task
+feedback child with empty summarizer role scopes and stored entry-economics
+exclusion diagnostics. Scheduled input totals may retain the requested universe;
+they do not represent model work. Explicit-run compacted requests must retain
+their omission count. Missing, altered, active, or extra authority evidence
+remains blocking; no model or plan publication is invented for an empty chain.
+
+The scheduler's admission result feeds the background runner's existing global
+plan-refresh/Exec-handoff/Core-buy gate. All per-plan model, risk, price, quote,
+session, kill-switch and order-authority checks remain required. CLOSED daily
+collection and explicit stage recovery continue to use the original rules.
+
 - Core server should stay up 24/7.
 - The API startup path tries to prime the persisted `/market/snapshot` cache once. On a KRX trading day the background runner uses the half-open 08:50–15:31 KST open-drive window (through the 15:30 session row) to refresh both the KIS index and investor-flow legs every `MARKET_SNAPSHOT_OPEN_DRIVE_REFRESH_INTERVAL_SECONDS` (default 300s); FX stays on the normal configured cadence (`MARKET_SNAPSHOT_REFRESH_INTERVAL_SECONDS`, default 3600s). The 08:50 PREOPEN refresh may fetch and prepare evidence, but a prior-session flow row is not current-session proof and KRX BUY stays fail-closed until the first same-day regular-session KIS observation at or after 09:00. During OPEN, investor flow is live-authoritative only when its provider business date/session provenance matches the current KRX session and its observation age is within `MARKET_SNAPSHOT_OPEN_DRIVE_MAX_AGE_SECONDS` (default 360s). After close, an unavailable or unverified refresh cannot overwrite the last trusted same-date 15:30 flow: Core preserves it as `cached` with its original provider observation time for same-market-date EOD strategy context only; live execution remains blocked by the runtime freshness gate, and the next-day PREOPEN date mismatch cannot revive it. Process-local single-flight coalescing is backed by a durable database bucket claim so only one process starts a bucket refresh. Transaction advisory locking makes concurrent first insert safe; attempted time, each KOSPI/KOSDAQ provider observation, receipt time, and quality form a monotonic persistence fence, so a slow failure or one regressed market leg cannot overwrite newer successful evidence merely because the other leg advanced the top-level timestamp. An initial timeout stays fail-closed while the shielded single-flight task finishes; a later success clears the runner cooldown immediately, while failure/cancellation retains it. That refresh completes before open-session plan refresh or dispatch. The configured interval cannot exceed the open-drive maximum age.
 - Open/trend evidence uses the KIS intraday index-bar business date and session time as its observation timestamp; the time-series request includes prior-session rows so PREOPEN can retain the latest provider proof, while cache collection/attempt timestamps never relabel or order a prior-session row. A newly built snapshot without provider `as_of` is not persisted or served: Core preserves a valid last-good snapshot as stale, or returns controlled unavailability until the next immediately-due refresh repairs an empty/legacy null cache. The same KIS index response's `prdy_tr_pbmn` is the preferred prior-session turnover baseline. PyKRX is queried only when that field is unavailable, and only a `completed`, zero-failure EOD run with complete as-of-universe metadata, exact requested-versus-persisted symbol membership, and matching SHA-256 membership digests qualifies. A missing or timed-out fallback leaves the fresh index leg visible but disables value-expansion confirmation.
