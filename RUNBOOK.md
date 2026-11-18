@@ -447,6 +447,36 @@ node --check "$capture_module"
 )
 ```
 
+### OpenClaw 2026.10.5 configured search-provider scope
+
+The [configured search-provider patch](ops/patches/openclaw-2026.10.5-configured-search-provider-scope.patch)
+uses the same OpenClaw version/build pin as the copy workaround above. An explicit
+search provider with one unique manifest owner passes that plugin ID to fallback
+loading. This avoids loading unrelated web providers and their transitive ACP
+plugins during secret preparation. Bundled-owner precedence, origin/security
+checks, fetch discovery, ambiguous or missing owners, and autodetection retain
+their existing behavior. Provider configuration and model settings are unchanged.
+
+The original native preparation exceeded a 20-second subprocess limit while
+loading six providers for configured DuckDuckGo. The patched native preparation
+completed in 7.568 seconds, selected DuckDuckGo, and resolved 19 auth stores with
+zero warnings or degraded stores. The isolated probe blocked HTTP/fetch and did
+not activate the prepared snapshot. After restart, verify Gateway health separately.
+
+Use the stopped maintenance, backup, dry-run/apply and reverse-patch rollback
+procedures above, substituting these module/patch paths and both hashes. Use the
+backup suffix `.pre-configured-search-scope` instead of `.pre-copy-only`.
+
+| Field | Value |
+| --- | --- |
+| Module | `/opt/homebrew/lib/node_modules/openclaw/dist/runtime-web-tools-jL0u7fOn.mjs` |
+| Patch | `ops/patches/openclaw-2026.10.5-configured-search-provider-scope.patch` |
+| Baseline SHA-256 | `cab1c4539a398c028cc7ce03401ba005f76583f4d2fb4ff72296b7072e225106` |
+| Patched SHA-256 | `5c06ff85164ab057260169d0bb211fc21e7118d5fc0d438c2362ffba083ff24f` |
+
+This changes a different module from the copy workaround; hash and roll back each
+independently. Revalidate both patches after any package reinstall or upgrade.
+
 ## Runtime write-path schema drift diagnostics
 
 When an EOD, DART, signal-decider, or execution write path fails, debug in this order:
