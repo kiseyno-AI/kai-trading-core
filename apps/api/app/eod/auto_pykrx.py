@@ -17,6 +17,7 @@ from app.eod.pykrx_pipeline_support import (
 from app.market.clock import KST, async_get_market_state
 from app.market.session import async_previous_krx_trading_date
 from app.repositories.eod_run_repository import (
+    load_active_auto_eod_recovery_admission,
     load_latest_eod_collection_run,
     load_oldest_outstanding_auto_eod_recovery_target,
 )
@@ -305,6 +306,7 @@ class AutoPykrxEODScheduler:
 
         previous_session_date = None
         uncollected_previous_session = None
+        historical_classifications = ()
         try:
             recovery_window_latest_date = (
                 current_market_date
@@ -326,6 +328,34 @@ class AutoPykrxEODScheduler:
                 on_or_after=recovery_window_start_date,
                 on_or_before=current_market_date,
             )
+            if (
+                recovery_only and market.state in {'PREOPEN', 'OPEN'}
+                and recovery_target is not None
+                and settings.eod_auto_pykrx_expired_current_only_admission_enabled
+            ):
+                source_date = await async_previous_krx_trading_date(
+                    date.fromisoformat(current_market_date), allow_fallback=False,
+                )
+                source_run = await asyncio.to_thread(
+                    load_latest_eod_collection_run, market='KRX',
+                    trade_date=source_date.isoformat(), source='pykrx',
+                ) if source_date is not None else None
+                admission = await asyncio.to_thread(
+                    load_active_auto_eod_recovery_admission,
+                    on_or_after=recovery_window_start_date, on_or_before=current_market_date,
+                    allow_expired_current_only_debt=True, target_trade_date=current_market_date,
+                    source_market_date=source_date, source_eod_run_id=(source_run or {}).get('id'),
+                )
+                recovery_target = admission.target
+                historical_classifications = admission.historical_classifications
+                self._state.last_result = {
+                    'triggered': False,
+                    'reason': 'current_session_recovery_admission_inspected',
+                    'historical_debt_admission': {
+                        'classification_count': len(admission.historical_classifications),
+                        'classifications': list(admission.historical_classifications),
+                    },
+                }
             if recovery_only and market.state == 'PREOPEN':
                 previous_session_date = await async_previous_krx_trading_date(
                     date.fromisoformat(current_market_date),
@@ -390,7 +420,10 @@ class AutoPykrxEODScheduler:
             if not older_recovery_due:
                 self._clear_preflight_backoff()
                 self._state.last_status = 'idle'
-                self._state.last_reason = 'no_older_recovery_debt'
+                self._state.last_reason = (
+                    'no_active_recovery_debt' if historical_classifications
+                    else 'no_older_recovery_debt'
+                )
                 return RecoveryOnlyScheduleDisposition.NO_DEBT
             if market.state == 'PREOPEN':
                 previous_session_preopen_recovery_due = bool(

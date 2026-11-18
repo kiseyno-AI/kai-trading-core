@@ -316,6 +316,7 @@ class Settings(BaseSettings):
     eod_auto_pykrx_markets: str = 'KOSPI,KOSDAQ'
     eod_auto_pykrx_refresh_universe: bool = True
     eod_auto_pykrx_stale_run_minutes: int = 30
+    eod_auto_pykrx_expired_current_only_admission_enabled: bool = False
     eod_pykrx_request_timeout_seconds: int = 20
     eod_pykrx_enrichment_pause_seconds: float = 0.05
     eod_pykrx_enrichment_retry_count: int = 2
