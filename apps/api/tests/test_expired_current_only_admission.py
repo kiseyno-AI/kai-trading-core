@@ -5,10 +5,10 @@ import hashlib
 import json
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, delete, event, insert, select
@@ -167,6 +167,211 @@ def test_policy_defaults_off():
     assert Settings(_env_file=None).eod_auto_pykrx_expired_current_only_admission_enabled is False
 
 
+def _install_native_empty_source(admission_db, path):
+    from app.agent_context.retry_service import AgentFeedbackRetryService
+    from app.agent_context.roles import SUMMARIZER_AGENT_NAMES, DECISION_SUPPORT_AGENT_NAMES
+    from app.eod.agent_chain_gates import empty_agent_scope_followup
+    from app.eod.daily_pipeline_stages import DailyPipelineStageService
+    from app.eod import pykrx_pipeline_runner as runner
+    from tests.test_feedback_retry_cycles import RecordingRunStateService, _feedback_prerequisites
+
+    retry = AgentFeedbackRetryService()
+    feedback_state = RecordingRunStateService()
+    current_date = '2026-11-17'
+    symbols = admission_db.fixture['current']['run_metadata']['requested_symbols']
+    stage_service = DailyPipelineStageService()
+    market = SimpleNamespace(state='CLOSED', server_time=f'{current_date}T22:00:00+09:00')
+    with (
+        patch.object(retry, '_load_eligible_symbols', return_value=['000660']),
+        patch('app.agent_context.retry_service.load_agent_feedback_eligibility_records', return_value=[{
+            'symbol': '000660', 'entry_economics': {'excluded_roles': [*SUMMARIZER_AGENT_NAMES, *DECISION_SUPPORT_AGENT_NAMES]},
+        }]),
+        patch('app.agent_context.retry_service.agent_feedback_prerequisite_service.inspect_feedback_prerequisites',
+              return_value=_feedback_prerequisites()),
+        patch('app.agent_context.retry_service.agent_context_feedback_run_state_service', feedback_state),
+        patch('app.agent_context.retry_service.agent_feedback_orchestrator.dispatch_for_symbols') as model_dispatch,
+        patch('app.agent_context.retry_service.agent_feedback_retry_service', retry),
+        patch('app.eod.pykrx_pipeline_runner.get_market_state', return_value=market),
+        patch('app.eod.daily_pipeline_stages.get_market_state', return_value=market),
+        patch('app.orders.next_open_execution.normalize_next_open_target_trade_date', return_value=date(2026, 11, 18)),
+    ):
+        summary = runner._run_daily_feedback_followup(
+            market_date=current_date, enabled=True,
+            symbols=None if path == 'scheduled_unscoped' else symbols,
+            knowledge_cutoff_at=datetime(2026, 11, 17, 12, tzinfo=timezone.utc),
+        )
+        assert summary['entry_economics_scope_empty'] is True
+        assert summary['status'] == 'skipped'
+        model_dispatch.assert_not_called()
+        if path.startswith('scheduled'):
+            outputs = {'agent_feedback_summaries': summary}
+            for stage, upstream in [('signal_decider', 'agent_feedback_summaries'),
+                                    ('next_open_execution_plan', 'signal_decider')]:
+                outputs[stage] = empty_agent_scope_followup(outputs[upstream], market_date=current_date)
+            rows = {}
+            for stage, output in outputs.items():
+                counts = runner._extract_result_counts(output, stage_id=stage)
+                counts['remaining'] = counts['total'] - counts['processed']
+                rows[stage] = dict(stage_id=stage, status=runner._resolve_result_status(output, stage_id=stage),
+                    **counts, source_run_ids=runner._extract_followup_source_run_ids(stage_id=stage, result=output),
+                    details={'terminal_count_authority': 'result', 'result_summary': runner._compact_result_summary(output)})
+        else:
+            state = MagicMock()
+            rows = {}
+            state.start_run.return_value = {'id': 1901}
+            state.finish_run.return_value = {'id': 1901, 'status': 'completed'}
+            state.finish_stage.side_effect = lambda **kwargs: rows.update({kwargs['stage_id']: kwargs}) or kwargs
+            service = DailyPipelineStageService(run_state_service=state, feedback_retry_service=MagicMock())
+            service.feedback_retry_service.run_retry_cycles.return_value = summary
+            result = service.run(market_date=current_date, stages=list(repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX),
+                symbols=symbols, trigger='manual_api', reused_eod_collection_run_id=598)
+            assert result['status'] == 'completed'
+            service.feedback_retry_service.run_retry_cycles.assert_called_once()
+
+    with admission_db.factory.begin() as session:
+        completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        terminal = list(repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX)
+        session.add(DailyPipelineRun(id=1901, market_date=date(2026, 11, 17), trigger='auto_eod_followup_resume',
+            status='completed', completed_at=completed_at, run_metadata={
+                'reused_eod_collection_run_id': 598, 'resolved_stages': terminal, 'symbols': symbols,
+            }))
+        for stage, values in rows.items():
+            allowed = {column.name for column in DailyPipelineStageRun.__table__.columns}
+            values = {k: v for k, v in values.items() if k in allowed and k not in {'id', 'pipeline_run_id', 'market_date'}}
+            session.add(DailyPipelineStageRun(**values, pipeline_run_id=1901,
+                market_date=date(2026, 11, 17), completed_at=completed_at))
+        started, finished = feedback_state.started[0], feedback_state.finished[-1]
+        session.add(AgentContextFeedbackRun(run_id=summary['run_id'], market_date=date(2026, 11, 17),
+            status=finished['status'], symbols_total=started['symbols_total'],
+            completed_count=finished['completed_count'], failed_count=finished['failed_count'],
+            request_payload=started['request_payload'], completed_at=completed_at))
+        current = session.get(EODCollectionRun, 598)
+        current.run_metadata = {**current.run_metadata, 'followup_recovery_required': False,
+            'downstream_recovery_pipeline_run_id': 1901,
+            'downstream_recovery_completed_at': completed_at.replace(tzinfo=timezone.utc).isoformat()}
+
+
+@pytest.mark.parametrize('path', ['scheduled', 'scheduled_unscoped', 'stage_service'])
+def test_native_definitive_empty_chain_is_completed_current_source(admission_db, path):
+    _install_native_empty_source(admission_db, path)
+    result = _read()
+    assert result.current_source_terminal_ready is True
+    assert result.target is None
+
+
+def test_unscoped_empty_requires_native_automatic_scope_evidence(admission_db):
+    _install_native_empty_source(admission_db, 'scheduled_unscoped')
+    with admission_db.factory() as session:
+        child = session.execute(select(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.market_date == date(2026, 11, 17),
+        )).scalar_one()
+        child_id, original = child.id, deepcopy(child.request_payload)
+    for field in ('scope', 'symbols', 'admission_scope_by_role', 'broad_symbols', 'broad_symbol_count'):
+        with admission_db.factory.begin() as session:
+            child = session.get(AgentContextFeedbackRun, child_id)
+            request = deepcopy(original)
+            request.pop(field)
+            child.request_payload = request
+        result = _read()
+        assert result.current_source_terminal_ready is False, field
+        assert result.target is not None, field
+
+
+def test_missing_or_malformed_empty_evidence_never_grants_readiness(admission_db):
+    _install_native_empty_source(admission_db, 'stage_service')
+    stage_fields = ['stage_id', 'status', 'details', 'processed', 'total', 'succeeded',
+                    'failed', 'remaining', 'source_run_ids', 'completed_at', 'market_date', 'error_message']
+    child_fields = ['run_id', 'market_date', 'status', 'symbols_total', 'completed_count',
+                    'failed_count', 'request_payload']
+    with admission_db.factory() as session:
+        stages = {r.stage_id: (r.id, {k: deepcopy(getattr(r, k)) for k in stage_fields})
+                  for r in session.execute(select(DailyPipelineStageRun).where(
+                      DailyPipelineStageRun.pipeline_run_id == 1901)).scalars()}
+        child = session.execute(select(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.run_id == stages['agent_feedback_summaries'][1]['details']['result_summary']['run_id'],
+        )).scalar_one()
+        child_id, child_original = child.id, {k: deepcopy(getattr(child, k)) for k in child_fields}
+    for case in ['missing_flag', 'wrong_result_date', 'missing_stage', 'missing_child', 'live_child',
+                 'nonzero_work', 'nonempty_role_scope', 'missing_exclusions', 'unexpected_model_source',
+                 'missing_omission_proof', 'wrong_omission_count', 'malformed_diagnostics', 'input_count_mismatch',
+                 'malformed_result', 'contradictory_requested', 'malformed_omission',
+                 'extra_claim', 'wrong_source_eod', 'stage_error', 'wrong_status', 'wrong_reason',
+                 'invented_completion_proof']:
+        with admission_db.factory.begin() as session:
+            restored = {}
+            for stage, (row_id, original) in stages.items():
+                row = session.get(DailyPipelineStageRun, row_id)
+                for key, value in original.items():
+                    setattr(row, key, deepcopy(value))
+                restored[stage] = row
+            child = session.get(AgentContextFeedbackRun, child_id)
+            for key, value in child_original.items():
+                setattr(child, key, deepcopy(value))
+            summary, signal, plan = (restored[s] for s in repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX)
+            if case == 'missing_flag':
+                details = deepcopy(plan.details)
+                details['result_summary'].pop('entry_economics_scope_empty')
+                plan.details = details
+            elif case == 'wrong_result_date':
+                details = deepcopy(signal.details)
+                details['result_summary']['market_date'] = '2026-11-16'
+                signal.details = details
+            elif case == 'missing_stage':
+                plan.stage_id = 'unknown_stage'
+            elif case == 'missing_child':
+                child.run_id = 'unrelated-child'
+            elif case == 'live_child':
+                child.status = 'running'
+            elif case == 'nonzero_work':
+                child.completed_count = 1
+            elif case in {'nonempty_role_scope', 'missing_exclusions', 'malformed_diagnostics'}:
+                request = deepcopy(child.request_payload)
+                if case == 'nonempty_role_scope':
+                    request['role_symbol_scopes']['technical-summarizer'] = ['000660']
+                elif case == 'missing_exclusions':
+                    request['eligibility_diagnostics'] = {}
+                    request['funnel_diagnostics'] = {}
+                else:
+                    request['funnel_diagnostics'] = {'role_diagnostics': ['malformed']}
+                child.request_payload = request
+            elif case == 'unexpected_model_source':
+                signal.source_run_ids = {'agent_feedback_run_id': child.run_id}
+            elif case == 'wrong_source_eod':
+                signal.source_run_ids = {'eod_run_id': 596}
+            elif case == 'stage_error':
+                plan.error_message = 'unresolved provider error'
+            elif case == 'wrong_status':
+                signal.status = 'completed'
+            elif case in {'extra_claim', 'wrong_reason', 'invented_completion_proof'}:
+                details = deepcopy(signal.details)
+                if case == 'extra_claim':
+                    details['result_summary']['grants_trading_authority'] = True
+                elif case == 'wrong_reason':
+                    details['result_summary']['reason'] = 'no_candidates'
+                else:
+                    details['completion_scope_proof'] = {'invented': True}
+                signal.details = details
+            elif case in {'missing_omission_proof', 'wrong_omission_count', 'malformed_omission',
+                          'malformed_result', 'contradictory_requested'}:
+                details = deepcopy(summary.details)
+                if case == 'missing_omission_proof':
+                    details.pop('result_summary_omissions')
+                elif case == 'wrong_omission_count':
+                    details['result_summary_omissions']['requested_symbols']['item_count'] = 1
+                elif case == 'malformed_omission':
+                    details['result_summary_omissions'] = ['malformed']
+                elif case == 'malformed_result':
+                    details['result_summary'] = 'malformed'
+                else:
+                    details['result_summary']['requested_symbols'] = ['999999']
+                summary.details = details
+            else:
+                summary.total = summary.remaining = 5
+        result = _read()
+        assert result.current_source_terminal_ready is False, case
+        assert result.target is not None, case
+
+
 def _install_actual_exhausted_current_lineage(admission_db, *, with_running_publication=False):
     fixture = json.loads((Path(__file__).parent / 'fixtures/current598_exhausted_admission.json').read_text())
     with admission_db.factory.begin() as session:
@@ -217,14 +422,14 @@ def test_actual_retry_cap_cannot_hide_running_current_summary(admission_db, with
     assert result.current_source_terminal_ready is False
 
 
-def _install_synthetic_future_completion(admission_db, *, zero_plan_kind=None):
+def _install_synthetic_future_completion(admission_db, *, zero_plan_kind=None, completed_at=None):
     """Only a future unit adapter; never a claim about current production."""
     from tests.test_daily_pipeline_stages import _completed_feedback_result
     from tests.test_eod_run_stage_support import EODRunStageSupportTests
     from app.eod.daily_pipeline_stages import DailyPipelineStageService
 
     cutoff = datetime(2026, 11, 17, 12, 39, 40, 591119, tzinfo=timezone.utc)
-    completed_at = datetime(2026, 11, 18, 0, 30)
+    completed_at = completed_at or datetime(2026, 11, 18, 0, 30)
     original_request = json.loads((Path(__file__).parent / 'fixtures/current598_exhausted_admission.json').read_text())['active_feedback']['request_payload']['requested_symbols']
     summary = _completed_feedback_result(symbols=['000660'], cutoff_at=cutoff)
     summary['requested_symbols'] = original_request
@@ -265,7 +470,7 @@ def _install_synthetic_future_completion(admission_db, *, zero_plan_kind=None):
                                (1901, ['signal_decider', 'next_open_execution_plan'])]:
             session.add(DailyPipelineRun(
                 id=run_id, market_date=date(2026, 11, 17), trigger='auto_eod_followup_resume',
-                status='completed', started_at=datetime(2026, 11, 18, 0, 5), completed_at=completed_at,
+                status='completed', started_at=completed_at - timedelta(minutes=25), completed_at=completed_at,
                 run_metadata={'reused_eod_collection_run_id': 598, 'entrypoint': 'daily_pipeline_stage_service.run',
                               'requested_stages': stages, 'resolved_stages': stages},
             ))
@@ -289,139 +494,14 @@ def _install_synthetic_future_completion(admission_db, *, zero_plan_kind=None):
             session.add(AgentContextFeedbackRun(
                 run_id=run_id, market_date=date(2026, 11, 17), status='completed',
                 symbols_total=count, completed_count=count, failed_count=0,
-                started_at=datetime(2026, 11, 18, 0, 0), completed_at=completed_at,
+                started_at=completed_at - timedelta(minutes=30), completed_at=completed_at,
                 request_payload={'knowledge_cutoff_at': cutoff.isoformat(), 'requested_symbols': original_request,
                                  'role_symbol_scopes': summary_proof['role_symbol_scopes']},
             ))
         current = session.get(EODCollectionRun, 598)
         current.run_metadata = {**current.run_metadata, 'followup_recovery_required': False,
             'downstream_recovery_pipeline_run_id': 1901,
-            'downstream_recovery_completed_at': '2026-11-18T00:31:00+00:00'}
-
-
-def _install_native_definitive_empty_completion(admission_db, *, scheduled):
-    from app.eod.daily_pipeline_stages import DailyPipelineStageService
-
-    _install_synthetic_future_completion(admission_db)
-    empty_result = {
-        'triggered': False,
-        'status': 'skipped',
-        'reason': 'no_agent_feedback_eligible_symbols',
-        'entry_economics_scope_empty': True,
-        'market_date': '2026-11-17',
-    }
-    completed_at = datetime(2026, 11, 18, 0, 30)
-    with admission_db.factory.begin() as session:
-        current = session.get(EODCollectionRun, 598)
-        metadata = deepcopy(current.run_metadata)
-        pipeline = session.get(DailyPipelineRun, 1901)
-        if scheduled:
-            metadata.pop('downstream_recovery_pipeline_run_id')
-            metadata.pop('downstream_recovery_completed_at')
-            metadata['daily_pipeline_run_id'] = 1901
-            expected = metadata['expected_daily_pipeline_stages']
-            pipeline.trigger = 'auto_close_scheduler'
-            pipeline.run_metadata = {
-                'eod_collection_run_id': 598,
-                'entrypoint': 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due',
-                'requested_stages': expected,
-                'resolved_stages': expected,
-            }
-            summary_row = session.execute(select(DailyPipelineStageRun).where(
-                DailyPipelineStageRun.pipeline_run_id == 1900,
-            )).scalar_one()
-            summary_row.pipeline_run_id = 1901
-            for stage in set(expected) - set(repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX):
-                session.add(DailyPipelineStageRun(
-                    pipeline_run_id=1901, market_date=date(2026, 11, 17),
-                    stage_id=stage, status='completed', completed_at=completed_at,
-                ))
-        for stage in repository._CURRENT_TERMINAL_CONTINUATION_SUFFIX:
-            row = session.execute(select(DailyPipelineStageRun).where(
-                DailyPipelineStageRun.stage_id == stage,
-                DailyPipelineStageRun.pipeline_run_id == (
-                    1900 if stage == 'agent_feedback_summaries' and not scheduled else 1901
-                ),
-            )).scalar_one()
-            row.status = 'skipped'
-            row.processed = row.total = row.succeeded = row.failed = row.remaining = 0
-            row.completed_at = completed_at
-            row.error_message = None
-            if scheduled:
-                row.source_run_ids = {'eod_run_id': 598}
-                row.details = {
-                    'mode': 'auto_eod_pipeline_tracking',
-                    'progress_source': 'auto_eod_stage_progress',
-                    'terminal_count_authority': 'result',
-                    'result_summary': deepcopy(empty_result),
-                }
-            else:
-                row.source_run_ids = {}
-                row.details = DailyPipelineStageService._build_stage_run_details(
-                    stage_id=stage,
-                    result=deepcopy(empty_result),
-                    invocation_symbols=[],
-                    market_date='2026-11-17',
-                )
-        session.execute(delete(AgentContextFeedbackRun).where(
-            AgentContextFeedbackRun.market_date == date(2026, 11, 17),
-        ))
-        current.run_metadata = metadata
-
-
-@pytest.mark.parametrize('scheduled', [False, True])
-def test_native_definitive_empty_agent_chain_proves_current_readiness(admission_db, scheduled):
-    _install_native_definitive_empty_completion(admission_db, scheduled=scheduled)
-
-    result = _read()
-
-    assert result.target is None
-    assert result.current_source_terminal_ready is True
-
-
-@pytest.mark.parametrize('case', [
-    'missing_stage', 'wrong_status', 'nonzero_count', 'wrong_reason',
-    'false_empty_flag', 'wrong_market_date', 'extra_claim', 'wrong_source_run',
-    'active_child',
-])
-def test_native_definitive_empty_agent_chain_remains_fail_closed(admission_db, case):
-    _install_native_definitive_empty_completion(admission_db, scheduled=False)
-    with admission_db.factory.begin() as session:
-        row = session.execute(select(DailyPipelineStageRun).where(
-            DailyPipelineStageRun.pipeline_run_id == 1901,
-            DailyPipelineStageRun.stage_id == 'signal_decider',
-        )).scalar_one()
-        if case == 'active_child':
-            session.add(AgentContextFeedbackRun(
-                run_id='active-empty-chain-child', market_date=date(2026, 11, 17),
-                status='running', symbols_total=0, completed_count=0, failed_count=0,
-                started_at=datetime(2026, 11, 18, 0, 31), request_payload={},
-            ))
-        elif case == 'missing_stage':
-            session.delete(row)
-        elif case == 'wrong_status':
-            row.status = 'completed'
-        elif case == 'nonzero_count':
-            row.total = row.remaining = 1
-        elif case == 'wrong_source_run':
-            row.source_run_ids = {'eod_run_id': 596}
-        else:
-            details = deepcopy(row.details)
-            summary = details['result_summary']
-            if case == 'wrong_reason':
-                summary['reason'] = 'no_candidates'
-            elif case == 'false_empty_flag':
-                summary['entry_economics_scope_empty'] = False
-            elif case == 'wrong_market_date':
-                summary['market_date'] = '2026-11-16'
-            else:
-                summary['grants_trading_authority'] = True
-            row.details = details
-
-    result = _read()
-
-    assert result.target is not None
-    assert result.current_source_terminal_ready is False
+            'downstream_recovery_completed_at': (completed_at + timedelta(minutes=1)).replace(tzinfo=timezone.utc).isoformat()}
 
 
 def test_split_native_completion_proofs_can_prove_future_current_readiness(admission_db):
@@ -727,17 +807,17 @@ def test_current_target_and_superseded_current_source_still_block(admission_db):
 
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('current_pending', [False, True])
-def test_live_scheduler_uses_classification_only_with_opt_in(admission_db, enabled, current_pending):
+@pytest.mark.parametrize('newer_manual', [False, True])
+def test_live_scheduler_uses_classification_only_with_opt_in(admission_db, enabled, current_pending, newer_manual):
     if not current_pending:
         _install_synthetic_future_completion(admission_db)
-    with admission_db.factory.begin() as session:
-        session.add(EODCollectionRun(
-            id=599, market='KRX', source='pykrx', trade_date=date(2026, 11, 17),
-            trigger='manual_api', status='completed', symbols_total=0,
-            symbols_succeeded=0, symbols_failed=0, run_metadata={'mode': 'manual'},
-            started_at=datetime(2026, 11, 18, 0, 45),
-            completed_at=datetime(2026, 11, 18, 0, 46),
-        ))
+    if newer_manual:
+        with admission_db.factory.begin() as session:
+            session.add(EODCollectionRun(
+                id=999, market='KRX', trade_date=date(2026, 11, 17), source='pykrx',
+                trigger='manual_daily_api', status='completed',
+                started_at=datetime(2026, 11, 18, 1, 0), run_metadata={'mode': 'daily_manual'},
+            ))
     scheduler = auto_pykrx.AutoPykrxEODScheduler()
     with (
         patch.object(auto_pykrx.settings, 'eod_auto_pykrx_expired_current_only_admission_enabled', enabled),
@@ -755,10 +835,7 @@ def test_live_scheduler_uses_classification_only_with_opt_in(admission_db, enabl
     assert scheduler.state.active_task is False
     dispatch.assert_not_called()
     if enabled:
-        source.assert_called_once_with(
-            market='KRX', trade_date='2026-11-17', source='pykrx',
-            automatic_only=True,
-        )
+        source.assert_called_once_with(market='KRX', trade_date='2026-11-17', source='pykrx', automatic_only=True)
         calendar.assert_called_once_with(date(2026, 11, 18), allow_fallback=False)
         assert classifier.call_args.kwargs['source_eod_run_id'] == 598
         assert classifier.call_args.kwargs['target_trade_date'] == '2026-11-18'
@@ -769,3 +846,29 @@ def test_live_scheduler_uses_classification_only_with_opt_in(admission_db, enabl
         classifier.assert_not_called()
         source.assert_not_called()
         calendar.assert_not_called()
+
+
+def test_preopen_newer_manual_does_not_restart_completed_automatic_source(admission_db):
+    _install_synthetic_future_completion(admission_db, completed_at=datetime(2026, 11, 17, 22, 30))
+    with admission_db.factory.begin() as session:
+        session.add(EODCollectionRun(id=999, market='KRX', trade_date=date(2026, 11, 17),
+            source='pykrx', trigger='manual_daily_api', status='completed',
+            started_at=datetime(2026, 11, 17, 22, 50), run_metadata={'mode': 'daily_manual'}))
+    admission_db.market.state = 'PREOPEN'
+    admission_db.market.server_time = '2026-11-18T08:00:00+09:00'
+    scheduler = auto_pykrx.AutoPykrxEODScheduler()
+    async def check():
+        disposition = await scheduler.schedule_recovery_if_due(expected_market_state='PREOPEN')
+        if scheduler._task:
+            await scheduler._task
+        return disposition
+    with (
+        patch.object(auto_pykrx.settings, 'eod_auto_pykrx_expired_current_only_admission_enabled', True),
+        patch.object(auto_pykrx, 'async_get_market_state', AsyncMock(return_value=admission_db.market)),
+        patch.object(auto_pykrx, '_oldest_recovery_window_date', AsyncMock(return_value='2026-11-12')),
+        patch.object(auto_pykrx, 'async_previous_krx_trading_date', AsyncMock(return_value=date(2026, 11, 17))),
+        patch.object(scheduler, '_run_scheduled_daily_pipeline', AsyncMock()) as dispatch,
+    ):
+        disposition = asyncio.run(check())
+    assert disposition == auto_pykrx.RecoveryOnlyScheduleDisposition.NO_DEBT
+    dispatch.assert_not_called()

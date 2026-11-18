@@ -386,6 +386,10 @@ class AutoPykrxEODScheduler:
                             market='KRX',
                             trade_date=previous_date,
                             source='pykrx',
+                            **(
+                                {'automatic_only': True}
+                                if settings.eod_auto_pykrx_expired_current_only_admission_enabled else {}
+                            ),
                         )
                         previous_metadata = (previous_run or {}).get('run_metadata') or {}
                         previous_total = int((previous_run or {}).get('symbols_total') or 0)

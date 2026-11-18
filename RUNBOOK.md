@@ -181,8 +181,12 @@ native plan proof confirms that exhaustive result; no positive plan count is req
 When entry-economics filtering proves the agent scope definitively empty, the
 native three-stage skipped chain is also terminal without decider or plan
 publications. Admission requires the exact no-eligible-symbol reason, empty-scope
-flag, market date, zero counts, linked automatic EOD lineage, and no active child;
-missing, altered, or extra authority claims remain blocking.
+flag, market date, linked automatic EOD lineage, and a completed zero-task
+feedback child with empty summarizer role scopes and stored entry-economics
+exclusion diagnostics. Scheduled input totals may retain the requested universe;
+they do not represent model work. Explicit-run compacted requests must retain
+their omission count. Missing, altered, active, or extra authority evidence
+remains blocking; no model or plan publication is invented for an empty chain.
 
 The scheduler's admission result feeds the background runner's existing global
 plan-refresh/Exec-handoff/Core-buy gate. All per-plan model, risk, price, quote,

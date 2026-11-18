@@ -16,6 +16,7 @@ from app.agent_context.lease_loss_evidence import (
     terminal_feedback_completed_run_evidence_error,
     terminal_feedback_lease_loss_evidence_error,
 )
+from app.agent_context.roles import SUMMARIZER_AGENT_NAMES
 from app.db import engine, session_scope
 from app.db_models import (
     AgentContextFeedbackRun,
@@ -3352,47 +3353,102 @@ def _current_source_terminal_authority_is_ready(
         for row in stages.values()
     ):
         return False
-    empty_stage_rows = {
-        stage_id: stages.get(stage_id)
-        for stage_id in ('signal_decider', 'next_open_execution_plan')
-    }
-    summary_rows = session.execute(select(DailyPipelineStageRun, DailyPipelineRun)
-        .join(DailyPipelineRun, DailyPipelineRun.id == DailyPipelineStageRun.pipeline_run_id)
-        .where(DailyPipelineStageRun.market_date == current.trade_date,
-               DailyPipelineStageRun.stage_id == 'agent_feedback_summaries')
-        .order_by(DailyPipelineRun.started_at.desc(), DailyPipelineRun.id.desc())).all()
-    empty_stage_rows['agent_feedback_summaries'] = next((
-        row for row, owner in summary_rows
-        if owner.status in {'completed', 'partial'}
-        and _pipeline_run_links_to_eod(owner, current)
-    ), None)
-    definitive_empty = True
-    for row in empty_stage_rows.values():
-        details = row.details if row is not None and isinstance(row.details, Mapping) else {}
-        result_summary = details.get('result_summary')
-        source_run_ids = row.source_run_ids if row is not None and isinstance(row.source_run_ids, Mapping) else {}
-        definitive_empty = bool(
-            definitive_empty
-            and row is not None
-            and row.status == 'skipped'
-            and row.completed_at is not None
-            and row.error_message is None
-            and all(getattr(row, key) == 0 for key in (
-                'processed', 'total', 'succeeded', 'failed', 'remaining',
-            ))
-            and 'completion_scope_proof' not in details
-            and set(source_run_ids) <= {'eod_run_id'}
-            and source_run_ids.get('eod_run_id', current.id) == current.id
-            and isinstance(result_summary, Mapping)
-            and empty_agent_scope_followup(
-                result_summary, market_date=current.trade_date.isoformat(),
-            ) == result_summary
+    if session.execute(select(AgentContextFeedbackRun.id).where(
+        AgentContextFeedbackRun.market_date == current.trade_date,
+        AgentContextFeedbackRun.status.in_(['running', 'queued', 'pending']),
+    ).limit(1)).first() is not None:
+        return False
+    if all(
+        stage_id in stages and stages[stage_id].status == 'skipped'
+        and stages[stage_id].completed_at is not None
+        and stages[stage_id].error_message is None
+        and isinstance(stages[stage_id].details, Mapping)
+        and 'completion_scope_proof' not in stages[stage_id].details
+        and isinstance(stages[stage_id].source_run_ids or {}, Mapping)
+        and set(stages[stage_id].source_run_ids or {}) <= (
+            {'eod_run_id', 'run_id', 'agent_feedback_run_id'}
+            if stage_id == 'agent_feedback_summaries' else {'eod_run_id'}
         )
-    if definitive_empty:
-        return session.execute(select(AgentContextFeedbackRun.id).where(
-            AgentContextFeedbackRun.market_date == current.trade_date,
-            AgentContextFeedbackRun.status.in_(['running', 'queued', 'pending']),
-        ).limit(1)).first() is None
+        and (stages[stage_id].source_run_ids or {}).get('eod_run_id', current.id) == current.id
+        and empty_agent_scope_followup(
+            (stages[stage_id].details or {}).get('result_summary'),
+            market_date=current.trade_date.isoformat(),
+        ) is not None
+        and (stage_id == 'agent_feedback_summaries' or
+             empty_agent_scope_followup(stages[stage_id].details['result_summary'],
+                 market_date=current.trade_date.isoformat()) == stages[stage_id].details['result_summary'])
+        and all(getattr(stages[stage_id], key) == 0 for key in (
+            'processed', 'succeeded', 'failed',
+        ))
+        # Scheduled totals can retain the input universe; the child below
+        # must independently prove zero role work, rather than zero inputs.
+        and stages[stage_id].total in (
+            {0, len(((stages[stage_id].details or {}).get('result_summary') or {}).get('requested_symbols') or [])}
+            if stage_id == 'agent_feedback_summaries' else {0}
+        )
+        and stages[stage_id].remaining in {0, stages[stage_id].total}
+        for stage_id in _CURRENT_TERMINAL_CONTINUATION_SUFFIX
+    ):
+        # Native empty propagation is a terminal outcome, not model publication.
+        # Require its zero-task source child and real exclusion diagnostics too.
+        summary = stages['agent_feedback_summaries']
+        result = summary.details['result_summary']
+        child_id = result.get('run_id')
+        source_ids = summary.source_run_ids or {}
+        child = session.execute(select(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.run_id == child_id,
+        )).scalar_one_or_none() if isinstance(child_id, str) and child_id else None
+        request = (child.request_payload or {}) if child is not None else {}
+        if not isinstance(request, Mapping):
+            return False
+        scopes = request.get('role_symbol_scopes')
+        diagnostics = request.get('eligibility_diagnostics') or {}
+        funnel = request.get('funnel_diagnostics') or {}
+        role_diagnostics = funnel.get('role_diagnostics') or {} if isinstance(funnel, Mapping) else {}
+        requested = request.get('requested_symbols')
+        from app.agent_context.eligibility import resolve_agent_feedback_scope
+
+        # Automatic eligibility persists its empty selected scope on the child,
+        # while the scheduled result retains the original unscoped request.
+        broad = request.get('broad_symbols')
+        automatic_empty = (
+            'requested_symbols' in result and result['requested_symbols'] is None
+            and requested == [] and request.get('symbols') == []
+            and request.get('scope') == resolve_agent_feedback_scope(requested_symbols=None)
+            and request.get('admission_scope_by_role') == {role: None for role in SUMMARIZER_AGENT_NAMES}
+            and isinstance(broad, list) and broad
+            and all(isinstance(symbol, str) for symbol in broad)
+            and len(set(broad)) == len(broad)
+            and request.get('broad_symbol_count') == len(broad)
+            and set(broad) <= set(metadata.get('requested_symbols') or [])
+        )
+        omitted = (summary.details or {}).get('result_summary_omissions') or {}
+        requested_matches = (
+            (result['requested_symbols'] == requested or automatic_empty) if 'requested_symbols' in result
+            else isinstance(requested, list) and isinstance(omitted, Mapping)
+            and omitted.get('requested_symbols') == {'type': 'list', 'item_count': len(requested)}
+        )
+        if not isinstance(diagnostics, Mapping) or not isinstance(role_diagnostics, Mapping):
+            return False
+        return bool(
+            child is not None and child.market_date == current.trade_date
+            and child.status == 'completed' and child.completed_at is not None
+            and child.symbols_total == child.completed_count == child.failed_count == 0
+            and _normalized_datetime(child.completed_at) <= _normalized_datetime(summary.completed_at)
+            and {source_ids[k] for k in ('run_id', 'agent_feedback_run_id') if source_ids.get(k)} == {child_id}
+            and set(request.get('roles') or []) == set(SUMMARIZER_AGENT_NAMES)
+            and isinstance(scopes, Mapping) and set(scopes) == set(SUMMARIZER_AGENT_NAMES)
+            and all(scope == [] for scope in scopes.values())
+            and requested_matches
+            and (automatic_empty or (isinstance(requested, list) and requested
+                 and len(set(requested)) == len(requested)
+                 and set(requested) <= set(metadata.get('requested_symbols') or [])))
+            and any(isinstance(d, Mapping) and d.get('entry_economics_exclusions')
+                    for d in (diagnostics, *role_diagnostics.values()))
+            and all(not any((stages[stage].source_run_ids or {}).get(k)
+                            for k in ('run_id', 'agent_feedback_run_id'))
+                    for stage in ('signal_decider', 'next_open_execution_plan'))
+        )
     proofs = {}
     for stage_id in ('signal_decider', 'next_open_execution_plan'):
         row = stages.get(stage_id)
@@ -3451,6 +3507,11 @@ def _current_source_terminal_authority_is_ready(
             return False
         feedback[stage_id] = child
     summary_child = feedback['agent_feedback_summaries']
+    summary_rows = session.execute(select(DailyPipelineStageRun, DailyPipelineRun)
+        .join(DailyPipelineRun, DailyPipelineRun.id == DailyPipelineStageRun.pipeline_run_id)
+        .where(DailyPipelineStageRun.market_date == current.trade_date,
+               DailyPipelineStageRun.stage_id == 'agent_feedback_summaries',
+               DailyPipelineStageRun.status == 'completed')).all()
     summary_proof = None
     for row, owner in summary_rows:
         summary_source = summary_cutoff_proof_from_stage(_pipeline_stage_outcome(row))
@@ -3460,7 +3521,6 @@ def _current_source_terminal_authority_is_ready(
         if ((owner.status == 'completed' or owner.id == pipeline.id)
             and owner.market_date == current.trade_date
             and _pipeline_run_links_to_eod(owner, current)
-            and row.status == 'completed'
             and row.failed == row.remaining == 0 and row.completed_at is not None
             and proof is not None and proof['source_run_id'] == summary_child.run_id
             and summary_source is not None and summary_source['source_run_id'] == summary_child.run_id
@@ -3484,10 +3544,7 @@ def _current_source_terminal_authority_is_ready(
         and summary_child.completed_count == summary_proof['total_item_count']
     ):
         return False
-    return session.execute(select(AgentContextFeedbackRun.id).where(
-        AgentContextFeedbackRun.market_date == current.trade_date,
-        AgentContextFeedbackRun.status.in_(['running', 'queued', 'pending']),
-    ).limit(1)).first() is None
+    return True
 
 
 def load_active_auto_eod_recovery_admission(

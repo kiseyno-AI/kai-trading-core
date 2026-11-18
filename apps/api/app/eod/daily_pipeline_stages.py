@@ -2863,6 +2863,7 @@ class DailyPipelineStageService:
                     pipeline_run_id=pipeline_run_id,
                     stage_id=stage_id,
                     market_date=resolved_market_date,
+                    symbols=[],
                 )
                 outcome = self._build_stage_outcome(stage_id, empty_scope_result)
                 stage_outcomes[stage_id] = outcome
