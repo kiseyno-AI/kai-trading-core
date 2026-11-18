@@ -6044,6 +6044,7 @@ def _retryable_feedback_rearm_config(
     except ValueError:
         return None
     raw_scope_authority = request_payload.get('scope_authority')
+    point_in_time_recovery = request_payload.get('point_in_time_recovery', False)
     try:
         outer_batch_size = int(
             request_payload.get('outer_batch_size') or 0
@@ -6081,6 +6082,7 @@ def _retryable_feedback_rearm_config(
             or isinstance(raw_scope_authority, Mapping)
         )
         and outer_batch_size > 0
+        and isinstance(point_in_time_recovery, bool)
     ):
         return None
 
@@ -6106,6 +6108,7 @@ def _retryable_feedback_rearm_config(
         ),
         'idempotency_key': idempotency_key,
         'outer_batch_size': outer_batch_size,
+        'point_in_time_recovery': point_in_time_recovery,
     }
 
 

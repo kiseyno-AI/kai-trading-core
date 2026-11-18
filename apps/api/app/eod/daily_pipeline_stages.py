@@ -1586,6 +1586,13 @@ class DailyPipelineStageService:
             normalized_inherited_feedback_retry_config = dict(
                 inherited_feedback_retry_config
             )
+            if not isinstance(
+                normalized_inherited_feedback_retry_config.get(
+                    'point_in_time_recovery', point_in_time_recovery,
+                ),
+                bool,
+            ):
+                raise ValueError('inherited feedback retry mode must be a boolean')
             inherited_feedback_source_run_id = str(
                 normalized_inherited_feedback_retry_config.get(
                     'source_run_id'
@@ -8990,6 +8997,7 @@ class DailyPipelineStageService:
                 else FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
             )
             retry_outer_batch_size = feedback_outer_batch_size
+            retry_point_in_time_recovery = point_in_time_recovery
             if (
                 stage_id == 'agent_feedback_summaries'
                 and isinstance(feedback_retry_config_override, Mapping)
@@ -9017,6 +9025,9 @@ class DailyPipelineStageService:
                 retry_outer_batch_size = int(
                     feedback_retry_config_override['outer_batch_size']
                 )
+                retry_point_in_time_recovery = feedback_retry_config_override.get(
+                    'point_in_time_recovery', point_in_time_recovery,
+                )
                 inherited_scope_authority = (
                     feedback_retry_config_override.get('scope_authority')
                 )
@@ -9043,7 +9054,7 @@ class DailyPipelineStageService:
                     max_cycles=feedback_max_cycles,
                     outer_batch_size=retry_outer_batch_size,
                     reuse_existing=reuse_existing_feedback,
-                    point_in_time_recovery=point_in_time_recovery,
+                    point_in_time_recovery=retry_point_in_time_recovery,
                     reuse_parent_run_id=(
                         feedback_reuse_parent_run_id
                         if stage_id == 'agent_feedback_summaries'

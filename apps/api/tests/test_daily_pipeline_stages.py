@@ -8240,6 +8240,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             'scope_authority': None,
             'idempotency_key': None,
             'outer_batch_size': 17,
+            'point_in_time_recovery': False,
         }
         with (
             patch(
@@ -8318,6 +8319,10 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertFalse(call['force'])
         self.assertTrue(call['bypass_prerequisite_gate'])
         self.assertTrue(call['config'].reuse_existing)
+        self.assertFalse(call['config'].point_in_time_recovery)
+        self.assertTrue(
+            feedback_retry_service.calls[1]['config'].point_in_time_recovery
+        )
         self.assertEqual(
             call['config'].reuse_parent_run_id,
             'feedback-cycle-parent',
@@ -8346,6 +8351,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         historical_metadata = self.run_state_service.runs[-1][
             'run_metadata'
         ]
+        self.assertTrue(historical_metadata['point_in_time_recovery'])
         self.assertEqual(
             historical_metadata['inherited_feedback_source_run_id'],
             'feedback-cycle-parent',
@@ -8440,6 +8446,7 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         )
         same_day_call = same_day_retry_service.calls[0]
         self.assertFalse(same_day_call['bypass_prerequisite_gate'])
+        self.assertFalse(same_day_call['config'].point_in_time_recovery)
         self.assertEqual(
             same_day_call['config'].reuse_parent_run_id,
             'feedback-cycle-parent',
@@ -8463,6 +8470,36 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             ],
             FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
         )
+
+    def test_feedback_rearm_rejects_nonboolean_parent_mode(self) -> None:
+        retry_service = _FakeFeedbackRetryService()
+        service = DailyPipelineStageService(feedback_retry_service=retry_service)
+        for malformed_mode in ('false', 0, None):
+            with (
+                self.subTest(point_in_time_recovery=malformed_mode),
+                self.assertRaisesRegex(ValueError, 'retry mode must be a boolean'),
+            ):
+                service.run(
+                    market_date='2026-04-14',
+                    stages=[
+                        'agent_feedback_summaries', 'signal_decider',
+                        'next_open_execution_plan',
+                    ],
+                    resume_from_stage='agent_feedback_summaries',
+                    trigger='auto_eod_followup_resume',
+                    point_in_time_recovery=True,
+                    reuse_existing_feedback=True,
+                    reused_eod_collection_run_id=7,
+                    inherited_feedback_retry_config={
+                        'source_run_id': 'feedback-cycle-parent',
+                        'knowledge_cutoff_at': datetime(
+                            2026, 4, 14, 8, 30, tzinfo=timezone.utc,
+                        ),
+                        'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                        'point_in_time_recovery': malformed_mode,
+                    },
+                )
+        self.assertEqual(retry_service.calls, [])
 
     def test_decider_only_suffix_rejects_summary_retry_config(self) -> None:
         service = DailyPipelineStageService()
