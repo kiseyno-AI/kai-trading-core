@@ -17,7 +17,13 @@ have started during that same PREOPEN and must now be fully completed. A new
 post-open Summary retry, a partial Summary intersection, generic historical
 replay, and failure for a different reason remain ineligible.
 
-Under the existing date admission transaction, the claim requires:
+The claim holds the existing EOD and pipeline-date fences, then the same
+per-market-date feedback-admission advisory lock used by the native retry
+writer, before taking row locks. The retry writer does not acquire EOD or
+pipeline fences inside its admission transaction. This order prevents a new
+feedback cohort from being inserted between the newer-cohort check and commit.
+
+Under that transaction, the claim requires:
 
 - The actual owned daily-price EOD fence, exact automatic decider/plan suffix,
   force false, feedback reuse true, and all normal prerequisite gates.

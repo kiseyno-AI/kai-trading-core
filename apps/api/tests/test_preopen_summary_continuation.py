@@ -1,10 +1,11 @@
 """Persisted admission transfer is an explicit, internal, one-shot opt-in."""
 
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timezone
+from threading import Event
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -296,6 +297,55 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
         again = self.claim()
         self.assertEqual(again['id'], first['id'])
         self.assertTrue(again['deduplicated'])
+
+
+    def test_claim_waits_for_native_feedback_admission_before_checking_newer_cohort(self):
+        from app.agent_context.retry_service import _claim_feedback_retry_run
+
+        writer_has_lock = Event()
+        allow_writer_scan = Event()
+
+        @contextmanager
+        def writer_scope(**_kwargs):
+            with self.sessions.begin() as session:
+                execute = session.execute
+
+                def pause_after_lock(statement, *args, **kwargs):
+                    result = execute(statement, *args, **kwargs)
+                    if str(statement) == 'SELECT pg_advisory_xact_lock(:lock_key)':
+                        writer_has_lock.set()
+                        if not allow_writer_scan.wait(5):
+                            raise AssertionError('test did not release feedback writer')
+                    return result
+
+                with patch.object(session, 'execute', side_effect=pause_after_lock):
+                    yield session
+
+        def native_writer():
+            return _claim_feedback_retry_run(
+                market_date=self.market_date, roles=ROLES,
+                requested_symbols=FULL, feedback_scope_mode='decider_scope_fast_path',
+                run_id='concurrent-newer-summary', started_at=self.now,
+                admission_knowledge_cutoff_at=CUTOFF,
+                policy_context_as_of_date=self.market_date,
+                role_symbol_scopes={role: SELECTED for role in ROLES}, fs_div='CFS',
+            )
+
+        with patch('app.agent_context.retry_service.session_scope', new=writer_scope):
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                writer = workers.submit(native_writer)
+                self.assertTrue(writer_has_lock.wait(5))
+                continuation = workers.submit(self.claim)
+                try:
+                    with self.assertRaises(TimeoutError):
+                        continuation.result(timeout=0.2)
+                finally:
+                    allow_writer_scan.set()
+                self.assertTrue(writer.result(timeout=5)['acquired'])
+                with self.assertRaisesRegex(ValueError, 'newer feedback'):
+                    continuation.result(timeout=5)
+        with self.sessions.begin() as session:
+            self.assertEqual(len(list(session.scalars(select(DailyPipelineRun)))), 1)
 
 
 class PreopenTargetSessionTests(unittest.TestCase):

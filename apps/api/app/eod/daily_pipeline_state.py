@@ -1047,6 +1047,21 @@ class DailyPipelineRunStateService:
                     )
                 ):
                     raise ValueError('preopen continuation requires actual owned EOD fence and summary proof')
+                from app.agent_context.retry_service import (
+                    _feedback_retry_admission_lock_key,
+                )
+                # EOD -> pipeline-date -> feedback admission -> row locks.
+                # The native retry claim holds only the latter two; it never
+                # waits for an EOD/pipeline fence inside its transaction.
+                # Acquire before any feedback rows, so a writer cannot insert
+                # a superseding cohort between validation and this claim.
+                session.execute(
+                    text('SELECT pg_advisory_xact_lock(:lock_key)'),
+                    {'lock_key': _feedback_retry_admission_lock_key(
+                        market_date=normalized_market_date,
+                        roles=(), symbols=None,
+                    )},
+                )
                 # Deduplicate before checking newer feedback: an already claimed
                 # child may itself have produced that feedback. Returning it
                 # never grants another execution or changes its history.
