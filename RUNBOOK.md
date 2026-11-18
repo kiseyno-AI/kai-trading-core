@@ -388,6 +388,65 @@ neither decider are not failures or entry-economics exclusions. Preserve the
 validated `source_summary_scope` in the native result when reconciling completion;
 do not reconstruct it from later funnel diagnostics or rerun successful models.
 
+### OpenClaw 2026.10.5 plugin capture copy workaround
+
+The [copy-only patch](ops/patches/openclaw-2026.10.5-plugin-capture-copy-only.patch)
+is pinned to OpenClaw `2026.10.5`, build commit
+`1b58cb9a1b4f4353e1add63c8506db4d890962e8`. It changes only
+`copyPluginSourceFile`'s `clone: "auto"` to `"never"` in
+`dist/plugin-generation-source-lookup-Dg6DuWgm.mjs`. The guarded helper retains
+nofollow admission, anchored source identity, `maxBytes`, exclusive destination
+creation and destination validation. No model or trading settings change.
+
+During the 2026-11-19 KST incident, Gateway stalled synchronously in
+`native.copyFileExclusiveSync` while capturing 117–390 KB SDK files on the
+external APFS volume. A separate-process 128 KiB fixture exceeded an 8-second
+timeout with `auto`; `never` returned method `copy`, 131072 bytes and an identical
+SHA-256 in 4.618 ms. This is a host-specific workaround, not an upstream fix.
+
+After the Gateway maintenance gate above, stop Gateway before modifying its
+package. From the Core repository root, run this in a subshell; any mismatch
+blocks application. Keep the original backup until recovery is verified.
+
+```sh
+(
+set -eu
+openclaw_pkg=/opt/homebrew/lib/node_modules/openclaw
+capture_patch="$PWD/ops/patches/openclaw-2026.10.5-plugin-capture-copy-only.patch"
+capture_module="$openclaw_pkg/dist/plugin-generation-source-lookup-Dg6DuWgm.mjs"
+test "$(node -p 'require(process.argv[1]).version' "$openclaw_pkg/package.json")" = 2026.10.5
+test "$(node -p 'require(process.argv[1]).commit' "$openclaw_pkg/dist/build-info.json")" = 1b58cb9a1b4f4353e1add63c8506db4d890962e8
+test "$(shasum -a 256 "$capture_module" | awk '{print $1}')" = f5d2a7a135361cd39680344842b825c9f9db2e1524417c3c1297a53ce7913ff8
+/usr/bin/patch -C -p1 -d "$openclaw_pkg" < "$capture_patch"
+test ! -e "$capture_module.pre-copy-only"
+cp -p "$capture_module" "$capture_module.pre-copy-only"
+/usr/bin/patch -p1 -d "$openclaw_pkg" < "$capture_patch"
+test "$(shasum -a 256 "$capture_module" | awk '{print $1}')" = ec6ab0563cded58c8dea08197bdb9a01293e7b454db78272763d2180051916f9
+node --check "$capture_module"
+)
+```
+
+Restart through the normal maintenance procedure and verify Gateway health and
+the original exact missing daily scope. Preserve completed model results. A
+package reinstall or upgrade can remove this patch; revalidate the version,
+module and filesystem benchmark before carrying it forward.
+
+For rollback, use the same idle/stopped maintenance gate. From the Core root:
+
+```sh
+(
+set -eu
+openclaw_pkg=/opt/homebrew/lib/node_modules/openclaw
+capture_module="$openclaw_pkg/dist/plugin-generation-source-lookup-Dg6DuWgm.mjs"
+capture_patch="$PWD/ops/patches/openclaw-2026.10.5-plugin-capture-copy-only.patch"
+test "$(shasum -a 256 "$capture_module" | awk '{print $1}')" = ec6ab0563cded58c8dea08197bdb9a01293e7b454db78272763d2180051916f9
+/usr/bin/patch -C -R -p1 -d "$openclaw_pkg" < "$capture_patch"
+/usr/bin/patch -R -p1 -d "$openclaw_pkg" < "$capture_patch"
+test "$(shasum -a 256 "$capture_module" | awk '{print $1}')" = f5d2a7a135361cd39680344842b825c9f9db2e1524417c3c1297a53ce7913ff8
+node --check "$capture_module"
+)
+```
+
 ## Runtime write-path schema drift diagnostics
 
 When an EOD, DART, signal-decider, or execution write path fails, debug in this order:
