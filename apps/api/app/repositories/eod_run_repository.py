@@ -208,6 +208,7 @@ class AutoEODRecoveryTarget:
 class AutoEODRecoveryAdmission:
     target: AutoEODRecoveryTarget | None
     historical_classifications: tuple[dict[str, Any], ...] = ()
+    current_source_terminal_ready: bool | None = None
 
 
 @dataclass
@@ -3295,6 +3296,162 @@ def _classify_expired_current_only_debt(
     }
 
 
+def _current_source_terminal_authority_is_ready(
+    session: Any, *, current: EODCollectionRun, target_date: date,
+) -> bool:
+    """Read native receipts independently of automatic retry eligibility."""
+    from app.eod.daily_pipeline_stages import DailyPipelineStageService
+    from app.eod.pykrx_pipeline_runner import AUTO_DAILY_TRACKED_STAGE_ORDER
+
+    metadata = current.run_metadata or {}
+    run_id = metadata.get('downstream_recovery_pipeline_run_id')
+    recovery_reference = type(run_id) is int
+    if not recovery_reference:
+        run_id = metadata.get('daily_pipeline_run_id')
+    reconciled_at = _normalized_datetime(metadata.get('downstream_recovery_completed_at'))
+    expected = list(AUTO_DAILY_TRACKED_STAGE_ORDER)
+    required_data = set(expected) - set(_CURRENT_TERMINAL_CONTINUATION_SUFFIX) - set(ORDERING_ONLY_OPTIONAL_CONTEXT_STAGE_IDS)
+    progress = metadata.get('stage_progress')
+    if not (
+        type(run_id) is int
+        and (metadata.get('followup_recovery_required') is False if recovery_reference
+             else metadata.get('followup_recovery_required') is not True)
+        and (not recovery_reference or reconciled_at is not None)
+        and _admission_price_membership(session, current) is not None
+        and metadata.get('expected_daily_pipeline_stages') == expected
+        and isinstance(progress, Mapping)
+        and all(isinstance(progress.get(stage), Mapping)
+                and progress[stage].get('status') == 'completed'
+                and progress[stage].get('failed') == 0 for stage in required_data)
+        and not any(metadata.get(k) for k in (
+            'downstream_retry_symbols', 'inherited_downstream_retry_symbols',
+            'followup_stage_debt', 'nonblocking_feedback_retry_debt',
+        ))
+    ):
+        return False
+    pipeline = session.get(DailyPipelineRun, run_id)
+    resolved = (pipeline.run_metadata or {}).get('resolved_stages') if pipeline is not None else None
+    canonical_suffix = resolved in [expected[index:] for index in range(len(expected) - 1)]
+    if not (
+        pipeline is not None and pipeline.market_date == current.trade_date
+        and pipeline.status in {'completed', 'partial'}
+        and pipeline.completed_at is not None
+        and (not recovery_reference or _normalized_datetime(pipeline.completed_at) <= reconciled_at)
+        and _pipeline_run_links_to_eod(pipeline, current)
+        and (pipeline.run_metadata or {}).get('allow_expired_analysis_replay') is not True
+        and (canonical_suffix if recovery_reference else resolved == expected)
+    ):
+        return False
+    stages = {row.stage_id: row for row in session.execute(
+        select(DailyPipelineStageRun).where(DailyPipelineStageRun.pipeline_run_id == run_id)
+    ).scalars()}
+    if set(stages) != set(resolved) or any(
+        row.market_date != current.trade_date
+        or not daily_pipeline_outcome_is_satisfied(_pipeline_stage_outcome(row))
+        for row in stages.values()
+    ):
+        return False
+    proofs = {}
+    for stage_id in ('signal_decider', 'next_open_execution_plan'):
+        row = stages.get(stage_id)
+        if not (
+            row is not None and row.market_date == current.trade_date
+            and row.status == 'completed' and row.completed_at is not None
+            and row.failed == row.remaining == 0
+        ):
+            return False
+        proof = DailyPipelineStageService.validated_stage_completion_scope_proof(
+            stage_id, (row.details or {}).get('completion_scope_proof'),
+        )
+        if proof is None:
+            return False
+        proofs[stage_id] = proof
+    signal, plan = proofs['signal_decider'], proofs['next_open_execution_plan']
+    signal_source_ids = stages['signal_decider'].source_run_ids or {}
+    plan_summary = ((stages['next_open_execution_plan'].details or {}).get('result_summary') or {}).get('summary') or {}
+    if not (
+        signal['failed_items'] == 0
+        and {str(signal_source_ids[k]) for k in ('run_id', 'agent_feedback_run_id') if signal_source_ids.get(k)}
+        == {signal['source_run_id']}
+        and plan['parent_run_id'] == signal['source_run_id']
+        and plan['parent_summary_run_id'] == signal['source_summary_run_id']
+        and plan['parent_admitted_symbols'] == signal['admitted_symbols']
+        and plan['parent_completed_symbols'] == signal['completed_symbols']
+        and plan['role_symbol_scopes'] == signal['completed_symbols_by_role']
+        and plan_summary.get('source_market_date') == current.trade_date.isoformat()
+        and plan_summary.get('target_trade_date') == target_date.isoformat()
+        and {(d['symbol'], d['decision_agent_name'], d['decision_run_id'], d['decision_snapshot_id'])
+             for d in plan['decision_partition']}
+        == {(d['symbol'], d['decision_agent_name'], d['decision_run_id'], d['decision_snapshot_id'])
+            for d in signal['decision_identities']}
+    ):
+        return False
+    feedback = {}
+    for stage_id, child_id, expected_count in (
+        ('signal_decider', signal['source_run_id'], signal['total_items']),
+        ('agent_feedback_summaries', signal['source_summary_run_id'], None),
+    ):
+        child = session.execute(select(AgentContextFeedbackRun).where(
+            AgentContextFeedbackRun.run_id == child_id,
+        )).scalar_one_or_none()
+        if not (
+            child is not None and child.market_date == current.trade_date
+            and child.status == 'completed' and child.completed_at is not None
+            and child.failed_count == 0
+            and (expected_count is None or child.completed_count == expected_count)
+            and _normalized_datetime((child.request_payload or {}).get('knowledge_cutoff_at'))
+            == _normalized_datetime(signal['knowledge_cutoff_at'])
+        ):
+            return False
+        if stage_id == 'signal_decider' and (
+            _normalized_datetime(child.completed_at) > _normalized_datetime(stages[stage_id].completed_at)
+        ):
+            return False
+        feedback[stage_id] = child
+    summary_child = feedback['agent_feedback_summaries']
+    summary_rows = session.execute(select(DailyPipelineStageRun, DailyPipelineRun)
+        .join(DailyPipelineRun, DailyPipelineRun.id == DailyPipelineStageRun.pipeline_run_id)
+        .where(DailyPipelineStageRun.market_date == current.trade_date,
+               DailyPipelineStageRun.stage_id == 'agent_feedback_summaries',
+               DailyPipelineStageRun.status == 'completed')).all()
+    summary_proof = None
+    for row, owner in summary_rows:
+        summary_source = summary_cutoff_proof_from_stage(_pipeline_stage_outcome(row))
+        proof = DailyPipelineStageService.validated_stage_completion_scope_proof(
+            'agent_feedback_summaries', (row.details or {}).get('completion_scope_proof'),
+        )
+        if ((owner.status == 'completed' or owner.id == pipeline.id)
+            and owner.market_date == current.trade_date
+            and _pipeline_run_links_to_eod(owner, current)
+            and row.failed == row.remaining == 0 and row.completed_at is not None
+            and proof is not None and proof['source_run_id'] == summary_child.run_id
+            and summary_source is not None and summary_source['source_run_id'] == summary_child.run_id
+            and proof['knowledge_cutoff_at'] == signal['knowledge_cutoff_at']
+            and _normalized_datetime(summary_child.completed_at) <= _normalized_datetime(row.completed_at)):
+            summary_proof = proof
+            break
+    if summary_proof is None:
+        return False
+    scopes = summary_proof['role_symbol_scopes']
+    request = summary_child.request_payload or {}
+    requested_scopes = request.get('role_symbol_scopes')
+    if not (
+        set(summary_proof['requested_symbols']) <= set(metadata.get('requested_symbols') or [])
+        and set(summary_proof['requested_symbols']) == set(request.get('requested_symbols') or [])
+        and isinstance(requested_scopes, Mapping) and set(requested_scopes) == set(scopes)
+        and all(isinstance(requested_scopes[role], list)
+                and len(requested_scopes[role]) == len(scopes[role])
+                and set(requested_scopes[role]) == set(scopes[role]) for role in scopes)
+        and sorted(set.intersection(*(set(scope) for scope in scopes.values()))) == signal['admitted_symbols']
+        and summary_child.completed_count == summary_proof['total_item_count']
+    ):
+        return False
+    return session.execute(select(AgentContextFeedbackRun.id).where(
+        AgentContextFeedbackRun.market_date == current.trade_date,
+        AgentContextFeedbackRun.status.in_(['running', 'queued', 'pending']),
+    ).limit(1)).first() is None
+
+
 def load_active_auto_eod_recovery_admission(
     *, on_or_after: str | date, on_or_before: str | date,
     allow_expired_current_only_debt: bool = False,
@@ -3310,10 +3467,10 @@ def load_active_auto_eod_recovery_admission(
     """
     lower, upper = _normalize_trade_date(on_or_after), _normalize_trade_date(on_or_before)
     target = load_oldest_outstanding_auto_eod_recovery_target(on_or_after=lower, on_or_before=upper)
-    if target is None or allow_expired_current_only_debt is not True:
+    if allow_expired_current_only_debt is not True:
         return AutoEODRecoveryAdmission(target)
     if target_trade_date is None or source_market_date is None or type(source_eod_run_id) is not int:
-        return AutoEODRecoveryAdmission(target)
+        return AutoEODRecoveryAdmission(target, current_source_terminal_ready=False)
     target_date, source_date = _normalize_trade_date(target_trade_date), _normalize_trade_date(source_market_date)
     market = get_market_state()
     if not (
@@ -3321,12 +3478,25 @@ def load_active_auto_eod_recovery_admission(
         and str(market.server_time)[:10] == target_date.isoformat()
         and next_krx_trading_date(source_date, allow_fallback=False) == target_date
     ):
-        return AutoEODRecoveryAdmission(target)
+        return AutoEODRecoveryAdmission(target, current_source_terminal_ready=False)
     source = load_exact_automatic_daily_eod_collection_run(eod_run_id=source_eod_run_id, trade_date=source_date)
     if source is None:
-        return AutoEODRecoveryAdmission(target)
+        return AutoEODRecoveryAdmission(target, current_source_terminal_ready=False)
+    original_target = target
+    with session_scope() as session:
+        current = session.get(EODCollectionRun, source_eod_run_id)
+        current_ready = current is not None and _current_source_terminal_authority_is_ready(
+            session, current=current, target_date=target_date,
+        )
     classifications = []
     while target is not None:
+        if (current_ready and target.eod_run_id == source_eod_run_id
+            and target.trade_date == source_date.isoformat()):
+            # A proved native completion can outlive a coarse partial parent.
+            # Preserve that history without scheduling its work again.
+            lower = source_date + timedelta(days=1)
+            target = load_oldest_outstanding_auto_eod_recovery_target(on_or_after=lower, on_or_before=upper)
+            continue
         with session_scope() as session:
             historical = session.get(EODCollectionRun, target.eod_run_id)
             current = session.get(EODCollectionRun, source_eod_run_id)
@@ -3334,11 +3504,15 @@ def load_active_auto_eod_recovery_admission(
                 session, historical=historical, current=current, target_date=target_date,
             ) if historical is not None and current is not None else None
         if proof is None:
-            return AutoEODRecoveryAdmission(target, tuple(classifications))
+            return AutoEODRecoveryAdmission(target, tuple(classifications), current_ready)
         classifications.append(proof)
         lower = date.fromisoformat(target.trade_date) + timedelta(days=1)
         target = load_oldest_outstanding_auto_eod_recovery_target(on_or_after=lower, on_or_before=upper)
-    return AutoEODRecoveryAdmission(None, tuple(classifications))
+    # Retry caps mean "no automatic retry available", not current completion.
+    # Keep the original historical blocker rather than inventing a new retry.
+    return AutoEODRecoveryAdmission(
+        None if current_ready else original_target, tuple(classifications), current_ready,
+    )
 
 
 def load_oldest_outstanding_auto_eod_recovery_date(

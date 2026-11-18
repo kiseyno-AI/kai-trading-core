@@ -164,6 +164,21 @@ returns the remaining active target and separate historical classification
 evidence. The scheduler includes that evidence in its existing `last_result`;
 the raw selector still exposes the unchanged old debt after restart.
 
+Exhausted automatic retries are never completion evidence. Before returning
+`NO_DEBT`, this opt-in read independently validates the current source's native
+summary, decider and plan completion receipts, matching child run/date/cutoff/
+scope, and actual plan target. It accepts a completed full daily publication or
+the native reconciliation marker referencing a completed SIG/plan suffix plus a
+separately published summary. The summary publisher may start while its child
+is running; completion proof is required only at its finish. Old primary and
+failed retry rows remain unchanged. Missing current proof keeps admission
+blocked even when the raw retry selector returns nothing. An eligible current
+PREOPEN retry or an uncollected prior session still follows its existing native
+scheduling path; the policy never creates a retry target or resets a cap.
+Completed decider identities with zero executable plans, zero WAITs, or only
+blocked/low-confidence candidates remain a normal completed outcome when the
+native plan proof confirms that exhaustive result; no positive plan count is required.
+
 The scheduler's admission result feeds the background runner's existing global
 plan-refresh/Exec-handoff/Core-buy gate. All per-plan model, risk, price, quote,
 session, kill-switch and order-authority checks remain required. CLOSED daily

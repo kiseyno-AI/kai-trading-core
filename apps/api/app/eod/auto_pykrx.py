@@ -307,6 +307,7 @@ class AutoPykrxEODScheduler:
         previous_session_date = None
         uncollected_previous_session = None
         historical_classifications = ()
+        current_source_terminal_ready = None
         try:
             recovery_window_latest_date = (
                 current_market_date
@@ -330,7 +331,6 @@ class AutoPykrxEODScheduler:
             )
             if (
                 recovery_only and market.state in {'PREOPEN', 'OPEN'}
-                and recovery_target is not None
                 and settings.eod_auto_pykrx_expired_current_only_admission_enabled
             ):
                 source_date = await async_previous_krx_trading_date(
@@ -348,12 +348,14 @@ class AutoPykrxEODScheduler:
                 )
                 recovery_target = admission.target
                 historical_classifications = admission.historical_classifications
+                current_source_terminal_ready = admission.current_source_terminal_ready
                 self._state.last_result = {
                     'triggered': False,
                     'reason': 'current_session_recovery_admission_inspected',
                     'historical_debt_admission': {
                         'classification_count': len(admission.historical_classifications),
                         'classifications': list(admission.historical_classifications),
+                        'current_source_terminal_ready': current_source_terminal_ready,
                     },
                 }
             if recovery_only and market.state == 'PREOPEN':
@@ -418,6 +420,10 @@ class AutoPykrxEODScheduler:
         previous_session_preopen_recovery_due = False
         if recovery_only:
             if not older_recovery_due:
+                if current_source_terminal_ready is False:
+                    self._state.last_status = 'blocked'
+                    self._state.last_reason = 'current_source_terminal_authority_unavailable'
+                    return RecoveryOnlyScheduleDisposition.DUE_BLOCKED
                 self._clear_preflight_backoff()
                 self._state.last_status = 'idle'
                 self._state.last_reason = (
