@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from app.db import engine
 from app.db_models import (
     AgentContextFeedbackRun, DailyPipelineRun, DailyPipelineStageRun,
-    EODCollectionRun, Symbol, DailyPriceBar,
+    EODCollectionRun, Symbol, DailyPriceBar, AgentContextFeedback, AgentContextFeedbackFailure,
 )
 from app.eod.daily_pipeline_state import DailyPipelineRunStateService
 
@@ -38,7 +38,7 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
         self.addCleanup(self.drop_schema)
         test_engine = engine.execution_options(schema_translate_map={None: self.schema})
         for model in (DailyPipelineRun, DailyPipelineStageRun, EODCollectionRun,
-                      AgentContextFeedbackRun, Symbol, DailyPriceBar):
+                      AgentContextFeedbackRun, Symbol, DailyPriceBar, AgentContextFeedback, AgentContextFeedbackFailure):
             model.__table__.create(test_engine)
         self.sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
 
@@ -65,8 +65,8 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
         request = {
             'market_date': str(self.market_date),
             'policy_context_as_of_date': str(self.market_date),
-            'requested_symbols': FULL, 'symbols': SELECTED,
-            'roles': ROLES, 'role_symbol_scopes': {r: SELECTED for r in ROLES},
+            'requested_symbols': FULL, 'symbols': list(reversed(SELECTED)),
+            'roles': ROLES, 'role_symbol_scopes': {r: list(reversed(SELECTED)) for r in ROLES},
             'admission_scope_by_role': {r: FULL for r in ROLES},
             'prepared_decider_role_symbol_scopes': {},
             'fs_div': 'CFS', 'knowledge_cutoff_at': CUTOFF,
@@ -122,7 +122,12 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
             ):
                 session.add(AgentContextFeedbackRun(
                     run_id=run_id, market_date=self.market_date, status=status,
-                    request_payload={**deepcopy(request), **({'resumed_from_run_id': 'summary-origin'}
+                    request_payload={**deepcopy(request),
+                                     'child_run_lineage': {
+                                         'schema_version': 'agent_feedback_child_run_lineage_v1',
+                                         'parent_run_id': run_id, 'child_link_field': 'parent_run_id',
+                                     },
+                                     **({'resumed_from_run_id': 'summary-origin'}
                                      if run_id == 'summary-retry' else {})},
                     summary_payload={'resumed_from_run_id': 'summary-origin'}
                     if run_id == 'summary-retry' else {},
@@ -130,6 +135,31 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
                                                    else datetime(2040, 1, 9, 14, tzinfo=timezone.utc)),
                     symbols_total=6, completed_count=6, failed_count=0,
                 ))
+            for role in ROLES:
+                child_id = 'summary-child-' + role
+                session.add(AgentContextFeedbackRun(
+                    run_id=child_id, market_date=self.market_date, status='completed',
+                    symbols_total=len(SELECTED), completed_count=len(SELECTED), failed_count=0,
+                    request_payload={
+                        'market_date': str(self.market_date),
+                        'policy_context_as_of_date': str(self.market_date),
+                        'request_run_id': child_id, 'parent_run_id': 'summary-retry',
+                        'roles': [role], 'symbols': SELECTED, 'requested_symbols': SELECTED,
+                        'role_symbol_scopes': {role: SELECTED},
+                        'fs_div': 'CFS', 'knowledge_cutoff_at': CUTOFF,
+                        'point_in_time_recovery': False,
+                        'mode': 'role_sequential_runtime_buffered',
+                        'feedback_scope_mode': 'decider_scope_fast_path',
+                    },
+                    started_at=datetime(2040, 1, 9, 23, tzinfo=timezone.utc),
+                    completed_at=datetime(2040, 1, 10, 0, 55, tzinfo=timezone.utc),
+                ))
+                for code in SELECTED:
+                    session.add(AgentContextFeedback(
+                        market_date=self.market_date, symbol=code, agent_name=role,
+                        run_id=child_id, summary_payload={}, feedback_payload={},
+                        received_at=datetime(2040, 1, 10, 0, 54, tzinfo=timezone.utc),
+                    ))
         for target, kwargs in (
             ('session_scope', {'new': scope}),
             ('_utcnow', {'return_value': self.now}),
@@ -184,6 +214,16 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
 
     def test_bad_persisted_evidence_is_rejected_without_creating_cohort(self):
         cases = [
+            ('child CFS mismatch', AgentContextFeedbackRun, 3, 'request_payload',
+             lambda q: {**q, 'fs_div': 'OFS'}),
+            ('child cutoff mismatch', AgentContextFeedbackRun, 3, 'request_payload',
+             lambda q: {**q, 'knowledge_cutoff_at': '2040-01-09T15:00:00+00:00'}),
+            ('child policy mismatch', AgentContextFeedbackRun, 3, 'request_payload',
+             lambda q: {**q, 'policy_context_as_of_date': '2040-01-10'}),
+            ('child unknown mode', AgentContextFeedbackRun, 3, 'request_payload',
+             lambda q: {**q, 'mode': 'unknown'}),
+            ('child future completion', AgentContextFeedbackRun, 3, 'completed_at',
+             lambda _: datetime(2040, 1, 10, 2, tzinfo=timezone.utc)),
             ('different EOD', DailyPipelineRun, 664, 'run_metadata',
              lambda m: {**m, 'reused_eod_collection_run_id': 599}),
             ('source late', DailyPipelineRun, 664, 'started_at',
@@ -281,7 +321,11 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
         def native_resolve(**kwargs):
             return resolve_latest_completed_summary_knowledge_cutoff(now=self.now, **kwargs)
 
-        with patch(MODULE + '_resolve_terminal_summary_knowledge_cutoff', side_effect=native_resolve):
+        with (
+            patch(MODULE + '_resolve_terminal_summary_knowledge_cutoff', side_effect=native_resolve),
+            patch('app.agent_context.retry_service.session_scope',
+                  side_effect=AssertionError('claim must reuse its locked transaction')),
+        ):
             result = self.claim()
         self.assertEqual(result['run_metadata']['preopen_summary_continuation'][
             'summary_feedback_run_id'], 'summary-retry')
@@ -346,6 +390,81 @@ class PreopenSummaryContinuationTests(unittest.TestCase):
                     continuation.result(timeout=5)
         with self.sessions.begin() as session:
             self.assertEqual(len(list(session.scalars(select(DailyPipelineRun)))), 1)
+
+
+    def test_native_partial_batch_and_exact_repair_use_latest_own_receipts(self):
+        role = ROLES[1]
+        with self.sessions.begin() as session:
+            original = session.scalar(select(AgentContextFeedbackRun).where(
+                AgentContextFeedbackRun.run_id == 'summary-child-' + role))
+            partial_request = {**deepcopy(original.request_payload), 'request_run_id': 'partial-child'}
+            session.add(AgentContextFeedbackRun(
+                run_id='partial-child', market_date=self.market_date, status='partial',
+                symbols_total=2, completed_count=1, failed_count=1,
+                request_payload=partial_request,
+                summary_payload={'failed_symbols_by_role': {role: [SELECTED[0]]}},
+                started_at=datetime(2040, 1, 10, 0, 56, tzinfo=timezone.utc),
+                completed_at=datetime(2040, 1, 10, 0, 57, tzinfo=timezone.utc),
+            ))
+            successful = session.scalar(select(AgentContextFeedback).where(
+                AgentContextFeedback.agent_name == role, AgentContextFeedback.symbol == SELECTED[1]))
+            successful.run_id = 'partial-child'
+            successful.received_at = datetime(2040, 1, 10, 0, 57, tzinfo=timezone.utc)
+            session.add(AgentContextFeedbackFailure(
+                market_date=self.market_date, symbol=SELECTED[0], agent_name=role,
+                run_id='partial-child', failure_kind='openclaw_transport_timeout',
+                retryable=True, summary_payload={},
+                received_at=datetime(2040, 1, 10, 0, 57, tzinfo=timezone.utc),
+            ))
+        with self.assertRaisesRegex(ValueError, 'child receipts'):
+            self.claim()
+        with self.sessions.begin() as session:
+            repair_request = {
+                **partial_request, 'request_run_id': 'exact-repair',
+                'symbols': [SELECTED[0]], 'requested_symbols': [SELECTED[0]],
+                'role_symbol_scopes': {role: [SELECTED[0]]},
+            }
+            session.add(AgentContextFeedbackRun(
+                run_id='exact-repair', market_date=self.market_date, status='completed',
+                symbols_total=1, completed_count=1, failed_count=0,
+                request_payload=repair_request,
+                started_at=datetime(2040, 1, 10, 0, 58, tzinfo=timezone.utc),
+                completed_at=datetime(2040, 1, 10, 0, 59, tzinfo=timezone.utc),
+            ))
+            repaired = session.scalar(select(AgentContextFeedback).where(
+                AgentContextFeedback.agent_name == role, AgentContextFeedback.symbol == SELECTED[0]))
+            repaired.run_id = 'exact-repair'
+            repaired.received_at = datetime(2040, 1, 10, 0, 59, tzinfo=timezone.utc)
+        self.assertIn('preopen_summary_continuation', self.claim()['run_metadata'])
+
+    def test_parent_string_without_native_child_context_is_still_a_newer_barrier(self):
+        with self.sessions.begin() as session:
+            session.add(AgentContextFeedbackRun(
+                run_id='forged-child', market_date=self.market_date, status='completed',
+                request_payload={'parent_run_id': 'summary-retry'},
+            ))
+        with self.assertRaisesRegex(ValueError, 'newer feedback'):
+            self.claim()
+
+    def test_valid_looking_latest_child_without_its_own_receipt_fails_closed(self):
+        with self.sessions.begin() as session:
+            original = session.scalar(select(AgentContextFeedbackRun).where(
+                AgentContextFeedbackRun.run_id == 'summary-child-' + ROLES[0]))
+            session.add(AgentContextFeedbackRun(
+                run_id='forged-receipt-child', market_date=self.market_date, status='completed',
+                symbols_total=2, completed_count=2, failed_count=0,
+                request_payload={**deepcopy(original.request_payload),
+                                 'request_run_id': 'forged-receipt-child'},
+                started_at=datetime(2040, 1, 10, 0, 58, tzinfo=timezone.utc),
+                completed_at=datetime(2040, 1, 10, 0, 59, tzinfo=timezone.utc),
+            ))
+        with self.assertRaisesRegex(ValueError, 'child receipts'):
+            self.claim()
+
+    def test_caller_must_preserve_original_membership_for_admission(self):
+        self.metadata['symbols'] = SELECTED
+        with self.assertRaisesRegex(ValueError, 'source contract mismatch: symbols'):
+            self.claim()
 
 
 class PreopenTargetSessionTests(unittest.TestCase):

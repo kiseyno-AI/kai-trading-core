@@ -11501,11 +11501,13 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
 
     def test_explicit_preopen_source_uses_only_atomic_native_claim_admission(self):
         service = DailyPipelineStageService()
+        full_scope = ['000001', '000002', '000003']
+        selected = full_scope[:2]
         proof = {
             'source_run_id': 'completed-preopen-summary',
             'feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
-            'requested_symbols': ['005930'],
-            'expected_completed_symbols': ['005930'],
+            'requested_symbols': full_scope,
+            'expected_completed_symbols': selected,
             'knowledge_cutoff_at': '2026-10-26T12:00:00+00:00',
             'fs_div': 'CFS',
         }
@@ -11523,12 +11525,30 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
             })
             return payload
 
+        resolution = {
+            'ready': True, 'source_run_id': proof['source_run_id'],
+            'feedback_scope_mode': proof['feedback_scope_mode'],
+            'knowledge_cutoff_at': datetime.fromisoformat(proof['knowledge_cutoff_at']),
+            'requested_symbols': selected,
+            'completed_scope_proof': {
+                'schema_version': 'completed_summarizer_intersection_v1',
+                'completed_symbols': selected, 'admitted_symbols': full_scope,
+            },
+        }
+
+        def execute_selected(stage_id, **kwargs):
+            if stage_id == 'signal_decider':
+                return _completed_decider_result_for_call(kwargs)
+            return {'status': 'completed'}
+
         with (
+            patch('app.eod.daily_pipeline_stages.resolve_latest_completed_summary_knowledge_cutoff',
+                  return_value=resolution) as resolve,
             patch.object(self.run_state_service, 'start_run', side_effect=native_claim) as claim,
-            patch.object(service, '_execute_stage', return_value={'status': 'completed'}) as execute,
+            patch.object(service, '_execute_stage', side_effect=execute_selected) as execute,
         ):
             service.run(
-                market_date='2026-10-26', symbols=['005930'],
+                market_date='2026-10-26', symbols=full_scope,
                 stages=['signal_decider', 'next_open_execution_plan'],
                 resume_from_stage='signal_decider', trigger='auto_eod_followup_resume',
                 reused_eod_collection_run_id=598, point_in_time_recovery=True,
@@ -11539,6 +11559,12 @@ class DailyPipelineStageServiceTests(unittest.TestCase):
         self.assertEqual(claim.call_args.kwargs['preopen_continuation_summary_proof'], proof)
         self.assertTrue(execute.call_args.kwargs['allow_same_day_intraday_watch_continuation'])
         self.assertFalse(execute.call_args.kwargs['allow_previous_session_preopen_recovery'])
+
+        self.assertEqual(claim.call_args.kwargs['run_metadata']['symbols'], full_scope)
+        self.assertEqual(resolve.call_args.kwargs['requested_symbols'], full_scope)
+        self.assertEqual([call.args[0] for call in execute.call_args_list],
+                         ['signal_decider', 'next_open_execution_plan'])
+        self.assertTrue(all(call.kwargs['symbols'] == selected for call in execute.call_args_list))
 
     def test_exact_auto_pitr_recovery_cannot_start_during_open(
         self,

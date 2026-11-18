@@ -630,10 +630,10 @@ def _preopen_summary_continuation_evidence(
             and all(isinstance(role, str) for role in request['roles']),
             'summary membership or role proof missing')
     requested = normalize_symbol_codes(request.get('requested_symbols'))
-    selected = normalize_symbol_codes(request.get('symbols'))
+    selected = sorted(normalize_symbol_codes(request.get('symbols')))
     cutoff = aware(request.get('knowledge_cutoff_at'))
     require(requested and requested == request['requested_symbols'] == metadata.get('symbols')
-            and selected and selected == request['symbols']
+            and selected and len(selected) == len(request['symbols'])
             and set(selected).issubset(requested)
             and request['market_date'] == request['policy_context_as_of_date'] == market_date.isoformat()
             and request['point_in_time_recovery'] is False
@@ -642,7 +642,10 @@ def _preopen_summary_continuation_evidence(
             and request['feedback_scope_mode'] == FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH
             and request['fs_div'] == metadata.get('fs_div')
             and set(request['roles']) == set(SUMMARIZER_AGENT_NAMES)
-            and request['role_symbol_scopes'] == {r: selected for r in SUMMARIZER_AGENT_NAMES}
+            and isinstance(request['role_symbol_scopes'], dict)
+            and set(request['role_symbol_scopes']) == set(SUMMARIZER_AGENT_NAMES)
+            and all(isinstance(scope, list) and sorted(scope) == selected
+                    for scope in request['role_symbol_scopes'].values())
             and request['admission_scope_by_role'] == {r: requested for r in SUMMARIZER_AGENT_NAMES}
             and summary.completed_count == len(selected) * len(SUMMARIZER_AGENT_NAMES)
             and cutoff is not None and cutoff < source_started
@@ -660,12 +663,74 @@ def _preopen_summary_continuation_evidence(
             daily_price_bar_has_current_eod_run_provenance(eod_id),
         )))
     require(persisted == set(requested), 'source EOD does not cover the frozen membership')
+    # Runtime batches and exact failed-key repairs belong to the pinned
+    # summary, rather than superseding it. Validate their frozen context,
+    # then let the native latest-child/own-receipt rules prove all role keys.
+    from app.agent_context.retry_service import (
+        CHILD_RUN_LINEAGE_SCHEMA_VERSION,
+        agent_feedback_retry_service,
+    )
+    require(all(payload.get('child_run_lineage') == {
+        'schema_version': CHILD_RUN_LINEAGE_SCHEMA_VERSION,
+        'parent_run_id': run_id, 'child_link_field': 'parent_run_id',
+    } for payload, run_id in ((request, parent_id), (retry, summary_id))),
+        'native parent child-lineage contract missing')
+
+    def owned_summary_child(row: AgentContextFeedbackRun) -> bool:
+        payload = row.request_payload or {}
+        child_roles = payload.get('roles')
+        scopes = payload.get('role_symbol_scopes')
+        if not (
+            isinstance(child_roles, list) and child_roles
+            and all(isinstance(role, str) for role in child_roles)
+            and len(child_roles) == len(set(child_roles))
+            and set(child_roles).issubset(SUMMARIZER_AGENT_NAMES)
+            and isinstance(scopes, dict) and set(scopes) == set(child_roles)
+            and all(isinstance(scope, list) and scope
+                    and all(isinstance(symbol, str) for symbol in scope)
+                    and len(scope) == len(set(scope))
+                    and set(scope).issubset(selected) for scope in scopes.values())
+        ):
+            return False
+        child_symbols = sorted(set().union(*(set(scope) for scope in scopes.values())))
+        child_started = aware(row.started_at)
+        child_completed = aware(row.completed_at)
+        represented = [payload]
+        echoed_request = (row.summary_payload or {}).get('request')
+        if isinstance(echoed_request, dict):
+            represented.append(echoed_request)
+        return bool(child_started is not None and child_completed is not None
+            and row.status in {'completed', 'completed_with_failures', 'partial', 'failed', 'abandoned'}
+            and summary_started <= child_started <= child_completed <= summary_completed
+            and all(p.get('parent_run_id') == summary_id
+                and p.get('request_run_id') == row.run_id
+                and p.get('mode') == 'role_sequential_runtime_buffered'
+                and p.get('market_date') == market_date.isoformat()
+                and p.get('policy_context_as_of_date') == request['policy_context_as_of_date']
+                and p.get('fs_div') == request['fs_div']
+                and p.get('point_in_time_recovery') is request['point_in_time_recovery']
+                and p.get('feedback_scope_mode') == request['feedback_scope_mode']
+                and aware(p.get('knowledge_cutoff_at')) == cutoff
+                and p.get('roles') == child_roles and p.get('role_symbol_scopes') == scopes
+                and isinstance(p.get('symbols'), list) and sorted(p['symbols']) == child_symbols
+                and isinstance(p.get('requested_symbols'), list)
+                and sorted(p['requested_symbols']) == child_symbols
+                for p in represented))
+
     newer = list(session.scalars(select(AgentContextFeedbackRun).where(
         AgentContextFeedbackRun.market_date == market_date,
         AgentContextFeedbackRun.id > summary.id).with_for_update()))
-    require(not any(set((row.request_payload or {}).get('roles') or ())
-                    & (set(SUMMARIZER_AGENT_NAMES) | {'signal-decider', 'short-term-decider'})
-                    for row in newer), 'newer feedback cohort supersedes this summary')
+    require(all(owned_summary_child(row) for row in newer),
+            'newer feedback cohort supersedes this summary')
+    receipts = agent_feedback_retry_service._load_same_day_terminal_symbols(
+        market_date=market_date, roles=SUMMARIZER_AGENT_NAMES, symbols=selected,
+        required_parent_run_id=summary_id, knowledge_cutoff_at=cutoff,
+        source_run_session=session,
+    )
+    require(all(receipts.completed_by_role.get(role, set()) == set(selected)
+                and not receipts.failed_by_role.get(role, set())
+                for role in SUMMARIZER_AGENT_NAMES),
+            'latest native summary child receipts are incomplete')
     resolved = _resolve_terminal_summary_knowledge_cutoff(
         market_date=market_date, source_run_id=summary_id,
         feedback_scope_mode=request['feedback_scope_mode'], requested_symbols=requested,

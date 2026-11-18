@@ -23,6 +23,13 @@ writer, before taking row locks. The retry writer does not acquire EOD or
 pipeline fences inside its admission transaction. This order prevents a new
 feedback cohort from being inserted between the newer-cohort check and commit.
 
+The caller preserves the original requested membership in `symbols` and
+`summary_cutoff_proof.requested_symbols` (for example, 2,770 symbols), while
+`expected_completed_symbols` is the canonical sorted completed intersection
+(for example, 120). The frozen parent request keeps its original ranked order.
+Native stage resolution narrows both decider and plan invocation to the proven
+completed cohort; preserving the admission membership does not broaden models.
+
 Under that transaction, the claim requires:
 
 - The actual owned daily-price EOD fence, exact automatic decider/plan suffix,
@@ -34,8 +41,8 @@ Under that transaction, the claim requires:
   the original requested subset. The EOD universe may contain extra symbols.
 - The exact original feedback parent and direct retry link, frozen requested
   membership, per-role scopes, CFS/policy/cutoff/mode, and aware causal timestamps.
-- A fully completed retry started before target OPEN, no newer summarizer or
-  decider cohort, and validation by the existing completed-summary resolver in
+- A fully completed retry started before target OPEN, no newer unrelated
+  feedback cohort, and validation by the existing completed-summary resolver in
   the same transaction. Caller-provided proof cannot replace persisted proof.
 
 The claim creates a **new** pipeline cohort with the native
