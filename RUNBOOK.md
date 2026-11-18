@@ -388,6 +388,27 @@ neither decider are not failures or entry-economics exclusions. Preserve the
 validated `source_summary_scope` in the native result when reconciling completion;
 do not reconstruct it from later funnel diagnostics or rerun successful models.
 
+### Gateway temporary storage on macOS
+
+A startup trace located an event-loop stall in `fs.accessSync` with
+`W_OK | X_OK` during terminal-upload staging cleanup on external temporary
+storage. Unrelated metadata awaits stopped progressing while that synchronous
+call blocked. This proves a filesystem-access stall; it does not establish TCC
+as the cause.
+
+For this host, use the idle maintenance gate above and restore only Gateway's
+`TMPDIR` to the value of `/usr/bin/getconf DARWIN_USER_TEMP_DIR` in its existing
+managed service environment and LaunchAgent `EnvironmentVariables`. Restart the
+original managed service and verify its effective `TMPDIR`. Other disposable
+Gateway caches that honor `TMPDIR` also use OS scratch. Keep durable OpenClaw
+state, agent databases and config on their existing external-storage paths,
+with authentication, provider/model settings and security controls unchanged.
+
+Verify Gateway health/readiness and the exact missing model-recovery scope
+before declaring recovery complete; preserve completed daily results. Recheck
+the effective `TMPDIR` after service reinstall/update: the macOS service
+generator currently derives its default temporary directory from the state path.
+
 ### OpenClaw 2026.10.5 plugin capture copy workaround
 
 The [copy-only patch](ops/patches/openclaw-2026.10.5-plugin-capture-copy-only.patch)
@@ -476,6 +497,32 @@ backup suffix `.pre-configured-search-scope` instead of `.pre-copy-only`.
 
 This changes a different module from the copy workaround; hash and roll back each
 independently. Revalidate both patches after any package reinstall or upgrade.
+
+### OpenClaw 2026.10.5 readable native-catalog config
+
+The [catalog-read patch](ops/patches/openclaw-2026.10.5-readable-catalog-config.patch)
+uses the same version/build pin above. `hasReadableNativeCatalogConfig` stalled
+in `accessSync(R_OK)` on the external config. After the existing `lstat`/`stat`
+regular-file admission, macOS processes with matching real/effective UID and GID
+probe with `O_RDONLY | O_NONBLOCK`, confirm the opened descriptor is a regular
+file with `fstat`, and close it in `finally`. Other platforms and differing
+real/effective IDs retain `accessSync(R_OK)`. The probe reads no file contents
+and changes no permissions.
+
+The actual external-config probe returned readable in 0.032 ms with one open,
+one close, zero access calls and zero content reads. All 19 private fixture
+checks passed, including mode-000 denial, symlinks, FIFOs, path races, descriptor
+cleanup, and platform/identity fallback.
+
+Reuse the stopped-maintenance apply/rollback procedure above with these values
+and backup suffix `.pre-readable-catalog-config`:
+
+| Field | Value |
+| --- | --- |
+| Module | `/opt/homebrew/lib/node_modules/openclaw/dist/registry-HOGUZGcB.mjs` |
+| Patch | `ops/patches/openclaw-2026.10.5-readable-catalog-config.patch` |
+| Baseline SHA-256 | `abc7531223afc0b3e0bb74cdb93a68b7a47e1a1d71f660b02e6a432c96b9bc5d` |
+| Patched SHA-256 | `b32ee100bbf66faf317368e4099715b3eb925488bce56f6a88131239728844b9` |
 
 ## Runtime write-path schema drift diagnostics
 
