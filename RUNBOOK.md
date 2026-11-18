@@ -409,6 +409,30 @@ before declaring recovery complete; preserve completed daily results. Recheck
 the effective `TMPDIR` after service reinstall/update: the macOS service
 generator currently derives its default temporary directory from the state path.
 
+### Same-version Codex executable on internal storage
+
+After the Gateway maintenance gate above, the [supported binary override](https://docs.openclaw.ai/plugins/codex-harness-reference/app-server-transport#environment-overrides)
+`OPENCLAW_CODEX_APP_SERVER_BIN` can select an internal copy of the bundled native
+Codex `0.160.0` executable when `appServer.command` is unset. Set only this value
+in the existing managed service environment and LaunchAgent environment, using
+the literal absolute executable path, including any spaces.
+
+Require the same 241555024 bytes and SHA-256
+`112fae7a5a1223e673c8a1791d32338f37df8b527ff1159bb8adac6c4dbf1b4b`;
+preserve executable mode and every security xattr, including provenance and
+quarantine state, with the source package unchanged. Durable state, databases,
+config, agent `CODEX_HOME`, home scope, working directory, model/auth settings
+and [ephemeral credential isolation](https://docs.openclaw.ai/plugins/codex-harness-reference/auth#auth-and-environment-isolation)
+retain their existing values.
+
+Verify the selected binary's version and initialization in that same agent
+context, then require a valid native feedback receipt bound to its original
+parent/child scope with prior reused results unchanged. Initialization alone
+does not prove model recovery. The latest matched Node LaunchAgent read probe
+passed in 9.802 ms; managed Gateway/autostart verification remains pending until
+active producers finish. Revalidate binary identity and selection after updates;
+full daily completion requires its own native completion proof.
+
 ### OpenClaw 2026.10.5 plugin capture copy workaround
 
 The [copy-only patch](ops/patches/openclaw-2026.10.5-plugin-capture-copy-only.patch)
