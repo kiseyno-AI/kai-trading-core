@@ -3084,6 +3084,16 @@ class EODPipelineStatusService:
             official_run = history_item.get('run') if isinstance(history_item.get('run'), dict) else None
             if not isinstance(official_stage, dict) or not isinstance(official_run, dict):
                 continue
+            if (
+                stage_id == 'signal_decider'
+                and dict(fallback_stage.get('details') or {}).get('mode')
+                == 'derived_from_signal_decider_outputs'
+                and any(
+                    str(record.get('market_date') or '') != market_date
+                    for record in (official_stage, official_run)
+                )
+            ):
+                continue
             if self._should_preserve_stored_coverage_stage(
                 stage_id=stage_id,
                 fallback_stage=fallback_stage,
@@ -4359,7 +4369,26 @@ class EODPipelineStatusService:
                         stage=current,
                     )
                 )
-                if not (
+                current_details = dict(current.get('details') or {})
+                candidate_proof = dict(details.get('completion_scope_proof') or {})
+                # A signal-only row count carries no two-role cohort identity.
+                derived_decider_count = bool(
+                    stage_id == 'signal_decider'
+                    and current_details.get('mode')
+                    == 'derived_from_signal_decider_outputs'
+                    and str(current.get('status') or '').strip().lower()
+                    == 'completed'
+                    and not current.get('source_run_ids')
+                    and 'completion_scope_proof' not in current_details
+                    and current.get('market_date')
+                    and current.get('market_date') == candidate.get('market_date')
+                    and candidate_scope_identity is not None
+                    and source_run_ids.get('signal_decider_run_id')
+                    == candidate_proof.get('source_run_id')
+                    and source_run_ids.get('source_summary_run_id')
+                    == candidate_proof.get('source_summary_run_id')
+                )
+                if not derived_decider_count and not (
                     candidate_total == current_total
                     and candidate_scope_identity is not None
                     and candidate_scope_identity

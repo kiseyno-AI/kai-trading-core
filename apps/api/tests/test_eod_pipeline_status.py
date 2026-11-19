@@ -9866,6 +9866,136 @@ class EODPipelineStatusServiceTests(unittest.TestCase):
                 )
                 self.assertNotEqual(built_stage['status'], 'completed')
 
+    def test_read_restores_decider_proof_over_signal_only_count_for_plan_only_run(self):
+        market_date = '2026-10-07'
+        decider = _completed_signal_decider_history_stage(
+            run_id=676, market_date=market_date, symbol_count=2,
+            updated_at='2026-10-07T14:00:00+00:00',
+        )
+        plan = _completed_next_open_history_stage(
+            run_id=676, market_date=market_date, total=2,
+            updated_at='2026-10-07T14:01:00+00:00',
+        )
+        latest_run = {
+            **plan['run'], 'id': 677,
+            'stages': {'next_open_execution_plan': plan['stage']},
+        }
+        service = EODPipelineStatusService(
+            market_state_loader=lambda: _FakeMarketState(),
+            pykrx_run_loader=lambda **_: None,
+            pykrx_stage_counts_loader=lambda *_: {},
+            live_symbol_count_loader=lambda: 2,
+            fundamentals_refresh_loader=lambda **_: None,
+            official_run_loader=lambda **_: latest_run,
+            official_stage_history_loader=lambda **_: {'signal_decider': decider},
+            signal_decider_counts_loader=lambda **_: {
+                'feedback_rows': 2, 'decision_snapshots': 2,
+                'updated_at': '2026-10-07T13:59:00+00:00',
+            },
+        )
+
+        for requested_date in (None, market_date):
+            with self.subTest(market_date=requested_date):
+                result = service.read(market_date=requested_date)
+                stage = result['stages']['signal_decider']
+                self.assertEqual(stage['total'], 4)
+                self.assertEqual(stage['processed'], 4)
+                self.assertEqual(stage['status'], 'completed')
+                self.assertEqual(stage['source_run_ids']['signal_decider_run_id'],
+                                 decider['stage']['source_run_ids']['signal_decider_run_id'])
+                self.assertEqual(stage['details']['completion_scope_proof'],
+                                 decider['stage']['details']['completion_scope_proof'])
+                self.assertEqual(result['stages']['next_open_execution_plan']['status'],
+                                 'completed')
+
+    def test_count_fallback_recovery_rejects_newer_or_different_decider_authority(self):
+        service = EODPipelineStatusService()
+        history = _completed_signal_decider_history_stage(
+            run_id=676, market_date='2026-10-07', symbol_count=2,
+            updated_at='2026-10-07T14:00:00+00:00',
+        )['stage']
+        baseline = service._build_signal_decider_stage(
+            market_date='2026-10-07',
+            aggregate={'feedback_rows': 2, 'updated_at': '2026-10-07T13:59:00+00:00'},
+        )
+        for case in (
+            'newer_count', 'wrong_date', 'wrong_parent', 'wrong_summary',
+            'invalid_proof', 'larger_count', 'real_source', 'real_proof',
+            'blocked', 'failed', 'running', 'partial',
+        ):
+            with self.subTest(case=case):
+                candidate, current = deepcopy(history), deepcopy(baseline)
+                if case == 'newer_count':
+                    current['updated_at'] = '2026-10-07T14:01:00+00:00'
+                elif case == 'wrong_date':
+                    candidate['market_date'] = '2026-10-06'
+                elif case == 'wrong_parent':
+                    candidate['source_run_ids']['signal_decider_run_id'] = 'other-parent'
+                elif case == 'wrong_summary':
+                    candidate['source_run_ids']['source_summary_run_id'] = 'other-summary'
+                elif case == 'invalid_proof':
+                    candidate['details']['completion_scope_proof']['proof_digest'] = 'invalid'
+                elif case == 'larger_count':
+                    current['total'] = 5
+                elif case == 'real_source':
+                    current['source_run_ids'] = {'signal_decider_run_id': 'new-parent'}
+                elif case == 'real_proof':
+                    current['details']['completion_scope_proof'] = deepcopy(
+                        history['details']['completion_scope_proof']
+                    )
+                else:
+                    current['status'] = case
+                self.assertFalse(service._recovery_state_is_newer(
+                    stage_id='signal_decider', candidate=candidate,
+                    current=current, candidate_is_history=True,
+                ))
+
+    def test_read_keeps_plan_blocked_for_history_from_another_session_or_parent(self):
+        for case in ('stage_date', 'run_date', 'plan_parent', 'newer_failed_run'):
+            with self.subTest(case=case):
+                market_date = '2026-10-07'
+                decider = _completed_signal_decider_history_stage(
+                    run_id=676, market_date=market_date, symbol_count=2,
+                    updated_at='2026-10-07T14:00:00+00:00',
+                )
+                plan = _completed_next_open_history_stage(
+                    run_id=675 if case == 'plan_parent' else 676,
+                    market_date=market_date, total=2,
+                    updated_at='2026-10-07T14:01:00+00:00',
+                )
+                latest_run = {
+                    **plan['run'], 'id': 677,
+                    'stages': {'next_open_execution_plan': plan['stage']},
+                }
+                if case in ('stage_date', 'run_date'):
+                    decider['stage' if case == 'stage_date' else 'run'][
+                        'market_date'
+                    ] = '2026-10-06'
+                elif case == 'newer_failed_run':
+                    latest_run['stages']['signal_decider'] = _incomplete_official_stage(
+                        run_id=677, stage_id='signal_decider', market_date=market_date,
+                        status='failed', updated_at='2026-10-07T14:02:00+00:00',
+                        succeeded=1, failed=1,
+                    )['stage']
+                service = EODPipelineStatusService(
+                    market_state_loader=lambda: _FakeMarketState(),
+                    pykrx_run_loader=lambda **_: None,
+                    pykrx_stage_counts_loader=lambda *_: {},
+                    live_symbol_count_loader=lambda: 2,
+                    fundamentals_refresh_loader=lambda **_: None,
+                    official_run_loader=lambda **_: latest_run,
+                    official_stage_history_loader=lambda **_: {'signal_decider': decider},
+                    signal_decider_counts_loader=lambda **_: {
+                        'feedback_rows': 2, 'updated_at': '2026-10-07T13:59:00+00:00',
+                    },
+                )
+                result = service.read(market_date=market_date)
+                self.assertEqual(result['stages']['next_open_execution_plan']['status'], 'blocked')
+                if case == 'newer_failed_run':
+                    self.assertEqual(result['stages']['signal_decider']['status'], 'failed')
+                elif case in ('stage_date', 'run_date'):
+                    self.assertEqual(result['stages']['signal_decider']['total'], 2)
+
     def test_read_prefers_newer_completed_decision_history_over_stale_blocked_overlays(self):
         market_date = '2026-10-07'
         for stage_id in ('signal_decider', 'next_open_execution_plan'):
