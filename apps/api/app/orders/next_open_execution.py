@@ -7790,9 +7790,10 @@ class SignalDeciderNextOpenExecutionService:
                 if (
                     observed_at is not None
                     and _is_krx_next_open_snapshot(snapshot)
-                    and weekly_policy_binding(source_parent_by_id.get(
-                        source_parent_run_id_by_key.get(key), {},
-                    )) is None
+                    and not any(
+                        key in bound_scope
+                        for bound_scope in weekly_policy_bound_scope_keys_by_parent.values()
+                    )
                     and (
                         (
                             _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME

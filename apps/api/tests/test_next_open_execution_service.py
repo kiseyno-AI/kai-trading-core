@@ -3808,18 +3808,44 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['items'], [])
 
     def test_late_weekly_rejection_cannot_restore_sibling_buy_authority(self) -> None:
+        self._assert_late_weekly_rejection_keeps_atomic_entry_fence()
+
+    def test_targeted_late_rejection_cannot_restore_weekly_sibling_buy(self) -> None:
+        self._assert_late_weekly_rejection_keeps_atomic_entry_fence(targeted_overlay=True)
+
+    def _assert_late_weekly_rejection_keeps_atomic_entry_fence(
+        self, *, targeted_overlay: bool = False,
+    ) -> None:
         self.agent_context_completeness_patcher.stop()
         self.agent_context_from_state_patcher.stop()
         settings.signal_decider_exec_integration_mode = 'dispatch'
         self._seed_completed_weekly_policy_cohort(
             symbols=['000660', '005930'],
-            signal_actions_by_symbol={'005930': 'reject'},
-            snapshot_received_at_by_key={
+            signal_actions_by_symbol=None if targeted_overlay else {'005930': 'reject'},
+            snapshot_received_at_by_key=None if targeted_overlay else {
                 ('005930', 'signal-decider'): datetime(
                     2026, 4, 30, 0, 15, tzinfo=timezone.utc,
                 ),
             },
         )
+        if targeted_overlay:
+            parent_run_id = f'weekly-overlay-{uuid4().hex[:10]}'
+            child_run_id = f'{parent_run_id}-signal'
+            observed_at = datetime(2026, 4, 30, 0, 15, tzinfo=timezone.utc)
+            self._seed_feedback_run(
+                run_id=parent_run_id, symbols=['005930'], roles=['signal-decider'],
+                started_at=observed_at, mode='daily_retry_cycle_role_sequenced',
+                scope='requested_symbols_scored_by_strategy_aware_prefilter',
+                child_run_lineage=True,
+            )
+            self._seed_feedback_run(
+                run_id=child_run_id, symbols=['005930'], roles=['signal-decider'],
+                started_at=observed_at, parent_run_id=parent_run_id,
+            )
+            self._seed_snapshot(
+                symbol='005930', next_day_open_action='reject',
+                decision_run_id=child_run_id, feedback_received_at=observed_at,
+            )
         with (
             patch(
                 'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
