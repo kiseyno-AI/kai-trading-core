@@ -3056,6 +3056,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         started_at: datetime | None = None,
         short_term_action: str = 'watch_for_trigger',
         signal_action: str = 'buy',
+        signal_actions_by_symbol: dict[str, str] | None = None,
     ) -> tuple[str, str, str]:
         normalized_symbols = sorted(symbols)
         roles = ['short-term-decider', 'signal-decider']
@@ -3140,7 +3141,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self._seed_snapshot(
                 symbol=symbol,
-                next_day_open_action=signal_action,
+                next_day_open_action=(signal_actions_by_symbol or {}).get(symbol, signal_action),
                 decision_run_id=signal_child,
                 feedback_received_at=received_at_by_key.get(
                     (symbol, 'signal-decider')
@@ -3741,6 +3742,200 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             late_snapshot_id,
         )
         self.assertNotEqual(older_snapshot_id, late_snapshot_id)
+
+    def test_refresh_keeps_late_reject_and_avoid_as_terminal_completion(self) -> None:
+        self.agent_context_completeness_patcher.stop()
+        self.agent_context_from_state_patcher.stop()
+        parent_run_id = f'late-terminal-{uuid4().hex[:10]}'
+        short_run_id = f'{parent_run_id}-short'
+        signal_run_id = f'{parent_run_id}-signal'
+        symbols = ['000660', '005930', '035420']
+        self._seed_feedback_run(
+            run_id=parent_run_id,
+            symbols=symbols,
+            roles=['short-term-decider', 'signal-decider'],
+            role_symbol_scopes={
+                'short-term-decider': ['000660', '035420'],
+                'signal-decider': ['005930'],
+            },
+            started_at=datetime(2026, 4, 29, 23, 0, tzinfo=timezone.utc),
+            symbols_total=3,
+            completed_count=3,
+            mode='daily_retry_cycle_role_sequenced',
+            child_run_lineage=True,
+        )
+        self._seed_snapshot(symbol='005930')
+        self._seed_short_term_snapshot(symbol='000660')
+        observed_at = datetime(2026, 4, 30, 0, 15, tzinfo=timezone.utc)
+        for run_id, role, role_symbols in (
+            (short_run_id, 'short-term-decider', ['000660', '035420']),
+            (signal_run_id, 'signal-decider', ['005930']),
+        ):
+            self._seed_feedback_run(
+                run_id=run_id,
+                symbols=role_symbols,
+                roles=[role],
+                started_at=observed_at,
+                parent_run_id=parent_run_id,
+            )
+        for symbol, action in [('000660', 'reject'), ('035420', 'avoid_chase')]:
+            self._seed_short_term_snapshot(
+                symbol=symbol,
+                tactical_action=action,
+                decision_run_id=short_run_id,
+                feedback_received_at=observed_at,
+            )
+        self._seed_snapshot(
+            symbol='005930',
+            next_day_open_action='reject',
+            decision_run_id=signal_run_id,
+            feedback_received_at=observed_at,
+        )
+
+        result = self._service(server_time='2026-04-30T09:20:00+09:00').refresh_plan_items(
+            target_trade_date=self.target_trade_date,
+            trigger='late_terminal_completion',
+        )
+
+        self.assertEqual(
+            result['summary']['agent_context_completeness']['cohort_status'],
+            'complete',
+            result['summary']['agent_context_completeness'],
+        )
+        self.assertEqual(result['completion_manifest']['decision_count'], 3)
+        self.assertEqual(result['completion_manifest']['excluded_decision_count'], 3)
+        self.assertEqual(result['completion_manifest']['incomplete_decision_count'], 0)
+        self.assertEqual(result['items'], [])
+
+    def test_late_weekly_rejection_cannot_restore_sibling_buy_authority(self) -> None:
+        self._assert_late_weekly_rejection_keeps_atomic_entry_fence()
+
+    def test_targeted_late_rejection_cannot_restore_weekly_sibling_buy(self) -> None:
+        self._assert_late_weekly_rejection_keeps_atomic_entry_fence(targeted_overlay=True)
+
+    def _assert_late_weekly_rejection_keeps_atomic_entry_fence(
+        self, *, targeted_overlay: bool = False,
+    ) -> None:
+        self.agent_context_completeness_patcher.stop()
+        self.agent_context_from_state_patcher.stop()
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_completed_weekly_policy_cohort(
+            symbols=['000660', '005930'],
+            signal_actions_by_symbol=None if targeted_overlay else {'005930': 'reject'},
+            snapshot_received_at_by_key=None if targeted_overlay else {
+                ('005930', 'signal-decider'): datetime(
+                    2026, 4, 30, 0, 15, tzinfo=timezone.utc,
+                ),
+            },
+        )
+        if targeted_overlay:
+            parent_run_id = f'weekly-overlay-{uuid4().hex[:10]}'
+            child_run_id = f'{parent_run_id}-signal'
+            observed_at = datetime(2026, 4, 30, 0, 15, tzinfo=timezone.utc)
+            self._seed_feedback_run(
+                run_id=parent_run_id, symbols=['005930'], roles=['signal-decider'],
+                started_at=observed_at, mode='daily_retry_cycle_role_sequenced',
+                scope='requested_symbols_scored_by_strategy_aware_prefilter',
+                child_run_lineage=True,
+            )
+            self._seed_feedback_run(
+                run_id=child_run_id, symbols=['005930'], roles=['signal-decider'],
+                started_at=observed_at, parent_run_id=parent_run_id,
+            )
+            self._seed_snapshot(
+                symbol='005930', next_day_open_action='reject',
+                decision_run_id=child_run_id, feedback_received_at=observed_at,
+            )
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+            patch(
+                'app.orders.next_open_execution._current_live_market_buy_authority',
+                return_value={'applies': True, 'action': 'allow'},
+            ),
+            patch(
+                'app.orders.next_open_execution._next_open_performance_cost_evidence',
+                return_value=(0, 'quote_spread_bps'),
+            ),
+        ):
+            result = self._service(server_time='2026-04-30T09:20:00+09:00').refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='late_weekly_terminal_completion',
+            )
+
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['items'], [])
+        self.assertEqual(result['completion_manifest']['incomplete_decision_count'], 4)
+
+    def test_scope_expires_late_unknown_unbounded_and_unproven_decisions(self) -> None:
+        from app.orders.next_open_execution import decision_snapshot_observed_at_utc
+
+        observed_at = datetime(2026, 4, 30, 0, 15, tzinfo=timezone.utc)
+        malformed_id = self._seed_short_term_snapshot(
+            symbol='005930', tactical_action='wait',
+            trigger_price=None, chase_limit_price=None,
+            target_price=None, stop_loss_price=None,
+            feedback_received_at=observed_at,
+        )
+        with session_scope() as session:
+            row = session.get(SignalDeciderDecisionSnapshot, malformed_id)
+            row.response_payload = {
+                **row.response_payload,
+                'tactical_action': {'action': 'reject'},
+                'preferred_action': None,
+            }
+        expected_expired = {
+            malformed_id,
+            self._seed_short_term_snapshot(
+                symbol='000660', tactical_action='unexpected',
+                trigger_price=None, chase_limit_price=None,
+                target_price=None, stop_loss_price=None,
+                feedback_received_at=observed_at,
+            ),
+            self._seed_short_term_snapshot(
+                symbol='035420', tactical_action=None,
+                trigger_price=None, chase_limit_price=None,
+                target_price=None, stop_loss_price=None,
+                feedback_received_at=observed_at,
+            ),
+            self._seed_snapshot(
+                symbol='051910', next_day_open_action='unexpected',
+                feedback_received_at=observed_at,
+            ),
+            self._seed_snapshot(
+                symbol='068270', next_day_open_action='wait',
+                feedback_received_at=observed_at,
+            ),
+            self._seed_snapshot(
+                symbol='012345', market='NASDAQ', next_day_open_action='reject',
+                feedback_received_at=observed_at,
+            ),
+        }
+        untimed_id = self._seed_snapshot(
+            symbol='012346', next_day_open_action='reject',
+            feedback_received_at=observed_at,
+        )
+        expected_expired.add(untimed_id)
+        with patch(
+            'app.orders.next_open_execution.decision_snapshot_observed_at_utc',
+            side_effect=lambda snapshot: (
+                None if snapshot.id == untimed_id
+                else decision_snapshot_observed_at_utc(snapshot)
+            ),
+        ):
+            state = self._service()._load_latest_decider_scope_state(
+                source_market_date=self.market_date,
+                target_trade_date=self.target_trade_date,
+                allow_post_open_intraday_watch=True,
+            )
+
+        self.assertEqual(
+            {row['snapshot_id'] for row in state['expired_snapshot_by_key'].values()},
+            expected_expired,
+        )
+        self.assertTrue(all(snapshot is None for snapshot in state['selected_by_key'].values()))
 
     def test_scope_allows_late_watch_only_for_bounded_intraday_authority(
         self,
