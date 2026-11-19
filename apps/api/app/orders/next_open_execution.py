@@ -7786,6 +7786,23 @@ class SignalDeciderNextOpenExecutionService:
                     ),
                     'target_open_at': target_open_at.isoformat(),
                 }
+                # Negative terminal decisions retain completion evidence without entry authority.
+                if (
+                    observed_at is not None
+                    and _is_krx_next_open_snapshot(snapshot)
+                    and (
+                        (
+                            _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
+                            and _effective_short_term_tactical_action(snapshot)
+                            in {'reject', 'avoid_chase'}
+                        )
+                        or (
+                            _snapshot_agent_name(snapshot) == SIGNAL_DECIDER_AGENT_NAME
+                            and _effective_signal_action(snapshot) == 'reject'
+                        )
+                    )
+                ):
+                    continue
                 if (
                     allow_post_open_intraday_watch
                     and _is_bounded_intraday_watch_snapshot(snapshot)
