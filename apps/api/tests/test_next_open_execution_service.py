@@ -3056,6 +3056,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         started_at: datetime | None = None,
         short_term_action: str = 'watch_for_trigger',
         signal_action: str = 'buy',
+        signal_actions_by_symbol: dict[str, str] | None = None,
     ) -> tuple[str, str, str]:
         normalized_symbols = sorted(symbols)
         roles = ['short-term-decider', 'signal-decider']
@@ -3140,7 +3141,7 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self._seed_snapshot(
                 symbol=symbol,
-                next_day_open_action=signal_action,
+                next_day_open_action=(signal_actions_by_symbol or {}).get(symbol, signal_action),
                 decision_run_id=signal_child,
                 feedback_received_at=received_at_by_key.get(
                     (symbol, 'signal-decider')
@@ -3805,6 +3806,42 @@ class NextOpenExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['completion_manifest']['excluded_decision_count'], 3)
         self.assertEqual(result['completion_manifest']['incomplete_decision_count'], 0)
         self.assertEqual(result['items'], [])
+
+    def test_late_weekly_rejection_cannot_restore_sibling_buy_authority(self) -> None:
+        self.agent_context_completeness_patcher.stop()
+        self.agent_context_from_state_patcher.stop()
+        settings.signal_decider_exec_integration_mode = 'dispatch'
+        self._seed_completed_weekly_policy_cohort(
+            symbols=['000660', '005930'],
+            signal_actions_by_symbol={'005930': 'reject'},
+            snapshot_received_at_by_key={
+                ('005930', 'signal-decider'): datetime(
+                    2026, 4, 30, 0, 15, tzinfo=timezone.utc,
+                ),
+            },
+        )
+        with (
+            patch(
+                'app.orders.next_open_execution.load_daily_bars_for_symbol_range',
+                return_value=[{'trade_date': '2026-04-29', 'close_price': 50000}],
+            ),
+            patch(
+                'app.orders.next_open_execution._current_live_market_buy_authority',
+                return_value={'applies': True, 'action': 'allow'},
+            ),
+            patch(
+                'app.orders.next_open_execution._next_open_performance_cost_evidence',
+                return_value=(0, 'quote_spread_bps'),
+            ),
+        ):
+            result = self._service(server_time='2026-04-30T09:20:00+09:00').refresh_plan_items(
+                target_trade_date=self.target_trade_date,
+                trigger='late_weekly_terminal_completion',
+            )
+
+        self.assertEqual(result['summary']['eligible_count'], 0)
+        self.assertEqual(result['items'], [])
+        self.assertEqual(result['completion_manifest']['incomplete_decision_count'], 4)
 
     def test_scope_expires_late_unknown_unbounded_and_unproven_decisions(self) -> None:
         from app.orders.next_open_execution import decision_snapshot_observed_at_utc

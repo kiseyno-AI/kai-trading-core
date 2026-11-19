@@ -7786,10 +7786,13 @@ class SignalDeciderNextOpenExecutionService:
                     ),
                     'target_open_at': target_open_at.isoformat(),
                 }
-                # Negative terminal decisions retain completion evidence without entry authority.
+                # Daily negative decisions retain completion evidence without entry authority.
                 if (
                     observed_at is not None
                     and _is_krx_next_open_snapshot(snapshot)
+                    and weekly_policy_binding(source_parent_by_id.get(
+                        source_parent_run_id_by_key.get(key), {},
+                    )) is None
                     and (
                         (
                             _snapshot_agent_name(snapshot) == SHORT_TERM_DECIDER_AGENT_NAME
