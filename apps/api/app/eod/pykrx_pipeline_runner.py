@@ -1344,6 +1344,8 @@ def _agent_followup_feeds_downstream(
     first-run rule in ``app.eod.agent_chain_gates``.
     """
 
+    if result.get('completion_authority_status') == 'invalid':
+        return False
     if _is_satisfied_followup_result(result, stage_id=stage_id):
         return True
     return finished_partial_feeds_downstream(
@@ -5915,6 +5917,8 @@ def run_market_data_pipeline(
             failed=0,
         )
 
+    terminal_completion_details: dict[str, dict[str, Any]] = {}
+
     def record_followup_result(
         stage_id: str,
         stage_result: dict[str, Any],
@@ -5930,6 +5934,41 @@ def run_market_data_pipeline(
             default_total=default_total,
             stage_id=stage_id,
         )
+        completion_details: dict[str, Any] = {}
+        if (stage_id in {'agent_feedback_summaries', 'signal_decider', 'next_open_execution_plan'}
+                and (stage_status == 'completed' or stage_id == 'agent_feedback_summaries' and stage_status == 'partial')):
+            from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+            try:
+                completion_details = DailyPipelineStageService.build_scheduled_terminal_details(
+                    stage_id=stage_id, market_date=latest_trade_date, result=stage_result,
+                    summary_result=result.get('feedback_followup'),
+                    summary_scope_proof=terminal_completion_details.get('agent_feedback_summaries', {}).get('completion_scope_proof'),
+                    parent_scope_proof=terminal_completion_details.get('signal_decider', {}).get('completion_scope_proof'),
+                )
+            except (SQLAlchemyError, KeyError, TypeError, ValueError) as exc:
+                completion_details = {'completion_authority_error_type': type(exc).__name__}
+            terminal_completion_details[stage_id] = completion_details
+            partial_summary_ready = (
+                stage_id == 'agent_feedback_summaries' and stage_status == 'partial'
+                and completion_details.get('summary_cutoff_resolution', {}).get('ready') is True
+            )
+            if 'completion_scope_proof' not in completion_details and not partial_summary_ready:
+                stage_status = 'partial'
+                completion_details.update(
+                    completion_authority_status='invalid',
+                    completion_authority_reason='terminal_progression_proof_unavailable',
+                )
+                # The caller consumes this same result to decide whether another model may run.
+                stage_result.update(
+                    status='partial', completion_authority_status='invalid',
+                    completion_authority_reason=completion_details['completion_authority_reason'],
+                )
+        source_run_ids = _extract_followup_source_run_ids(stage_id=stage_id, result=stage_result)
+        proof = completion_details.get('completion_scope_proof')
+        if stage_id == 'next_open_execution_plan' and isinstance(proof, dict):
+            source_run_ids.update(parent_signal_decider_run_id=proof['parent_run_id'],
+                                  source_summary_run_id=proof['parent_summary_run_id'])
         persist_stage_progress(
             stage=stage_id,
             status=stage_status,
@@ -5939,13 +5978,11 @@ def run_market_data_pipeline(
             total=counts['total'],
             succeeded=counts['succeeded'],
             failed=counts['failed'],
-            source_run_ids=_extract_followup_source_run_ids(
-                stage_id=stage_id,
-                result=stage_result,
-            ),
+            source_run_ids=source_run_ids,
             extra={
                 'terminal_count_authority': 'result',
                 'result_summary': _compact_result_summary(stage_result),
+                **completion_details,
             },
         )
 
@@ -6814,6 +6851,8 @@ def run_market_data_pipeline(
                 result['feedback_followup'],
                 stage_id='agent_feedback_summaries',
             ):
+                if result['feedback_followup'].get('status') == 'partial':
+                    feedback_scope_kwargs['symbols'] = terminal_completion_details['agent_feedback_summaries']['summary_cutoff_resolution']['requested_symbols']
                 result['signal_decider_followup'] = run_followup_stage(
                     'signal_decider',
                     activity='Running point-in-time recovery signal deciders',
@@ -7160,6 +7199,8 @@ def run_market_data_pipeline(
                     result['feedback_followup'],
                     stage_id='agent_feedback_summaries',
                 ):
+                    if result['feedback_followup'].get('status') == 'partial':
+                        feedback_scope_kwargs['symbols'] = terminal_completion_details['agent_feedback_summaries']['summary_cutoff_resolution']['requested_symbols']
                     result['signal_decider_followup'] = run_followup_stage(
                         'signal_decider',
                         activity='Running signal-decider follow-up',

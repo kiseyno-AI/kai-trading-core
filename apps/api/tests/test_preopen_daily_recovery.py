@@ -172,6 +172,14 @@ class PreopenDailyRecoveryTests(TestCase):
                 }),
             )
 
+        # Dispatch is mocked here; the terminal-persistence tests verify the real proofs.
+        completion = self.mock(
+            'app.eod.daily_pipeline_stages.DailyPipelineStageService.build_scheduled_terminal_details',
+            return_value={'completion_scope_proof': {
+                'parent_run_id': 'preopen-fixture-decider',
+                'parent_summary_run_id': 'summary-frozen-preopen',
+            }},
+        )
         result = service._run_market_data_pipeline(
             start_date='20260403', end_date='20260403', markets=('KOSPI',),
             trigger='auto_close_scheduler', refresh_universe=True, mode='daily_auto',
@@ -195,6 +203,10 @@ class PreopenDailyRecoveryTests(TestCase):
             'prices', 'enrichment', 'risk', 'fundamentals', 'piotroski',
             'factors', 'stored_signal', 'feedback', 'decider', 'plan',
         ])
+        self.assertEqual(
+            [call.kwargs['stage_id'] for call in completion.call_args_list],
+            ['agent_feedback_summaries', 'signal_decider', 'next_open_execution_plan'],
+        )
         self.assertEqual(fundamentals.call_args.kwargs['symbols'], scope)
         self.assertFalse(fundamentals.call_args.kwargs['run_piotroski_followup'])
         self.assertFalse(fundamentals.call_args.kwargs['run_feedback_followup'])
