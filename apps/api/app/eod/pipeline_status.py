@@ -2014,6 +2014,7 @@ class EODPipelineStatusService:
                 stages=stages,
                 stage_history=official_stage_history,
                 market_date=resolved_market_date,
+                latest_run=official_run,
             )
         if official_run is not None:
             stages = self._overlay_official_run_stages(
@@ -3021,6 +3022,101 @@ class EODPipelineStatusService:
                 return True
         return False
 
+    @staticmethod
+    def _rebuild_scheduled_terminal_stages(
+        *,
+        official_run: dict[str, Any],
+        market_date: str,
+    ) -> dict[str, dict[str, Any]]:
+        official_stages = official_run.get('stages') if isinstance(official_run.get('stages'), dict) else {}
+        metadata = official_run.get('run_metadata')
+        if not (
+            official_run.get('trigger') == 'auto_close_scheduler'
+            and isinstance(metadata, dict)
+            and metadata.get('entrypoint')
+            == 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
+            and str(official_run.get('market_date'))[:10] == market_date
+        ):
+            return official_stages
+        official_stages = dict(official_stages)
+
+        def bound_stage(stage_id: str) -> dict[str, Any]:
+            terminal = official_stages.get(stage_id)
+            if not isinstance(terminal, dict):
+                return {}
+            details = terminal.get('details')
+            source_ids = terminal.get('source_run_ids')
+            if not isinstance(details, dict) or not isinstance(source_ids, dict):
+                return {}
+            result = details.get('result_summary')
+            if not (
+                terminal.get('stage_id') == stage_id
+                and str(terminal.get('market_date'))[:10] == market_date
+                and terminal.get('pipeline_run_id', official_run.get('id')) == official_run.get('id')
+                and details.get('mode') == 'auto_eod_pipeline_tracking'
+                and isinstance(result, dict)
+                and source_ids.get('eod_run_id') is not None
+                and source_ids.get('eod_run_id') == metadata.get('eod_collection_run_id')
+                and (
+                    stage_id == 'next_open_execution_plan'
+                    or (
+                        source_ids.get('agent_feedback_run_id') is not None
+                        and source_ids.get('agent_feedback_run_id') == result.get('run_id')
+                    )
+                )
+            ):
+                return {}
+            return terminal
+
+        summary = bound_stage('agent_feedback_summaries')
+        scheduled_summary_result = (summary.get('details') or {}).get('result_summary')
+        for terminal_id in ('agent_feedback_summaries', 'signal_decider', 'next_open_execution_plan'):
+            terminal = bound_stage(terminal_id)
+            details = terminal.get('details') or {}
+            if terminal.get('status') != 'completed' or 'completion_scope_proof' in details:
+                continue
+            summary = bound_stage('agent_feedback_summaries')
+            summary_details = summary.get('details') or {}
+            summary_scope_proof = summary_details.get('completion_scope_proof')
+            if terminal_id == 'signal_decider' and not (
+                DailyPipelineStageService.validated_stage_completion_scope_proof(
+                    'agent_feedback_summaries', summary_scope_proof,
+                ) is not None
+                or (
+                    summary.get('status') == 'partial'
+                    and 'completion_scope_proof' not in summary_details
+                )
+            ):
+                continue
+            parent = bound_stage('signal_decider')
+            try:
+                rebuilt = DailyPipelineStageService.build_scheduled_terminal_details(
+                    stage_id=terminal_id, market_date=market_date,
+                    result=details['result_summary'],
+                    summary_result=scheduled_summary_result,
+                    summary_scope_proof=summary_scope_proof,
+                    parent_scope_proof=(parent.get('details') or {}).get('completion_scope_proof'),
+                )
+            except (KeyError, TypeError, ValueError, SQLAlchemyError):
+                continue
+            proof = rebuilt.get('completion_scope_proof')
+            if not isinstance(proof, dict):
+                continue
+            source_ids = dict(terminal.get('source_run_ids') or {})
+            if terminal_id == 'next_open_execution_plan':
+                parent_ids = {
+                    'parent_signal_decider_run_id': proof['parent_run_id'],
+                    'source_summary_run_id': proof['parent_summary_run_id'],
+                }
+                if any(key in source_ids and source_ids[key] != value for key, value in parent_ids.items()):
+                    continue
+                source_ids.update(parent_ids)
+            official_stages[terminal_id] = {
+                **terminal, 'source_run_ids': source_ids,
+                'details': {**details, **rebuilt, 'completion_proof_source': 'validated_scheduled_publications'},
+            }
+        return official_stages
+
     def _overlay_official_run_stages(
         self,
         *,
@@ -3028,62 +3124,11 @@ class EODPipelineStatusService:
         official_run: dict[str, Any],
         market_date: str,
     ) -> dict[str, dict[str, Any]]:
-        official_stages = official_run.get('stages') if isinstance(official_run.get('stages'), dict) else {}
+        official_stages = self._rebuild_scheduled_terminal_stages(
+            official_run=official_run, market_date=market_date,
+        )
         if not official_stages:
             return stages
-        if (
-            official_run.get('trigger') == 'auto_close_scheduler'
-            and (official_run.get('run_metadata') or {}).get('entrypoint')
-            == 'PYKRX_BACKFILL_SERVICE.run_daily_pipeline_if_due'
-            and str(official_run.get('market_date'))[:10] == market_date
-        ):
-            official_stages = {key: dict(value) for key, value in official_stages.items()}
-            scheduled_summary_result = (official_stages.get('agent_feedback_summaries', {}).get('details') or {}).get('result_summary')
-            for terminal_id in ('agent_feedback_summaries', 'signal_decider', 'next_open_execution_plan'):
-                terminal = official_stages.get(terminal_id) or {}
-                details = terminal.get('details') or {}
-                if not (
-                    terminal.get('status') == 'completed'
-                    and str(terminal.get('market_date'))[:10] == market_date
-                    and details.get('mode') == 'auto_eod_pipeline_tracking'
-                    and 'completion_scope_proof' not in details
-                    and isinstance(details.get('result_summary'), dict)
-                    and (terminal.get('source_run_ids') or {}).get('eod_run_id')
-                    == (official_run.get('run_metadata') or {}).get('eod_collection_run_id')
-                    and (terminal.get('source_run_ids') or {}).get('eod_run_id') is not None
-                    and (
-                        terminal_id == 'next_open_execution_plan'
-                        or (terminal.get('source_run_ids') or {}).get('agent_feedback_run_id')
-                        == details['result_summary'].get('run_id')
-                    )
-                ):
-                    continue
-                summary_scope_proof = (official_stages.get('agent_feedback_summaries', {}).get('details') or {}).get('completion_scope_proof')
-                if terminal_id == 'signal_decider' and DailyPipelineStageService.validated_stage_completion_scope_proof(
-                    'agent_feedback_summaries', summary_scope_proof,
-                ) is None:
-                    continue
-                try:
-                    rebuilt = DailyPipelineStageService.build_scheduled_terminal_details(
-                        stage_id=terminal_id, market_date=market_date,
-                        result=details['result_summary'],
-                        summary_result=scheduled_summary_result,
-                        summary_scope_proof=summary_scope_proof,
-                        parent_scope_proof=(official_stages.get('signal_decider', {}).get('details') or {}).get('completion_scope_proof'),
-                    )
-                except (KeyError, TypeError, ValueError, SQLAlchemyError):
-                    continue
-                proof = rebuilt.get('completion_scope_proof')
-                if not isinstance(proof, dict):
-                    continue
-                source_ids = dict(terminal.get('source_run_ids') or {})
-                if terminal_id == 'next_open_execution_plan':
-                    source_ids.update(parent_signal_decider_run_id=proof['parent_run_id'],
-                                      source_summary_run_id=proof['parent_summary_run_id'])
-                official_stages[terminal_id] = {
-                    **terminal, 'source_run_ids': source_ids,
-                    'details': {**details, **rebuilt, 'completion_proof_source': 'validated_scheduled_publications'},
-                }
         overlaid = dict(stages)
         for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             official_stage = official_stages.get(stage_id)
@@ -3126,7 +3171,47 @@ class EODPipelineStatusService:
         stages: dict[str, dict[str, Any]],
         stage_history: dict[str, dict[str, Any]],
         market_date: str,
+        latest_run: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
+        scheduled_runs: dict[int, dict[str, Any]] = {}
+        scheduled_stages: dict[int, dict[str, Any]] = {}
+        inconsistent_runs: set[int] = set()
+        for stage_id in ('agent_feedback_summaries', 'signal_decider', 'next_open_execution_plan'):
+            item = stage_history.get(stage_id)
+            if not isinstance(item, dict):
+                continue
+            run, stage = item.get('run'), item.get('stage')
+            if not isinstance(run, dict) or not isinstance(stage, dict):
+                continue
+            run_id = run.get('id')
+            if type(run_id) is not int or run_id <= 0:
+                continue
+            if run_id in scheduled_runs and scheduled_runs[run_id] != run:
+                inconsistent_runs.add(run_id)
+            scheduled_runs[run_id] = run
+            if stage.get('pipeline_run_id') == run_id:
+                scheduled_stages.setdefault(run_id, {})[stage_id] = stage
+        stage_history = dict(stage_history)
+        latest_parent = {key: value for key, value in (latest_run or {}).items() if key != 'stages'}
+        latest_stages = (latest_run or {}).get('stages')
+        if not isinstance(latest_stages, dict):
+            latest_stages = {}
+        for run_id, run in scheduled_runs.items():
+            if run_id in inconsistent_runs:
+                continue
+            grouped_stages = scheduled_stages.get(run_id, {})
+            if run == latest_parent and all(
+                latest_stages.get(stage_id) == stage
+                for stage_id, stage in grouped_stages.items()
+            ):
+                # The following latest-run overlay validates this identical chain once.
+                continue
+            rebuilt = self._rebuild_scheduled_terminal_stages(
+                official_run={**run, 'stages': grouped_stages},
+                market_date=market_date,
+            )
+            for stage_id, stage in rebuilt.items():
+                stage_history[stage_id] = {**stage_history[stage_id], 'stage': stage}
         overlaid = dict(stages)
         for stage_id in PIPELINE_STAGE_HISTORY_ORDER:
             fallback_stage = stages.get(stage_id) or {}

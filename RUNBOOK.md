@@ -272,6 +272,11 @@ are distinct from invalid proof fields: conflicting run/date/cutoff, incomplete
 role scopes, missing typed decisions and incomplete plan manifests remain closed.
 A completed plan can still have every item excluded by the confidence threshold;
 processing completion does not authorize an order or activate an Exec handoff.
+Later subset recoveries may move these completed records into official stage
+history; the reader validates their original lineage without replaying them.
+A terminal partial summary can also supply a proven completed intersection for
+downstream work while its failed symbols and whole-stage partial status remain
+unchanged.
 
 Technical/action partial repair uses the original stage-bound partition: `stages=[stage]`, `symbols=retry_debt_stock_codes`, the full selected `exact_membership_symbols`, and `recovery_parent_scope_outcome`. Its `recovery_stage_scope_outcome` wrapper also binds `market_date`, `eod_collection_run_id`, and any `deferred_stage_outcomes`. The executor publishes only repaired symbols and persists unfinished omitted stages under `deferred_recovery_stage_outcomes` so a restart can continue without replaying repaired stages. A stage-wide global read, such as market-level enrichment, remains distinct from symbol-level writes; do not infer its failed components from a stock count.
 - Database persistence stores symbol master data, tracked symbols, quote cache/history, market status snapshots, the current market snapshot cache, durable Korea Exim FX snapshots for request-time USD/KRW fallback, macro context observations, EOD bars, EOD run records, persisted daily price contexts, daily PyKRX enrichment rows, daily technical/action snapshots, KIS daily signal features, KIS intraday snapshot history/current-cache rows, KIS daily market-risk snapshots, persisted daily market-risk filter results, persisted daily momentum factor results, persisted daily low-risk factor results, persisted daily beta factor results, persisted daily advanced value factor results, persisted daily unified value factor results, persisted daily composite factor results, persisted daily market participation context, and stored day-based trending ranks.

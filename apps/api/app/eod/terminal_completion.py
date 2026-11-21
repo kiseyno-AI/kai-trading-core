@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 from sqlalchemy import select, text
@@ -16,12 +17,14 @@ from app.agent_context.reuse_service import (
     _request_payload_knowledge_cutoff_at,
 )
 from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGENT_NAMES
+from app.agent_context.retry_service import _exact_completed_summary_scope, resolve_terminal_role_success_intersection
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.signal_decider_loop_service import (
-    _normalize_action, _normalize_short_term_action, _short_term_generic_action, _to_int,
+    _normalize_action, _normalize_optional_text, _normalize_short_term_action, _short_term_generic_action, _to_int,
 )
 from app.db import session_scope
 from app.core.settings import settings
+from app.core.numbers import finite_float
 from app.market.symbol_codes import is_canonical_krx_short_code
 from app.db_models import AgentContextFeedback, AgentContextFeedbackRun, SignalDeciderDecisionSnapshot, SignalDeciderExecutionPlanItem
 
@@ -29,7 +32,7 @@ from app.db_models import AgentContextFeedback, AgentContextFeedbackRun, SignalD
 def validate_feedback_publications(
     *, market_date: str, result: dict[str, Any], source_summary_run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Bind exact published rows and typed responses to their completed parent run."""
+    """Bind published rows to a completed run or a proven terminal summary intersection."""
     invalid = {'valid': False, 'decision_identities': []}
     try:
         market_day = date.fromisoformat(market_date)
@@ -47,16 +50,27 @@ def validate_feedback_publications(
         scopes = summary['role_symbol_scopes']
         if not isinstance(scopes, dict) or set(scopes) != set(roles):
             return invalid
-        expected = {(symbol, role) for role, symbols in scopes.items() for symbol in symbols}
-        if not expected or any(
+        admitted = {(symbol, role) for role, symbols in scopes.items() for symbol in symbols}
+        if not admitted or any(
             not isinstance(symbols, list) or len(symbols) != len(set(symbols))
             or any(not isinstance(s, str) or not is_canonical_krx_short_code(s) for s in symbols)
             for symbols in scopes.values()
         ):
             return invalid
         run_id = result['run_id']
-        if (result.get('status') != 'completed' or result.get('completed') is not True
-                or result.get('market_date') != market_date):
+        partial_summary = not is_decider and result.get('status') == 'partial'
+        terminal_scope = None
+        if partial_summary:
+            terminal_scope = resolve_terminal_role_success_intersection(
+                progress_summary=summary, roles=roles, expected_role_symbol_scopes=scopes,
+            )
+            if terminal_scope.get('ready') is not True or summary.get('run_id') != run_id:
+                return invalid
+            expected = {(symbol, role) for symbol in terminal_scope['completed_symbols'] for role in roles}
+        else:
+            expected = admitted
+        if (result.get('market_date') != market_date or not partial_summary
+                and (result.get('status') != 'completed' or result.get('completed') is not True)):
             return invalid
         if 'final_pending' in result and (type(result['final_pending']) is not int or result['final_pending'] != 0):
             return invalid
@@ -69,11 +83,12 @@ def validate_feedback_publications(
                 return invalid
             request = run.request_payload or {}
             if not (
-                run.market_date == market_day and run.status == 'completed'
+                run.market_date == market_day and run.status == ('partial' if partial_summary else 'completed')
                 and run.completed_at is not None
-                and type(run.symbols_total) is int and run.symbols_total == len(expected)
+                and type(run.symbols_total) is int and run.symbols_total == len(admitted)
                 and type(run.completed_count) is int and type(run.failed_count) is int
-                and run.completed_count == len(expected) and run.failed_count == 0
+                and run.completed_count == (terminal_scope['completed_items'] if partial_summary else len(expected))
+                and run.failed_count == (terminal_scope['failed_items'] if partial_summary else 0)
                 and request.get('mode') == DAILY_RETRY_CYCLE_MODE
                 and str(request.get('market_date'))[:10] == market_date
                 and set(request.get('roles') or []) == set(roles)
@@ -84,6 +99,19 @@ def validate_feedback_publications(
                 and (not is_decider or request.get('source_summary_run_id') == source_summary_run_id)
             ):
                 return invalid
+            if partial_summary:
+                dispatched_scope = _exact_completed_summary_scope(request)
+                persisted_scope = resolve_terminal_role_success_intersection(
+                    progress_summary=(run.summary_payload or {}).get('progress_summary') or {},
+                    roles=roles, expected_role_symbol_scopes=scopes,
+                )
+                summary_admitted = request.get('requested_symbols')
+                if (dispatched_scope is None or persisted_scope != terminal_scope
+                        or not isinstance(summary_admitted, list) or not summary_admitted
+                        or len(summary_admitted) != len(set(summary_admitted))
+                        or any(not isinstance(s, str) or not is_canonical_krx_short_code(s) for s in summary_admitted)
+                        or not set(terminal_scope['admitted_symbols']) <= set(summary_admitted)):
+                    return invalid
             symbols = sorted({symbol for symbol, _ in expected})
             rows = session.execute(select(AgentContextFeedback).where(
                 AgentContextFeedback.market_date == market_day,
@@ -114,12 +142,13 @@ def validate_feedback_publications(
                 child_request = (child.request_payload or {}) if child else {}
                 reuse = reused.get(key) or {}
                 # A terminal partial batch can still publish this independently validated row.
-                direct = bool(
+                if not (
                     child and child.market_date == market_day
                     and child.status in {'completed', 'partial'} and child.completed_at is not None
-                    and child_request.get('parent_run_id') == run_id
                     and _request_payload_knowledge_cutoff_at(child_request) == cutoff
-                )
+                ):
+                    return invalid
+                direct = child_request.get('parent_run_id') == run_id
                 if not direct and not (
                     reuse.get('feedback_id') == row.id
                     and reuse.get('feedback_run_id') == row.run_id
@@ -159,6 +188,13 @@ def validate_feedback_publications(
                     SignalDeciderDecisionSnapshot.response_summary_payload,
                     SignalDeciderDecisionSnapshot.next_day_open_action,
                     SignalDeciderDecisionSnapshot.target_price, SignalDeciderDecisionSnapshot.stop_loss_price,
+                    SignalDeciderDecisionSnapshot.decision_action,
+                    SignalDeciderDecisionSnapshot.preferred_action,
+                    SignalDeciderDecisionSnapshot.entry_price_basis,
+                    SignalDeciderDecisionSnapshot.confidence_score_10,
+                    SignalDeciderDecisionSnapshot.conviction_score_10,
+                    SignalDeciderDecisionSnapshot.expected_return_pct,
+                    SignalDeciderDecisionSnapshot.suggested_holding_period,
                 )).order_by(SignalDeciderDecisionSnapshot.id.desc())).scalars().all()
                 selected = {}
                 for snapshot in snapshots:
@@ -196,10 +232,36 @@ def validate_feedback_publications(
                         )) if snapshot.agent_name == 'short-term-decider'
                         else _normalize_action(normalized.get('next_day_open_action') or normalized.get('preferred_action'))
                     )
-                    if (snapshot.next_day_open_action != expected_action
-                            or snapshot.target_price != _to_int(normalized.get('target_price'))
-                            or snapshot.stop_loss_price != _to_int(normalized.get('stop_loss_price'))):
-                        return invalid
+                    short_term = snapshot.agent_name == 'short-term-decider'
+                    holding = normalized.get('expected_holding_period' if short_term else 'suggested_holding_period')
+                    expected_columns = {
+                        'decision_action': expected_action,
+                        'preferred_action': expected_action if short_term else _normalize_action(normalized.get('preferred_action')),
+                        'next_day_open_action': expected_action if short_term else _normalize_action(normalized.get('next_day_open_action')),
+                        'entry_price_basis': 'trigger_limit' if short_term else _normalize_optional_text(
+                            normalized.get('entry_price_basis'), default='next_open',
+                        ) or 'next_open',
+                        'target_price': _to_int(normalized.get('target_price')),
+                        'stop_loss_price': _to_int(normalized.get('stop_loss_price')),
+                        'confidence_score_10': finite_float(normalized.get('confidence_score_10')),
+                        'conviction_score_10': finite_float(normalized.get('conviction_score_10')),
+                        'expected_return_pct': None if short_term else finite_float(normalized.get('expected_return_pct')),
+                        'suggested_holding_period': _normalize_optional_text(
+                            str(holding) if holding is not None else None, max_length=64,
+                        ),
+                    }
+                    for field, expected_value in expected_columns.items():
+                        stored_value = getattr(snapshot, field)
+                        if stored_value is not None and field in {'confidence_score_10', 'conviction_score_10', 'expected_return_pct'}:
+                            stored_value = finite_float(stored_value)
+                            if stored_value is None:
+                                return invalid
+                            # PostgreSQL persists these Numeric(12, 6) projections at six decimal places.
+                            stored_value = Decimal(str(stored_value)).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+                            if expected_value is not None:
+                                expected_value = Decimal(str(expected_value)).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+                        if stored_value != expected_value:
+                            return invalid
                     selected[key] = snapshot
                 if selected.keys() != expected:
                     return invalid
@@ -207,8 +269,27 @@ def validate_feedback_publications(
                     'symbol': s.symbol, 'decision_agent_name': s.agent_name,
                     'decision_snapshot_id': s.id, 'decision_run_id': s.decision_run_id,
                 } for s in selected.values()), key=lambda v: (v['symbol'], v['decision_agent_name']))
-            return {'valid': True, 'decision_identities': identities}
-    except (KeyError, TypeError, ValueError, AttributeError):
+            publication = {'valid': True, 'decision_identities': identities}
+            if partial_summary:
+                publication['summary_cutoff_resolution'] = {
+                    'ready': True, 'source_run_id': run_id,
+                    'knowledge_cutoff_at': cutoff.isoformat(),
+                    'feedback_scope_mode': result['feedback_scope_mode'],
+                    'requested_symbols': terminal_scope['completed_symbols'],
+                    'completed_scope_proof': {
+                        'schema_version': 'completed_summarizer_intersection_v1',
+                        'completed_symbols': terminal_scope['completed_symbols'],
+                        'admitted_symbols': sorted(summary_admitted),
+                    },
+                    'terminal_role_scope_proof': {
+                        'schema_version': 'terminal_role_success_intersection_v1',
+                        **{key: terminal_scope[key] for key in (
+                            'failed_symbols_by_role', 'total_items', 'completed_items', 'failed_items',
+                        )},
+                    },
+                }
+            return publication
+    except (KeyError, TypeError, ValueError, AttributeError, InvalidOperation):
         return invalid
 
 
