@@ -5915,6 +5915,8 @@ def run_market_data_pipeline(
             failed=0,
         )
 
+    terminal_completion_details: dict[str, dict[str, Any]] = {}
+
     def record_followup_result(
         stage_id: str,
         stage_result: dict[str, Any],
@@ -5930,6 +5932,26 @@ def run_market_data_pipeline(
             default_total=default_total,
             stage_id=stage_id,
         )
+        completion_details: dict[str, Any] = {}
+        if stage_id in {'agent_feedback_summaries', 'signal_decider', 'next_open_execution_plan'} and stage_status == 'completed':
+            from app.eod.daily_pipeline_stages import DailyPipelineStageService
+
+            completion_details = DailyPipelineStageService.build_scheduled_terminal_details(
+                stage_id=stage_id, market_date=latest_trade_date, result=stage_result,
+                summary_result=result.get('feedback_followup'),
+                summary_scope_proof=terminal_completion_details.get('agent_feedback_summaries', {}).get('completion_scope_proof'),
+                parent_scope_proof=terminal_completion_details.get('signal_decider', {}).get('completion_scope_proof'),
+            )
+            terminal_completion_details[stage_id] = completion_details
+            if 'completion_scope_proof' not in completion_details:
+                stage_status = 'partial'
+                stage_result['status'] = 'partial'
+                completion_details['completion_authority_reason'] = 'terminal_progression_proof_unavailable'
+        source_run_ids = _extract_followup_source_run_ids(stage_id=stage_id, result=stage_result)
+        proof = completion_details.get('completion_scope_proof')
+        if stage_id == 'next_open_execution_plan' and isinstance(proof, dict):
+            source_run_ids.update(parent_signal_decider_run_id=proof['parent_run_id'],
+                                  source_summary_run_id=proof['parent_summary_run_id'])
         persist_stage_progress(
             stage=stage_id,
             status=stage_status,
@@ -5939,13 +5961,11 @@ def run_market_data_pipeline(
             total=counts['total'],
             succeeded=counts['succeeded'],
             failed=counts['failed'],
-            source_run_ids=_extract_followup_source_run_ids(
-                stage_id=stage_id,
-                result=stage_result,
-            ),
+            source_run_ids=source_run_ids,
             extra={
                 'terminal_count_authority': 'result',
                 'result_summary': _compact_result_summary(stage_result),
+                **completion_details,
             },
         )
 

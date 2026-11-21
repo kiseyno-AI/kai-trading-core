@@ -7611,6 +7611,107 @@ class DailyPipelineStageService:
         return compacted_result, omissions
 
     @staticmethod
+    def _validate_terminal_feedback_publications(**kwargs: Any) -> dict[str, Any]:
+        from app.eod.terminal_completion import validate_feedback_publications
+
+        return validate_feedback_publications(**kwargs)
+
+    @staticmethod
+    def build_scheduled_terminal_details(
+        *,
+        stage_id: str,
+        market_date: str,
+        result: dict[str, Any],
+        summary_result: dict[str, Any] | None = None,
+        summary_scope_proof: Mapping[str, Any] | None = None,
+        parent_scope_proof: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Use the explicit executor's proofs for scheduled or legacy publications."""
+        from copy import deepcopy
+
+        prepared = deepcopy(result)
+        authority = parent_scope_proof
+        if stage_id in {'agent_feedback_summaries', 'signal_decider'}:
+            publication = DailyPipelineStageService._validate_terminal_feedback_publications(
+                market_date=market_date, result=prepared,
+                source_summary_run_id=(summary_result or {}).get('run_id'),
+            )
+            if publication.get('valid') is not True:
+                return {}
+        if stage_id == 'signal_decider':
+            summary_proof = DailyPipelineStageService._build_feedback_completion_scope_proof(
+                summary_result or {}, invocation_symbols=None,
+            )
+            if summary_proof is None:
+                return {}
+            if summary_scope_proof is not None:
+                validated_summary = DailyPipelineStageService.validated_stage_completion_scope_proof(
+                    'agent_feedback_summaries', summary_scope_proof,
+                )
+                if validated_summary != summary_proof:
+                    return {}
+            elif DailyPipelineStageService._validate_terminal_feedback_publications(
+                    market_date=market_date, result=summary_result,
+            ).get('valid') is not True:
+                return {}
+            cutoff = datetime.fromisoformat(summary_proof['knowledge_cutoff_at'])
+            scopes = summary_proof['role_symbol_scopes']
+            symbols = sorted(set.intersection(*(set(v) for v in scopes.values())))
+            if not symbols or set(prepared.get('requested_symbols') or []) != set(symbols):
+                return {}
+            if datetime.fromisoformat(str(prepared.get('knowledge_cutoff_at'))) != cutoff:
+                return {}
+            completed_scope = {
+                'schema_version': 'completed_summarizer_intersection_v1',
+                'completed_symbols': symbols,
+                'admitted_symbols': summary_proof['scope_symbols'],
+            }
+            resolution = {
+                'ready': True, 'source_run_id': summary_proof['source_run_id'],
+                'knowledge_cutoff_at': cutoff,
+                'feedback_scope_mode': summary_proof['feedback_scope_mode'],
+                'requested_symbols': symbols, 'completed_scope_proof': completed_scope,
+            }
+            scope_authority = {
+                'schema_version': FEEDBACK_SCOPE_AUTHORITY_SCHEMA_VERSION,
+                'kind': FEEDBACK_SCOPE_AUTHORITY_COMPLETED_SUMMARY_INTERSECTION,
+                'source_summary_run_id': summary_proof['source_run_id'],
+                'source_feedback_scope_mode': summary_proof['feedback_scope_mode'],
+                'decision_feedback_scope_mode': FEEDBACK_SCOPE_MODE_DECIDER_SCOPE_FAST_PATH,
+                'knowledge_cutoff_at': cutoff.isoformat(),
+                'completed_scope_proof': completed_scope,
+            }
+            if prepared.get('scope_authority') not in (None, scope_authority):
+                return {}
+            identities = publication.get('decision_identities')
+            if 'decision_identities' in prepared and prepared['decision_identities'] != identities:
+                return {}
+            prepared.update(scope_authority=scope_authority, requested_symbols=symbols,
+                            decision_identities=identities)
+            source_scope = prepared.get('source_summary_scope')
+            if isinstance(source_scope, dict):
+                if set(source_scope.get('prepared_symbols') or []) != set(symbols):
+                    return {}
+                source_scope['prepared_symbols'] = symbols
+            authority = DailyPipelineStageService._terminal_decider_progression_proof(
+                {'status': prepared.get('status'), 'result': prepared},
+                expected_decider_symbols=symbols,
+                feedback_cutoff_resolution=resolution,
+            )
+            if authority is None:
+                return {}
+        if stage_id == 'next_open_execution_plan' and 'items' not in prepared:
+            from app.eod.terminal_completion import load_plan_publication_items
+
+            prepared['items'] = load_plan_publication_items(
+                market_date=market_date, result=prepared,
+            )
+        return DailyPipelineStageService._build_stage_run_details(
+            stage_id=stage_id, result=prepared, market_date=market_date,
+            completion_parent_proof=authority,
+        )
+
+    @staticmethod
     def _build_stage_run_details(
         *,
         stage_id: str,

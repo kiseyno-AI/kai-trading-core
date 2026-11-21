@@ -4438,6 +4438,13 @@ class PykrxBackfillServiceTests(TestCase):
             metadata['universe_snapshot']['current_universe_mutated']
         )
 
+    @patch(
+        'app.eod.daily_pipeline_stages.DailyPipelineStageService.build_scheduled_terminal_details',
+        new=lambda **_: {'completion_scope_proof': {
+            'parent_run_id': 'cohort-fixture-decider',
+            'parent_summary_run_id': 'cohort-fixture-summary',
+        }},
+    )  # Completion persistence has separate coverage; these dispatch fixtures test cohort admission.
     def test_prior_date_daily_auto_preserves_prices_and_narrows_partial_followups(
         self,
     ) -> None:
@@ -18546,6 +18553,13 @@ class PykrxBackfillServiceTests(TestCase):
         )
 
     @patch('app.eod.pykrx_backfill.settings.openclaw_feedback_trigger_after_fundamentals_refresh', False)
+    @patch(
+        'app.eod.daily_pipeline_stages.DailyPipelineStageService.build_scheduled_terminal_details',
+        new=lambda **_: {'completion_scope_proof': {
+            'parent_run_id': 'cohort-fixture-decider',
+            'parent_summary_run_id': 'cohort-fixture-summary',
+        }},
+    )  # These mocked dispatch results deliberately omit completion evidence.
     def test_run_collection_advances_exact_partial_cohorts_through_decider(
         self,
     ) -> None:
