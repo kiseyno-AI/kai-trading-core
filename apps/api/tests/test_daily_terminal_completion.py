@@ -360,6 +360,7 @@ def _publication_rows():
             conviction_score_10=normalized.get('conviction_score_10'),
             expected_return_pct=None if role == 'short-term-decider' else normalized.get('expected_return_pct'),
             suggested_holding_period=normalized.get('expected_holding_period') if role == 'short-term-decider' else normalized.get('suggested_holding_period'),
+            data_quality_warnings_payload=deepcopy(normalized.get('data_quality_warnings') or []),
         ))
     return result, parent, feedback, children, snapshots
 
@@ -372,7 +373,10 @@ def _publication_rows():
                                     'reused_unfinished_child', 'reused_wrong_date', 'reused_wrong_cutoff',
                                     'typed_confidence', 'typed_conviction', 'typed_decision_action',
                                     'typed_preferred_action', 'typed_entry_basis', 'typed_return', 'typed_holding_period',
-                                    'typed_numeric_rounding', 'typed_wait_projection'])
+                                    'typed_numeric_rounding', 'typed_wait_projection',
+                                    'snapshot_invalid_false', 'snapshot_invalid_none', 'snapshot_invalid_zero',
+                                    'snapshot_legacy_no_flag', 'warning_extra', 'warning_hidden',
+                                    'warning_match', 'warning_empty_none'])
 def test_publication_validator_checks_actual_orm_feedback_and_typed_contracts(mutation):
     result, parent, rows, children, snapshots = _publication_rows()
     if mutation == 'foreign_parent':
@@ -387,6 +391,21 @@ def test_publication_validator_checks_actual_orm_feedback_and_typed_contracts(mu
         rows[0].normalized_feedback_payload.pop('thesis_summary')
     elif mutation == 'typed_mismatch':
         snapshots[0].response_payload['target_price'] += 100
+    elif mutation in {'snapshot_invalid_false', 'snapshot_invalid_none', 'snapshot_invalid_zero'}:
+        snapshots[0].response_payload['response_contract_valid'] = {
+            'snapshot_invalid_false': False, 'snapshot_invalid_none': None, 'snapshot_invalid_zero': 0,
+        }[mutation]
+    elif mutation == 'snapshot_legacy_no_flag':
+        snapshots[0].response_payload.pop('response_contract_valid')
+    elif mutation == 'warning_extra':
+        snapshots[0].data_quality_warnings_payload = ['unmatched_warning']
+    elif mutation in {'warning_hidden', 'warning_match'}:
+        for payload in (rows[0].normalized_feedback_payload, snapshots[0].response_payload):
+            payload['data_quality_warnings'] = ['published_warning']
+        if mutation == 'warning_match':
+            snapshots[0].data_quality_warnings_payload = ['published_warning']
+    elif mutation == 'warning_empty_none':
+        snapshots[0].data_quality_warnings_payload = None
     elif mutation == 'typed_numeric_rounding':
         index = next(i for i, row in enumerate(rows) if row.agent_name == 'signal-decider')
         rows[index].normalized_feedback_payload['expected_return_pct'] = 6.1234565
@@ -458,7 +477,8 @@ def test_publication_validator_checks_actual_orm_feedback_and_typed_contracts(mu
     with patch('app.eod.terminal_completion.session_scope', readonly_session):
         actual = validate_feedback_publications(market_date='2026-11-20', result=result,
                                                 source_summary_run_id='summary-run')
-    assert actual['valid'] is (mutation in {None, 'reused_source', 'partial_child', 'typed_numeric_rounding', 'typed_wait_projection'})
+    assert actual['valid'] is (mutation in {None, 'reused_source', 'partial_child', 'typed_numeric_rounding',
+                                          'typed_wait_projection', 'snapshot_legacy_no_flag', 'warning_match', 'warning_empty_none'})
     assert str(session.execute.call_args_list[0].args[0]) == 'SET TRANSACTION READ ONLY'
     assert all(str(c.args[0]).lstrip().startswith(('SELECT', 'SET TRANSACTION')) for c in session.execute.call_args_list)
 

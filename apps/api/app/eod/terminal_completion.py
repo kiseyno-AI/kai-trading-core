@@ -20,7 +20,8 @@ from app.agent_context.roles import DECISION_SUPPORT_AGENT_NAMES, SUMMARIZER_AGE
 from app.agent_context.retry_service import _exact_completed_summary_scope, resolve_terminal_role_success_intersection
 from app.agent_context.run_modes import DAILY_RETRY_CYCLE_MODE
 from app.agent_context.signal_decider_loop_service import (
-    _normalize_action, _normalize_optional_text, _normalize_short_term_action, _short_term_generic_action, _to_int,
+    _normalize_action, _normalize_optional_text, _normalize_short_term_action, _normalize_text_list,
+    _short_term_generic_action, _to_int,
 )
 from app.db import session_scope
 from app.core.settings import settings
@@ -195,6 +196,7 @@ def validate_feedback_publications(
                     SignalDeciderDecisionSnapshot.conviction_score_10,
                     SignalDeciderDecisionSnapshot.expected_return_pct,
                     SignalDeciderDecisionSnapshot.suggested_holding_period,
+                    SignalDeciderDecisionSnapshot.data_quality_warnings_payload,
                 )).order_by(SignalDeciderDecisionSnapshot.id.desc())).scalars().all()
                 selected = {}
                 for snapshot in snapshots:
@@ -204,12 +206,19 @@ def validate_feedback_publications(
                     row = rows_by_key[key]
                     if snapshot.feedback_id != row.id or snapshot.decision_run_id != row.run_id:
                         return invalid
+                    if (isinstance(snapshot.response_payload, dict)
+                            and 'response_contract_valid' in snapshot.response_payload
+                            and snapshot.response_payload['response_contract_valid'] is not True):
+                        return invalid
                     normalized = normalize_agent_response(
                         role=snapshot.agent_name, output_text=json.dumps(snapshot.response_payload),
                         raw_response={}, market_date=market_day, symbol=snapshot.symbol,
                         agent_name=snapshot.agent_name,
                     )
                     if normalized.get('response_contract_valid') is not True:
+                        return invalid
+                    if _normalize_text_list(snapshot.data_quality_warnings_payload) != _normalize_text_list(
+                            snapshot.response_payload.get('data_quality_warnings')):
                         return invalid
                     snapshot_provenance = (snapshot.response_summary_payload or {}).get('decision_provenance') or {}
                     fenced = apply_decider_model_identity_fence(
