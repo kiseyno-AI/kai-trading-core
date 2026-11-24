@@ -6,7 +6,9 @@ from typing import Any
 from app.brokers.kis.client import KISClient
 from app.brokers.kis.provider import kis_real_client
 from app.db import session_scope
-from app.market.us_index_prices import SUPPORTED_US_INDEX_CODES, validate_kis_us_index_prices
+from app.market.us_index_prices import (
+    SUPPORTED_US_INDEX_CODES, USIndexPricesUnavailable, validate_kis_us_index_prices,
+)
 from app.market.us_index_snapshot_store import save_us_index_snapshot
 from app.market.us_session import latest_completed_us_session
 
@@ -44,7 +46,7 @@ async def collect_us_index_inputs(
             collected_at = clock()
             try:
                 validate_kis_us_index_prices(payload, index_code=code, session=session)
-            except LookupError:
+            except USIndexPricesUnavailable:
                 indices.append({
                     'index_code': code, 'status': 'unavailable', 'stage': 'validate',
                     'reason': 'missing_session_prices',

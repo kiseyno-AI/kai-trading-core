@@ -162,6 +162,26 @@ def test_bad_provider_data_is_failure_and_does_not_block_the_next_index(payload,
     }
 
 
+@pytest.mark.parametrize('error_type', [KeyError, IndexError, LookupError])
+def test_unexpected_lookup_errors_are_technical_failures_not_missing_prices(error_type, database):
+    class BrokenProviderHeader(dict):
+        def get(self, key, default=None):
+            raise error_type('unexpected provider mapping lookup')
+
+    payload = _payload('SPX')
+    payload['output1'] = BrokenProviderHeader()
+    result = asyncio.run(collect_us_index_inputs(
+        as_of=AS_OF, index_codes=('SPX',), client=FakeKISClient({'SPX': payload}),
+        session_factory=database,
+    ))
+
+    assert result['counts'] == {'saved': 0, 'unavailable': 0, 'failed': 1}
+    assert result['indices'][0] == {
+        'index_code': 'SPX', 'status': 'failed', 'stage': 'validate',
+        'error_type': error_type.__name__,
+    }
+
+
 def test_database_failure_is_not_misclassified_as_missing_provider_prices(database):
     attempts = 0
 

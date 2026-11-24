@@ -12,6 +12,10 @@ from app.market.us_session import CompletedUSSession
 SUPPORTED_US_INDEX_CODES = ('SPX', 'COMP', 'SOX')
 
 
+class USIndexPricesUnavailable(LookupError):
+    """A successful KIS response lacks one or both required session prices."""
+
+
 @dataclass(frozen=True)
 class USIndexSessionPrices:
     index_code: str
@@ -41,7 +45,7 @@ def validate_kis_us_index_prices(
     if not isinstance(rows, (list, Mapping)):
         raise ValueError('KIS output2 must be a list or object')
     if not rows:
-        raise LookupError(f'Missing KIS index prices for {", ".join(dates)}')
+        raise USIndexPricesUnavailable(f'Missing KIS index prices for {", ".join(dates)}')
     if isinstance(rows, Mapping):
         rows = [rows]
     header = payload.get('output1')
@@ -66,7 +70,7 @@ def validate_kis_us_index_prices(
         prices[date_text] = _positive_price(row.get('ovrs_nmix_prpr'))
     missing = [value for value in dates if value not in prices]
     if missing:
-        raise LookupError(f'Missing KIS index prices for {", ".join(missing)}')
+        raise USIndexPricesUnavailable(f'Missing KIS index prices for {", ".join(missing)}')
     return USIndexSessionPrices(
         index_code=normalized_code,
         session=session,

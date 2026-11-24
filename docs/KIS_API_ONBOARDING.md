@@ -153,8 +153,8 @@ contains the normalized `index_code`, that `session`, `price` and `previous_pric
   separators are accepted; malformed grouping, booleans, blanks, NaN, infinity,
   zero and negative values are rejected.
 - A successful empty `output2` list/object or absent required session raises
-  `LookupError` listing the missing dates. No older date, synthetic zero or sibling
-  index substitutes for a missing value. Both list and single-object row shapes
+  `USIndexPricesUnavailable` (a `LookupError`) listing the missing dates. No older
+  date, synthetic zero or sibling index substitutes for a missing value. Both list and single-object row shapes
   are understood; one row alone cannot satisfy two required dates.
 - Malformed response containers, non-success result codes, identity mismatches,
   invalid business-date strings, invalid required prices and duplicate required
@@ -275,6 +275,8 @@ with no fabricated snapshot. Technical errors are `status="failed"` with
 responses and credentials are not emitted. A storage lookup error remains a
 storage failure, not provider unavailability. Other indices still run, and
 previously committed captures remain readable by ID. Cancellation propagates.
+Only `USIndexPricesUnavailable` is normal missing data; unexpected `KeyError`,
+`IndexError` or other lookup failures during validation remain technical failures.
 
 Batch `status="completed"` means no technical failures, even if prices are
 unavailable; `data_complete` is true only when every selected index was saved.
