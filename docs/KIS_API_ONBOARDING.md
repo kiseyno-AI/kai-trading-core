@@ -178,6 +178,64 @@ when the response was collected and whether it was available before its cutoff.
 The validator performs no I/O, does not mutate the payload and adds no retries,
 storage, HTTP route, scheduler, daily-pipeline gate, trading signal or order.
 
+## Durable US index inputs: fourth integration slice
+
+`app.market.us_index_snapshot_store` provides `save_us_index_snapshot` and
+`load_us_index_snapshot`. Apply migration `20261124_0091` before using this store.
+It adds only `us_index_input_snapshots`; existing market, daily and order tables
+are unchanged. The store uses Core's existing PostgreSQL connection/session scope.
+
+Saving requires the original decoded KIS response, requested index, explicit
+aware `as_of` and `collected_at`, and `source_environment="real"` or `"mock"`.
+`as_of` fixes the requested calendar window; `collected_at` records the caller's
+response-receipt time and cannot precede `as_of`. Both are normalized to UTC.
+The store freezes the JSON response before validating the two exact prices, then
+records its canonical JSON/hash, exact decimal strings, frozen session dates and
+closes, and installed calendar version. Reads restore these stored values without
+fetching quotes or recalculating historical calendar rules.
+
+```python
+from datetime import UTC, datetime
+from app.market.us_index_snapshot_store import load_us_index_snapshot, save_us_index_snapshot
+
+as_of = datetime.now(UTC)
+session = latest_completed_us_session(as_of=as_of)
+payload = await client.fetch_overseas_index_daily_prices(
+    index_code='SPX',
+    start_date=session.previous_session_date.strftime('%Y%m%d'),
+    end_date=session.session_date.strftime('%Y%m%d'),
+)
+collected_at = datetime.now(UTC)
+saved = save_us_index_snapshot(
+    payload, index_code='SPX', as_of=as_of, collected_at=collected_at,
+    source_environment='mock' if client.use_mock else 'real',
+)
+restored = load_us_index_snapshot(saved.snapshot_id)
+```
+
+The SHA-256 snapshot ID includes the normalized timestamps, environment, source
+response and validated values. Repeating the same capture returns the original
+record, including under concurrent writes; a later capture or changed response
+creates another record. Source hashes describe canonical decoded JSON, not the
+original HTTP bytes. Text storage preserves decimal strings and hash input across
+database round trips. PostgreSQL guards reject UPDATE, DELETE and TRUNCATE on the
+new table. Downgrading this migration removes its snapshot history.
+
+`created_at` is a database-generated transaction/insertion timestamp outside the
+input hash, so retries do not rewrite it. It is not a commit or publication time.
+The returned frozen record includes prices, all capture timestamps, environment,
+source JSON/hash and calendar version. Unknown IDs return `None`; hash mismatches
+raise `ValueError`. Missing/invalid source data is rejected before opening a
+database session, and storage failures are not converted into in-memory success.
+
+Receipt time/environment are caller-supplied provenance, not a KIS final-bar
+attestation. The default Core session scope commits before returning; callers
+injecting their own transaction scope own its commit. Future cutoff selection
+must still freeze successfully committed snapshot IDs on time.
+This slice adds no provider calls, automatic collector, route, scheduler,
+daily-pipeline gate, scoring or order behavior. Existing optional-process failure
+isolation must be preserved when collection is wired in a later slice.
+
 ## Notes
 - Do not commit real secrets
 - The token route returns presence, cache, expiry, type, and safe defer metadata only. It never returns the raw KIS access token and is disabled when `UPSTREAM_BEARER_TOKEN` is unset.

@@ -301,6 +301,32 @@ class CurrentMarketSnapshotCache(Base, TimestampMixin):
     refresh_trigger: Mapped[str | None] = mapped_column(String(64))
 
 
+class USIndexInputSnapshot(Base):
+    __tablename__ = 'us_index_input_snapshots'
+    __table_args__ = (
+        Index(
+            'ix_us_index_input_snapshots_index_session_collected',
+            'index_code',
+            'session_date',
+            'collected_at',
+        ),
+        CheckConstraint(
+            'collected_at >= as_of',
+            name='ck_us_index_input_snapshots_capture_order',
+        ),
+    )
+
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    index_code: Mapped[str] = mapped_column(String(16), nullable=False)
+    session_date: Mapped[date] = mapped_column(Date, nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+
 class CurrentFXRateSnapshot(Base, TimestampMixin):
     __tablename__ = 'current_fx_rate_snapshots'
     __table_args__ = (
