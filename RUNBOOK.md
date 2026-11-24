@@ -38,7 +38,12 @@ Core now owns daily equity history. To cut over an installation with an existing
 
 The importer verifies existing amounts and refuses a conflicting date instead of overwriting it. It imports only daily totals and dates. Restart Core, confirm the private history route, then switch Observatory to the Core API and verify its public response omits every amount. Keep the old SQLite file as a private backup until the cutover is confirmed.
 
+## US index snapshot rollback
+
+Before downgrading migration `20261124_0091`, export and retain `us_index_input_snapshots`; downgrade drops that table and its immutable capture history.
+
 ## Health checks
+
 - `GET /health`
 - `GET /broker/kis/health`
 - `GET /quotes/realtime/monitored`
