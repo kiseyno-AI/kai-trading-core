@@ -164,7 +164,8 @@ from app.forecast_context.service import timesfm_forecast_service, unavailable_e
 logger = logging.getLogger(__name__)
 
 OPENCLAW_MODEL_IDENTITY_OBSERVATION_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2)
-OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION = 25
+# Both audited layouts retain the same session identity columns and semantics.
+OPENCLAW_AGENT_SQLITE_SCHEMA_VERSIONS = frozenset({25, 38})
 PERSISTED_SNAPSHOT_JSON_MAX_BYTES = 1024 * 1024
 POST_DECISION_NEWS_SCAN_LIMIT = 50
 _OPENCLAW_SESSION_REGISTRY_OBSERVATION_LOCK = threading.Lock()
@@ -1981,11 +1982,10 @@ class OpenClawAgentClient:
         )
         schema_row = schema_rows[0] if len(schema_rows) == 1 else None
         if (
-            user_version != OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION
+            user_version not in OPENCLAW_AGENT_SQLITE_SCHEMA_VERSIONS
             or schema_row is None
             or schema_row['role'] != 'agent'
-            or schema_row['schema_version']
-            != OPENCLAW_AGENT_SQLITE_SCHEMA_VERSION
+            or schema_row['schema_version'] != user_version
             or schema_row['agent_id'] != agent_name
             or len(rows) != 1
             or rows[0]['agent_harness_id'] != 'codex'

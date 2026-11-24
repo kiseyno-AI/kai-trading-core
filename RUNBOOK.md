@@ -109,6 +109,31 @@ The importer verifies existing amounts and refuses a conflicting date instead of
 - `POST /eod/composite-factors/compute`
 - `GET /eod/composite-factors`
 
+## OpenClaw decider identity compatibility
+
+Core accepts the verified local agent SQLite formats 25 and 38. The database
+version and `schema_meta` version must agree; file ownership, session identity,
+Codex harness, completion and timestamp checks remain mandatory. Unknown
+formats are rejected. A response model alias does not prove the actual provider
+or model. After an OpenClaw upgrade, validate one new decider completion before
+resuming its exact failed scope. Failed sessions may already have been removed
+by the normal session-cleanup queue.
+
+Scheduled agent counters preserve an explicit zero successful-feedback count;
+processed failures are never substituted for successful publications.
+
+An original scheduled decider outage can resume only from its exact verified
+summary parent, financial-statement basis, cutoff and frozen role scope. A valid
+retry marker with missing scope authority reports
+`followup_feedback_rearm_contract_unavailable` with
+`exact_parent_feedback_contract_unavailable`; it does not authorize a broader
+rerun. Repair missing summaries before resuming an uncovered decider cohort.
+An exact summary-parent retry retains that parent's independent prepared
+decider scopes; it does not rerank candidates using the recovery-time funnel.
+An authorized expired analysis replay keeps the existing order-window checks;
+valid WAIT snapshots can still enter Core's observation-only monitoring during
+their target session without creating order authority.
+
 ## Reviewed stale DART sync-run reconciliation
 
 The incident-scoped reconciliation for historical sync-run IDs
