@@ -122,6 +122,16 @@ by the normal session-cleanup queue.
 Scheduled agent counters preserve an explicit zero successful-feedback count;
 processed failures are never substituted for successful publications.
 
+An original scheduled decider outage can resume only from its exact verified
+summary parent, financial-statement basis, cutoff and frozen role scope. A valid
+retry marker with missing scope authority reports
+`followup_feedback_rearm_contract_unavailable` with
+`exact_parent_feedback_contract_unavailable`; it does not authorize a broader
+rerun. Repair missing summaries before resuming an uncovered decider cohort.
+An authorized expired analysis replay keeps the existing order-window checks;
+valid WAIT snapshots can still enter Core's observation-only monitoring during
+their target session without creating order authority.
+
 ## Reviewed stale DART sync-run reconciliation
 
 The incident-scoped reconciliation for historical sync-run IDs
