@@ -6180,6 +6180,51 @@ class AgentFeedbackRetryService:
                 else None
             )
         knowledge_cutoff_at = effective_knowledge_cutoff_at.isoformat()
+        frozen_parent_id = str(getattr(config, 'reuse_parent_run_id', None) or '').strip()
+        if freeze_decider_scopes and frozen_parent_id:
+            parent_payload = (
+                previous_run.get('request_payload', {})
+                if isinstance(previous_run, dict) else {}
+            )
+            parent_scope = (
+                _exact_completed_summary_scope(parent_payload)
+                if isinstance(parent_payload, Mapping) else None
+            )
+            if not (
+                isinstance(previous_run, dict)
+                and isinstance(parent_payload, Mapping)
+                and previous_run.get('run_id') == frozen_parent_id
+                and str(previous_run.get('market_date')) == config.market_date.isoformat()
+                and parent_payload.get('mode') == DAILY_RETRY_CYCLE_MODE
+                and set(parent_payload.get('roles') or ()) == set(SUMMARIZER_AGENT_NAMES)
+                and _previous_run_matches_knowledge_cutoff(previous_run, knowledge_cutoff_at)
+                and _previous_run_matches_fs_div(previous_run, resolved_fs_div)
+                and _previous_run_matches_policy_context_as_of_date(
+                    previous_run, market_date=config.market_date,
+                    policy_context_as_of_date=resolved_policy_context_as_of_date,
+                )
+                and parent_scope is not None
+                and parent_scope[2] == {
+                    role: sorted(symbols) for role, symbols in role_symbol_scopes.items()
+                }
+            ):
+                raise ValueError('frozen decider summary retry parent contract does not match')
+            raw_prepared_scopes = parent_payload.get('prepared_decider_role_symbol_scopes')
+            try:
+                prepared_decider_scopes = (
+                    {role: [] for role in DECISION_SUPPORT_AGENT_NAMES}
+                    if isinstance(raw_prepared_scopes, Mapping)
+                    and set(raw_prepared_scopes) == set(DECISION_SUPPORT_AGENT_NAMES)
+                    and all(symbols == [] for symbols in raw_prepared_scopes.values())
+                    else _normalize_role_symbol_scopes(
+                        raw_prepared_scopes, roles=DECISION_SUPPORT_AGENT_NAMES,
+                        requested_symbols=parent_scope[0],
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError('frozen decider role scope is invalid') from exc
+            if prepared_decider_scopes is None:
+                raise ValueError('frozen decider role scope is unavailable')
         if normalized_scope_authority is None:
             normalized_scope_authority = (
                 _normalize_feedback_scope_authority(

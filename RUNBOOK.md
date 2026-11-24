@@ -128,6 +128,8 @@ retry marker with missing scope authority reports
 `followup_feedback_rearm_contract_unavailable` with
 `exact_parent_feedback_contract_unavailable`; it does not authorize a broader
 rerun. Repair missing summaries before resuming an uncovered decider cohort.
+An exact summary-parent retry retains that parent's independent prepared
+decider scopes; it does not rerank candidates using the recovery-time funnel.
 An authorized expired analysis replay keeps the existing order-window checks;
 valid WAIT snapshots can still enter Core's observation-only monitoring during
 their target session without creating order authority.
