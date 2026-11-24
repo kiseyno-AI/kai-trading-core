@@ -87,8 +87,8 @@ completed one. The three verification
 responses contained both November 24 and November 23 rows. This proves retrieval,
 not before-KRX publication timing, completed-session selection or full history.
 Do not treat the first row or a successful response as a ready trading signal.
-Calendar session selection is provided below; provider-row validation and
-immutable storage remain separate follow-up slices.
+Calendar selection and exact-row validation are provided below; immutable
+storage remains a separate follow-up slice.
 
 ## Completed US session calendar: second integration slice
 
@@ -128,9 +128,55 @@ with 4.13.2). [Versioned calendar API](https://github.com/gerrymanoim/exchange_c
 [NIST DST dates](https://www.nist.gov/pml/time-and-frequency-division/popular-links/daylight-saving-time-dst).
 
 **Scheduled closure is not proof that KIS has published a final bar.** These dates
-are request bounds only. Provider rows still need exact-date, price and provenance
-validation before a snapshot can be used. This function performs no provider or
-database I/O and adds no scheduler, route, pipeline gate, signal or order behavior.
+are request bounds only. The validator below checks row identity, dates and prices;
+publication readiness and collection provenance require separate evidence.
+This function performs no provider or database I/O and adds no scheduler, route,
+pipeline gate, signal or order behavior.
+
+## Exact US index prices: third integration slice
+
+`app.market.us_index_prices.validate_kis_us_index_prices(payload, index_code=...,
+session=...)` validates a successful response from the first-slice KIS client.
+Pass the `CompletedUSSession` produced by `latest_completed_us_session` with the
+collector's explicit timestamp. The returned frozen `USIndexSessionPrices`
+contains the normalized `index_code`, that `session`, `price` and `previous_price`.
+
+- The supported master codes are `SPX`, `COMP` and `SOX`. A nonempty response must
+  identify the requested index in `output1.stck_shrn_iscd` and have `rt_cd="0"`.
+- Prices come only from the two exact `output2.stck_bsop_date` matches, using each
+  row's `ovrs_nmix_prpr`. Row order is irrelevant. Other dated rows, including an
+  unfinished current session, do not supply prices. Header current/prior prices
+  and percentages are not used for historical session values.
+- Prices must pass the existing finite-number admission check and be positive.
+  They are returned as `Decimal` values parsed from the original representation,
+  preserving decimal-string precision without rounding. Proper thousands
+  separators are accepted; malformed grouping, booleans, blanks, NaN, infinity,
+  zero and negative values are rejected.
+- A successful empty `output2` list/object or absent required session raises
+  `LookupError` listing the missing dates. No older date, synthetic zero or sibling
+  index substitutes for a missing value. Both list and single-object row shapes
+  are understood; one row alone cannot satisfy two required dates.
+- Malformed response containers, non-success result codes, identity mismatches,
+  invalid business-date strings, invalid required prices and duplicate required
+  dates raise `ValueError`. Every row must have a valid `YYYYMMDD` business date;
+  prices are checked only for the two required dates. Duplicate required dates
+  are rejected even when their prices agree.
+
+```python
+from app.market.us_index_prices import validate_kis_us_index_prices
+
+prices = validate_kis_us_index_prices(payload, index_code='SPX', session=session)
+# prices.price / prices.previous_price: exact provider Decimal values
+# prices.session: the same calendar window used for the request
+```
+
+The field mapping is documented in the [official KIS example](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/overseas_stock/inquire_daily_chartprice/chk_inquire_daily_chartprice.py).
+That example does not establish a publication timestamp or final-bar guarantee;
+`mod_yn` is a modification flag, not proof of finality. Validation certifies the
+selected values' structure and consistency only. The caller must still establish
+when the response was collected and whether it was available before its cutoff.
+The validator performs no I/O, does not mutate the payload and adds no retries,
+storage, HTTP route, scheduler, daily-pipeline gate, trading signal or order.
 
 ## Notes
 - Do not commit real secrets
