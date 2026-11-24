@@ -87,7 +87,50 @@ completed one. The three verification
 responses contained both November 24 and November 23 rows. This proves retrieval,
 not before-KRX publication timing, completed-session selection or full history.
 Do not treat the first row or a successful response as a ready trading signal.
-Calendar-aware validation and immutable storage are separate follow-up slices.
+Calendar session selection is provided below; provider-row validation and
+immutable storage remain separate follow-up slices.
+
+## Completed US session calendar: second integration slice
+
+`app.market.us_session.latest_completed_us_session(as_of=...)` is a pure calendar
+lookup. It requires an explicit timezone-aware `datetime` and returns a frozen
+`CompletedUSSession` with `session_date`, `close_at`, `previous_session_date` and
+`previous_close_at`. Dates are XNYS session labels; both close timestamps are UTC.
+
+The candidate is based on the New York civil date, then checked against its
+scheduled exchange close. A close is eligible when `close_at <= as_of`, including
+the exact closing instant without rounding away microseconds. Before that instant
+the preceding session is selected. XNYS supplies holidays, early closes and DST;
+there is no fixed UTC closing hour or weekday fallback. Naive/invalid inputs and
+dates outside the installed calendar's supported range raise `ValueError`.
+
+```python
+from datetime import datetime
+from app.market.us_session import latest_completed_us_session
+
+session = latest_completed_us_session(
+    as_of=datetime.fromisoformat('2026-11-24T07:00:00+09:00'),
+)
+# session_date: 2026-11-23; close_at: 2026-11-23T21:00:00+00:00
+# previous_session_date: 2026-11-20
+payload = await client.fetch_overseas_index_daily_prices(
+    index_code='SPX',
+    start_date=session.previous_session_date.strftime('%Y%m%d'),
+    end_date=session.session_date.strftime('%Y%m%d'),
+)
+```
+
+Verified calendar cases include Thanksgiving 2026-11-26 (closed), Black Friday
+2026-11-27 (13:00 New York / 18:00 UTC close), and the March/November DST changes.
+The implementation uses the existing `exchange_calendars` dependency (verified
+with 4.13.2). [Versioned calendar API](https://github.com/gerrymanoim/exchange_calendars/blob/4.13.2/exchange_calendars/exchange_calendar.py),
+[NYSE hours and holidays](https://www.nyse.com/trade/hours-calendars),
+[NIST DST dates](https://www.nist.gov/pml/time-and-frequency-division/popular-links/daylight-saving-time-dst).
+
+**Scheduled closure is not proof that KIS has published a final bar.** These dates
+are request bounds only. Provider rows still need exact-date, price and provenance
+validation before a snapshot can be used. This function performs no provider or
+database I/O and adds no scheduler, route, pipeline gate, signal or order behavior.
 
 ## Notes
 - Do not commit real secrets
