@@ -238,6 +238,55 @@ This slice adds no provider calls, automatic collector, route, scheduler,
 daily-pipeline gate, scoring or order behavior. Existing optional-process failure
 isolation must be preserved when collection is wired in a later slice.
 
+## Manual US index collector: fifth integration slice
+
+`app.market.us_index_collector.collect_us_index_inputs(as_of=..., index_codes=...)`
+connects the client, completed-session selector, validator and durable store.
+`as_of` must be timezone-aware and fixes one session window for the entire batch,
+even if collection crosses the next US close. The supported selection defaults
+to `SPX,COMP,SOX`; a subset supports retrying only failed indices. Codes are
+normalized and deduplicated before any requests. Invalid selections/timestamps
+are rejected before provider or database access.
+
+The default is the existing shared `kis_real_client`: real-domain read-only
+quotes even when orders use mock mode. Each selected index is requested once,
+sequentially, with the two calendar dates as bounds. Existing KIS token caching,
+pacing and transport limits apply; the collector adds no retry or continuation
+loop. It records UTC receipt time immediately after each response and derives
+`real`/`mock` from the actual client's `use_mock`. Valid captures are committed
+individually through the existing store, off the event-loop thread.
+
+Run from `apps/api`, with configured KIS credentials, Core database access and
+migration `20261124_0091` already applied:
+
+```sh
+python -m app.internal.us_index_collect
+# Retry only COMP for the same frozen session selection:
+python -m app.internal.us_index_collect --indices COMP --as-of 2026-11-24T07:00:00+09:00
+```
+
+The CLI prints JSON containing `as_of`, both US session dates,
+`source_environment`, `counts` (`saved`, `unavailable`, `failed`) and an `indices`
+list. Saved entries include `index_code`, `status="saved"`, `snapshot_id` and
+`collected_at`. A successful empty response or absent required date is
+`status="unavailable", stage="validate", reason="missing_session_prices"`,
+with no fabricated snapshot. Technical errors are `status="failed"` with
+`stage="fetch"|"validate"|"store"` and `error_type`; exception messages, raw
+responses and credentials are not emitted. A storage lookup error remains a
+storage failure, not provider unavailability. Other indices still run, and
+previously committed captures remain readable by ID. Cancellation propagates.
+
+Batch `status="completed"` means no technical failures, even if prices are
+unavailable; `data_complete` is true only when every selected index was saved.
+Any technical failure yields `partial` (other indices handled) or `failed` (all
+failed). CLI exit codes are 0 for completed, 1 for partial/failed and 2 for bad
+arguments. Rerunning a subset makes a new capture with a new receipt time; it
+does not rewrite earlier evidence or rerun successful indices automatically.
+
+This command neither applies migrations nor schedules itself. It adds no HTTP
+route, daily-pipeline dependency, cutoff selection, signal, score or order.
+Receipt time and structurally valid bars still do not prove provider finality.
+
 ## Notes
 - Do not commit real secrets
 - The token route returns presence, cache, expiry, type, and safe defer metadata only. It never returns the raw KIS access token and is disabled when `UPSTREAM_BEARER_TOKEN` is unset.

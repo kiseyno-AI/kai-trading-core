@@ -42,6 +42,17 @@ The importer verifies existing amounts and refuses a conflicting date instead of
 
 Before downgrading migration `20261124_0091`, export and retain `us_index_input_snapshots`; downgrade drops that table and its immutable capture history.
 
+## Manual US index input collection
+
+After migration `20261124_0091` is applied, run `python -m app.internal.us_index_collect`
+from `apps/api` with Core's database and KIS credentials. This makes one sequential
+real-domain quote request per index (`SPX,COMP,SOX`) and saves each valid capture
+independently. To retry only a failed index, pass `--indices COMP --as-of <original-aware-timestamp>`.
+JSON output distinguishes normal missing prices (`unavailable`, exit 0) from
+technical failures (`failed`, batch exit 1); invalid arguments exit 2. The command
+does not run migrations, daily stages or orders and is not scheduled. See the
+[collector contract](docs/KIS_API_ONBOARDING.md#manual-us-index-collector-fifth-integration-slice).
+
 ## Health checks
 
 - `GET /health`
