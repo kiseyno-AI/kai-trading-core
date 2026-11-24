@@ -78,9 +78,12 @@ Use master codes rather than assuming the dotted code in older examples is the
 required spelling. [Official master helper](https://github.com/koreainvestment/open-trading-api/blob/main/stocks_info/overseas_index_code.py),
 [official API example](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/overseas_stock/inquire_daily_chartprice/inquire_daily_chartprice.py).
 
-The method returns the provider payload unchanged, including `output1` and
-`output2`; an empty result stays empty. A response may include the **current,
-unfinished US session** alongside the last completed one. The three verification
+The method returns a complete single-page provider payload unchanged, including
+`output1` and `output2`; an empty result stays empty. If KIS reports more pages
+(`tr_cont=M/F`), it raises `KISClientError` instead of returning partial history;
+request a shorter date range. It makes no automatic continuation requests.
+A response may include the **current, unfinished US session** alongside the last
+completed one. The three verification
 responses contained both November 24 and November 23 rows. This proves retrieval,
 not before-KRX publication timing, completed-session selection or full history.
 Do not treat the first row or a successful response as a ready trading signal.

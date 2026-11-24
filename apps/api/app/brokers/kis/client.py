@@ -931,7 +931,7 @@ class KISClient:
                 raise ValueError(f'{name} must be a valid YYYYMMDD date') from None
         if start_date > end_date:
             raise ValueError('start_date must not be after end_date')
-        return await self._get(
+        body, continuation = await self._get_response(
             '/uapi/overseas-price/v1/quotations/inquire-daily-chartprice',
             tr_id='FHKST03030100',
             params={
@@ -942,6 +942,9 @@ class KISClient:
                 'FID_PERIOD_DIV_CODE': 'D',
             },
         )
+        if continuation in {'M', 'F'}:
+            raise KISClientError('KIS index history is incomplete; request a shorter date range')
+        return body
 
     async def _fetch_overseas_ranking(
         self,

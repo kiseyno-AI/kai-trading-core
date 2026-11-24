@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from app.brokers.kis.client import KISAPIError, KISClient, KISTimeoutError
+from app.brokers.kis.client import KISAPIError, KISClient, KISClientError, KISTimeoutError
 from app.core.settings import settings
 
 
@@ -13,9 +13,9 @@ class CapturingKISClient(KISClient):
         self.calls = []
         self.response = response if response is not None else {'output': {'last': '220.10'}}
 
-    async def _get(self, path, *, tr_id, params):
+    async def _get_response(self, path, *, tr_id, params, tr_cont=''):
         self.calls.append((path, tr_id, params))
-        return self.response
+        return self.response, ''
 
 
 class PaginatedKISClient(KISClient):
@@ -114,6 +114,25 @@ class KISUSMarketDataClientTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await client.fetch_overseas_index_daily_prices(**arguments)
                 self.assertEqual(client.calls, [])
+
+    async def test_index_history_rejects_incomplete_pages_without_extra_requests(self):
+        for continuation in ('M', 'F'):
+            with self.subTest(continuation=continuation):
+                client = KISClient(use_mock=True)
+                response = httpx.Response(200, headers={'tr_cont': continuation}, json={
+                    'rt_cd': '0',
+                    'output2': [{'stck_bsop_date': '20261123', 'ovrs_nmix_prpr': '7100.00'}],
+                })
+                with (
+                    patch.dict(settings.__dict__, {'kis_app_key': 'test-key', 'kis_app_secret': 'test-secret'}),
+                    patch.object(client, 'issue_access_token', AsyncMock(return_value={'access_token': 'test-token'})),
+                    patch('app.brokers.kis.client.request_with_audit', AsyncMock(return_value=response)) as request,
+                ):
+                    with self.assertRaisesRegex(KISClientError, 'incomplete'):
+                        await client.fetch_overseas_index_daily_prices(
+                            index_code='SPX', start_date='20200101', end_date='20261124'
+                        )
+                self.assertEqual(request.await_count, 1)
 
     async def test_index_history_preserves_kis_rejection(self):
         client = KISClient(use_mock=True)
