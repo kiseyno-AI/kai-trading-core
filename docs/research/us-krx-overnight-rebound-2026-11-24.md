@@ -2,6 +2,8 @@
 
 Date: 2026-11-24. Status: research and implementation plan, not implemented or calibrated. Source baseline: Core `a7fa8718c35d4630e50ec8610e4525d0510ff445`; Exec `b3e0254d619e4366a7200d0f76117ab2f646658b`.
 
+The authoritative operational schedule, durable preopen-selection admission, failure matrix and rollout prerequisites are specified in [Preopen market revision design](../PREOPEN_MARKET_REVISION_DESIGN.md). In particular, today's 08:00 baseline activation must be fenced before a proposed 08:40 revision, and hardcoded session hours in Core/Exec require reconciliation; this document's calendar-relative timing is a proposal, not existing support.
+
 ## Expected behavior
 
 Before each KRX session, incorporate information published since the previous EOD decisions, including the completed US session. Estimate the Korean opening response separately from the return available after an attainable entry. Reconsider affected decisions before the market opens, preserving independent short-term and signal lanes. Price-touch processing must use a persisted decision and deterministic conditions, without another agent call.
