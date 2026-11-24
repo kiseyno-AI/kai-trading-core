@@ -57,6 +57,38 @@
 ## Operator command
 - From `apps/api`, prefer `python3.11 -m app.internal.ops kis-intraday-snapshots-collect --symbols 005930 --include-news true` for shell-driven capture.
 
+## Overseas index daily data: first integration slice
+
+`KISClient.fetch_overseas_index_daily_prices(index_code=..., start_date=..., end_date=...)`
+reads `/uapi/overseas-price/v1/quotations/inquire-daily-chartprice` with
+`FHKST03030100`, market code `N` and daily period `D`. Dates must be valid
+`YYYYMMDD` strings in ascending order; invalid inputs fail before a provider call.
+It reuses the existing client authentication, pacing, timeout and error mapping.
+It adds no retry loop, HTTP route, scheduler, persistence, signal or order behavior.
+
+```python
+payload = await client.fetch_overseas_index_daily_prices(
+    index_code='SPX', start_date='20261120', end_date='20261124',
+)
+```
+
+The official index master and one read-only request per index on 2026-11-24
+confirmed `SPX` (S&P500), `COMP` (Nasdaq Composite) and `SOX` (PHLX Semiconductor).
+Use master codes rather than assuming the dotted code in older examples is the
+required spelling. [Official master helper](https://github.com/koreainvestment/open-trading-api/blob/main/stocks_info/overseas_index_code.py),
+[official API example](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/overseas_stock/inquire_daily_chartprice/inquire_daily_chartprice.py).
+
+The method returns a complete single-page provider payload unchanged, including
+`output1` and `output2`; an empty result stays empty. If KIS reports more pages
+(`tr_cont=M/F`), it raises `KISClientError` instead of returning partial history;
+request a shorter date range. It makes no automatic continuation requests.
+A response may include the **current, unfinished US session** alongside the last
+completed one. The three verification
+responses contained both November 24 and November 23 rows. This proves retrieval,
+not before-KRX publication timing, completed-session selection or full history.
+Do not treat the first row or a successful response as a ready trading signal.
+Calendar-aware validation and immutable storage are separate follow-up slices.
+
 ## Notes
 - Do not commit real secrets
 - The token route returns presence, cache, expiry, type, and safe defer metadata only. It never returns the raw KIS access token and is disabled when `UPSTREAM_BEARER_TOKEN` is unset.
