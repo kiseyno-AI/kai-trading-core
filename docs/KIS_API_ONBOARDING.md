@@ -214,8 +214,9 @@ restored = load_us_index_snapshot(saved.snapshot_id)
 ```
 
 The SHA-256 snapshot ID includes the normalized timestamps, environment, source
-response and validated values. Repeating the same capture returns the original
-record, including under concurrent writes; a later capture or changed response
+response, validated values and calendar/schema versions. Repeating the same
+capture under the same versions returns the original record, including under
+concurrent writes; a later capture, changed response or new calendar version
 creates another record. Source hashes describe canonical decoded JSON, not the
 original HTTP bytes. Text storage preserves decimal strings and hash input across
 database round trips. PostgreSQL guards reject UPDATE, DELETE and TRUNCATE on the
@@ -224,9 +225,10 @@ new table. Downgrading this migration removes its snapshot history.
 `created_at` is a database-generated transaction/insertion timestamp outside the
 input hash, so retries do not rewrite it. It is not a commit or publication time.
 The returned frozen record includes prices, all capture timestamps, environment,
-source JSON/hash and calendar version. Unknown IDs return `None`; hash mismatches
-raise `ValueError`. Missing/invalid source data is rejected before opening a
-database session, and storage failures are not converted into in-memory success.
+source JSON/hash and calendar version. Unknown IDs return `None`; hash or indexed
+metadata mismatches raise `ValueError`. Missing/invalid source data is rejected
+before opening a database session, and storage failures are not converted into
+in-memory success.
 
 Receipt time/environment are caller-supplied provenance, not a KIS final-bar
 attestation. The default Core session scope commits before returning; callers

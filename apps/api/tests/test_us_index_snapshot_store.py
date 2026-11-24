@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app.market.us_index_snapshot_store import load_us_index_snapshot, save_us_index_snapshot
+from app.market import us_index_snapshot_store as snapshot_store_module
 from app.db import engine as core_test_engine
 from app.db_models import USIndexInputSnapshot
 
@@ -258,6 +259,37 @@ def test_corrupted_snapshot_is_not_returned_as_valid_data(database, payload, cap
 
     with pytest.raises(ValueError, match='hash mismatch'):
         load_us_index_snapshot(saved.snapshot_id, session_factory=factory)
+
+
+@pytest.mark.parametrize('field', ['index_code', 'session_date', 'as_of', 'collected_at'])
+def test_changed_indexed_metadata_is_not_returned_as_valid_data(database, payload, capture, field) -> None:
+    _, _, factory = database
+    saved = save_us_index_snapshot(payload, **capture, session_factory=factory)
+    values = {
+        'index_code': 'SOX',
+        'session_date': saved.prices.session.session_date + timedelta(days=1),
+        'as_of': saved.as_of - timedelta(seconds=1),
+        'collected_at': saved.collected_at + timedelta(seconds=1),
+    }
+    with factory() as session:
+        session.execute(update(USIndexInputSnapshot).where(
+            USIndexInputSnapshot.snapshot_id == saved.snapshot_id,
+        ).values({field: values[field]}))
+
+    with pytest.raises(ValueError, match='metadata mismatch'):
+        load_us_index_snapshot(saved.snapshot_id, session_factory=factory)
+
+
+def test_calendar_version_is_part_of_the_snapshot_vintage(database, payload, capture, monkeypatch) -> None:
+    _, _, factory = database
+    first = save_us_index_snapshot(payload, **capture, session_factory=factory)
+    monkeypatch.setattr(snapshot_store_module, 'version', lambda name: 'test-next-calendar-version')
+
+    second = save_us_index_snapshot(payload, **capture, session_factory=factory)
+
+    assert second.snapshot_id != first.snapshot_id
+    assert second.calendar_version == 'test-next-calendar-version'
+    assert load_us_index_snapshot(first.snapshot_id, session_factory=factory) == first
 
 
 def test_storage_failure_does_not_become_an_in_memory_success(payload, capture) -> None:

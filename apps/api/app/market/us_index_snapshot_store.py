@@ -46,6 +46,10 @@ def _utc(value: datetime, name: str) -> datetime:
     return value.astimezone(UTC)
 
 
+def _database_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def _record(row: USIndexInputSnapshot) -> USIndexInputSnapshotRecord:
     if _sha256(row.snapshot_json) != row.snapshot_id:
         raise ValueError('US index snapshot hash mismatch')
@@ -59,18 +63,24 @@ def _record(row: USIndexInputSnapshot) -> USIndexInputSnapshotRecord:
         previous_session_date=date.fromisoformat(window['previous_session_date']),
         previous_close_at=datetime.fromisoformat(window['previous_close_at']),
     )
-    created_at = row.created_at
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=UTC)
+    as_of = datetime.fromisoformat(data['as_of'])
+    collected_at = datetime.fromisoformat(data['collected_at'])
+    if (
+        row.index_code != data['index_code']
+        or row.session_date != session.session_date
+        or _database_utc(row.as_of) != as_of
+        or _database_utc(row.collected_at) != collected_at
+    ):
+        raise ValueError('US index snapshot metadata mismatch')
     return USIndexInputSnapshotRecord(
         snapshot_id=row.snapshot_id,
         prices=USIndexSessionPrices(
             index_code=data['index_code'], session=session,
             price=Decimal(data['price']), previous_price=Decimal(data['previous_price']),
         ),
-        as_of=datetime.fromisoformat(data['as_of']),
-        collected_at=datetime.fromisoformat(data['collected_at']),
-        created_at=created_at.astimezone(UTC),
+        as_of=as_of,
+        collected_at=collected_at,
+        created_at=_database_utc(row.created_at),
         source_environment=data['source_environment'],
         source_payload_sha256=data['source_payload_sha256'],
         source_payload_json=data['source_payload_json'],
