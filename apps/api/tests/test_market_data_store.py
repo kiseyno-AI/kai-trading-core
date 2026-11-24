@@ -2861,13 +2861,13 @@ class FactorBatchPersistenceTests(unittest.TestCase):
         def fake_session_scope():
             yield fake_session
 
-        started = perf_counter()
         with patch('app.market_data_store.session_scope', fake_session_scope):
+            started = perf_counter()
             result = load_prior_market_turnover_baselines(
                 market_date=date(2026, 4, 8),
                 markets=['KOSPI', 'KOSDAQ'],
             )
-        elapsed = perf_counter() - started
+            elapsed = perf_counter() - started
 
         self.assertEqual(fake_session.execute_count, 2)
         self.assertEqual(result['KOSPI']['expected_symbol_count'], 2000)
