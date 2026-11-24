@@ -2,11 +2,11 @@
 
 Date: 2026-11-24. Status: research and implementation plan, not implemented or calibrated. Source baseline: Core `a7fa8718c35d4630e50ec8610e4525d0510ff445`; Exec `b3e0254d619e4366a7200d0f76117ab2f646658b`.
 
-The latest policy is an **optional additive supplement**, specified in [Optional US-market supplement design](../PREOPEN_MARKET_REVISION_DESIGN.md). Existing daily/monitoring/execution never waits for it; the earlier mandatory preopen-selection/08:00 baseline-fence proposal is superseded. Only independently successful new candidates can be added, without replacing executable baseline families. Shared-account real/uncertain broker exposure remains subject to existing safety.
+The latest proposal is an **independent optional rule strategy**, specified in the [development specification](../PREOPEN_MARKET_REVISION_DESIGN.md). It calls no decider, adds no artificial score and uses its own explicit risk/rule criteria instead of the original six-point gate. The original two-decider daily/monitoring/execution flow is unchanged and never waits for it. The earlier decider-reassessment alternative below is research history, not the current implementation path. Shared-account real/uncertain broker exposure remains subject to existing safety.
 
-## Expected behavior
+## Forecast research objective
 
-Before each KRX session, optionally analyze information published since previous EOD decisions, including the completed US session. Estimate the Korean opening response separately from the return available after an attainable entry. Fresh optional lane decisions may add opportunities where no executable baseline family exists; original publications/plans remain independent. Price-touch processing uses a persisted decision and deterministic conditions, without another agent call.
+Before each KRX session, optionally analyze information from the completed US session. Estimate the Korean opening response separately from return available after attainable entry. The current proposal uses this evidence in a separate deterministic strategy with truthful rule provenance, risk sizing and timed exits, preserving original publications/plans. No live behavior has changed.
 
 A strong US rebound should be available to the deciders as timestamped evidence. It must not remain hidden behind an authoritative previous-session defensive label. A market forecast does not itself choose a stock, create a WAIT, or authorize a broker order.
 
@@ -139,7 +139,9 @@ The initial production use, after validation, is a structured reason for fresh p
 
 Model fitting is an offline research job, never a price-touch operation. Daily inference is a small deterministic calculation over the persisted shared snapshot. Optional features missing by design must not create synthetic zero returns or fail the entire EOD process.
 
-## Decision flow and ownership
+## Earlier decider-reassessment alternative (superseded)
+
+This section records the prior alternative. It is not the current development instruction: the rule-origin strategy in the linked specification replaces the fresh-decider, six-point and snapshot-bound execution assumptions described here. Historical inputs, statistical targets and failure-isolation lessons remain relevant.
 
 ### Previous evening: preserve the original EOD analysis
 
@@ -210,7 +212,7 @@ An EOD decider could prepare an explicitly conditional rebound branch with its o
 
 Relevant existing regression anchors: [market-context tests](../../apps/api/tests/test_signal_decider_market_context.py), [next-open execution tests](../../apps/api/tests/test_next_open_execution_service.py), [TimesFM reuse tests](../../apps/api/tests/test_timesfm_feedback_reuse.py), [forecast tests](../../apps/api/tests/test_timesfm_forecast_service.py), [side-agent input tests](../../apps/api/tests/test_side_agent_inputs.py). Exec anchors are `tests/test_live_market_context.py` and `tests/test_plan_judgment_actions.py`.
 
-## Delivery slices
+## Earlier delivery slices (superseded)
 
 1. **Evidence and offline baseline:** validate KIS direct-index master coverage, timing and historical rows first; use independently verified external alternatives only if it cannot meet the requirement. Persist shared timestamped snapshots; implement the lag-only relative-shock features and chronological benchmark/calibration report. No trading behavior changes. Reuse the KIS client, existing HTTP/context patterns, `side_agents/market_inputs.py`, `us_equities/market_data.py`, `market/`, and `analytics/signal_lab.py` where appropriate; isolate optional-source failures from the daily pipeline and avoid a new provider SDK.
 2. **Preopen revisions in observation mode:** add the shared revision module, durable job/proof identity, backward-compatible reason metadata, both prompt forms, exact role-level retries and target-session readback. Wire the existing scheduled runner and explicit recovery entry points to that same module. Persist new verdicts in isolated observational storage, collect subsequent outcomes and measure latency; prove they cannot be consumed by live selectors, overwrite authority or reach Exec.
