@@ -68,10 +68,11 @@ def _write_openclaw_session_store(
     provider: str | None = 'openai',
     model: str | None = 'gpt-6.1-sol',
     harness: str | None = 'codex',
+    schema_version: int = 25,
 ) -> None:
     path.parent.mkdir(parents=True)
     with sqlite3.connect(path) as connection:
-        connection.execute('PRAGMA user_version = 25')
+        connection.execute(f'PRAGMA user_version = {schema_version}')
         connection.executescript(
             '''
             CREATE TABLE schema_meta (
@@ -103,9 +104,9 @@ def _write_openclaw_session_store(
         connection.execute(
             '''
             INSERT INTO schema_meta (meta_key, role, schema_version, agent_id)
-            VALUES ('primary', 'agent', 25, ?)
+            VALUES ('primary', 'agent', ?, ?)
             ''',
-            (agent_name,),
+            (schema_version, agent_name),
         )
         ended_ms = started_ms + 10
         connection.execute(
@@ -602,9 +603,15 @@ def test_decider_expected_model_settings_default_to_gpt_6_1_sol(
     assert configured.openclaw_agent_max_prompt_chars == 125_000
 
 
-def test_post_dispatch_session_observation_reads_current_openclaw_sqlite_store(
+@pytest.mark.parametrize(
+    'schema_version, expected_model',
+    [(25, 'openai/gpt-6.1-sol'), (38, 'openai/gpt-6.1-sol'), (39, None)],
+)
+def test_post_dispatch_session_observation_accepts_audited_sqlite_schema_versions(
     tmp_path,
     monkeypatch,
+    schema_version,
+    expected_model,
 ) -> None:
     session_key = 'feedback/signal-decider/sqlite-run'
     session_id = 'sqlite-session-1'
@@ -623,6 +630,7 @@ def test_post_dispatch_session_observation_reads_current_openclaw_sqlite_store(
         session_key=session_key,
         session_id=session_id,
         started_ms=started_ms,
+        schema_version=schema_version,
     )
     with sqlite3.connect(store) as connection:
         connection.execute(
@@ -652,7 +660,11 @@ def test_post_dispatch_session_observation_reads_current_openclaw_sqlite_store(
         session_id=session_id,
     )
 
-    assert observed['actual_model_ref'] == 'openai/gpt-6.1-sol'
+    assert observed['actual_model_ref'] == expected_model
+    assert observed['verified'] is (expected_model is not None)
+    if expected_model is None:
+        assert observed['actual_source_fingerprint'] is None
+        return
     assert observed['actual_identity_source'] == 'openclaw_session_store_sqlite'
     assert observed['verification_basis'] == 'post_dispatch_session_observation'
     assert observed['verified'] is True
@@ -1029,6 +1041,12 @@ def test_post_dispatch_session_observation_stops_after_bounded_retries(
     ('mutation_sql', 'mutation_params'),
     [
         ('PRAGMA user_version = 24', ()),
+        ('PRAGMA user_version = 38', ()),
+        ('PRAGMA user_version = 39', ()),
+        (
+            'UPDATE schema_meta SET schema_version = 38 WHERE meta_key = ?',
+            ('primary',),
+        ),
         (
             "UPDATE schema_meta SET role = 'gateway' WHERE meta_key = 'primary'",
             (),

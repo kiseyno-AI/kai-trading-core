@@ -109,6 +109,19 @@ The importer verifies existing amounts and refuses a conflicting date instead of
 - `POST /eod/composite-factors/compute`
 - `GET /eod/composite-factors`
 
+## OpenClaw decider identity compatibility
+
+Core accepts the verified local agent SQLite formats 25 and 38. The database
+version and `schema_meta` version must agree; file ownership, session identity,
+Codex harness, completion and timestamp checks remain mandatory. Unknown
+formats are rejected. A response model alias does not prove the actual provider
+or model. After an OpenClaw upgrade, validate one new decider completion before
+resuming its exact failed scope. Failed sessions may already have been removed
+by the normal session-cleanup queue.
+
+Scheduled agent counters preserve an explicit zero successful-feedback count;
+processed failures are never substituted for successful publications.
+
 ## Reviewed stale DART sync-run reconciliation
 
 The incident-scoped reconciliation for historical sync-run IDs

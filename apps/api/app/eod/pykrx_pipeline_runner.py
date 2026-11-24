@@ -1536,10 +1536,17 @@ def _extract_raw_result_counts(
     progress = result.get('progress') if isinstance(result.get('progress'), dict) else {}
     progress_summary = progress.get('summary') if isinstance(progress.get('summary'), dict) else {}
     if progress_summary:
-        succeeded = _int(
-            progress_summary.get('completed_feedback_count')
-            or progress_summary.get('completed_symbols')
-            or progress_summary.get('processed_symbols')
+        succeeded = next(
+            (
+                _int(progress_summary[key])
+                for key in (
+                    'completed_feedback_count',
+                    'completed_symbols',
+                    'processed_symbols',
+                )
+                if key in progress_summary
+            ),
+            0,
         )
         failed = _int(progress_summary.get('failed_items') or progress_summary.get('failed_symbols'))
         total = _int(
