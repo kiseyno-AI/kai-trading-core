@@ -911,6 +911,38 @@ class KISClient:
             },
         )
 
+    async def fetch_overseas_index_daily_prices(
+        self,
+        *,
+        index_code: str,
+        start_date: str,
+        end_date: str,
+    ) -> dict[str, Any]:
+        """Read raw index bars; callers must validate session completion/freshness."""
+        normalized_index = index_code.strip().upper()
+        if not normalized_index:
+            raise ValueError('index_code is required')
+        for name, value in (('start_date', start_date), ('end_date', end_date)):
+            if not isinstance(value, str) or not re.fullmatch(r'[0-9]{8}', value):
+                raise ValueError(f'{name} must be a valid YYYYMMDD date')
+            try:
+                datetime.strptime(value, '%Y%m%d')
+            except ValueError:
+                raise ValueError(f'{name} must be a valid YYYYMMDD date') from None
+        if start_date > end_date:
+            raise ValueError('start_date must not be after end_date')
+        return await self._get(
+            '/uapi/overseas-price/v1/quotations/inquire-daily-chartprice',
+            tr_id='FHKST03030100',
+            params={
+                'FID_COND_MRKT_DIV_CODE': 'N',
+                'FID_INPUT_ISCD': normalized_index,
+                'FID_INPUT_DATE_1': start_date,
+                'FID_INPUT_DATE_2': end_date,
+                'FID_PERIOD_DIV_CODE': 'D',
+            },
+        )
+
     async def _fetch_overseas_ranking(
         self,
         *,
