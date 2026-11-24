@@ -9,6 +9,13 @@ from app.core.numbers import finite_float
 from app.market.us_session import CompletedUSSession
 
 
+SUPPORTED_US_INDEX_CODES = ('SPX', 'COMP', 'SOX')
+
+
+class USIndexPricesUnavailable(LookupError):
+    """A successful KIS response lacks one or both required session prices."""
+
+
 @dataclass(frozen=True)
 class USIndexSessionPrices:
     index_code: str
@@ -28,7 +35,7 @@ def validate_kis_us_index_prices(
     payload: Mapping[str, Any], *, index_code: str, session: CompletedUSSession,
 ) -> USIndexSessionPrices:
     """Validate two session prices without certifying provider publication finality."""
-    if not isinstance(index_code, str) or index_code.strip().upper() not in {'SPX', 'COMP', 'SOX'}:
+    if not isinstance(index_code, str) or index_code.strip().upper() not in SUPPORTED_US_INDEX_CODES:
         raise ValueError('Unsupported US index_code')
     if not isinstance(payload, Mapping) or payload.get('rt_cd') != '0':
         raise ValueError('KIS response must have rt_cd=0')
@@ -38,7 +45,7 @@ def validate_kis_us_index_prices(
     if not isinstance(rows, (list, Mapping)):
         raise ValueError('KIS output2 must be a list or object')
     if not rows:
-        raise LookupError(f'Missing KIS index prices for {", ".join(dates)}')
+        raise USIndexPricesUnavailable(f'Missing KIS index prices for {", ".join(dates)}')
     if isinstance(rows, Mapping):
         rows = [rows]
     header = payload.get('output1')
@@ -63,7 +70,7 @@ def validate_kis_us_index_prices(
         prices[date_text] = _positive_price(row.get('ovrs_nmix_prpr'))
     missing = [value for value in dates if value not in prices]
     if missing:
-        raise LookupError(f'Missing KIS index prices for {", ".join(missing)}')
+        raise USIndexPricesUnavailable(f'Missing KIS index prices for {", ".join(missing)}')
     return USIndexSessionPrices(
         index_code=normalized_code,
         session=session,
