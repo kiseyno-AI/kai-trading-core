@@ -95,6 +95,52 @@ class KISUSMarketDataClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, response)
 
+    async def test_index_deadline_guard_runs_after_client_setup_before_network_dispatch(self):
+        client = KISClient(use_mock=True)
+        real_http_client = httpx.AsyncClient
+        expired = False
+        constructed = []
+        sent = []
+
+        def guard():
+            if expired:
+                raise TimeoutError('quote cutoff reached')
+
+        def transport(request):
+            sent.append(request)
+            return httpx.Response(200, json={'rt_cd': '0', 'output2': []})
+
+        def delayed_client_setup(*args, **kwargs):
+            nonlocal expired
+            constructed.append(True)
+            expired = True
+            return real_http_client(*args, transport=httpx.MockTransport(transport), **kwargs)
+
+        with (
+            patch.dict(settings.__dict__, {'kis_app_key': 'test-key', 'kis_app_secret': 'test-secret'}),
+            patch.object(client, 'issue_access_token', AsyncMock(return_value={'access_token': 'test-token'})),
+            patch('app.brokers.kis.client.httpx.AsyncClient', side_effect=delayed_client_setup),
+        ):
+            with self.assertRaises(TimeoutError):
+                await client.fetch_overseas_index_daily_prices(
+                    index_code='SPX', start_date='20261123', end_date='20261124', deadline_guard=guard,
+                )
+        self.assertEqual(constructed, [True])
+        self.assertEqual(sent, [])
+
+    async def test_index_deadline_guard_can_stop_before_authentication(self):
+        client = KISClient(use_mock=True)
+
+        def guard():
+            raise TimeoutError('quote cutoff reached')
+
+        with patch.object(client, 'issue_access_token', AsyncMock()) as token:
+            with self.assertRaises(TimeoutError):
+                await client.fetch_overseas_index_daily_prices(
+                    index_code='SPX', start_date='20261123', end_date='20261124', deadline_guard=guard,
+                )
+        token.assert_not_awaited()
+
     async def test_invalid_index_history_inputs_do_not_call_provider(self):
         for overrides in (
             {'index_code': '   '},

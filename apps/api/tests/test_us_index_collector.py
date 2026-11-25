@@ -357,3 +357,40 @@ def test_database_work_does_not_block_the_event_loop_thread(database):
         session_factory=background_database,
     ))
     assert result['counts']['saved'] == 1
+
+
+def test_explicit_deadline_is_checked_at_the_quote_boundary(database):
+    client = FakeKISClient()
+    result = asyncio.run(collect_us_index_inputs(
+        as_of=AS_OF, deadline=AS_OF + timedelta(seconds=1), index_codes=('SPX',),
+        client=client, session_factory=database, clock=lambda: AS_OF + timedelta(seconds=1),
+    ))
+    assert client.calls == []
+    assert result['indices'] == [{
+        'index_code': 'SPX', 'status': 'failed', 'stage': 'fetch', 'error_type': 'TimeoutError',
+    }]
+
+
+@pytest.mark.parametrize('deadline', [AS_OF, AS_OF.replace(tzinfo=None), 'invalid'])
+def test_invalid_deadline_is_rejected_before_provider_access(deadline):
+    client = FakeKISClient()
+    with pytest.raises(ValueError, match='deadline'):
+        asyncio.run(collect_us_index_inputs(as_of=AS_OF, deadline=deadline, client=client))
+    assert client.calls == []
+
+
+def test_a_response_at_the_deadline_never_opens_the_database():
+    client = FakeKISClient()
+    times = iter((AS_OF, AS_OF + timedelta(seconds=1)))
+
+    def no_database():
+        raise AssertionError('Late response must not be stored')
+
+    result = asyncio.run(collect_us_index_inputs(
+        as_of=AS_OF, deadline=AS_OF + timedelta(seconds=1), index_codes=('SPX',),
+        client=client, session_factory=no_database, clock=lambda: next(times),
+    ))
+    assert len(client.calls) == 1
+    assert result['indices'] == [{
+        'index_code': 'SPX', 'status': 'failed', 'stage': 'validate', 'error_type': 'TimeoutError',
+    }]

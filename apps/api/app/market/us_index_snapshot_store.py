@@ -7,6 +7,7 @@ from importlib.metadata import version
 import json
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -136,3 +137,29 @@ def load_us_index_snapshot(
     with session_factory() as db_session:
         row = db_session.get(USIndexInputSnapshot, snapshot_id)
         return _record(row) if row is not None else None
+
+
+def load_us_index_captures(
+    *, as_of: datetime, collected_by: datetime, session: CompletedUSSession,
+    source_environment: str, session_factory=session_scope,
+) -> dict[str, USIndexInputSnapshotRecord]:
+    """Recover the first committed capture per index in one exact collection window."""
+    as_of = _utc(as_of, 'as_of')
+    collected_by = _utc(collected_by, 'collected_by')
+    if collected_by < as_of:
+        raise ValueError('collected_by cannot precede as_of')
+    if source_environment not in ('real', 'mock'):
+        raise ValueError('source_environment must be real or mock')
+    statement = select(USIndexInputSnapshot).where(
+        USIndexInputSnapshot.as_of == as_of,
+        USIndexInputSnapshot.session_date == session.session_date,
+        USIndexInputSnapshot.collected_at >= as_of,
+        USIndexInputSnapshot.collected_at <= collected_by,
+    ).order_by(USIndexInputSnapshot.collected_at, USIndexInputSnapshot.snapshot_id)
+    captures = {}
+    with session_factory() as db_session:
+        for row in db_session.scalars(statement):
+            record = _record(row)
+            if record.source_environment == source_environment and record.prices.session == session:
+                captures.setdefault(record.prices.index_code, record)
+    return captures

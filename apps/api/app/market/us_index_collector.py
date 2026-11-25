@@ -21,6 +21,7 @@ async def collect_us_index_inputs(
     *, as_of: datetime, index_codes: Sequence[str] = SUPPORTED_US_INDEX_CODES,
     client: KISClient | None = None, session_factory=session_scope,
     clock: Callable[[], datetime] = _utc_now,
+    deadline: datetime | None = None,
 ) -> dict[str, Any]:
     """Manually collect a fixed US session without involving daily jobs or orders."""
     if (
@@ -32,18 +33,31 @@ async def collect_us_index_inputs(
     index_codes = tuple(dict.fromkeys(code.strip().upper() for code in index_codes))
     session = latest_completed_us_session(as_of=as_of)
     as_of = as_of.astimezone(UTC)
+    if deadline is not None:
+        if not isinstance(deadline, datetime) or deadline.utcoffset() is None or deadline <= as_of:
+            raise ValueError('deadline must be timezone-aware and after as_of')
+        deadline = deadline.astimezone(UTC)
     client = client if client is not None else kis_real_client
     environment = 'mock' if client.use_mock else 'real'
+
+    def check_deadline() -> None:
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError('US index request deadline reached')
+
     indices = []
     for code in index_codes:
         stage = 'fetch'
         try:
+            check_deadline()
             payload = await client.fetch_overseas_index_daily_prices(
                 index_code=code, start_date=session.previous_session_date.strftime('%Y%m%d'),
                 end_date=session.session_date.strftime('%Y%m%d'),
+                **({'deadline_guard': check_deadline} if deadline is not None else {}),
             )
             stage = 'validate'
             collected_at = clock()
+            if deadline is not None and collected_at >= deadline:
+                raise TimeoutError('US index response missed its deadline')
             try:
                 validate_kis_us_index_prices(payload, index_code=code, session=session)
             except USIndexPricesUnavailable:

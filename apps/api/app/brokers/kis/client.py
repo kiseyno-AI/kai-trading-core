@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import re
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -697,7 +697,10 @@ class KISClient:
         json_body: Mapping[str, Any] | None = None,
         tr_cont: str = '',
         use_hashkey: bool = False,
+        deadline_guard: Callable[[], None] | None = None,
     ) -> tuple[dict[str, Any], str]:
+        if deadline_guard is not None:
+            deadline_guard()
         token = await self.issue_access_token()
         token_store = self._token_store()
         used_access_token = str(token['access_token'])
@@ -727,7 +730,13 @@ class KISClient:
                 headers['hashkey'] = hashkey
 
         await self._wait_for_request_slot()
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
+        client_options: dict[str, Any] = {}
+        if deadline_guard is not None:
+            async def check_request_deadline(_request: httpx.Request) -> None:
+                deadline_guard()
+
+            client_options['event_hooks'] = {'request': [check_request_deadline]}
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0, **client_options) as client:
             try:
                 response = await request_with_audit(
                     client,
@@ -800,8 +809,12 @@ class KISClient:
         tr_id: str,
         params: Mapping[str, Any],
         tr_cont: str = '',
+        deadline_guard: Callable[[], None] | None = None,
     ) -> tuple[dict[str, Any], str]:
-        return await self._request('GET', path, tr_id=tr_id, params=params, tr_cont=tr_cont)
+        return await self._request(
+            'GET', path, tr_id=tr_id, params=params, tr_cont=tr_cont,
+            **({'deadline_guard': deadline_guard} if deadline_guard is not None else {}),
+        )
 
     async def _post(self, path: str, *, tr_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         response_body, _ = await self._request(
@@ -917,6 +930,7 @@ class KISClient:
         index_code: str,
         start_date: str,
         end_date: str,
+        deadline_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Read raw index bars; callers must validate session completion/freshness."""
         normalized_index = index_code.strip().upper()
@@ -941,6 +955,7 @@ class KISClient:
                 'FID_INPUT_DATE_2': end_date,
                 'FID_PERIOD_DIV_CODE': 'D',
             },
+            **({'deadline_guard': deadline_guard} if deadline_guard is not None else {}),
         )
         if continuation in {'M', 'F'}:
             raise KISClientError('KIS index history is incomplete; request a shorter date range')
