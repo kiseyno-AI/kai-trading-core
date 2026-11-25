@@ -65,6 +65,8 @@ inputs before 07:12 KST. Treat `input_freeze.snapshot_ids` and its `manifest_id`
 the frozen identity; top-level `snapshot_ids` remain collection evidence and may
 differ. Retain `frozen/<real|mock>-YYYY-MM-DD/{input.json,seal.json}` with the linked
 snapshot database. Never delete an unsealed candidate to select different IDs.
+The job account needs directory-fsync support and permission to open the state
+path's ancestors through its filesystem mount root; a sync error cannot seal input.
 See the [freeze and replay contract](docs/US_INDEX_INPUT_FREEZE.md) for reading
 sealed inputs after the window and handling interrupted or corrupt evidence.
 

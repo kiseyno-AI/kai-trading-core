@@ -62,6 +62,13 @@ referenced `us_index_input_snapshots` rows. Do not delete or edit files, reset
 today's collection checkpoint, or remove a candidate/seal to choose different IDs.
 Restore damaged evidence from a consistent backup rather than reselecting it.
 
+The service account must be able to open and fsync each ancestor through the
+filesystem's mount root. The collector can create the state directory itself;
+an existing directory after interruption does not prove its link was synced.
+Every retry therefore syncs the ancestors again. A permission/fsync error is a
+technical failure and leaves an unsealed candidate; it is never ignored to claim
+a successful freeze. Verify these permissions before enabling the optional job.
+
 ## Running and reading
 
 From `apps/api`, with existing Core database/KIS configuration, the existing CLI

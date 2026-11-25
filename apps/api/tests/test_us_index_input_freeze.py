@@ -310,6 +310,38 @@ def test_new_directory_links_are_synced_before_confirmation(tmp_path, database, 
     assert required <= synced
 
 
+def test_unreadable_ancestor_cannot_seal_until_its_sync_succeeds(tmp_path, database, captures, monkeypatch):
+    open_fd = os.open
+    blocked = tmp_path.parent.resolve()
+
+    def restricted_open(path, *args, **kwargs):
+        if Path(path).resolve() == blocked:
+            raise PermissionError('simulated unreadable ancestor')
+        return open_fd(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', restricted_open)
+    ids = {code: record.snapshot_id for code, record in captures.items()}
+    with pytest.raises(PermissionError):
+        freeze_us_index_inputs(
+            target_trade_date=TARGET_DATE, snapshot_ids=ids, state_dir=tmp_path,
+            session_factory=database, clock=Clock(),
+        )
+    folder = tmp_path / 'frozen/real-2026-11-25'
+    candidate = (folder / 'input.json').read_bytes()
+    assert not (folder / 'seal.json').exists()
+    assert load_frozen_us_index_inputs(
+        target_trade_date=TARGET_DATE, state_dir=tmp_path, session_factory=database,
+    ) is None
+
+    monkeypatch.setattr(os, 'open', open_fd)
+    resumed = freeze_us_index_inputs(
+        target_trade_date=TARGET_DATE, snapshot_ids={}, state_dir=tmp_path,
+        session_factory=database, clock=Clock(11),
+    )
+    assert resumed.snapshot_ids == ids
+    assert (folder / 'input.json').read_bytes() == candidate
+
+
 @pytest.mark.parametrize('minute', [11, 12])
 def test_interrupted_seal_keeps_its_candidate_and_only_resumes_before_cutoff(
     tmp_path, database, captures, monkeypatch, minute,
