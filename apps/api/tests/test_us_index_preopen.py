@@ -13,8 +13,9 @@ from sqlalchemy.orm import Session
 
 from app.db_models import USIndexInputSnapshot
 from app.internal.exact_repair_manifest import checkpoint_file_lock
+from app.market.us_index_input_freeze import freeze_us_index_inputs, load_frozen_us_index_inputs
 from app.market.us_index_preopen import run_us_index_preopen
-from app.market.us_index_snapshot_store import load_us_index_snapshot
+from app.market.us_index_snapshot_store import load_us_index_snapshot, save_us_index_snapshot
 
 
 KST = ZoneInfo('Asia/Seoul')
@@ -398,12 +399,103 @@ def test_standalone_cli_runs_actual_scheduler_and_reports_committed_ids(tmp_path
     exit_code = main(
         ['--state-dir', str(tmp_path)],
         runner=partial(run_us_index_preopen, client=FakeKIS(), session_factory=database, clock=Clock()),
+        freezer=partial(freeze_us_index_inputs, session_factory=database, clock=Clock()),
     )
 
     result = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert result['data_complete'] is True
     assert len(result['snapshot_ids']) == 3
+    assert result['input_freeze']['status'] == 'frozen'
+    frozen = load_frozen_us_index_inputs(
+        target_trade_date=Clock().value.date(), state_dir=tmp_path, session_factory=database,
+    )
+    assert frozen.manifest_id == result['input_freeze']['manifest_id']
+    assert frozen.snapshot_ids == result['snapshot_ids']
+
+
+def test_cli_does_not_freeze_incomplete_collection(tmp_path, database, capsys):
+    from app.internal.us_index_preopen import main
+
+    client = FakeKIS()
+    client.responses['COMP'] = {'rt_cd': '0', 'output2': []}
+
+    def no_freeze(**kwargs):
+        raise AssertionError('Incomplete collection must not be sealed')
+
+    assert main(
+        ['--state-dir', str(tmp_path)],
+        runner=partial(run_us_index_preopen, client=client, session_factory=database, clock=Clock()),
+        freezer=no_freeze,
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['data_complete'] is False
+    assert 'input_freeze' not in result
+    assert not (tmp_path / 'frozen').exists()
+
+
+def test_cli_retries_failed_freezing_without_recollecting_committed_inputs(tmp_path, database, capsys):
+    from app.internal.us_index_preopen import main
+
+    client = FakeKIS()
+    runner = partial(run_us_index_preopen, client=client, session_factory=database, clock=Clock())
+
+    def broken_freeze(**kwargs):
+        raise OSError('credential=synthetic-secret')
+
+    assert main(['--state-dir', str(tmp_path)], runner=runner, freezer=broken_freeze) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        'status': 'failed', 'stage': 'freeze', 'error_type': 'OSError',
+    }
+    assert len(client.calls) == 3
+
+    assert main(
+        ['--state-dir', str(tmp_path)], runner=runner,
+        freezer=partial(freeze_us_index_inputs, session_factory=database, clock=Clock()),
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['input_freeze']['status'] == 'frozen'
+    assert len(client.calls) == 3
+
+
+def test_cli_reports_unavailable_freeze_when_collection_finishes_at_cutoff(tmp_path, database, capsys):
+    from app.internal.us_index_preopen import main
+
+    assert main(
+        ['--state-dir', str(tmp_path)],
+        runner=partial(run_us_index_preopen, client=FakeKIS(), session_factory=database, clock=Clock()),
+        freezer=partial(freeze_us_index_inputs, session_factory=database, clock=Clock(7, 12)),
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['data_complete'] is True
+    assert result['input_freeze'] == {'status': 'unavailable'}
+    assert not (tmp_path / 'frozen').exists()
+
+
+def test_cli_keeps_frozen_ids_separate_from_revised_collection_recovery(tmp_path, database, capsys):
+    from app.internal.us_index_preopen import main
+
+    clock = Clock(7, 5)
+    client = FakeKIS()
+    runner = partial(run_us_index_preopen, client=client, session_factory=database, clock=clock)
+    freezer = partial(freeze_us_index_inputs, session_factory=database, clock=clock)
+    assert main(['--state-dir', str(tmp_path)], runner=runner, freezer=freezer) == 0
+    first = json.loads(capsys.readouterr().out)
+    original = load_us_index_snapshot(first['snapshot_ids']['SPX'], session_factory=database)
+    payload = json.loads(original.source_payload_json)
+    payload['output2'][0]['ovrs_nmix_prpr'] = '7200'
+    revised = save_us_index_snapshot(
+        payload, index_code='SPX', as_of=original.as_of, collected_at=original.as_of,
+        source_environment='real', session_factory=database,
+    )
+    clock.value = clock.value.replace(minute=10)
+
+    assert main(['--state-dir', str(tmp_path)], runner=runner, freezer=freezer) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second['snapshot_ids']['SPX'] == revised.snapshot_id
+    assert second['input_freeze'] == first['input_freeze']
+    assert second['input_freeze']['snapshot_ids']['SPX'] == original.snapshot_id
+    assert len(client.calls) == 3
 
 
 def test_cli_reports_database_errors_without_leaking_exception_text(tmp_path, capsys):

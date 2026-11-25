@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import importlib.util
@@ -23,6 +23,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 
 from app.market.us_index_snapshot_store import load_us_index_captures, load_us_index_snapshot, save_us_index_snapshot
 from app.market import us_index_snapshot_store as snapshot_store_module
+from app.market.us_index_input_freeze import freeze_us_index_inputs, load_frozen_us_index_inputs
 from app.db import engine as core_test_engine
 from app.db_models import USIndexInputSnapshot
 
@@ -360,6 +361,31 @@ def test_postgresql_round_trip_preserves_hash_and_decimal_text(postgres_database
         as_of=capture['as_of'], collected_by=capture['collected_at'], session=saved.prices.session,
         source_environment=capture['source_environment'], session_factory=postgres_database,
     ) == {'SPX': saved}
+
+
+def test_postgresql_input_freeze_replays_the_exact_committed_rows(postgres_database, tmp_path) -> None:
+    as_of = datetime(2026, 11, 24, 22, tzinfo=UTC)
+    captures = {
+        code: save_us_index_snapshot(
+            {'rt_cd': '0', 'output1': {'stck_shrn_iscd': code}, 'output2': [
+                {'stck_bsop_date': '20261124', 'ovrs_nmix_prpr': '7100.123456789012345678'},
+                {'stck_bsop_date': '20261123', 'ovrs_nmix_prpr': '7000'},
+            ]},
+            index_code=code, as_of=as_of, collected_at=as_of + timedelta(minutes=1),
+            source_environment='real', session_factory=postgres_database,
+        ) for code in ('SPX', 'COMP', 'SOX')
+    }
+    frozen = freeze_us_index_inputs(
+        target_trade_date=date(2026, 11, 25),
+        snapshot_ids={code: row.snapshot_id for code, row in captures.items()},
+        state_dir=tmp_path, session_factory=postgres_database, clock=lambda: as_of + timedelta(minutes=10),
+    )
+    replayed = load_frozen_us_index_inputs(
+        target_trade_date=date(2026, 11, 25), state_dir=tmp_path, session_factory=postgres_database,
+    )
+    assert replayed == frozen
+    assert replayed.snapshots == tuple(captures.values())
+    assert replayed.snapshots[0].prices.price == Decimal('7100.123456789012345678')
 
 
 @pytest.mark.parametrize('statement', [

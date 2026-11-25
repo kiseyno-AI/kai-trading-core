@@ -65,8 +65,15 @@ are tried in a later slot.
 
 The collection result contains status, target date, slot, completeness and safe
 snapshot IDs. Checkpoints retain per-slot requested indices and safe outcomes.
+When `data_complete` is true, the standalone CLI attempts the
+[immutable input freeze](US_INDEX_INPUT_FREEZE.md) using those committed IDs.
+It adds `input_freeze.status: frozen`, `manifest_id` and nested `snapshot_ids` on
+success, or `input_freeze.status: unavailable` when no seal can be obtained.
+Top-level `snapshot_ids` still describe collection and may differ from an existing
+seal's nested IDs. The freeze does not collect or select newer provider data.
 The standalone CLI emits JSON and exits 0 for completed/normal no-op/expired,
 1 for technical failure or partial failure, and 2 for invalid CLI arguments.
+Freeze errors report `status: failed`, `stage: freeze` and a safe `error_type`.
 Exception text and credentials are not emitted. Failures have no original daily
 stage, retry-debt, block, monitoring or order side effects.
 
@@ -110,7 +117,9 @@ does not backfill the expired session. See Apple's [launchd jobs guide](https://
 and [timed jobs guide](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html#//apple_ref/doc/uid/10000172i-CH1-SW2),
 plus the installed `launchd.plist(5)` manual for current interval behavior.
 
-These IDs are collection/recovery evidence, not a sealed cutoff manifest, a
-provider-finality attestation or an executable signal. Input freezing, feature
-calculation, rule validation, strategy publication and deployment enablement
-remain separate steps. This change does not install or enable the job itself.
+Collection IDs remain collection/recovery evidence; only the separate validated
+input and seal files establish the frozen selection. Neither is a provider-finality
+attestation or an executable signal. Feature/metric calculation, rule validation,
+decision strategy publication and deployment enablement remain separate steps.
+The baseline, daily runner and Exec remain unchanged. This change does not install
+or enable the job itself.

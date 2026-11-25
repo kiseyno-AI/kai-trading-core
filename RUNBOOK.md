@@ -60,13 +60,23 @@ The optional standalone `python -m app.internal.us_index_preopen` command owns
 only unavailable/failed indices, preserves committed captures after interruption
 and never starts or blocks daily stages, monitoring or orders. Keep one persistent
 `var/us-index-preopen` directory; do not reset today's spent-attempt checkpoint.
+After complete collection, the CLI attempts to freeze the exact three committed
+inputs before 07:12 KST. Treat `input_freeze.snapshot_ids` and its `manifest_id` as
+the frozen identity; top-level `snapshot_ids` remain collection evidence and may
+differ. Retain `frozen/<real|mock>-YYYY-MM-DD/{input.json,seal.json}` with the linked
+snapshot database. Never delete an unsealed candidate to select different IDs.
+The job account needs directory-fsync support and permission to open the state
+path's ancestors through its filesystem mount root; a sync error cannot seal input.
+See the [freeze and replay contract](docs/US_INDEX_INPUT_FREEZE.md) for reading
+sealed inputs after the window and handling interrupted or corrupt evidence.
 
 After deploying a reviewed remote revision with migration `20261124_0091` applied,
 preview `bash scripts/install_us_index_preopen_launchd.sh --print`, then install
 without `--print`. This registers a separate, opt-in per-user polling job; nothing
 is installed automatically by Core startup. See [full recovery and deployment
 instructions](docs/US_INDEX_PREOPEN_COLLECTION.md). A sleeping Mac can miss the
-window; these collection IDs do not constitute a sealed strategy input.
+window; an unsealed candidate cannot be promoted after 07:12. A valid seal is
+input evidence only; strategy validation and activation remain separate work.
 
 ## Health checks
 
