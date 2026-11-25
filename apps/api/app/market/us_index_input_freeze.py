@@ -1,17 +1,21 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from functools import partial
 from pathlib import Path
 import os
 import re
+from zoneinfo import ZoneInfo
 
 from app.db import session_scope
 from app.internal.exact_repair_manifest import (
     canonical_json_sha256, checkpoint_file_lock, load_json_mapping, write_checkpoint,
 )
-from app.market.us_index_preopen import KST, _read_clock, _utc_now, resolve_us_index_preopen_session
 from app.market.us_index_prices import SUPPORTED_US_INDEX_CODES
-from app.market.us_index_snapshot_store import USIndexInputSnapshotRecord, load_us_index_snapshot
+from app.market.us_index_snapshot_store import USIndexInputSnapshotRecord, _utc, load_us_index_snapshot
+
+
+KST = ZoneInfo('Asia/Seoul')
 
 
 @dataclass(frozen=True)
@@ -38,7 +42,7 @@ def _folder(state_dir, target_trade_date: date, source_environment: str) -> Path
 
 def _timestamp(value) -> datetime:
     try:
-        return _read_clock(lambda: datetime.fromisoformat(value))
+        return _utc(datetime.fromisoformat(value), 'US index manifest timestamp')
     except (TypeError, ValueError):
         raise ValueError('US index manifest timestamps must be timezone-aware ISO strings') from None
 
@@ -129,7 +133,7 @@ def load_frozen_us_index_inputs(
 def freeze_us_index_inputs(
     *, target_trade_date: date, snapshot_ids: Mapping[str, str], source_environment: str = 'real',
     state_dir: str | Path = 'var/us-index-preopen', session_factory=session_scope,
-    clock: Callable[[], datetime] = _utc_now,
+    clock: Callable[[], datetime] = partial(datetime.now, UTC),
 ) -> USIndexInputFreezeRecord | None:
     """Seal observed committed IDs before cutoff, or replay the existing selection."""
     folder = _folder(state_dir, target_trade_date, source_environment)
@@ -141,8 +145,11 @@ def freeze_us_index_inputs(
         return existing
     as_of = datetime.combine(target_trade_date, time(7), tzinfo=KST).astimezone(UTC)
     cutoff = as_of + timedelta(minutes=12)
-    if not as_of <= _read_clock(clock) < cutoff:
+    if not as_of <= _utc(clock(), 'clock') < cutoff:
         return None
+    # Replay must not initialize scheduling calendars or provider clients.
+    from app.market.us_index_preopen import resolve_us_index_preopen_session
+
     session, skip_reason = resolve_us_index_preopen_session(target_trade_date)
     if skip_reason is not None:
         return None
@@ -155,7 +162,7 @@ def freeze_us_index_inputs(
         )
         if existing is not None:
             return existing
-        if not as_of <= _read_clock(clock) < cutoff:
+        if not as_of <= _utc(clock(), 'clock') < cutoff:
             return None
         if (folder / 'input.json').exists():
             data, snapshots = _selection(folder, target_trade_date, source_environment, session_factory)
@@ -166,7 +173,7 @@ def freeze_us_index_inputs(
                 return None
             snapshots = tuple(load_us_index_snapshot(ids[code], session_factory=session_factory)
                               for code in SUPPORTED_US_INDEX_CODES)
-            selected_at = _read_clock(clock)
+            selected_at = _utc(clock(), 'clock')
             if not as_of <= selected_at < cutoff:
                 return None
             _validate_snapshots(snapshots, as_of, selected_at, source_environment)
@@ -178,11 +185,11 @@ def freeze_us_index_inputs(
             data['manifest_id'] = canonical_json_sha256(data)
         if snapshots[0].prices.session != session:
             raise ValueError('US index selection calendar window mismatch')
-        if not selected_at <= _read_clock(clock) < cutoff:
+        if not selected_at <= _utc(clock(), 'clock') < cutoff:
             return None
         write_checkpoint(folder / 'input.json', data)
         _sync_parent_directories(folder)
-        confirmed_at = _read_clock(clock)
+        confirmed_at = _utc(clock(), 'clock')
         if not selected_at <= confirmed_at < cutoff:
             return None
         seal = {

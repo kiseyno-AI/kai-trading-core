@@ -458,7 +458,7 @@ def test_concurrent_different_selections_have_one_winner(tmp_path, database, cap
     assert all(record is None or record == winner for record in results)
 
 
-def test_a_fresh_python_process_replays_stored_ids_and_exact_prices(tmp_path, database, captures):
+def test_a_fresh_python_process_replays_without_calendar_initialization(tmp_path, database, captures):
     frozen = freeze_us_index_inputs(
         target_trade_date=TARGET_DATE,
         snapshot_ids={code: record.snapshot_id for code, record in captures.items()},
@@ -469,9 +469,17 @@ from contextlib import contextmanager
 from datetime import date
 import json
 import sys
+import exchange_calendars
+from exchange_calendars.exchange_calendar_xkrx import XKRXExchangeCalendar
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+def no_calendar(*args, **kwargs):
+    raise AssertionError('Replay must not initialize or query a calendar')
+XKRXExchangeCalendar.__init__ = no_calendar
+exchange_calendars.get_calendar = no_calendar
 from app.market.us_index_input_freeze import load_frozen_us_index_inputs
+assert 'app.market.us_index_preopen' not in sys.modules
+assert 'app.brokers.kis.provider' not in sys.modules
 engine = create_engine(sys.argv[1])
 @contextmanager
 def factory():
