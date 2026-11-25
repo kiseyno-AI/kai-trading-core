@@ -24,11 +24,15 @@ pagination or fallback loop is introduced. Ordinary successful collection needs
 only three fetches. The default asynchronous collection budget is 90 seconds per
 tick, bounded by the remaining time to 07:12; a programmatic caller may lower it.
 
-The clock/window are checked after database reads, before each index and again
-at the collector's quote boundary. Responses received at or after the cutoff are
+The clock/window are checked after database reads, before each index, before
+authentication and in the guarded quote client's async HTTPX request hook after
+request preparation, immediately before network dispatch. Default/order clients
+do not register that hook. [HTTPX request-hook timing](https://www.python-httpx.org/advanced/event-hooks/).
+Responses received at or after the cutoff are
 not saved. An already-running synchronous database operation cannot be forcibly
 cancelled by an asyncio timeout; Core's existing SQL/connect timeouts still apply.
-A late completion is expired, and no further quote is started by that tick.
+A late completion is expired after the standalone event loop has drained its
+database worker threads, and no further quote is started by that tick.
 
 The job uses Core's existing XKRX calendar, including its confirmed 2026 closure
 overrides, and checks calendar-provided 09:00–15:30 hours. Closed dates, known
@@ -91,7 +95,13 @@ The per-user label is `com.kiseyno.kai-us-index-preopen`. Its `StartInterval=60`
 polls regardless of host timezone; `RunAtLoad=true` performs an initial schedule
 check, and `KeepAlive=false` avoids failure restart loops. The shell wrapper
 skips Python entirely outside 07:00–07:11 KST, then Python checks the exact clock
-and calendar before requests. stdout/stderr go to separate `apps/api/var/log`
+and calendar before requests. Like Core's launcher, interpreter selection honors
+explicit `PYTHON_BIN`, an executable active virtual environment, local `.venv`,
+then `python3.12` on PATH. The installer resolves and embeds its absolute choice
+in the job's `PYTHON_BIN` environment, so launchd does not depend on an interactive
+shell's activated environment. The wrapper loads the existing trusted,
+shell-compatible Core `.env`, preserving the explicit Python override.
+stdout/stderr go to separate `apps/api/var/log`
 files. Remove with `launchctl bootout gui/$(id -u)/com.kiseyno.kai-us-index-preopen`.
 
 Polling does not promise execution exactly on the minute. `StartInterval` firings

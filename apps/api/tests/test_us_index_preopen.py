@@ -3,6 +3,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from functools import partial
 import json
+import os
+import time
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -296,6 +298,53 @@ def test_deadline_is_rechecked_after_database_work_before_claiming_or_fetching(t
     assert result['reason'] == 'outside_window'
     assert client.calls == []
     assert not (tmp_path / 'real-2026-11-25.json').exists()
+
+
+def test_database_worker_crossing_deadline_during_executor_shutdown_is_expired(tmp_path, database):
+    clock = Clock(7, 11)
+    accesses = 0
+
+    @contextmanager
+    def slow_commit():
+        nonlocal accesses
+        accesses += 1
+        with database() as session:
+            yield session
+            if accesses == 2:
+                time.sleep(0.3)
+                clock.value = clock.value.replace(minute=12)
+
+    client = FakeKIS()
+    result = run_us_index_preopen(
+        state_dir=tmp_path, client=client, session_factory=slow_commit, clock=clock,
+        budget_seconds=0.1,
+    )
+    assert result['status'] == 'expired'
+    assert result['reason'] == 'outside_window'
+    assert result['data_complete'] is False
+    assert len(client.calls) == 1
+
+
+def test_checkpoint_write_crossing_cutoff_cannot_report_a_ready_result(tmp_path, database, monkeypatch):
+    clock = Clock(7, 11)
+    replace = os.replace
+    writes = 0
+
+    def delayed_replace(source, destination):
+        nonlocal writes
+        replace(source, destination)
+        writes += 1
+        if writes == 2:
+            clock.value = clock.value.replace(minute=12)
+
+    monkeypatch.setattr(os, 'replace', delayed_replace)
+    result = run_us_index_preopen(
+        state_dir=tmp_path, client=FakeKIS(), session_factory=database, clock=clock,
+    )
+    assert result['status'] == 'expired'
+    assert result['data_complete'] is False
+    checkpoint = json.loads((tmp_path / 'real-2026-11-25.json').read_text())
+    assert checkpoint['attempts']['07:10']['result']['status'] == 'expired'
 
 
 @pytest.mark.parametrize('value', [None, '2026-11-25T07:00:00', datetime(2026, 11, 25, 7)])

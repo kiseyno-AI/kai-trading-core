@@ -39,15 +39,20 @@ async def collect_us_index_inputs(
         deadline = deadline.astimezone(UTC)
     client = client if client is not None else kis_real_client
     environment = 'mock' if client.use_mock else 'real'
+
+    def check_deadline() -> None:
+        if deadline is not None and clock() >= deadline:
+            raise TimeoutError('US index request deadline reached')
+
     indices = []
     for code in index_codes:
         stage = 'fetch'
         try:
-            if deadline is not None and clock() >= deadline:
-                raise TimeoutError('US index request deadline reached')
+            check_deadline()
             payload = await client.fetch_overseas_index_daily_prices(
                 index_code=code, start_date=session.previous_session_date.strftime('%Y%m%d'),
                 end_date=session.session_date.strftime('%Y%m%d'),
+                **({'deadline_guard': check_deadline} if deadline is not None else {}),
             )
             stage = 'validate'
             collected_at = clock()

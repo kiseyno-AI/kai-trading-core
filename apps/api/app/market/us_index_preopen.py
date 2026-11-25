@@ -149,8 +149,16 @@ def run_us_index_preopen(
             ))
         except Exception as exc:
             result = {'status': 'failed', 'stage': 'collect', 'error_type': type(exc).__name__, 'indices': []}
-        state['attempts'][slot].update(finished_at=_read_clock(clock).isoformat(), result=result)
+        finished_at = _read_clock(clock)
+        if not as_of <= finished_at < deadline:
+            result.update(status='expired', reason='outside_window')
+        state['attempts'][slot].update(finished_at=finished_at.isoformat(), result=result)
         write_checkpoint(path, state)
+        finished_at = _read_clock(clock)
+        if not as_of <= finished_at < deadline and result['status'] != 'expired':
+            result.update(status='expired', reason='outside_window')
+            state['attempts'][slot]['finished_at'] = finished_at.isoformat()
+            write_checkpoint(path, state)
     snapshot_ids.update({item['index_code']: item['snapshot_id'] for item in result['indices']
                          if item['status'] == 'saved'
                          and datetime.fromisoformat(item['collected_at']) < deadline})
