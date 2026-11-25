@@ -24,6 +24,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from app.market.us_index_snapshot_store import load_us_index_captures, load_us_index_snapshot, save_us_index_snapshot
 from app.market import us_index_snapshot_store as snapshot_store_module
 from app.market.us_index_input_freeze import freeze_us_index_inputs, load_frozen_us_index_inputs
+from app.market.us_index_features import calculate_us_index_features
 from app.db import engine as core_test_engine
 from app.db_models import USIndexInputSnapshot
 
@@ -386,6 +387,9 @@ def test_postgresql_input_freeze_replays_the_exact_committed_rows(postgres_datab
     assert replayed == frozen
     assert replayed.snapshots == tuple(captures.values())
     assert replayed.snapshots[0].prices.price == Decimal('7100.123456789012345678')
+    features = calculate_us_index_features(replayed)
+    assert features['input_manifest_id'] == frozen.manifest_id
+    assert float(features['indices']['SPX']['return_pct']) == pytest.approx(1.4303350969858906)
 
 
 @pytest.mark.parametrize('statement', [

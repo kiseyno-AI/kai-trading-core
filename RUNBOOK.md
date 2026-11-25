@@ -78,6 +78,12 @@ instructions](docs/US_INDEX_PREOPEN_COLLECTION.md). A sleeping Mac can miss the
 window; an unsealed candidate cannot be promoted after 07:12. A valid seal is
 input evidence only; strategy validation and activation remain separate work.
 
+## Read-only US-index features
+
+From `apps/api`, run `python -m app.internal.us_index_features --target-trade-date 2026-11-25 --state-dir var/us-index-preopen` to calculate descriptive metrics from that date's verified seal. Supply optional `--history-date` arguments oldest first, at most 20; no history is discovered automatically. Missing current or explicitly requested history seals are normal unavailable results (exit 0); technical failures exit 1 with a safe `error_type`, and malformed arguments exit 2.
+
+Two-close inputs provide returns and spreads; acceleration needs three closes and the 20-return lagged baseline needs 22. Missing sessions stop the baseline, including gaps caused by KRX closure or special-hours collection no-ops. Preserve unavailable values; never backdate seals or manufacture zero returns. The command does not collect, schedule evaluation or publish signals. See [feature formulas, output and limits](docs/US_INDEX_FEATURES.md); proposed 07:15 evaluation and a full-history capture contract remain future work.
+
 ## Health checks
 
 - `GET /health`

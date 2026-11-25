@@ -119,7 +119,12 @@ plus the installed `launchd.plist(5)` manual for current interval behavior.
 
 Collection IDs remain collection/recovery evidence; only the separate validated
 input and seal files establish the frozen selection. Neither is a provider-finality
-attestation or an executable signal. Feature/metric calculation, rule validation,
-decision strategy publication and deployment enablement remain separate steps.
+attestation or an executable signal. The separate, read-only
+[feature calculator](US_INDEX_FEATURES.md) consumes explicit sealed dates; this
+collection CLI does not invoke it or schedule the proposed 07:15 evaluation.
+KRX closure and special-hours no-ops can leave gaps in the 20-return US-history
+baseline; they are not zero-return events and historical seals must not be
+backdated. Rule validation, decision strategy publication, full-history capture
+and deployment enablement remain separate steps.
 The baseline, daily runner and Exec remain unchanged. This change does not install
 or enable the job itself.
