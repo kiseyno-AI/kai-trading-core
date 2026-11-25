@@ -20,6 +20,9 @@ def main(argv: Sequence[str] | None = None, *, loader=load_frozen_us_index_input
     if len(args.history_date) > REFERENCE_WINDOW:
         parser.error('At most 20 explicit historical dates are supported')
     try:
+        chronology = [*args.history_date, args.target_trade_date]
+        if any(older >= newer for older, newer in zip(chronology, chronology[1:])):
+            raise ValueError('Historical dates must be distinct, oldest first and before the target')
         records = []
         for day in [args.target_trade_date, *args.history_date]:
             record = loader(

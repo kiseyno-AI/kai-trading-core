@@ -20,6 +20,8 @@ duplicate, reversed or mixed-environment history is a technical `ValueError`.
 The calculator traces prior US-session links backwards using frozen windows,
 without a live calendar. A gap stops the usable history; conflicting overlapping
 closes or close timestamps raise `ValueError` rather than mixing revisions.
+Overlap checks cover all explicitly supplied adjacent records, including those
+before a later gap that makes them unusable for the reference statistics.
 `history_count` counts that contiguous suffix; `history_inputs` preserves every
 explicitly supplied target date and manifest ID, including records beyond a gap.
 
@@ -91,7 +93,8 @@ history seal gives `reason: missing_history`. Both report
 `missing_target_trade_date` and exit 0. Technical failures report
 `status: failed`, `stage: features`, `error_type` and exit 1 without exception text.
 Malformed CLI arguments exit 2; validly parsed but inconsistent history is a
-technical failure. Nothing is collected, scheduled, installed or persisted.
+technical failure even when those seals are absent. Requested dates are checked
+before storage availability. Nothing is collected, scheduled, installed or persisted.
 
 For a frozen fixture with previous closes 100 and current closes
 `SPX=102, COMP=104, SOX=106`, the first command produces this output excerpt

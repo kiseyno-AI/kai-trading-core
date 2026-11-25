@@ -337,6 +337,22 @@ def test_cli_rejects_an_unbounded_history_request_before_reading_storage(capsys)
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize('dates', [
+    ['2026-11-26'], ['2026-11-24', '2026-11-24'], ['2026-11-24', '2026-11-23'],
+])
+def test_cli_rejects_inconsistent_requested_dates_even_without_stored_evidence(capsys, dates):
+    from app.internal.us_index_features import main
+
+    def no_storage(**kwargs):
+        raise AssertionError('Invalid dates must be rejected before availability checks')
+
+    arguments = ['--target-trade-date', '2026-11-25']
+    for day in dates:
+        arguments += ['--history-date', day]
+    assert main(arguments, loader=no_storage) == 1
+    assert json.loads(capsys.readouterr().out) == {'status': 'failed', 'stage': 'features', 'error_type': 'ValueError'}
+
+
 def test_later_raw_price_captures_cannot_change_a_sealed_feature_result(inputs, capsys):
     from app.internal.us_index_features import main
 
@@ -415,3 +431,23 @@ def test_history_close_timestamps_must_match_the_stored_session_link(inputs):
     ))
     with pytest.raises(ValueError, match='session window'):
         calculate_us_index_features(current, history=(shifted,))
+
+
+@pytest.mark.parametrize('problem', ['price', 'timestamp'])
+def test_older_overlapping_history_is_validated_even_beyond_a_later_gap(inputs, problem):
+    capture, _, _ = inputs
+    older = capture(date(2026, 11, 18), {
+        code: Decimal(101) if problem == 'price' else Decimal(100) for code in CODES
+    })
+    if problem == 'timestamp':
+        shifted = replace(older.snapshots[0].prices.session,
+                          close_at=older.snapshots[0].prices.session.close_at + timedelta(hours=1))
+        older = replace(older, snapshots=tuple(
+            replace(row, prices=replace(row.prices, session=shifted)) for row in older.snapshots
+        ))
+    previous = capture(date(2026, 11, 19), {code: Decimal(100) for code in CODES})
+    recent = capture(date(2026, 11, 24), {code: Decimal(100) for code in CODES})
+    current = capture(date(2026, 11, 25), {code: Decimal(102) for code in CODES})
+
+    with pytest.raises(ValueError):
+        calculate_us_index_features(current, history=(older, previous, recent))

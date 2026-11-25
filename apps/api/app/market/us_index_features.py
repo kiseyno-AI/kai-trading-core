@@ -47,15 +47,16 @@ def _history_prices(current, history):
             or left['SPX'].session.session_date >= right['SPX'].session.session_date
         ):
             raise ValueError('History must be distinct, chronological, same-environment and strictly prior')
+        if left['SPX'].session.session_date == right['SPX'].session.previous_session_date:
+            if left['SPX'].session.close_at != right['SPX'].session.previous_close_at:
+                raise ValueError('Historical US session window mismatch')
+            if any(left[code].price != right[code].previous_price for code in SUPPORTED_US_INDEX_CODES):
+                raise ValueError('Historical closing price continuity mismatch')
     chain = []
     newer = prices[-1]
     for older in reversed(prices[:-1]):
         if older['SPX'].session.session_date != newer['SPX'].session.previous_session_date:
             break
-        if older['SPX'].session.close_at != newer['SPX'].session.previous_close_at:
-            raise ValueError('Historical US session window mismatch')
-        if any(older[code].price != newer[code].previous_price for code in SUPPORTED_US_INDEX_CODES):
-            raise ValueError('Historical closing price continuity mismatch')
         chain.append(older)
         newer = older
     reason = 'nonconsecutive_history' if len(chain) != len(history) else 'insufficient_history'
