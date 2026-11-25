@@ -5,7 +5,8 @@ the standalone `app.internal.us_index_preopen` CLI calls `freeze_us_index_inputs
 to bind one exact committed snapshot ID for each of `SPX`, `COMP` and `SOX`.
 It adds no strategy, score, rule, order, HTTP route, migration, installation,
 deployment or live KIS call. The existing baseline, daily runner and Exec are
-unchanged; feature/metric calculation and decision strategy remain future steps.
+unchanged. The separate [stage 8 feature calculator](US_INDEX_FEATURES.md) now
+consumes explicit sealed inputs; decision strategy remains future work.
 
 ## Selection and cutoff
 
@@ -107,3 +108,11 @@ The manifest proves the local input selection and cutoff contract. It is not a
 provider-finality attestation, a computed feature or permission to trade. See
 [collection operations](US_INDEX_PREOPEN_COLLECTION.md) for attempt budgets and the
 separate opt-in launchd installation.
+
+For read-only calculation, use `python -m app.internal.us_index_features
+--target-trade-date YYYY-MM-DD` from `apps/api`, optionally naming earlier seals
+with repeated `--history-date` arguments. The calculator does not discover
+history or fetch replacement snapshots. A seal's two closes support current
+returns; acceleration and normalization require explicit contiguous prior inputs.
+KRX closures or special-hours no-ops may leave missing seals; do not backdate new
+ones to fill history. See [feature inputs and limits](US_INDEX_FEATURES.md).
