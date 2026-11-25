@@ -152,6 +152,30 @@ def test_constant_reference_keeps_a_tie_inclusive_percentile_but_has_no_shock(in
         assert item['percentile_pct'] == '100'
 
 
+def test_identical_repeating_returns_do_not_acquire_artificial_volatility(inputs):
+    capture, _, _ = inputs
+    previous = Decimal(3 ** 20)
+    day = date(2026, 10, 21)
+    history = []
+    for step in range(20):
+        close = Decimal(4 ** (step + 1) * 3 ** (19 - step))
+        history.append(capture(day, {code: close for code in CODES}, {code: previous for code in CODES}))
+        previous = close
+        day += timedelta(days=1)
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+    current = capture(day, {code: previous * Decimal('1.5') for code in CODES},
+                      {code: previous for code in CODES})
+
+    result = calculate_us_index_features(current, history=history)
+
+    for item in result['indices'].values():
+        assert item['reference_sample_std_pct'] == '0'
+        assert item['shock_z'] is None
+        assert item['shock_unavailable_reason'] == 'zero_reference_volatility'
+        assert item['percentile_pct'] == '100'
+
+
 def test_replay_identity_binds_algorithm_and_exact_current_and_history_manifests(inputs):
     capture, _, _ = inputs
     prior = capture(date(2026, 11, 24), {code: Decimal(100) for code in CODES})

@@ -82,11 +82,14 @@ def calculate_us_index_features(
             }
             if reason is None:
                 observed = [_return(prices[code]) for prices in prior]
-                mean = sum(observed, Decimal(0)) / REFERENCE_WINDOW
-                deviation = (sum(((x - mean) ** 2 for x in observed), Decimal(0)) / (REFERENCE_WINDOW - 1)).sqrt()
+                # Center first so identical repeating returns retain exactly zero variance.
+                offsets = [x - observed[0] for x in observed]
+                mean_offset = sum(offsets, Decimal(0)) / REFERENCE_WINDOW
+                mean = observed[0] + mean_offset
+                deviation = (sum(((x - mean_offset) ** 2 for x in offsets), Decimal(0)) / (REFERENCE_WINDOW - 1)).sqrt()
                 item.update({
                     'reference_mean_pct': _text(mean), 'reference_sample_std_pct': _text(deviation),
-                    'shock_z': _text((value - mean) / deviation) if deviation else None,
+                    'shock_z': _text((value - observed[0] - mean_offset) / deviation) if deviation else None,
                     'shock_unavailable_reason': None if deviation else 'zero_reference_volatility',
                     'percentile_pct': _text(Decimal(sum(x <= value for x in observed)) * 100 / REFERENCE_WINDOW),
                 })

@@ -52,6 +52,8 @@ handled by index methodology, so do not apply stock split adjustments again.
 The reference is exactly `r[t-20], ..., r[t-1]`, excluding the current event:
 `mean = sum(reference) / 20`, `s = sqrt(sum((r - mean)^2) / 19)`, and
 `shock_z = (r[t] - mean) / s`. The denominator 19 is sample standard deviation.
+Mean/variance arithmetic is centered on the first reference return so identical
+repeating returns do not acquire artificial variance from summation rounding.
 [NIST measures of scale](https://www.itl.nist.gov/div898/handbook/eda/section3/eda356.htm).
 `percentile_pct = 100 * count(reference_return <= r[t]) / 20` uses a
 right-continuous empirical CDF, includes ties and has five-point resolution.
