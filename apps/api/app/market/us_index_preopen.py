@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Callable
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -15,7 +15,7 @@ from app.market.session import KRX_EXCHANGE_CALENDAR
 from app.market.us_index_collector import collect_us_index_inputs
 from app.market.us_index_prices import SUPPORTED_US_INDEX_CODES
 from app.market.us_index_snapshot_store import load_us_index_captures
-from app.market.us_session import latest_completed_us_session
+from app.market.us_session import CompletedUSSession, latest_completed_us_session
 
 
 KST = ZoneInfo('Asia/Seoul')
@@ -33,6 +33,26 @@ def _read_clock(clock: Callable[[], datetime]) -> datetime:
     if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError('clock must return a timezone-aware datetime')
     return value.astimezone(UTC)
+
+
+def resolve_us_index_preopen_session(target_trade_date: date) -> tuple[CompletedUSSession | None, str | None]:
+    target = target_trade_date.isoformat()
+    if not KRX_EXCHANGE_CALENDAR.is_session(target):
+        return None, 'krx_closed'
+    if (
+        KRX_EXCHANGE_CALENDAR.session_open(target).tz_convert(KST).time() != time(9)
+        or KRX_EXCHANGE_CALENDAR.session_close(target).tz_convert(KST).time() != time(15, 30)
+    ):
+        return None, 'special_krx_hours'
+    as_of = datetime.combine(target_trade_date, time(7), tzinfo=KST)
+    session = latest_completed_us_session(as_of=as_of)
+    previous_krx_day = KRX_EXCHANGE_CALENDAR.previous_session(target).date()
+    previous_us_session = latest_completed_us_session(
+        as_of=datetime.combine(previous_krx_day, time(7), tzinfo=KST),
+    )
+    if session.session_date <= previous_us_session.session_date:
+        return None, 'no_new_us_session'
+    return session, None
 
 
 async def _collect_pending(
@@ -84,20 +104,9 @@ def run_us_index_preopen(
     as_of = now.replace(hour=7, minute=0, second=0, microsecond=0).astimezone(UTC)
     deadline = as_of + timedelta(minutes=12)
     target_date = now.date().isoformat()
-    if not KRX_EXCHANGE_CALENDAR.is_session(target_date):
-        return {'status': 'not_due', 'reason': 'krx_closed', 'target_trade_date': target_date}
-    if (
-        KRX_EXCHANGE_CALENDAR.session_open(target_date).tz_convert(KST).time() != time(9)
-        or KRX_EXCHANGE_CALENDAR.session_close(target_date).tz_convert(KST).time() != time(15, 30)
-    ):
-        return {'status': 'not_due', 'reason': 'special_krx_hours', 'target_trade_date': target_date}
-    session = latest_completed_us_session(as_of=as_of)
-    previous_krx_day = KRX_EXCHANGE_CALENDAR.previous_session(target_date).date()
-    previous_us_session = latest_completed_us_session(
-        as_of=datetime.combine(previous_krx_day, time(7), tzinfo=KST),
-    )
-    if session.session_date <= previous_us_session.session_date:
-        return {'status': 'not_due', 'reason': 'no_new_us_session', 'target_trade_date': target_date}
+    session, skip_reason = resolve_us_index_preopen_session(now.date())
+    if skip_reason is not None:
+        return {'status': 'not_due', 'reason': skip_reason, 'target_trade_date': target_date}
     client = client if client is not None else kis_real_client
     environment = 'mock' if client.use_mock else 'real'
     path = Path(state_dir) / f'{environment}-{target_date}.json'
@@ -132,7 +141,7 @@ def run_us_index_preopen(
         if not pending:
             return {
                 'status': 'completed', 'data_complete': True, 'target_trade_date': target_date,
-                'snapshot_ids': snapshot_ids,
+                'snapshot_ids': snapshot_ids, 'source_environment': environment,
             }
         slot = max(slot for slot in COLLECTION_SLOTS if slot <= now.time()).strftime('%H:%M')
         if slot in state['attempts']:
@@ -166,5 +175,6 @@ def run_us_index_preopen(
         'status': result['status'],
         'data_complete': len(snapshot_ids) == len(SUPPORTED_US_INDEX_CODES) and result['status'] != 'expired',
         'target_trade_date': target_date, 'slot': slot, 'snapshot_ids': snapshot_ids,
+        'source_environment': environment,
         **({'reason': result['reason']} if 'reason' in result else {}),
     }
