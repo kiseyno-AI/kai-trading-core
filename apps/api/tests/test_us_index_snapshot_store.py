@@ -21,7 +21,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateSchema, DropSchema
 
-from app.market.us_index_snapshot_store import load_us_index_snapshot, save_us_index_snapshot
+from app.market.us_index_snapshot_store import load_us_index_captures, load_us_index_snapshot, save_us_index_snapshot
 from app.market import us_index_snapshot_store as snapshot_store_module
 from app.db import engine as core_test_engine
 from app.db_models import USIndexInputSnapshot
@@ -100,6 +100,24 @@ def test_repeating_the_same_capture_returns_the_original_record(database, payloa
     second = save_us_index_snapshot(payload, **arguments)
 
     assert second == first
+
+
+def test_capture_recovery_is_scoped_to_clock_environment_and_exact_as_of(database, payload, capture):
+    _, _, factory = database
+    first = save_us_index_snapshot(payload, **capture, session_factory=factory)
+    for changes in (
+        {'source_environment': 'real'},
+        {'as_of': capture['as_of'] + timedelta(seconds=1)},
+        {'collected_at': capture['collected_at'] + timedelta(seconds=5)},
+    ):
+        save_us_index_snapshot(payload, **(capture | changes), session_factory=factory)
+
+    recovered = load_us_index_captures(
+        as_of=capture['as_of'], collected_by=capture['collected_at'] + timedelta(seconds=1),
+        session=first.prices.session, source_environment='mock', session_factory=factory,
+    )
+
+    assert recovered == {'SPX': first}
 
 
 def test_capture_is_readable_in_a_new_python_process(database, payload, capture) -> None:
@@ -338,6 +356,10 @@ def test_postgresql_round_trip_preserves_hash_and_decimal_text(postgres_database
 
     assert load_us_index_snapshot(saved.snapshot_id, session_factory=postgres_database) == saved
     assert saved.prices.price == Decimal('7100.123456789012345678')
+    assert load_us_index_captures(
+        as_of=capture['as_of'], collected_by=capture['collected_at'], session=saved.prices.session,
+        source_environment=capture['source_environment'], session_factory=postgres_database,
+    ) == {'SPX': saved}
 
 
 @pytest.mark.parametrize('statement', [

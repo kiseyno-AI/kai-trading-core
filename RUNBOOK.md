@@ -53,6 +53,21 @@ technical failures (`failed`, batch exit 1); invalid arguments exit 2. The comma
 does not run migrations, daily stages or orders and is not scheduled. See the
 [collector contract](docs/KIS_API_ONBOARDING.md#manual-us-index-collector-fifth-integration-slice).
 
+## Independent preopen US-index schedule
+
+The optional standalone `python -m app.internal.us_index_preopen` command owns
+07:00/07:05/07:10 KST collection slots and stops new requests at 07:12. It retries
+only unavailable/failed indices, preserves committed captures after interruption
+and never starts or blocks daily stages, monitoring or orders. Keep one persistent
+`var/us-index-preopen` directory; do not reset today's spent-attempt checkpoint.
+
+After deploying a reviewed remote revision with migration `20261124_0091` applied,
+preview `bash scripts/install_us_index_preopen_launchd.sh --print`, then install
+without `--print`. This registers a separate, opt-in per-user polling job; nothing
+is installed automatically by Core startup. See [full recovery and deployment
+instructions](docs/US_INDEX_PREOPEN_COLLECTION.md). A sleeping Mac can miss the
+window; these collection IDs do not constitute a sealed strategy input.
+
 ## Health checks
 
 - `GET /health`

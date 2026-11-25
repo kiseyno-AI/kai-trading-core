@@ -289,6 +289,16 @@ This command neither applies migrations nor schedules itself. It adds no HTTP
 route, daily-pipeline dependency, cutoff selection, signal, score or order.
 Receipt time and structurally valid bars still do not prove provider finality.
 
+## Independent preopen scheduling: sixth integration slice
+
+The opt-in standalone `app.internal.us_index_preopen` command adds durable
+07:00/07:05/07:10 KST attempts, failed/unavailable-index-only recovery and a
+07:12 cutoff. It reuses the shared real quote client and existing snapshot table;
+no daily-runner or trading caller is added. The manual command above retains its
+default behavior. Programmatic collectors may pass an aware `deadline` after
+`as_of` to reject new requests or responses at/after that boundary.
+See [schedule, recovery, budgets and launchd installation](US_INDEX_PREOPEN_COLLECTION.md).
+
 ## Notes
 - Do not commit real secrets
 - The token route returns presence, cache, expiry, type, and safe defer metadata only. It never returns the raw KIS access token and is disabled when `UPSTREAM_BEARER_TOKEN` is unset.
