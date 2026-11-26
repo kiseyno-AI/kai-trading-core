@@ -39,6 +39,27 @@ def seal(body):
 def test_strong_positive_leadership_is_an_observational_watch():
     assert evaluate_us_rebound(features())['status'] == 'WATCH'
 
+
+def test_a_broad_market_shock_can_combine_with_separate_tech_acceleration():
+    data = features()
+    data['indices']['SPX'].update({
+        'reference_sample_std_pct': '0.4', 'shock_z': '2.5', 'percentile_pct': '100',
+    })
+    data['indices']['COMP'].update({
+        'reference_mean_pct': '1.45', 'reference_sample_std_pct': '0.5',
+        'shock_z': '1.1', 'percentile_pct': '85',
+    })
+    data['indices']['SOX'].update({
+        'return_pct': '0.5', 'acceleration_pp': '-0.1',
+        'reference_mean_pct': '0.05', 'reference_sample_std_pct': '0.5',
+        'shock_z': '0.9', 'percentile_pct': '75',
+    })
+    data['return_spreads_pp'] = {'COMP-SPX': '1', 'SOX-SPX': '-0.5', 'SOX-COMP': '-1.5'}
+    result = evaluate_us_rebound(seal(data))
+    assert result['status'] == 'WATCH'
+    assert result['order_authority'] is False
+
+
 @pytest.mark.parametrize('updates', [
     {'SPX': {'return_pct': '0'}},
     {'COMP': {'return_pct': '0'}},
