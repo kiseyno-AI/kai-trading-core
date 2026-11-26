@@ -378,6 +378,8 @@ class RuleExecutionOutbox:
                 now = _aware(clock())
                 if now.date() != frozen_setup.origin.target_trade_date or now.time() >= time(8, 40) or now >= frozen_setup.entry_expires_at:
                     return 'new_authority_window_expired'
+                if plan['mode'] != 'paper':
+                    return 'live_execution_not_approved'
                 if authority is None or not authority.enabled:
                     return 'explicit_rule_authority_unavailable'
                 generation = plan['items'][0]['risk_context']['_core_activation']['authority_generation_fingerprint']
