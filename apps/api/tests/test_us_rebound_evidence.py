@@ -119,9 +119,10 @@ def exec_response(request):
     raise AssertionError('unexpected Exec path')
 
 
-def account_result(kis, monkeypatch, handler=exec_response, publication=None, use_default_publication=False):
+def account_result(kis, monkeypatch, handler=exec_response, publication=None, use_default_publication=False, prepared_override=None):
     monkeypatch.setattr('app.orders.account_inquiry_service._utc_now', lambda: NOW)
     prepared, explicit = live_setup()
+    prepared = prepared_override or prepared
 
     async def read():
         async with httpx.AsyncClient(base_url='http://exec.test', transport=httpx.MockTransport(handler)) as client:
@@ -556,4 +557,45 @@ def test_original_publication_change_inside_a_read_group_is_unavailable(monkeypa
     result = asyncio.run(read())
     assert result.value is None
     assert result.reasons == ('original_authority_changed_during_read',)
+
+
+@pytest.mark.parametrize('session_addition', [{'whole_shares_only': None}, {'whole_shares_only': True},
+                                            {'whole_shares_only': False}, {'unknown_session_field': None}])
+def test_existing_remote_rule_commitment_accepts_only_reviewed_nullable_session_default(monkeypatch, session_addition):
+    from app.overnight_rebound.execution_contract import build_rule_execution_plan, RuleExecutionPlan
+    from app.overnight_rebound.sizing import size_rule_entry
+    from tests.test_us_rebound_execution_contract import market
+    from tests.test_us_rebound_rule_sizing import account
+    from tests.test_us_rebound_execution_outbox import Remote
+
+    prepared, explicit = live_setup()
+    sized = size_rule_entry(setup=prepared, policy=explicit,
+        account=account(account_reference=prepared.account_reference, runtime_mode='live', nrcvb_buy_qty=1), now=NOW)
+    remote = Remote(None, None)
+    remote.plan = build_rule_execution_plan(setup=prepared, sizing=sized,
+        authority_generation_fingerprint='e' * 64, requested_at=NOW)
+    readback = remote.readback()
+    for item in readback['rule_contract']['items']:
+        item['session_policy'].update(session_addition)
+    with pytest.raises(ValueError):
+        RuleExecutionPlan.model_validate(readback['rule_contract'])
+    other = setup(policy=explicit, market=market(symbol='091160'), session=prepared.session,
+                  account_reference=prepared.account_reference).setup
+    def handler(request):
+        if request.url.path == '/v4/execution-plans':
+            return httpx.Response(200, json=[readback])
+        return exec_response(request)
+    kis = RawKIS()
+    kis.daily['output1'], kis.cancelable['output'] = [], []
+    result = account_result(kis, monkeypatch, handler=handler, prepared_override=other,
+                            publication=completed_empty_publication())
+    if session_addition == {'whole_shares_only': None}:
+        assert result.status == 'available'
+        assert result.value.other_rule_committed_notional_krw == Decimal('10100.25')
+        assert result.value.other_rule_committed_risk_krw == Decimal('300.25')
+        assert size_rule_entry(setup=other, policy=explicit, account=result.value, now=NOW).target_quantity == 8
+        assert readback['rule_contract']['items'][0]['session_policy']['whole_shares_only'] is None
+    else:
+        assert result.value is None
+        assert result.status in ('failed', 'unavailable')
 

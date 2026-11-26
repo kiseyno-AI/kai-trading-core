@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -604,7 +605,14 @@ class RuleEvidenceAdapter:
             for plan in plans:
                 if plan.get('origin_type') != 'rule' or plan.get('rule_origin', {}).get('target_trade_date') != setup.origin.target_trade_date.isoformat():
                     continue
-                contract = RuleExecutionPlan.model_validate(plan.get('rule_contract'))
+                material = deepcopy(plan.get('rule_contract'))
+                if isinstance(material, dict):
+                    for item in material.get('items', []):
+                        session_policy = item.get('session_policy') if isinstance(item, dict) else None
+                        # Exec adds this reviewed nullable default; retain every other session constraint.
+                        if isinstance(session_policy, dict) and session_policy.get('whole_shares_only') is None:
+                            session_policy.pop('whole_shares_only', None)
+                contract = RuleExecutionPlan.model_validate(material)
                 entry = next(item for item in contract.items if item.side == 'buy')
                 entry_acks = [item for item in plan.get('item_acks', []) if item.get('core_item_key') == entry.core_item_key and item.get('rule_origin') == contract.rule_origin.model_dump(mode='json')]
                 if len(entry_acks) != 1 or contract.mode != setup.mode or plan.get('contract_ack', {}).get('dispatch_material_fingerprint') != contract.metadata.dispatch_material_fingerprint or entry.risk_context.get('execution_account_route', {}).get('configured_route_fingerprint') != initial_binding['configured_route_fingerprint']:
