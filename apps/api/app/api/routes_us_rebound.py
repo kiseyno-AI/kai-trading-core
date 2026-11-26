@@ -13,15 +13,17 @@ router = APIRouter(prefix='/strategies/us-rebound', tags=['strategies'])
 def get_us_rebound_status(target_trade_date: date | None = None) -> dict:
     """Read strategy evidence; never collect data or grant order authority."""
     now = datetime.now(KST)
+    effective_target = target_trade_date or now.date()
     try:
         value = load_us_rebound_status(
-            target_trade_date=target_trade_date or now.date(), state_dir=settings.us_rebound_state_dir,
+            target_trade_date=effective_target, state_dir=settings.us_rebound_state_dir,
         )
     except (ValueError, OSError) as exc:
         raise HTTPException(503, detail={'code': 'us_rebound_status_unavailable', 'error_type': type(exc).__name__}) from exc
     execution = value.get('execution') or {}
     registered = any(item.get('status') in {'accepted', 'activation_pending', 'active'} for item in execution.get('items', []))
-    requested = (settings.us_rebound_mode in {'paper', 'live'}
+    requested = (settings.us_rebound_mode == 'paper'
+                 and effective_target == now.date()
                  and str(settings.us_rebound_execution_enabled).strip().lower() in {'true', '1'}
                  and execution.get('mode') == settings.us_rebound_mode)
     return {

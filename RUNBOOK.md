@@ -103,7 +103,7 @@ job only after successful registration, preserving its plist and all state.
 without provider/order calls; normal calendar gaps are `NO_SIGNAL` and missing
 input expires as `UNAVAILABLE`. This is observation only: no paper/live order
 connection, calibrated thresholds or execution authority in `observe` mode. The
-separate rule handoff remains disabled by default; explicit paper/live mode,
+separate rule handoff remains disabled by default and paper-only; explicit paper mode,
 approved private policy and independent execution opt-in are required. Its ETF/
 account evidence is limited to durable 08:20/08:30 attempts, with no provider
 refetch for minute polling or uncertain RPC recovery. It does not block the

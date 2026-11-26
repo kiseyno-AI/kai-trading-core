@@ -4,7 +4,7 @@
 collects US-index history, seals inputs and records an exploratory `WATCH`,
 `NO_SIGNAL` or `UNAVAILABLE` observation. Every evaluation retains
 `order_authority: false`. A separate disabled-by-default rule handoff can prepare
-and delegate validated paper/live watch families; it does not change either
+and delegate explicitly configured paper watch families; it does not change either
 decider or their daily pipeline. No production paper/live configuration is
 enabled by this code change.
 
@@ -27,7 +27,8 @@ US_REBOUND_ENABLED_FROM=2026-11-27
 US_REBOUND_STATE_DIR=var/us-index-preopen
 ```
 
-`US_REBOUND_MODE` supports `disabled`, `observe`, `paper` and `live`. Observation requires an
+`US_REBOUND_MODE` accepts `disabled`, `observe`, `paper` and `live`; live handoff
+is rejected pending product approval. Observation requires an
 explicit ISO start date; earlier dates do no work. The state setting is independent
 of the daily pipeline. Keep the same persistent state directory across restarts
 and deployments, shared with existing preopen attempt claims. Relative paths are
@@ -68,7 +69,7 @@ or starting Python, independent of host timezone. A manual bounded tick uses
 | 07:00, 07:05, 07:10 | Collect missing `SPX`, `COMP`, `SOX` histories with `include_history=True`: 22 exact US closes per index. |
 | Before 07:12 | Reuse the existing shared attempt claims, combined maximum of nine fetches, 90-second tick budget and history input seal cutoff. |
 | 07:15 until before 08:40 | Evaluate the current history seal; missing input records `unavailable` liveness and waits without recollection. |
-| 08:20 and 08:30 | Only explicitly enabled paper/live operation may claim a bounded ETF/account evidence attempt. Observation never enters this path. |
+| 08:20 and 08:30 | Only explicitly enabled paper operation may claim a bounded ETF/account evidence attempt. Observation never enters this path. |
 | 08:40 onward | An unfinished evaluation becomes normal `UNAVAILABLE` with `reason: evaluation_expired`; saved evaluations replay unchanged. |
 
 No new US session, a closed KRX session or special KRX hours produces a normal
@@ -134,13 +135,13 @@ runner's calendar checks and is not a promise of provider availability.
 The [operation module](../apps/api/app/overnight_rebound/operation.py) connects the
 [rule contract and private outbox](US_REBOUND_EXECUTION_CONTRACT.md) to the same
 independent CLI. `observe` always bypasses execution, regardless of other flags.
-Paper/live mode requires the single separate `US_REBOUND_EXECUTION_ENABLED=true`
+Paper mode requires the single separate `US_REBOUND_EXECUTION_ENABLED=true`
 opt-in plus every explicit field below. Missing policy/configuration is normal
 execution unavailability, not a Core startup error. These are placeholders for
 an authorized configuration, not instructions to enable the current deployment:
 
 ```dotenv
-US_REBOUND_MODE=<paper-or-live>
+US_REBOUND_MODE=paper
 US_REBOUND_EXECUTION_ENABLED=true
 US_REBOUND_EXECUTION_ACCOUNT_REFERENCE=KIS:<account>-<product>
 US_REBOUND_EXECUTION_POLICY_FILE=<absolute-private-policy-path>
@@ -154,8 +155,11 @@ The account must match the one valid route from the existing account-target
 configuration. The destination/token are explicit and independent of original
 decider execution flags. Native paper credentials are not provisioned: paper
 operation reports unavailable before evidence/transport calls rather than using
-real credentials. Live mode additionally requires validated live policy evidence;
-no validation identity, score or probability is fabricated.
+real credentials. This release rejects new live handoffs with
+`live_execution_not_approved`, even when a policy claims live validation and an
+operator authority is supplied. Live activation needs separate explicit product
+approval and a reviewed code change. No validation identity, score or
+probability is fabricated.
 
 The policy is an owned, private JSON file with no group/world permissions. Its
 exact outer shape is shown below; the ellipsis is documentation, not a valid
@@ -166,8 +170,8 @@ policy or executable default:
   "schema_version": "us_rebound_execution_policy_v1",
   "entry_expires_at_kst": "<HH:MM:SS>",
   "policy": {
-    "execution_mode": "<paper-or-live>",
-    "validation_status": "<paper_only-or-validated_live>",
+    "execution_mode": "paper",
+    "validation_status": "paper_only",
     "...": "every RuleExecutionPolicy parameter except entry_expires_at"
   }
 }
@@ -200,7 +204,7 @@ existing outbox debt fails closed rather than rebuilding a grant.
 `execution-status.json` is a separate safe projection. The read-only API returns
 its status/reasons, whitelisted symbols and actual `last_confirmed_at` timestamps;
 it excludes accounts, quantities, prices, policy paths, tokens and private claim
-hashes. `order_execution_enabled=true` requires a current paper/live mode, the
+hashes. `order_execution_enabled=true` requires today's KST target, current paper mode, the
 separate true opt-in, matching persisted mode and confirmed active watch
 authority. It is not fresh remote trading permission; Core market and Exec
 pause/kill gates still apply. `checked_at` is job liveness; it does not

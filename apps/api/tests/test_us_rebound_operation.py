@@ -17,6 +17,18 @@ from tests.test_us_rebound_execution_outbox import Remote
 NOW = datetime.fromisoformat('2026-11-30T08:20:00+09:00')
 
 
+@pytest.fixture
+def current_api_clock(monkeypatch):
+    def set_clock(value):
+        class Clock:
+            @staticmethod
+            def now(tz):
+                return value.astimezone(tz)
+        monkeypatch.setattr('app.api.routes_us_rebound.datetime', Clock)
+    set_clock(NOW)
+    return set_clock
+
+
 def forbidden(**kwargs):
     raise AssertionError('Execution/evidence I/O is forbidden in this scope')
 
@@ -30,6 +42,23 @@ def test_observation_and_disabled_execution_do_no_execution_io_or_create_state(t
         assert result['status'] == 'disabled'
         assert result['reason'] == reason
     assert list(tmp_path.iterdir()) == []
+
+
+def test_live_policy_cannot_enable_execution_without_product_approval(tmp_path):
+    from pathlib import Path
+
+    config = configuration(tmp_path)
+    path = Path(config.policy_file)
+    artifact = json.loads(path.read_text())
+    artifact['policy'].update(execution_mode='live', validation_status='validated_live',
+        validation_evidence_id='synthetic-validation', validation_evidence_hash='f' * 64)
+    path.write_text(json.dumps(artifact))
+    result = asyncio.run(run_us_rebound_operation(mode='live', config=config,
+        evaluation=current_evaluation(), state_dir=tmp_path, clock=lambda: NOW,
+        seal_loader=forbidden, adapter_factory=forbidden, account_target_reader=target_reader))
+
+    assert result['status'] == 'unavailable'
+    assert result['reason'] == 'live_execution_not_approved'
 
 
 def current_evaluation(status='WATCH'):
@@ -253,7 +282,7 @@ def test_existing_independent_runner_calls_operation_only_in_explicit_execution_
         asyncio.run(client.aclose())
 
 
-def test_read_only_status_reports_persisted_authority_without_http_or_private_fields(tmp_path, monkeypatch):
+def test_read_only_status_reports_persisted_authority_without_http_or_private_fields(tmp_path, monkeypatch, current_api_clock):
     from fastapi.testclient import TestClient
     from app.core.settings import settings
     from app.main import app
@@ -276,7 +305,7 @@ def test_read_only_status_reports_persisted_authority_without_http_or_private_fi
 
 
 @pytest.mark.parametrize(('mode', 'enabled'), [('observe', True), ('paper', False), ('live', True), ('paper', 'invalid')])
-def test_persisted_activation_does_not_assert_current_permission_after_operator_scope_changes(tmp_path, monkeypatch, mode, enabled):
+def test_persisted_activation_does_not_assert_current_permission_after_operator_scope_changes(tmp_path, monkeypatch, current_api_clock, mode, enabled):
     from fastapi.testclient import TestClient
     from app.core.settings import settings
     from app.main import app
@@ -294,4 +323,92 @@ def test_persisted_activation_does_not_assert_current_permission_after_operator_
     assert response.status_code == 200
     assert response.json()['order_execution_enabled'] is False
     assert response.json()['execution']['status'] == 'active'
+
+
+def test_fifo_policy_is_rejected_without_waiting_for_a_writer_through_public_operation(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    fifo = tmp_path / 'policy.fifo'
+    os.mkfifo(fifo, 0o600)
+    code = '''
+import asyncio, json, sys
+from dataclasses import replace
+from pathlib import Path
+from tests.test_us_rebound_operation import NOW, configuration, current_evaluation
+from app.overnight_rebound.operation import run_us_rebound_operation
+folder = Path(sys.argv[1])
+config = replace(configuration(folder), policy_file=sys.argv[2])
+result = asyncio.run(run_us_rebound_operation(mode='paper', config=config,
+    evaluation=current_evaluation(), state_dir=folder, clock=lambda: NOW))
+print(json.dumps(result))
+'''
+    with subprocess.Popen([sys.executable, '-c', code, str(tmp_path), str(fifo)],
+        cwd=Path(__file__).parents[1], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+        try:
+            output, error = child.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            pytest.fail('FIFO policy blocked the operation while waiting for a writer')
+    assert child.returncode == 0, error
+    result = json.loads(output)
+    assert result['status'] == 'unavailable'
+    assert result['reason'] == 'execution_policy_or_scope_unavailable'
+
+
+@pytest.mark.parametrize(('server_now', 'target'), [
+    (NOW.replace(month=12, day=1), date(2026, 11, 30)),
+    (NOW, date(2026, 12, 1)),
+])
+def test_historical_and_future_active_cache_remains_visible_without_current_permission(tmp_path, monkeypatch, current_api_clock, server_now, target):
+    from fastapi.testclient import TestClient
+    from app.core.settings import settings
+    from app.main import app
+    from app.internal.exact_repair_manifest import write_checkpoint
+    current_api_clock(server_now)
+    value = {'strategy_id': 'krx_us_rebound', 'target_trade_date': target.isoformat(), 'source_environment': 'real',
+        'mode': 'paper', 'status': 'active', 'checked_at': NOW.isoformat(),
+        'items': [{'symbol': '069500', 'status': 'active', 'last_confirmed_at': NOW.isoformat()}]}
+    write_checkpoint(tmp_path / f'rebound/real-{target.isoformat()}/execution-status.json',
+                     {**value, 'record_hash': canonical_json_sha256(value)})
+    monkeypatch.setattr(settings, 'upstream_bearer_token', None)
+    monkeypatch.setattr(settings, 'us_rebound_state_dir', str(tmp_path))
+    monkeypatch.setattr(settings, 'us_rebound_mode', 'paper')
+    monkeypatch.setattr(settings, 'us_rebound_execution_enabled', True)
+    response = TestClient(app).get(f'/strategies/us-rebound/status?target_trade_date={target.isoformat()}')
+    assert response.status_code == 200
+    assert response.json()['server_time'].startswith(server_now.date().isoformat())
+    assert response.json()['order_execution_enabled'] is False
+    assert response.json()['execution']['status'] == 'active'
+
+
+@pytest.mark.parametrize('expiry', ['08:10:00', '08:25:00', '15:25:00'])
+def test_invalid_entry_window_skips_all_new_evidence_calls(tmp_path, expiry):
+    config = configuration(tmp_path)
+    from pathlib import Path
+    path = Path(config.policy_file)
+    value = json.loads(path.read_text())
+    value['entry_expires_at_kst'] = expiry
+    path.write_text(json.dumps(value))
+    result = asyncio.run(run_us_rebound_operation(mode='paper', config=config, evaluation=current_evaluation(),
+        state_dir=tmp_path, clock=lambda: NOW, seal_loader=seal_loader,
+        adapter_factory=forbidden, account_target_reader=target_reader))
+    assert result['status'] == 'unavailable'
+
+
+def test_expired_entry_window_still_reconciles_existing_pending_ack_without_new_evidence(tmp_path):
+    config, remote = configuration(tmp_path), WireExec()
+    remote.lose_activation = True
+    async def tick(now, factory, loader):
+        async with httpx.AsyncClient(base_url=config.destination_base_url, headers={'Authorization': 'Bearer synthetic-exec-token'},
+                                     transport=httpx.MockTransport(remote)) as client:
+            return await run_us_rebound_operation(mode='paper', config=config, evaluation=current_evaluation(),
+                state_dir=tmp_path, clock=lambda: now, seal_loader=loader,
+                adapter_factory=factory, client=client, account_target_reader=target_reader)
+    assert asyncio.run(tick(NOW, Evidence, seal_loader))['status'] == 'pending'
+    assert asyncio.run(tick(NOW.replace(hour=9, minute=11), forbidden, forbidden))['status'] == 'active'
+    assert len(remote.posts) == len(remote.activation_posts) == 1
 

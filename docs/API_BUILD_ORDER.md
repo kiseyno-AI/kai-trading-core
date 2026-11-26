@@ -831,7 +831,7 @@ Global bearer authentication is unchanged. The response includes liveness
 `status`, optional immutable `evaluation`, `last_tick`, `mode`, `enabled_from`,
 `server_time` and `schedule_kst`, plus an optional safe persisted `execution`
 projection. Observation remains execution-HTTP-free. `order_execution_enabled`
-requires current matching paper/live mode and true execution opt-in plus last
+requires current matching paper mode and true execution opt-in plus last
 confirmed active watch authority; `execution_connection=rule_v4`
 requires persisted registration/activation proof. Neither is a fresh broker
 read. Execution evidence attempts are bounded to 08:20/08:30; account, quantity,

@@ -87,7 +87,7 @@ def load_us_rebound_execution_status(*, target_trade_date, state_dir, source_env
 def _policy(path, day, mode):
     if not path:
         return None
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0))
     with os.fdopen(descriptor, 'r', encoding='utf-8') as handle:
         metadata = os.fstat(handle.fileno())
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077 or metadata.st_uid != os.getuid() or metadata.st_size > 2 * 1024 * 1024:
@@ -123,6 +123,8 @@ async def run_us_rebound_operation(
         return {'status': 'disabled', 'reason': 'observation_only', 'mode': mode}
     if config.enabled is False or str(config.enabled).strip().lower() in ('false', '0', ''):
         return {'status': 'disabled', 'reason': 'execution_disabled', 'mode': mode}
+    if mode == 'live':
+        return {'status': 'unavailable', 'reason': 'live_execution_not_approved', 'mode': mode}
     now = _aware(clock())
     environment = evaluation.get('source_environment', 'real')
     folder = _folder(state_dir, now.date(), environment)
@@ -218,8 +220,11 @@ async def run_us_rebound_operation(
                 if _destination(str(http.base_url)) != destination or http.headers.get('Authorization') != f'Bearer {config.bearer_token}':
                     return report('unavailable', 'execution_transport_binding_mismatch')
                 current = _aware(clock())
+                entry_window_valid = (session.session_open_at < policy.entry_expires_at
+                    < session.session_close_at - timedelta(seconds=policy.close_buffer_seconds)
+                    and current < policy.entry_expires_at)
                 slot = max((item for item in EVIDENCE_SLOTS if item <= current.time()), default=None)
-                new_reads = slot is not None and current.time() < time(8, 40) and current < operator_until and slot.isoformat() not in state['attempts']
+                new_reads = entry_window_valid and slot is not None and current.time() < time(8, 40) and current < operator_until and slot.isoformat() not in state['attempts']
                 needs_evidence = any(symbol not in state['setups'] or outbox.status(RuleExecutionSetup.model_validate(state['setups'][symbol]['setup']))['status'] == 'not_prepared' for symbol in ETF_NAMES)
                 if new_reads and needs_evidence:
                     state['attempts'][slot.isoformat()] = {'started_at': current.isoformat(),
@@ -275,7 +280,8 @@ async def run_us_rebound_operation(
                             outcomes.append({'symbol': symbol, **{key: prepared[key] for key in ('status', 'reason') if key in prepared}})
                             continue
                     elif setup is None or old_status == 'not_prepared':
-                        outcomes.append({'symbol': symbol, 'status': 'not_due', 'reason': 'evidence_attempt_not_due'})
+                        outcomes.append({'symbol': symbol, 'status': 'not_due', 'reason':
+                            'evidence_attempt_not_due' if entry_window_valid else 'policy_entry_window_invalid'})
                         continue
                     item = state['setups'][symbol]
                     status = outbox.status(setup)
@@ -285,7 +291,7 @@ async def run_us_rebound_operation(
                     if status['status'] in ('create_pending', 'activation_pending'):
                         item['readback_only'] = True
                         _write(private_path, state)
-                    authority = None if item.get('readback_only') else RuleExecutionAuthority(
+                    authority = None if item.get('readback_only') or not entry_window_valid else RuleExecutionAuthority(
                         enabled=True, mode=mode, account_reference=config.account_reference, policy_hash=policy.policy_hash,
                         authority_generation_fingerprint=generation, evidence_id=config.authority_id,
                         valid_until=datetime.fromisoformat(item['evidence_valid_until']),
@@ -308,7 +314,7 @@ async def run_us_rebound_operation(
                     return report('pending', items=outcomes)
                 if any(item['status'] == 'failed' for item in outcomes):
                     return report('failed', 'evidence_failed', outcomes)
-                return report('unavailable', 'no_executable_setup', outcomes)
+                return report('unavailable', 'no_executable_setup' if entry_window_valid else 'policy_entry_window_invalid', outcomes)
 
             async with asyncio.timeout(MAX_BATCH_SECONDS):
                 if client is not None:

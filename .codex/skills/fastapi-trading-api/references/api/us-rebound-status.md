@@ -18,7 +18,7 @@ Optional `execution` reads only the current session's persisted safe operation
 projection. It includes status/reasons and per-symbol status with an actual
 `last_confirmed_at` when available; it excludes policy paths, tokens, prices,
 account-derived claim IDs and private evidence. `order_execution_enabled` is true
-only when current paper/live mode and true execution opt-in match persisted
+only for today's KST target when current paper mode and true execution opt-in match persisted
 confirmed active watch authority. It is not a fresh broker check; market and
 Exec pause/kill gates still apply.
 `execution_connection=rule_v4` requires persisted registration/activation proof;
