@@ -829,9 +829,13 @@ agent-sized plans remain compatible. See [quantity planning](CORE_QUANTITY_SIZIN
 `US_REBOUND_STATE_DIR`; it does not collect, call providers or submit orders.
 Global bearer authentication is unchanged. The response includes liveness
 `status`, optional immutable `evaluation`, `last_tick`, `mode`, `enabled_from`,
-`server_time` and `schedule_kst`. It always reports
-`order_execution_enabled=false` and `execution_connection=not_connected`, with no
-account or quantity fields. Invalid dates return 422; corrupt/unreadable evidence
+`server_time` and `schedule_kst`, plus an optional safe persisted `execution`
+projection. Observation remains execution-HTTP-free. `order_execution_enabled`
+requires current matching paper/live mode and true execution opt-in plus last
+confirmed active watch authority; `execution_connection=rule_v4`
+requires persisted registration/activation proof. Neither is a fresh broker
+read. Execution evidence attempts are bounded to 08:20/08:30; account, quantity,
+price, credential and private claim fields are omitted. Invalid dates return 422; corrupt/unreadable evidence
 returns safe 503 `us_rebound_status_unavailable`. Exploratory `WATCH` conveys no
 order authority. See the [endpoint payload](../.codex/skills/fastapi-trading-api/references/api/us-rebound-status.md)
 and [operation and rollback](US_REBOUND_OPERATION.md).

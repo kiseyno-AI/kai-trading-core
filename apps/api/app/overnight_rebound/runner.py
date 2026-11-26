@@ -1,5 +1,6 @@
 """Restart-safe, independent scheduling; never enters the daily agent pipeline."""
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -61,16 +62,23 @@ def load_us_rebound_status(
         'source_environment': source_environment,
         'status': 'completed' if evaluation is not None else (last_tick or {}).get('status', 'not_started'),
         'evaluation': evaluation, 'last_tick': last_tick,
+        'execution': _execution_status(target_trade_date, state_dir, source_environment),
     }
+
+
+def _execution_status(day, state_dir, environment):
+    from app.overnight_rebound.operation import load_us_rebound_execution_status
+    return load_us_rebound_execution_status(target_trade_date=day, state_dir=state_dir, source_environment=environment)
 
 
 def run_us_rebound_tick(
     *, mode='disabled', enabled_from: date | None = None, state_dir='var/us-index-preopen',
     source_environment='real', clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     collector=run_us_index_preopen, loader=load_frozen_us_index_inputs, freezer=freeze_us_index_inputs,
+    execution_config=None, execution_runner=None,
 ) -> dict:
     """Advance only this strategy's debt; disabled/future sessions perform no I/O."""
-    if mode not in ('disabled', 'observe'):
+    if mode not in ('disabled', 'observe', 'paper', 'live'):
         raise ValueError('Unsupported US rebound mode')
     now = _read_clock(clock).astimezone(KST)
     result = {'strategy_id': STRATEGY_ID, 'target_trade_date': now.date().isoformat(), 'mode': mode}
@@ -152,6 +160,16 @@ def run_us_rebound_tick(
         if not acquired:
             return {**result, 'status': 'not_due', 'reason': 'busy'}
         try:
-            return advance()
+            outcome = advance()
         except Exception as exc:
             return report(status='failed', error_type=type(exc).__name__)
+    if mode in ('paper', 'live') and outcome.get('evaluation') is not None:
+        from app.overnight_rebound.operation import RuleOperationConfig, run_us_rebound_operation
+        try:
+            outcome['execution'] = asyncio.run((execution_runner or run_us_rebound_operation)(
+                mode=mode, config=execution_config or RuleOperationConfig(), evaluation=outcome['evaluation'],
+                state_dir=state_dir, clock=clock, seal_loader=loader,
+            ))
+        except Exception as exc:
+            outcome['execution'] = {'status': 'failed', 'reason': 'execution_tick_failed', 'error_type': type(exc).__name__}
+    return outcome

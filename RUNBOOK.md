@@ -102,7 +102,11 @@ job only after successful registration, preserving its plist and all state.
 `GET /strategies/us-rebound/status?target_trade_date=2026-11-27` reads evidence
 without provider/order calls; normal calendar gaps are `NO_SIGNAL` and missing
 input expires as `UNAVAILABLE`. This is observation only: no paper/live order
-connection, calibrated thresholds or execution authority. It does not block the
+connection, calibrated thresholds or execution authority in `observe` mode. The
+separate rule handoff remains disabled by default; explicit paper/live mode,
+approved private policy and independent execution opt-in are required. Its ETF/
+account evidence is limited to durable 08:20/08:30 attempts, with no provider
+refetch for minute polling or uncertain RPC recovery. It does not block the
 existing agents or daily pipeline. See [configuration, Thanksgiving calendar,
 evidence recovery and rollback](docs/US_REBOUND_OPERATION.md); preserve baseline
 Core/Exec/daily services and all checkpoints, seals and evaluations.
