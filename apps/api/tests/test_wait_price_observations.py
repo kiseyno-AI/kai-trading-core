@@ -541,6 +541,8 @@ def test_display_sampling_covers_non_wait_monitored_symbols_without_execution_ev
                        and quote['realtime_subscribed'] is False for quote in available)
             assert all(quote['current_price'] is None for quote in quotes if quote not in available)
             assert prices.health_snapshot()['wait_orderbook_observation']['failed_batches'] == int(fail_batch)
+            assert prices.health_snapshot()['wait_orderbook_observation']['requested_count'] == wait_count
+            assert prices.health_snapshot()['wait_orderbook_observation']['sampled_count'] == wait_count
             assert prices._prices == {}
             books = prices.orderbooks_snapshot()
             assert books['items'] == []

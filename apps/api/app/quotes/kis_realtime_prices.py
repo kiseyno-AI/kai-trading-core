@@ -1392,7 +1392,7 @@ class KISRealtimePriceService:
                 self._wait_orderbook_sampled_symbols = sampled
                 self._wait_orderbook_first_sample_at = first_sample_at
                 self._health['wait_orderbook_observation'] = {
-                    'requested_count': len(symbols), 'sampled_count': len(sampled),
+                    'requested_count': len(wait_symbols), 'sampled_count': len(sampled),
                     'failed_batches': failures, 'last_sample_at': _isoformat(_utc_now()),
                 }
             await asyncio.sleep(2 if self.client._environment() == 'demo' else 1)

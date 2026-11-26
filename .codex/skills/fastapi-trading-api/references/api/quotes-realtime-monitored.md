@@ -58,8 +58,9 @@ When WAIT orderbook sampling is active, `health.wait_orderbook_observation`
 reports `requested_count`, `sampled_count`, `failed_batches`, and
 `last_sample_at` for the latest regular-session sampling round. The
 sampled count measures orderbook coverage separately from trade subscriptions.
-Only registered WAIT symbols contribute to that sampled count and passive quote
-coverage; read the per-symbol display fields for non-WAIT quote availability.
+Both counters describe registered WAIT symbols (`requested_count` at round
+start), and only WAIT symbols contribute passive quote coverage; read the
+per-symbol display fields for non-WAIT quote availability.
 
 ## WAIT display samples
 
