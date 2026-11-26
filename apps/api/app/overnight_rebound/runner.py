@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 from app.internal.exact_repair_manifest import (
     canonical_json_sha256, checkpoint_file_lock, load_json_mapping, write_checkpoint,
 )
-from app.market.us_index_input_freeze import freeze_us_index_inputs, load_frozen_us_index_inputs
+from app.market.us_index_input_freeze import (
+    _sync_parent_directories, freeze_us_index_inputs, load_frozen_us_index_inputs,
+)
 from app.market.us_index_features import calculate_us_index_features
 from app.market.us_index_preopen import _read_clock, resolve_us_index_preopen_session, run_us_index_preopen
 from app.overnight_rebound.rules import evaluate_us_rebound
@@ -142,6 +144,7 @@ def run_us_rebound_tick(
             'completed_at': completed_at.isoformat(), 'order_authority': False,
         }
         evaluation['evaluation_id'] = canonical_json_sha256(evaluation)
+        _sync_parent_directories(folder)
         write_checkpoint(path, evaluation)
         return report(status='completed', evaluation=evaluation)
 

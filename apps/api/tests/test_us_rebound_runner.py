@@ -2,6 +2,8 @@ from datetime import date, datetime
 from contextlib import contextmanager
 from decimal import Decimal
 from functools import partial
+import os
+from pathlib import Path
 import shutil
 from zoneinfo import ZoneInfo
 
@@ -191,3 +193,21 @@ def test_technical_collection_outcomes_remain_failures(tmp_path, state):
     )
     assert result['status'] == 'failed'
     assert load_us_rebound_status(target_trade_date=date(2026, 11, 30), state_dir=tmp_path)['status'] == 'failed'
+
+
+def test_new_evaluation_cannot_complete_before_its_parent_links_are_durable(tmp_path, monkeypatch):
+    original_open = os.open
+
+    def deny_parent_sync(path, *args, **kwargs):
+        if Path(path) == tmp_path / 'rebound':
+            raise OSError('directory durability unavailable')
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', deny_parent_sync)
+    result = run_us_rebound_tick(
+        mode='observe', enabled_from=date(2026, 11, 27), state_dir=tmp_path,
+        clock=lambda: datetime(2026, 11, 27, 7, 15, tzinfo=KST),
+    )
+    assert result['status'] == 'failed'
+    assert result['error_type'] == 'OSError'
+    assert not (tmp_path / 'rebound/real-2026-11-27/evaluation.json').exists()

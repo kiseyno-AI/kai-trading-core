@@ -94,7 +94,8 @@ with a fabricated snapshot or score. Preserve the linked snapshot database too.
 
 - SPX and COMP returns are both strictly positive.
 - COMP or SOX acceleration is strictly positive.
-- The same index has shock z-score at least 2 and reference percentile at least 95.
+- At least one of SPX, COMP or SOX has both a shock z-score at least 2 and a
+  reference percentile at least 95; it need not be the accelerating tech index.
 - COMP or SOX outperforms SPX by a strictly positive return spread.
 
 Zero reference volatility in any index makes the observation `UNAVAILABLE`.
