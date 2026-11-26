@@ -13,8 +13,12 @@ gap, stop/target, cost/slippage, volatility multiplier, risk/notional/liquidity
 limit, evidence TTL, entry expiry and close buffer is explicit. `paper_only`
 permits paper preparation only. Live preparation requires `validated_live`,
 explicit validation evidence identity/hash, and real inputs; runtime handoff
-also needs a separate exact `RuleExecutionAuthority`. Test literals are worked
-examples, not production policy values.
+also needs a separate exact `RuleExecutionAuthority`. Live preparation models
+are retained for read-only analysis, but this release permits new handoffs only
+in paper mode. The outbox rejects live creation and activation with
+`live_execution_not_approved` regardless of claimed validation or authority;
+explicit product approval and a reviewed code change are required before that
+path can open. Test literals are worked examples, not production policy values.
 
 `build_rule_execution_setup` accepts an intact evaluation hash, verified prior
 KRX close/volatility/liquidity evidence, and an authoritative session. Missing,

@@ -201,6 +201,42 @@ def test_missing_authority_runtime_mismatch_and_network_crossing_cutoff_cannot_p
     assert remote.posts == []
 
 
+@pytest.mark.parametrize('remote_stage', ['absent', 'registered'])
+def test_live_validation_and_explicit_authority_cannot_mint_unapproved_live_execution(tmp_path, remote_stage):
+    from app.overnight_rebound.execution_contract import build_rule_execution_plan
+    from app.overnight_rebound.sizing import size_rule_entry
+
+    explicit = policy(execution_mode='live', validation_status='validated_live',
+                      validation_evidence_id='synthetic-validation', validation_evidence_hash='f' * 64)
+    prepared = setup(policy=explicit).setup
+    evidence = account(runtime_mode='live')
+    outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    outbox.prepare(setup=prepared, policy=explicit, account=evidence,
+                   authority_generation_fingerprint='e' * 64, clock=lambda: NOW)
+    remote = Remote(outbox, prepared)
+    remote.enabled = True
+    if remote_stage == 'registered':
+        grant = size_rule_entry(setup=prepared, policy=explicit, account=evidence, now=NOW)
+        remote.plan = build_rule_execution_plan(setup=prepared, sizing=grant,
+            authority_generation_fingerprint='e' * 64, requested_at=NOW)
+
+    def handler(request):
+        response = remote(request)
+        if request.url.path.endswith('/capabilities'):
+            value = response.json()
+            value['runtime_binding']['mode'] = 'live'
+            return httpx.Response(200, json=value)
+        return response
+
+    async def run():
+        async with httpx.AsyncClient(base_url='http://exec.test', transport=httpx.MockTransport(handler)) as client:
+            approved = authority().model_copy(update={'mode': 'live', 'policy_hash': explicit.policy_hash})
+            return await outbox.advance(setup=prepared, authority=approved, client=client, clock=lambda: NOW)
+
+    assert asyncio.run(run())['reason'] == 'live_execution_not_approved'
+    assert remote.posts == remote.activation_posts == []
+
+
 def test_readback_price_or_origin_mismatch_preserves_the_claim_for_manual_review(tmp_path):
     prepared = setup().setup
     outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
