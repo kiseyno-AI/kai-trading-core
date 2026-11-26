@@ -225,6 +225,155 @@ def test_readback_price_or_origin_mismatch_preserves_the_claim_for_manual_review
     assert outbox.prepare(setup=prepared, policy=policy(), account=account(), authority_generation_fingerprint='f' * 64, clock=lambda: NOW)['status'] == 'manual_review'
 
 
+@pytest.mark.parametrize('change', ['valid_until', 'calculated_at', 'cash_per_share'])
+def test_changed_grant_with_an_echoed_old_fingerprint_cannot_activate(tmp_path, change):
+    prepared = setup().setup
+    outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    outbox.prepare(setup=prepared, policy=policy(), account=account(), authority_generation_fingerprint='e' * 64, clock=lambda: NOW)
+    remote = Remote(outbox, prepared)
+    remote.enabled, remote.lose_create_ack = True, False
+
+    def handler(request):
+        response = remote(request)
+        if request.method == 'GET' and request.url.path == '/v4/execution-plans' and remote.plan is not None:
+            body = response.json()
+            grant = body[0]['rule_contract']['items'][0]['quantity_policy']
+            if change == 'cash_per_share':
+                grant['sizing_inputs'][change] = '1'
+            else:
+                grant[change] = '2026-11-27T15:10:00+09:00' if change == 'valid_until' else '2026-11-27T07:59:00+09:00'
+            return httpx.Response(200, json=body)
+        return response
+
+    async def run():
+        async with httpx.AsyncClient(base_url='http://exec.test', transport=httpx.MockTransport(handler)) as client:
+            await outbox.advance(setup=prepared, authority=authority(), client=client, clock=lambda: NOW)
+            return await outbox.advance(setup=prepared, authority=authority(), client=client, clock=lambda: NOW)
+
+    assert asyncio.run(run())['status'] == 'manual_review'
+    assert remote.activation_posts == []
+
+
+@pytest.mark.parametrize('change', [
+    None, 'policy_hash', 'unknown_risk', 'broker', 'monitoring', 'session_copy',
+    'metadata_trigger', 'requested_at', 'account_reference',
+])
+def test_exact_readback_accepts_only_reviewed_exec_normalization(tmp_path, change):
+    prepared = setup().setup
+    outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    outbox.prepare(setup=prepared, policy=policy(), account=account(), authority_generation_fingerprint='e' * 64, clock=lambda: NOW)
+    remote = Remote(outbox, prepared)
+    remote.enabled, remote.lose_create_ack, remote.lose_activation_ack = True, False, False
+
+    def handler(request):
+        response = remote(request)
+        if request.method != 'GET' or request.url.path != '/v4/execution-plans' or remote.plan is None:
+            return response
+        body = response.json()
+        contract = body[0]['rule_contract']
+        contract['metadata']['account_reference'] = None
+        for item in contract['items']:
+            item.update(generic_action=None, raw_action=None, tactical_action=None)
+            item.setdefault('handoff_intent', None)
+            item['session_policy']['whole_shares_only'] = None
+            risk = item['risk_context']
+            risk.update({name: deepcopy(item[name]) for name in (
+                'broker', 'close_exit_at', 'currency', 'exchange', 'market', 'rule_origin', 'session_policy',
+            )})
+            if item['side'] == 'buy':
+                risk['handoff_intent'] = item['handoff_intent']
+                risk['watch_buy_monitoring'] = {
+                    'received_intent': 'intraday_watch_buy', 'trigger_source': 'trigger_price',
+                    'trigger_price': '10000.0000', 'chase_limit_price': None, 'direction': 'at_or_below',
+                    'tactical_action': None, 'exec_monitoring_active': None,
+                }
+        risk = contract['items'][0]['risk_context']
+        if change == 'policy_hash':
+            risk['execution_policy_hash'] = '0' * 64
+        elif change == 'unknown_risk':
+            risk['unreviewed_authority'] = True
+        elif change == 'broker':
+            risk['broker'] = 'alpaca'
+        elif change == 'monitoring':
+            risk['watch_buy_monitoring']['direction'] = 'at_or_above'
+        elif change == 'session_copy':
+            risk['session_policy']['whole_shares_only'] = True
+        elif change == 'metadata_trigger':
+            contract['metadata']['trigger'] = 'changed-trigger'
+        elif change == 'requested_at':
+            contract['requested_at'] = contract['metadata']['requested_at'] = NOW.replace(minute=1).isoformat()
+        elif change == 'account_reference':
+            contract['metadata']['account_reference'] = 'KIS:other-account'
+        return httpx.Response(200, json=body)
+
+    async def run():
+        async with httpx.AsyncClient(base_url='http://exec.test', transport=httpx.MockTransport(handler)) as client:
+            await outbox.advance(setup=prepared, authority=authority(), client=client, clock=lambda: NOW)
+            return await outbox.advance(setup=prepared, authority=authority(), client=client, clock=lambda: NOW)
+
+    assert asyncio.run(run())['status'] == ('active' if change is None else 'manual_review')
+    assert len(remote.activation_posts) == (1 if change is None else 0)
+
+
+def test_preparation_rejects_account_evidence_from_another_destination(tmp_path):
+    prepared = setup().setup
+    outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    with pytest.raises(ValueError, match='immutable destination'):
+        outbox.prepare(setup=prepared, policy=policy(), account=account(execution_destination='http://other.test'),
+                       authority_generation_fingerprint='e' * 64, clock=lambda: NOW)
+    assert outbox.status(prepared)['status'] == 'not_prepared'
+
+
+def test_prepared_route_binding_survives_restart_and_rejects_the_first_changed_route(tmp_path):
+    prepared = setup().setup
+    outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    outbox.prepare(setup=prepared, policy=policy(), account=account(), authority_generation_fingerprint='e' * 64, clock=lambda: NOW)
+    restarted = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    remote = Remote(restarted, prepared)
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        response = remote(request)
+        body = response.json()
+        body['runtime_binding']['configured_route_fingerprint'] = 'b' * 32
+        return httpx.Response(200, json=body)
+
+    async def run():
+        async with httpx.AsyncClient(base_url='http://exec.test', transport=httpx.MockTransport(handler)) as client:
+            return await restarted.advance(setup=prepared, authority=authority(), client=client, clock=lambda: NOW)
+
+    assert asyncio.run(run())['reason'] == 'rule_runtime_binding_changed'
+    assert paths == ['/v4/execution-plans/capabilities']
+    assert remote.posts == remote.activation_posts == []
+
+
+def test_legacy_preparation_without_evidence_route_binding_cannot_gain_authority(tmp_path):
+    from app.overnight_rebound.execution_outbox import _load, _save
+
+    prepared = setup().setup
+    outbox = RuleExecutionOutbox(tmp_path, destination_base_url='http://exec.test')
+    outbox.prepare(setup=prepared, policy=policy(), account=account(), authority_generation_fingerprint='e' * 64, clock=lambda: NOW)
+    path = outbox._folder(prepared) / 'prepared.json'
+    legacy = _load(path)
+    legacy.pop('evidence_runtime_binding')
+    _save(path, legacy)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise AssertionError('unbound preparation must not perform RPC')
+
+    async def run():
+        async with httpx.AsyncClient(base_url='http://exec.test', transport=httpx.MockTransport(handler)) as client:
+            return await outbox.advance(setup=prepared, authority=authority(), client=client, clock=lambda: NOW)
+
+    result = asyncio.run(run())
+    assert result['status'] == 'manual_review'
+    assert result['reason'] == 'preparation_runtime_binding_unproven'
+    assert calls == []
+
+
 @pytest.mark.parametrize('generated_kind', ['timer', 'stop_repair'])
 def test_generated_close_timer_does_not_erase_original_intake_activation_proof(tmp_path, generated_kind):
     prepared = setup().setup

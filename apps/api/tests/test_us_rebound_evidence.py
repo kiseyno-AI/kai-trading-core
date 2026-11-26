@@ -144,6 +144,8 @@ def test_unknown_original_book_uses_proven_full_cap_not_fictional_zero(monkeypat
     assert result.value.baseline_entitlement_krw == Decimal('100000')
     assert result.value.remaining_account_buy_notional_krw == 0
     assert result.value.read_group_id
+    assert result.value.execution_destination == 'http://exec.test'
+    assert result.value.execution_route_fingerprint == 'a' * 32
     assert 'original_entitlement_full_shared_cap_bound' in result.reasons
     assert all(method == 'GET' for method, _, _ in kis.calls)
 
@@ -311,8 +313,12 @@ def test_zero_provider_calculation_basis_is_malformed_not_a_funded_grant(monkeyp
     assert result.reasons == ('malformed_provider_evidence',)
 
 
-@pytest.mark.parametrize('change', ['missing_previous', 'holiday_bar', 'inconsistent_ohlc', 'zero_atr'])
-def test_etf_history_requires_exact_completed_calendar_bars_and_usable_volatility(change):
+@pytest.mark.parametrize(('change', 'expected_status'), [
+    ('missing_previous', 'unavailable'), ('holiday_bar', 'unavailable'),
+    ('empty_history', 'unavailable'), ('zero_atr', 'unavailable'),
+    ('inconsistent_ohlc', 'failed'), ('nonnumeric_close', 'failed'),
+])
+def test_etf_history_distinguishes_missing_history_from_malformed_bars(change, expected_status):
     kis = RawKIS()
     if change == 'missing_previous':
         kis.chart['output2'].pop()
@@ -320,13 +326,19 @@ def test_etf_history_requires_exact_completed_calendar_bars_and_usable_volatilit
         kis.chart['output2'].append({**kis.chart['output2'][-1], 'stck_bsop_date': '20261121'})
     elif change == 'inconsistent_ohlc':
         kis.chart['output2'][-1]['stck_hgpr'] = '9000'
+    elif change == 'nonnumeric_close':
+        kis.chart['output2'][-1]['stck_clpr'] = 'not-a-price'
+    elif change == 'empty_history':
+        kis.chart['output2'] = []
     else:
         for row in kis.chart['output2']:
             row['stck_hgpr'] = row['stck_lwpr'] = '10000'
     adapter = RuleEvidenceAdapter(kis_client=kis, exec_client=None)
     result = asyncio.run(adapter.market(symbol='069500', session=resolve_rule_session(date(2026, 11, 27)).value,
                                        mode='live', clock=lambda: NOW, max_pages=2))
-    assert result.value is None and result.status == 'unavailable'
+    assert result.value is None and result.status == expected_status
+    if expected_status == 'failed':
+        assert result.reasons == ('malformed_provider_evidence',)
 
 
 def test_read_that_crosses_cutoff_returns_no_market_evidence_or_later_request():
@@ -444,6 +456,60 @@ def test_legacy_remote_book_cannot_override_a_healthy_empty_publication(monkeypa
     result = account_result(RawKIS(), monkeypatch, handler=handler, publication=completed_empty_publication())
     assert result.status == 'no_capacity'
     assert result.value.baseline_entitlement_krw == Decimal('100000')
+
+
+def original_remote_plan():
+    items = [('closed:entry', 'buy'), ('legacy:entry', 'buy'), ('legacy:stop', 'sell')]
+    return {
+        'execution_plan_id': 'original-plan', 'accepted_item_count': 3,
+        'item_acks': [{'core_item_key': key, 'execution_plan_item_id': key, 'execution_plan_id': 'original-plan',
+                       'status': 'accepted'} for key, _ in items],
+        'item_states': [
+            {'core_item_key': key, 'execution_plan_item_id': key, 'side': side,
+             'core_quantity_state': {'target_quantity': 1, 'revision': 1, 'filled_quantity': 0,
+                 'open_quantity': 0, 'remaining_quantity': 0, 'submission_uncertain': False, 'entry_closed': True}}
+            if key == 'closed:entry' else
+            {'core_item_key': key, 'execution_plan_item_id': key, 'side': side}
+            for key, side in items
+        ],
+    }
+
+
+def test_mixed_unknown_original_buy_cannot_release_the_proven_baseline_cap(monkeypatch):
+    kis = RawKIS()
+    kis.daily['output1'], kis.cancelable['output'] = [], []
+
+    def handler(request):
+        if request.url.path == '/v4/execution-plans':
+            return httpx.Response(200, json=[original_remote_plan()])
+        return exec_response(request)
+
+    result = account_result(kis, monkeypatch, handler=handler, publication=completed_empty_publication())
+    assert result.status == 'no_capacity'
+    assert result.value.baseline_entitlement_krw == Decimal('100000')
+
+
+@pytest.mark.parametrize('change', ['verified_sells', 'missing_side', 'missing_intake_item', 'duplicate_state'])
+def test_original_authority_requires_complete_membership_and_explicit_sides(monkeypatch, change):
+    kis = RawKIS()
+    kis.daily['output1'], kis.cancelable['output'] = [], []
+    plan = original_remote_plan()
+    plan['item_states'][1]['side'] = 'sell'
+    if change == 'missing_side':
+        del plan['item_states'][1]['side']
+    elif change == 'missing_intake_item':
+        plan['item_states'].pop()
+    elif change == 'duplicate_state':
+        plan['item_states'][2]['execution_plan_item_id'] = plan['item_states'][0]['execution_plan_item_id']
+
+    def handler(request):
+        if request.url.path == '/v4/execution-plans':
+            return httpx.Response(200, json=[plan])
+        return exec_response(request)
+
+    result = account_result(kis, monkeypatch, handler=handler, publication=completed_empty_publication())
+    assert result.status == ('available' if change == 'verified_sells' else 'no_capacity')
+    assert result.value.baseline_entitlement_krw == (0 if change == 'verified_sells' else Decimal('100000'))
 
 
 def test_account_group_keeps_private_proof_out_of_public_diagnostics(monkeypatch):

@@ -380,10 +380,27 @@ def _no_remote_original_buy_authority(plans):
         states = plan.get('item_states')
         if not isinstance(states, list) or not states:
             return False
-        quantities = [item['core_quantity_state'] for item in states if isinstance(item.get('core_quantity_state'), dict)]
-        if not quantities:
+        acks = plan.get('item_acks')
+        if not isinstance(acks, list) or not acks or type(plan.get('accepted_item_count')) is not int or plan['accepted_item_count'] != len(acks):
             return False
-        for item in quantities:
+        identities = [(item.get('core_item_key'), item.get('execution_plan_item_id')) for item in states if isinstance(item, dict)]
+        if len(identities) != len(states) or len({identity[1] for identity in identities}) != len(states) or any(
+            not all(isinstance(value, str) and value for value in identity) for identity in identities
+        ):
+            return False
+        acknowledged = []
+        for ack in acks:
+            if not isinstance(ack, dict) or ack.get('status') != 'accepted' or ack.get('execution_plan_id') != plan.get('execution_plan_id'):
+                return False
+            acknowledged.append((ack.get('core_item_key'), ack.get('execution_plan_item_id')))
+        if len(set(acknowledged)) != len(acks) or not set(acknowledged).issubset(identities):
+            return False
+        for state in states:
+            if state.get('side') == 'sell':
+                continue
+            item = state.get('core_quantity_state')
+            if state.get('side') != 'buy' or not isinstance(item, dict):
+                return False
             if item.get('submission_uncertain') is not False or type(item.get('entry_closed')) is not bool:
                 return False
             if any(type(item.get(name)) is not int or item[name] < 0 for name in ('target_quantity', 'revision', 'filled_quantity', 'open_quantity', 'remaining_quantity')):
@@ -428,10 +445,12 @@ class RuleEvidenceAdapter:
             )
             if not isinstance(payload, dict) or payload.get('rt_cd') != '0':
                 raise _Unavailable('etf_history_unavailable')
+            if payload.get('output2') is None or payload['output2'] == []:
+                raise _Unavailable('etf_history_unavailable')
             try:
                 bars = extract_kis_final_bars(payload, symbol=symbol, start_date=start, end_date=end)
             except ValueError:
-                raise _Unavailable('etf_history_incomplete_or_malformed') from None
+                raise _Malformed('etf_history_malformed') from None
             if set(bars) != {day.date() for day in days}:
                 raise _Unavailable('etf_history_not_contiguous')
             ordered = [bars[day.date()] for day in days]
@@ -621,6 +640,7 @@ class RuleEvidenceAdapter:
                 'account_reference': account.account_reference, 'mode': setup.mode, 'symbol': setup.symbol,
                 'requested_price': str(setup.chase_limit_price),
                 'quantity_calculation_price': str(calculation_price), 'route': initial_binding,
+                'destination': str(self.exec.base_url).rstrip('/'),
                 'target_trade_date': setup.origin.target_trade_date.isoformat(), 'components': batch.components,
             }
             read_group = canonical_json_sha256(proof)
@@ -634,6 +654,8 @@ class RuleEvidenceAdapter:
                              if item['component'].endswith('/inquire-balance'))
             evidence = RuleAccountEvidence(
                 account_reference=account.account_reference, provider='kis', runtime_mode=setup.mode,
+                execution_destination=str(self.exec.base_url).rstrip('/'),
+                execution_route_fingerprint=initial_binding['configured_route_fingerprint'],
                 symbol=setup.symbol, order_possible_price=setup.chase_limit_price, read_group_id=read_group,
                 observed_at=min(stamps), balance_observed_at=balance_at,
                 order_possible_requested_at=requested_at, order_possible_observed_at=power_received,

@@ -2,9 +2,9 @@
 
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, StrictBool, StrictInt
+from pydantic import AwareDatetime, Field, StrictBool, StrictInt
 
 from app.overnight_rebound.execution_contract import (
     Nonnegative, Positive, RuleExecutionPolicy, RuleExecutionSetup, Text, _Frozen, _aware,
@@ -25,6 +25,8 @@ class RuleAccountEvidence(_Frozen):
     account_reference: Text
     provider: Literal['kis']
     runtime_mode: Literal['paper', 'live']
+    execution_destination: Text
+    execution_route_fingerprint: Annotated[str, Field(pattern=r'^[0-9a-f]{32}$')]
     symbol: Literal['069500', '091160']
     order_possible_price: Positive
     read_group_id: Text

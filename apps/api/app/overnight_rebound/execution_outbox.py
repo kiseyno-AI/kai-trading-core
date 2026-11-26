@@ -91,6 +91,53 @@ def _ack(payload: dict, plan: dict) -> dict:
     )
 
 
+def _readback_material(raw: dict, plan: dict, route_fingerprint: str) -> dict:
+    """Remove only reviewed Exec additions after checking their exact meaning."""
+    material = deepcopy(raw)
+    if not isinstance(material.get('metadata'), dict) or not isinstance(material.get('items'), list):
+        raise ValueError('rule readback material is incomplete')
+    if material['metadata'].get('account_reference', '') is None:
+        material['metadata']['account_reference'] = plan['metadata']['account_reference']
+    expected_items = {item['core_item_key']: item for item in plan['items']}
+    for item in material['items']:
+        if not isinstance(item, dict) or any(not isinstance(item.get(name), dict) for name in ('session_policy', 'risk_context')):
+            raise ValueError('rule readback item material is incomplete')
+        expected = expected_items[item['core_item_key']]
+        for name in ('generic_action', 'raw_action', 'tactical_action', 'handoff_intent'):
+            if name not in expected and item.get(name) is None:
+                item.pop(name, None)
+        session = item['session_policy']
+        if 'whole_shares_only' not in expected['session_policy'] and session.get('whole_shares_only') is None:
+            session.pop('whole_shares_only', None)
+        additions = {
+            **{name: expected[name] for name in ('broker', 'close_exit_at', 'currency', 'exchange', 'market', 'rule_origin')},
+            'session_policy': {**expected['session_policy'], 'whole_shares_only': None},
+            'execution_account_route': {
+                'version': 'kis-account-route-v1', 'configured_route_fingerprint': route_fingerprint,
+            },
+        }
+        if expected['side'] == 'buy':
+            additions['handoff_intent'] = expected['handoff_intent']
+            additions['watch_buy_monitoring'] = {
+                'received_intent': expected['intent'], 'trigger_source': 'trigger_price',
+                'trigger_price': expected['trigger_price'], 'chase_limit_price': None,
+                'direction': 'at_or_below', 'tactical_action': None, 'exec_monitoring_active': None,
+            }
+        risk = item['risk_context']
+        if risk.get('execution_account_route') != additions['execution_account_route']:
+            raise ValueError('rule persisted account route mismatch')
+        for name, value in additions.items():
+            if name not in expected['risk_context'] and name in risk:
+                observed = risk.pop(name)
+                if name == 'watch_buy_monitoring' and isinstance(observed, dict):
+                    if _number(observed.get('trigger_price')) != _number(value['trigger_price']):
+                        raise ValueError('rule server-added monitoring price mismatch')
+                    observed['trigger_price'] = value['trigger_price']
+                if canonical_json_sha256(observed) != canonical_json_sha256(value):
+                    raise ValueError('rule server-added readback material mismatch')
+    return material
+
+
 def _readback(payload: dict, plan: dict, state: dict) -> tuple[dict, bool, str | None]:
     links = _ack(payload, plan)
     if state.get('execution_plan_id') not in (None, payload['execution_plan_id']):
@@ -100,9 +147,16 @@ def _readback(payload: dict, plan: dict, state: dict) -> tuple[dict, bool, str |
     raw = payload.get('rule_contract')
     if not isinstance(raw, dict):
         raise ValueError('rule immutable price readback unavailable')
-    contract = RuleExecutionPlan.model_validate(raw)
+    material = _readback_material(raw, plan, state['runtime_binding']['configured_route_fingerprint'])
+    contract = RuleExecutionPlan.model_validate(material)
     if contract.plan_id != plan['plan_id'] or contract.rule_origin.model_dump(mode='json') != plan['rule_origin'] or contract.mode != plan['mode'] or contract.metadata.dispatch_material_fingerprint != plan['metadata']['dispatch_material_fingerprint']:
         raise ValueError('rule persisted contract mismatch')
+    if (
+        execution_plan_dispatch_material_fingerprint(material) != plan['metadata']['dispatch_material_fingerprint']
+        or material['requested_at'] != plan['requested_at']
+        or any(material['metadata'].get(name) != plan['metadata'].get(name) for name in ('requested_at', 'trigger'))
+    ):
+        raise ValueError('rule immutable dispatch material mismatch')
     actual = {item.core_item_key: item for item in contract.items}
     states = payload.get('item_states')
     if not isinstance(states, list) or len(states) < len(links):
@@ -132,13 +186,9 @@ def _readback(payload: dict, plan: dict, state: dict) -> tuple[dict, bool, str |
                 raise ValueError('rule immutable price mismatch')
         if persisted.risk_context.get('rule_session') != item['risk_context']['rule_session']:
             raise ValueError('rule readback session evidence mismatch')
-        route = persisted.risk_context.get('execution_account_route')
-        expected_route = state.get('runtime_binding', {}).get('configured_route_fingerprint')
-        if not isinstance(route, dict) or route.get('version') != 'kis-account-route-v1' or route.get('configured_route_fingerprint') != expected_route:
-            raise ValueError('rule persisted account route mismatch')
         if item['side'] == 'buy':
-            if persisted.quantity_policy.get('type') != 'core_sized' or persisted.quantity_policy.get('revision') != item['quantity_policy']['revision'] or persisted.quantity_policy.get('target_quantity') != item['quantity_policy']['target_quantity']:
-                raise ValueError('rule readback quantity revision mismatch')
+            if persisted.quantity_policy != item['quantity_policy']:
+                raise ValueError('rule readback quantity grant mismatch')
             activation = observed.get('core_activation_state')
             if not isinstance(activation, dict) or activation.get('dispatch_material_fingerprint') != plan['metadata']['dispatch_material_fingerprint'] or activation.get('authority_generation_fingerprint') != item['risk_context']['_core_activation']['authority_generation_fingerprint']:
                 raise ValueError('rule readback activation binding unavailable')
@@ -241,6 +291,8 @@ class RuleExecutionOutbox:
         account: RuleAccountEvidence | None, authority_generation_fingerprint: str,
         clock: Callable[[], datetime],
     ) -> dict:
+        if account is not None and _destination(account.execution_destination) != self.destination:
+            raise ValueError('rule account evidence differs from the immutable destination')
         self._mkdir(setup)
         with checkpoint_file_lock(self._account_folder(setup) / 'ledger.json') as acquired:
             if not acquired:
@@ -281,6 +333,10 @@ class RuleExecutionOutbox:
                 'schema_version': 'us_rebound_execution_outbox_v1', 'destination': self.destination,
                 'setup': setup.model_dump(mode='json'), 'policy': policy.model_dump(mode='json'),
                 'plan': plan, 'sizing': sizing.model_dump(mode='json'),
+                'evidence_runtime_binding': {
+                    'mode': account.runtime_mode, 'provider': account.provider, 'account_reference_matches': True,
+                    'configured_route_fingerprint': account.execution_route_fingerprint,
+                },
                 'evidence_valid_until': (min(
                     setup.evidence_observed_at, account.observed_at, account.balance_observed_at,
                     account.order_possible_requested_at, account.order_possible_observed_at,
@@ -337,6 +393,18 @@ class RuleExecutionOutbox:
 
             if state['status'] == 'manual_review':
                 return self.status(setup)
+            evidence_binding = prepared.get('evidence_runtime_binding')
+            if (
+                not isinstance(evidence_binding, dict)
+                or set(evidence_binding) != {'mode', 'provider', 'account_reference_matches', 'configured_route_fingerprint'}
+                or evidence_binding.get('mode') != plan['mode'] or evidence_binding.get('provider') != 'kis'
+                or evidence_binding.get('account_reference_matches') is not True
+                or not isinstance(evidence_binding.get('configured_route_fingerprint'), str)
+                or len(evidence_binding['configured_route_fingerprint']) != 32
+                or any(c not in '0123456789abcdef' for c in evidence_binding['configured_route_fingerprint'])
+            ):
+                state['status'] = 'manual_review'
+                return report('preparation_runtime_binding_unproven')
             try:
                 capabilities_response = await client.get('/v4/execution-plans/capabilities', headers={'X-Core-Account-Reference': frozen_setup.account_reference}, follow_redirects=False)
                 capabilities_response.raise_for_status()
@@ -348,7 +416,7 @@ class RuleExecutionOutbox:
                 route = binding.get('configured_route_fingerprint') if isinstance(binding, dict) else None
                 if not isinstance(binding, dict) or binding.get('mode') != plan['mode'] or binding.get('provider') != 'kis' or binding.get('account_reference_matches') is not True or not isinstance(route, str) or len(route) != 32 or any(c not in '0123456789abcdef' for c in route):
                     return report('rule_runtime_binding_mismatch')
-                if state.get('runtime_binding') not in (None, binding):
+                if binding != evidence_binding or state.get('runtime_binding') not in (None, evidence_binding):
                     return report('rule_runtime_binding_changed')
                 state['runtime_binding'] = binding
                 report()

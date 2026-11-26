@@ -10,6 +10,7 @@ def account(**updates):
     return RuleAccountEvidence.model_validate({
         'account_reference': 'KIS:test-only', 'observed_at': NOW.isoformat(),
         'provider': 'kis', 'runtime_mode': 'paper', 'symbol': '069500',
+        'execution_destination': 'http://exec.test', 'execution_route_fingerprint': 'a' * 32,
         'order_possible_price': '10050', 'read_group_id': 'test-evidence-group',
         'balance_observed_at': NOW.isoformat(), 'order_possible_observed_at': NOW.isoformat(),
         'order_possible_requested_at': NOW.isoformat(),

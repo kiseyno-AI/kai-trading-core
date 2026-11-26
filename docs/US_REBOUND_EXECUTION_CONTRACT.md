@@ -27,6 +27,7 @@ authoritative close minus the configured buffer, binds the complete family.
 
 `RuleAccountEvidence` is a private group of scoped reads, not an atomic broker
 snapshot. It requires account/provider/mode/symbol, the exact chase price,
+the evidence read's execution destination and configured route fingerprint,
 `read_group_id`, request/receipt timestamps, fresh component timestamps, full
 exposure/reservation coverage, and the original two lanes' complete entitlement.
 Do not derive completeness from truncated portfolio lists.
@@ -113,12 +114,17 @@ The injected client must match the immutable destination. Before any POST,
 `GET /v4/execution-plans/capabilities` must prove
 `rule_origin_krx_us_rebound_v1`, exact mode/provider/account matching through the
 private `X-Core-Account-Reference` header, and a stable configured route
-fingerprint. A paper plan cannot reach a live runtime. Redirects and legacy
+fingerprint matching the persisted account-evidence binding. The first RPC
+cannot rebind a grant to another destination or route. A paper plan cannot
+reach a live runtime. Redirects and legacy
 fallback are disabled. Registration does not activate a disabled rule.
 
 Pending debt is durable before create/activation RPC. Lost responses reconcile
 the exact plan ID, full origin, fingerprint, prices/deadline, durable item IDs,
-route, quantity revision, and persisted entry activation state. Unknown
+route, the complete original quantity grant (including expiry, calculation time
+and sizing/cost inputs), and persisted entry activation state. An echoed digest
+cannot substitute for checking the returned material. Only reviewed server
+normalization is accepted. Unknown
 responses remain debt. Exact retries use identical bytes/IDs. Extra generated
 close-timer state does not change the original three intake bindings. Existing
 fills, open quantities, entry closure or submission uncertainty block new
@@ -196,8 +202,14 @@ It only proves zero when a nonempty completed two-lane cohort has validated
 linked signal/plan completion proofs, exact source/target dates, a zero-item
 nonblocking publication, matching current snapshot/run identities, no blocked
 scope, no actionable effective decision, no current Core rows and no unresolved
-remote original BUY authority. Trigger-valid WAIT remains actionable. Local
-book/publication reads must remain identical at the close of the group. The
+remote original BUY authority. Trigger-valid WAIT remains actionable.
+
+Remote item states must cover every acknowledged intake item with exact unique
+IDs and explicit sides; every BUY needs complete quantity proof. Only proven
+SELLs may be omitted from the BUY-authority check. A mixed known/unknown BUY
+book retains the full cap.
+
+Local book/publication reads must remain identical at the close of the group. The
 read path invokes no planner refresh, agent, daily stage, dispatch or preflight.
 
 Empty rows, a wholly empty admitted cohort, legacy/unknown authority or a
