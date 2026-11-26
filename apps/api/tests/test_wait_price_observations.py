@@ -441,3 +441,114 @@ def test_orderbook_sampling_covers_more_than_one_kis_batch(tmp_path, monkeypatch
             await prices.stop()
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize(('environment', 'wait_count', 'session_active', 'utc_hour', 'fail_batch'), [
+    pytest.param('real', 1, True, 4, False, id='mixed-wait-and-non-wait'),
+    pytest.param('real', 0, True, 4, False, id='empty-wait-registry'),
+    pytest.param('demo', 0, True, 4, False, id='demo-rate-delays'),
+    pytest.param('real', 0, False, 4, False, id='unverified-session'),
+    pytest.param('real', 0, True, 23, False, id='outside-regular-hours'),
+    pytest.param('real', 0, True, 4, True, id='failed-batch-stays-unavailable'),
+])
+def test_display_sampling_covers_non_wait_monitored_symbols_without_execution_evidence(
+    tmp_path, monkeypatch, environment, wait_count, session_active, utc_hour, fail_batch,
+):
+    import asyncio
+
+    from app.quotes import kis_realtime_prices
+
+    async def check():
+        now = datetime(2026, 11, 10, utc_hour, 0, tzinfo=timezone.utc)
+        can_sample = session_active and utc_hour == 4
+        observer = WaitPriceObservations(tmp_path)
+        symbols = [f'{index:06d}' for index in range(1, 88)] + ['0017J0']
+        wait_symbols = symbols[:wait_count]
+        observer.configure(now.date(), [
+            wait_price_observations.WaitPriceWatch(
+                index, 'signal-decider', symbol, '2026-11-09',
+                (now - timedelta(hours=5)).isoformat(), '50',
+                buy_direction='at_or_below', chase_limit_price='50',
+            )
+            for index, symbol in enumerate(wait_symbols, 1)
+        ], now=now)
+        batches = []
+        delays = []
+        round_done = asyncio.Event()
+        sleep = asyncio.sleep
+
+        async def record_delay(delay):
+            if delay >= 1:
+                delays.append(delay)
+                if delay == (2 if not can_sample or environment == 'demo' else 1):
+                    round_done.set()
+                    await sleep(3600)
+                    return
+            await sleep(0)
+
+        class Client:
+            def _environment(self):
+                return environment
+
+            def websocket_url(self):
+                return 'ws://example.test'
+
+            async def fetch_domestic_multi_quotes(self, batch):
+                batches.append(batch)
+                if fail_batch and len(batches) == 2:
+                    raise kis_realtime_prices.KISClientError('injected quote batch failure')
+                return [{
+                    'inter_shrn_iscd': symbol, 'inter2_prpr': '99',
+                    'inter2_askp': '100', 'inter2_bidp': '98',
+                    'seln_rsqn': '3', 'shnu_rsqn': '4',
+                    'inter2_prdy_clpr': '100', 'prdy_ctrt': '-1.00',
+                } for symbol in batch]
+
+            async def fetch_domestic_orderbook(self, symbol):
+                raise AssertionError('display sampling must not confirm a non-WAIT entry')
+
+        async def skip_trade_socket():
+            pass
+
+        monkeypatch.setattr(wait_price_observations, 'wait_price_observations', observer)
+        monkeypatch.setattr(kis_realtime_prices, '_utc_now', lambda: now)
+        monkeypatch.setattr(kis_realtime_prices.settings, 'kis_realtime_price_enabled', True)
+        monkeypatch.setattr(kis_realtime_prices.asyncio, 'sleep', record_delay)
+        prices = KISRealtimePriceService(client=Client())
+        monkeypatch.setattr(prices, '_is_configured', lambda: (True, None))
+        monkeypatch.setattr(prices, '_recorded_market_session_is_active', lambda: session_active)
+        monkeypatch.setattr(prices, '_run', skip_trade_socket)
+        prices.observe_monitored_symbols(symbols, trigger='test')
+        await prices.start()
+        try:
+            await asyncio.wait_for(round_done.wait(), 2)
+            if not can_sample:
+                assert batches == []
+                assert delays == [2]
+                assert all(quote['current_price'] is None for quote in prices.monitored_snapshot()['items'])
+                return
+            assert [len(batch) for batch in batches] == [30, 30, 28]
+            assert [symbol for batch in batches for symbol in batch] == symbols
+            assert delays == ([1.1, 1.1, 2] if environment == 'demo' else [1])
+            quotes = prices.monitored_snapshot()['items']
+            assert len(quotes) == 88
+            available = [quote for quote in quotes if quote['price_status'] == 'available']
+            assert len(available) == (58 if fail_batch else 88)
+            assert all(quote['current_price'] == 99 and quote['bid_price'] == 98
+                       and quote['ask_price'] == 100 for quote in available)
+            assert all(quote['price_source'] == 'kis_rest_multi_quote'
+                       and quote['price_time_basis'] == 'received_at'
+                       and quote['realtime_subscribed'] is False for quote in available)
+            assert all(quote['current_price'] is None for quote in quotes if quote not in available)
+            assert prices.health_snapshot()['wait_orderbook_observation']['failed_batches'] == int(fail_batch)
+            assert prices._prices == {}
+            books = prices.orderbooks_snapshot()
+            assert books['items'] == []
+            assert books['passive_quote_symbols'] == wait_symbols
+            history = observer.history(now.date())
+            assert len(history) == wait_count
+            assert all(row['status'] == 'not_observed' and 'ask_entry' not in row for row in history)
+        finally:
+            await prices.stop()
+
+    asyncio.run(check())

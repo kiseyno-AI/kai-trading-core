@@ -1,7 +1,7 @@
 # GET /quotes/realtime/monitored and /stream
 
 ## Summary
-Read or stream Core's process-local realtime price snapshot for execution-runtime monitored symbols. Core owns the KIS websocket and fans out the latest in-memory ticks. The existing background WAIT multi-quote sampler also supplies display-only current prices and best bid/ask for candidates without a fresh websocket tick, including subscription-capacity-limited symbols; the route itself does not call KIS REST or persist these display samples. The route is a realtime diagnostic surface; execution-runtime dashboard endpoints add local cache/daily display fallback fields for web cards.
+Read or stream Core's process-local realtime price snapshot for execution-runtime monitored symbols. Core owns the KIS websocket and fans out the latest in-memory ticks. The existing background multi-quote sampler covers the union of current WAIT watches and all desired monitored symbols in batches of at most 30, supplying display-only current prices and best bid/ask even without a websocket slot. It retains the verified regular-session guard and existing sampling cadence; non-WAIT samples never become WAIT observations or passive execution evidence. The route itself does not call KIS REST or persist these display samples. The route is a realtime diagnostic surface; execution-runtime dashboard endpoints add local cache/daily display fallback fields for web cards.
 
 ## Example request
 ```http
@@ -58,6 +58,8 @@ When WAIT orderbook sampling is active, `health.wait_orderbook_observation`
 reports `requested_count`, `sampled_count`, `failed_batches`, and
 `last_sample_at` for the latest regular-session sampling round. The
 sampled count measures orderbook coverage separately from trade subscriptions.
+Only registered WAIT symbols contribute to that sampled count and passive quote
+coverage; read the per-symbol display fields for non-WAIT quote availability.
 
 ## WAIT display samples
 
