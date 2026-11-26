@@ -412,3 +412,147 @@ def test_expired_entry_window_still_reconciles_existing_pending_ack_without_new_
     assert asyncio.run(tick(NOW.replace(hour=9, minute=11), forbidden, forbidden))['status'] == 'active'
     assert len(remote.posts) == len(remote.activation_posts) == 1
 
+
+@pytest.mark.parametrize('failure,reason', [
+    ('missing_policy', 'execution_policy_or_scope_unavailable'),
+    ('invalid_policy', 'execution_policy_or_scope_unavailable'),
+    ('unreadable_policy', 'execution_policy_or_scope_unavailable'),
+    ('missing_config', 'execution_configuration_unavailable'),
+    ('changed_scope', 'persisted_execution_scope_changed'),
+])
+def test_confirmed_families_remain_visible_when_configuration_fails(
+    tmp_path, monkeypatch, current_api_clock, failure, reason,
+):
+    from dataclasses import replace
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from app.core.settings import settings
+    from app.main import app
+    from app.overnight_rebound.operation import load_us_rebound_execution_status
+
+    config, remote = configuration(tmp_path), WireExec()
+    async def activate():
+        async with httpx.AsyncClient(base_url=config.destination_base_url,
+            headers={'Authorization': 'Bearer synthetic-exec-token'}, transport=httpx.MockTransport(remote)) as client:
+            return await run_us_rebound_operation(mode='paper', config=config, evaluation=current_evaluation(),
+                state_dir=tmp_path, clock=lambda: NOW, seal_loader=seal_loader,
+                adapter_factory=Evidence, client=client, account_target_reader=target_reader)
+    confirmed = asyncio.run(activate())
+    assert confirmed['status'] == 'active'
+    assert any(item.get('last_confirmed_at') == NOW.isoformat() for item in confirmed['items'])
+    calls, requests = list(Evidence.calls), list(remote.requests)
+    if failure == 'missing_policy':
+        Path(config.policy_file).unlink()
+    elif failure == 'invalid_policy':
+        Path(config.policy_file).write_text('{')
+    elif failure == 'unreadable_policy':
+        config = replace(config, policy_file=str(tmp_path))
+    elif failure == 'missing_config':
+        config = replace(config, account_reference=None)
+    else:
+        config = replace(config, authority_id='different-operator-scope')
+    later = NOW.replace(minute=21)
+    monkeypatch.setattr(httpx.AsyncClient, 'request', forbidden)
+    result = asyncio.run(run_us_rebound_operation(mode='paper', config=config, evaluation=current_evaluation(),
+        state_dir=tmp_path, clock=lambda: later, seal_loader=forbidden,
+        adapter_factory=forbidden, account_target_reader=target_reader))
+
+    assert result['status'] == 'unavailable'
+    assert result['reason'] == reason
+    assert result['items'] == confirmed['items']
+    assert result['checked_at'] == later.isoformat()
+    assert Evidence.calls == calls and remote.requests == requests
+    assert load_us_rebound_execution_status(target_trade_date=NOW.date(), state_dir=tmp_path) == result
+    monkeypatch.setattr(settings, 'us_rebound_state_dir', str(tmp_path))
+    monkeypatch.setattr(settings, 'us_rebound_mode', 'paper')
+    monkeypatch.setattr(settings, 'us_rebound_execution_enabled', True)
+    current_api_clock(later)
+    response = TestClient(app).get('/strategies/us-rebound/status?target_trade_date=2026-11-30')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['execution_connection'] == 'rule_v4'
+    assert body['order_execution_enabled'] is True
+    assert body['execution'] == result
+    assert all(private not in json.dumps(body) for private in ('12345678', 'target_quantity', 'claim_id', 'policy.json'))
+
+
+@pytest.mark.parametrize('corruption', ['json', 'hash', 'scope', 'items'])
+def test_configuration_failure_does_not_trust_or_replace_corrupt_execution_status(
+    tmp_path, monkeypatch, current_api_clock, corruption,
+):
+    from fastapi.testclient import TestClient
+    from app.core.settings import settings
+    from app.main import app
+    from app.internal.exact_repair_manifest import write_checkpoint
+
+    value = {'strategy_id': 'krx_us_rebound', 'target_trade_date': NOW.date().isoformat(),
+        'source_environment': 'real', 'mode': 'paper', 'status': 'active', 'checked_at': NOW.isoformat(),
+        'items': [{'symbol': '069500', 'status': 'active', 'last_confirmed_at': NOW.isoformat()}]}
+    if corruption == 'scope':
+        value['target_trade_date'] = '2026-11-27'
+    elif corruption == 'items':
+        value['items'] = ['invalid']
+    path = tmp_path / 'rebound/real-2026-11-30/execution-status.json'
+    write_checkpoint(path, {**value, 'record_hash': 'wrong' if corruption == 'hash' else canonical_json_sha256(value)})
+    if corruption == 'json':
+        path.write_text('{')
+    previous = path.read_bytes()
+    result = asyncio.run(run_us_rebound_operation(mode='paper', config=RuleOperationConfig(enabled=True),
+        evaluation=current_evaluation(), state_dir=tmp_path, clock=lambda: NOW,
+        seal_loader=forbidden, adapter_factory=forbidden))
+    assert result['status'] == 'unavailable'
+    assert result['reason'] == 'execution_status_unavailable'
+    assert result['items'] == []
+    assert path.read_bytes() == previous
+    monkeypatch.setattr(settings, 'us_rebound_state_dir', str(tmp_path))
+    monkeypatch.setattr(httpx.AsyncClient, 'request', forbidden)
+    response = TestClient(app).get('/strategies/us-rebound/status?target_trade_date=2026-11-30')
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(('mode', 'status'), [('paper', 'accepted'), ('paper', 'activation_pending'), ('live', 'active')])
+def test_configuration_failure_preserves_registered_items_without_rebinding_their_mode(
+    tmp_path, monkeypatch, current_api_clock, mode, status,
+):
+    from fastapi.testclient import TestClient
+    from app.core.settings import settings
+    from app.main import app
+    from app.internal.exact_repair_manifest import write_checkpoint
+
+    value = {'strategy_id': 'krx_us_rebound', 'target_trade_date': NOW.date().isoformat(),
+        'source_environment': 'real', 'mode': mode, 'status': 'pending', 'checked_at': NOW.isoformat(),
+        'items': [{'symbol': '069500', 'status': status, 'last_confirmed_at': NOW.isoformat()}]}
+    path = tmp_path / 'rebound/real-2026-11-30/execution-status.json'
+    write_checkpoint(path, {**value, 'record_hash': canonical_json_sha256(value)})
+    monkeypatch.setattr(httpx.AsyncClient, 'request', forbidden)
+    result = asyncio.run(run_us_rebound_operation(mode='paper', config=RuleOperationConfig(enabled=True),
+        evaluation=current_evaluation(), state_dir=tmp_path, clock=lambda: NOW.replace(minute=21),
+        seal_loader=forbidden, adapter_factory=forbidden))
+    assert result['status'] == 'unavailable'
+    assert result['items'] == value['items'] and result['mode'] == mode
+    monkeypatch.setattr(settings, 'us_rebound_state_dir', str(tmp_path))
+    monkeypatch.setattr(settings, 'us_rebound_mode', 'paper')
+    monkeypatch.setattr(settings, 'us_rebound_execution_enabled', True)
+    response = TestClient(app).get('/strategies/us-rebound/status?target_trade_date=2026-11-30')
+    assert response.status_code == 200
+    assert response.json()['execution_connection'] == 'rule_v4'
+    assert response.json()['order_execution_enabled'] is False
+
+
+def test_configuration_failure_does_not_import_another_sessions_execution_facts(tmp_path):
+    from app.internal.exact_repair_manifest import write_checkpoint
+
+    value = {'strategy_id': 'krx_us_rebound', 'target_trade_date': '2026-11-27',
+        'source_environment': 'real', 'mode': 'paper', 'status': 'active',
+        'items': [{'symbol': '069500', 'status': 'active', 'last_confirmed_at': '2026-11-27T08:20:00+09:00'}]}
+    path = tmp_path / 'rebound/real-2026-11-27/execution-status.json'
+    write_checkpoint(path, {**value, 'record_hash': canonical_json_sha256(value)})
+    previous = path.read_bytes()
+    result = asyncio.run(run_us_rebound_operation(mode='paper', config=RuleOperationConfig(enabled=True),
+        evaluation=current_evaluation(), state_dir=tmp_path, clock=lambda: NOW,
+        seal_loader=forbidden, adapter_factory=forbidden))
+    assert result['status'] == 'unavailable'
+    assert result['reason'] == 'execution_configuration_unavailable'
+    assert result['items'] == []
+    assert path.read_bytes() == previous
+

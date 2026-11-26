@@ -81,6 +81,8 @@ def load_us_rebound_execution_status(*, target_trade_date, state_dir, source_env
     value = _read(path)
     if value.get('strategy_id') != 'krx_us_rebound' or value.get('target_trade_date') != target_trade_date.isoformat() or value.get('source_environment') != source_environment:
         raise ValueError('US rebound execution status scope mismatch')
+    if value.get('mode') not in ('paper', 'live') or not isinstance(value.get('items'), list) or any(not isinstance(item, dict) for item in value['items']):
+        raise ValueError('US rebound execution status is invalid')
     return _public(value)
 
 
@@ -135,6 +137,15 @@ async def run_us_rebound_operation(
                  'source_environment': environment, 'mode': mode, 'status': status,
                  'checked_at': _aware(clock()).isoformat(), 'items': list(items),
                  **({'reason': reason} if reason else {})}
+        try:
+            previous = load_us_rebound_execution_status(
+                target_trade_date=now.date(), state_dir=state_dir, source_environment=environment,
+            )
+        except (OSError, ValueError):
+            return _public({**value, 'status': 'unavailable', 'reason': 'execution_status_unavailable', 'items': []})
+        if not value['items'] and previous and any(item.get('status') in ('accepted', 'activation_pending', 'active') for item in previous['items']):
+            value['items'] = previous['items']
+            value['mode'] = previous['mode']
         _write(public_path, _public(value))
         return _public(value)
 

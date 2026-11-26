@@ -208,8 +208,12 @@ hashes. `order_execution_enabled=true` requires today's KST target, current pape
 separate true opt-in, matching persisted mode and confirmed active watch
 authority. It is not fresh remote trading permission; Core market and Exec
 pause/kill gates still apply. `checked_at` is job liveness; it does not
-refresh `last_confirmed_at` without a new acknowledgement/readback. Disabling
-new Core handoffs does not revoke an already accepted Exec family or its
+refresh `last_confirmed_at` without a new acknowledgement/readback. Missing or
+invalid handoff configuration preserves the last validated current-session
+registration/activation items and their timestamps. A failed tick reports its
+own status/reason alongside those facts; it does not imply that Exec stopped
+an accepted family. Corrupt or mis-scoped previous status is not replaced or trusted.
+Disabling new Core handoffs does not revoke an already accepted Exec family or its
 protection; preserve its state and use the reviewed Exec controls when needed.
 
 ## Rollback and pending work

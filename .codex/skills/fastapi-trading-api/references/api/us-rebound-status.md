@@ -23,6 +23,10 @@ confirmed active watch authority. It is not a fresh broker check; market and
 Exec pause/kill gates still apply.
 `execution_connection=rule_v4` requires persisted registration/activation proof;
 otherwise it remains `not_connected`. Observation never performs execution HTTP.
+Configuration failures update `execution.status`/`reason` while retaining valid
+current-session items, their persisted mode and unchanged `last_confirmed_at`.
+Known active items can therefore coexist with a failed job status. Corrupt or
+mis-scoped previous state returns 503 rather than losing its evidence.
 
 ## Example request
 

@@ -29,7 +29,7 @@ def get_us_rebound_status(target_trade_date: date | None = None) -> dict:
     return {
         **value, 'server_time': now.isoformat(), 'mode': settings.us_rebound_mode,
         'enabled_from': settings.us_rebound_enabled_from,
-        'order_execution_enabled': requested and execution.get('status') == 'active',
+        'order_execution_enabled': requested and any(item.get('status') == 'active' for item in execution.get('items', [])),
         'execution_connection': 'rule_v4' if registered else 'not_connected',
         'schedule_kst': {'collection': ['07:00', '07:05', '07:10'], 'evaluation': '07:15',
                          'execution_evidence': ['08:20', '08:30'], 'deadline': '08:40'},
