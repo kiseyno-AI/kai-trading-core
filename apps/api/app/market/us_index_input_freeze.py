@@ -11,7 +11,7 @@ from app.db import session_scope
 from app.internal.exact_repair_manifest import (
     canonical_json_sha256, checkpoint_file_lock, load_json_mapping, write_checkpoint,
 )
-from app.market.us_index_prices import SUPPORTED_US_INDEX_CODES
+from app.market.us_index_prices import SUPPORTED_US_INDEX_CODES, validate_us_index_price_history
 from app.market.us_index_snapshot_store import USIndexInputSnapshotRecord, _utc, load_us_index_snapshot
 
 
@@ -28,16 +28,21 @@ class USIndexInputFreezeRecord:
     selected_at: datetime
     confirmed_at: datetime
     snapshots: tuple[USIndexInputSnapshotRecord, ...]
+    input_kind: str = 'session'
 
     @property
     def snapshot_ids(self) -> dict[str, str]:
         return {record.prices.index_code: record.snapshot_id for record in self.snapshots}
 
 
-def _folder(state_dir, target_trade_date: date, source_environment: str) -> Path:
-    if type(target_trade_date) is not date or source_environment not in ('real', 'mock'):
+def _folder(state_dir, target_trade_date: date, source_environment: str, include_history: bool = False) -> Path:
+    if (
+        type(target_trade_date) is not date or source_environment not in ('real', 'mock')
+        or type(include_history) is not bool
+    ):
         raise ValueError('A target date and real/mock source environment are required')
-    return Path(state_dir) / 'frozen' / f'{source_environment}-{target_trade_date.isoformat()}'
+    namespace = 'frozen-history' if include_history else 'frozen'
+    return Path(state_dir) / namespace / f'{source_environment}-{target_trade_date.isoformat()}'
 
 
 def _timestamp(value) -> datetime:
@@ -73,7 +78,7 @@ def _sync_parent_directories(folder: Path) -> None:
         directory = parent
 
 
-def _validate_snapshots(snapshots, as_of, selected_at, environment) -> None:
+def _validate_snapshots(snapshots, as_of, selected_at, environment, *, include_history: bool = False) -> None:
     for code, snapshot in zip(SUPPORTED_US_INDEX_CODES, snapshots):
         if snapshot is None or (
             snapshot.prices.index_code != code or snapshot.as_of != as_of
@@ -82,13 +87,22 @@ def _validate_snapshots(snapshots, as_of, selected_at, environment) -> None:
             or snapshot.prices.session != snapshots[0].prices.session
         ):
             raise ValueError('US index input snapshot binding mismatch')
+    if include_history:
+        expected = tuple(item.session for item in snapshots[0].history_prices)
+        for snapshot in snapshots:
+            validate_us_index_price_history(snapshot.prices, snapshot.history_prices)
+            if tuple(item.session for item in snapshot.history_prices) != expected:
+                raise ValueError('US index historical session alignment mismatch')
 
 
-def _selection(folder: Path, target_trade_date: date, environment: str, session_factory):
+def _selection(folder: Path, target_trade_date: date, environment: str, session_factory, include_history=False):
     data = load_json_mapping(folder / 'input.json', label='US index input selection')
     body = {key: value for key, value in data.items() if key != 'manifest_id'}
-    if data.get('manifest_id') != canonical_json_sha256(body) or body.get('schema_version') != 'us_index_input_v1':
+    schema = 'us_index_history_input_v1' if include_history else 'us_index_input_v1'
+    if data.get('manifest_id') != canonical_json_sha256(body) or body.get('schema_version') != schema:
         raise ValueError('US index input manifest hash/version mismatch')
+    if include_history and body.get('input_kind') != 'history_22':
+        raise ValueError('US index history input contract mismatch')
     if body.get('target_trade_date') != target_trade_date.isoformat() or body.get('source_environment') != environment:
         raise ValueError('US index input manifest identity mismatch')
     ids = _snapshot_ids(body.get('snapshot_ids'))
@@ -102,23 +116,24 @@ def _selection(folder: Path, target_trade_date: date, environment: str, session_
         raise ValueError('US index input manifest time window mismatch')
     snapshots = tuple(load_us_index_snapshot(ids[code], session_factory=session_factory)
                       for code in SUPPORTED_US_INDEX_CODES)
-    _validate_snapshots(snapshots, as_of, selected, environment)
+    _validate_snapshots(snapshots, as_of, selected, environment, include_history=include_history)
     return data, snapshots
 
 
 def load_frozen_us_index_inputs(
     *, target_trade_date: date, source_environment: str = 'real',
     state_dir: str | Path = 'var/us-index-preopen', session_factory=session_scope,
+    include_history: bool = False,
 ) -> USIndexInputFreezeRecord | None:
     """Replay exact sealed IDs without collecting or selecting newer data."""
-    folder = _folder(state_dir, target_trade_date, source_environment)
+    folder = _folder(state_dir, target_trade_date, source_environment, include_history)
     if not (folder / 'seal.json').exists():
         return None
     seal = load_json_mapping(folder / 'seal.json', label='US index input seal')
     body = {key: value for key, value in seal.items() if key != 'seal_hash'}
     if seal.get('seal_hash') != canonical_json_sha256(body) or body.get('schema_version') != 'us_index_seal_v1':
         raise ValueError('US index input seal hash/version mismatch')
-    data, snapshots = _selection(folder, target_trade_date, source_environment, session_factory)
+    data, snapshots = _selection(folder, target_trade_date, source_environment, session_factory, include_history)
     selected_at = _timestamp(data['selected_at'])
     cutoff = _timestamp(data['cutoff_at'])
     confirmed_at = _timestamp(body['confirmed_at'])
@@ -127,6 +142,7 @@ def load_frozen_us_index_inputs(
     return USIndexInputFreezeRecord(
         data['manifest_id'], target_trade_date, source_environment,
         _timestamp(data['as_of']), cutoff, selected_at, confirmed_at, snapshots,
+        input_kind='history_22' if include_history else 'session',
     )
 
 
@@ -134,12 +150,14 @@ def freeze_us_index_inputs(
     *, target_trade_date: date, snapshot_ids: Mapping[str, str], source_environment: str = 'real',
     state_dir: str | Path = 'var/us-index-preopen', session_factory=session_scope,
     clock: Callable[[], datetime] = partial(datetime.now, UTC),
+    include_history: bool = False,
 ) -> USIndexInputFreezeRecord | None:
     """Seal observed committed IDs before cutoff, or replay the existing selection."""
-    folder = _folder(state_dir, target_trade_date, source_environment)
+    folder = _folder(state_dir, target_trade_date, source_environment, include_history)
     existing = load_frozen_us_index_inputs(
         target_trade_date=target_trade_date, source_environment=source_environment,
         state_dir=state_dir, session_factory=session_factory,
+        include_history=include_history,
     )
     if existing is not None:
         return existing
@@ -159,13 +177,14 @@ def freeze_us_index_inputs(
         existing = load_frozen_us_index_inputs(
             target_trade_date=target_trade_date, source_environment=source_environment,
             state_dir=state_dir, session_factory=session_factory,
+            include_history=include_history,
         )
         if existing is not None:
             return existing
         if not as_of <= _utc(clock(), 'clock') < cutoff:
             return None
         if (folder / 'input.json').exists():
-            data, snapshots = _selection(folder, target_trade_date, source_environment, session_factory)
+            data, snapshots = _selection(folder, target_trade_date, source_environment, session_factory, include_history)
             selected_at = _timestamp(data['selected_at'])
         else:
             ids = _snapshot_ids(snapshot_ids)
@@ -176,12 +195,15 @@ def freeze_us_index_inputs(
             selected_at = _utc(clock(), 'clock')
             if not as_of <= selected_at < cutoff:
                 return None
-            _validate_snapshots(snapshots, as_of, selected_at, source_environment)
+            _validate_snapshots(snapshots, as_of, selected_at, source_environment, include_history=include_history)
             data = {
-                'schema_version': 'us_index_input_v1', 'target_trade_date': target_trade_date.isoformat(),
+                'schema_version': 'us_index_history_input_v1' if include_history else 'us_index_input_v1',
+                'target_trade_date': target_trade_date.isoformat(),
                 'source_environment': source_environment, 'as_of': as_of.isoformat(),
                 'cutoff_at': cutoff.isoformat(), 'selected_at': selected_at.isoformat(), 'snapshot_ids': ids,
             }
+            if include_history:
+                data['input_kind'] = 'history_22'
             data['manifest_id'] = canonical_json_sha256(data)
         if snapshots[0].prices.session != session:
             raise ValueError('US index selection calendar window mismatch')
@@ -200,4 +222,5 @@ def freeze_us_index_inputs(
         return load_frozen_us_index_inputs(
             target_trade_date=target_trade_date, source_environment=source_environment,
             state_dir=state_dir, session_factory=session_factory,
+            include_history=include_history,
         )

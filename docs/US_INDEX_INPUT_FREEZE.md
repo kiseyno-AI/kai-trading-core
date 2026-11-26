@@ -8,6 +8,11 @@ deployment or live KIS call. The existing baseline, daily runner and Exec are
 unchanged. The separate [stage 8 feature calculator](US_INDEX_FEATURES.md) now
 consumes explicit sealed inputs; decision strategy remains future work.
 
+Opt-in `--include-history` uses `frozen-history/<real|mock>-YYYY-MM-DD/` with
+`us_index_history_input_v1`, `input_kind: history_22` and all three synchronized
+22-close captures. The seal and two-phase cutoff rules below are shared; existing
+`frozen/` files remain unchanged and are never enriched. See [history mode](US_INDEX_HISTORY.md).
+
 ## Selection and cutoff
 
 A new freeze requires **07:00 <= current time < 07:12 Asia/Seoul** on the KRX
@@ -115,4 +120,5 @@ with repeated `--history-date` arguments. The calculator does not discover
 history or fetch replacement snapshots. A seal's two closes support current
 returns; acceleration and normalization require explicit contiguous prior inputs.
 KRX closures or special-hours no-ops may leave missing seals; do not backdate new
-ones to fill history. See [feature inputs and limits](US_INDEX_FEATURES.md).
+ones to fill history. Pass `--include-history` to the preopen and feature commands
+to seal/replay the current full-history namespace instead. See [feature inputs and limits](US_INDEX_FEATURES.md).

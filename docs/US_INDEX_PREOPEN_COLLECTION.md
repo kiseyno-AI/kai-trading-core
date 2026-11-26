@@ -24,6 +24,12 @@ pagination or fallback loop is introduced. Ordinary successful collection needs
 only three fetches. The default asynchronous collection budget is 90 seconds per
 tick, bounded by the remaining time to 07:12; a programmatic caller may lower it.
 
+Opt-in `--include-history` widens each existing request to 22 exact US-session
+closes and freezes complete histories separately. Both modes share the same
+date/environment checkpoint, spent slots and nine-fetch maximum; switching modes
+adds no attempt budget. Recovery requires full history in history mode. Default
+collection is unchanged. See [history commands and limits](US_INDEX_HISTORY.md).
+
 The clock/window are checked after database reads, before each index, before
 authentication and in the guarded quote client's async HTTPX request hook after
 request preparation, immediately before network dispatch. Default/order clients
@@ -124,7 +130,8 @@ attestation or an executable signal. The separate, read-only
 collection CLI does not invoke it or schedule the proposed 07:15 evaluation.
 KRX closure and special-hours no-ops can leave gaps in the 20-return US-history
 baseline; they are not zero-return events and historical seals must not be
-backdated. Rule validation, decision strategy publication, full-history capture
+backdated. Opt-in [full-history capture](US_INDEX_HISTORY.md) can cover those gaps
+from the current US-session range. Rule validation, decision strategy publication
 and deployment enablement remain separate steps.
 The baseline, daily runner and Exec remain unchanged. This change does not install
 or enable the job itself.

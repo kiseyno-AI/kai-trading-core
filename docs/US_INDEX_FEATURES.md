@@ -7,6 +7,12 @@ automatic history discovery. The separate CLI reads explicit sealed dates; the
 preopen collector does not invoke it. A proposed 07:15 evaluation remains future
 work, alongside strategy validation and any signal, score or order integration.
 
+Stage 9 adds opt-in `--include-history`: the current `history_22` seal supplies
+20 lagged pairs directly, producing `us_index_features_v2` with
+`history_source: current_snapshot_history` and an ID binding that full history.
+It never synthesizes older freeze records. Defaults and the explicit older-seal
+version-1 path below remain unchanged. See [full-history inputs](US_INDEX_HISTORY.md).
+
 ## Inputs and replay
 
 Callers must supply verified `USIndexInputFreezeRecord` objects. The calculator
@@ -77,7 +83,9 @@ With complete constant history, `history_unavailable_reason` is `null`, `s` is
 KRX closures and special-hours no-ops can leave missing US-history seals. Startup
 and holiday gaps therefore need not provide normalization. Never invent zero
 returns, backdate seals or silently replace a missing session with an older one.
-A separate full-history capture contract remains future work.
+The opt-in [full-history capture](US_INDEX_HISTORY.md) can cover those gaps from
+the current 22-close range without backdating seals; missing provider dates still
+remain unavailable.
 
 ## Read-only CLI
 
@@ -87,6 +95,8 @@ From `apps/api`, with the existing Core database configuration:
 python -m app.internal.us_index_features --target-trade-date 2026-11-25 --state-dir var/us-index-preopen --source-environment real
 # Optional history: repeat --history-date, oldest first, at most 20 dates.
 python -m app.internal.us_index_features --target-trade-date 2026-11-25 --history-date 2026-11-24
+# Opt-in replay of the current full-history seal; cannot combine with --history-date.
+python -m app.internal.us_index_features --include-history --target-trade-date 2026-11-25 --state-dir var/us-index-preopen
 ```
 
 Environment defaults to `real`; `mock` is supported. No current seal gives

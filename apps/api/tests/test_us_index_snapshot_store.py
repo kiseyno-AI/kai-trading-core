@@ -25,6 +25,7 @@ from app.market.us_index_snapshot_store import load_us_index_captures, load_us_i
 from app.market import us_index_snapshot_store as snapshot_store_module
 from app.market.us_index_input_freeze import freeze_us_index_inputs, load_frozen_us_index_inputs
 from app.market.us_index_features import calculate_us_index_features
+from app.market.us_session import latest_completed_us_session, prior_completed_us_sessions
 from app.db import engine as core_test_engine
 from app.db_models import USIndexInputSnapshot
 
@@ -364,25 +365,39 @@ def test_postgresql_round_trip_preserves_hash_and_decimal_text(postgres_database
     ) == {'SPX': saved}
 
 
-def test_postgresql_input_freeze_replays_the_exact_committed_rows(postgres_database, tmp_path) -> None:
+@pytest.mark.parametrize('include_history', [False, True])
+def test_postgresql_input_freeze_replays_the_exact_committed_rows(postgres_database, tmp_path, include_history) -> None:
     as_of = datetime(2026, 11, 24, 22, tzinfo=UTC)
+    rows = [
+        {'stck_bsop_date': '20261124', 'ovrs_nmix_prpr': '7100.123456789012345678'},
+        {'stck_bsop_date': '20261123', 'ovrs_nmix_prpr': '7000'},
+    ]
+    options = {'include_history': True} if include_history else {}
+    if include_history:
+        current_session = latest_completed_us_session(as_of=as_of)
+        required = {day for window in (*prior_completed_us_sessions(current_session), current_session)
+                    for day in (window.session_date, window.previous_session_date)}
+        rows = [
+            {'stck_bsop_date': day.strftime('%Y%m%d'),
+             'ovrs_nmix_prpr': '7100.123456789012345678' if day == current_session.session_date else '7000'}
+            for day in sorted(required, reverse=True)
+        ]
     captures = {
         code: save_us_index_snapshot(
-            {'rt_cd': '0', 'output1': {'stck_shrn_iscd': code}, 'output2': [
-                {'stck_bsop_date': '20261124', 'ovrs_nmix_prpr': '7100.123456789012345678'},
-                {'stck_bsop_date': '20261123', 'ovrs_nmix_prpr': '7000'},
-            ]},
+            {'rt_cd': '0', 'output1': {'stck_shrn_iscd': code}, 'output2': rows},
             index_code=code, as_of=as_of, collected_at=as_of + timedelta(minutes=1),
-            source_environment='real', session_factory=postgres_database,
+            source_environment='real', session_factory=postgres_database, **options,
         ) for code in ('SPX', 'COMP', 'SOX')
     }
     frozen = freeze_us_index_inputs(
         target_trade_date=date(2026, 11, 25),
         snapshot_ids={code: row.snapshot_id for code, row in captures.items()},
         state_dir=tmp_path, session_factory=postgres_database, clock=lambda: as_of + timedelta(minutes=10),
+        **options,
     )
     replayed = load_frozen_us_index_inputs(
         target_trade_date=date(2026, 11, 25), state_dir=tmp_path, session_factory=postgres_database,
+        **options,
     )
     assert replayed == frozen
     assert replayed.snapshots == tuple(captures.values())
@@ -390,6 +405,8 @@ def test_postgresql_input_freeze_replays_the_exact_committed_rows(postgres_datab
     features = calculate_us_index_features(replayed)
     assert features['input_manifest_id'] == frozen.manifest_id
     assert float(features['indices']['SPX']['return_pct']) == pytest.approx(1.4303350969858906)
+    assert features['history_count'] == (20 if include_history else 0)
+    assert len(replayed.snapshots[0].history_prices) == (20 if include_history else 0)
 
 
 @pytest.mark.parametrize('statement', [

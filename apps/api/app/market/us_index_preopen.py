@@ -57,6 +57,7 @@ def resolve_us_index_preopen_session(target_trade_date: date) -> tuple[Completed
 
 async def _collect_pending(
     *, codes, as_of, deadline, client, session_factory, clock, budget_seconds,
+    include_history: bool = False,
 ) -> dict[str, Any]:
     started = monotonic()
     indices = []
@@ -74,6 +75,7 @@ async def _collect_pending(
             single = await asyncio.wait_for(collect_us_index_inputs(
                 as_of=as_of, index_codes=(code,), client=client,
                 session_factory=session_factory, clock=lambda: _read_clock(clock), deadline=deadline,
+                **({'include_history': True} if include_history else {}),
             ), timeout=remaining)
         except TimeoutError:
             indices.append({
@@ -93,6 +95,7 @@ def run_us_index_preopen(
     *, state_dir: str | Path = 'var/us-index-preopen', client: KISClient | None = None,
     session_factory=session_scope, clock: Callable[[], datetime] = _utc_now,
     budget_seconds: float = MAX_COLLECTION_SECONDS,
+    include_history: bool = False,
 ) -> dict[str, Any]:
     """Collect optional preopen inputs in a standalone process."""
     budget_seconds = finite_float(budget_seconds)
@@ -132,6 +135,7 @@ def run_us_index_preopen(
         captures = load_us_index_captures(
             as_of=as_of, collected_by=now, session=session,
             source_environment=environment, session_factory=session_factory,
+            **({'include_history': True} if include_history else {}),
         )
         now = _read_clock(clock).astimezone(KST)
         if not as_of <= now < deadline:
@@ -142,6 +146,7 @@ def run_us_index_preopen(
             return {
                 'status': 'completed', 'data_complete': True, 'target_trade_date': target_date,
                 'snapshot_ids': snapshot_ids, 'source_environment': environment,
+                **({'input_kind': 'history_22'} if include_history else {}),
             }
         slot = max(slot for slot in COLLECTION_SLOTS if slot <= now.time()).strftime('%H:%M')
         if slot in state['attempts']:
@@ -150,11 +155,14 @@ def run_us_index_preopen(
                 'slot': slot, 'data_complete': False, 'snapshot_ids': snapshot_ids,
             }
         state['attempts'][slot] = {'started_at': now.isoformat(), 'index_codes': pending}
+        if include_history:
+            state['attempts'][slot]['input_kind'] = 'history_22'
         write_checkpoint(path, state)
         try:
             result = asyncio.run(_collect_pending(
                 codes=pending, as_of=as_of, deadline=deadline, client=client,
                 session_factory=session_factory, clock=clock, budget_seconds=budget_seconds,
+                **({'include_history': True} if include_history else {}),
             ))
         except Exception as exc:
             result = {'status': 'failed', 'stage': 'collect', 'error_type': type(exc).__name__, 'indices': []}
@@ -176,5 +184,6 @@ def run_us_index_preopen(
         'data_complete': len(snapshot_ids) == len(SUPPORTED_US_INDEX_CODES) and result['status'] != 'expired',
         'target_trade_date': target_date, 'slot': slot, 'snapshot_ids': snapshot_ids,
         'source_environment': environment,
+        **({'input_kind': 'history_22'} if include_history else {}),
         **({'reason': result['reason']} if 'reason' in result else {}),
     }

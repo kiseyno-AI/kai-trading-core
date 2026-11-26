@@ -299,6 +299,15 @@ default behavior. Programmatic collectors may pass an aware `deadline` after
 `as_of` to reject new requests or responses at/after that boundary.
 See [schedule, recovery, budgets and launchd installation](US_INDEX_PREOPEN_COLLECTION.md).
 
+## Opt-in full US-index history: ninth integration slice
+
+`include_history=True` / `--include-history` on the existing collection, preopen
+and feature paths adds 22 exact completed US-session closes. It widens the same
+single request, shares preopen claims and cutoff, stores schema-2 snapshots and
+uses a separate history seal. All two-close defaults remain unchanged. Missing
+required dates remain unavailable; the official samples do not guarantee one-page
+completeness. See [commands, official sources and rollback](US_INDEX_HISTORY.md).
+
 ## Notes
 - Do not commit real secrets
 - The token route returns presence, cache, expiry, type, and safe defer metadata only. It never returns the raw KIS access token and is disabled when `UPSTREAM_BEARER_TOKEN` is unset.

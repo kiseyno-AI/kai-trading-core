@@ -1,12 +1,13 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.numbers import finite_float
-from app.market.us_session import CompletedUSSession
+from app.market.us_session import CompletedUSSession, US_INDEX_HISTORY_RETURNS, prior_completed_us_sessions
 
 
 SUPPORTED_US_INDEX_CODES = ('SPX', 'COMP', 'SOX')
@@ -77,3 +78,61 @@ def validate_kis_us_index_prices(
         price=prices[dates[0]],
         previous_price=prices[dates[1]],
     )
+
+
+def validate_kis_us_index_history(
+    payload: Mapping[str, Any], *, index_code: str, session: CompletedUSSession,
+) -> tuple[USIndexSessionPrices, ...]:
+    """Require 22 dated closes for the current pair and 20 prior return windows."""
+    pairs = []
+    unavailable = None
+    for window in (*prior_completed_us_sessions(session), session):
+        try:
+            pairs.append(validate_kis_us_index_prices(payload, index_code=index_code, session=window))
+        except USIndexPricesUnavailable as error:
+            # Missing closes must not hide malformed evidence in another required pair.
+            unavailable = error
+    if unavailable is not None:
+        raise unavailable
+    return tuple(pairs[:-1])
+
+
+def validate_us_index_price_history(
+    current: USIndexSessionPrices, history: Sequence[USIndexSessionPrices],
+) -> None:
+    """Validate frozen history without consulting a calendar, provider or database."""
+    if len(history) != US_INDEX_HISTORY_RETURNS:
+        raise ValueError('US index history requires exactly 20 prior return windows')
+    if not isinstance(current, USIndexSessionPrices) or current.index_code not in SUPPORTED_US_INDEX_CODES:
+        raise ValueError('US index history requires a supported current index')
+    pairs = (*history, current)
+    for prices in pairs:
+        if not isinstance(prices, USIndexSessionPrices) or prices.index_code != current.index_code:
+            raise ValueError('US index history must contain the same index')
+        for value in (prices.price, prices.previous_price):
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise ValueError('US index history requires positive finite Decimal closes')
+        window = prices.session
+        if (
+            not isinstance(window, CompletedUSSession)
+            or type(window.session_date) is not date or type(window.previous_session_date) is not date
+        ):
+            raise ValueError('US index history requires dated frozen session windows')
+        for close_at in (window.previous_close_at, window.close_at):
+            if not isinstance(close_at, datetime) or close_at.utcoffset() is None:
+                raise ValueError('US index history requires timezone-aware frozen closes')
+        if (
+            window.previous_session_date >= window.session_date
+            or window.previous_close_at >= window.close_at
+            or window.close_at.astimezone(ZoneInfo('America/New_York')).date() != window.session_date
+            or window.previous_close_at.astimezone(ZoneInfo('America/New_York')).date() != window.previous_session_date
+        ):
+            raise ValueError('US index history session window mismatch')
+    for older, newer in zip(pairs, pairs[1:]):
+        if (
+            older.session.session_date != newer.session.previous_session_date
+            or older.session.close_at != newer.session.previous_close_at
+        ):
+            raise ValueError('US index history requires consecutive frozen session windows')
+        if older.price != newer.previous_price:
+            raise ValueError('US index historical price continuity mismatch')
