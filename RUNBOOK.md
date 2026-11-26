@@ -83,9 +83,29 @@ input evidence only; strategy validation and activation remain separate work.
 
 From `apps/api`, run `python -m app.internal.us_index_features --target-trade-date 2026-11-25 --state-dir var/us-index-preopen` to calculate descriptive metrics from that date's verified seal. Supply optional `--history-date` arguments oldest first, at most 20; no history is discovered automatically. Missing current or explicitly requested history seals are normal unavailable results (exit 0); technical failures exit 1 with a safe `error_type`, and malformed arguments exit 2.
 
-Two-close inputs provide returns and spreads; acceleration needs three closes and the 20-return lagged baseline needs 22. Missing sessions stop the baseline, including gaps caused by KRX closure or special-hours collection no-ops. Preserve unavailable values; never backdate seals or manufacture zero returns. The command does not collect, schedule evaluation or publish signals. See [feature formulas, output and limits](docs/US_INDEX_FEATURES.md); proposed 07:15 evaluation remains future work.
+Two-close inputs provide returns and spreads; acceleration needs three closes and the 20-return lagged baseline needs 22. Missing sessions stop the baseline, including gaps caused by KRX closure or special-hours collection no-ops. Preserve unavailable values; never backdate seals or manufacture zero returns. The command does not collect, schedule evaluation or publish signals. See [feature formulas, output and limits](docs/US_INDEX_FEATURES.md); the separate observation runner below owns optional 07:15 evaluation.
 
 For opt-in full history, add `--include-history` to the manual or preopen collection command and to the read-only feature command. The modes share preopen claims and the nine-fetch budget; preserve the same state directory. History freezes use `frozen-history/`, leaving existing seals unchanged. The feature flag reads that namespace and cannot combine with `--history-date`. See [explicit commands, cutoff and rollback](docs/US_INDEX_HISTORY.md).
+
+## Independent US-rebound observations
+
+US rebound is disabled by default. Deploy a reviewed remote revision and apply
+additive snapshot migration `20261124_0091` before registering the new job. Set
+`US_REBOUND_MODE=observe`, explicit `US_REBOUND_ENABLED_FROM=2026-11-27` and a
+persistent `US_REBOUND_STATE_DIR` in `apps/api/.env`. Preview with
+`bash scripts/install_us_rebound_launchd.sh --print`; install without `--print`.
+The independent job polls 06:45–15:30 KST, collects full history in the existing
+07:00/07:05/07:10 slots before 07:12, and evaluates from 07:15 until before 08:40.
+It enables the new job, then persistently disables the optional legacy preopen
+job only after successful registration, preserving its plist and all state.
+
+`GET /strategies/us-rebound/status?target_trade_date=2026-11-27` reads evidence
+without provider/order calls; normal calendar gaps are `NO_SIGNAL` and missing
+input expires as `UNAVAILABLE`. This is observation only: no paper/live order
+connection, calibrated thresholds or execution authority. It does not block the
+existing agents or daily pipeline. See [configuration, Thanksgiving calendar,
+evidence recovery and rollback](docs/US_REBOUND_OPERATION.md); preserve baseline
+Core/Exec/daily services and all checkpoints, seals and evaluations.
 
 ## Health checks
 

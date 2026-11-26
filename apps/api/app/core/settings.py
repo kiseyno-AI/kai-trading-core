@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     api_log_rotation_backup_count: int = 10
     startup_maintenance_enabled: bool = True
     background_runner_enabled: bool = True
+    # Parse optional strategy configuration in its job, so bad values cannot stop Core startup.
+    us_rebound_mode: str = 'disabled'
+    us_rebound_enabled_from: Optional[str] = None
+    us_rebound_state_dir: str = 'var/us-index-preopen'
     # Hourly read-only check that the latest trading day's derived tables cover the
     # price-bar universe (see app/internal/daily_coverage_audit.py). It only logs and
     # reports through the runner snapshot; it never changes pipeline behavior.
