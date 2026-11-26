@@ -21,10 +21,12 @@ def main(argv: Sequence[str] | None = None, *, collector=collect_us_index_inputs
         '--as-of', type=datetime.fromisoformat,
         help='ISO timestamp with timezone offset fixing the session window (default: now in UTC).',
     )
+    parser.add_argument('--include-history', action='store_true', help='Require 22 current-window session closes.')
     args = parser.parse_args(argv)
     try:
         result = asyncio.run(collector(
             as_of=args.as_of or datetime.now(UTC), index_codes=tuple(args.indices.split(',')),
+            **({'include_history': True} if args.include_history else {}),
         ))
     except ValueError as exc:
         parser.error(str(exc))

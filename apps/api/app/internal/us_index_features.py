@@ -16,9 +16,12 @@ def main(argv: Sequence[str] | None = None, *, loader=load_frozen_us_index_input
     parser.add_argument('--history-date', action='append', default=[], type=date.fromisoformat)
     parser.add_argument('--source-environment', choices=('real', 'mock'), default='real')
     parser.add_argument('--state-dir', default='var/us-index-preopen')
+    parser.add_argument('--include-history', action='store_true', help='Read the current 22-close history seal.')
     args = parser.parse_args(argv)
     if len(args.history_date) > REFERENCE_WINDOW:
         parser.error('At most 20 explicit historical dates are supported')
+    if args.include_history and args.history_date:
+        parser.error('--include-history cannot be combined with --history-date')
     try:
         chronology = [*args.history_date, args.target_trade_date]
         if any(older >= newer for older, newer in zip(chronology, chronology[1:])):
@@ -27,6 +30,7 @@ def main(argv: Sequence[str] | None = None, *, loader=load_frozen_us_index_input
         for day in [args.target_trade_date, *args.history_date]:
             record = loader(
                 target_trade_date=day, source_environment=args.source_environment, state_dir=args.state_dir,
+                **({'include_history': True} if args.include_history else {}),
             )
             if record is None:
                 result = {

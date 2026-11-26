@@ -41,6 +41,7 @@ The importer verifies existing amounts and refuses a conflicting date instead of
 ## US index snapshot rollback
 
 Before downgrading migration `20261124_0091`, export and retain `us_index_input_snapshots`; downgrade drops that table and its immutable capture history.
+After writing history snapshot schema `2`, retain compatible readers; never rewrite or delete immutable captures to downgrade. See [history rollback](docs/US_INDEX_HISTORY.md#rollback).
 
 ## Manual US index input collection
 
@@ -82,7 +83,9 @@ input evidence only; strategy validation and activation remain separate work.
 
 From `apps/api`, run `python -m app.internal.us_index_features --target-trade-date 2026-11-25 --state-dir var/us-index-preopen` to calculate descriptive metrics from that date's verified seal. Supply optional `--history-date` arguments oldest first, at most 20; no history is discovered automatically. Missing current or explicitly requested history seals are normal unavailable results (exit 0); technical failures exit 1 with a safe `error_type`, and malformed arguments exit 2.
 
-Two-close inputs provide returns and spreads; acceleration needs three closes and the 20-return lagged baseline needs 22. Missing sessions stop the baseline, including gaps caused by KRX closure or special-hours collection no-ops. Preserve unavailable values; never backdate seals or manufacture zero returns. The command does not collect, schedule evaluation or publish signals. See [feature formulas, output and limits](docs/US_INDEX_FEATURES.md); proposed 07:15 evaluation and a full-history capture contract remain future work.
+Two-close inputs provide returns and spreads; acceleration needs three closes and the 20-return lagged baseline needs 22. Missing sessions stop the baseline, including gaps caused by KRX closure or special-hours collection no-ops. Preserve unavailable values; never backdate seals or manufacture zero returns. The command does not collect, schedule evaluation or publish signals. See [feature formulas, output and limits](docs/US_INDEX_FEATURES.md); proposed 07:15 evaluation remains future work.
+
+For opt-in full history, add `--include-history` to the manual or preopen collection command and to the read-only feature command. The modes share preopen claims and the nine-fetch budget; preserve the same state directory. History freezes use `frozen-history/`, leaving existing seals unchanged. The feature flag reads that namespace and cannot combine with `--history-date`. See [explicit commands, cutoff and rollback](docs/US_INDEX_HISTORY.md).
 
 ## Health checks
 
