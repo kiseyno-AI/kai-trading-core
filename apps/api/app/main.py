@@ -29,6 +29,7 @@ from app.api.routes_portfolio import router as portfolio_router
 from app.api.routes_trading_accounts import router as trading_accounts_router
 from app.api.routes_trading import router as trading_router
 from app.api.routes_us_equities import router as us_equities_router
+from app.api.routes_us_rebound import router as us_rebound_router
 from app.agent_context.run_state_service import (
     agent_context_feedback_run_state_service,
 )
@@ -250,6 +251,7 @@ app.include_router(external_news_router)
 app.include_router(agent_context_router)
 app.include_router(crypto_router)
 app.include_router(us_equities_router)
+app.include_router(us_rebound_router)
 
 
 @app.get('/health')

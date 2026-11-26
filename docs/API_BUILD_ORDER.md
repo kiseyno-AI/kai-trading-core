@@ -45,9 +45,11 @@
 42. Core-owned realtime monitored price fan-out read/stream APIs
 43. Read-only Upbit crypto market-data routes for paper/research strategy inputs
 44. BTC/ETH Upbit crypto strategy context read route for paper/research decision support
+45. Read-only independent US-rebound observation status route
 
 ## Current routes
 - `GET /health` (application and database liveness; also subject to bearer auth when `UPSTREAM_BEARER_TOKEN` is set)
+- `GET /strategies/us-rebound/status?target_trade_date=YYYY-MM-DD` (persisted observation evidence; date defaults to today KST)
 - `POST /broker/kis/token` (operator Bearer auth required; sanitized token metadata only)
 - `GET /broker/kis/health`
 - `GET /broker/kis/quote?symbol=005930&market_code=J`
@@ -820,6 +822,19 @@ agent-sized plans remain compatible. See [quantity planning](CORE_QUANTITY_SIZIN
 - Curated DART ownership or dividend read slices built on top of the current disclosure backbone
 - KIS balance inquiry
 - KIS account positions
+
+## US-rebound observation status
+
+`GET /strategies/us-rebound/status` reads real-environment persisted evidence from
+`US_REBOUND_STATE_DIR`; it does not collect, call providers or submit orders.
+Global bearer authentication is unchanged. The response includes liveness
+`status`, optional immutable `evaluation`, `last_tick`, `mode`, `enabled_from`,
+`server_time` and `schedule_kst`. It always reports
+`order_execution_enabled=false` and `execution_connection=not_connected`, with no
+account or quantity fields. Invalid dates return 422; corrupt/unreadable evidence
+returns safe 503 `us_rebound_status_unavailable`. Exploratory `WATCH` conveys no
+order authority. See the [endpoint payload](../.codex/skills/fastapi-trading-api/references/api/us-rebound-status.md)
+and [operation and rollback](US_REBOUND_OPERATION.md).
 
 ## US equity universe notes
 - `POST /us-equities/universe/refresh` builds the US execution universe from three official sources: Nasdaq Trader `nasdaqlisted.txt` and `otherlisted.txt`, the public KIS overseas master archives for NASDAQ/NYSE/NYSE American, and the SEC ticker/CIK/exchange mapping.
