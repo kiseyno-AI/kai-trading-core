@@ -1347,7 +1347,9 @@ class KISRealtimePriceService:
         previous_confirmation = ''
         while not self._stop_requested:
             local_now = _utc_now().astimezone(KST)
-            symbols = sorted(wait_price_observations.symbols(local_now.date()))
+            wait_symbols = wait_price_observations.symbols(local_now.date())
+            with self._state_lock:
+                symbols = sorted(set(wait_symbols) | self._desired_symbols)
             if (
                 not symbols or not self._recorded_market_session_is_active()
                 or not datetime_time(9) <= local_now.time() < datetime_time(15, 30)
@@ -1390,7 +1392,7 @@ class KISRealtimePriceService:
                 self._wait_orderbook_sampled_symbols = sampled
                 self._wait_orderbook_first_sample_at = first_sample_at
                 self._health['wait_orderbook_observation'] = {
-                    'requested_count': len(symbols), 'sampled_count': len(sampled),
+                    'requested_count': len(wait_symbols), 'sampled_count': len(sampled),
                     'failed_batches': failures, 'last_sample_at': _isoformat(_utc_now()),
                 }
             await asyncio.sleep(2 if self.client._environment() == 'demo' else 1)
@@ -1402,6 +1404,7 @@ class KISRealtimePriceService:
 
         sampled: set[str] = set()
         confirmation_candidates: set[str] = set()
+        wait_symbols = set(wait_price_observations.symbols(received_at.astimezone(KST).date()))
         for row in rows:
             symbol = _normalize_symbol(row.get('inter_shrn_iscd'))
             if symbol is None or symbol not in batch:
@@ -1428,6 +1431,9 @@ class KISRealtimePriceService:
                         'ask_price': _to_json_number(ask) if valid_book else None,
                     }
 
+            # Non-WAIT monitoring samples provide display prices, never passive execution evidence.
+            if symbol not in wait_symbols:
+                continue
             size_text = _normalize_text(row.get('seln_rsqn'))
             if (
                 ask is None or bid is None or not 0 < bid <= ask
