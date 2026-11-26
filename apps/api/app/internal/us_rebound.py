@@ -1,4 +1,4 @@
-"""Advance one independent US-rebound observation tick."""
+"""Advance one independently configured US-rebound tick."""
 
 import argparse
 from collections.abc import Sequence
@@ -19,11 +19,15 @@ def main(argv: Sequence[str] | None = None, *, runner=run_us_rebound_tick) -> in
             date.fromisoformat(settings.us_rebound_enabled_from)
             if settings.us_rebound_mode != 'disabled' and settings.us_rebound_enabled_from else None
         )
-        result = runner(mode=settings.us_rebound_mode, enabled_from=enabled_from, state_dir=args.state_dir)
+        options = {}
+        if settings.us_rebound_mode in ('paper', 'live'):
+            from app.overnight_rebound.operation import RuleOperationConfig
+            options['execution_config'] = RuleOperationConfig.from_settings(settings)
+        result = runner(mode=settings.us_rebound_mode, enabled_from=enabled_from, state_dir=args.state_dir, **options)
     except Exception as exc:
         result = {'status': 'failed', 'stage': 'us_rebound', 'error_type': type(exc).__name__}
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + '\n')
-    return 1 if result['status'] == 'failed' else 0
+    return 1 if result['status'] == 'failed' or (result.get('execution') or {}).get('status') == 'failed' else 0
 
 
 if __name__ == '__main__':

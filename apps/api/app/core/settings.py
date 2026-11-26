@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     us_rebound_mode: str = 'disabled'
     us_rebound_enabled_from: Optional[str] = None
     us_rebound_state_dir: str = 'var/us-index-preopen'
+    us_rebound_execution_enabled: str | bool = False
+    us_rebound_execution_account_reference: Optional[str] = None
+    us_rebound_execution_policy_file: Optional[str] = None
+    us_rebound_execution_destination_base_url: Optional[str] = None
+    us_rebound_execution_bearer_token: Optional[str] = None
+    us_rebound_execution_authority_id: Optional[str] = None
+    us_rebound_execution_authority_until: Optional[str] = None
     # Hourly read-only check that the latest trading day's derived tables cover the
     # price-bar universe (see app/internal/daily_coverage_audit.py). It only logs and
     # reports through the runner snapshot; it never changes pipeline behavior.
@@ -419,7 +426,7 @@ class Settings(BaseSettings):
         le=40,
     )
 
-    @field_validator('upstream_bearer_token', 'signal_decider_exec_bearer_token', mode='before')
+    @field_validator('upstream_bearer_token', 'signal_decider_exec_bearer_token', 'us_rebound_execution_bearer_token', mode='before')
     @classmethod
     def normalize_optional_bearer_token(cls, value):
         if value is None:

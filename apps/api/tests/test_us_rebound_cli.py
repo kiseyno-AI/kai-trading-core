@@ -33,3 +33,18 @@ def test_bad_optional_strategy_configuration_does_not_prevent_core_settings_load
     monkeypatch.setattr(settings, 'us_rebound_enabled_from', configured.us_rebound_enabled_from)
     assert main([], runner=lambda **kwargs: (_ for _ in ()).throw(AssertionError())) == 1
     assert json.loads(capsys.readouterr().out)['error_type'] == 'ValueError'
+
+
+def test_execution_configuration_is_separate_and_optional_values_do_not_break_core_startup(monkeypatch, capsys):
+    configured = Settings(us_rebound_mode='paper', us_rebound_enabled_from='2026-11-30',
+                          us_rebound_execution_enabled='not-a-boolean', us_rebound_execution_authority_until='not-a-date')
+    monkeypatch.setattr(settings, 'us_rebound_mode', configured.us_rebound_mode)
+    monkeypatch.setattr(settings, 'us_rebound_enabled_from', configured.us_rebound_enabled_from)
+    monkeypatch.setattr(settings, 'us_rebound_execution_enabled', configured.us_rebound_execution_enabled)
+    seen = []
+    def runner(**kwargs):
+        seen.append(kwargs)
+        return {'status': 'completed', 'execution': {'status': 'failed'}}
+    assert main([], runner=runner) == 1
+    assert seen[0]['execution_config'].enabled == 'not-a-boolean'
+    assert json.loads(capsys.readouterr().out)['execution']['status'] == 'failed'

@@ -14,6 +14,20 @@ order authority. Configuration and schedule fields do not establish that the
 optional launchd job is installed or currently running; inspect `last_tick`.
 No account or quantity fields are returned.
 
+Optional `execution` reads only the current session's persisted safe operation
+projection. It includes status/reasons and per-symbol status with an actual
+`last_confirmed_at` when available; it excludes policy paths, tokens, prices,
+account-derived claim IDs and private evidence. `order_execution_enabled` is true
+only for today's KST target when current paper mode and true execution opt-in match persisted
+confirmed active watch authority. It is not a fresh broker check; market and
+Exec pause/kill gates still apply.
+`execution_connection=rule_v4` requires persisted registration/activation proof;
+otherwise it remains `not_connected`. Observation never performs execution HTTP.
+Configuration failures update `execution.status`/`reason` while retaining valid
+current-session items, their persisted mode and unchanged `last_confirmed_at`.
+Known active items can therefore coexist with a failed job status. Corrupt or
+mis-scoped previous state returns 503 rather than losing its evidence.
+
 ## Example request
 
 ```http
@@ -33,6 +47,7 @@ Example before a persisted tick, with observation configured:
   "status": "not_started",
   "evaluation": null,
   "last_tick": null,
+  "execution": null,
   "server_time": "2026-11-27T06:45:00+09:00",
   "mode": "observe",
   "enabled_from": "2026-11-27",
@@ -41,6 +56,7 @@ Example before a persisted tick, with observation configured:
   "schedule_kst": {
     "collection": ["07:00", "07:05", "07:10"],
     "evaluation": "07:15",
+    "execution_evidence": ["08:20", "08:30"],
     "deadline": "08:40"
   }
 }
