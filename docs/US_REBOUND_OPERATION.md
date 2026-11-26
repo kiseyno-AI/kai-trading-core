@@ -213,6 +213,7 @@ invalid handoff configuration preserves the last validated current-session
 registration/activation items and their timestamps. A failed tick reports its
 own status/reason alongside those facts; it does not imply that Exec stopped
 an accepted family. Corrupt or mis-scoped previous status is not replaced or trusted.
+Public status updates use a nonblocking file lock; contention defers the projection while private acknowledgements remain durable.
 Disabling new Core handoffs does not revoke an already accepted Exec family or its
 protection; preserve its state and use the reviewed Exec controls when needed.
 

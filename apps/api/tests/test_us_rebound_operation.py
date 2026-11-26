@@ -556,3 +556,120 @@ def test_configuration_failure_does_not_import_another_sessions_execution_facts(
     assert result['items'] == []
     assert path.read_bytes() == previous
 
+
+def test_interleaved_failure_cannot_regress_a_published_activation_ack(tmp_path, monkeypatch):
+    import threading
+    import app.overnight_rebound.operation as operation
+
+    config, remote = configuration(tmp_path), WireExec()
+    remote.lose_activation = True
+    async def tick(now, factory=forbidden, loader=forbidden):
+        async with httpx.AsyncClient(base_url=config.destination_base_url, headers={'Authorization': 'Bearer synthetic-exec-token'},
+                                     transport=httpx.MockTransport(remote)) as client:
+            return await run_us_rebound_operation(mode='paper', config=config, evaluation=current_evaluation(),
+                state_dir=tmp_path, clock=lambda: now, seal_loader=loader,
+                adapter_factory=factory, client=client, account_target_reader=target_reader)
+    assert asyncio.run(tick(NOW, Evidence, seal_loader))['status'] == 'pending'
+    public_path = tmp_path / 'rebound/real-2026-11-30/execution-status.json'
+    original_load, original_write = operation.load_us_rebound_execution_status, operation._write
+    published, nested, errors = [], [], []
+    entered = False
+    later = NOW.replace(minute=21)
+
+    def write(path, value):
+        if path == public_path:
+            published.append(value)
+        original_write(path, value)
+
+    def load(**kwargs):
+        nonlocal entered
+        previous = original_load(**kwargs)
+        if not entered:
+            entered = True
+            def reconcile():
+                try:
+                    nested.append(asyncio.run(tick(later)))
+                except Exception as exc:
+                    errors.append(exc)
+            thread = threading.Thread(target=reconcile, daemon=True)
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), 'Nested reconciliation must not wait for the public lock'
+            assert not errors
+        return previous
+
+    monkeypatch.setattr(operation, '_write', write)
+    monkeypatch.setattr(operation, 'load_us_rebound_execution_status', load)
+    asyncio.run(run_us_rebound_operation(mode='paper', config=RuleOperationConfig(enabled=True),
+        evaluation=current_evaluation(), state_dir=tmp_path, clock=lambda: NOW,
+        seal_loader=forbidden, adapter_factory=forbidden))
+    assert nested[0]['status'] == 'active'
+    assert nested[0]['items'][0]['last_confirmed_at'] == later.isoformat()
+    saw_active = False
+    for value in published:
+        active = next((item for item in value['items'] if item['symbol'] == '069500' and item['status'] == 'active'), None)
+        saw_active = saw_active or active is not None
+        if saw_active:
+            assert active and active['last_confirmed_at'] == later.isoformat()
+    requests = list(remote.requests)
+    result = asyncio.run(tick(NOW.replace(minute=22)))
+    assert result['status'] == 'active'
+    assert result['items'][0]['last_confirmed_at'] == later.isoformat()
+    assert remote.requests == requests
+    assert original_load(target_trade_date=NOW.date(), state_dir=tmp_path)['items'] == result['items']
+
+
+@pytest.mark.parametrize('record', ['active', 'other_date', 'corrupt'])
+def test_busy_public_status_lock_does_not_read_or_replace_existing_facts(tmp_path, monkeypatch, record):
+    from app.internal.exact_repair_manifest import checkpoint_file_lock, write_checkpoint
+
+    value = {'strategy_id': 'krx_us_rebound', 'target_trade_date': NOW.date().isoformat(),
+        'source_environment': 'real', 'mode': 'paper', 'status': 'active', 'checked_at': NOW.isoformat(),
+        'items': [{'symbol': '069500', 'status': 'active', 'last_confirmed_at': NOW.isoformat()}]}
+    if record == 'other_date':
+        value['target_trade_date'] = '2026-11-27'
+    path = tmp_path / 'rebound/real-2026-11-30/execution-status.json'
+    write_checkpoint(path, {**value, 'record_hash': canonical_json_sha256(value)})
+    if record == 'corrupt':
+        path.write_text('{')
+    previous = path.read_bytes()
+    monkeypatch.setattr('app.overnight_rebound.operation.load_us_rebound_execution_status', forbidden)
+    with checkpoint_file_lock(path) as acquired:
+        assert acquired
+        result = asyncio.run(run_us_rebound_operation(mode='paper', config=RuleOperationConfig(enabled=True),
+            evaluation=current_evaluation(), state_dir=tmp_path, clock=lambda: NOW,
+            seal_loader=forbidden, adapter_factory=forbidden))
+    assert result['status'] == 'busy'
+    assert result['reason'] == 'execution_status_busy'
+    assert result['items'] == []
+    assert path.read_bytes() == previous
+
+
+def test_busy_public_lock_defers_projection_without_losing_fresh_private_ack(tmp_path):
+    from app.internal.exact_repair_manifest import checkpoint_file_lock
+
+    config, remote = configuration(tmp_path), WireExec()
+    remote.lose_activation = True
+    async def tick(now, factory=forbidden, loader=forbidden):
+        async with httpx.AsyncClient(base_url=config.destination_base_url, headers={'Authorization': 'Bearer synthetic-exec-token'},
+                                     transport=httpx.MockTransport(remote)) as client:
+            return await run_us_rebound_operation(mode='paper', config=config, evaluation=current_evaluation(),
+                state_dir=tmp_path, clock=lambda: now, seal_loader=loader,
+                adapter_factory=factory, client=client, account_target_reader=target_reader)
+    assert asyncio.run(tick(NOW, Evidence, seal_loader))['status'] == 'pending'
+    path = tmp_path / 'rebound/real-2026-11-30/execution-status.json'
+    previous = path.read_bytes()
+    later = NOW.replace(minute=21)
+    with checkpoint_file_lock(path) as acquired:
+        assert acquired
+        result = asyncio.run(tick(later))
+        assert result['status'] == 'active'
+        assert result['items'][0]['last_confirmed_at'] == later.isoformat()
+        assert path.read_bytes() == previous
+    requests = list(remote.requests)
+    result = asyncio.run(tick(NOW.replace(minute=22)))
+    assert result['status'] == 'active'
+    assert result['items'][0]['last_confirmed_at'] == later.isoformat()
+    assert remote.requests == requests
+    assert json.loads(path.read_text())['items'] == result['items']
+

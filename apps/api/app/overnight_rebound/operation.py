@@ -137,17 +137,20 @@ async def run_us_rebound_operation(
                  'source_environment': environment, 'mode': mode, 'status': status,
                  'checked_at': _aware(clock()).isoformat(), 'items': list(items),
                  **({'reason': reason} if reason else {})}
-        try:
-            previous = load_us_rebound_execution_status(
-                target_trade_date=now.date(), state_dir=state_dir, source_environment=environment,
-            )
-        except (OSError, ValueError):
-            return _public({**value, 'status': 'unavailable', 'reason': 'execution_status_unavailable', 'items': []})
-        if not value['items'] and previous and any(item.get('status') in ('accepted', 'activation_pending', 'active') for item in previous['items']):
-            value['items'] = previous['items']
-            value['mode'] = previous['mode']
-        _write(public_path, _public(value))
-        return _public(value)
+        with checkpoint_file_lock(public_path) as acquired:
+            if not acquired:
+                return _public(value if value['items'] else {**value, 'status': 'busy', 'reason': 'execution_status_busy'})
+            try:
+                previous = load_us_rebound_execution_status(
+                    target_trade_date=now.date(), state_dir=state_dir, source_environment=environment,
+                )
+            except (OSError, ValueError):
+                return _public({**value, 'status': 'unavailable', 'reason': 'execution_status_unavailable', 'items': []})
+            if not value['items'] and previous and any(item.get('status') in ('accepted', 'activation_pending', 'active') for item in previous['items']):
+                value['items'] = previous['items']
+                value['mode'] = previous['mode']
+            _write(public_path, _public(value))
+            return _public(value)
 
     if evaluation.get('status') != 'WATCH':
         return report('skipped', 'rule_not_watch')
