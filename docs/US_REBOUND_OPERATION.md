@@ -48,6 +48,9 @@ disables and boots out the optional `com.kiseyno.kai-us-index-preopen` job only
 after successful registration. The old plist and all state remain available for
 rollback. A failed registration leaves the legacy job untouched. Core, Exec and
 daily services remain independent.
+If disabling the legacy job fails after registration, installation reports an
+error and attempts to stop/disable the new collector; verify launchd state before
+retrying instead of treating that installation as successful.
 
 The new job polls every 60 seconds, with `RunAtLoad=true` and `KeepAlive=false`.
 Logs are `apps/api/var/log/us-rebound.log` and `us-rebound-error.log`. The

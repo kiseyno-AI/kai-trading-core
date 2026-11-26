@@ -146,9 +146,11 @@ def test_printing_launchd_configuration_is_inert_and_escapes_paths(tmp_path):
     assert not probe.exists()
 
 
-@pytest.mark.parametrize(('bootstrap_status', 'old_bootout_status'), [(0, 0), (0, 3), (7, 0)])
+@pytest.mark.parametrize(('bootstrap_status', 'old_bootout_status', 'old_disable_status'), [
+    (0, 0, 0), (0, 3, 0), (7, 0, 0), (0, 0, 5),
+])
 def test_install_retires_only_preopen_after_successful_registration(
-    tmp_path, bootstrap_status, old_bootout_status,
+    tmp_path, bootstrap_status, old_bootout_status, old_disable_status,
 ):
     root = tmp_path / 'worker'
     (root / 'scripts').mkdir(parents=True)
@@ -180,6 +182,7 @@ def test_install_retires_only_preopen_after_successful_registration(
         '  bootstrap:*) exit "$BOOTSTRAP_STATUS" ;;\n'
         '  bootout:*/com.kiseyno.kai-us-index-preopen) exit "$OLD_BOOTOUT_STATUS" ;;\n'
         '  bootout:*) exit 3 ;;\n'
+        '  disable:*/com.kiseyno.kai-us-index-preopen) exit "$OLD_DISABLE_STATUS" ;;\n'
         '  enable:*|disable:*) exit 0 ;;\n'
         'esac\n'
         'exit 90\n'
@@ -190,7 +193,8 @@ def test_install_retires_only_preopen_after_successful_registration(
         ['bash', str(installer)], capture_output=True, text=True,
         env={**os.environ, 'PYTHON_BIN': sys.executable, 'HOME': str(launch_home),
              'PATH': f'{root / "scripts"}:{os.environ["PATH"]}', 'LAUNCHCTL_PROBE': str(probe),
-             'BOOTSTRAP_STATUS': str(bootstrap_status), 'OLD_BOOTOUT_STATUS': str(old_bootout_status)},
+             'BOOTSTRAP_STATUS': str(bootstrap_status), 'OLD_BOOTOUT_STATUS': str(old_bootout_status),
+             'OLD_DISABLE_STATUS': str(old_disable_status)},
     )
 
     domain = f'gui/{os.getuid()}'
@@ -202,10 +206,15 @@ def test_install_retires_only_preopen_after_successful_registration(
     ]
     if bootstrap_status == 0:
         expected_calls.append(['disable', f'{domain}/com.kiseyno.kai-us-index-preopen', ''])
-        expected_calls.append(['bootout', f'{domain}/com.kiseyno.kai-us-index-preopen', ''])
+        if old_disable_status == 0:
+            expected_calls.append(['bootout', f'{domain}/com.kiseyno.kai-us-index-preopen', ''])
+        else:
+            expected_calls.append(['bootout', f'{domain}/com.kiseyno.kai-us-rebound', ''])
+            expected_calls.append(['disable', f'{domain}/com.kiseyno.kai-us-rebound', ''])
     assert [line.split('\t') for line in probe.read_text().splitlines()] == expected_calls
-    assert result.returncode == bootstrap_status
-    assert bool(result.stdout) is (bootstrap_status == 0)
+    expected_status = bootstrap_status or (1 if old_disable_status else 0)
+    assert result.returncode == expected_status
+    assert bool(result.stdout) is (expected_status == 0)
     configuration = plistlib.loads(plist.read_bytes())
     assert configuration['Label'] == 'com.kiseyno.kai-us-rebound'
     assert configuration['EnvironmentVariables']['PYTHON_BIN'] == sys.executable

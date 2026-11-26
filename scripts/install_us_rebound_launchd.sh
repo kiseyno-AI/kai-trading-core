@@ -41,6 +41,11 @@ launchctl enable "$domain/$label"
 launchctl bootout "$domain/$label" 2>/dev/null || true
 launchctl bootstrap "$domain" "$plist"
 # Keep two-close polling disabled across logins after successful replacement.
-launchctl disable "$domain/com.kiseyno.kai-us-index-preopen"
+if ! launchctl disable "$domain/com.kiseyno.kai-us-index-preopen"; then
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  launchctl disable "$domain/$label" 2>/dev/null || true
+  echo 'could not retire legacy preopen job; new installation aborted' >&2
+  exit 1
+fi
 launchctl bootout "$domain/com.kiseyno.kai-us-index-preopen" 2>/dev/null || true
 echo "installed $label -> $plist"
